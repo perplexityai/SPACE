@@ -874,6 +874,10 @@ kind_stack_assert_cluster_mounts() {
         "$REPO_ROOT/infra/space/kind/kind-cluster.yaml.tmpl" "$expected"
     kind_assert_live_cluster_mounts "$KIND_CLUSTER" "$expected"
     rm -f "$expected"
+    # The vendor mount is right; each SPACE node keeps the copy of it it made
+    # on its first boot, which a host tree changed since never reaches.
+    bash "$REPO_ROOT/infra/space/kind/scripts/check-node-vendor.sh" \
+        "$KIND_CLUSTER" || exit 1
 }
 
 # Refuse a cluster whose Postgres data directory an earlier space-postgres

@@ -24,9 +24,9 @@
 set -euo pipefail
 
 # Test-dependency strictness is a runtime switch read by
-# pplx-space-db-test-fixtures: exporting SPACE_CI_REQUIRE_TEST_DEPS=1 turns
-# unavailable Postgres/Redis testcontainers into hard test failures instead of
-# silent skips. Keep local runs graceful, but make Buildkite fail closed.
+# pplx-space-db-test-fixtures. Unavailable Postgres/Redis testcontainers fail
+# their tests unless SPACE_TEST_DEPS_OPTIONAL opts out; on Buildkite,
+# SPACE_CI_REQUIRE_TEST_DEPS=1 also overrides an opt-out the agent inherits.
 if [ -n "${BUILDKITE:-}" ]; then
     export SPACE_CI_REQUIRE_TEST_DEPS=1
 fi
@@ -640,9 +640,10 @@ run_test_checks() {
     SPACE_NEXTEST_REDIS_CLEANUP_ID="${BUILDKITE_JOB_ID:-local-$$}"
     export SPACE_NEXTEST_REDIS_CLEANUP_ID
 
-    # The fixtures append one SPACE-TEST-DEP-SKIP line here per graceful local
-    # skip. CI is strict, so a dependency outage fails its test; the zero-count
-    # report remains useful evidence that no fail-open path was taken.
+    # The fixtures append one SPACE-TEST-DEP-SKIP line here per skip a run
+    # opted into with SPACE_TEST_DEPS_OPTIONAL. CI is strict, so a dependency
+    # outage fails its test; the zero-count report remains useful evidence that
+    # no fail-open path was taken.
     SPACE_TEST_DEP_SKIP_LOG="$(pwd)/${target_dir}/space-test-dep-skips.log"
     export SPACE_TEST_DEP_SKIP_LOG
     prepare_test_dep_skip_log "${target_dir}" "${SPACE_TEST_DEP_SKIP_LOG}"

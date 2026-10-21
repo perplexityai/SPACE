@@ -462,11 +462,12 @@ async fn unreachable_store_fails_open() {
 }
 
 // ---------------------------------------------------------------------------
-// Redis-backed behavior (testcontainers; skips without Docker).
+// Redis-backed behavior (testcontainers, or SPACE_TEST_REDIS_URL).
 // ---------------------------------------------------------------------------
 
 /// Prefers `SPACE_TEST_REDIS_URL` so the Lua can be exercised without Docker;
-/// otherwise starts a throwaway container. `None` skips the test.
+/// otherwise starts a throwaway container. `None` skips the test, which only a
+/// run that opted out of required test dependencies allows.
 async fn try_redis_url() -> TestResult<Option<(Option<ContainerAsync<Redis>>, String)>> {
     if let Ok(url) = std::env::var("SPACE_TEST_REDIS_URL")
         && !url.trim().is_empty()
@@ -482,12 +483,7 @@ async fn try_redis_url() -> TestResult<Option<(Option<ContainerAsync<Redis>>, St
     {
         Ok(node) => node,
         Err(error) => {
-            if pplx_space_db_test_fixtures::require_test_deps() {
-                return Err(error.into());
-            }
-            pplx_space_db_test_fixtures::report_dependency_skip(&format!(
-                "redis unavailable: {error}"
-            ))?;
+            pplx_space_db_test_fixtures::report_unavailable_dependency("redis", &error)?;
             return Ok(None);
         }
     };

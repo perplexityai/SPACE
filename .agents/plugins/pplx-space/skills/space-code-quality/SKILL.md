@@ -79,8 +79,9 @@ existing coverage gap, and lowest owning layer; zero new tests can be correct.
 
 Database-backed tests use the repository fixtures. When Docker is unavailable,
 bring it up rather than accepting dependency skips as validation. Use
-`$space-validation` on macOS. `SPACE_CI_REQUIRE_TEST_DEPS=1` makes unavailable
-Postgres and Redis fixtures fail closed in CI; do not weaken that behavior.
+`$space-validation` on macOS. Unavailable Postgres and Redis fixtures fail
+closed unless `SPACE_TEST_DEPS_OPTIONAL=1` opts out; do not weaken that
+behavior or validate with the opt-out set.
 
 ## Durable comments
 

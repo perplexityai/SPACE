@@ -158,3 +158,9 @@ pub fn dispatcher_slots(in_flight: usize, capacity: usize) {
     gauge("operations.dispatcher.in_flight", in_flight as f64, &[]);
     gauge("operations.dispatcher.capacity", capacity as f64, &[]);
 }
+
+/// A step that would have slept before retrying returned to the
+/// dispatcher instead, freeing its execution slot. `site` names the step.
+pub fn retry_wait_deferred(site: &str) {
+    counter("operations.retry_wait_deferred", 1, &[tag("site", site)]);
+}

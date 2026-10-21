@@ -501,11 +501,15 @@ local_resource(
 # layout). A node keeps the image it was created from, so this refuses a cluster
 # whose SPACE nodes predate the image or run an older build of it, with the
 # remedy (recreate the cluster), instead of letting the node services wait for a
-# cache that never comes. Every node-service release depends on it.
+# cache that never comes. Every node-service release depends on it. It also
+# refuses nodes whose vendor tree, copied from the host tree on their first boot
+# and kept since, no longer matches that tree (check-node-vendor.sh).
 local_resource(
     "check-kind-node-image",
-    cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/check-kind-node-image.sh".format(KIND_CLUSTER),
+    cmd = ("SPACE_KIND_CLUSTER={0} bash infra/space/kind/scripts/check-kind-node-image.sh && " +
+           "SPACE_KIND_CLUSTER={0} bash infra/space/kind/scripts/check-node-vendor.sh").format(KIND_CLUSTER),
     deps = ["infra/space/kind/scripts/check-kind-node-image.sh",
+            "infra/space/kind/scripts/check-node-vendor.sh",
             "infra/space/kind/scripts/kind-node-image.sh", "infra/space/kind/node",
             "scripts/lib/space-loop-devices.sh", "infra/space/identity/node-identities.sh"],
     labels = ["bootstrap"],

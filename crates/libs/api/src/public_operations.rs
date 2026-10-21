@@ -71,6 +71,9 @@ fn update_claimed_payload_sql() -> &'static str {
     )
 }
 const DEFAULT_IDEMPOTENCY_TTL_HOURS: i64 = 24;
+/// Advisory transaction lock that serializes dispatcher claims across
+/// controller replicas so the keyed-claim rule sees every committed claim.
+pub const PUBLIC_OPERATION_CLAIM_LOCK_KEY: i64 = 0x7370_6163_655f_6f70;
 
 mod responses;
 pub(crate) use responses::ResponseAdmissionError;
@@ -213,6 +216,24 @@ impl PublicOperationStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(seconds.map(|seconds| Duration::from_secs(u64::try_from(seconds).unwrap_or(0))))
+    }
+
+    /// How long ago the operation was first claimed, if it has been.
+    pub async fn time_since_first_claim(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<Duration>, PublicOperationStoreError> {
+        let seconds = sqlx::query_scalar::<_, Option<f64>>(pplx_space_common_core::sql!(
+            "SELECT EXTRACT(EPOCH FROM NOW() - started_at)::DOUBLE PRECISION
+             FROM public_operations
+             WHERE operation_id = $1"
+        ))
+        .bind(operation_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(seconds
+            .flatten()
+            .map(|seconds| Duration::from_secs_f64(seconds.max(0.0))))
     }
 
     pub async fn fetch_operation(
@@ -743,7 +764,16 @@ impl PublicOperationStore {
         &self,
         input: ClaimPublicOperations<'_>,
     ) -> Result<PublicOperationClaim, PublicOperationStoreError> {
-        claim_operations(&self.pool, input).await
+        claim_operations(&self.pool, input, ClaimMode::Keyed).await
+    }
+
+    /// The claim before per-sandbox keying: plain request order with no
+    /// key rule and no claim lock. Kept as the dispatcher's kill switch.
+    pub async fn claim_operations_unkeyed(
+        &self,
+        input: ClaimPublicOperations<'_>,
+    ) -> Result<PublicOperationClaim, PublicOperationStoreError> {
+        claim_operations(&self.pool, input, ClaimMode::Unkeyed).await
     }
 
     pub async fn complete_claimed_operation(
@@ -1187,6 +1217,18 @@ impl ClaimedPublicOperation {
         };
         Some(sandbox_id.to_string())
     }
+
+    /// The work-queue key the dispatcher serializes on: the `sbx_<uuid>`
+    /// target of a sandbox operation. A fork, and any operation that names
+    /// no sandbox, has no key and never waits on another operation.
+    pub fn work_key(&self) -> Option<&str> {
+        if self.target_type != Some(OperationTargetType::Sandbox)
+            || self.kind == OperationKind::ForkSandbox
+        {
+            return None;
+        }
+        self.target_id.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1202,6 +1244,10 @@ pub enum PublicOperationRequeueReason {
     TransientFailure,
     WorkflowProgress,
     ActivationBackpressure,
+    /// The execution handed a retry wait back to the dispatcher instead of
+    /// sleeping in its slot. Not a failure of its own: it spends no attempt
+    /// and is bounded by the operation's age instead.
+    RetryDeferred,
 }
 
 impl PublicOperationRequeueReason {
@@ -1210,11 +1256,15 @@ impl PublicOperationRequeueReason {
             Self::TransientFailure => "transient_failure",
             Self::WorkflowProgress => "workflow_progress",
             Self::ActivationBackpressure => "activation_backpressure",
+            Self::RetryDeferred => "retry_deferred",
         }
     }
 
     pub const fn preserves_retry_budget(self) -> bool {
-        matches!(self, Self::WorkflowProgress | Self::ActivationBackpressure)
+        matches!(
+            self,
+            Self::WorkflowProgress | Self::ActivationBackpressure | Self::RetryDeferred
+        )
     }
 }
 
@@ -1414,9 +1464,16 @@ fn new_claim_token() -> String {
     format!("public-operation-{}", Uuid::now_v7())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimMode {
+    Keyed,
+    Unkeyed,
+}
+
 async fn claim_operations(
     pool: &PgPool,
     input: ClaimPublicOperations<'_>,
+    mode: ClaimMode,
 ) -> Result<PublicOperationClaim, PublicOperationStoreError> {
     if input.limit == 0 || input.claimable_kinds.is_empty() {
         return Ok(PublicOperationClaim {
@@ -1433,24 +1490,120 @@ async fn claim_operations(
         .collect::<Vec<_>>();
 
     let mut tx = pool.begin().await?;
-    // Claim in order of when each operation became claimable, so a requeued
-    // retry waits behind work that was queued before its backoff expired.
+    let keyed = mode == ClaimMode::Keyed;
+    if keyed {
+        // The key rule reads other rows' claim state from this statement's
+        // snapshot, so overlapping claimers could both run one sandbox: one
+        // takes a delete past a wake in backoff while the other, on an older
+        // snapshot, takes that wake as it comes due. The dispatcher runs
+        // behind leader election, so this only matters around a handover; a
+        // busy lock makes this tick claim nothing rather than wait. The same
+        // round trip turns off JIT, which the key probe's cost estimate would
+        // trigger and which costs more than the query.
+        let (claim_lock_held, _jit) = sqlx::query_as::<_, (bool, String)>(sql!(
+            "SELECT pg_try_advisory_xact_lock($1), set_config('jit', 'off', true)"
+        ))
+        .bind(PUBLIC_OPERATION_CLAIM_LOCK_KEY)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !claim_lock_held {
+            tx.rollback().await?;
+            return Ok(PublicOperationClaim {
+                claim_token,
+                operations: Vec::new(),
+            });
+        }
+    }
+    // Across keys, claim in order of when each operation became claimable,
+    // so a requeued retry waits behind work queued before its backoff
+    // expired. With `$11` (keyed) set, `blocked` lets at most one operation
+    // per sandbox start: none while one runs under a live claim; otherwise a
+    // stale claim first, so its token is rotated before anything else on the
+    // sandbox can start beside its old execution; otherwise the
+    // earliest-requested one if it is due; otherwise the earliest due delete
+    // with no create requested before it, so a delete is not stuck behind
+    // work in retry backoff but never overtakes a create. Only sandboxes with
+    // more than one active operation can hold anything back, so the window
+    // pass reads just those, in one sort. Forks name
+    // their source by a different id form and keep their own lifecycle lock,
+    // so they stay outside the key. With `$11` unset (the kill switch)
+    // `blocked` is empty.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
-        "WITH picked AS (
-             SELECT operation_id,
-                    GREATEST(requested_at, next_attempt_at) AS claimable_at,
-                    claim_token <> '' AS reclaimed
+        "WITH shared AS (
+             SELECT org_id, target_id
              FROM public_operations
-             WHERE state IN ($4, $5)
+             WHERE $11::BOOLEAN
+               AND state IN ($4, $5)
+               AND target_type = $7
+               AND target_id IS NOT NULL
                AND kind = ANY($6)
-               AND next_attempt_at <= NOW()
+               AND kind <> $8
+             GROUP BY org_id, target_id
+             HAVING COUNT(*) > 1
+         ),
+         active AS (
+             SELECT operation_id,
+                    op.org_id,
+                    op.target_id,
+                    requested_at,
+                    kind,
+                    next_attempt_at <= NOW() AS due,
+                    state = $5 AND claim_token <> ''
+                        AND claimed_at > NOW() - make_interval(secs => $2::BIGINT) AS live,
+                    state = $5 AND claim_token <> ''
+                        AND claimed_at <= NOW() - make_interval(secs => $2::BIGINT) AS stale
+             FROM shared
+             JOIN public_operations op
+               ON op.org_id = shared.org_id
+              AND op.target_type = $7
+              AND op.target_id = shared.target_id
+             WHERE op.state IN ($4, $5)
+               AND op.kind = ANY($6)
+               AND op.kind <> $8
+         ),
+         ranked AS (
+             SELECT operation_id,
+                    ROW_NUMBER() OVER queue AS position,
+                    FIRST_VALUE(due) OVER queue AS head_due,
+                    BOOL_OR(live) OVER whole AS sandbox_live,
+                    BOOL_OR(stale) OVER whole AS sandbox_stale,
+                    stale AND NOT COALESCE(BOOL_OR(stale) OVER earlier, FALSE) AS first_stale,
+                    kind = $9
+                        AND due
+                        AND NOT COALESCE(BOOL_OR(kind = $10) OVER earlier, FALSE)
+                        AND NOT COALESCE(BOOL_OR(kind = $9 AND due) OVER earlier, FALSE)
+                        AS first_free_delete
+             FROM active
+             WINDOW queue AS (
+                        PARTITION BY org_id, target_id ORDER BY requested_at, operation_id
+                    ),
+                    whole AS (queue ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+                    earlier AS (queue ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+         ),
+         blocked AS (
+             SELECT operation_id
+             FROM ranked
+             WHERE sandbox_live
+                OR (sandbox_stale AND NOT first_stale)
+                OR (NOT sandbox_stale AND head_due AND position > 1)
+                OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
+         ),
+         picked AS (
+             SELECT candidate.operation_id,
+                    GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
+                    candidate.claim_token <> '' AS reclaimed
+             FROM public_operations candidate
+             WHERE candidate.state IN ($4, $5)
+               AND candidate.kind = ANY($6)
+               AND candidate.next_attempt_at <= NOW()
                AND (
-                   claim_token = ''
-                   OR claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
+                   candidate.claim_token = ''
+                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
                )
-             ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
+               AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
+             ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
              LIMIT $1
-             FOR UPDATE SKIP LOCKED
+             FOR UPDATE OF candidate SKIP LOCKED
          )
          UPDATE public_operations o
          SET state = $5,
@@ -1487,6 +1640,11 @@ async fn claim_operations(
     .bind(OperationState::Queued.as_str())
     .bind(OperationState::Running.as_str())
     .bind(&kind_labels)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(OperationKind::ForkSandbox.as_str())
+    .bind(OperationKind::DeleteSandbox.as_str())
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(keyed)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -1636,7 +1794,7 @@ async fn release_claimed_operation(
          SET state = $3,
              claim_token = '',
              progress_message = $4,
-             next_attempt_at = NOW() + make_interval(secs => $5::BIGINT),
+             next_attempt_at = NOW() + make_interval(secs => $5::DOUBLE PRECISION),
              attempts = GREATEST(attempts - CASE WHEN $7 THEN 0 ELSE 1 END, 0),
              updated_at = NOW()
          WHERE operation_id = $1
@@ -1648,7 +1806,7 @@ async fn release_claimed_operation(
     .bind(&input.claim_token)
     .bind(OperationState::Queued.as_str())
     .bind(&input.progress_message)
-    .bind(duration_secs_i64(input.retry_after))
+    .bind(input.retry_after.as_secs_f64())
     .bind(OperationState::Running.as_str())
     .bind(input.count_attempt)
     .fetch_optional(&mut *tx)

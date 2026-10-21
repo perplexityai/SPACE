@@ -7,7 +7,6 @@ every item's reach exactly what it was in the parent.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import sys
@@ -20,6 +19,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import split_rust_module as srm  # noqa: E402
+from required_test_deps import unavailable_dependency  # noqa: E402
 
 TOOL = SCRIPTS_DIR / "split_rust_module.py"
 
@@ -707,12 +707,12 @@ ORACLE = {
 }
 
 
-def rustc() -> str | None:
+def rustc() -> str:
     import shutil
 
     found = shutil.which("rustc")
-    if found is None and os.environ.get("SPACE_CI_REQUIRE_TEST_DEPS") == "1":
-        pytest.fail("rustc is required for the compile oracle in CI")
+    if found is None:
+        unavailable_dependency("rustc", "not on PATH; the compile oracle needs the Rust toolchain")
     return found
 
 
@@ -725,8 +725,8 @@ def build_and_test(root: Path) -> subprocess.CompletedProcess:
     return subprocess.run([str(exe)], capture_output=True, text=True)
 
 
-@pytest.mark.skipif(rustc() is None, reason="rustc not installed")
 def test_split_crate_compiles_and_keeps_behavior(tmp_path):
+    rustc()  # Fails here, or skips under the opt-out, without the toolchain.
     src = tmp_path / "oracle/src"
     for rel, text in ORACLE.items():
         (src / rel).parent.mkdir(parents=True, exist_ok=True)

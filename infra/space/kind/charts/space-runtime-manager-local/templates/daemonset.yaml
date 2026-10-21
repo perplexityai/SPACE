@@ -17,9 +17,9 @@ spec:
   # successor wait for its predecessor. The successor binds at once and takes
   # the socket path by rename (crates/libs/common/svc/src/bootstrap/unix_socket.rs), while
   # both probes target that one shared socket rather than an instance-local
-  # health socket; and with kernel installs enabled the successor's installer
-  # empties the shared staging directory, which it may only do "when nothing
-  # in staging is live" (installs/staging.rs prepare, installs/operations.rs).
+  # health socket; and with installs enabled the successor's installer empties
+  # the shared staging directory on open, which it may only do "when nothing in
+  # staging is live" (staging::prepare, Installer::open).
   # Two instances therefore must not overlap on a node. Nothing waits on its
   # listings, so the brief gap during a replacement costs nothing.
   {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
@@ -36,7 +36,8 @@ spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       # space-rtmgr with its socket and node-manager client groups
-      # (SPACE_RUNTIME_MANAGER_GROUPS); vendor and cache mounts stay read-only.
+      # (SPACE_RUNTIME_MANAGER_GROUPS): installs ask node-manager, over its
+      # socket, to publish what they staged (NodeManagerPublisher).
       securityContext:
         {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_RTMGR" "groups" "SPACE_RUNTIME_MANAGER_GROUPS") | nindent 8 }}
       initContainers:
@@ -46,8 +47,15 @@ spec:
       containers:
         - name: runtime-manager
           {{- include "space-node-service.image" . | nindent 10 }}
+          # With artifactInstalls.enabled, no `--list-only`: listings, and
+          # installs of the catalog's releases and kernels from the compiled
+          # sources (FIRECRACKER_RELEASE_SOURCE, Firecracker's GitHub release
+          # downloads, and FIRECRACKER_CI_KERNEL_SOURCE, its CI bucket read
+          # anonymously), downloaded over the pod network into staging.
           command: ["/opt/space/bin/space-rtmgr-svc"]
+          {{- if not .Values.artifactInstalls.enabled }}
           args: ["--list-only"]
+          {{- end }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}
@@ -70,9 +78,16 @@ spec:
             failureThreshold: 3
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
-            {{- include "space-node-service.mount.cache" (dict "readOnly" true) | nindent 12 }}
-            # The runtime aliases (/space/bin/firecracker, jailer) and the
-            # vendor releases and kernels they resolve to.
+            # Writable with artifactInstalls.enabled, for its staging only,
+            # /space/cache/.rtmgr-staging (RUNTIME_MANAGER_STAGING_DIR), which
+            # node-manager creates private to space-rtmgr and the installer
+            # clears on open; the account is in no group that writes the rest
+            # of the cache.
+            {{- include "space-node-service.mount.cache" (dict "readOnly" (not .Values.artifactInstalls.enabled)) | nindent 12 }}
+            # The runtime aliases (/space/bin/firecracker, jailer), the vendor
+            # releases and kernels they resolve to, and the managed store
+            # /space/vendor/artifacts it lists. Read-only: node-manager alone
+            # publishes into the store.
             - name: space-bin
               mountPath: /space/bin
               readOnly: true

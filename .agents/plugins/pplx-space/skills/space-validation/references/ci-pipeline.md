@@ -81,7 +81,8 @@ falsely fresh in PRs; main's cold build is what catches it. Read build outputs
 through Cargo (`CARGO_BIN_EXE_*`, its JSON messages), or by the uplifted name of
 a target Cargo still builds.
 
-Every graceful Postgres/Redis fixture skip emits a `SPACE-TEST-DEP-SKIP:`
+Postgres/Redis fixtures fail closed unless the run opts out with
+`SPACE_TEST_DEPS_OPTIONAL=1`. Every opted-out skip emits a `SPACE-TEST-DEP-SKIP:`
 stderr marker and appends to the file named by `SPACE_TEST_DEP_SKIP_LOG` when
 set (`crates/libs/db-test-fixtures/src/lib.rs`);
 `ci/scripts/run-rust-checks.sh` collects and reports the count on
@@ -89,8 +90,11 @@ every run — zero proves no fail-open path was taken. A configured log is
 fail-closed: path and write errors fail the affected test so collection
 cannot silently be incomplete. The run-scoped nextest Postgres setup is also
 fail-closed so a setup outage cannot fan out into opaque per-test failures;
+only an opted-out run without a reachable Docker daemon skips it, with a
+marker, leaving each test to fail or skip on its own;
 the Redis setup (`ci/scripts/setup-nextest-redis.sh`) is
-**deliberately fail-open** and falls back to the counted skip machinery. Do
+**deliberately fail-open** and falls back to per-test containers, which fail
+closed or, opted out, take the counted skip. Do
 not weaken the fail-closed paths, and do not "fix the asymmetry" by making
 the Redis setup fail-closed.
 

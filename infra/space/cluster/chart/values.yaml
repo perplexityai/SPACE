@@ -45,3 +45,17 @@ space-data-plane-local:
   entry:
     type: ClusterIP
   ecwHosts: ""
+
+# Kind gives every node its own root-owned /space/vendor (stage_vendor in
+# kind/node/space-kind-node.sh); a caller's node brings its own, which may be
+# read-only or not root-owned. On such a node node-manager cannot prepare the
+# managed store, never creates runtime-manager's staging directory, and
+# runtime-manager exits at startup instead of listing. So node-manager keeps
+# /space/vendor read-only and runtime-manager runs --list-only, as they did
+# before Kind turned installs on. Turn both on together (templates/validate.yaml).
+space-node-manager-local:
+  artifactInstalls:
+    enabled: false
+space-runtime-manager-local:
+  artifactInstalls:
+    enabled: false

@@ -13,6 +13,8 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+from required_test_deps import unavailable_dependency
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -104,9 +106,11 @@ def postgres_runner_or_skip(test_case: unittest.TestCase) -> PostgresRunner:
     if database_url is None:
         database_url = os.environ.get("DATABASE_URL")
     if not database_url:
-        test_case.fail(
-            "set PRUNE_CLUSTER_ARTIFACTS_TEST_DATABASE_URL or DATABASE_URL to run "
-            "the Postgres-backed prune mutation test"
+        unavailable_dependency(
+            "postgres",
+            "set PRUNE_CLUSTER_ARTIFACTS_TEST_DATABASE_URL or DATABASE_URL, as "
+            "ci/scripts/run-python-tests.sh does, to run the Postgres-backed prune "
+            "mutation test",
         )
     if POSTGRES_DRIVER is None:
         test_case.fail("install psycopg or psycopg2 to run the Postgres-backed test")

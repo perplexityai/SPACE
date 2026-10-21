@@ -1489,3 +1489,20 @@ fn test_route_ed25519_authority() -> Arc<SpaceApiRouteEd25519Authority> {
         Arc::new(SpaceApiRouteEd25519Authority::load_required_from_environment(&env).unwrap())
     }
 }
+
+mod deferral;
+mod keyed_queue;
+
+type BeforeClaimHook = Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+tokio::task_local! {
+    /// Runs in the run loop after it reaps finished executions and before it
+    /// claims, so a test can finish an execution inside that window.
+    static BEFORE_CLAIM: BeforeClaimHook;
+}
+
+pub(super) async fn before_claim() {
+    if let Ok(hook) = BEFORE_CLAIM.try_with(Arc::clone) {
+        hook().await;
+    }
+}

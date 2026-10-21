@@ -37,8 +37,8 @@ Read only the references that match the task:
 Targeted tests are for iteration. Use the owning domain skill's final validation
 before committing or opening a PR; `$space-rust-development` owns the complete
 Rust command matrix. Dependency skips are not final validation when Docker can
-be started. CI exports `SPACE_CI_REQUIRE_TEST_DEPS=1` so Postgres and Redis
-fixtures fail closed.
+be started. Postgres and Redis fixtures fail closed by default;
+`SPACE_TEST_DEPS_OPTIONAL=1` turns them into counted skips.
 
 Use `$space-template-lifecycle` when validation depends on template publishing,
 kernel staging, or builder trust. Live cluster mutations remain approval-gated

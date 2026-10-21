@@ -10,7 +10,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use pplx_space_common_core::types::time::format_simple_duration;
-use pplx_space_public_api::{OperationKind, OperationState, PublicErrorCode};
+use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
 use tokio::time::MissedTickBehavior;
 
 use crate::public_operations::{
@@ -27,6 +27,13 @@ pub const DEFAULT_CLAIM_STALE_AFTER: Duration = Duration::from_secs(60);
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_RETRY_ATTEMPTS: i32 = 16;
 pub const DEFAULT_M1_MAX_AGE: Duration = Duration::from_secs(1_800);
+/// How long an operation may keep deferring its retry waits, from its first
+/// claim. Deferred retries spend no attempts, so this matches the longest a
+/// fenced restore can retry in its slot on the attempt budget: 16 attempts of
+/// a 130 s wait plus the 5 s requeue hint.
+pub const DEFERRED_RETRY_WINDOW: Duration = Duration::from_secs(16 * 135);
+/// Largest spacing ceiling between deferred retries.
+const DEFERRED_RETRY_MAX_SPACING: Duration = Duration::from_secs(60);
 
 fn m1_deadline_message(max_age_seconds: u64) -> String {
     let max_age = format_simple_duration(Duration::from_secs(max_age_seconds));
@@ -167,7 +174,7 @@ where
     let attempts = operation.attempts;
     let executor_label = executor.as_str();
     pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor_label);
-    let renew_every = (config.claim_stale_after / 3).max(Duration::from_millis(10));
+    let renew_every = claim_renewal_interval(config.claim_stale_after);
     let mut renewal = tokio::time::interval(renew_every);
     renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
     renewal.tick().await;
@@ -285,6 +292,17 @@ where
             } else {
                 "unsupported_executor_state"
             };
+            let retry_deferred =
+                supported_requeue && requeue_reason == PublicOperationRequeueReason::RetryDeferred;
+            // Deferred retries spend no attempts; past the deferral window
+            // they fail as an exhausted budget would.
+            let deferred_for = if retry_deferred {
+                store.time_since_first_claim(operation_id).await?
+            } else {
+                None
+            };
+            let deferral_exhausted =
+                deferred_for.is_some_and(|deferred_for| deferred_for >= DEFERRED_RETRY_WINDOW);
             let deadline = if is_native_m1_terminalized_kind(api_product, kind) {
                 config.m1_max_age
             } else {
@@ -349,8 +367,9 @@ where
                     );
                 }
                 updated
-            } else if !preserve_retry_budget
-                && retry_budget_exhausted(attempts, config.max_retry_attempts)
+            } else if deferral_exhausted
+                || (!preserve_retry_budget
+                    && retry_budget_exhausted(attempts, config.max_retry_attempts))
             {
                 let terminal_error_code = result
                     .terminal_error_code
@@ -393,15 +412,22 @@ where
                 }
                 updated
             } else {
+                let retry_hint = result
+                    .retry_after
+                    .filter(|retry_after| !retry_after.is_zero())
+                    .unwrap_or(config.retry_after);
+                let retry_after = match deferred_for {
+                    Some(deferred_for) => {
+                        deferred_retry_delay(operation_id, deferred_for, retry_hint)
+                    }
+                    None => retry_hint,
+                };
                 let updated = store
                     .release_claimed_operation(ReleaseClaimedPublicOperation {
                         claim_token,
                         operation_id,
                         progress_message,
-                        retry_after: result
-                            .retry_after
-                            .filter(|retry_after| !retry_after.is_zero())
-                            .unwrap_or(config.retry_after),
+                        retry_after,
                         // Expected workflow progress and activation admission
                         // waits do not consume the transient-failure budget.
                         count_attempt: !preserve_retry_budget,
@@ -430,6 +456,35 @@ where
     }
 
     Ok(report)
+}
+
+/// How often a running execution renews its claim: a third of
+/// `claim_stale_after`, so two renewals can be lost before it goes stale.
+pub fn claim_renewal_interval(claim_stale_after: Duration) -> Duration {
+    (claim_stale_after / 3).max(Duration::from_millis(10))
+}
+
+/// The delay before re-driving an operation that deferred its retry wait:
+/// the executor's `hint` plus an equal-jittered eighth of how long it has
+/// been deferring, capped at a minute. A fence that clears quickly is retried
+/// within seconds; a long one is retried about once a minute.
+pub fn deferred_retry_delay(
+    operation_id: OperationId,
+    deferred_for: Duration,
+    hint: Duration,
+) -> Duration {
+    let half = (deferred_for / 8).min(DEFERRED_RETRY_MAX_SPACING) / 2;
+    hint + half + half.mul_f64(retry_jitter_fraction(operation_id, deferred_for.as_secs()))
+}
+
+fn retry_jitter_fraction(operation_id: OperationId, seed: u64) -> f64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    operation_id.to_string().hash(&mut hasher);
+    seed.hash(&mut hasher);
+    // The top 53 bits fill an f64 mantissa exactly: a fraction in [0, 1).
+    (hasher.finish() >> 11) as f64 / (1_u64 << 53) as f64
 }
 
 fn retry_budget_exhausted(attempts: i32, max_retry_attempts: i32) -> bool {

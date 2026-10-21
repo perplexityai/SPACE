@@ -34,6 +34,9 @@ const RECOVERY_JOIN_MAX_DELAY: Duration = Duration::from_secs(5);
 /// budget-elapsed error. The grace only covers publish/scheduling latency —
 /// the run itself never runs longer because of it.
 const COALESCED_RUN_PUBLISH_GRACE: Duration = Duration::from_millis(500);
+/// How long a deferring caller keeps retrying a fenced restore claim inside
+/// its slot before handing the wait back.
+pub(crate) const RETRY_DEFERRAL_GRACE: Duration = Duration::from_secs(2);
 
 /// The follower-join backoff's two bounds, carried on the substrate so a
 /// test can shorten a join's re-check without touching the wake path it is
@@ -1127,18 +1130,24 @@ impl KubernetesSubstrate {
                     let run_sandbox = wake_sandbox.clone();
                     let handling = restore_claim_handling.clone();
                     let wake_trace = crate::wake_trace::current();
-                    crate::wake_trace::scope(wake_trace, async move {
-                        substrate
-                            .wake_execution_uncoalesced(
-                                &run_sandbox,
-                                timeout,
-                                metric_identity,
-                                None,
-                                target,
-                                handling,
-                            )
-                            .await
-                    })
+                    // The run is detached, so it re-enters the owner's retry
+                    // deferral explicitly, as it does the wake trace.
+                    let retry_deferral = crate::retry_deferral::current();
+                    crate::wake_trace::scope(
+                        wake_trace,
+                        crate::retry_deferral::scope(retry_deferral, async move {
+                            substrate
+                                .wake_execution_uncoalesced(
+                                    &run_sandbox,
+                                    timeout,
+                                    metric_identity,
+                                    None,
+                                    target,
+                                    handling,
+                                )
+                                .await
+                        }),
+                    )
                 })
                 .await;
             // The owner already recorded its plan in the detached run. Only
@@ -1269,6 +1278,7 @@ impl KubernetesSubstrate {
         let (_, join_deadline) = ready_wait_bounds(timeout);
         let mut join_backoff = RecoveryJoinBackoff::new(self.recovery_join_backoff);
         let mut refreshed_sandbox = None;
+        let mut conflict_started = None;
         let prepared = loop {
             let current_sandbox = refreshed_sandbox.as_ref().unwrap_or(sandbox);
             let lap = match self
@@ -1332,12 +1342,30 @@ impl KubernetesSubstrate {
                     // `Conflict`, not `RestoreInFlight`, so this lap has no
                     // other sleep or deadline check — pace it inside the
                     // readiness budget and stop when the budget elapses.
-                    if tokio::time::timeout_at(
-                        join_deadline,
-                        tokio::time::sleep(join_backoff.next_delay()),
-                    )
-                    .await
-                    .is_err()
+                    // Under the dispatcher's `crate::retry_deferral` scope
+                    // (never set by HTTP callers), this is the one step that
+                    // changes: it keeps the fast first retries for
+                    // `RETRY_DEFERRAL_GRACE`, then returns `RestoreInFlight`
+                    // and records the deferral instead of holding its slot.
+                    let conflicted_for =
+                        conflict_started.get_or_insert_with(Instant::now).elapsed();
+                    let deferring = crate::retry_deferral::current().is_some();
+                    if deferring
+                        && conflicted_for >= RETRY_DEFERRAL_GRACE
+                        && crate::retry_deferral::defer_retry_wait("restore_claim_conflict")
+                    {
+                        return Err(SubstrateError::restore_in_flight(format!(
+                            "sandbox {sandbox_id} restore claim is unavailable; deferring \
+                             the retry to the caller"
+                        )));
+                    }
+                    let mut delay = join_backoff.next_delay();
+                    if deferring {
+                        delay = delay.min(RETRY_DEFERRAL_GRACE.saturating_sub(conflicted_for));
+                    }
+                    if tokio::time::timeout_at(join_deadline, tokio::time::sleep(delay))
+                        .await
+                        .is_err()
                     {
                         return Err(SubstrateError::restore_in_flight(format!(
                             "sandbox {sandbox_id} readiness budget elapsed while its restore \

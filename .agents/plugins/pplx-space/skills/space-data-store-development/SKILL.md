@@ -130,6 +130,6 @@ feature on the crate itself.
 
 Use the shared database fixtures. Nextest uses one run-scoped Postgres and
 isolated clones; direct `cargo test` can use a process-local testcontainer.
-Unavailable Postgres or Redis must fail when `SPACE_CI_REQUIRE_TEST_DEPS=1`.
-Local skips are diagnostic only, not acceptable final validation when Docker can
-be started.
+Unavailable Postgres or Redis fails the test unless the run opts out with
+`SPACE_TEST_DEPS_OPTIONAL=1`. Opted-out skips are diagnostic only, not
+acceptable final validation when Docker can be started.

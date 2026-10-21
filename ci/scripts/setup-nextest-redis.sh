@@ -3,9 +3,9 @@
 #
 # Unlike setup-nextest-postgres.sh, this script is fail-OPEN: if Docker or the
 # container can't be made ready, it exits 0 without publishing
-# SPACE_TEST_REDIS_URL. Every Redis-backed test already has its own graceful
-# path (skip without Docker, or fall back to starting its own throwaway
-# container) via pplx_space_db_test_fixtures::require_test_deps(), so this
+# SPACE_TEST_REDIS_URL. Every Redis-backed test falls back to starting its own
+# throwaway container, and fails or, opted out, skips without Docker through
+# pplx_space_db_test_fixtures::report_unavailable_dependency(), so this
 # script failing hard would take down the whole api package over an
 # optimization, not a real missing dependency. The run-scoped Postgres setup
 # stays fail-closed deliberately (see AGENTS.md); Redis does not need the same
@@ -44,7 +44,7 @@ fail_open() {
         docker rm --force "${container_id}" >/dev/null 2>&1 || true
     fi
     # No SPACE_TEST_REDIS_URL is written: tests fall back to their own
-    # graceful per-test container/skip behavior.
+    # per-test containers.
     exit 0
 }
 

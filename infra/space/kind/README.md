@@ -354,7 +354,11 @@ in-cluster (see "Seed template" below).
 release, and the guest kernel at the sha256 the installer pins (set
 `SPACE_FC_KERNEL_VERSION` and `SPACE_FC_KERNEL_SHA256` together to change it).
 A missing tree, another Firecracker release, a missing kernel or any other
-kernel is staged again, so step 2 is optional in practice. It is otherwise
+kernel is staged again, so step 2 is optional in practice. A change to the
+host tree reaches only nodes created after it: each node copies the tree on
+its first boot and keeps its copy ([The node layer](#the-node-layer)), so on
+a reused cluster the bring-up refuses nodes whose copy differs and names the
+remedy, recreating the cluster (`scripts/check-node-vendor.sh`). It is otherwise
 idempotent: it
 creates the kind cluster (if missing) with the SPACE Kind node image on the
 sandbox workers and builders (see [The node layer](#the-node-layer)), labels
@@ -929,7 +933,7 @@ and fail on the first sandbox with a healthy-looking cluster.
 
 | Knob | Default | What uses it |
 | -- | -- | -- |
-| `SPACE_VENDOR_ROOT` | `~/.space-devbox/space/vendor` | mounted at `/space/vendor` on the sandbox and builder nodes |
+| `SPACE_VENDOR_ROOT` | `~/.space-devbox/space/vendor` | mounted read-only at `/opt/space-kind/host-vendor` on the sandbox and builder nodes, each of which copies it into its own `/space/vendor` on its first boot ([The node layer](#the-node-layer)) |
 | `SPACE_KIND_DATA_ROOT` | `~/.kind-data` | mounted at `/var/lib/containerd` on every node |
 | `SPACE_KIND_PRUNE_SUPERSEDED_IMAGES` | on | `0` keeps every superseded build of SPACE's own images in the `SPACE_KIND_DATA_ROOT` stores; see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure) |
 | `SPACE_TILT_PRUNE_HOST_IMAGES` | on | `0` keeps every superseded build of SPACE's own images in the host's Docker store, under Tilt and after `bootstrap.sh`; see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure) |
@@ -1185,7 +1189,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── containerd-shim-space-v2        (runtime registered by the node image, binary installed by install-shim.sh)
 │   ├── one pod per node-service DaemonSet (release `space`):
 │   │   ├── space-node-manager        → host supervisor (root, privileged)
-│   │   ├── space-runtime-manager     (read-only list)  (space-rtmgr)
+│   │   ├── space-runtime-manager     → node-manager    (space-rtmgr)
 │   │   ├── space-volume-manager      → object store    (space-volmgr)
 │   │   ├── space-credential-manager                    (space-sbxmgr)
 │   │   ├── space-template-manager                      (space-tmplmgr)
@@ -1418,9 +1422,9 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 
 | Service | Identity | Pod shape | Why (public code) |
 |---|---|---|---|
-| node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/space/vendor`, `/dev/kvm`; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
+| node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/dev/kvm`; `/space/vendor` writable; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); creates the managed store `/space/vendor/artifacts` and publishes the runtime manager's staged releases and kernels into it (`node_artifacts.rs`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
 | runtime-supervisor | root | host systemd unit, no pod; environment from `/space/config/space.env`, which node-manager's Kind-only `kind-node-env` init container writes | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
-| runtime-manager | space-rtmgr + space-rtmgrclients | non-root, no capabilities, read-only rootfs; `/space/vendor`, `/space/bin`, `/space/cache` read-only | lists runtimes and kernels |
+| runtime-manager | space-rtmgr + SPACE_RUNTIME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/vendor` and `/space/bin` read-only, `/space/cache` HostToContainer | lists runtimes and kernels, and installs the catalog's: downloads them from the compiled sources over the pod network into its private `/space/cache/.rtmgr-staging`, then asks node-manager over its socket to publish them (`crates/libs/node/runtime/manager/server`); the account writes nothing else in the cache or the store |
 | volume-manager | space-volmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); the account `docs/installation.md` describes: node-manager's btrfs send-lease RPCs authorize it and credential-manager serves it on the volume socket |
 | credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
 | template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because its template-release reads are scoped by source address (below) |
@@ -1581,12 +1585,25 @@ DaemonSet init containers, so **UDS peer authorization (SO_PEERCRED) is live in
 this harness** — e.g. warm-pool fills are authorized as `Service(space-tmplmgr)`,
 not silently as root.
 
-The runtime manager only lists the node's Firecracker releases and kernels
-(`space-rtmgr list`): its DaemonSet starts it with `--list-only`, so it opens
-no install root; nothing depends on it yet, and it restarts on its own like
-every other service. The baseline Kind smoke checks its JSON listing on both a
-worker and a builder, requiring a complete scan with a valid vendor runtime and a
-staged cache kernel. These checks do not gate node readiness.
+The runtime manager runs as on a deployed node: it lists the node's
+Firecracker releases and kernels (`space-rtmgr list`) and installs the
+catalog's (`space-rtmgr runtimes install`, `space-rtmgr kernels install`; see
+[the catalog](../../../docs/runtime-manager-catalog.md)). An install downloads
+from Firecracker's GitHub releases or its public CI bucket over the pod
+network, checks the bytes against the compiled pins, stages them in
+`/space/cache/.rtmgr-staging`, and node-manager copies them, checked again,
+into the node's root-owned `/space/vendor/artifacts`. Nothing triggers an
+install on its own and nothing depends on one: an operator runs the CLI from
+the node's `space-node-debug` shell. Its installer needs the staging directory
+node-manager creates at startup, after preparing the store
+(`prepare_artifact_store`), and `space-cache.service` formats the cache on
+every boot; a runtime manager that starts first exits (`Installer::open`) and
+restarts on its own, as sandbox-manager does until node-manager answers.
+Execution prefers a managed copy of the compiled E0 release and kernel once one
+is installed. The baseline Kind smoke
+checks the JSON listing on both a worker and a builder, requiring a complete
+scan with a valid vendor runtime and a staged cache kernel; no suite runs an
+install. These checks do not gate node readiness.
 
 **Credential-manager.** The authority runs on the control plane as the
 `space-credmgr-authority` Deployment (`charts/space-credmgr-authority-local`,
@@ -1763,7 +1780,7 @@ asks of the hosting deployment.
 | Control-plane replicas spread across nodes | no anti-affinity or topology spread: every control-plane pod runs on the one infra node, where a spread constraint has nothing to spread over and a required anti-affinity would leave second replicas Pending |
 | space-admin-api under a PodDisruptionBudget like the public API | one replica (operator traffic only) under the same `maxUnavailable: 1` budget, so it never holds a drain and does not keep the admin surface up during one; it rolls by `Recreate`, so a rollout leaves the admin surface down while the old pod drains and the new one starts |
 | Reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_*`) prunes dead letters and asks EC2 whether a non-ready node's instance is gone | off, because a Kind bench must not call AWS: for a candidate it would sign `DescribeInstances` to the public EC2 API with the object store's keys. A reply with no live instance reads as gone; Kind's refs would be kept only because that call fails. No switch disables the EC2 detector alone, its EC2 client takes only the global `AWS_ENDPOINT_URL` (which would also redirect the controller's S3 clients), and its Postgres-only dead-letter pass runs in the same instance, so both stay off. The gone-node queue GC runs, dry-run |
-| The runtime manager installs releases and kernels, which node-manager publishes into the root-owned store `/space/vendor/artifacts` | `/space/vendor` is a read-only host bind, so the runtime manager runs `--list-only`: listing and cache checks work, installs are off |
+| The runtime manager installs releases and kernels, which node-manager publishes into the root-owned store `/space/vendor/artifacts` | the same: each sandbox worker and builder has its own root-owned `/space/vendor`, copied from the read-only host vendor tree on the node's first boot, and the runtime manager runs without `--list-only`. Until a managed E0 is installed, execution reads the baked release from `/space/bin/runtime/firecracker` (node-manager's `SPACE_FIRECRACKER_VENDOR_DIR`), the node layer's copy, rather than from `/space/vendor/firecracker`. node-manager seals execution copies with fs-verity on the execution cache `/space/cache/firecracker`, not on the store (`require_verity_api` in `stage_release_at`, `stage_sealed_kernel_at`); that cache is the node's btrfs loop image on the host's kernel, and where that kernel gives it no fs-verity node-manager logs `fs-verity unavailable` and keeps its verified legacy execution protection. No suite runs an install |
 | Operators run node-local CLIs from the node host's shell   | the same CLIs run in the Kind-only `space-node-debug` root shell DaemonSet     |
 | Release images record the CI commit as their build SHA (`ci/scripts/run-space-bundle-builds.py`) | the same from a clean worktree, as its 12-digit short form; an image the worktree's changes reach records `<commit>-dirty-<content>` instead, computed when it is built. `service.version` stays the commit read when Tilt or bootstrap started. The smoke bring-up refuses a SPACE container that does not run the latest build of its image; under `SKIP_BOOTSTRAP=1` only once Tilt has nothing pending, and it warns instead while Tilt is updating ([Build identity and provenance](#build-identity-and-provenance)) |
 | Release binaries, built without `test-hooks`              | binaries built with `test-hooks` (`docker/Dockerfile.rust-build-kind`), so smokes can shrink timers and flip scenario switches; no chart sets a hook for authentication, and the TokenReview listeners read their namespace from the ServiceAccount mount as release binaries do |
@@ -1831,7 +1848,7 @@ these units, enabled in the image:
 | `space-loop-nodes.service` | mknods loop-device nodes in the node's `/dev` (64, raised past any index in use); pods copy the node's `/dev` when they start | `max_loop=10000` (07-sysctl.sh) |
 | `space-kind-devices.service` | mode 0666 on `/dev/kvm`, `/dev/vhost-vsock`, `/dev/vhost-net` | the `kvm` group; Kind-only, never on a worker |
 | `space-cgroup.service` | `/sys/fs/cgroup/space` with `+cpu +memory +io +pids` delegated | `space-cgroup.service` (07-sysctl.sh) |
-| `space-layout.service` | the SPACE groups and service accounts; the `/space/run` skeleton and dependency-drain gates; protected Firecracker copies under `/space/bin/runtime/firecracker` and `/space/bin/{firecracker,jailer}` links; `/space/etc/sandbox.toml`; `/var/run/netns` | 07-sysctl.sh accounts and directory skeleton, 04-firecracker.sh runtime installation |
+| `space-layout.service` | the SPACE groups and service accounts; the `/space/run` skeleton and dependency-drain gates; the node's root-owned `/space/vendor`, copied from the host vendor tree on first boot; protected Firecracker copies under `/space/bin/runtime/firecracker` and `/space/bin/{firecracker,jailer}` links; `/space/etc/sandbox.toml`; `/var/run/netns` | 07-sysctl.sh accounts and directory skeleton, 04-firecracker.sh runtime installation |
 | `space-cache.service` | formats `/var/lib/space-cache.img` on every boot (sparse, 40 GiB), mounts it `nosuid,noatime` on `/space/cache` with loop autoclear and shared propagation, then creates the cache skeleton | 01-partitions.sh / 11-nvme-cache.sh |
 | `space-kind-vsock-jails.service` | long-running: mknods `/dev/vhost-vsock` into each Firecracker jail under `/space/cache/firecracker/jails` as it appears (the jailer does not) | the node image provides it; Kind-only |
 
@@ -1867,10 +1884,21 @@ build fails otherwise. Check them with
 `kubectl get --raw /api/v1/nodes/<node>/proxy/configz` and `docker exec <node>
 containerd config dump`.
 
-The vendor mount remains a read-only, developer-owned download cache. At boot,
-`space-layout.service` copies the bootstrap Firecracker 1.15.1 binaries into
-root-owned `/space/bin/runtime/firecracker`; node-manager uses this path and
-verifies the compiled binary digests before execution. Repeated boots keep the
+The host vendor tree (`SPACE_VENDOR_ROOT`) is a developer-owned download
+cache, mounted read-only at `/opt/space-kind/host-vendor` and never written. On
+a node's first boot `space-layout.service` copies it into a fresh directory,
+makes the copy root-owned and closed to group and other writes, and renames it
+to `/space/vendor`, the root-owned tree a deployed node's image bakes; the
+node's rootfs keeps it, and what node-manager publishes into
+`/space/vendor/artifacts`, across node restarts, and a changed host tree
+reaches a node only when the node is recreated. `scripts/check-node-vendor.sh`,
+which `bootstrap.sh`, the smoke harness and Tilt run on a reused cluster,
+refuses one whose nodes' copies differ from the host tree (contents and link
+targets, `artifacts/` aside). A `/space/vendor` that is a
+mount, the layout of a cluster created before this copy, fails the unit. At
+every boot the unit then copies the bootstrap Firecracker 1.15.1 binaries from
+the node's tree into root-owned `/space/bin/runtime/firecracker`; node-manager
+uses this path and verifies the compiled binary digests before execution. Repeated boots keep the
 installed files unchanged. A differing installed copy fails staging and requires
 node recreation rather than overwriting binaries that a sandbox may be using.
 The production init container still stages the guest kernel into the cache.

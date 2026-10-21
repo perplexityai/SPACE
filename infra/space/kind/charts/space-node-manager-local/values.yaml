@@ -26,6 +26,15 @@ node: {}
 # 180 s mutex wait (--service-mutex-timeout-secs default).
 terminationGracePeriodSeconds: 60
 
+# Managed artifact installs: node-manager's /space/vendor mount is writable,
+# so it creates the store /space/vendor/artifacts and publishes into it, and
+# runtime-manager runs without --list-only. Set with
+# space-runtime-manager-local's artifactInstalls.enabled; both need the node's
+# own root-owned /space/vendor, which the Kind node layer provides
+# (stage_vendor in node/space-kind-node.sh). infra/space/cluster turns it off.
+artifactInstalls:
+  enabled: true
+
 # The loop-device pool node-manager raises its node to at startup
 # (crates/libs/node/mgr/server/src/loop_devices.rs). Empty means that
 # module's floor of 64, which the node image's space-loop-nodes.service also

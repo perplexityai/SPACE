@@ -97,6 +97,16 @@ The render fails, listing every gap, unless the file supplies:
 - Both entry Services become `ClusterIP`. `entry.type` takes any Service type,
   and `nodePort` applies only to `NodePort`.
 - The Kind ECW test hosts are cleared.
+- Managed artifact installs stay off (`artifactInstalls.enabled: false` on
+  `space-node-manager-local` and `space-runtime-manager-local`). Kind turns them
+  on because its node layer gives every node its own root-owned
+  `/space/vendor`. Here node-manager mounts `/space/vendor` read-only and does
+  not create the store `/space/vendor/artifacts`, and runtime-manager runs
+  `--list-only` with a read-only `/space/cache`. On a node whose
+  `/space/vendor` is root-owned, writable by root alone and on a writable
+  filesystem, set both to `true` together; `templates/validate.yaml` refuses
+  a file that sets only one. With them on, runtime-manager exits at startup
+  until node-manager has prepared the store and its staging directory.
 
 Telemetry follows `global.observability` through the space-kind-telemetry
 helper. A chart's `telemetry.traceExporter: "off"` still vetoes its traces,

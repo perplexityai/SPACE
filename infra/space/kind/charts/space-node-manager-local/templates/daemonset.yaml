@@ -323,9 +323,15 @@ spec:
             - name: space-bin
               mountPath: /space/bin
               readOnly: true
+            # Writable with artifactInstalls.enabled: node-manager creates the
+            # managed store /space/vendor/artifacts (NODE_ARTIFACTS_DIR) at
+            # startup and publishes the releases and kernels the runtime
+            # manager staged into it (prepare_artifact_store, publish_artifact).
             - name: vendor
               mountPath: /space/vendor
+              {{- if not .Values.artifactInstalls.enabled }}
               readOnly: true
+              {{- end }}
             - name: space-etc
               mountPath: /space/etc
               readOnly: true
@@ -362,8 +368,9 @@ spec:
           hostPath:
             path: /sys/fs/cgroup
             type: Directory
-        # The Firecracker vendor tree, bind-mounted into the kind node from
-        # $SPACE_VENDOR_ROOT by kind-cluster.yaml.tmpl's extraMounts.
+        # The node's root-owned vendor tree, which the node layer seeds from
+        # $SPACE_VENDOR_ROOT on the node's first boot (stage_vendor in
+        # node/space-kind-node.sh).
         - name: vendor
           hostPath:
             path: /space/vendor

@@ -148,6 +148,35 @@ extract_verified_squashfs() (
   unsquashfs -d "${build_dir}/squashfs-root" "${image_dir}/image.squashfs"
 )
 
+# Populate through the kernel, rather than libext2fs's mke2fs -d path. In
+# particular, long symlinks must remain block-backed when inline_data is used:
+# libext2fs's inline symlinks can break fsck/resize after an xattr is added.
+populate_ext4() (
+  set -euo pipefail
+  local image="$1" source="$2" target mounted=0
+  target="$(mktemp -d)"
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap in this subshell.
+  cleanup_population() {
+    local status=$?
+    if [[ "$mounted" == 1 ]] && ! umount "$target"; then
+      echo "ERROR: cannot unmount seed staging filesystem at ${target}" >&2
+      exit 1
+    fi
+    rmdir "$target"
+    exit "$status"
+  }
+  trap cleanup_population EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  mount -t ext4 -o loop "$image" "$target"
+  mounted=1
+  tar --create --file=- --numeric-owner --xattrs --xattrs-include='*' \
+    --acls --sparse --one-file-system --directory "$source" . \
+    | tar --extract --file=- --same-owner --preserve-permissions \
+      --numeric-owner --xattrs --xattrs-include='*' --acls --overwrite \
+      --directory "$target"
+)
+
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return
 fi
@@ -811,11 +840,13 @@ echo "=== Creating ext4 image ==="
 # to the configured build disk size before installing packages.
 IMG_SIZE="1024M"
 truncate -s "$IMG_SIZE" "${OUTPUT}/rootfs.ext4"
-mkfs.ext4 -O dir_nlink,large_dir -J size=4 -m 1 -d "${CHROOT}" -F "${OUTPUT}/rootfs.ext4"
+mkfs.ext4 -O dir_nlink,large_dir -J size=4 -m 1 -F "${OUTPUT}/rootfs.ext4"
+populate_ext4 "${OUTPUT}/rootfs.ext4" "${CHROOT}"
 
 # Shrink to minimum + 100 MB headroom (SSH host keys, logs, journal)
-e2fsck -fy "${OUTPUT}/rootfs.ext4" 2>/dev/null || true
+e2fsck -fn "${OUTPUT}/rootfs.ext4"
 resize2fs -M "${OUTPUT}/rootfs.ext4"
+e2fsck -fn "${OUTPUT}/rootfs.ext4"
 # Get actual filesystem size (resize2fs -M shrinks fs but not the file)
 FS_BLOCKS=$(dumpe2fs -h "${OUTPUT}/rootfs.ext4" 2>/dev/null | awk '/Block count:/{print $NF}')
 BLOCK_SIZE=$(dumpe2fs -h "${OUTPUT}/rootfs.ext4" 2>/dev/null | awk '/Block size:/{print $NF}')
@@ -828,6 +859,7 @@ HEADROOM=$(( 100 * 1024 * 1024 ))
 TARGET_SIZE=$(( FS_SIZE + HEADROOM ))
 truncate -s "$TARGET_SIZE" "${OUTPUT}/rootfs.ext4"
 resize2fs "${OUTPUT}/rootfs.ext4"
+e2fsck -fn "${OUTPUT}/rootfs.ext4"
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
 cat > "${OUTPUT}/metadata.json" <<EOF

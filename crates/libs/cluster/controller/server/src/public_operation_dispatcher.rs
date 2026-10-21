@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -8,21 +9,23 @@ use pplx_space_api::egress_profiles::EgressProfiles;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operation_driver::{
     DEFAULT_CLAIM_STALE_AFTER, DEFAULT_M1_MAX_AGE, DEFAULT_MAX_RETRY_ATTEMPTS, DEFAULT_RETRY_AFTER,
-    OperationExecutionConfig, OperationExecutor, drive_claimed_operation, execution_span,
+    OperationExecutionConfig, OperationExecutor, claim_renewal_interval, drive_claimed_operation,
+    execution_span,
 };
 pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, TickReport};
 use pplx_space_api::public_operations::{
     ClaimPublicOperations, ClaimedPublicOperation, PublicOperationClaim,
-    PublicOperationRequeueReason, PublicOperationStore,
+    PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
     UpdateSandboxOperationExecutor,
 };
 use pplx_space_api::public_template_operations::DeleteTemplateOperationExecutor;
+use pplx_space_api::retry_deferral::RetryDeferral;
 use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
 use pplx_space_feature_flags::FeatureFlagClient;
-use pplx_space_public_api::{OperationKind, OperationState, PublicErrorCode};
+use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -44,6 +47,11 @@ const DEFAULT_CLAIM_LIMIT: u32 = 64;
 const DEFAULT_EXECUTION_CONCURRENCY: usize = 16;
 const MAX_EXECUTION_CONCURRENCY: usize = 128;
 const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
+/// How soon an operation handed back because its key is already executing
+/// in this process becomes claimable again.
+const BUSY_KEY_RETRY_AFTER: Duration = Duration::from_secs(1);
+const KEYED_CLAIM_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_KEYED_CLAIM_ENABLED";
+const RETRY_DEFERRAL_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_RETRY_DEFERRAL_ENABLED";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerConfig {
@@ -55,6 +63,11 @@ pub struct ReconcilerConfig {
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
     pub m1_max_age: Option<Duration>,
+    /// Kill switch for the keyed work queue: off restores the unkeyed claim.
+    pub keyed_claim_enabled: bool,
+    /// Kill switch for retry deferral, independent of the keyed claim: off
+    /// keeps every retry wait inside the execution's slot.
+    pub retry_deferral_enabled: bool,
 }
 
 impl Default for ReconcilerConfig {
@@ -68,6 +81,8 @@ impl Default for ReconcilerConfig {
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             m1_max_age: Some(DEFAULT_M1_MAX_AGE),
+            keyed_claim_enabled: true,
+            retry_deferral_enabled: true,
         }
     }
 }
@@ -93,9 +108,8 @@ impl ReconcilerConfig {
                 DEFAULT_CLAIM_LIMIT,
                 1024,
             ),
-            // A deployment setting, unlike the test hooks around it: each
-            // execution holds its slot for the whole operation, so this bounds
-            // the dispatcher's throughput.
+            // A deployment setting, unlike the test hooks around it: it caps
+            // operations executing at once (see `retry_deferral` for waits).
             execution_concurrency: config.bounded_usize(
                 "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
                 DEFAULT_EXECUTION_CONCURRENCY,
@@ -107,6 +121,10 @@ impl ReconcilerConfig {
             ),
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            keyed_claim_enabled: config
+                .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
+            retry_deferral_enabled: config
+                .truthy_default(RETRY_DEFERRAL_ENABLED_ENV, default.retry_deferral_enabled),
             m1_max_age: config
                 .test_optional_positive_duration_secs(
                     M1_MAX_AGE_ENV,
@@ -320,6 +338,8 @@ pub async fn run<E>(
     // so without this line an over-ceiling setting looks like it took effect.
     tracing::info!(
         execution_concurrency = config.execution_concurrency,
+        keyed_claim_enabled = config.keyed_claim_enabled,
+        retry_deferral_enabled = config.retry_deferral_enabled,
         "starting public-operation-dispatcher"
     );
 
@@ -328,38 +348,84 @@ pub async fn run<E>(
     interval.tick().await;
 
     // Executions run independently of the claim loop: a slow operation holds
-    // one of `execution_concurrency` slots but does not delay pickup of newly
-    // queued operations into the remaining slots.
+    // one of `execution_concurrency` slots but does not delay pickup into the
+    // others. `busy_keys` is this process's view of the claim's one-per-
+    // sandbox rule: a claim that would overlap a local execution of its key
+    // is handed back, beside the loop, instead of running twice.
     let concurrency = config.execution_concurrency.max(1);
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
+    let mut busy_keys: HashMap<String, OperationId> = HashMap::new();
+    let mut task_keys: HashMap<tokio::task::Id, String> = HashMap::new();
+    let mut hand_backs = JoinSet::new();
+    // Reclaiming an operation still executing here means its execution lost
+    // the claim and notices only at its next renewal. Any other collision is
+    // an execution whose result reached the store before its task returned.
+    let stale_reclaim_retry_after = claim_renewal_interval(execution_config.claim_stale_after);
     let mut last_claim_failure_warn: Option<Instant> = None;
     let mut suppressed_claim_failures: u64 = 0;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Free finished executions' slots and keys before claiming.
+                while let Some(joined) = in_flight.try_join_next_with_id() {
+                    finish_execution(joined, &mut busy_keys, &mut task_keys);
+                }
                 pplx_space_metrics::operations::dispatcher_slots(in_flight.len(), concurrency);
                 let free = concurrency.saturating_sub(in_flight.len());
                 if free == 0 {
                     continue;
                 }
+                #[cfg(test)]
+                tests::before_claim().await;
                 let started = Instant::now();
                 match claim_up_to(&config, &store, &executor, free).await {
                     Ok(claim) => {
+                        // An execution that committed while the claim ran
+                        // must not make its successor look busy.
+                        while let Some(joined) = in_flight.try_join_next_with_id() {
+                            finish_execution(joined, &mut busy_keys, &mut task_keys);
+                        }
                         let claimed = claim.operations.len();
                         for operation in claim.operations {
-                            let span = execution_span(&operation);
-                            in_flight.spawn(
-                                execute_claimed_operation(
+                            let key = config
+                                .keyed_claim_enabled
+                                .then(|| operation.work_key().map(str::to_owned))
+                                .flatten();
+                            if let Some(key) = &key
+                                && let Some(&running) = busy_keys.get(key)
+                            {
+                                let retry_after = if running == operation.id {
+                                    stale_reclaim_retry_after
+                                } else {
+                                    BUSY_KEY_RETRY_AFTER
+                                };
+                                hand_backs.spawn(hand_back_busy_key(
                                     store.clone(),
-                                    executor.clone(),
                                     claim.claim_token.clone(),
-                                    execution_config,
                                     operation,
-                                )
-                                .instrument(span),
-                            );
+                                    retry_after,
+                                ));
+                                continue;
+                            }
+                            if let Some(key) = &key {
+                                busy_keys.insert(key.clone(), operation.id);
+                            }
+                            let span = execution_span(&operation);
+                            let execution = execute_claimed_operation(
+                                store.clone(),
+                                executor.clone(),
+                                claim.claim_token.clone(),
+                                execution_config,
+                                config.retry_deferral_enabled,
+                                operation,
+                            )
+                            .instrument(span);
+                            let task = in_flight.spawn(execution);
+                            if let Some(key) = key {
+                                task_keys.insert(task.id(), key);
+                            }
                         }
                         if claimed > 0 {
                             tracing::debug!(
@@ -387,9 +453,10 @@ pub async fn run<E>(
                     }
                 }
             }
-            Some(joined) = in_flight.join_next(), if !in_flight.is_empty() => {
-                log_execution_outcome(joined);
+            Some(joined) = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
+                finish_execution(joined, &mut busy_keys, &mut task_keys);
             }
+            Some(_) = hand_backs.join_next(), if !hand_backs.is_empty() => {}
             _ = shutdown_token.cancelled() => break,
         }
     }
@@ -397,8 +464,64 @@ pub async fn run<E>(
     // Stop claiming, but let claimed executions finish and record their
     // outcome, matching the previous behavior of completing the in-progress
     // batch before exiting.
-    while let Some(joined) = in_flight.join_next().await {
-        log_execution_outcome(joined);
+    while let Some(joined) = in_flight.join_next_with_id().await {
+        finish_execution(joined, &mut busy_keys, &mut task_keys);
+    }
+    while hand_backs.join_next().await.is_some() {}
+}
+
+type ExecutionOutcome =
+    Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>;
+
+/// Frees the finished execution's key, whether it returned or panicked: a
+/// panicked execution is gone, and the claim it stopped renewing goes stale
+/// so the claim query recovers the operation in its key's order.
+fn finish_execution(
+    joined: Result<(tokio::task::Id, ExecutionOutcome), tokio::task::JoinError>,
+    busy_keys: &mut HashMap<String, OperationId>,
+    task_keys: &mut HashMap<tokio::task::Id, String>,
+) {
+    let task_id = match &joined {
+        Ok((task_id, _)) => *task_id,
+        Err(error) => error.id(),
+    };
+    if let Some(key) = task_keys.remove(&task_id) {
+        busy_keys.remove(&key);
+    }
+    log_execution_outcome(joined.map(|(_, outcome)| outcome));
+}
+
+/// Requeue an operation this process cannot start because another of its
+/// key's operations is still executing here, without charging an attempt.
+async fn hand_back_busy_key(
+    store: PublicOperationStore,
+    claim_token: String,
+    operation: ClaimedPublicOperation,
+    retry_after: Duration,
+) {
+    tracing::warn!(
+        operation_id = %operation.id,
+        kind = operation.kind.as_str(),
+        sandbox_id = operation.sandbox_id(),
+        "public-operation-dispatcher claimed an operation whose sandbox is still executing \
+         locally; handing it back"
+    );
+    if let Err(error) = store
+        .release_claimed_operation(ReleaseClaimedPublicOperation {
+            claim_token,
+            operation_id: operation.id,
+            progress_message: "waiting for an earlier operation on the same sandbox".to_owned(),
+            retry_after,
+            count_attempt: false,
+        })
+        .await
+    {
+        tracing::warn!(
+            operation_id = %operation.id,
+            error = %error,
+            "public-operation-dispatcher could not hand back a busy-key claim; \
+             it becomes claimable once the claim goes stale"
+        );
     }
 }
 
@@ -439,13 +562,16 @@ where
     let limit = u32::try_from(free_slots)
         .unwrap_or(u32::MAX)
         .min(config.claim_limit);
-    store
-        .claim_operations(ClaimPublicOperations {
-            limit,
-            claim_stale_after: config.claim_stale_after,
-            claimable_kinds: executor.supported_kinds(),
-        })
-        .await
+    let input = ClaimPublicOperations {
+        limit,
+        claim_stale_after: config.claim_stale_after,
+        claimable_kinds: executor.supported_kinds(),
+    };
+    if config.keyed_claim_enabled {
+        store.claim_operations(input).await
+    } else {
+        store.claim_operations_unkeyed(input).await
+    }
 }
 
 /// Claim one batch and run it to completion. [`run`] does not use this: it
@@ -462,13 +588,7 @@ where
 {
     use futures_util::{StreamExt, stream};
 
-    let claim = store
-        .claim_operations(ClaimPublicOperations {
-            limit: config.claim_limit,
-            claim_stale_after: config.claim_stale_after,
-            claimable_kinds: executor.supported_kinds(),
-        })
-        .await?;
+    let claim = claim_up_to(config, store, executor, usize::MAX).await?;
 
     let mut report = TickReport {
         claimed: claim.operations.len(),
@@ -483,6 +603,7 @@ where
             executor.clone(),
             claim.claim_token.clone(),
             execution_config,
+            config.retry_deferral_enabled,
             operation,
         )
         .instrument(span)
@@ -501,6 +622,7 @@ async fn execute_claimed_operation<E>(
     executor: E,
     claim_token: String,
     config: OperationExecutionConfig,
+    defer_retry_waits: bool,
     operation: ClaimedPublicOperation,
 ) -> Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>
 where
@@ -508,6 +630,13 @@ where
 {
     let execution_claim_token = claim_token.clone();
     let execution_operation = operation.clone();
+    let deferral = defer_retry_waits.then(RetryDeferral::new);
+    let recorded = deferral.clone();
+    let execution = pplx_space_api::retry_deferral::scope(deferral, async move {
+        executor
+            .execute(&execution_claim_token, execution_operation)
+            .await
+    });
     drive_claimed_operation(
         store,
         claim_token,
@@ -515,9 +644,16 @@ where
         operation,
         OperationExecutor::Dispatcher,
         async move {
-            executor
-                .execute(&execution_claim_token, execution_operation)
-                .await
+            let mut result = execution.await;
+            // A transient retry after a step handed its wait back is the
+            // deferral; other requeue reasons keep their own accounting.
+            if result.state == OperationState::Queued
+                && result.requeue_reason == PublicOperationRequeueReason::TransientFailure
+                && recorded.as_ref().is_some_and(RetryDeferral::deferred)
+            {
+                result.requeue_reason = PublicOperationRequeueReason::RetryDeferred;
+            }
+            result
         },
     )
     .await

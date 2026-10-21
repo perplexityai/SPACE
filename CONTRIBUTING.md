@@ -68,6 +68,32 @@ its reason; do not exclude whole files or test directories.
 These checks cover staged changes, not history; review surrounding staged content
 because diff scans can miss edits inside existing multiline keys.
 
+## Run the tests
+
+Tests that need Postgres or Redis start them in Docker, so run them with a
+reachable Docker daemon. `cargo nextest run` starts one shared Postgres and
+Redis per run through the setup scripts in [.config/nextest.toml](.config/nextest.toml);
+build `cargo build -p pplx-space-db-test-fixtures --bin space-nextest-postgres-setup`
+first when you select packages with `-p`. Other runners start a container per
+test. `ci/scripts/run-python-tests.sh` starts the Postgres the Python tests use.
+
+These dependencies are required: when one is unavailable, each test that needs
+it fails and names it. To run without them, set `SPACE_TEST_DEPS_OPTIONAL=1`;
+those tests then skip, each printing a `SPACE-TEST-DEP-SKIP:` line, and validate
+nothing. Opted out, `cargo nextest run` and `ci/scripts/run-python-tests.sh`
+also start no Postgres when Docker is not reachable, and say so with the same
+marker. A few Rust tests use fixtures that never skip, such as `pg_test_db`,
+and fail even then.
+
+CI sets `SPACE_CI_REQUIRE_TEST_DEPS=1`, which overrides the opt-out. Don't set
+that variable yourself: the fixtures still read it set to empty or `0` as
+optional, for older callers, but the NoCoW host-filesystem tests treat any
+value of it as a CI run and fail without their fixture.
+
+Tests that need root or a disposable host filesystem have their own opt-ins,
+which this does not turn on; see "Privileged tests and the CI host" in
+[docs/rust/space-conventions.md](docs/rust/space-conventions.md).
+
 ## Submit a pull request
 
 Keep the change focused and link the relevant issue when there is one. In the

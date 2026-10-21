@@ -141,7 +141,14 @@ rejects the Kind value itself.
 {{- end -}}
 {{- end -}}
 {{- if $v.nodeServices.enabled -}}
-{{- $snap := ((index $v "space-sandbox-manager-local" | default dict).snapshots | default dict) -}}
+{{- /* Installs need both halves: runtime-manager without --list-only exits
+       at startup unless node-manager prepared the store and its staging. */ -}}
+{{- $nmInstalls := ((index $v "space-node-manager-local" | default dict).artifactInstalls | default dict).enabled -}}
+{{- $rtInstalls := ((index $v "space-runtime-manager-local" | default dict).artifactInstalls | default dict).enabled -}}
+{{- if ne (toString $nmInstalls) (toString $rtInstalls) -}}
+{{- $fail = append $fail "space-node-manager-local.artifactInstalls.enabled and space-runtime-manager-local.artifactInstalls.enabled must be the same" -}}
+{{- end -}}
+{{- $snap :=((index $v "space-sandbox-manager-local" | default dict).snapshots | default dict) -}}
 {{- if or (not $snap.endpoint) (eq (toString $snap.endpoint) "http://object-store:8333") -}}
 {{- $fail = append $fail "space-sandbox-manager-local.snapshots.endpoint is required (the Kind object store is not installed)" -}}
 {{- end -}}

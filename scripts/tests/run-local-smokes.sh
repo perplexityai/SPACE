@@ -328,10 +328,20 @@ run_s3_roundtrip() {
   # authority rightly refuses its made-up subject and key. The typed
   # scenarios cover the exchanged path instead: local.storage_exchange_scoping
   # and every suspend/restore.
-  local static_key
-  static_key="$(kubectl --context "$KCTX" -n "$NS" get daemonset space-volume-manager \
+  # A failed read is a failure, as the lookups above treat theirs; only an
+  # absent variable means the worker exchanges its credentials. stderr goes to
+  # its own file so a kubectl warning cannot read as a key.
+  local static_key static_key_err="$RESULTS_DIR/s3-roundtrip.mode-read.err"
+  if ! static_key="$(kubectl --context "$KCTX" -n "$NS" get daemonset space-volume-manager \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="volume-manager")].env[?(@.name=="SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID")].name}' \
-    2>/dev/null || true)"
+    2>"$static_key_err")"; then
+    printf 'FAIL  %-14s :: could not read the worker volume-manager DaemonSet: %s\n' \
+      "s3-roundtrip" "$(tr '\n' ' ' <"$static_key_err")"
+    rm -f "$static_key_err"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+  rm -f "$static_key_err"
   if [[ -z "$static_key" ]]; then
     printf 'SKIP  %-14s :: worker volume-manager exchanges its object-store credentials, which the authority vends only for a real sandbox'"'"'s snapshot keys (run with SPACE_KIND_STORAGE_CREDENTIALS=static, or see local.storage_exchange_scoping)\n' "s3-roundtrip"
     return
