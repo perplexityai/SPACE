@@ -453,6 +453,24 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone, so a serde derive that only compiles through feature
+    # unification with common-core's dependents fails here.
+    echo "--- :rust: Running isolated content-digest clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-content-digest \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-content-digest \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching

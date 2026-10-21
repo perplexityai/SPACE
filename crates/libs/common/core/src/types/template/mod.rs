@@ -39,7 +39,6 @@
 mod build;
 mod desired_state;
 mod digest;
-mod hash;
 mod identity;
 #[cfg(feature = "serde")]
 mod manifest;
@@ -48,6 +47,8 @@ mod metadata;
 mod reference;
 mod system;
 mod visibility;
+
+use pplx_space_content_digest as hash;
 
 pub use build::{
     Arch, ArchParseError, BuildRunId, BuildRunIdParseError, OwnerType, TemplateBuildId,

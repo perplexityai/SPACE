@@ -1,3 +1,12 @@
+//! Algorithm-typed content digests: [`HashAlg`], [`Digest`], short
+//! [`DigestPrefix`]es and the generic [`ContentHash`] wrapper, with their parse
+//! errors and prefix-length constants.
+//!
+//! These are generic digest values; the template-specific wrappers live in
+//! `pplx-space-common-core`, which also re-exports these types at their former
+//! paths. Template, execution, object-store and archive code all name them, so
+//! they live in their own crate rather than in common-core's template module.
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -9,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::HashAlg;
+/// # use pplx_space_content_digest::HashAlg;
 /// assert_eq!(HashAlg::Sha256.to_string(), "sha256");
 /// ```
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -38,7 +47,7 @@ pub const MIN_DIGEST_PREFIX_HEX_LEN: usize = 12;
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::HashAlg;
+/// # use pplx_space_content_digest::HashAlg;
 /// assert_eq!(HashAlg::from_str("sha256").unwrap(), HashAlg::Sha256);
 /// assert!(HashAlg::from_str("sha512").is_err());
 /// ```
@@ -52,7 +61,7 @@ impl HashAlg {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::HashAlg;
+    /// # use pplx_space_content_digest::HashAlg;
     /// assert_eq!(HashAlg::parse("sha256").unwrap(), HashAlg::Sha256);
     /// ```
     pub fn parse(value: &str) -> Result<Self, HashAlgParseError> {
@@ -118,7 +127,7 @@ impl From<HashAlg> for String {
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::Digest;
+/// # use pplx_space_content_digest::Digest;
 /// assert!(Digest::from_str("sha256:not-hex").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -268,7 +277,7 @@ impl From<DigestPrefix> for String {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::{Digest, HashAlg};
+/// # use pplx_space_content_digest::{Digest, HashAlg};
 /// let digest = Digest::sha256([0xab; 32]);
 /// assert_eq!(digest.algorithm(), HashAlg::Sha256);
 /// assert!(digest.to_string().starts_with("sha256:"));
@@ -287,7 +296,7 @@ impl Digest {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::Digest;
+    /// # use pplx_space_content_digest::Digest;
     /// let digest = Digest::sha256([0xab; 32]);
     /// assert_eq!(digest.to_string().len(), "sha256:".len() + 64);
     /// ```
@@ -305,7 +314,7 @@ impl Digest {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{Digest, HashAlg};
+    /// # use pplx_space_content_digest::{Digest, HashAlg};
     /// let digest = Digest::sha256([0xab; 32]);
     /// assert_eq!(digest.algorithm(), HashAlg::Sha256);
     /// ```
@@ -428,14 +437,14 @@ impl From<Digest> for String {
 
 /// Generic content-addressed hash.
 ///
-/// Prefer [`TemplateIndexDigest`] or [`TemplateArtifactDigest`] when the digest's
+/// Prefer `TemplateIndexDigest` or `TemplateArtifactDigest` when the digest's
 /// role is known. This wrapper remains useful for storage code and existing
 /// template-manager paths that only need a generic digest.
 ///
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::{ContentHash, Digest};
+/// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
 /// assert!(hash.to_string().starts_with("sha256:"));
 /// ```
@@ -450,7 +459,7 @@ impl ContentHash {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{ContentHash, Digest};
+    /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let digest = Digest::sha256([0xab; 32]);
     /// assert_eq!(ContentHash::new(digest).digest(), digest);
     /// ```
@@ -463,7 +472,7 @@ impl ContentHash {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{ContentHash, Digest};
+    /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let digest = Digest::sha256([0xab; 32]);
     /// let hash = ContentHash::new(digest);
     /// assert_eq!(hash.digest(), digest);
@@ -511,7 +520,7 @@ impl FromStr for ContentHash {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::ContentHash;
+    /// # use pplx_space_content_digest::ContentHash;
     /// let hex = "ab".repeat(32);
     /// let bare: ContentHash = hex.parse().unwrap();
     /// let prefixed: ContentHash = format!("sha256:{hex}").parse().unwrap();

@@ -96,6 +96,7 @@ members = [
     "crates/libs/common/proto-build",
     "crates/libs/common/work-coalescer",
     "crates/libs/common/svc",
+    "crates/libs/content-digest",
     "crates/libs/data/plane/server",
     "crates/libs/db-test-fixtures",
     "crates/libs/db/migrator",
@@ -314,6 +315,7 @@ pplx-space-common-lru-reaper = { path = "crates/libs/common/lru-reaper" }
 pplx-space-common-proto-build = { path = "crates/libs/common/proto-build" }
 pplx-space-common-svc = { path = "crates/libs/common/svc", default-features = false }
 pplx-space-common-work-coalescer = { path = "crates/libs/common/work-coalescer" }
+pplx-space-content-digest = { path = "crates/libs/content-digest" }
 pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
 pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }
