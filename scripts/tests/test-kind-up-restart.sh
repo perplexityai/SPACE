@@ -12,8 +12,14 @@
 #   3. A run whose settings up.sh or the bring-up would refuse (an invalid
 #      storage mode, parallelism or timeout) leaves the running Tilt running:
 #      the refusal comes before the stop, not after it.
+#   4. So does a reused cluster whose nodes' vendor copies differ from the host
+#      vendor tree, including when they differ only from the tree this run
+#      stages (a kernel whose pin changed): check-node-vendor.sh runs, for
+#      real, before the stop and after the staging.
 #
-# External commands are PATH stubs. The running Tilt is a real process renamed
+# External commands are PATH stubs, and up.sh runs from a shadow of the
+# checkout whose vendor installer and other cluster checks are stubs too; those
+# have their own tests. The running Tilt is a real process renamed
 # `tilt up`, so up.sh reads its environment from /proc as it would a real
 # watcher's, and the stop really signals it — and only it: `pgrep`, `lsof` and
 # `curl` report nothing but that process. Each run is ended right after the
@@ -59,9 +65,31 @@ bin="$work/bin"
 mkdir -p "$bin" "$work/home"
 stub() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$bin/$1"; chmod +x "$bin/$1"; }
 tilt_pidfile="$work/fake-tilt.pid"
-stub docker 'exit 0'
-stub kind 'exit 0'                       # no clusters
-stub kubectl 'exit 99'
+# The cluster exists only while $work/cluster does. Its nodes carry every
+# mount the rendered config declares, so the mount check passes, and their
+# vendor copies differ from the host tree when $work/drift exists, or when
+# $work/stale-pin does and this run has restaged the tree ($work/restaged).
+vendor_root="$work/home/.space-devbox/space/vendor"
+data_root="$work/home/.kind-data"
+stub docker "case \"\$*\" in
+  'ps -a '*) [[ -e '$work/cluster' ]] && printf 'space-local-worker\\nspace-local-builder\\n' ;;
+  inspect*)
+    for n in control-plane worker1 worker2 worker3 builder builder2; do
+      echo \"/var/lib/containerd $data_root/\$n/containerd\"
+    done
+    for n in 1 2 3 4; do echo '/opt/space-kind/host-vendor $vendor_root'; echo '/dev/kvm /dev/kvm'; done ;;
+  'exec '*' diff '*)
+    if [[ -e '$work/drift' || ( -e '$work/stale-pin' && -e '$work/restaged' ) ]]; then
+      echo 'Files /opt/space-kind/host-vendor/vmlinux and /space/vendor/vmlinux differ'
+      exit 1
+    fi ;;
+esac
+exit 0"
+stub kind "[[ \"\$*\" == 'get clusters' && -e '$work/cluster' ]] && echo space-local; exit 0"
+stub kubectl "case \"\$*\" in
+  *' get nodes '*) [[ -e '$work/cluster' ]] && printf 'space-local-worker\\nspace-local-builder\\n' ;;
+  *) exit 99 ;;
+esac"
 stub openssl 'exit 0'
 stub jq 'exit 0'
 stub helm '[[ "$*" == "version --short" ]] && echo v3.15.4; exit 0'
@@ -80,6 +108,39 @@ stub tilt 'case "$*" in
 esac'
 
 base_env=(PATH="$bin:$PATH" HOME="$work/home" SPACE_KIND_MIN_FREE_GIB=0)
+
+# A shadow of the checkout: every entry a symlink to the real one, except the
+# Kind scripts directory, whose entries are symlinks too but can be replaced.
+shadow="$work/checkout"
+shadow_dir() {
+    local rel="$1" real="$repo_root" here="$shadow" part entry name parts
+    IFS=/ read -r -a parts <<<"$rel"
+    for part in "${parts[@]}" ""; do
+        mkdir -p "$here"
+        for entry in "$real"/* "$real"/.[!.]*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            name="${entry##*/}"
+            [[ "$name" == "$part" ]] || ln -s "$entry" "$here/$name"
+        done
+        [[ -n "$part" ]] || break
+        real="$real/$part"
+        here="$here/$part"
+    done
+}
+shadow_dir infra/space/kind/scripts
+shadow_stub() {
+    rm -f "$shadow/infra/space/kind/scripts/$1"
+    printf '#!/usr/bin/env bash\n%s\n' "$2" >"$shadow/infra/space/kind/scripts/$1"
+}
+# The tree is staged unless the pin changed and this run has not restaged it.
+shadow_stub install-fc-vendor.sh "if [[ \"\${1:-}\" == --check ]]; then
+  [[ ! -e '$work/stale-pin' || -e '$work/restaged' ]]
+else
+  touch '$work/restaged'
+fi"
+for check in check-postgres-data.sh check-object-store-transition.sh check-kind-node-image.sh check-node-layout.sh; do
+    shadow_stub "$check" 'exit 0'
+done
 
 # up_case NAME EXPECT "TILT_ENV ..." "RUN_ENV ..." — EXPECT is restart, reuse
 # or refuse. Starts a fake Tilt with TILT_ENV, runs up.sh with RUN_ENV.
@@ -100,7 +161,7 @@ up_case() {
     local out="$work/$name.out" rc=0
     env -i "${base_env[@]}" SPACE_TILT_PIDFILE="$work/tilt.pid" SPACE_TILT_STATE_DIR="$work/state" \
         ${run_env[@]+"${run_env[@]}"} \
-        bash "$repo_root/infra/space/kind/scripts/up.sh" >"$out" 2>&1 || rc=$?
+        bash "$shadow/infra/space/kind/scripts/up.sh" >"$out" 2>&1 || rc=$?
     sleep 0.2
     (( rc != 0 )) || fail "$name: the stubbed run must end at the port-owner refusal" "$(cat "$out")"
     case "$expect" in
@@ -146,7 +207,25 @@ up_case invalid-storage-mode refuse "" "SPACE_KIND_STORAGE_CREDENTIALS=bogus"
 up_case invalid-parallelism refuse "" "SPACE_TILT_MAX_PARALLEL_UPDATES=many"
 up_case invalid-timeout refuse "" "SPACE_BOOTSTRAP_TIMEOUT=30m SPACE_KIND_TELEMETRY_MODE=otel"
 
+# 4: so does a reused cluster whose nodes' vendor copies differ.
+vendor_case() {
+    local name="$1"
+    shift
+    rm -f "$work/cluster" "$work/drift" "$work/stale-pin" "$work/restaged"
+    touch "$@"
+    up_case "$name" refuse "" "SPACE_KIND_DATADOG_MODE=fakeintake"
+    grep -q "\[check-node-vendor\] ERROR: kind cluster space-local has SPACE nodes" "$work/$name.out" \
+        || fail "$name: the refusal must be check-node-vendor.sh's" "$(cat "$work/$name.out")"
+    rm -f "$work/cluster" "$work/drift" "$work/stale-pin" "$work/restaged"
+}
+vendor_case vendor-copy-differs "$work/cluster" "$work/drift"
+vendor_case vendor-pin-changed "$work/cluster" "$work/stale-pin"
+# Non-vacuity: the same reused cluster with matching copies is restarted.
+touch "$work/cluster"
+up_case vendor-copy-matches restart "" "SPACE_KIND_DATADOG_MODE=fakeintake"
+rm -f "$work/cluster"
+
 if [ "$status" -eq 0 ]; then
-    echo "ok: up.sh restarts Tilt only for a changed setting Tilt reads, and refuses invalid settings before stopping it"
+    echo "ok: up.sh restarts Tilt only for a changed setting Tilt reads, and refuses invalid settings and a reused cluster's drifted vendor copies before stopping it"
 fi
 exit "$status"

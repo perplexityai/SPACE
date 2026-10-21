@@ -1234,14 +1234,7 @@ bootstrap_kind_stack__prepare_cluster() {
     kind_stack_config="$(mktemp "${TMPDIR:-/tmp}/kind-cluster-bringup.XXXXXX")"
     kind_render_cluster_config \
         "$REPO_ROOT/infra/space/kind/kind-cluster.yaml.tmpl" "$kind_stack_config"
-    # Staged unless the tree already holds this Firecracker release and the
-    # pinned guest kernel.
-    if ! SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
-        bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh" --check; then
-        echo "[bootstrap] staging Firecracker vendor tree → $SPACE_VENDOR_ROOT"
-        SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
-            bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh"
-    fi
+    kind_stack_stage_vendor
 
     if ! kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
         # Creates the containerd-storage dirs (a clean box has none until the
@@ -1284,8 +1277,25 @@ bootstrap_kind_stack__prepare_cluster() {
     fi
 }
 
-# The refusals an existing cluster can earn before Tilt (re)starts on it.
-# Exits on a refusal; nothing to check when there is no cluster.
+# Stage the Firecracker vendor tree the cluster bind-mounts, unless it already
+# holds this Firecracker release and the pinned guest kernel
+# (`install-fc-vendor.sh --check`). Before `kind create`, which refuses a
+# missing tree, and before the existing-cluster refusals below, which compare
+# each node's copy with the tree this run stages.
+kind_stack_stage_vendor() {
+    # shellcheck source=../../../infra/space/kind/scripts/lib/kind-host-paths.sh
+    source "$REPO_ROOT/infra/space/kind/scripts/lib/kind-host-paths.sh"
+    if ! SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
+        bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh" --check; then
+        echo "[bootstrap] staging Firecracker vendor tree → $SPACE_VENDOR_ROOT"
+        SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
+            bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh"
+    fi
+}
+
+# The refusals an existing cluster can earn before Tilt (re)starts on it, once
+# the vendor tree is staged (`kind_stack_stage_vendor`). Exits on a refusal;
+# nothing to check when there is no cluster.
 kind_stack_assert_existing_cluster() {
     kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
     # Before Tilt (re)starts and applies the versitygw charts: a cluster
@@ -1294,6 +1304,12 @@ kind_stack_assert_existing_cluster() {
         "$KIND_CLUSTER" || exit 1
     # SPACE nodes get their node layer from their image, fixed at create.
     bash "$REPO_ROOT/infra/space/kind/scripts/check-kind-node-image.sh" \
+        "$KIND_CLUSTER" || exit 1
+    # Each of those nodes copied the host vendor tree on its first boot and
+    # keeps that copy, so a host tree changed since (kind_stack_stage_vendor
+    # replaces a kernel whose pin changed) would never reach it. The mount
+    # check makes the same comparison, but before this run stages the tree.
+    bash "$REPO_ROOT/infra/space/kind/scripts/check-node-vendor.sh" \
         "$KIND_CLUSTER" || exit 1
     # A cluster still running one node-stack pod per node has to be
     # recreated before the per-service node DaemonSets land beside it.

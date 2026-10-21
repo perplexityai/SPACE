@@ -42,7 +42,9 @@ default, plus the optional AWS credentials when storage credentials are
 `static`. Nothing else restarts it, so a refreshed AWS session token in the
 default mode keeps the running Tilt. Before stopping it, `up.sh` checks its own
 refusals (the timeout, storage mode and parallelism, and the cluster's mounts,
-layout and Postgres data); a refusal at Tiltfile load is not pre-checked. Tilt's log
+node image, layout, Postgres data and nodes' vendor copies, after staging the
+vendor tree as the bring-up does); a refusal at Tiltfile load is not
+pre-checked. Tilt's log
 is `~/.space-devbox/kind/tilt-space-local.log`, its pid is in
 `~/.space-devbox/kind/tilt-space-local.pid`, and `teardown.sh` stops it.
 
@@ -2011,7 +2013,8 @@ to `/space/vendor`, the root-owned tree a deployed node's image bakes; the
 node's rootfs keeps it, and what node-manager publishes into
 `/space/vendor/artifacts`, across node restarts, and a changed host tree
 reaches a node only when the node is recreated. `scripts/check-node-vendor.sh`,
-which `bootstrap.sh`, the smoke harness and Tilt run on a reused cluster,
+which `up.sh` (before it stops a running Tilt), the smoke harness and Tilt
+run on a reused cluster,
 refuses one whose nodes' copies differ from the host tree (contents and link
 targets, `artifacts/` aside). A `/space/vendor` that is a
 mount, the layout of a cluster created before this copy, fails the unit. At

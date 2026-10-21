@@ -16,10 +16,11 @@
 # or was started with other values of the settings listed in TILT_SETTINGS
 # below, since Tilt reads those once, at start. Before a running Tilt is
 # stopped, this run's own refusals are checked: the timeout, storage mode and
-# parallelism, and the cluster's mounts, layout and data (assert_restartable);
-# the Tiltfile's load-time refusals are not, and would leave no watcher. Tilt
-# keeps running afterwards and redeploys whatever changes in the checkout;
-# teardown.sh stops it.
+# parallelism, and the cluster's mounts, node image, layout, data and the
+# nodes' vendor copies, against the vendor tree this run stages
+# (assert_restartable); the Tiltfile's load-time refusals are not, and would
+# leave no watcher. Tilt keeps running afterwards and redeploys whatever
+# changes in the checkout; teardown.sh stops it.
 #
 # Usage:
 #   bash infra/space/kind/scripts/up.sh
@@ -182,6 +183,9 @@ assert_restartable() {
     || die "SPACE_TILT_MAX_PARALLEL_UPDATES must be a positive integer"
   kind_stack_assert_cluster_mounts
   kind_stack_assert_postgres_data
+  # As the bring-up does, so the nodes' vendor copies are compared with the
+  # tree this run would stage, not the one it would replace.
+  kind_stack_stage_vendor
   kind_stack_assert_existing_cluster
 }
 
