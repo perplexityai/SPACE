@@ -56,6 +56,10 @@ enum ControllerErrorKind {
     /// which blames the sandbox fleet for a Postgres lock race and puts the
     /// wrong `origin` on the response metrics.
     LockContention,
+    /// A DELETE refused because a suspend's snapshot upload is still in
+    /// flight. Carried so the native delete executor can wait for the upload
+    /// to finalize instead of failing the operation.
+    SuspendUploadInFlight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +295,16 @@ impl ControllerError {
 
     pub(crate) const fn is_sandbox_already_exists(&self) -> bool {
         matches!(self.kind, ControllerErrorKind::SandboxAlreadyExists)
+    }
+
+    pub(crate) fn suspend_upload_in_flight(message: impl Into<String>) -> Self {
+        let mut error = Self::conflict(message);
+        error.kind = ControllerErrorKind::SuspendUploadInFlight;
+        error
+    }
+
+    pub(crate) const fn is_suspend_upload_in_flight(&self) -> bool {
+        matches!(self.kind, ControllerErrorKind::SuspendUploadInFlight)
     }
 
     pub fn precondition_failed(message: impl Into<String>) -> Self {

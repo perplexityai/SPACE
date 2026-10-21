@@ -32,6 +32,9 @@ use crate::public_operations::{ApiProduct, ClaimedPublicOperation, PublicOperati
 use crate::public_sandbox_projection::public_lifecycle_state as project_public_lifecycle_state;
 
 const CREATE_RETRY_AFTER: Duration = Duration::from_secs(5);
+/// How soon a native delete held off by a suspend's snapshot upload checks
+/// again. The operation's M1 deadline bounds the whole wait.
+const SUSPEND_UPLOAD_RETRY_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -971,9 +974,29 @@ impl SandboxLifecycleExecutionError {
                     CREATE_RETRY_AFTER,
                 )
             }
+            Self::Controller(error) if waits_for_suspend_upload(operation, &error) => {
+                PublicOperationExecutionResult::workflow_progress(
+                    "waiting for the suspend-snapshot upload to finalize before deleting",
+                    SUSPEND_UPLOAD_RETRY_AFTER,
+                )
+            }
             Self::Controller(error) => controller_error_result(operation, error),
         }
     }
+}
+
+/// Whether a delete refused for an in-flight suspend-snapshot upload requeues
+/// until the upload finalizes. A failed operation is immutable and an
+/// Idempotency-Key replay returns it, so a terminal conflict would leave a
+/// native caller's cleanup delete failed for the key's lifetime.
+///
+/// Only native requests qualify: they always carry an actor, and their M1
+/// deadline bounds the wait. ECW deletes carry no actor and keep their 409;
+/// admin deletes have no deadline and keep theirs too.
+fn waits_for_suspend_upload(operation: &ClaimedPublicOperation, error: &ControllerError) -> bool {
+    error.is_suspend_upload_in_flight()
+        && operation.api_product == ApiProduct::Native
+        && operation.actor_user_id.is_some()
 }
 
 #[derive(Debug, thiserror::Error)]

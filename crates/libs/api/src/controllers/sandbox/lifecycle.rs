@@ -120,7 +120,7 @@ fn is_retryable_finalize_sandbox_db_delete_error(err: &sqlx::Error) -> bool {
 /// pre-flight check (before runtime teardown) and at the locked
 /// check inside the finalize transaction.
 fn in_flight_suspend_upload_conflict() -> ControllerError {
-    ControllerError::conflict(
+    ControllerError::suspend_upload_in_flight(
         "sandbox has a suspend-snapshot upload in flight; \
          retry the DELETE after the snapshot finalizes",
     )

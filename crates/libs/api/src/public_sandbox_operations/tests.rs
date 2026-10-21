@@ -1219,3 +1219,130 @@ async fn admitted_create_re_execution_after_success_does_not_create_again() -> T
     );
     Ok(())
 }
+
+fn claimed_delete_operation(
+    sandbox_id: SandboxId,
+    org_id: OrgId,
+    actor_user_id: Option<UserId>,
+    api_product: ApiProduct,
+) -> ClaimedPublicOperation {
+    let public_sandbox_id = PublicSandboxId::from(sandbox_id);
+    ClaimedPublicOperation {
+        id: OperationId::new(),
+        org_id,
+        actor_user_id,
+        api_product,
+        kind: OperationKind::DeleteSandbox,
+        target_type: Some(OperationTargetType::Sandbox),
+        target_id: Some(public_sandbox_id.to_string()),
+        payload: serde_json::to_value(SandboxLifecycleOperationPayload {
+            sandbox_id: public_sandbox_id,
+            action: SandboxLifecycleAction::Delete,
+            rollback: None,
+        })
+        .expect("delete payload serializes"),
+        attempts: 1,
+        claim_generation: 1,
+        traceparent: None,
+    }
+}
+
+/// Only a native request's delete waits out a suspend-snapshot upload. An ECW
+/// delete (no actor) and an admin delete (no M1 deadline) keep the terminal
+/// conflict, as does any other conflict on a native delete.
+#[test]
+fn only_native_deletes_wait_for_an_in_flight_suspend_upload() {
+    let sandbox_id = SandboxId::new();
+    let org_id = OrgId::new();
+    let upload = || ControllerError::suspend_upload_in_flight("upload in flight");
+    let other = || ControllerError::conflict("sandbox has a fork operation in progress");
+    let actor = Some(UserId::new());
+    let cases = [
+        ("native", actor, ApiProduct::Native, upload(), true),
+        ("ecw", None, ApiProduct::Native, upload(), false),
+        ("admin", actor, ApiProduct::Admin, upload(), false),
+        ("other conflict", actor, ApiProduct::Native, other(), false),
+    ];
+    for (name, actor, api_product, error, waits) in cases {
+        let operation = claimed_delete_operation(sandbox_id, org_id, actor, api_product);
+        let result = SandboxLifecycleExecutionError::Controller(error).into_result(&operation);
+        if waits {
+            assert_eq!(result.state, OperationState::Queued, "{name}");
+            assert_eq!(
+                result.requeue_reason,
+                PublicOperationRequeueReason::WorkflowProgress,
+                "{name}: waiting for the upload must not spend the retry budget"
+            );
+            assert_eq!(
+                result.retry_after,
+                Some(SUSPEND_UPLOAD_RETRY_AFTER),
+                "{name}"
+            );
+        } else {
+            assert_eq!(result.state, OperationState::Failed, "{name}");
+            assert_eq!(
+                result.terminal_error_code,
+                Some(PublicErrorCode::Conflict),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// A native delete that arrives while a suspend's snapshot upload is in flight
+/// requeues without touching the sandbox, then deletes it once the upload
+/// finalizes.
+#[tokio::test]
+async fn native_delete_requeues_behind_an_in_flight_suspend_upload() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation
+         )
+         VALUES ($1, $2, $3, 'space', 'suspended', 'on_node', 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(user_id)
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    let snapshot_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state)
+         VALUES ($1, $2, 'full', 'creating')"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    let operation = claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native);
+
+    let waiting = executor.execute(&operation).await;
+    assert_eq!(waiting.state, OperationState::Queued);
+    assert_eq!(
+        waiting.requeue_reason,
+        PublicOperationRequeueReason::WorkflowProgress
+    );
+    assert_eq!(waiting.retry_after, Some(SUSPEND_UPLOAD_RETRY_AFTER));
+    let sandbox = fetch_sandbox(&db.pool, sandbox_id)
+        .await?
+        .expect("the sandbox survives while its upload is in flight");
+    assert_eq!(sandbox.lifecycle, "suspended");
+
+    sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+        .bind(snapshot_id)
+        .execute(&db.pool)
+        .await?;
+    let finished = executor.execute(&operation).await;
+    assert_eq!(finished.state, OperationState::Succeeded);
+    assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_none());
+    Ok(())
+}
