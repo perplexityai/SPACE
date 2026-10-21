@@ -8,6 +8,25 @@ published seed release.
 
 ## Build and publish system templates
 
+Seed formatting creates an empty ext4 filesystem, then loop-mounts it and
+populates it through the kernel using GNU tar. The copy preserves numeric
+ownership, modes, hard links, sparse files, ACLs and extended attributes
+(including file capabilities). The image must unmount successfully before
+read-only fsck validation, minimum-size compaction and headroom expansion;
+each stage requires fsck exit status zero rather than repairing errors.
+
+This avoids the long-inline-symlink population path in `mke2fs -d` implicated
+in [e2fsprogs #295](https://github.com/tytso/e2fsprogs/issues/295). It does not
+enable the seed's `inline_data` feature: that is a separate image-policy
+change. The component regression exercises both feature settings, including
+the symlink/xattr case and metadata preservation after shrink and expansion.
+On a disposable Linux environment with root loop-mount access, GNU tar,
+e2fsprogs, `attr`, `acl` and `libcap2-bin`, run:
+
+```bash
+bash scripts/tests/test-seed-ext4-population.sh
+```
+
 Install the CLI from the same source version as the deployment:
 
 ```bash

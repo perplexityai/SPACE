@@ -307,7 +307,7 @@ jobs:
           # run as the image's unprivileged user, with no Docker socket and no
           # host network; the runner starts their Postgres and Redis. The
           # privileged group then runs as root from the same build, in the
-          # "Run the privileged Rust tests" step. See .config/nextest.toml.
+          # "Run privileged filesystem and Rust tests" step. See .config/nextest.toml.
           - name: Rust tests
             command: bash ci/scripts/run-rust-checks.sh tests-unprivileged
             # The full all-targets/all-features graph exhausts the standard
@@ -781,7 +781,7 @@ jobs:
       # without compiling; the script returns anything it creates as root to
       # the runner user. No host network: the setup scripts and testcontainers
       # reach their containers on the bridge network.
-      - name: Run the privileged Rust tests
+      - name: Run privileged filesystem and Rust tests
         if: >-
           !cancelled() && matrix.privileged_tests == true &&
           (steps.run.outcome == 'success' || steps.run.outcome == 'failure')
@@ -809,7 +809,11 @@ jobs:
             docker_args+=(--env SPACE_CI_MAIN_ONLY_TESTS=1)
           fi
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
-            bash -c 'git config --global --add safe.directory /workspace && exec bash ci/scripts/with-nocow-test-filesystem.sh bash ci/scripts/run-rust-checks.sh tests-privileged'
+            bash -c '
+              git config --global --add safe.directory /workspace &&
+              bash scripts/tests/test-seed-ext4-population.sh &&
+              exec bash ci/scripts/with-nocow-test-filesystem.sh bash ci/scripts/run-rust-checks.sh tests-privileged
+            '
 
       # Their logs print on every run: a test that fails and then passes on
       # nextest's retry leaves the job green.
