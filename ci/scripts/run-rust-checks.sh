@@ -587,6 +587,24 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a net-common feature the generated net-gateway contract
+    # needs but only gets through unification with the client fails here.
+    echo "--- :rust: Running isolated net-gateway protocol clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-net-gateway-protocol \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-net-gateway-protocol \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

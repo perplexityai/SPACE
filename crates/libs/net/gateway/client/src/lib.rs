@@ -1,8 +1,6 @@
 pub use pplx_space_net_common::{orig_dst, proxy::*};
 
-pub mod proto {
-    tonic::include_proto!("space.net.gateway.v1");
-}
+pub use pplx_space_net_gateway_protocol::proto;
 
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
@@ -63,68 +61,6 @@ impl std::str::FromStr for TcpDomainAuthorizationMode {
                 value: value.to_string(),
             }),
         }
-    }
-}
-
-impl proto::NetworkState {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unspecified => "unspecified",
-            Self::NoIdentity => "no_identity",
-            Self::PendingPolicy => "pending_policy",
-            Self::Ready => "ready",
-            Self::PolicyError => "policy_error",
-            Self::Draining => "draining",
-            Self::Stopped => "stopped",
-        }
-    }
-}
-
-impl std::fmt::Display for proto::NetworkState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str((*self).as_str())
-    }
-}
-
-impl proto::NetworkPolicyErrorKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::LoaderError => "loader_error",
-            Self::Timeout => "timeout",
-            Self::PolicyRefMismatch => "policy_ref_mismatch",
-            Self::GatewayStopping => "gateway_stopping",
-        }
-    }
-}
-
-impl std::fmt::Display for proto::NetworkPolicyErrorKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str((*self).as_str())
-    }
-}
-
-impl proto::InterceptionReadiness {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unspecified => "unspecified",
-            Self::NotRequired => "not_required",
-            Self::Ready => "ready",
-            Self::DependenciesNotReady => "dependencies_not_ready",
-        }
-    }
-
-    /// Whether the gateway reported that guest egress is currently failing
-    /// closed on TLS-interception dependencies. `Unspecified` (old binary)
-    /// is not treated as blocked.
-    pub const fn blocks_admission(self) -> bool {
-        matches!(self, Self::DependenciesNotReady)
-    }
-}
-
-impl std::fmt::Display for proto::InterceptionReadiness {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str((*self).as_str())
     }
 }
 

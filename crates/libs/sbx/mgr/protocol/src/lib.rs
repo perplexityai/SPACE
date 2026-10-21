@@ -14,7 +14,7 @@ pub mod operations {
 #[allow(clippy::large_enum_variant)]
 pub mod proto {
     tonic::include_proto!("space.sandbox.manager.v1");
-    pub use pplx_space_net_gateway_client::proto::{SandboxSubstrateKind, SpaceApiRouteIdentity};
+    pub use pplx_space_net_gateway_protocol::proto::{SandboxSubstrateKind, SpaceApiRouteIdentity};
 
     pub const FILE_DESCRIPTOR_SET: &[u8] =
         tonic::include_file_descriptor_set!("sandbox_manager_descriptor");

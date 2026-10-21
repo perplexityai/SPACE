@@ -1,0 +1,24 @@
+[package]
+name = "pplx-space-net-gateway-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+# internal
+pplx-space-net-common = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+pplx-space-common-proto-build = { workspace = true }
+tonic-prost-build = { workspace = true }

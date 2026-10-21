@@ -6123,22 +6123,31 @@ dependencies = [
 name = "pplx-space-net-gateway-client"
 version = "0.8.0"
 dependencies = [
- "anyhow",
  "hyper-util",
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-proto-build",
  "pplx-space-net-common",
+ "pplx-space-net-gateway-protocol",
  "pplx-space-test-env",
- "prost",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tonic",
+ "tower",
+]
+
+[[package]]
+name = "pplx-space-net-gateway-protocol"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "pplx-space-common-proto-build",
+ "pplx-space-net-common",
+ "prost",
+ "tonic",
  "tonic-prost",
  "tonic-prost-build",
- "tower",
 ]
 
 [[package]]
@@ -6927,7 +6936,7 @@ dependencies = [
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
  "pplx-space-net-common",
- "pplx-space-net-gateway-client",
+ "pplx-space-net-gateway-protocol",
  "pplx-space-spaced-build",
  "pplx-space-spaced-common",
  "prost",

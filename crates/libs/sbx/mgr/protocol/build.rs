@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         .extern_path(".space.net.policy.v1", "::pplx_space_net_common::proto")
         .extern_path(
             ".space.net.gateway.v1",
-            "::pplx_space_net_gateway_client::proto",
+            "::pplx_space_net_gateway_protocol::proto",
         );
     pplx_space_common_proto_build::compile_protos_with_descriptor_set(
         builder,

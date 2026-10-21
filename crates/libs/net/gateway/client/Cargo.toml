@@ -12,22 +12,16 @@ workspace = true
 
 [dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
-prost = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
-tonic-prost = { workspace = true }
 tower = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["host-sockets"] }
-
-[build-dependencies]
-anyhow = { workspace = true }
-pplx-space-common-proto-build = { workspace = true }
-tonic-prost-build = { workspace = true }
+pplx-space-net-gateway-protocol = { workspace = true }
 
 [dev-dependencies]
 nix = { workspace = true, features = ["fs", "mount", "sched", "user"] }

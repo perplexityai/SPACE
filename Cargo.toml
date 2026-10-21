@@ -78,6 +78,7 @@ members = [
     "crates/libs/execution/common",
     "crates/libs/net/common",
     "crates/libs/net/gateway/client",
+    "crates/libs/net/gateway/protocol",
     "crates/libs/net/gateway/server",
     "crates/libs/build/mgr",
     "crates/libs/build/mgr/client",
@@ -347,6 +348,7 @@ pplx-space-volmgr = { path = "crates/libs/vol/mgr/server" }
 pplx-space-volmgr-client = { path = "crates/libs/vol/mgr/client" }
 pplx-space-net-gateway = { path = "crates/libs/net/gateway/server" }
 pplx-space-net-gateway-client = { path = "crates/libs/net/gateway/client" }
+pplx-space-net-gateway-protocol = { path = "crates/libs/net/gateway/protocol" }
 pplx-space-node-api-client = { path = "crates/libs/node/api/client" }
 pplx-space-node-ctl-client = { path = "crates/libs/node/ctl/client" }
 pplx-space-node-api-server = { path = "crates/libs/node/api/server" }
