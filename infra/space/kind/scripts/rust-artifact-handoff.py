@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Hand off one verified producer image within a GitHub Actions run.
 
-The producer either builds the image or, with `reuse`, takes the one main CI
-published for the same Rust input key (`build-rust-artifacts.sh --input-key`)
-from a registry package that only main writes (`publish`). Either way the
-shards load and verify the exact image the producer recorded.
+A PR's producer either builds the image or, with `reuse`, takes the one main
+CI published for the same Rust input key (`build-rust-artifacts.sh
+--input-key`) from a registry package that only main writes. Main always
+builds; a job of its own then `publish`es the image, so the shards never wait
+for the push. Either way the shards load and verify the exact image the
+producer recorded.
 """
 
 from __future__ import annotations
@@ -25,8 +27,10 @@ BUILD = ROOT / "infra/space/kind/scripts/build-rust-artifacts.sh"
 # Set by build-rust-artifacts.sh on a Docker-mode image with an exact input key.
 INPUT_KEY_LABEL = "space.pplx.net/kind-rust-input-key"
 REVISION_LABEL = "org.opencontainers.image.revision"
-# A pull slower than this costs more than the build it would save.
-PULL_TIMEOUT_SECONDS = 240
+# A healthy pull of the image takes well under a minute. One still running
+# after this has stalled, and all of its wait is added to the build that
+# then runs anyway. The log reports each pull's duration to calibrate this.
+PULL_TIMEOUT_SECONDS = 90
 
 
 def context() -> dict:
@@ -109,21 +113,28 @@ def reuse(repository: str) -> None:
     try:
         key = input_key()
         reference = f"{repository}:{key}"
-        # Never echo a remote error body or authentication diagnostics.
-        pulled = subprocess.run(
-            ["docker", "pull", "--quiet", reference],
-            capture_output=True,
-            text=True,
-            timeout=PULL_TIMEOUT_SECONDS,
-            check=False,
-        )
-        if pulled.returncode:
+        started = time.monotonic()
+        try:
+            # Never echo a remote error body or authentication diagnostics.
+            pulled = subprocess.run(
+                ["docker", "pull", "--quiet", reference],
+                capture_output=True,
+                text=True,
+                timeout=PULL_TIMEOUT_SECONDS,
+                check=False,
+            ).returncode
+        except subprocess.TimeoutExpired:
+            pulled = None
+        elapsed = time.monotonic() - started
+        if pulled != 0:
+            outcome = "timed out" if pulled is None else "failed"
             print(
-                f"::notice::No published Rust artifact image for input key "
-                f"{key[:12]} could be pulled; building it",
+                f"::notice::The pull of the Rust artifact image for input key "
+                f"{key[:12]} {outcome} after {elapsed:.0f} s; building it",
                 flush=True,
             )
             return
+        print(f"Pulled {reference} in {elapsed:.0f} s", flush=True)
         image_labels = labels(reference)
         built_from = image_labels.get(REVISION_LABEL, "")
         if image_labels.get(INPUT_KEY_LABEL) != key or not re.fullmatch(
@@ -153,9 +164,10 @@ def reuse(repository: str) -> None:
 
 
 def publish(repository: str) -> None:
-    """Publish the image this producer built under its input key (main only).
+    """Publish the loaded producer image under its input key (main only).
 
-    Never fails: a later run with the same key then builds it again.
+    Main builds on every push, so this replaces the key's earlier image.
+    Never fails: a later PR with the same key then builds it.
     """
 
     try:
@@ -392,7 +404,7 @@ def load(directory: Path) -> None:
         "SPACE_KIND_PREBUILT_RUST_KEY": key,
     }
     subprocess.run(
-        ["bash", "infra/space/kind/scripts/build-rust-artifacts.sh"],
+        ["bash", str(BUILD)],
         cwd=ROOT,
         env=environment,
         check=True,

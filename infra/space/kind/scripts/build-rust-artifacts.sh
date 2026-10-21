@@ -277,32 +277,72 @@ registry_bases() {
     "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" | sort
 }
 
+# Why the Rust Dockerfiles may read context bytes the input key cannot list,
+# one reason per line; empty when they cannot. Instructions are matched in any
+# case and indentation, as BuildKit reads them. A mount reads the context
+# unless it is a secret, tmpfs, ssh or plain cache mount (an untyped mount is
+# a bind mount).
+uncovered_context_reads() {
+  local dockerfile mount
+  for dockerfile in "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE"; do
+    grep -qiE '^[[:space:]]*(ADD|ONBUILD)([[:space:]]|$)' "$dockerfile" \
+      && echo "$dockerfile uses ADD or ONBUILD"
+    grep -iE '^[[:space:]]*COPY([[:space:]]|$)' "$dockerfile" | grep -qvE '^COPY ' \
+      && echo "$dockerfile has a COPY not written as an unindented uppercase instruction"
+    grep -qE '^COPY .*\\$' "$dockerfile" && echo "$dockerfile continues a COPY onto another line"
+    while read -r mount; do
+      [[ "$mount" =~ (^|,)type=(secret|tmpfs|ssh)(,|$) ]] && continue
+      [[ "$mount" =~ (^|,)type=cache(,|$) && ! "$mount" =~ (^|,)from= ]] && continue
+      echo "$dockerfile mounts --mount=$mount"
+    done < <(grep -oiE -- '--mount=[^[:space:]]+' "$dockerfile" | cut -d= -f2-)
+  done
+}
+
 # The content key of the Docker-mode artifact image: equal keys mean the
-# build reads the same bytes. It covers both Dockerfiles (the stages, their
-# build-argument defaults and feature and bin lists), every path they COPY
-# from the context by mode and blob ID, the .dockerignore that filters those,
-# this script, which passes the build no build arguments, the digest
-# ci/mirrored-images.txt pins for each registry base, and the architecture.
-# Commits, times and file stat data are not part of it. A key exists only
-# for committed inputs: it fails when any input is modified or untracked, or
-# when a Dockerfile uses an instruction it cannot account for.
+# build reads the same bytes. It covers:
+#   - both Dockerfiles: the stages, their build-argument defaults, and the
+#     feature and bin lists;
+#   - every path they COPY from the context, by mode and blob ID;
+#   - the ignore files that filter those (.dockerignore and each Dockerfile's
+#     own <Dockerfile>.dockerignore, which BuildKit prefers), and every
+#     .gitattributes from the root down to each input, which can change the
+#     checked-out bytes;
+#   - this script, which passes the build no build arguments;
+#   - the digest the effective mirrored-image list (SPACE_MIRRORED_IMAGES, as
+#     ci/scripts/mirror-images.sh reads it) pins for each registry base;
+#   - the architecture.
+# Commits, times and file stat data are not part of it. A key exists only for
+# committed inputs: it fails when any input is modified or untracked, or when
+# a Dockerfile reads the context in a way it cannot list.
 rust_input_key() {
-  local paths=() base pin changes listing
-  if grep -qE '^(ADD|ONBUILD)[[:space:]]|--mount=type=bind|^COPY .*\\$' "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE"; then
-    die "the Rust Dockerfiles read context files the input key does not cover (ADD, a bind mount or a continued COPY)"
-  fi
+  local paths=() optional=() path dir base pin changes listing uncovered
+  local pins="${SPACE_MIRRORED_IMAGES:-$REPO_ROOT/ci/mirrored-images.txt}"
+  uncovered="$(uncovered_context_reads)"
+  [[ -z "$uncovered" ]] || die "the Rust Dockerfiles read context files the input key cannot list:"$'\n'"$uncovered"
   mapfile -t paths < <(cat "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" | copy_sources | sort -u)
   (( ${#paths[@]} > 0 )) || die "could not read the COPY sources of the Rust Dockerfiles"
   paths+=("$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" .dockerignore infra/space/kind/scripts/build-rust-artifacts.sh)
-  changes="$(git status --porcelain --untracked-files=all -- "${paths[@]}")" \
+  # Inputs that change the build only when present; absent, they list nothing.
+  optional=("$KIND_DOCKERFILE.dockerignore" "$COMMON_DOCKERFILE.dockerignore" .gitattributes)
+  for path in "${paths[@]}"; do
+    dir="$(dirname "$path")"
+    while [[ "$dir" != . ]]; do
+      optional+=("$dir/.gitattributes")
+      dir="$(dirname "$dir")"
+    done
+  done
+  mapfile -t optional < <(printf '%s\n' "${optional[@]}" | sort -u)
+  changes="$(git status --porcelain --untracked-files=all -- "${paths[@]}" "${optional[@]}")" \
     || die "could not read the Rust build inputs' git status"
   [[ -z "$changes" ]] || die "the Rust build inputs have uncommitted changes; they have no input key"
   listing="$(git ls-files -s --error-unmatch -- "${paths[@]}")" \
     || die "a COPY source of the Rust Dockerfiles is not tracked"
+  listing+=$'\n'"$(git ls-files -s -- "${optional[@]}")" \
+    || die "could not list the Rust build's ignore and attribute files"
   {
     echo "space-kind-rust-artifacts docker v1 $(uname -m)"
     while read -r base; do
-      pin="$(awk -v name="$base" '$1 == name { print $2 }' ci/mirrored-images.txt)"
+      pin="$(awk -v name="$base" '$1 == name { print $2 }' "$pins")"
       echo "base $base ${pin:-unpinned}"
     done < <(registry_bases)
     printf '%s\n' "$listing"
