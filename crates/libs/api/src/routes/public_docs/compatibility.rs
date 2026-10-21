@@ -605,12 +605,64 @@ pub(super) fn compare_exact(subset: &Value, superset: &Value, direction: Directi
     for keyword in ["pattern", "format"] {
         if let Some(expected) = superset.get(keyword)
             && subset.get(keyword) != Some(expected)
-            && !(keyword == "pattern" && matches!(expected.as_str(), Some(".*" | "^.*$")))
+            && !(keyword == "pattern" && pattern_contains(expected, subset.get(keyword)))
         {
             return Err(fail(location, format!("{} {keyword} changed incompatibly", direction.name())));
         }
     }
     Ok(())
+}
+
+/// Whether every string `subset` matches is provably matched by `superset`.
+///
+/// A pattern matches when any of its top-level alternatives does, so a
+/// superset that keeps each of the subset's alternatives verbatim matches at
+/// least as much. Anything else needs regex containment, which this does not
+/// attempt: a reordered or rewritten alternative is reported as a change.
+fn pattern_contains(superset: &Value, subset: Option<&Value>) -> bool {
+    let Some(superset) = superset.as_str() else {
+        return false;
+    };
+    if matches!(superset, ".*" | "^.*$") {
+        return true;
+    }
+    let (Some(wide), Some(narrow)) = (
+        top_level_alternatives(superset),
+        subset.and_then(Value::as_str).and_then(top_level_alternatives),
+    ) else {
+        return false;
+    };
+    narrow.iter().all(|alternative| wide.contains(alternative))
+}
+
+/// Splits an ECMA-262 pattern at the `|`s outside groups and character
+/// classes, or returns `None` when its groups or classes do not balance.
+fn top_level_alternatives(pattern: &str) -> Option<Vec<&str>> {
+    let mut alternatives = Vec::new();
+    let (mut depth, mut in_class, mut escaped, mut start) = (0usize, false, false, 0);
+    for (index, character) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => depth = depth.checked_sub(1)?,
+            '|' if !in_class && depth == 0 => {
+                alternatives.push(pattern.get(start..index)?);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if escaped || in_class || depth != 0 {
+        return None;
+    }
+    alternatives.push(pattern.get(start..)?);
+    Some(alternatives)
 }
 
 pub(super) fn union(schema: &Value) -> Option<&Vec<Value>> {

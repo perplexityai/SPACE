@@ -740,10 +740,11 @@ fn classify_disk_metric_targets(
             continue;
         }
         for digest in budget.directories(&path)? {
-            if digest
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("sha256:"))
-                && regular_file_exists(&digest.join("rootfs.ext4"))?
+            if digest.file_name().is_some_and(|n| {
+                n.to_string_lossy()
+                    .parse::<pplx_space_common_core::types::Digest>()
+                    .is_ok()
+            }) && regular_file_exists(&digest.join("rootfs.ext4"))?
             {
                 targets.templates.push(path_string(path));
                 break;

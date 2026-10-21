@@ -171,6 +171,38 @@ fn accepts_parameter_hoisting_numeric_subtypes_and_response_additions() {
     request_schema(&Value::Null, &Value::Null).optional(Some(&json!({ "pattern": "^a+$" })), Some(&json!({ "pattern": "^.*$" })), "request").unwrap();
 }
 
+/// A pattern matches when any top-level alternative does, so a request may add
+/// alternatives that keep every baseline one verbatim, and a response may drop
+/// them. A `|` escaped or inside a group or class does not separate
+/// alternatives; splitting there would accept a pattern that matches less.
+#[test]
+#[rustfmt::skip]
+fn patterns_widen_only_by_keeping_every_alternative() {
+    for (baseline, current, request_compatible, response_compatible) in [
+        ("^a$", "^a$|^b$", true, false),
+        ("^a$", "^b$|^a$", true, false),
+        ("^a$|^b$", "^a$", false, true),
+        ("^a$", "^(a)$|^b$", false, false),
+        ("b$", r"^a\|b$", false, false),
+        ("b]$", "^[a|b]$", false, false),
+        ("b)$", "^(a|b)$", false, false),
+        ("b$", "^(a|b$", false, false),
+    ] {
+        let baseline = json!({ "pattern": baseline });
+        let current = json!({ "pattern": current });
+        assert_eq!(
+            request_schema(&Value::Null, &Value::Null).optional(Some(&baseline), Some(&current), "request").is_ok(),
+            request_compatible,
+            "request {baseline} -> {current}"
+        );
+        assert_eq!(
+            response_schema(&Value::Null, &Value::Null).optional(Some(&current), Some(&baseline), "response").is_ok(),
+            response_compatible,
+            "response {baseline} -> {current}"
+        );
+    }
+}
+
 /// An open request object accepted unknown keys and ignored them, so
 /// documenting one later constrains a value that never reached behaviour.
 /// Responses get no such allowance: there the same shape means the contract
