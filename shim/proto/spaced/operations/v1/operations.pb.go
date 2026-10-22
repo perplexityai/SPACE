@@ -2353,7 +2353,9 @@ type StartRequest struct {
 	// is what the E2B compatibility path does. The native data plane derives this
 	// from the data-plane session id so the control plane can return a usable
 	// process id before the process exists, and so a retried start is refused
-	// rather than executing the command twice.
+	// rather than executing the command twice. An id stays in use after its
+	// process exits, for as long as the guest retains the exit (15 minutes, or
+	// less once many newer processes start).
 	ProcessId     *string `protobuf:"bytes,12,opt,name=process_id,json=processId,proto3,oneof" json:"process_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2638,6 +2640,9 @@ type ListProcessesRequest struct {
 	// Also list processes that have exited but are still retained, with their
 	// exit. Older guests ignore it and list running processes only.
 	IncludeExited bool `protobuf:"varint,1,opt,name=include_exited,json=includeExited,proto3" json:"include_exited,omitempty"`
+	// List only this process. Older guests ignore it and list every process,
+	// so a caller still selects the one it wants.
+	ProcessId     *string `protobuf:"bytes,2,opt,name=process_id,json=processId,proto3,oneof" json:"process_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2677,6 +2682,13 @@ func (x *ListProcessesRequest) GetIncludeExited() bool {
 		return x.IncludeExited
 	}
 	return false
+}
+
+func (x *ListProcessesRequest) GetProcessId() string {
+	if x != nil && x.ProcessId != nil {
+		return *x.ProcessId
+	}
+	return ""
 }
 
 type ProcessInfo struct {
@@ -4187,9 +4199,12 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\routput_cursor\x18\x03 \x01(\x04H\x01R\foutputCursor\x88\x01\x01B\n" +
 	"\n" +
 	"\b_timeoutB\x10\n" +
-	"\x0e_output_cursor\"=\n" +
+	"\x0e_output_cursor\"p\n" +
 	"\x14ListProcessesRequest\x12%\n" +
-	"\x0einclude_exited\x18\x01 \x01(\bR\rincludeExited\"\xe7\x03\n" +
+	"\x0einclude_exited\x18\x01 \x01(\bR\rincludeExited\x12\"\n" +
+	"\n" +
+	"process_id\x18\x02 \x01(\tH\x00R\tprocessId\x88\x01\x01B\r\n" +
+	"\v_process_id\"\xe7\x03\n" +
 	"\vProcessInfo\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\x12\x10\n" +
@@ -4471,6 +4486,7 @@ func file_spaced_operations_v1_operations_proto_init() {
 	file_spaced_operations_v1_operations_proto_msgTypes[34].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[35].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[38].OneofWrappers = []any{}
+	file_spaced_operations_v1_operations_proto_msgTypes[39].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[40].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[51].OneofWrappers = []any{
 		(*ProcessEvent_Started)(nil),

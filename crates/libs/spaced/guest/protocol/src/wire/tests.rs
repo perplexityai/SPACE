@@ -124,6 +124,12 @@ fn process_exits_report_shell_style_exit_codes() {
             128,
         ),
         (
+            Some(Outcome::Signaled(ProcessSignaled {
+                signal: Some(i32::MAX),
+            })),
+            i32::MAX,
+        ),
+        (
             Some(Outcome::TimedOut(ProcessTimedOut { signal: Some(9) })),
             124,
         ),

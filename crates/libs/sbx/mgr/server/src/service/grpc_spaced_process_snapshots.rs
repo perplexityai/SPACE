@@ -264,6 +264,7 @@ impl SandboxManagerService {
             ));
         };
         let include_exited = operation.include_exited;
+        let process_id = operation.process_id.clone();
         let sandbox = self
             .ensure_active_for_read_only_guest_activity(
                 Some(route_auth.clone()),
@@ -277,11 +278,11 @@ impl SandboxManagerService {
         route_auth.authorize_sandbox(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
         let processes = client
-            .list_processes(include_exited)
+            .list_processes(include_exited, process_id.as_deref())
             .await?
             .into_iter()
             .map(process_info_to_spaced)
-            .collect::<Result<_, _>>()?;
+            .collect();
         Ok(Response::new(SpacedListProcessesResponse { processes }))
     }
 

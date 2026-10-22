@@ -60,7 +60,8 @@ pub async fn list_processes(
 ) -> Result<Json<PublicPage<PublicProcess>>, PublicApiError> {
     let cursor = query.cursor()?;
     let limit = query.limit();
-    let processes = fetch_public_processes(authorized, &state, org.id, &sandbox_id, false).await?;
+    let processes =
+        fetch_public_processes(authorized, &state, org.id, &sandbox_id, false, None).await?;
 
     Ok(Json(process_page(processes, cursor.as_ref(), limit)?))
 }
@@ -102,8 +103,17 @@ pub async fn get_process(
     let process_id = ProcessId::parse(process_id)
         .map_err(|_| PublicApiError::bad_request("invalid process id"))?;
     // Also an exited process the sandbox still retains, with its exit; the
-    // list stays running-only.
-    let processes = fetch_public_processes(authorized, &state, org.id, &sandbox_id, true).await?;
+    // list stays running-only. A guest that predates the filter lists every
+    // process, so this still selects the one asked for.
+    let processes = fetch_public_processes(
+        authorized,
+        &state,
+        org.id,
+        &sandbox_id,
+        true,
+        Some(&process_id),
+    )
+    .await?;
     let Some(process) = processes
         .into_iter()
         .find(|process| process.process_id == process_id)
@@ -216,6 +226,7 @@ async fn fetch_public_processes(
     org_id: OrgId,
     sandbox_id: &str,
     include_exited: bool,
+    process_id: Option<&ProcessId>,
 ) -> Result<Vec<PublicProcess>, PublicApiError> {
     let sandbox = ensure_sandbox_owner(authorized, state, org_id, sandbox_id).await?;
     let sandbox_id = PublicSandboxId::from(sandbox.id);
@@ -228,6 +239,7 @@ async fn fetch_public_processes(
             SandboxApiMetricIdentity::native("process_list"),
             sandbox_id.into(),
             include_exited,
+            process_id,
         )
         .await
         .map_err(controller_error)?;

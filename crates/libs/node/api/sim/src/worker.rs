@@ -1473,8 +1473,16 @@ impl WorkerApi for SimWorkerApiService {
         request: Request<sbx::SpacedListProcessesRequest>,
     ) -> Result<Response<sbx::SpacedListProcessesResponse>, Status> {
         let req = request.into_inner();
-        required_operation(req.operation)?;
-        let processes = self.state.processes().list(&req.sandbox_id).await;
+        let operation = required_operation(req.operation)?;
+        let processes = self
+            .state
+            .processes()
+            .list(
+                &req.sandbox_id,
+                operation.include_exited,
+                operation.process_id.as_deref(),
+            )
+            .await;
         Ok(Response::new(sbx::SpacedListProcessesResponse {
             processes,
         }))

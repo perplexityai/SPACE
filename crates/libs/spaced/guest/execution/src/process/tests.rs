@@ -773,7 +773,7 @@ async fn kill_reaped_process_releases_stalled_output_and_capacity() {
     )
     .await;
     let completed = tokio::time::timeout(Duration::from_secs(2), async {
-        while !service.inner.processes.list(false).is_empty() {
+        while !service.inner.processes.list(false, None).is_empty() {
             tokio::task::yield_now().await;
         }
     })
@@ -1493,7 +1493,7 @@ async fn a_completed_process_exit_stays_connectable_until_its_retention_ends() {
         }
     };
 
-    backdate(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
+    backdate(COMPLETED_PROCESS_OUTPUT_RETENTION + Duration::from_secs(1));
     service.inner.processes.remove_expired();
     let events = connect()
         .await
@@ -1515,10 +1515,18 @@ async fn a_completed_process_exit_stays_connectable_until_its_retention_ends() {
         ))
     );
     assert!(
-        service.inner.processes.list(false).is_empty(),
+        service.inner.processes.list(false, None).is_empty(),
         "the default list reports running processes only"
     );
-    let listed = service.inner.processes.list(true);
+    assert!(
+        service
+            .inner
+            .processes
+            .list(true, Some("sbxps_2f1c9a4e-0000-7000-8000-000000000099"))
+            .is_empty(),
+        "a filtered list reports only the process asked for"
+    );
+    let listed = service.inner.processes.list(true, Some(process_id));
     let [listed] = listed.as_slice() else {
         panic!("the exited process is listed when asked: {listed:?}");
     };
@@ -1561,6 +1569,7 @@ async fn a_completed_process_releases_its_output_after_the_idempotency_window() 
                 "-c".into(),
                 "head -c 1048576 /dev/zero".into(),
             ],
+            env: [("OUTPUT_RELEASE".into(), "kept".into())].into(),
             idempotency_key: Some("output-release".into()),
             process_id: Some(process_id.into()),
             ..Default::default()
@@ -1576,13 +1585,24 @@ async fn a_completed_process_releases_its_output_after_the_idempotency_window() 
         registry.shared_output_slots.available_permits() < idle_shared,
         "the finished process still holds its output for a retried start"
     );
+    let listed_env = || {
+        registry
+            .list(true, Some(process_id))
+            .pop()
+            .expect("the exited process is listed")
+            .env
+    };
+    assert_eq!(
+        listed_env().get("OUTPUT_RELEASE").map(String::as_str),
+        Some("kept")
+    );
 
     for entry in registry.records.iter() {
         entry
             .record()
             .expect("published")
             .journal
-            .backdate_completion(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
+            .backdate_completion(COMPLETED_PROCESS_OUTPUT_RETENTION + Duration::from_secs(1));
     }
     registry.remove_expired();
     assert_eq!(
@@ -1590,11 +1610,15 @@ async fn a_completed_process_releases_its_output_after_the_idempotency_window() 
         idle_shared,
         "the shared output budget is released"
     );
+    assert!(
+        listed_env().is_empty(),
+        "the environment goes with the output"
+    );
     // The reaper's next work for it is the end of its retention.
     assert!(
-        registry
-            .next_expiry()
-            .is_some_and(|next| next > Instant::now() + IDEMPOTENCY_RECORD_TTL),
+        registry.next_expiry().is_some_and(
+            |next| next > tokio::time::Instant::now() + COMPLETED_PROCESS_OUTPUT_RETENTION
+        ),
         "{:?}",
         registry.next_expiry()
     );
@@ -1620,6 +1644,153 @@ async fn a_completed_process_releases_its_output_after_the_idempotency_window() 
         ),
         "a reattach without a cursor gets the start and the exit: {events:?}"
     );
+    shut_down(&service).await;
+}
+
+// Each finished process's output is released on time, even while the reaper
+// sleeps toward a later deadline. It used to wake only on its timer, so after
+// releasing one record's output it slept until that record expired, and a
+// command finishing meanwhile kept its output and shared budget until then.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_reaper_releases_a_later_exit_output_on_time() {
+    let service = cancellation_service();
+    let registry = &service.inner.processes;
+    let idle_shared = registry.shared_output_slots.available_permits();
+    let run = |key: &'static str, script: &'static str| {
+        let service = &service;
+        async move {
+            let response = Process::start(
+                service,
+                Request::new(StartRequest {
+                    command: vec!["/bin/sh".into(), "-c".into(), script.into()],
+                    idempotency_key: Some(key.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("process starts");
+            let mut events = response.into_inner();
+            while let Some(event) = events.next().await {
+                event.expect("process stream remains successful");
+            }
+        }
+    };
+    // Advances the reaper's clock past an output window and lets it work.
+    let after_output_window = || async {
+        tokio::time::pause();
+        tokio::time::advance(COMPLETED_PROCESS_OUTPUT_RETENTION + Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    };
+
+    run("reaper-first", "exit 0").await;
+    after_output_window().await;
+    assert!(
+        registry.next_expiry().is_some_and(|next| {
+            next > tokio::time::Instant::now() + COMPLETED_PROCESS_OUTPUT_RETENTION
+        }),
+        "the first output is released and the reaper sleeps toward its retention end"
+    );
+    tokio::time::resume();
+
+    // Past the per-record guaranteed share, so it borrows shared budget.
+    run("reaper-second", "head -c 1048576 /dev/zero").await;
+    assert!(registry.shared_output_slots.available_permits() < idle_shared);
+    after_output_window().await;
+    let released = registry.shared_output_slots.available_permits();
+    tokio::time::resume();
+    assert_eq!(
+        released, idle_shared,
+        "the second output is released one window after its exit"
+    );
+    shut_down(&service).await;
+}
+
+// A write in flight when the process exits keeps the stdin pipe only until it
+// returns; the release used to skip a held pipe and never come back to it, so
+// a descendant read no EOF until the record went. A write that passed its
+// running check just before the exit is answered as for an exited process.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_write_in_flight_at_exit_closes_stdin_when_it_returns() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::SendSignalRequest;
+    let service = cancellation_service();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("stdin-closed");
+    let reading = directory.path().join("reading");
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"exec 3<&0; (touch "$2"; cat <&3 >/dev/null; touch "$1") >/dev/null 2>&1 & exec sleep 30"#
+                    .into(),
+                "sh".into(),
+                marker.to_str().unwrap().into(),
+                reading.to_str().unwrap().into(),
+            ],
+            stdin: true,
+            idempotency_key: Some("stdin-held-release".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    let started = events
+        .next()
+        .await
+        .expect("started")
+        .expect("process stream remains successful");
+    let record = service
+        .inner
+        .processes
+        .get_running(&ProcessId::parse(started.process_id.clone()).unwrap())
+        .expect("running");
+    let ProcessInput::Pipe(stdin) = &record.input else {
+        panic!("pipe stdin")
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !reading.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the descendant reads stdin");
+    let held = stdin.lock().await;
+    Process::send_signal(
+        &service,
+        Request::new(SendSignalRequest {
+            process_id: started.process_id,
+            signal: libc::SIGKILL,
+        }),
+    )
+    .await
+    .expect("the leader is killed");
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    assert!(record.journal.is_completed());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!marker.exists(), "the held write keeps the pipe open");
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the descendant reads EOF once the held write returns");
+    let status = record
+        .write_stdin(b"late")
+        .await
+        .expect_err("the process has exited");
+    assert_eq!(status.code(), tonic::Code::NotFound, "{status:?}");
+    drop(record);
     shut_down(&service).await;
 }
 
@@ -1664,15 +1835,32 @@ async fn an_exited_process_closes_its_stdin_for_descendants() {
 }
 
 // The PTY's writer and resize descriptors close with the exit, so the master
-// is gone and a descendant writing to the terminal gets EIO.
+// is gone and a descendant still writing to the terminal gets EIO. The
+// descendant leaves the process group, so it outlives the output drain.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_exited_pty_process_closes_its_terminal() {
     let service = cancellation_service();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("terminal-write");
     let response = Process::start(
         &service,
         Request::new(StartRequest {
-            command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                // The leader exits once the descendant has left its group.
+                concat!(
+                    "setsid sh -c 'touch \"$2\"; for _ in $(seq 100); do ",
+                    "echo x >&3 2>/dev/null || { echo failed > \"$1\"; exit; }; sleep 0.1; ",
+                    "done; echo written > \"$1\"' sh \"$1\" \"$2\" 3>&1 </dev/null >/dev/null 2>&1 & ",
+                    "while [ ! -e \"$2\" ]; do sleep 0.05; done; exit 0",
+                )
+                .into(),
+                "sh".into(),
+                marker.to_str().unwrap().into(),
+                directory.path().join("detached").to_str().unwrap().into(),
+            ],
             pty: Some(
                 pplx_space_spaced_guest_protocol::proto::bridge_guest::PtyConfig { size: None },
             ),
@@ -1686,23 +1874,21 @@ async fn an_exited_pty_process_closes_its_terminal() {
     while let Some(event) = events.next().await {
         event.expect("process stream remains successful");
     }
-    let record = service
-        .inner
-        .processes
-        .records
-        .iter()
-        .next()
-        .and_then(|entry| entry.value().record().cloned())
-        .expect("the exited process is retained");
-    let ProcessInput::Pty(pty) = &record.input else {
-        panic!("a PTY-backed process");
-    };
-    assert!(pty.writer.lock().await.is_none(), "the writer is closed");
-    assert!(
-        pty.resize_fd.lock().unwrap().is_none(),
-        "the resize descriptor is closed"
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(result) = std::fs::read_to_string(&marker) {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the descendant finishes writing");
+    assert_eq!(
+        result.trim(),
+        "failed",
+        "a terminal write fails once the process has exited"
     );
-    drop(record);
     shut_down(&service).await;
 }
 

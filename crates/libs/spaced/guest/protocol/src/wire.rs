@@ -101,7 +101,10 @@ impl crate::proto::operations::ProcessExit {
         use crate::proto::operations::process_exit::Outcome;
         match &self.outcome {
             Some(Outcome::Exited(exited)) => exited.exit_code,
-            Some(Outcome::Signaled(signaled)) => 128 + signaled.signal.unwrap_or_default(),
+            // The signal comes from the guest: saturate rather than overflow.
+            Some(Outcome::Signaled(signaled)) => {
+                128_i32.saturating_add(signaled.signal.unwrap_or_default())
+            }
             Some(Outcome::TimedOut(_)) => 124,
             Some(Outcome::Unknown(_)) | None => 1,
         }

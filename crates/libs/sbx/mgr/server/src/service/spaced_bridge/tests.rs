@@ -262,7 +262,7 @@ fn process_info_to_spaced_preserves_process_config() {
         }),
     };
 
-    let spaced = process_info_to_spaced(info).expect("valid process info");
+    let spaced = process_info_to_spaced(info.clone());
 
     assert_eq!(spaced.process_id, "proc-1");
     assert_eq!(spaced.pid, 123);
@@ -281,6 +281,19 @@ fn process_info_to_spaced_preserves_process_config() {
     assert_eq!(
         spaced.ended_at.map(|ended_at| ended_at.seconds),
         Some(1_790_596_800)
+    );
+
+    // An exit whose outcome this build cannot decode, as prost reports a newer
+    // guest's, lists as unknown instead of failing the list.
+    let spaced = process_info_to_spaced(host_proto::ProcessInfo {
+        exit: Some(host_proto::ProcessExit { outcome: None }),
+        ..info
+    });
+    assert_eq!(
+        spaced.exit.and_then(|exit| exit.outcome),
+        Some(crate::proto::spaced_process_exit::Outcome::Unknown(
+            crate::proto::SpacedProcessUnknown {}
+        ))
     );
 }
 

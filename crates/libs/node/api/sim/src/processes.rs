@@ -11,7 +11,8 @@
 //! output records carry a sequence starting at `0`; a connect with an
 //! `output_cursor` replays every record at or after that sequence, and a
 //! connect without one follows the live tail and replays nothing. The
-//! process table is per sandbox and is dropped with the sandbox.
+//! process table is per sandbox and is dropped with the sandbox. An exited
+//! process stays listable with its exit, as the guest retains one, until then.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,11 +67,28 @@ struct SimProcess {
     output: Vec<Vec<u8>>,
     exit_tx: Arc<ExitSender>,
     exit_rx: ExitReceiver,
+    ended_at: Arc<std::sync::OnceLock<prost_types::Timestamp>>,
 }
 
 impl SimProcess {
     fn exited(&self) -> bool {
         self.exit_rx.borrow().is_some()
+    }
+
+    fn end(&self, exit: sbx::SpacedProcessExit) {
+        let _ = self
+            .ended_at
+            .set(prost_types::Timestamp::from(std::time::SystemTime::now()));
+        let _ = self.exit_tx.send(Some(exit));
+    }
+
+    /// What the list reports: with its exit once it has ended.
+    fn listed_info(&self) -> sbx::SpacedProcessInfo {
+        sbx::SpacedProcessInfo {
+            exit: *self.exit_rx.borrow(),
+            ended_at: self.ended_at.get().copied(),
+            ..self.info.clone()
+        }
     }
 }
 
@@ -108,9 +126,10 @@ impl SimProcessTable {
             output,
             exit_tx: Arc::new(exit_tx),
             exit_rx,
+            ended_at: Arc::default(),
         };
         if !spec.command.iter().any(|arg| arg.contains("sleep")) {
-            let _ = process.exit_tx.send(Some(exited(0)));
+            process.end(exited(0));
         }
         let stream = event_stream(
             &process,
@@ -159,23 +178,33 @@ impl SimProcessTable {
         };
         for process in processes.values() {
             if !process.exited() {
-                let _ = process.exit_tx.send(Some(signaled(9)));
+                process.end(signaled(9));
             }
         }
     }
 
-    /// Processes that have not exited, oldest pid first.
-    pub async fn list(&self, sandbox_id: &str) -> Vec<sbx::SpacedProcessInfo> {
+    /// Processes that have not exited, and with `include_exited` also those
+    /// that have, with their exit; with `process_id`, only that one. Oldest
+    /// pid first.
+    pub async fn list(
+        &self,
+        sandbox_id: &str,
+        include_exited: bool,
+        process_id: Option<&str>,
+    ) -> Vec<sbx::SpacedProcessInfo> {
         let map = self.inner.lock().await;
-        let mut running: Vec<_> = map
+        let mut listed: Vec<_> = map
             .get(sandbox_id)
             .into_iter()
-            .flat_map(|processes| processes.values())
-            .filter(|process| !process.exited())
-            .map(|process| process.info.clone())
+            .flat_map(|processes| processes.iter())
+            .filter(|(id, process)| {
+                process_id.is_none_or(|process_id| id.as_str() == process_id)
+                    && (include_exited || !process.exited())
+            })
+            .map(|(_, process)| process.listed_info())
             .collect();
-        running.sort_by_key(|info| info.pid);
-        running
+        listed.sort_by_key(|info| info.pid);
+        listed
     }
 
     /// Deliver a signal; terminating signals end the process as `Signaled`.
@@ -197,7 +226,7 @@ impl SimProcessTable {
             });
         }
         if TERMINATING_SIGNALS.contains(&signal) {
-            let _ = process.exit_tx.send(Some(signaled(signal)));
+            process.end(signaled(signal));
         }
         Ok(())
     }

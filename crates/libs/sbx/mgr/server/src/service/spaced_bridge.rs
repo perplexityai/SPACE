@@ -676,10 +676,8 @@ pub(super) fn write_batch_entry_to_host(
     }
 }
 
-pub(super) fn process_info_to_spaced(
-    info: host_proto::ProcessInfo,
-) -> Result<SpacedProcessInfo, Status> {
-    Ok(SpacedProcessInfo {
+pub(super) fn process_info_to_spaced(info: host_proto::ProcessInfo) -> SpacedProcessInfo {
+    SpacedProcessInfo {
         process_id: info.process_id,
         pid: info.pid,
         command: info.command,
@@ -688,9 +686,17 @@ pub(super) fn process_info_to_spaced(
         user: info.user,
         tag: info.tag,
         pty: info.pty,
-        exit: info.exit.map(process_exit_to_spaced).transpose()?,
+        // Unlike a stream's exit event, a listed exit without an outcome is
+        // reported as unknown: prost decodes an outcome added by a newer guest
+        // as none, and one record must not fail the whole list.
+        exit: info.exit.map(|exit| SpacedProcessExit {
+            outcome: Some(exit.outcome.map_or(
+                crate::proto::spaced_process_exit::Outcome::Unknown(SpacedProcessUnknown {}),
+                process_outcome_to_spaced,
+            )),
+        }),
         ended_at: info.ended_at,
-    })
+    }
 }
 
 // Decode boundary: reject structurally missing wire data (unset oneofs) as a
@@ -725,13 +731,21 @@ pub(super) fn process_event_to_spaced(
 }
 
 fn process_exit_to_spaced(exit: host_proto::ProcessExit) -> Result<SpacedProcessExit, Status> {
-    use crate::proto::spaced_process_exit::Outcome as SpacedOutcome;
-    use host_proto::process_exit::Outcome as HostOutcome;
-
     let host_outcome = exit
         .outcome
         .ok_or_else(|| Status::internal("spaced host returned exit event without outcome"))?;
-    let outcome = match host_outcome {
+    Ok(SpacedProcessExit {
+        outcome: Some(process_outcome_to_spaced(host_outcome)),
+    })
+}
+
+fn process_outcome_to_spaced(
+    outcome: host_proto::process_exit::Outcome,
+) -> crate::proto::spaced_process_exit::Outcome {
+    use crate::proto::spaced_process_exit::Outcome as SpacedOutcome;
+    use host_proto::process_exit::Outcome as HostOutcome;
+
+    match outcome {
         HostOutcome::Exited(exited) => SpacedOutcome::Exited(SpacedProcessExited {
             exit_code: exited.exit_code,
         }),
@@ -742,10 +756,7 @@ fn process_exit_to_spaced(exit: host_proto::ProcessExit) -> Result<SpacedProcess
             signal: timed_out.signal,
         }),
         HostOutcome::Unknown(_) => SpacedOutcome::Unknown(SpacedProcessUnknown {}),
-    };
-    Ok(SpacedProcessExit {
-        outcome: Some(outcome),
-    })
+    }
 }
 
 /// Interval between presence touches while a foreground guest stream stays

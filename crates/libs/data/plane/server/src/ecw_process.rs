@@ -1006,6 +1006,7 @@ async fn list_processes(
         // E2B lists and selects running processes only.
         operation: Some(spaced_ops::ListProcessesRequest {
             include_exited: false,
+            process_id: None,
         }),
     };
     let (response, _route) = retryable_bounded_node_api_unary(
