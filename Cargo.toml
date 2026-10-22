@@ -122,6 +122,7 @@ members = [
     "crates/libs/env-vars",
     "crates/libs/feature-flags",
     "crates/libs/events",
+    "crates/libs/federated-grant-store",
     "crates/libs/metrics",
     "crates/libs/metrics-emit",
     "crates/libs/grpc-metrics",
@@ -353,6 +354,7 @@ pplx-space-migration-checksums = { path = "crates/libs/migration-checksums" }
 pplx-space-execution-common = { path = "crates/libs/execution/common" }
 pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
 pplx-space-events = { path = "crates/libs/events" }
+pplx-space-federated-grant-store = { path = "crates/libs/federated-grant-store" }
 pplx-space-credmgr = { path = "crates/libs/credential/mgr/server" }
 pplx-space-credmgr-client = { path = "crates/libs/credential/mgr/client" }
 pplx-space-credential-injection-core = { path = "crates/libs/credential/injection/core" }

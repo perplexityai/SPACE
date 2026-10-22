@@ -1,4 +1,8 @@
 //! Owning store for sandbox-scoped federated service grants.
+//!
+//! It is its own crate so that code reading or writing those grants can
+//! depend on the store without depending on `pplx-space-common-svc`.
+//! `pplx-space-common-svc` re-exports it as `sql::federated_service_grants`.
 
 use pplx_space_common_core::types::{OrgId, SandboxId};
 

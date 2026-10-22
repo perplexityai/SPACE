@@ -830,6 +830,32 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a sqlx or common-core feature the federated grant store
+    # needs but only gets through unification with common-svc fails here.
+    echo "--- :rust: Running isolated federated grant store clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-federated-grant-store \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-federated-grant-store \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+    # Library alone too, so a dev-dependency cannot supply a sqlx feature it needs.
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-federated-grant-store \
+        --no-default-features \
+        --lib \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

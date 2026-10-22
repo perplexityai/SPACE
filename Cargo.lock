@@ -5558,6 +5558,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-dependency-drain",
  "pplx-space-ecw-credential",
+ "pplx-space-federated-grant-store",
  "pplx-space-federated-identity",
  "pplx-space-k8s-node-id",
  "pplx-space-kube-client",
@@ -5969,6 +5970,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-federated-grant-store"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "sqlx",
+ "thiserror 2.0.20",
+ "time",
+ "uuid",
 ]
 
 [[package]]

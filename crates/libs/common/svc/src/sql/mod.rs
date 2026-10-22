@@ -11,7 +11,7 @@ use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 pub mod contention;
-pub mod federated_service_grants;
+pub use pplx_space_federated_grant_store as federated_service_grants;
 pub mod identity;
 #[cfg(feature = "migration-checksums")]
 pub use pplx_space_migration_checksums as migration_checksums;
