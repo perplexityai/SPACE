@@ -1047,7 +1047,7 @@ fn validate_token_review_status(
     let user = status.user.ok_or(TokenReviewFailure::Rejected {
         reason: TokenReviewRejectReason::MissingUser,
     })?;
-    let node = super::AuthenticatedKubernetesNode::from_user_info(&user);
+    let node = super::AuthenticatedKubernetesNode::from_reviewed_user_info(&user);
     let username = user.username.ok_or(TokenReviewFailure::Rejected {
         reason: TokenReviewRejectReason::MissingUser,
     })?;

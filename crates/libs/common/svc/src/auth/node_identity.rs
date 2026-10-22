@@ -24,7 +24,15 @@ impl AuthenticatedKubernetesNode {
     }
 
     #[cfg(feature = "k8s")]
-    pub(super) fn from_user_info(
+    /// Extract a pod's node binding after TokenReview authentication and audience
+    /// validation. This function does not authenticate the supplied UserInfo.
+    ///
+    /// Pod-bound token node metadata is stable in Kubernetes 1.32+. The node UID
+    /// is optional upstream, so require all four unambiguous claims. Tokens
+    /// without a complete pod/node binding return None. Callers must still
+    /// match the node name and UID against live inventory before granting access.
+    /// See <https://kubernetes.io/docs/reference/access-authn-authz/service-accounts-admin/#additional-metadata-in-pod-bound-tokens>.
+    pub(super) fn from_reviewed_user_info(
         user: &k8s_openapi::api::authentication::v1::UserInfo,
     ) -> Option<Self> {
         use pplx_space_common_core::types::{PodName, PodUid};

@@ -260,7 +260,7 @@ impl BuildTokenReviewer {
 fn publication_node(
     user: &k8s_openapi::api::authentication::v1::UserInfo,
 ) -> Result<AuthenticatedBuildNode, Status> {
-    AuthenticatedBuildNode::from_user_info(user)
+    AuthenticatedBuildNode::from_reviewed_user_info(user)
         .ok_or_else(|| Status::permission_denied("publication requires a pod-bound node identity"))
 }
 
