@@ -1246,6 +1246,25 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone with no features and with all of them, so a tonic, tower or
+    # http-body feature the gRPC rate limiter needs but only gets through
+    # unification with common-svc fails here.
+    echo "--- :rust: Running isolated gRPC rate limiter clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-grpc-rate-limiter \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-grpc-rate-limiter \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

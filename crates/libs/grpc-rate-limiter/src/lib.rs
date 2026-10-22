@@ -3,6 +3,9 @@
 //! This module is intentionally transport-aware at the edge: for UDS gRPC it
 //! extracts peer identity from `SO_PEERCRED` via tonic's `UdsConnectInfo`.
 //! Policy is keyed by stable peer identity, not by PID.
+//!
+//! It is its own crate so a service can rate-limit gRPC requests without
+//! depending on the rest of `pplx-space-common-svc`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -18,7 +21,7 @@ use pin_project_lite::pin_project;
 use tonic::Status;
 use tower::{Layer, Service};
 
-use crate::peer_auth::{PeerIdentity, peer_identity_from_http_request};
+use pplx_space_uds_peer_auth::{PeerIdentity, peer_identity_from_http_request};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

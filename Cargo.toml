@@ -69,6 +69,7 @@ members = [
     "crates/libs/uds-peer-auth",
     "crates/libs/unix-socket-bind",
     "crates/libs/valkey",
+    "crates/libs/grpc-rate-limiter",
     "crates/libs/systemd-watchdog",
     "crates/libs/node/api/client",
     "crates/libs/node/api/server",
@@ -469,6 +470,7 @@ pplx-space-unix-socket-path = { path = "crates/libs/unix-socket-path" }
 pplx-space-uds-peer-auth = { path = "crates/libs/uds-peer-auth" }
 pplx-space-unix-socket-bind = { path = "crates/libs/unix-socket-bind" }
 pplx-space-valkey = { path = "crates/libs/valkey" }
+pplx-space-grpc-rate-limiter = { path = "crates/libs/grpc-rate-limiter" }
 pplx-space-tokio-runtime = { path = "crates/libs/tokio-runtime" }
 [profile.release]
 lto = "thin"

@@ -5602,6 +5602,7 @@ dependencies = [
  "pplx-space-ecw-credential",
  "pplx-space-federated-grant-store",
  "pplx-space-federated-identity",
+ "pplx-space-grpc-rate-limiter",
  "pplx-space-http-server",
  "pplx-space-ingress-admission",
  "pplx-space-k8s-node-id",
@@ -6064,6 +6065,23 @@ name = "pplx-space-grpc-metrics"
 version = "0.8.0"
 dependencies = [
  "pplx-space-metrics-emit",
+]
+
+[[package]]
+name = "pplx-space-grpc-rate-limiter"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "pin-project-lite",
+ "pplx-space-common-grpc",
+ "pplx-space-metrics",
+ "pplx-space-uds-peer-auth",
+ "tokio",
+ "tonic",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
