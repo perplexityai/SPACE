@@ -16,6 +16,7 @@ base64 = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl"] }
+pplx-space-accounts = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
@@ -59,9 +60,15 @@ serde = [
     "pplx-space-k8s-ids/serde",
     "pplx-space-cluster-id/serde",
     "pplx-space-guest-process/serde",
+    "pplx-space-accounts/serde",
 ]
-sqlx = ["dep:sqlx", "pplx-space-semver/sqlx", "pplx-space-k8s-ids/sqlx"]
-rusqlite = ["dep:rusqlite"]
+sqlx = [
+    "dep:sqlx",
+    "pplx-space-semver/sqlx",
+    "pplx-space-k8s-ids/sqlx",
+    "pplx-space-accounts/sqlx",
+]
+rusqlite = ["dep:rusqlite", "pplx-space-accounts/rusqlite"]
 # Compiles in the test-only environment overrides (see `env::test_hook`). Only
 # kind and smoke images and test builds enable it; release binaries cannot read
 # these variables, so they are not part of the public configuration surface.

@@ -4929,6 +4929,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
+name = "pplx-space-accounts"
+version = "0.8.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-admin-cli"
 version = "0.8.0"
 dependencies = [
@@ -5417,6 +5428,7 @@ dependencies = [
  "k8s-openapi",
  "libc",
  "nix 0.31.3",
+ "pplx-space-accounts",
  "pplx-space-byte-size",
  "pplx-space-cluster-id",
  "pplx-space-content-digest",

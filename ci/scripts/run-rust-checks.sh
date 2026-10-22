@@ -318,11 +318,13 @@ run_sbxmgr_production_checks() {
         sbxmgr_assert_direct_dependents pplx-space-sqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store
         # rusqlite enters only through the store, the helpers it depends on,
-        # and two shared crates whose rusqlite use hands no connection out:
-        # common-jobs' functions take a connection in, and common-core only
-        # implements rusqlite's value conversion traits for its types.
+        # and three shared crates whose rusqlite use hands no connection out:
+        # common-jobs' functions take a connection in, and common-core and
+        # accounts only implement rusqlite's value conversion traits for
+        # their types.
         sbxmgr_assert_direct_dependents rusqlite "${sbxmgr_feature_args[@]}" -- \
-            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core
+            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core \
+            pplx-space-accounts
     done
 }
 
@@ -953,6 +955,49 @@ run_clippy_checks() {
         -p pplx-space-unix-socket-bind \
         --no-default-features \
         --lib \
+        -- \
+        -D warnings
+
+    # Built alone, so a serde, sqlx or rusqlite feature the account identity
+    # crate needs but only gets through unification with common-core fails
+    # here: with no features, each feature by itself, and all features.
+    echo "--- :rust: Running isolated account identity clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-accounts \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-accounts \
+        --no-default-features \
+        --features serde \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-accounts \
+        --no-default-features \
+        --features sqlx \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-accounts \
+        --no-default-features \
+        --features rusqlite \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-accounts \
+        --all-features \
+        --all-targets \
         -- \
         -D warnings
 }
