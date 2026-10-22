@@ -1,4 +1,8 @@
 //! Control-plane Postgres identities used by application connection pools.
+//!
+//! It is its own crate so that connection-pool code can name the closed set of
+//! application Postgres logins without depending on `pplx-space-common-core`,
+//! which re-exports it as `types::database`.
 
 use std::fmt;
 

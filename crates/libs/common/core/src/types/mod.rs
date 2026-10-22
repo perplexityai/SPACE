@@ -29,7 +29,7 @@ pub mod balloon;
 pub mod cluster;
 pub mod compute;
 pub mod data;
-pub mod database;
+pub use pplx_space_db_identity as database;
 pub mod disk_io;
 pub mod env;
 pub mod environment;

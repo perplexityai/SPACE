@@ -1216,6 +1216,18 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a feature or optional dependency added to the database
+    # identity crate later that resolves only through unification with
+    # common-core fails here.
+    echo "--- :rust: Running isolated database identity clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-db-identity \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

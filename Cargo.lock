@@ -5455,6 +5455,7 @@ dependencies = [
  "pplx-space-cluster-id",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
+ "pplx-space-db-identity",
  "pplx-space-durations",
  "pplx-space-env-vars",
  "pplx-space-execution-spec",
@@ -5890,6 +5891,10 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
 ]
+
+[[package]]
+name = "pplx-space-db-identity"
+version = "0.8.0"
 
 [[package]]
 name = "pplx-space-db-migrate"

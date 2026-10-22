@@ -23,6 +23,7 @@ pplx-space-byte-size = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
+pplx-space-db-identity = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
