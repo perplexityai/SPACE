@@ -248,6 +248,10 @@ message ConnectProcessRequest {
   // its reader position, so output written meanwhile cannot evict it, and
   // reports it in `ProcessConnected.output_cursor`. Older guests ignore it.
   bool resume_from_oldest_retained = 4;
+  // Emit ProcessOutputGap and continue when unread output is evicted, including
+  // after the connection starts. Unlike resume_from_oldest_retained, this also
+  // reports the initial gap instead of silently moving the starting cursor.
+  optional bool resume_after_output_gap = 5;
 }
 message ListProcessesRequest {
   // Also list processes that have exited but are still retained, with their
@@ -302,6 +306,8 @@ message ProcessEvent {
     ProcessOutput stdout = 5;
     ProcessOutput stderr = 6;
     ProcessExit exit = 7;
+    // Sent only to a ConnectProcess caller that set resume_after_output_gap.
+    ProcessOutputGap output_gap = 8;
   }
 }
 message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
@@ -313,6 +319,16 @@ message ProcessConnected {
   optional uint64 output_cursor = 1;
 }
 message ProcessOutput { bytes data = 1; }
+message ProcessOutputGap {
+  // Output events evicted before this stream delivered them.
+  uint64 skipped_events = 1;
+  // The output_cursor of the next output event this stream delivers.
+  uint64 output_cursor = 2;
+  // Total stdout and stderr data bytes the process emitted before
+  // output_cursor. A caller that counted the bytes it received from cursor 0
+  // subtracts that count to learn how many bytes it missed.
+  uint64 output_bytes_before = 3;
+}
 message ProcessExit {
   oneof outcome {
     ProcessExited exited = 1;

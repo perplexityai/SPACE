@@ -382,6 +382,10 @@ async fn print_process_event(
         Some(Event::Stderr(output)) => {
             return write_output(&mut tokio::io::stderr(), &output.data).await;
         }
+        Some(Event::OutputGap(gap)) => format!(
+            "output_gap process_id={} skipped_events={} output_cursor={} output_bytes_before={}\n",
+            event.process_id, gap.skipped_events, gap.output_cursor, gap.output_bytes_before
+        ),
         Some(Event::Exit(exit)) => {
             use pplx_space_spaced_host_client::proto::process_exit::Outcome;
             match exit.outcome {

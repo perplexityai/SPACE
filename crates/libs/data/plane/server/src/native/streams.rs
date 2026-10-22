@@ -356,6 +356,7 @@ pub(crate) async fn connect_process_stream(
                 // A cursor whose output was evicted starts at the oldest
                 // output retained, which `ProcessConnected` reports.
                 resume_from_oldest_retained: true,
+                resume_after_output_gap: None,
             }),
         },
         route_token,

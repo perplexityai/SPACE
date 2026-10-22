@@ -722,6 +722,11 @@ pub(super) fn process_event_to_spaced(
         }),
         HostEvent::Stdout(output) => SpacedEvent::Stdout(SpacedProcessOutput { data: output.data }),
         HostEvent::Stderr(output) => SpacedEvent::Stderr(SpacedProcessOutput { data: output.data }),
+        HostEvent::OutputGap(gap) => SpacedEvent::OutputGap(SpacedProcessOutputGap {
+            skipped_events: gap.skipped_events,
+            output_cursor: gap.output_cursor,
+            output_bytes_before: gap.output_bytes_before,
+        }),
         HostEvent::Exit(exit) => SpacedEvent::Exit(process_exit_to_spaced(exit)?),
     };
 

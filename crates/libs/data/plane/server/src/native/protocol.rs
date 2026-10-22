@@ -154,7 +154,9 @@ pub(crate) fn process_event_frames(event: ProcessEvent, output_seq: &mut u64) ->
             }],
             output_bytes: 0,
         },
-        None => ProcessFrameBatch {
+        // Native reconnects do not yet set `resume_after_output_gap`, so a gap
+        // cannot arrive here; a lagged native reader still fails.
+        Some(spaced_process_event::Event::OutputGap(_)) | None => ProcessFrameBatch {
             frames: Vec::new(),
             output_bytes: 0,
         },

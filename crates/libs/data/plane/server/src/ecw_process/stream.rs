@@ -163,6 +163,10 @@ impl<R> ResumableProcessStartState<R> {
                 self.output_cursor = self.output_cursor.saturating_add(1);
                 self.reopens_without_progress = 0;
             }
+            Some(spaced_ops::process_event::Event::OutputGap(gap)) => {
+                self.ensure_bound_process(event)?;
+                self.output_cursor = gap.output_cursor;
+            }
             Some(spaced_ops::process_event::Event::Exit(_)) => {
                 self.ensure_bound_process(event)?;
                 self.terminal = true;
@@ -450,6 +454,7 @@ pub(super) fn build_process_start_resume_request(
                 .and_then(|operation| operation.timeout),
             output_cursor: Some(output_cursor),
             resume_from_oldest_retained: false,
+            resume_after_output_gap: None,
         }),
     }
 }
