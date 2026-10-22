@@ -88,6 +88,15 @@ impl SandboxManagerService {
             if shutdown.is_cancelled() {
                 return;
             }
+            if row.state == SandboxState::Pausing {
+                let id = row.id.clone();
+                if let Err(error) = self.recover_interrupted_pause_with_probe(row, |id| async move {
+                    observe_firecracker_vm_state(&id, "periodic pause recovery", &self.node_manager).await
+                }).await {
+                    tracing::warn!(sandbox_id = %id, %error, "periodic pause recovery failed; will retry");
+                }
+                return;
+            }
             let prepare_row = row.clone();
             if let Err(error) = self
                 .recover_resident_with_probe(
