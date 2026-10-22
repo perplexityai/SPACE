@@ -17,6 +17,10 @@ node: {}
 # data checksums/compression, or does not use btrfs.
 rootfsBackingPolicy: ""
 
+# Empty keeps the binary default. Set sha256 to revert new registrations;
+# existing releases continue to use the algorithm in their identity.
+hashAlgorithm: ""
+
 # On-node template cache LRU eviction. `GcConfig::from_env` reads these once at
 # template-manager start: an unset or zero budget means the loop spawns, logs
 # once and exits, so a bench without this block never exercises eviction at
@@ -50,6 +54,11 @@ rootfsBackingPolicy: ""
 #
 # A change here rolls template-manager only; the sandboxes on the node keep
 # running.
+#
+# The GC interval and grace and the prefetch latest-N are test hooks
+# (`GcConfig::from_env` in eviction.rs, `LATEST_N_TEST_HOOK` in prefetch.rs);
+# the release lane (`rustBuild: release`) renders only the budget, which
+# release binaries read.
 templateCache:
   budgetBytes: "1610612736"
   gcIntervalSecs: "15"

@@ -40,10 +40,16 @@
 #                       cluster's storage credentials mode is still compared
 #                       with SPACE_KIND_STORAGE_CREDENTIALS, and a mismatch
 #                       refused (`__storage_mode_mismatch`,
-#                       `__node_storage_keys_mismatch`)
+#                       `__node_storage_keys_mismatch`), and so is a
+#                       cluster-controller whose reconcile-queue GC wiring
+#                       differs from this checkout's chart
+#                       (`__reconcile_queue_gc_mismatch`)
 #   SPACE_KIND_STORAGE_CREDENTIALS — exchange (default) or static
 #                       (infra/space/kind/lib/storage-credentials.sh); a live
 #                       Tilt running the other mode is restarted in this one
+#   SPACE_KIND_RUST_BUILD — test-hooks (default) or release
+#                       (infra/space/kind/lib/rust-build.sh); compared and
+#                       switched like the storage credentials mode
 #   BOOTSTRAP_TIMEOUT — per-stage seconds for blocking initialization/readiness
 #   SPACE_KIND_RUN_DIR — the run's output directory, where the bring-up writes
 #                       provenance.json, the image every SPACE container runs
@@ -81,6 +87,8 @@
 # where callers need not set REPO_ROOT, so it is found beside this file.
 # shellcheck source=../../../infra/space/kind/lib/storage-credentials.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/storage-credentials.sh"
+# shellcheck source=../../../infra/space/kind/lib/rust-build.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/rust-build.sh"
 
 # Assert the suites' prerequisites here, at the entry point every kind suite
 # already sources, so callers cannot accidentally omit the prerequisite gate.
@@ -926,9 +934,9 @@ kind_stack_start_detached() {
 # taking the API port, another bring-up switching the storage credentials
 # mode, and node tombstones a scenario left. It leaves out the prerequisite,
 # mount, node vendor copy and Postgres data checks, which only provisioning
-# the box or creating the cluster changes, and the image provenance check,
-# which only a Tilt build changes; scenarios restart and reconfigure workloads
-# but build no image. The runner uses this only when its own bootstrap's
+# the box or creating the cluster changes, and the image provenance and Rust
+# build checks, which only a Tilt build changes; scenarios restart and
+# reconfigure workloads but build no image. The runner uses this only when its own bootstrap's
 # provenance check passed (KIND_STACK_PROVENANCE_PASSED_FILE), not when a busy
 # Tilt skipped it.
 # Each check added to `bootstrap_kind_stack` belongs here or in that list.
@@ -1117,6 +1125,33 @@ bootstrap_kind_stack__storage_mode_mismatch() {
     [[ "$deployed" == "$requested" ]] || printf '%s\n' "$deployed"
 }
 
+# Prints the Rust build the cluster's SPACE Rust containers run when it
+# differs from the requested SPACE_KIND_RUST_BUILD ("mixed" when they run no
+# single build), and nothing when it matches or there is nothing to compare
+# yet. The build is read from the image each running container uses, checked
+# against the build its pod was rendered for
+# (infra/space/kind/scripts/deployed-rust-build.py). With a timeout ($1), every
+# Rust Deployment and DaemonSet must first finish rolling out. Fails on an
+# invalid request or an unreadable cluster.
+bootstrap_kind_stack__rust_build_mismatch() {
+    local requested deployed status=0
+    local -a wait_args=()
+    requested="$(space_kind_rust_build)" || return 1
+    kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
+    [[ -z "${1:-}" ]] || wait_args=(--wait "$1")
+    deployed="$(python3 "$REPO_ROOT/infra/space/kind/scripts/deployed-rust-build.py" \
+        --cluster "$KIND_CLUSTER" ${wait_args[@]+"${wait_args[@]}"})" || status=$?
+    case "$status" in
+        0) [[ "$deployed" == "$requested" ]] || printf '%s\n' "$deployed" ;;
+        1) printf 'mixed\n' ;;
+        3) ;;
+        *)
+            echo "ERROR: cannot read the Rust build of kind cluster $KIND_CLUSTER" >&2
+            return 1
+            ;;
+    esac
+}
+
 # The node-service DaemonSets that read the object store, each with the
 # container that does: the sandbox workers' and builders' volume-manager and
 # the builders' build-manager. Each holds the store's static keys in static
@@ -1270,6 +1305,65 @@ bootstrap_kind_stack__refuse_storage_mode_mismatch() {
     fi
 }
 
+# Prints each part of the reconcile-queue GC's Kind wiring that the applied
+# cluster-controller Deployment lacks against this checkout's render of its
+# chart: the GC switch, AWS_ENDPOINT_URL_EC2 and the pod's loopback alias for
+# the public EC2 name (`reconcilers.reconcileQueueGc` and `ec2.fakeEndpoint`
+# in charts/space-cluster-controller-local), plus an available
+# space-kind-fake-ec2 when the render names it. Nothing when they agree or
+# there is no Deployment yet. A bench brought up before the fake existed runs
+# the GC off with nothing to answer it, and no suite would notice. Fails on
+# an unreadable cluster or render.
+bootstrap_kind_stack__reconcile_queue_gc_mismatch() {
+    kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
+    local ctx="kind-${KIND_CLUSTER}" applied rendered manifest available errors
+    if ! applied="$(kubectl --context "$ctx" -n space get deployment space-cluster-controller \
+            --ignore-not-found -o json 2>&1)"; then
+        echo "ERROR: cannot read the cluster-controller of kind cluster $KIND_CLUSTER: $applied" >&2
+        return 1
+    fi
+    [[ -n "$applied" ]] || return 0
+    # helm warns about the charts' symlinked libraries on stderr, so only
+    # stdout is the manifest.
+    errors="$(mktemp)"
+    if ! manifest="$(helm template space "$REPO_ROOT/infra/space/kind/charts/space-cluster-controller-local" \
+            --namespace space --show-only templates/deployment.yaml 2>"$errors")" \
+        || ! rendered="$(kubectl --context "$ctx" create --dry-run=client -o json -f - \
+            <<<"$manifest" 2>"$errors")"; then
+        echo "ERROR: cannot render this checkout's cluster-controller chart: $(<"$errors")" >&2
+        rm -f "$errors"
+        return 1
+    fi
+    rm -f "$errors"
+    local diff endpoint
+    if ! diff="$(jq -nr --argjson want "$rendered" --argjson have "$applied" '
+            def env($name): [.spec.template.spec.containers[]
+                | select(.name == "cluster-controller") | .env[]?
+                | select(.name == $name) | .value] | first // "";
+            def wiring: {
+                SPACE_RECONCILE_QUEUE_GC_ENABLED: env("SPACE_RECONCILE_QUEUE_GC_ENABLED"),
+                AWS_ENDPOINT_URL_EC2: env("AWS_ENDPOINT_URL_EC2"),
+                hostAliases: ([.spec.template.spec.hostAliases[]? | .ip as $ip
+                    | .hostnames[] | "\(.)->\($ip)"] | sort | join(","))
+            };
+            ($want | wiring) as $w | ($have | wiring) as $h
+            | $w | keys_unsorted[] | select($w[.] != $h[.])
+            | "\(.): applied \($h[.] | @json), this checkout renders \($w[.] | @json)"' 2>&1)" \
+        || ! endpoint="$(jq -r '[.spec.template.spec.containers[].env[]?
+            | select(.name == "AWS_ENDPOINT_URL_EC2") | .value] | first // ""' <<<"$rendered" 2>&1)"; then
+        echo "ERROR: cannot compare the cluster-controller's reconcile-queue GC wiring: ${endpoint:-$diff}" >&2
+        return 1
+    fi
+    [[ -z "$diff" ]] || printf '%s\n' "$diff"
+    [[ -n "$endpoint" ]] || return 0
+    if ! available="$(kubectl --context "$ctx" -n space get deployment space-kind-fake-ec2 \
+            --ignore-not-found -o jsonpath='{.status.availableReplicas}' 2>&1)"; then
+        echo "ERROR: cannot read the fake EC2 endpoint of kind cluster $KIND_CLUSTER: $available" >&2
+        return 1
+    fi
+    [[ "${available:-0}" -ge 1 ]] || echo "space-kind-fake-ec2: no available replica"
+}
+
 bootstrap_kind_stack__bring_up() {
     # Always run the port-owner guard, even under SKIP_BOOTSTRAP — the
     # whole point is that the smoke test is destructive against
@@ -1279,9 +1373,27 @@ bootstrap_kind_stack__bring_up() {
     # Before the SKIP_BOOTSTRAP return: suites pick scenarios and expectations
     # by the requested mode, so running them against a cluster in the other
     # one would test what was not asked for.
-    local deployed_mode
+    local deployed_mode gc_wiring deployed_build
+    deployed_build="$(bootstrap_kind_stack__rust_build_mismatch)" || exit 1
     if [[ "${SKIP_BOOTSTRAP:-0}" == "1" ]]; then
+        if [[ -n "$deployed_build" ]]; then
+            echo "ERROR: kind cluster $KIND_CLUSTER runs the $deployed_build Rust build (read from its Rust" >&2
+            echo "       containers' images), and this run asks for SPACE_KIND_RUST_BUILD=${SPACE_KIND_RUST_BUILD:-test-hooks}" >&2
+            echo "       (the default is test-hooks). Set SPACE_KIND_RUST_BUILD to the cluster's build, or" >&2
+            echo "       switch the cluster by running once without SKIP_BOOTSTRAP=1, which restarts Tilt" >&2
+            echo "       in the requested build." >&2
+            exit 1
+        fi
         bootstrap_kind_stack__refuse_storage_mode_mismatch
+        gc_wiring="$(bootstrap_kind_stack__reconcile_queue_gc_mismatch)" || exit 1
+        if [[ -n "$gc_wiring" ]]; then
+            echo "ERROR: kind cluster $KIND_CLUSTER does not run this checkout's reconcile-queue GC wiring:" >&2
+            sed 's/^/       /' <<<"$gc_wiring" >&2
+            echo "       Bring it up from this checkout by running once without SKIP_BOOTSTRAP=1," >&2
+            echo "       which starts Tilt here (or restarts one watching another checkout) to apply" >&2
+            echo "       the cluster-controller chart and deploy space-kind-fake-ec2." >&2
+            exit 1
+        fi
         echo "[bootstrap] SKIP_BOOTSTRAP=1; assuming kind+tilt are already running"
         bootstrap_kind_stack__check_live_provenance
         return
@@ -1321,8 +1433,8 @@ bootstrap_kind_stack__bring_up() {
             tilt_state=stale
         elif bootstrap_kind_stack__tilt_watches_other_checkout; then
             tilt_state=elsewhere
-        elif [[ -n "$deployed_mode" ]]; then
-            # Tilt reads the mode once, from the environment it started with.
+        elif [[ -n "$deployed_mode" || -n "$deployed_build" ]]; then
+            # Tilt reads the modes once, from the environment it started with.
             tilt_state=mode
         fi
     elif orphan_pid="$(bootstrap_kind_stack__tilt_orphaned)"; then
@@ -1352,7 +1464,7 @@ bootstrap_kind_stack__bring_up() {
             echo "[bootstrap] restarting tilt from this checkout so its code is what gets built and deployed"
             bootstrap_kind_stack__stop_stale_tilt || exit 1
         elif [[ "$tilt_state" == "mode" ]]; then
-            echo "[bootstrap] restarting tilt to switch storage credentials from $deployed_mode to ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange}"
+            echo "[bootstrap] restarting tilt to switch to storage credentials ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange} and the ${SPACE_KIND_RUST_BUILD:-test-hooks} Rust build"
             bootstrap_kind_stack__stop_stale_tilt || exit 1
         elif [[ "$tilt_state" == "orphaned" ]]; then
             bootstrap_kind_stack__stop_stale_tilt "$orphan_pid" || exit 1
@@ -1467,6 +1579,16 @@ bootstrap_kind_stack__bring_up() {
     deployed_mode="$(bootstrap_kind_stack__storage_mode_mismatch)" || exit 1
     if [[ -n "$deployed_mode" ]]; then
         echo "ERROR: the bring-up finished with the cluster still in storage credentials mode $deployed_mode" >&2
+        exit 1
+    fi
+    # Tilt replaces each Rust workload's pods when its image or its rendered
+    # build changes; wait for every replacement before reading what runs.
+    deployed_build="$(bootstrap_kind_stack__rust_build_mismatch 600)" || exit 1
+    if [[ -n "$deployed_build" ]]; then
+        echo "ERROR: the bring-up finished with SPACE Rust containers on the $deployed_build Rust build," >&2
+        echo "       not ${SPACE_KIND_RUST_BUILD:-test-hooks}; per pod:" >&2
+        python3 "$REPO_ROOT/infra/space/kind/scripts/deployed-rust-build.py" \
+            --cluster "$KIND_CLUSTER" --pods >/dev/null || true
         exit 1
     fi
     node_keys="$(bootstrap_kind_stack__node_storage_keys_mismatch)" || exit 1

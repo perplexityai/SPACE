@@ -10,6 +10,7 @@ use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use aws_smithy_xml::decode::{Document, ScopedDecoder, XmlDecodeError, try_data};
 use aws_types::SdkConfig;
+use aws_types::service_config::ServiceConfigKey;
 use http::{Request, StatusCode, header};
 
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +132,15 @@ impl AwsQueryService {
     fn endpoint_prefix(self) -> &'static str {
         self.signing_name()
     }
+
+    /// The SDK service ID, which names the service's own endpoint setting
+    /// (`AWS_ENDPOINT_URL_EC2`, `AWS_ENDPOINT_URL_AUTO_SCALING`).
+    fn service_id(self) -> &'static str {
+        match self {
+            Self::Ec2 => "EC2",
+            Self::AutoScaling => "Auto Scaling",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,11 +157,37 @@ impl AwsQueryClient<ReqwestTransport> {
         Self {
             service,
             region: config.region().map(|region| region.as_ref().to_string()),
-            endpoint_url: config.endpoint_url().map(str::to_string),
+            endpoint_url: configured_endpoint_url(service, config),
             credentials_provider: config.credentials_provider(),
             transport: ReqwestTransport::default(),
         }
     }
+}
+
+/// The endpoint override, resolved as the generated AWS SDK clients resolve
+/// theirs: an endpoint set in code on the `SdkConfig` wins. Otherwise
+/// aws-config's service config answers, in its order: the service's
+/// `AWS_ENDPOINT_URL_<SERVICE>`, the global `AWS_ENDPOINT_URL`, `endpoint_url`
+/// in the profile's `services` section for the service, then the profile's own
+/// `endpoint_url`. The `SdkConfig`'s endpoint is the fallback when that yields
+/// nothing.
+fn configured_endpoint_url(service: AwsQueryService, config: &SdkConfig) -> Option<String> {
+    if config.get_origin("endpoint_url").is_client_config() {
+        return config.endpoint_url().map(str::to_string);
+    }
+    config
+        .service_config()
+        .and_then(|service_config| {
+            service_config.load_config(
+                ServiceConfigKey::builder()
+                    .service_id(service.service_id())
+                    .env("AWS_ENDPOINT_URL")
+                    .profile("endpoint_url")
+                    .build()
+                    .expect("every service config key field is set"),
+            )
+        })
+        .or_else(|| config.endpoint_url().map(str::to_string))
 }
 
 impl<T: QueryTransport> AwsQueryClient<T> {

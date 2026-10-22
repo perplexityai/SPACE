@@ -11,6 +11,7 @@ use kube::runtime::{reflector, watcher::Event};
 
 use super::execution::RecoveryJoinBackoffPolicy;
 use super::*;
+use crate::controllers::substrate::AbandonedRestoreRetirement;
 
 /// The namespace a substrate built here keeps its sandbox pods and their
 /// `sandbox_k8s_executions` rows in.
@@ -26,8 +27,9 @@ impl KubernetesSubstrate {
     /// It dials a pod's sandbox proxy on `sandbox_proxy_port`, and a node's
     /// node-api on the port its node-api pod advertises, or on
     /// `sandbox_proxy_port` when that pod advertises none. Its create,
-    /// data-plane, delete and cancel-rate budgets are the ones
-    /// [`Self::try_from_env`] computes with none of their variables set. The
+    /// data-plane, delete and cancel-rate budgets, and its abandoned-restore
+    /// retirement switch (off), are the ones [`Self::try_from_env`] computes
+    /// with none of their variables set. The
     /// node-api client still reads its transport and bearer tokens from the
     /// process environment, as in production.
     pub fn with_seeded_caches(
@@ -40,6 +42,7 @@ impl KubernetesSubstrate {
         substrate.k8s.create_command_ready_timeout = parse_create_command_ready_timeout(None);
         substrate.k8s.create_data_plane_ready_timeout = parse_create_data_plane_ready_timeout(None);
         substrate.k8s.k8s_blocking_delete_timeout = DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT;
+        substrate.k8s.abandoned_restore_retirement = AbandonedRestoreRetirement::Disabled;
         substrate.cancel_tracker = CancelRateTracker::with_default_budget();
         substrate
     }
@@ -81,8 +84,9 @@ pub(super) fn seeded_substrate(
 }
 
 /// A substrate over `pool` and `client` with the given caches, one-second
-/// create and delete budgets, a cancel-rate budget of 64 a second, and the
-/// node-group placement gate closed.
+/// create and delete budgets, a cancel-rate budget of 64 a second,
+/// abandoned-restore retirement enabled, and the node-group placement gate
+/// closed.
 pub(super) fn assemble_substrate(
     pool: PgPool,
     client: Client,
@@ -103,6 +107,7 @@ pub(super) fn assemble_substrate(
             create_command_ready_timeout: Duration::from_secs(1),
             create_data_plane_ready_timeout: Duration::from_secs(1),
             k8s_blocking_delete_timeout: Duration::from_secs(1),
+            abandoned_restore_retirement: AbandonedRestoreRetirement::Enabled,
             caches,
         },
         restore_waiters: RestoreWaiters::new(

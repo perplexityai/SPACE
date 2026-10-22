@@ -310,6 +310,10 @@ fn cluster_deleted_evict_rotates_past_backed_off_candidates() {
     assert_eq!(candidates, vec![drainable]);
 }
 
+/// node-ctl's default poll, the sync interval the eviction tests run at
+/// unless they are about another one.
+const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(crate::DEFAULT_POLL_INTERVAL_SECS);
+
 #[test]
 fn cluster_deleted_evict_quiescence_refusal_defers_to_the_window_end_not_the_flat_backoff() {
     // sbx-manager's quiescence refusal is a FailedPrecondition that says
@@ -320,10 +324,23 @@ fn cluster_deleted_evict_quiescence_refusal_defers_to_the_window_end_not_the_fla
         Duration::from_secs(549),
     );
     assert_eq!(
-        cluster_deleted_evict_refusal_disposition(&refusal),
-        ClusterDeletedEvictDisposition::Deferred(
-            Duration::from_secs(549) + CLUSTER_DELETED_EVICT_RETRY_SLACK
-        )
+        cluster_deleted_evict_refusal_disposition(&refusal, DEFAULT_SYNC_INTERVAL),
+        ClusterDeletedEvictDisposition::Deferred(Duration::from_secs(549) + DEFAULT_SYNC_INTERVAL)
+    );
+}
+
+#[test]
+fn cluster_deleted_evict_quiescence_slack_is_one_configured_sync() {
+    // The deferral is the window's end plus one configured poll, not a
+    // default-sized minute: with a 20 s poll and a 10 s window, 30 s rather
+    // than 70 s.
+    let refusal = pplx_space_common_grpc::with_retry_after(
+        tonic::Status::failed_precondition("inside the 10s quiescence window"),
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        cluster_deleted_evict_refusal_disposition(&refusal, Duration::from_secs(20)),
+        ClusterDeletedEvictDisposition::Deferred(Duration::from_secs(30))
     );
 }
 
@@ -340,7 +357,7 @@ fn cluster_deleted_evict_refusal_without_a_horizon_keeps_the_flat_backoff() {
         tonic::Status::deadline_exceeded("teardown still running"),
     ] {
         assert_eq!(
-            cluster_deleted_evict_refusal_disposition(&status),
+            cluster_deleted_evict_refusal_disposition(&status, DEFAULT_SYNC_INTERVAL),
             ClusterDeletedEvictDisposition::Deferred(CLUSTER_DELETED_EVICT_BACKOFF)
         );
     }
@@ -355,7 +372,7 @@ fn cluster_deleted_evict_horizon_is_capped_at_the_flat_backoff() {
         Duration::from_secs(4 * 3600),
     );
     assert_eq!(
-        cluster_deleted_evict_refusal_disposition(&refusal),
+        cluster_deleted_evict_refusal_disposition(&refusal, DEFAULT_SYNC_INTERVAL),
         ClusterDeletedEvictDisposition::Deferred(CLUSTER_DELETED_EVICT_BACKOFF)
     );
 }
@@ -363,11 +380,17 @@ fn cluster_deleted_evict_horizon_is_capped_at_the_flat_backoff() {
 #[test]
 fn cluster_deleted_evict_aborted_retries_next_sync_and_other_codes_fail() {
     assert_eq!(
-        cluster_deleted_evict_refusal_disposition(&tonic::Status::aborted("staging pull live")),
+        cluster_deleted_evict_refusal_disposition(
+            &tonic::Status::aborted("staging pull live"),
+            DEFAULT_SYNC_INTERVAL
+        ),
         ClusterDeletedEvictDisposition::RetryNextSync
     );
     assert_eq!(
-        cluster_deleted_evict_refusal_disposition(&tonic::Status::internal("boom")),
+        cluster_deleted_evict_refusal_disposition(
+            &tonic::Status::internal("boom"),
+            DEFAULT_SYNC_INTERVAL
+        ),
         ClusterDeletedEvictDisposition::Failed(CLUSTER_DELETED_EVICT_BACKOFF)
     );
 }

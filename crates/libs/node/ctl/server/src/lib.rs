@@ -402,13 +402,45 @@ struct NodeCtlWorker {
     db: Arc<Mutex<Connection>>,
     node_id: String,
     node_role: Option<NodeRole>,
+    /// The resolved reconciliation poll, as `spawn_poll_loop` runs it.
+    poll_interval: Duration,
     cluster_reconcile_trigger: ClusterReconcileTrigger,
     resource_status_reader: NodeResourceStatusReader,
     network_pool_status_reader: NetworkPoolStatusReader,
     orphan_inventory: orphan_inventory::Observer,
-    #[cfg(feature = "kubernetes")]
-    kubernetes_controller: Option<kubernetes_controller::Controller>,
+    /// The Kubernetes node-local controller when this node runs one.
+    node_objects: Option<Box<dyn NodeObjectReconciles>>,
     rx: mpsc::Receiver<WorkItem>,
+}
+
+/// The node's Kubernetes object reconciles: template-presence node metadata,
+/// network-slot status capacity, the SSD placement labels and the host-CPU
+/// label. They ride the template-inventory publication (see
+/// `NodeCtlWorker::run_outbound_sync`). A trait so a test can stand in for the
+/// Kubernetes controller.
+#[tonic::async_trait]
+trait NodeObjectReconciles: Send + Sync {
+    /// Run each reconcile once; a failure is logged and the rest still run.
+    async fn reconcile_node_objects(&mut self);
+}
+
+#[cfg(feature = "kubernetes")]
+#[tonic::async_trait]
+impl NodeObjectReconciles for kubernetes_controller::Controller {
+    async fn reconcile_node_objects(&mut self) {
+        if let Err(error) = self.reconcile_template_inventory().await {
+            tracing::warn!(%error, "local Kubernetes template-inventory facet failed");
+        }
+        if let Err(error) = self.reconcile_network_slot_capacity().await {
+            tracing::warn!(%error, "local Kubernetes network-slot capacity reconcile failed");
+        }
+        if let Err(error) = self.reconcile_ssd_headroom_tier().await {
+            tracing::warn!(%error, "local Kubernetes ssd-headroom-tier reconcile failed");
+        }
+        if let Err(error) = self.reconcile_host_cpu().await {
+            tracing::warn!(%error, "local Kubernetes host-cpu reconcile failed");
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -524,12 +556,16 @@ pub async fn run(
         db: db.clone(),
         node_id: node_id.clone(),
         node_role,
+        poll_interval: poll_interval(poll_interval_secs),
         cluster_reconcile_trigger: cluster_reconcile_trigger.clone(),
         resource_status_reader,
         network_pool_status_reader,
         orphan_inventory: orphan_inventory::Observer::default(),
         #[cfg(feature = "kubernetes")]
-        kubernetes_controller,
+        node_objects: kubernetes_controller
+            .map(|controller| Box::new(controller) as Box<dyn NodeObjectReconciles>),
+        #[cfg(not(feature = "kubernetes"))]
+        node_objects: None,
         rx,
     };
     let mut worker_task = tokio::spawn(worker.run(worker_shutdown_token));
@@ -783,14 +819,21 @@ fn node_role_label(role: Option<NodeRole>) -> &'static str {
     }
 }
 
+/// The poll period for a configured interval; a zero interval polls every
+/// second rather than spinning.
+fn poll_interval(interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs.max(1))
+}
+
 fn spawn_poll_loop(
     tx: mpsc::Sender<WorkItem>,
     interval_secs: u64,
     shutdown_token: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let interval_secs = interval_secs.max(1);
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        let period = poll_interval(interval_secs);
+        let interval_secs = period.as_secs();
+        let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -1154,6 +1197,7 @@ impl NodeCtlWorker {
                 Ok(false) => {
                     let node_id = self.node_id.clone();
                     let node_role = self.node_role;
+                    let poll_interval = self.poll_interval;
                     let facet_token = shutdown_token.child_token();
                     let (scope_kind, scope_items) = facet_scope_span_fields(&scope);
                     let span = tracing::info_span!(
@@ -1178,7 +1222,7 @@ impl NodeCtlWorker {
                                     facet.name(),
                                     FACET_RUN_TIMEOUT.as_secs()
                                 )),
-                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone()) => result,
+                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone(), poll_interval) => result,
                             };
                             (facet, status_name, started_at, result)
                         }
@@ -1265,23 +1309,11 @@ impl NodeCtlWorker {
         // the host-CPU label) share this cadence: the template-inventory facet
         // is pushed on every periodic outbound tick, so gating on it runs each
         // of these reconciles every tick and self-heals drift.
-        #[cfg(feature = "kubernetes")]
         if batch.facets().any(|(facet_name, _)| {
             facets::FacetKind::parse(facet_name) == Some(facets::FacetKind::TemplateInventory)
-        }) && let Some(controller) = &mut self.kubernetes_controller
+        }) && let Some(node_objects) = &mut self.node_objects
         {
-            if let Err(error) = controller.reconcile_template_inventory().await {
-                tracing::warn!(%error, "local Kubernetes template-inventory facet failed");
-            }
-            if let Err(error) = controller.reconcile_network_slot_capacity().await {
-                tracing::warn!(%error, "local Kubernetes network-slot capacity reconcile failed");
-            }
-            if let Err(error) = controller.reconcile_ssd_headroom_tier().await {
-                tracing::warn!(%error, "local Kubernetes ssd-headroom-tier reconcile failed");
-            }
-            if let Err(error) = controller.reconcile_host_cpu().await {
-                tracing::warn!(%error, "local Kubernetes host-cpu reconcile failed");
-            }
+            node_objects.reconcile_node_objects().await;
         }
 
         if !cluster_sync_configured() {

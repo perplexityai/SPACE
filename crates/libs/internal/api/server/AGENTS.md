@@ -17,12 +17,14 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   address equals the caller's remote IP (except publication above), never by a
   request field alone; one that names a node uses `authenticated_origin_node_id`. Existing exception:
   `TouchArtifactBackup` binds no node.
-- Destructive work authorized by the caller's role needs a registration that
-  existed before the call.
+- ClusterApi never creates a node registration. `nodes` and `node_k8s` rows
+  come from the cluster controller's Kubernetes node sync, sandbox pod
+  placement and Direct admin registration; a request naming an unregistered
+  node fails with `NotFound`.
 - `PublishNodeState` writes inventory, projections, node status and receipt
-  consumption in one transaction (`src/publish.rs`), after origin
-  registration commits separately. Keep receipts last, so their fencing sees
-  the final evidence.
+  consumption in one transaction (`src/publish.rs`), after resolving the
+  publisher to its existing registration. Keep receipts last, so their fencing
+  sees the final evidence.
 - A new `public.sandboxes` lifecycle write from a node report rechecks, in
   the write or under a `FOR UPDATE` or `FOR NO KEY UPDATE` row lock taken in
   the same transaction, that `active_node_id` is the authenticated publisher

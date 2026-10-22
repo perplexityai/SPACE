@@ -29,7 +29,7 @@ pub mod guest;
 pub mod host;
 pub mod inventory;
 pub mod operation_budget;
-mod sql_locator;
+pub use pplx_space_sql_locator::sql;
 
 /// Legacy sandbox ID string helpers.
 ///

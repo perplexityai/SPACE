@@ -52,6 +52,13 @@ spec:
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
+            {{- with .Values.hashAlgorithm }}
+            {{- if not (has . (list "sha256" "blake3")) }}
+            {{- fail "hashAlgorithm must be sha256 or blake3" }}
+            {{- end }}
+            - name: SPACE_TEMPLATE_HASH_ALGORITHM
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.rootfsBackingPolicy }}
             {{- if not (has . (list "inherit" "nocow")) }}
             {{- fail "rootfsBackingPolicy must be inherit, nocow, or empty" }}
@@ -66,6 +73,7 @@ spec:
             - name: SPACE_TEMPLATE_CACHE_BUDGET_BYTES
               value: {{ . | quote }}
             {{- end }}
+            {{- if eq (include "space-node-service.rustBuild" $) "test-hooks" }}
             {{- with .gcIntervalSecs }}
             - name: SPACE_TEMPLATE_GC_INTERVAL_SECS
               value: {{ . | quote }}
@@ -79,6 +87,7 @@ spec:
             # pinned bytes count toward the budget and are never reclaimed.
             - name: SPACE_TEMPLATE_PREFETCH_LATEST_N
               value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- end }}
           {{- include "space-node-service.probes" $ctx | nindent 10 }}

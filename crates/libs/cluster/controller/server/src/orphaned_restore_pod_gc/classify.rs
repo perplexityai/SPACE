@@ -163,10 +163,17 @@ pub enum SkipClass {
     /// current execution still materializing its UID, and a same-generation pod
     /// a restore re-drive could resume and adopt. Pod names embed the
     /// generation and are unique, so no second same-generation pod can coexist
-    /// with the current one. A lingering active execution on a `suspended` row
-    /// also lands here; retiring it is the suspend subsystem's job, not this
-    /// loop's.
+    /// with the current one.
     ActiveRuntime,
+    /// The pod's generation equals the active execution's on a `suspended`
+    /// row. A restore revert now retires its claim's execution in the same
+    /// transaction, so this shape is left by a revert that predates that or
+    /// couldn't prove a durable restore source, or by a suspend write that
+    /// raced a wake. Nothing on the row says which, and in the last case the
+    /// pod holds the only copy of the sandbox's state, so it's never reaped
+    /// here. Tallied apart from [`Self::ActiveRuntime`] so its count sizes
+    /// that backlog; the next restore of the sandbox clears it.
+    SuspendedSameGeneration,
     /// The owning row exists but isn't Kubernetes-managed, or holds a
     /// lifecycle value this loop doesn't recognize. It has an owner this loop
     /// can't reason about, so leave the pod alone.
@@ -189,6 +196,7 @@ impl SkipClass {
             Self::RowRestoring => "row_restoring",
             Self::RowTransient => "row_transient",
             Self::ActiveRuntime => "active_runtime",
+            Self::SuspendedSameGeneration => "suspended_same_generation",
             Self::UnrecognizedRow => "unrecognized_row",
             Self::RowQuarantined => "row_quarantined",
             Self::NoActiveExecution => "no_active_execution",
@@ -215,10 +223,11 @@ impl SkipClass {
 /// generation, so a same-generation pod can still be adopted by a restore that
 /// resumes that generation — deleting it unlocked would race that adoption and
 /// could destroy a live or recoverable runtime. Such a pod is the current
-/// execution or is still materializing its UID; on a `suspended` row it may be
-/// the carrier a failed revert teardown left behind, which the suspend
-/// subsystem owns. Its writers clear `active` only once that pod is gone or a
-/// durable snapshot exists, which is what makes this loop's
+/// execution or is still materializing its UID; on a `suspended` row it is
+/// [`SkipClass::SuspendedSameGeneration`]. The writers that clear `active` on
+/// a `suspended` row do so only once that pod is gone or restore selection is
+/// proven to pick a durable snapshot (a restore revert retires its claim's
+/// execution as `replaced` under that proof), which is what makes this loop's
 /// no-active-execution reap of a `suspended` row safe; a writer that cleared
 /// `active` with the carrier still holding the only copy would break that.
 ///
@@ -284,6 +293,11 @@ pub fn classify_disposition(
                 // the row's current runtime.
                 Some(active_generation) if pod_generation < active_generation => {
                     Disposition::Orphaned(OrphanReason::RowReverted)
+                }
+                Some(active_generation)
+                    if lifecycle == L::Suspended && pod_generation == active_generation =>
+                {
+                    Disposition::Skip(SkipClass::SuspendedSameGeneration)
                 }
                 // At or above the active generation — the current execution,
                 // still materializing, or a same-generation pod a re-drive could

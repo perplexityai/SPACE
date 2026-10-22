@@ -52,6 +52,7 @@ fn stale_instance() -> ResolvedPodInstance {
         ip: PodIp::parse("127.0.0.2").unwrap(),
         pod_uid: Some(PodUid::parse("space-sbx-old-uid").unwrap()),
         generation: 1,
+        sandbox_restoring: false,
     }
 }
 
@@ -83,10 +84,10 @@ struct MovedPod {
     _db: pplx_space_db_test_fixtures::TestDb,
 }
 
-async fn moved_pod() -> TestResult<MovedPod> {
+async fn moved_pod(lifecycle: &str) -> TestResult<MovedPod> {
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let sandbox_id = SandboxId::new();
-    insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
+    insert_test_sandbox_row(&db.pool, sandbox_id, lifecycle).await?;
     let pod_name = "space-sbx-new";
     insert_k8s_execution(
         &db.pool,
@@ -131,7 +132,7 @@ async fn a_native_request_follows_a_moved_pod_after_a_one_second_dial() -> TestR
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
-    let moved = moved_pod().await?;
+    let moved = moved_pod("started").await?;
 
     let started = Instant::now();
     let client = native_access::scope(
@@ -158,6 +159,30 @@ async fn a_native_request_follows_a_moved_pod_after_a_one_second_dial() -> TestR
         1,
         "only the live pod's channel is kept"
     );
+    Ok(())
+}
+
+/// A replacement whose sandbox is `restoring` serves no user request: the
+/// first dial's error goes back to the caller, whose recovery joins the
+/// restore.
+#[tokio::test(flavor = "current_thread")]
+async fn a_native_request_does_not_follow_a_moved_pod_into_a_restore() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let moved = moved_pod("restoring").await?;
+
+    let result = native_access::scope(
+        moved
+            .substrate
+            .access_kept_worker_client(moved.sandbox_id, &stale_instance()),
+    )
+    .await;
+    moved.shutdown.cancel();
+
+    let error = result.expect_err("the restoring replacement is not dialed");
+    assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(moved.substrate.pod_worker_channels.len(), 0);
     Ok(())
 }
 
@@ -206,7 +231,7 @@ async fn any_other_caller_waits_out_the_full_budget_on_the_old_address() -> Test
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
-    let moved = moved_pod().await?;
+    let moved = moved_pod("started").await?;
 
     let started = Instant::now();
     let result = moved

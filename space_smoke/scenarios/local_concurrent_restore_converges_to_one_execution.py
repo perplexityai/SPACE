@@ -65,6 +65,9 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
         before = len(race.executions())
         outcomes = race.race_connects(CALLERS)
         race.expect_converged(outcomes, executions_total=before + 1, label="happy")
+        # Every caller landed, so the slowest waited out the whole restore:
+        # the claim, the pod POST, the pod reaching Running and the VM serving.
+        restore_seconds = max(o.elapsed_seconds for o in outcomes)
         test.reconnect_by_id()
         observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")
         test.expect_command(observed, stdout=marker)
@@ -159,7 +162,29 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
         # The join is the no-hang contract: it fails if a caller is still
         # running at the deadline and re-raises if the callers died.
         firing.join(timeout=200)
-        running_after_lift = pod_watch.stop_after(seconds=30)
+        joined = time.monotonic()
+        # Nothing re-drives a refused pod POST once its caller is gone (the
+        # restore abandons the claim), so a pod that could still run was
+        # admitted before the callers drained and is listed by now. Keep
+        # watching until every such pod is gone, however long one sat Pending
+        # first, and for at least one restore as measured on this runner above
+        # plus the watch's polls. A pod still listed when the drain gives up
+        # fails here: the watch cannot close while one remains.
+        remaining = race.wait_for_pods_gone()
+        window = restore_seconds + 2 * pod_watch.interval_seconds
+        watched = round(max(window, time.monotonic() - joined + pod_watch.interval_seconds), 1)
+        test.record("teardown_no_running_window_seconds", watched)
+        running_after_lift = pod_watch.stop_after(
+            seconds=max(pod_watch.interval_seconds, joined + window - time.monotonic())
+        )
+        test.verify(
+            not remaining,
+            "teardown: an admitted pod never drained, so whether it ran is unknown",
+            pods=[(p.pod_name, p.phase, p.deleting) for p in remaining],
+            pods_reached_running_after_lift=[
+                (p.pod_name, p.execution_generation) for p in running_after_lift
+            ],
+        )
         race.expect_torn_down(
             outcomes,
             label="teardown",

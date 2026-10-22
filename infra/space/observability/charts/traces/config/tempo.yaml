@@ -29,6 +29,8 @@ backend_scheduler:
 backend_worker:
   compaction:
     block_retention: {{ .Values.tempo.blockRetention }}
+query_frontend:
+  query_end_cutoff: {{ .Values.tempo.queryEndCutoff }}
 overrides:
   defaults:
     ingestion:

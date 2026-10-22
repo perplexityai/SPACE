@@ -316,3 +316,164 @@ fn warning_cache_disk_marks_published_node_full_for_direct_scheduling() {
         "disk_available_warning: disk available fraction below warning threshold"
     );
 }
+
+/// Stands in for the Kubernetes node-local controller: counts the reconcile
+/// passes `run_outbound_sync` gives it.
+struct CountingNodeObjects(Arc<std::sync::atomic::AtomicUsize>);
+
+#[tonic::async_trait]
+impl NodeObjectReconciles for CountingNodeObjects {
+    async fn reconcile_node_objects(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A worker on a migrated, seeded node-ctl database with cluster sync
+/// unconfigured (this test binary never sets the endpoint), so each outbound
+/// facet's sync records its pass in `reconciliation_status` without a cluster.
+async fn timer_test_worker(
+    dir: &Path,
+) -> (
+    NodeCtlWorker,
+    mpsc::Sender<WorkItem>,
+    Arc<Mutex<Connection>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let db_path = dir.join("node-ctl.db");
+    pplx_space_sqlite::migrate("node-ctl", &db_path, &NODE_CTL_MIGRATOR)
+        .await
+        .expect("migrate node-ctl database");
+    let conn = pplx_space_sqlite::open_rusqlite(
+        &db_path,
+        pplx_space_sqlite::RusqliteOpenOptions::default(),
+    )
+    .expect("open node-ctl database");
+    init_reconciliation_status(&conn, DEFAULT_POLL_INTERVAL_SECS).expect("seed statuses");
+    let db = Arc::new(Mutex::new(conn));
+    let (tx, rx) = mpsc::channel(WORK_QUEUE_CAPACITY);
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker = NodeCtlWorker {
+        db: db.clone(),
+        node_id: "node-under-test".to_string(),
+        node_role: Some(NodeRole::Worker),
+        poll_interval: poll_interval(DEFAULT_POLL_INTERVAL_SECS),
+        cluster_reconcile_trigger: ClusterReconcileTrigger::new(tx.clone(), "node-under-test"),
+        resource_status_reader: NodeResourceStatusReader::new(),
+        network_pool_status_reader: NetworkPoolStatusReader::new(),
+        orphan_inventory: orphan_inventory::Observer::default(),
+        node_objects: Some(Box::new(CountingNodeObjects(passes.clone()))),
+        rx,
+    };
+    (worker, tx, db, passes)
+}
+
+/// When each outbound reconciler last completed a pass (0: never).
+fn outbound_completions(db: &Arc<Mutex<Connection>>) -> BTreeMap<String, u64> {
+    let outbound = [
+        SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
+        TEMPLATE_INVENTORY_OUTBOUND_RECONCILER,
+        NODE_STATUS_OUTBOUND_RECONCILER,
+    ];
+    read_reconciliation_statuses(db)
+        .expect("read reconciliation statuses")
+        .into_iter()
+        .filter(|status| outbound.contains(&status.name.as_str()))
+        .map(|status| (status.name, status.last_completed_at_unix_secs))
+        .collect()
+}
+
+/// One poll-loop tick, through the worker's real loop, publishes the periodic
+/// outbound facets — the sandbox-inventory census, template inventory and
+/// node status — and runs the node's Kubernetes object reconciles on the
+/// template-inventory publication. Nothing else marks those facets dirty
+/// here, so the tick alone has to supply them: a `TimerTick` that stopped
+/// passing `periodic_outbound_refs()`, or a Node-reconcile gate evaluated
+/// before those refs join the batch, leaves the counts at zero.
+#[tokio::test]
+async fn a_timer_tick_publishes_the_periodic_outbound_facets_and_reconciles_node_objects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (worker, tx, db, passes) = timer_test_worker(dir.path()).await;
+    assert!(
+        outbound_completions(&db)
+            .values()
+            .all(|completed| *completed == 0),
+        "a freshly seeded node has run no outbound pass"
+    );
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(worker.run(shutdown.child_token()));
+
+    tx.send(WorkItem::TimerTick {
+        next_due_at: now_secs() + DEFAULT_POLL_INTERVAL_SECS.cast_signed(),
+    })
+    .await
+    .expect("queue a timer tick");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let completions = outbound_completions(&db);
+        if completions.len() == 3 && completions.values().all(|completed| *completed > 0) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the timer tick did not run every periodic outbound facet: {completions:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the timer tick did not run the node's Kubernetes object reconciles once"
+    );
+
+    shutdown.cancel();
+    task.await.expect("worker task");
+}
+
+/// The control for the test above: an outbound sync with nothing dirty and
+/// no tick publishes nothing and reconciles no Node objects, so what the
+/// tick did came from the tick.
+#[tokio::test]
+async fn an_outbound_sync_with_nothing_dirty_publishes_and_reconciles_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (worker, tx, db, passes) = timer_test_worker(dir.path()).await;
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(worker.run(shutdown.child_token()));
+
+    tx.send(WorkItem::SyncDirty)
+        .await
+        .expect("queue a dirty sync");
+    // The worker handles items in order: once this refresh's inbound pass has
+    // recorded itself, the dirty sync before it has run.
+    tx.send(WorkItem::ManualRefresh {
+        refs: vec![dirty_state::FacetRef::new(
+            facets::FacetKind::NetworkPolicy.name(),
+            None::<String>,
+        )],
+    })
+    .await
+    .expect("queue a refresh");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while read_reconciliation_statuses(&db)
+        .expect("read reconciliation statuses")
+        .iter()
+        .all(|status| {
+            status.name != NETWORK_POLICY_RECONCILER || status.last_completed_at_unix_secs == 0
+        })
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refresh never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        outbound_completions(&db)
+            .values()
+            .all(|completed| *completed == 0),
+        "an empty dirty sync published an outbound facet"
+    );
+    assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    shutdown.cancel();
+    task.await.expect("worker task");
+}

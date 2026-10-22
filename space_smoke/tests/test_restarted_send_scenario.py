@@ -120,6 +120,9 @@ class _Control:
     def end_btrfs_send_interrupt(self, node_name: str, *, token: str) -> None:
         self.calls.append(f"end {token}")
 
+    def metric_export_interval_seconds(self, node_name: str, component: str) -> float:
+        return 2.0
+
 
 def _assertions(control: _Control) -> tuple[_Fixture, SuspendCodecAssertions, ResourceScope]:
     fixture = _Fixture()
@@ -136,7 +139,7 @@ def _interrupted(control: _Control) -> tuple[_Fixture, SuspendCodecAssertions]:
 
 def setUpModule() -> None:
     # The baseline is the first read: no export lag to wait out here.
-    patch = mock.patch("space_smoke.fixtures.STREAM_REJECTIONS_SETTLE_SECONDS", 0)
+    patch = mock.patch("space_smoke.fixtures.metric_settle_seconds", lambda _interval: 0)
     patch.start()
     unittest.addModuleCleanup(patch.stop)
 

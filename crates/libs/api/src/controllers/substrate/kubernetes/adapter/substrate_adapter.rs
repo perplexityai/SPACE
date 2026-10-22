@@ -1497,9 +1497,22 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .resolve_pod_instance(sandbox_id)
             .await
             .map_err(ControllerError::from)?
-            && let Ok(client) = self.access_kept_worker_client(sandbox_id, &pod).await
         {
-            return Ok(client);
+            if pod.sandbox_restoring {
+                return self
+                    .join_restore_before_dial(
+                        sandbox_id,
+                        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+                            "runtime_client",
+                        ),
+                        Duration::from_secs(120),
+                        charge,
+                    )
+                    .await;
+            }
+            if let Ok(client) = self.access_kept_worker_client(sandbox_id, &pod).await {
+                return Ok(client);
+            }
         }
 
         let sandbox = self
@@ -1507,11 +1520,23 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .require_sandbox(sandbox_id)
             .await
             .map_err(ControllerError::from)?;
+        if is_restoring_lifecycle(&sandbox.lifecycle) {
+            return self
+                .join_restore_before_dial(
+                    sandbox_id,
+                    pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+                        "runtime_client",
+                    ),
+                    Duration::from_secs(120),
+                    charge,
+                )
+                .await;
+        }
         if normalize_lifecycle(&sandbox_before_resolution.lifecycle) == "suspending"
             && is_suspended_lifecycle(&sandbox.lifecycle)
         {
-            let binding = self
-                .wake_execution_with_metric_identity(
+            return self
+                .wake_and_dial_once_started(
                     &sandbox,
                     Duration::from_secs(120),
                     pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
@@ -1519,9 +1544,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     ),
                     charge,
                 )
-                .await
-                .map_err(ControllerError::from)?;
-            return connect_worker(binding.binding.runtime_endpoint).await;
+                .await;
         }
         if is_wake_recovery_lifecycle(&sandbox.lifecycle)
             && !is_dormant_lifecycle(&sandbox.lifecycle)
@@ -1556,6 +1579,12 @@ impl SubstrateAdapter for KubernetesSubstrate {
         else {
             return Ok(None);
         };
+        if pod.sandbox_restoring {
+            // Never dial a restoring pod (see `join_restore_before_dial`).
+            // This path neither recovers nor waits: its callers are
+            // best-effort or turn "unreachable" into a retryable 503.
+            return Ok(None);
+        }
 
         match self.access_kept_worker_client(sandbox_id, &pod).await {
             Ok(client) => Ok(Some(client)),
@@ -1591,16 +1620,14 @@ impl SubstrateAdapter for KubernetesSubstrate {
     ) -> Result<RuntimeClient, ControllerError> {
         if is_suspended_lifecycle(&sandbox.lifecycle) {
             Self::should_allow_access_recovery(sandbox, activity)?;
-            let binding = self
-                .wake_execution_with_metric_identity(
+            return self
+                .wake_and_dial_once_started(
                     sandbox,
                     timeout,
                     metric_identity,
                     crate::controllers::substrate::RecoveryCharge::Exempt,
                 )
-                .await
-                .map_err(ControllerError::from)?;
-            return connect_worker(binding.binding.runtime_endpoint).await;
+                .await;
         }
 
         if let Some(pod) = self
@@ -1608,6 +1635,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .await
             .map_err(ControllerError::from)?
         {
+            if pod.sandbox_restoring {
+                return self
+                    .join_restore_before_dial(sandbox.id, metric_identity, timeout, charge)
+                    .await;
+            }
             let pod_ip = pod.ip;
             // A preserved slow create was reported `started` before its guest
             // command API was confirmed ready. Force a (bounded) command-ready
@@ -1668,6 +1700,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .await
             .map_err(ControllerError::from)?;
         Self::should_allow_access_recovery(&sandbox, activity)?;
+        if is_restoring_lifecycle(&sandbox.lifecycle) {
+            return self
+                .join_restore_before_dial(sandbox.id, metric_identity, timeout, charge)
+                .await;
+        }
         let binding = self
             .ensure_execution_ready_for_access(&sandbox, metric_identity, timeout, charge, None)
             .await?;

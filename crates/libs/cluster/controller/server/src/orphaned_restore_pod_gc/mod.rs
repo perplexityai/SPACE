@@ -47,14 +47,12 @@
 //! registers the capture with `BeginArtifactBackup`, which refuses it either
 //! way, so a reap can't register a snapshot the sandbox's next restore would
 //! select. A restore whose unmaterialized claim the request abandoned (the
-//! re-drive cancellation guard) retired its execution as `replaced`, and a pod
-//! below the active generation has a newer one, so the refusal says the
-//! execution was superseded and the node releases the VM and discards the
-//! capture. A restore the transient-lifecycle
-//! sweeper reverted cleared the row's node columns instead, so the capture is
-//! refused for having no source node; nothing tells the node to release, and
-//! the pod stays terminating (reported as `teardown_stuck`). A successful
-//! DELETE therefore means that
+//! re-drive cancellation guard), or that the API's rollback or the
+//! transient-lifecycle sweeper reverted with abandoned-restore retirement
+//! enabled, retired its execution as `replaced`,
+//! and a pod below the active generation has a newer one. Either way the
+//! refusal says the execution was superseded, and the node releases the VM and
+//! discards the capture. A successful DELETE therefore means that
 //! teardown has begun (the pod is terminating), not that the VM is gone: it's
 //! reported as `requested_orphaned_restore_pod_delete`, and the reap is only
 //! confirmed (`reaped_orphaned_restore_pod`, `cleanup_completed`) once the pod
@@ -99,16 +97,21 @@
 //!
 //! ## The one orphan this loop deliberately does NOT handle
 //!
-//! A same-generation pod on a `suspended` row — the revert's `retire_execution`
-//! teardown failed before clearing `active` — is left to the suspend subsystem.
-//! Reaping it safely means retiring the stale execution first (to defeat the
-//! adoption race) *and* proving the pod holds no committed state that exists
-//! only locally: a restored sandbox that later idle-auto-suspends presents
-//! identically, and its carrier pod may hold the only copy of the suspended VM
-//! state. That proof needs suspend-domain snapshot-recency and marker
-//! machinery, not a pod GC, and is tracked as a separate follow-up. Until then
-//! such a pod is cleaned by the next restore, or reaped here once the
-//! generation advances past it.
+//! A same-generation pod on a `suspended` row whose execution is still active
+//! is left alone. With abandoned-restore retirement enabled
+//! (`SPACE_ABANDONED_RESTORE_RETIREMENT_ENABLED`, off by default), both
+//! restore reverts (the API's rollback and the transient-lifecycle sweeper's)
+//! retire their claim's execution as `replaced` in the same transaction, once
+//! restore selection is proven to choose a durable pre-restore source, which
+//! turns their leftover pod into the no-active-execution orphan this loop
+//! reaps. What remains in this shape is left by a revert with retirement
+//! disabled, or that predates it, or couldn't prove the source, or by a
+//! suspend write that raced a wake and put a live, routed sandbox back to
+//! `suspended`. The row can't tell them apart, and in the last case the pod
+//! holds the only copy of the sandbox's state, so this loop only tallies them
+//! (`SkipClass::SuspendedSameGeneration`). The next restore of the sandbox
+//! clears such a pod, or this loop reaps it once the generation advances past
+//! it.
 //!
 //! Safeguards, in order:
 //! - **Restore-only.** Only pods carrying a restore annotation are considered;

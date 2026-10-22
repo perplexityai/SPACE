@@ -238,6 +238,10 @@ def configuration(env):
             # own running totals; delta stays the default for Datadog, whose
             # OTLP intake accepts only delta.
             f"telemetry.otlpMetricsTemporality={'cumulative' if mode == 'otel' else ''}",
+            # The local Prometheus is a bench backend that scenarios read
+            # back; a 2 s export keeps their waits for a sample short. The
+            # 10 s default stays for Datadog.
+            f"telemetry.otlpMetricExportIntervalMillis={'2000' if mode == 'otel' else ''}",
             f"telemetry.excludeDatadogLogs={'true' if mode == 'otel' else 'false'}",
             *[
                 f"telemetry.otlp{signal.title()}Endpoint={value}"

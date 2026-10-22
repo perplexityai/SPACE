@@ -16,6 +16,8 @@ struct FencedRestoreExecutor {
     in_slot_attempts: Arc<AtomicUsize>,
     /// Requeue for activation backpressure instead of a transient failure.
     backpressure: Arc<AtomicBool>,
+    /// Supply the error the operation fails with if it runs out of retries.
+    supplies_terminal_error: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -50,7 +52,10 @@ impl PublicOperationExecutor for FencedRestoreExecutor {
             progress_message: "restore claim is fenced by a lingering pod".to_string(),
             result_json: None,
             terminal_error_code: None,
-            terminal_error_json: None,
+            terminal_error_json: self
+                .supplies_terminal_error
+                .load(Ordering::SeqCst)
+                .then(|| serde_json::json!({ "reason": "restore_claim_fenced" })),
             retry_after: Some(Duration::from_secs(5)),
             requeue_reason: if self.backpressure.load(Ordering::SeqCst) {
                 PublicOperationRequeueReason::ActivationBackpressure
@@ -131,8 +136,8 @@ async fn a_restore_fenced_for_over_ten_minutes_still_converges() -> TestResult {
         let (state, attempts, delay_secs, _) = operation_row(&db.pool, operation_id).await?;
         assert_eq!(state, "queued");
         assert_eq!(attempts, 0, "a deferred requeue spends no attempt");
-        // The 5 s hint plus an equal-jittered eighth of the time deferring,
-        // capped at a minute.
+        // The 5 s hint plus an equal-jittered eighth of the time since the
+        // first claim, that term capped at a minute.
         let ceiling = (age_secs as f64 / 8.0).min(60.0);
         assert!(
             (5.0 + ceiling / 2.0 - 0.5..=5.0 + ceiling + 0.5).contains(&delay_secs),
@@ -178,6 +183,15 @@ async fn a_deferred_operation_past_its_window_fails_with_its_existing_error() ->
     .await?;
     age_and_make_due(&db.pool, start, max_age.as_secs() as i64 + 1).await?;
     assert_eq!(tick(&config, &store, &executor).await?.retried, 1);
+    // The window runs from the first claim, not from creation.
+    age_and_make_due(&db.pool, start, window.as_secs() as i64 + 1).await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations SET started_at = NOW() WHERE operation_id = $1"
+    ))
+    .bind(start.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(tick(&config, &store, &executor).await?.retried, 1);
     age_and_make_due(&db.pool, start, window.as_secs() as i64 + 1).await?;
     assert_eq!(tick(&config, &store, &executor).await?.failed, 1);
     let (state, _, _, error) = operation_row(&db.pool, start).await?;
@@ -185,6 +199,15 @@ async fn a_deferred_operation_past_its_window_fails_with_its_existing_error() ->
     let error = error.expect("a failed operation carries its error envelope");
     assert_eq!(error["reason"], "retry_attempts_exhausted");
     assert_eq!(error["retry_reason"], "retry_deferred");
+    // Its attempts were given back, so the envelope names the window.
+    assert_eq!(error["deferred_retry_window_ms"], window.as_secs() * 1000);
+    let elapsed_ms = error["elapsed_since_first_claim_ms"]
+        .as_u64()
+        .expect("the envelope carries the elapsed time");
+    assert!(
+        (window.as_secs() * 1000..(window.as_secs() + 60) * 1000).contains(&elapsed_ms),
+        "{elapsed_ms}"
+    );
 
     // A wake keeps its age deadline.
     let wake = create_queued_operation(
@@ -201,6 +224,36 @@ async fn a_deferred_operation_past_its_window_fails_with_its_existing_error() ->
     let error = error.expect("a failed operation carries its error envelope");
     assert_eq!(error["reason"], "operation_deadline_exceeded");
     assert_eq!(error["last_requeue_reason"], "retry_deferred");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_executor_supplied_error_also_names_the_exhausted_window() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let executor = FencedRestoreExecutor::default();
+    executor
+        .supplies_terminal_error
+        .store(true, Ordering::SeqCst);
+    let window = pplx_space_api::public_operation_driver::DEFERRED_RETRY_WINDOW;
+    let operation_id = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::StartSandbox,
+        "sbx_fenced_start_own_error",
+    )
+    .await?;
+    age_and_make_due(&db.pool, operation_id, window.as_secs() as i64 + 1).await?;
+    assert_eq!(tick(&deferral_config(), &store, &executor).await?.failed, 1);
+    let (_, _, _, error) = operation_row(&db.pool, operation_id).await?;
+    let error = error.expect("a failed operation carries its error envelope");
+    assert_eq!(error["reason"], "restore_claim_fenced");
+    assert_eq!(error["deferred_retry_window_ms"], window.as_secs() * 1000);
+    assert!(error["elapsed_since_first_claim_ms"].as_u64().is_some());
     Ok(())
 }
 

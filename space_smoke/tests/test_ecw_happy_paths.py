@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import time
 import unittest
+from datetime import UTC, datetime
 from typing import cast
 from unittest import mock
 
@@ -46,12 +48,13 @@ from space_smoke.scenarios.ecw_timeout_rearm import (
     timeout_rearm,
 )
 from space_smoke.scenarios.ecw_timeout_update import (
+    DEADLINE_MARGIN_SECONDS,
     EXTENDED_TIMEOUT_SECONDS,
     INITIAL_TIMEOUT_SECONDS,
     MARKER as TIMEOUT_MARKER,
+    RECONNECT_TIMEOUT_SECONDS,
+    SCHEDULER_TICK_SECONDS,
     SUSPENDED_TIMEOUT_SECONDS,
-    WAIT_AFTER_RECONNECT_SECONDS,
-    WAIT_SECONDS,
     timeout_update,
 )
 
@@ -85,12 +88,15 @@ class _Sandbox:
         *,
         state: EcwSandboxState | None = EcwSandboxState.RUNNING,
         info_sandbox_id: str | None = None,
+        timeout: int = INITIAL_TIMEOUT_SECONDS,
     ) -> None:
         self.trace: list[str] = []
         self.files = _Filesystem(self.trace)
         self._command_files: dict[str, str] = {}
         self.state = state
         self.info_sandbox_id = info_sandbox_id or self.sandbox_id
+        self._timeout = timeout
+        self._end_at = time.time() + timeout
 
     def run(self, command: str, *, timeout: int = 60) -> EcwCommandResult:
         self.trace.append(f"run:{command}:{timeout}")
@@ -107,7 +113,12 @@ class _Sandbox:
 
     def get_info(self) -> EcwSandboxInfo:
         self.trace.append("get_info")
-        return EcwSandboxInfo(self.info_sandbox_id, "seed", self.state)
+        return EcwSandboxInfo(
+            self.info_sandbox_id,
+            "seed",
+            self.state,
+            end_at=datetime.fromtimestamp(self._end_at, UTC),
+        )
 
     def try_get_info(self) -> EcwSandboxInfo | None:
         self.trace.append("try_get_info")
@@ -115,6 +126,9 @@ class _Sandbox:
 
     def set_timeout(self, timeout: int) -> None:
         self.trace.append(f"set_timeout:{timeout}")
+        self._timeout = timeout
+        if self.state is EcwSandboxState.RUNNING:
+            self._end_at = time.time() + timeout
 
     def refresh(self) -> None:
         self.trace.append("refresh")
@@ -126,6 +140,7 @@ class _Sandbox:
     def connect(self, *, timeout: int = 300) -> _Sandbox:
         self.trace.append(f"connect:{timeout}")
         self.state = EcwSandboxState.RUNNING
+        self._end_at = time.time() + max(timeout, self._timeout)
         return self
 
     def kill(self) -> None:
@@ -171,21 +186,29 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
             timeout_update.verify(_fixture(sandbox))
 
         self.assertEqual(timeout_update.sandbox.timeout, INITIAL_TIMEOUT_SECONDS)
-        self.assertEqual(
-            [call.args[0] for call in sleep.call_args_list],
-            [WAIT_SECONDS, WAIT_AFTER_RECONNECT_SECONDS],
-        )
+        # Each wait runs out a deadline plus one scheduler tick and the margin:
+        # the original deadline, then the longest earlier timeout after restore.
+        settle = SCHEDULER_TICK_SECONDS + DEADLINE_MARGIN_SECONDS
+        waits = [call.args[0] for call in sleep.call_args_list]
+        self.assertEqual(len(waits), 2)
+        self.assertAlmostEqual(waits[0], INITIAL_TIMEOUT_SECONDS + settle, delta=1)
+        self.assertAlmostEqual(waits[1], EXTENDED_TIMEOUT_SECONDS + settle, delta=1)
         self.assertEqual(
             sandbox.trace,
             [
+                "get_info",
                 f"set_timeout:{EXTENDED_TIMEOUT_SECONDS}",
+                "get_info",
+                "get_info",
                 f"run:printf %s {TIMEOUT_MARKER}:60",
+                "get_info",
                 "pause",
                 "try_get_info",
                 "get_info",
                 f"set_timeout:{SUSPENDED_TIMEOUT_SECONDS}",
                 "get_info",
-                "connect:1",
+                f"connect:{RECONNECT_TIMEOUT_SECONDS}",
+                "get_info",
                 "try_get_info",
                 "get_info",
                 f"run:printf %s {TIMEOUT_MARKER}:60",

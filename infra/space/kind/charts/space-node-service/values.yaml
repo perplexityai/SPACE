@@ -43,7 +43,8 @@ node:
   # scale to 1 GiB. The floor is a deployment setting; the reservation is a
   # test hook that only the Kind build's test-hooks feature reads, and release
   # binaries always reserve 8 GiB
-  # (crates/libs/common/core/src/host/disk_admission.rs). Without this every
+  # (crates/libs/common/core/src/host/disk_admission.rs), so the release lane
+  # (`rustBuild: release`) renders only the floor. Without the floor every
   # node publishes scheduling_status=full and sandbox-manager rejects
   # prepare_sandbox with disk_available_below_threshold. Read by the services
   # that admit cache allocations: node-manager, sandbox-manager,

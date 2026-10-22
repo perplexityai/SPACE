@@ -119,14 +119,44 @@ check decoded bytes before publishing the rootfs into the cache. Compressed-file
 checksums, base-snapshot identities and runtime binary checksums remain SHA-256.
 
 Deploy dual-algorithm readers across the API, workers, builders and operator
-clients before enabling BLAKE3 production. The reader release still registers new
-rootfs images with SHA-256. It needs no PostgreSQL or SQLite migration, and uses
-the existing algorithm-prefixed protobuf string fields.
+clients before deploying BLAKE3 producers. New registrations default to BLAKE3.
+No PostgreSQL or SQLite migration is needed; the existing protobuf strings carry
+the algorithm prefix.
+
+For an emergency return to SHA-256 production, set
+`SPACE_TEMPLATE_HASH_ALGORITHM=sha256` on **template-manager** processes that
+register builds, including builders, and restart them. The setting is read once
+at service startup; invalid values fail startup. Set it in the deployment's
+persistent environment configuration so later deployments retain the override.
+Remove it or set `SPACE_TEMPLATE_HASH_ALGORITHM=blake3` to restore the default.
+
+The override affects new registrations. Imports, pulls, cache recovery and
+refreshes continue to verify the algorithm recorded in each existing identity.
+A registration already in progress can finish using its original setting.
+Existing BLAKE3 releases remain readable; the override neither rewrites them nor
+makes them compatible with SHA-only binaries.
+
+Merge and deploy the reader release everywhere, including builders, before
+merging the producer-default change. Keep that deployed reader release as the
+rollback target. Deploying both changes together provides no reader-only
+rollback release.
+
+The Kind template-manager chart exposes this setting as `hashAlgorithm`.
+Install the equivalent deployment value before enabling BLAKE3 production so
+an emergency change survives the next deployment.
 
 Existing SHA-256 releases keep their identities. A BLAKE3 digest for the same
-bytes is a distinct release and cache entry. Once BLAKE3 releases are published,
+bytes is a distinct release and cache entry. Rebuilding identical content can
+therefore trigger another download and materialization on each consuming node,
+with both entries retained until normal garbage collection. Monitor template
+materialization bytes, cache occupancy and restore latency during the rollout.
+Once BLAKE3 releases are published,
 keep dual-algorithm readers deployed: an older SHA-only binary cannot consume
 those releases or safely reconcile their cache directories.
+
+The standalone `scripts/space-upload-template.sh` uploader still produces
+SHA-256 identities independently of this setting. Migrate that producer, retained
+releases and their consumers before considering retirement of SHA-256 readers.
 
 ## Build environment exports
 

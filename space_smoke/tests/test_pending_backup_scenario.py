@@ -46,6 +46,7 @@ class _Control:
         self.publications = [CensusPublication("worker-a", "applied", 1)]
         self.backed = False
         self.op_state = "succeeded"
+        self.publish_failure: str | None = None
 
     def object_store_replicas(self) -> int:
         self.calls.append("read")
@@ -85,6 +86,13 @@ class _Control:
     def operation_state(self, operation_id: str) -> str:
         return self.op_state
 
+    def sandbox_pod_placement(self, sandbox_id: str):
+        return SimpleNamespace(node_name="worker-a")
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        self.calls.append(f"publish:{node_name}:{facet}")
+        return self.publish_failure
+
 
 def _assertions(control: _Control):
     fixture = _Fixture()
@@ -103,6 +111,7 @@ class Verdicts(unittest.TestCase):
     def test_an_empty_queue_with_an_unbacked_artifact_still_fails(self) -> None:
         control = _Control()
         _, census, _ = _assertions(control)
+        census.suspend_async()
         census.expect_queue_names_this_sandbox(timeout=60)
         control.queue = []
         control.backed = False
@@ -125,7 +134,62 @@ class Verdicts(unittest.TestCase):
         control = _Control()
         control.queue = [PendingBackupRow("a", "full"), PendingBackupRow("b", "disk")]
         _, census, _ = _assertions(control)
+        census.suspend_async()
         with self.assertRaisesRegex(InvariantViolation, "more than once"):
+            census.expect_queue_names_this_sandbox(timeout=60)
+
+    def test_the_census_is_requested_from_the_sandboxs_worker_until_the_row_appears(self) -> None:
+        control = _Control()
+        control.queue = []
+        _, census, _ = _assertions(control)
+        census.suspend_async()
+        reads = 0
+
+        def queue(_sandbox_id: str):
+            nonlocal reads
+            reads += 1
+            return [PendingBackupRow("art-1", "full")] if reads >= 3 else []
+
+        control.pending_backup_queue = queue  # type: ignore[method-assign]
+        census.expect_queue_names_this_sandbox(timeout=60, republish_seconds=0)
+        self.assertEqual(
+            [call for call in control.calls if call.startswith("publish:")],
+            ["publish:worker-a:sandbox-inventory"] * 3,
+        )
+        self.assertLess(control.calls.index("suspend"), control.calls.index("publish:worker-a:sandbox-inventory"))
+
+    def test_a_failed_census_request_is_recorded_and_the_polled_row_still_passes(self) -> None:
+        # node-ctl restarting or an exec blip fails the request; its own poll
+        # still sends the census, so the row arriving is a pass.
+        control = _Control()
+        control.publish_failure = "publish node-ctl facet sandbox-inventory on worker-a failed (1): unavailable"
+        control.queue = []
+        fixture, census, _ = _assertions(control)
+        census.suspend_async()
+        reads = 0
+
+        def queue(_sandbox_id: str):
+            nonlocal reads
+            reads += 1
+            return [PendingBackupRow("art-1", "full")] if reads >= 3 else []
+
+        control.pending_backup_queue = queue  # type: ignore[method-assign]
+        census.expect_queue_names_this_sandbox(timeout=60, republish_seconds=0)
+        self.assertEqual(fixture.records["pending_artifact"], "art-1")
+        self.assertEqual(len(fixture.records["census_request_failures"]), 3)
+
+    def test_failed_census_requests_with_no_row_still_fail_within_the_budget(self) -> None:
+        control = _Control()
+        control.publish_failure = "publish node-ctl facet sandbox-inventory on worker-a failed (124): timed out"
+        control.queue = []
+        _, census, _ = _assertions(control)
+        census.suspend_async()
+        with self.assertRaisesRegex(InvariantViolation, "no pending-backup queue row"):
+            census.expect_queue_names_this_sandbox(timeout=0)
+
+    def test_the_queue_wait_needs_the_suspend_to_have_recorded_the_worker(self) -> None:
+        _, census, _ = _assertions(_Control())
+        with self.assertRaisesRegex(RuntimeError, "suspend_async"):
             census.expect_queue_names_this_sandbox(timeout=60)
 
 

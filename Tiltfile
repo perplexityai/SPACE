@@ -93,9 +93,15 @@ if config.tilt_subcommand != "down":
         quiet = True,
     )).strip()
     watch_file("infra/space/kind/scripts/sts-bridge-secret.sh")
+# Which Rust binaries to build and deploy: test-hooks (the default) or the
+# release lane, which builds without the test-hooks feature and renders no test
+# hook into the charts. See "Release-build lane" in infra/space/kind/README.md.
+RUST_BUILD = str(local(["bash", "infra/space/kind/lib/rust-build.sh"], quiet = True)).strip()
+watch_file("infra/space/kind/lib/rust-build.sh")
 CHART_SET = TELEMETRY_SET + [
     "storageCredentials=" + STORAGE_CREDENTIALS,
     "storageExchange.secretChecksum=" + STS_BRIDGE_SECRET_CHECKSUM,
+    "rustBuild=" + RUST_BUILD,
 ]
 watch_file("infra/space/kind/charts/space-kind-telemetry")
 # Reconcile before returning any changed producer manifests, including on a
@@ -175,6 +181,9 @@ if TELEMETRY_MODE == "otel":
 # /artifacts layout, refusing binaries the runtime images' glibc cannot load;
 # elsewhere it runs docker/Dockerfile.rust-build-kind (one cook, one build, as
 # BuildKit stages). SPACE_KIND_RUST_ARTIFACTS=incremental|docker forces either.
+# Both build RUST_BUILD, the mode the charts are rendered for, and every
+# runtime image built from the artifact image carries its build label
+# (runtime-image-cache.sh), which scripts/deployed-rust-build.py reads back.
 # Each custom_build still runs the script first — it is idempotent and
 # serialized by a file lock, so no image can start from a stale artifact image
 # whatever order Tilt updates them in.
@@ -186,6 +195,7 @@ RUST_ARTIFACT_DEPS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo
                       "docker/Dockerfile.rust-build-kind",
                       "docker/Dockerfile.rust-artifacts-host",
                       "infra/space/kind/scripts/build-rust-artifacts.sh",
+                      "infra/space/kind/lib/rust-build.sh",
                       "scripts/build-runtime-supervisor.sh",
                       "infra/space/identity/node-identities.sh",
                       "templates/firecracker/seed/rootfs-builder.sh",
@@ -193,7 +203,7 @@ RUST_ARTIFACT_DEPS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo
                       "templates/firecracker/recipes/code-runtime.toml",
                       "templates/firecracker/recipes/code-runtime"]
 
-RUST_ARTIFACT_BUILD = "bash infra/space/kind/scripts/build-rust-artifacts.sh"
+RUST_ARTIFACT_BUILD = "SPACE_KIND_RUST_BUILD={} bash infra/space/kind/scripts/build-rust-artifacts.sh".format(RUST_BUILD)
 
 # Every image build first pulls whichever of its Dockerfiles' registry bases
 # are missing, retrying failed pulls, so a registry rate limit during a cold
@@ -302,8 +312,9 @@ rust_runtime_image(
 # space-worker: the production worker image (docker/Dockerfile.worker — the
 # binaries, cargo features, unix identities, init scripts, nftables policies and
 # recipes the production node DaemonSets run). Every node-service DaemonSet,
-# the operator shell and space-internal-api run it unchanged. LTO disabled for
-# faster local iteration.
+# the operator shell and space-internal-api run it unchanged. LTO is off for
+# faster local iteration, except in the release lane (RUST_BUILD), which links
+# with thin LTO.
 custom_build(
     ref = "space-worker:local",
     command = " && ".join([
@@ -365,6 +376,19 @@ custom_build(
         image_build("space-kind-sts-bridge") + " -t $EXPECTED_REF --build-arg SPACE_GIT_SHA .",
     ]),
     deps = ["docker/Dockerfile.kind-sts-bridge", "infra/space/kind/sts-bridge"],
+    skips_local_docker = False,
+)
+
+# Kind-only: the fake EC2 endpoint the cluster-controller's reconcile-queue GC
+# calls in place of EC2. Go, standard library only.
+custom_build(
+    ref = "space-kind-fake-ec2:local",
+    command = " && ".join([
+        BUILD_INPUTS_SNAPSHOT,
+        pull_base_images("docker/Dockerfile.kind-fake-ec2"),
+        image_build("space-kind-fake-ec2") + " -t $EXPECTED_REF --build-arg SPACE_GIT_SHA .",
+    ]),
+    deps = ["docker/Dockerfile.kind-fake-ec2", "infra/space/kind/fake-ec2"],
     skips_local_docker = False,
 )
 
@@ -537,8 +561,8 @@ local_resource(
 
 # ── Helm releases (in dependency order) ───────────────────────────────────
 
-def helm_release(name, chart):
-    return helm(chart, name = name, namespace = NAMESPACE, set = CHART_SET)
+def helm_release(name, chart, values = []):
+    return helm(chart, name = name, namespace = NAMESPACE, values = values, set = CHART_SET)
 
 # Both entry points use a fresh, shared render for backend transitions.
 # Fake mode never consumes SaaS credentials; SaaS uses an existing Secret only.
@@ -576,7 +600,10 @@ SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
 # No port_forward: localhost:8080 is the cluster's host port mapping onto the
 # space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
 # across the autoscaled replicas as a deployment's load balancer does.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local"))
+# values-kind.yaml carries the bench's non-test-hook overrides, which the
+# caller-provided-cluster chart must not inherit; bootstrap.sh passes it too.
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local",
+                      values = ["infra/space/kind/charts/space-api-local/values-kind.yaml"]))
 k8s_resource(
     "space-api",
     labels = ["control-plane"],
@@ -624,7 +651,7 @@ k8s_yaml(helm(
     "infra/space/kind/charts/space-internal-api-local",
     name = "space",
     namespace = NAMESPACE,
-    set = TELEMETRY_SET,
+    set = TELEMETRY_SET + ["rustBuild=" + RUST_BUILD],
 ))
 k8s_resource(
     "space-internal-api",
@@ -644,7 +671,8 @@ k8s_resource(
 )
 # The authority's external key provider: the Kind-only intermediate-key broker
 # fixture, whose derived keys survive restarts of either side.
-k8s_yaml(helm("infra/space/kind/charts/space-kind-key-broker", name = "space", namespace = NAMESPACE))
+k8s_yaml(helm("infra/space/kind/charts/space-kind-key-broker", name = "space", namespace = NAMESPACE,
+              set = ["rustBuild=" + RUST_BUILD]))
 k8s_resource(
     "space-kind-key-broker",
     labels = ["control-plane"],
@@ -668,6 +696,15 @@ k8s_resource(
     "space-cluster-controller",
     labels = ["control-plane"],
     resource_deps = ["space-api", "label-kind-infra"],
+)
+# Kind-only fake EC2 endpoint: the cluster-controller reconcile-queue GC's
+# DescribeInstances, answered from the cluster's Nodes. Its leaf comes from
+# internal-rpc-tls.
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-kind-fake-ec2"))
+k8s_resource(
+    "space-kind-fake-ec2",
+    labels = ["control-plane"],
+    resource_deps = ["label-kind-infra", "internal-rpc-tls"],
 )
 
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-ui-local"))
@@ -763,7 +800,8 @@ for line in NODE_RELEASES:
 
 # Kind-only operator shell on every sandbox worker and builder; the smoke
 # harness's on-node checks run here.
-k8s_yaml(helm("infra/space/kind/charts/space-node-debug", name = "space", namespace = NAMESPACE))
+k8s_yaml(helm("infra/space/kind/charts/space-node-debug", name = "space", namespace = NAMESPACE,
+              set = ["rustBuild=" + RUST_BUILD]))
 k8s_resource(
     "space-node-debug",
     labels = ["node-debug"],

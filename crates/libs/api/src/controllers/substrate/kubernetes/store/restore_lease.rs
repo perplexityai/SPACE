@@ -210,57 +210,206 @@ impl K8sStore {
             .collect()
     }
 
-    /// Best-effort lifecycle revert for the restore/wake rollback paths in
-    /// [`super::super::execution`]. Reverts the row to `lifecycle` (in practice
-    /// `"suspended"`) when a Kubernetes restore or wake fails mid-flight.
-    /// CAS-guarded against `('failed', 'quarantined', 'deleted', 'cleanup_required')` so
-    /// a rollback can't overwrite a terminal lifecycle the
-    /// transient-lifecycle sweeper just claimed (the sweeper decided the
-    /// operation was wedged; the rollback's "revert to my last known
-    /// state" intent is wrong once the row has been retired).
+    /// Revert a failed fresh restore claim from `restoring` to `suspended`.
     ///
-    /// **Returns Ok regardless of whether the write applied.** The
-    /// rollback is best-effort by design — `failed` is the correct
-    /// resting state for a swept row, and callers don't act on the
-    /// no-write case. The function name encodes this contract; do
-    /// **not** call this from paths that depend on "the row is now in
-    /// `lifecycle` after this returns." Use a dedicated CAS-guarded
-    /// UPDATE inline if you need to detect race-loss (see the
-    /// post-restore / post-wake CAS in
-    /// `crates/libs/api/src/controllers/sandbox/lifecycle.rs` for the
-    /// pattern).
-    /// Best-effort revert of a sandbox's lifecycle (used by the restore
-    /// rollback path to put a failed restore back to `suspended`).
+    /// The revert is the one writer that knows the restore was abandoned, so
+    /// it records that on the execution the claim created: in the same
+    /// transaction, that execution is retired as `replaced` and the row is
+    /// unplaced. A pod the claim materialized then belongs to no active
+    /// execution, so no later restore adopts it (a new claim allocates a newer
+    /// generation, whose lingering-pod sweep deletes this one), and a backup
+    /// its runtime captures registers against a retired generation. Left
+    /// active instead, the execution keeps a same-generation pod adoptable on
+    /// a `suspended` row that no reconciler revisits, and that row looks like
+    /// one whose pod holds the only copy of the sandbox's state.
     ///
-    /// `restore_lease_token` token-guards the revert: when `Some`, the UPDATE
-    /// only matches if the row still holds that exact lease token. This closes
-    /// a stale-rollback race the restore lease introduced — a fresh attempt's
-    /// clean-failure rollback could be delayed past the lease TTL, by which
-    /// point a retry has claimed a *new* token and is actively restoring;
-    /// without the guard the stale rollback would flip the newer restore back
-    /// to `suspended` (and the clear-trigger would drop the newer lease),
-    /// orphaning live work. `None` skips the guard (evacuation reverts, which
-    /// are marker-gated and tokenless, and test-only lifecycle setup).
-    pub(in crate::controllers::substrate::kubernetes) async fn revert_lifecycle_after_rollback_best_effort(
+    /// The retirement needs the suspended-revert proof: restore selection on
+    /// the reverted row must still choose a ready, durably stored pre-restore
+    /// source, the state the sandbox had when it was suspended. The retired
+    /// runtime served no user request: the access, runtime-client, ingress
+    /// and data-plane route paths never dial a `restoring` sandbox's pod, but
+    /// join its restore or fail retryably, once every routing replica runs
+    /// them; until then retirement stays disabled. Without the proof, or when the
+    /// active execution can't be shown
+    /// to be this claim's (one that predates the claim was reused, not
+    /// created by it), only the lifecycle reverts and the execution is left as
+    /// it was.
+    ///
+    /// `restore_lease_token` binds the revert to the claim that owns the row:
+    /// a rollback delayed past the lease TTL must not flip a retry that holds
+    /// a newer token back to `suspended` (the lease-clear trigger would also
+    /// drop that retry's lease). `None` is the tokenless evacuation claim.
+    /// Either way the row must still be `restoring`; a row another writer
+    /// moved on, including one a node converged to `started`, is left alone.
+    ///
+    /// `activation_attempt` is the attempt and generation this claim was
+    /// assigned, if it got that far. The execution is retired only if it
+    /// still carries them, because a redrive of the same `restoring` row
+    /// reuses the execution under a new attempt. A claim with no attempt is
+    /// identified by its lease token alone, so a tokenless one retires
+    /// nothing: a delayed evacuation rollback can't tell its execution from a
+    /// later evacuation redrive's.
+    ///
+    /// With `retirement` disabled, only the lifecycle reverts, whatever the
+    /// proof says: the execution, placement and placement clock stay as the
+    /// restore left them (see [`AbandonedRestoreRetirement`]).
+    pub(in crate::controllers::substrate::kubernetes) async fn revert_restore_claim_to_suspended(
         &self,
         sandbox_id: SandboxId,
-        lifecycle: &str,
         restore_lease_token: Option<Uuid>,
-    ) -> Result<(), SubstrateError> {
-        sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET lifecycle = $1
-              WHERE id = $2
-                AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
-                AND ($3::uuid IS NULL OR restore_lease_token = $3)"
+        activation_attempt: Option<(SandboxActivationAttemptId, i64)>,
+        retirement: crate::controllers::substrate::AbandonedRestoreRetirement,
+    ) -> Result<RestoreClaimRevert, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start restore revert transaction")?;
+        // Lock first, in its own statement: a later statement in this
+        // transaction then reads the snapshots and executions as of after the
+        // lock, so a writer that committed while this waited is seen.
+        let locked: Option<bool> = sqlx::query_scalar(sql!(
+            "SELECT TRUE
+               FROM sandboxes
+              WHERE id = $1
+                AND lifecycle = 'restoring'
+                AND ($2::uuid IS NULL OR restore_lease_token = $2)
+                FOR UPDATE"
         ))
-        .bind(lifecycle)
         .bind(sandbox_id)
         .bind(restore_lease_token)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .db_context_with(|| format!("failed to revert sandbox lifecycle to {lifecycle}"))?;
-        Ok(())
+        .db_context("failed to lock sandbox for restore revert")?;
+        if locked.is_none() {
+            tx.commit()
+                .await
+                .db_context("failed to commit restore revert transaction")?;
+            return Ok(RestoreClaimRevert::NotReverted);
+        }
+
+        let proof = restore_retry_suspended_revert_snapshot_exists("s");
+        // Under the row lock no other claim can replace the execution, and
+        // `lifecycle_changed_at` still reads this claim's `restoring`
+        // transition, so an active execution created since, carrying this
+        // claim's attempt (or, with no attempt, under this claim's lease
+        // token), is the one it created.
+        let query = format!(
+            "SELECT claimed.generation,
+                    claimed.pod_name,
+                    EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions e
+                         WHERE e.sandbox_id = s.id
+                           AND e.active
+                    ),
+                    {proof}
+               FROM sandboxes s
+               LEFT JOIN LATERAL (
+                   SELECT e.generation, e.pod_name
+                     FROM sandbox_k8s_executions e
+                    WHERE e.sandbox_id = s.id
+                      AND e.active
+                      AND e.created_at >= s.lifecycle_changed_at
+                      AND CASE
+                              WHEN $3::uuid IS NOT NULL
+                                  THEN e.activation_attempt_id = $3
+                                       AND e.generation = $4
+                              ELSE $2::uuid IS NOT NULL
+                          END
+               ) claimed ON TRUE
+              WHERE s.id = $1"
+        );
+        let (claimed_generation, claimed_pod, any_active, source_proven): (
+            Option<i64>,
+            Option<String>,
+            bool,
+            bool,
+        ) = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(sandbox_id)
+            .bind(restore_lease_token)
+            .bind(activation_attempt.map(|(attempt, _)| attempt))
+            .bind(activation_attempt.map(|(_, generation)| generation))
+            .fetch_one(&mut *tx)
+            .await
+            .db_context("failed to read restore revert evidence")?;
+
+        let retire = source_proven && retirement.is_enabled();
+        let outcome = match (claimed_generation.zip(claimed_pod), retire) {
+            (Some((generation, pod_name)), true) => {
+                if !self
+                    .finish_active_execution_generation_in(
+                        &mut tx, sandbox_id, generation, "replaced",
+                    )
+                    .await?
+                {
+                    // Not expected under the row lock; fail closed rather
+                    // than revert a row whose execution this claim can't
+                    // retire.
+                    tx.rollback()
+                        .await
+                        .db_context("failed to roll back restore revert transaction")?;
+                    return Ok(RestoreClaimRevert::NotReverted);
+                }
+                // `target_node_id` and the artifact marker name the wake
+                // source and stay; the lifecycle triggers keep the marker on
+                // `suspended`. `placement_changed_at` is cleared, as the
+                // markerless restoring recovery in `pod_tracking.rs` does for
+                // its rows: a
+                // restore whose pod bound moved it past the proven
+                // pre-restore source, and both the suspended selector and
+                // `durably_restorable` take a markerless snapshot only when
+                // it is newer than the last placement.
+                sqlx::query(sql!(
+                    "UPDATE sandboxes
+                        SET lifecycle = 'suspended',
+                            placement = 'unplaced',
+                            active_node_id = NULL,
+                            placement_changed_at = NULL
+                      WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(&mut *tx)
+                .await
+                .db_context("failed to revert sandbox lifecycle to suspended")?;
+                RestoreClaimRevert::ExecutionRetired { pod_name }
+            }
+            (None, true) if !any_active => {
+                // Proven, and no execution at all: the same placement-clock
+                // clear as above. An execution the claim reused rather than
+                // created keeps the clock, since nothing proves its pod
+                // holds no state of its own.
+                sqlx::query(sql!(
+                    "UPDATE sandboxes
+                        SET lifecycle = 'suspended',
+                            placement_changed_at = NULL
+                      WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(&mut *tx)
+                .await
+                .db_context("failed to revert sandbox lifecycle to suspended")?;
+                RestoreClaimRevert::LifecycleOnly
+            }
+            (claimed, _) => {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(&mut *tx)
+                .await
+                .db_context("failed to revert sandbox lifecycle to suspended")?;
+                if claimed.is_some() || any_active {
+                    RestoreClaimRevert::ExecutionLeftActive
+                } else {
+                    RestoreClaimRevert::LifecycleOnly
+                }
+            }
+        };
+        tx.commit()
+            .await
+            .db_context("failed to commit restore revert transaction")?;
+        Ok(outcome)
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn begin_restore_lifecycle(
@@ -490,7 +639,7 @@ impl K8sStore {
         }
     }
 
-    async fn claim_markerless_restoring_restore_lease(
+    pub(in crate::controllers::substrate::kubernetes) async fn claim_markerless_restoring_restore_lease(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RestoreClaim>, SubstrateError> {
@@ -569,6 +718,53 @@ impl K8sStore {
                 "sandbox {sandbox_id} changed lifecycle while claiming its restore lease"
             ),
         })
+    }
+
+    /// Commit `restoring -> started` for the restore this caller owns, once
+    /// its wake has succeeded. Returns whether the row moved.
+    ///
+    /// This is the cancelled-wake redrive's fenced completion CAS
+    /// (`wake_completion.rs`): the row must still be `restoring` with a
+    /// routable active execution behind it. Where the redrive waits for the
+    /// lease to expire, so that no live attempt is overridden, this requires
+    /// the lease to be the caller's own: the owner is that live attempt. A
+    /// row a rollback, the sweeper, a suspend or a delete has moved on matches
+    /// nothing (leaving `restoring` also clears the token, through the
+    /// `sandboxes_clear_restore_lease` trigger), and once it is `started`
+    /// neither the API rollback nor the sweeper's revert (both
+    /// `restoring`-guarded) can move it back.
+    ///
+    /// Without this, a Kubernetes restore driven from an access path, which
+    /// runs no lifecycle-controller completion, stays `restoring` until the
+    /// node's published state converges it, and a user request may not dial
+    /// it until then.
+    pub(in crate::controllers::substrate::kubernetes) async fn complete_owned_user_restore(
+        &self,
+        sandbox_id: SandboxId,
+        restore_lease_token: Uuid,
+    ) -> Result<bool, SubstrateError> {
+        let routable =
+            pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s(
+                "sandboxes",
+                "$3",
+            );
+        let query = format!(
+            "UPDATE sandboxes
+                SET lifecycle = 'started', placement = 'on_node'
+              WHERE id = $1
+                AND lifecycle = 'restoring'
+                AND restore_lease_token = $2
+                AND {routable}"
+        );
+        let completed = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(sandbox_id.as_uuid())
+            .bind(restore_lease_token)
+            .bind(pplx_space_common_core::types::SubstrateKind::Kubernetes)
+            .execute(&self.pool)
+            .await
+            .db_context("failed to complete owned sandbox restore")?
+            .rows_affected();
+        Ok(completed == 1)
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn release_user_restore_lease(

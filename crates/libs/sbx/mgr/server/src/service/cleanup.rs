@@ -1064,13 +1064,13 @@ impl SandboxManagerService {
             }
         }
         if target_state == SandboxState::Deleting && completion.deletes_row() {
-            let erase_safety = crate::db::read::sandbox(&transaction, &sandbox_id_string)
+            let erase_safety = crate::db::read::sandbox_view(&transaction, &sandbox_id_string)
+                .erase_safety()
                 .map_err(|error| {
                     Status::internal(format!(
                         "inspect suspend publication during delete admission failed: {error}"
                     ))
-                })?
-                .map(|row| (row.state, row.erase_safety()));
+                })?;
             match erase_safety {
                 Some((state, crate::db::SandboxEraseSafety::SuspendPublicationPending)) => {
                     tracing::info!(

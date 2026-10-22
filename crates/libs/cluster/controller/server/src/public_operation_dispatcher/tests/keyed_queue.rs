@@ -1,6 +1,5 @@
 //! The dispatcher as a keyed work queue: one executing operation per
-//! sandbox, deferred retries that hand their slot back, and a capped,
-//! backed-off retry budget.
+//! sandbox, and deferred retries that hand their slot back.
 
 use super::*;
 use pplx_space_api::public_operations::PUBLIC_OPERATION_CLAIM_LOCK_KEY;
@@ -416,6 +415,10 @@ async fn delete_supersedes_backed_off_work_but_not_a_pending_create() -> TestRes
             OperationState::Queued.as_str()
         );
     }
+    // The wake comes due while the delete runs: the delete's live claim
+    // holds it back.
+    defer_until(&db.pool, wake, 0).await?;
+    assert_eq!(claimed_ids(&claim_all(&store).await?), Vec::new());
     Ok(())
 }
 
@@ -673,9 +676,13 @@ async fn busy_key_hand_back_delay(
                 "SELECT EXTRACT(EPOCH FROM next_attempt_at - updated_at)::DOUBLE PRECISION
                  FROM public_operations
                  WHERE operation_id = $1 AND state = 'queued'
-                   AND progress_message = 'waiting for an earlier operation on the same sandbox'"
+                   AND EXISTS (
+                       SELECT 1 FROM public_operation_events
+                       WHERE operation_id = $1 AND event_type = $2
+                   )"
             ))
             .bind(handed_back.as_uuid())
+            .bind(PublicOperationEventType::Requeued.as_str())
             .fetch_optional(&db.pool)
             .await?;
             if let Some(delay) = delay {
@@ -728,28 +735,34 @@ async fn an_execution_finishing_during_a_claim_frees_its_sandbox_for_that_claim(
     };
     let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
     let store = PublicOperationStore::new(db.pool.clone());
-    create_op(&store, org_id, OperationKind::DeleteSandbox, "sbx_reap").await?;
+    let first = create_op(&store, org_id, OperationKind::DeleteSandbox, "sbx_reap").await?;
     let executor = BlockingExecutor::default();
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hook: super::BeforeClaimHook = {
         let armed = armed.clone();
         let executor = executor.clone();
+        let pool = db.pool.clone();
         Arc::new(move || {
             let armed = armed.clone();
             let executor = executor.clone();
+            let pool = pool.clone();
             Box::pin(async move {
                 if !armed.swap(false, Ordering::SeqCst) {
                     return;
                 }
                 // The first delete finishes after this tick's reap and before
-                // its claim. Its task drops its executor clone as it
-                // completes; on this current-thread runtime that means it has
-                // finished and waits unreaped.
+                // its claim. Its execution drops its executor clone before
+                // the driver writes its completion, so wait for both: once
+                // the completion is visible, this claim's snapshot sees the
+                // sandbox free while the task waits unreaped.
                 let alive = Arc::strong_count(&executor.started);
                 executor.release.notify_one();
                 while Arc::strong_count(&executor.started) >= alive {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
+                super::wait_for_state(&pool, first, OperationState::Succeeded)
+                    .await
+                    .expect("the first delete completes");
             })
         })
     };

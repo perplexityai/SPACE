@@ -35,7 +35,11 @@ protocol variables. `telemetry.otlpMetricsTemporality`, which bring-up sets to
 `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` for the Rust services and
 the runtime-supervisor, so a rare counter keeps its total however long the
 Collector's delta-to-cumulative conversion has been idle; empty keeps their
-delta default. The shim stays delta. The generic `OTEL_EXPORTER_OTLP_ENDPOINT`
+delta default. The shim stays delta. `telemetry.otlpMetricExportIntervalMillis`,
+which bring-up sets to `2000` in `otel` mode, becomes `OTEL_METRIC_EXPORT_INTERVAL`
+for the Rust services in Pods (and, through sandbox-manager, its host
+sidecars); empty keeps their 10 s default, and the shim and runtime-supervisor
+keep it. The generic `OTEL_EXPORTER_OTLP_ENDPOINT`
 is not emitted. Logs stay on stdout for Alloy to collect; they need no endpoint. The
 node-hosted shim and runtime-supervisor cannot use pod DNS, so they address
 each Collector by the fixed ClusterIP that chart's Kind profile pins.

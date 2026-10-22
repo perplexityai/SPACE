@@ -18,7 +18,10 @@ FROM ${SPACE_GRPC_HEALTH_PROBE_IMAGE} AS grpc-health-probe
 
 FROM scratch AS build-artifacts-kind-host
 
+# test-hooks or release, as docker/Dockerfile.rust-build-kind records it.
+ARG SPACE_KIND_RUST_BUILD=test-hooks
 LABEL org.opencontainers.image.title="space-rust-build-kind"
+LABEL space.pplx.net/kind-rust-build="${SPACE_KIND_RUST_BUILD}"
 LABEL org.opencontainers.image.description="SPACE Rust build artifacts for the local kind stack, assembled from the incremental builder-container cargo build."
 
 COPY --from=artifacts / /artifacts/

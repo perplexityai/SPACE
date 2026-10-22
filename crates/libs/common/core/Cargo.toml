@@ -13,13 +13,19 @@ workspace = true
 [dependencies]
 aws-lc-rs = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-bytesize = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl"] }
+pplx-space-byte-size = { workspace = true }
+pplx-space-content-digest = { workspace = true }
+pplx-space-cpu-arch = { workspace = true }
+pplx-space-durations = { workspace = true }
+pplx-space-env-vars = { workspace = true }
+pplx-space-k8s-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
+pplx-space-semver = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
 rusqlite = { workspace = true, optional = true }
-semver = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
@@ -38,8 +44,19 @@ tempfile = { workspace = true }
 default = []
 archive = ["dep:aws-lc-rs"]
 kubernetes = ["dep:base64", "dep:k8s-openapi", "dep:sha2", "serde", "pplx-space-net-common/serde"]
-serde = ["dep:toml", "dep:serde", "dep:serde_json", "bytesize/serde", "uuid/serde"]
-sqlx = ["dep:sqlx"]
+serde = [
+    "dep:toml",
+    "dep:serde",
+    "dep:serde_json",
+    "pplx-space-byte-size/serde",
+    "pplx-space-content-digest/serde",
+    "pplx-space-durations/serde",
+    "uuid/serde",
+    "pplx-space-semver/serde",
+    "pplx-space-cpu-arch/serde",
+    "pplx-space-k8s-ids/serde",
+]
+sqlx = ["dep:sqlx", "pplx-space-semver/sqlx", "pplx-space-k8s-ids/sqlx"]
 rusqlite = ["dep:rusqlite"]
 # Compiles in the test-only environment overrides (see `env::test_hook`). Only
 # kind and smoke images and test builds enable it; release binaries cannot read

@@ -63,21 +63,16 @@ async fn node_lookups_select_only_their_substrate() -> TestResult {
         vec![kubernetes.to_string()]
     );
 
-    // A Kubernetes node name resolves only to a Kubernetes registration. With
-    // no remote address the miss cannot bootstrap a new row.
+    // A Kubernetes node name resolves only to a Kubernetes registration; a
+    // miss is NotFound rather than a new row.
     let resolved = fixture
         .service
-        .resolve_origin_node_id(
-            "substrate-scope-kubernetes",
-            Some(SpaceNodeRole::Worker),
-            None,
-        )
+        .resolve_origin_node_id("substrate-scope-kubernetes", Some(SpaceNodeRole::Worker))
         .await?;
     assert_eq!(resolved.id, kubernetes);
-    assert!(!resolved.bootstrapped);
     let err = fixture
         .service
-        .resolve_origin_node_id("substrate-scope-direct", Some(SpaceNodeRole::Worker), None)
+        .resolve_origin_node_id("substrate-scope-direct", Some(SpaceNodeRole::Worker))
         .await
         .expect_err("a Direct node's name is not a Kubernetes registration");
     assert_eq!(err.code(), Code::NotFound);
@@ -87,7 +82,7 @@ async fn node_lookups_select_only_their_substrate() -> TestResult {
     for node_id in [direct, kubernetes] {
         let origin = fixture
             .service
-            .resolve_origin_node_id(&node_id.to_string(), Some(SpaceNodeRole::Worker), None)
+            .resolve_origin_node_id(&node_id.to_string(), Some(SpaceNodeRole::Worker))
             .await?;
         assert_eq!(origin.id, node_id);
     }
@@ -101,67 +96,5 @@ async fn node_lookups_select_only_their_substrate() -> TestResult {
     let mut expected = vec![direct, kubernetes];
     expected.sort();
     assert_eq!(node_ids, expected);
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn bootstrap_k8s_origin_node_writes_and_updates_only_kubernetes_rows() -> TestResult {
-    let Some(fixture) = cluster_fixture().await? else {
-        return Ok(());
-    };
-    let pool = &fixture.service.pool;
-    let role = SpaceNodeRole::Worker;
-    let row = |node_id: NodeId| {
-        sqlx::query_as::<_, (String, Option<String>)>(sql!(
-            "SELECT managed_by, host(address) FROM nodes WHERE id = $1"
-        ))
-        .bind(node_id)
-        .fetch_one(pool)
-    };
-
-    // A fresh registration is written as Kubernetes-managed.
-    let fresh = fixture
-        .service
-        .bootstrap_k8s_origin_node("substrate-scope-fresh", role, "192.0.2.41".parse()?)
-        .await?;
-    assert!(fresh.bootstrapped);
-    assert_eq!(
-        row(fresh.id).await?,
-        ("k8s".to_owned(), Some("192.0.2.41".to_owned()))
-    );
-
-    // An existing row at the derived id is refreshed only when it is a
-    // Kubernetes registration; a Direct row there is refused and left as is.
-    for (managed_by, refreshed) in [("k8s", true), ("space", false)] {
-        let node_name = format!("substrate-scope-existing-{managed_by}");
-        let node_id = space_k8s_node_id(&node_name, role.as_str());
-        sqlx::query(sql!(
-            "INSERT INTO nodes (id, address, role, managed_by, state)
-             VALUES ($1, '192.0.2.42'::INET, 'worker', $2, 'ready')"
-        ))
-        .bind(node_id)
-        .bind(managed_by)
-        .execute(pool)
-        .await?;
-
-        let result = fixture
-            .service
-            .bootstrap_k8s_origin_node(&node_name, role, "192.0.2.43".parse()?)
-            .await;
-        if refreshed {
-            assert_eq!(result?.id, node_id);
-            assert_eq!(
-                row(node_id).await?,
-                ("k8s".to_owned(), Some("192.0.2.43".to_owned()))
-            );
-        } else {
-            let err = result.expect_err("a Direct row at the derived id must not be adopted");
-            assert_eq!(err.code(), Code::FailedPrecondition);
-            assert_eq!(
-                row(node_id).await?,
-                ("space".to_owned(), Some("192.0.2.42".to_owned()))
-            );
-        }
-    }
     Ok(())
 }

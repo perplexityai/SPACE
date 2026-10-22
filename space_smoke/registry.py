@@ -49,6 +49,7 @@ class Scenario(Generic[Fixture]):
     ignored: str | None
     telemetry_mode: str | None
     storage_credentials: str | None
+    test_hooks: str | None
     verify: Callable[[Fixture], None]
     source_module: str
 
@@ -86,6 +87,7 @@ def scenario(
     telemetry_mode: str | None = None,
     timeout_minutes: int | None = None,
     storage_credentials: str | None = None,
+    test_hooks: str | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
     """Declare a smoke; its typed parameter selects the prepared fixture.
 
@@ -100,6 +102,10 @@ def scenario(
     known mode that the runner did not ask for. `storage_credentials` does the
     same for the Kind storage credentials mode the scenario exercises
     (SPACE_KIND_STORAGE_CREDENTIALS).
+    `test_hooks` names the test hooks (`pplx_space_common_core::env::test_hook`)
+    the scenario cannot pass without; implicit selection skips it, visibly, on
+    a bench of release binaries (SPACE_KIND_RUST_BUILD=release), which read
+    none.
     `timeout_minutes` raises the fixture's wall-clock budget for a scenario
     whose own waits outlast it; it never lowers it.
     """
@@ -147,6 +153,8 @@ def scenario(
         raise ValueError("smoke timeout must be a positive number of minutes")
     if storage_credentials not in (None, "exchange", "static"):
         raise ValueError("smoke storage credentials mode must be 'exchange' or 'static'")
+    if test_hooks is not None and not test_hooks.strip():
+        raise ValueError("smoke test hooks must name the hooks the scenario needs")
     supported_surfaces = frozenset(api_surfaces)
     if not supported_surfaces or not supported_surfaces <= {"ecw", "native"}:
         raise ValueError("smoke API surfaces must contain 'ecw' and/or 'native'")
@@ -201,6 +209,7 @@ def scenario(
             ignored=ignored,
             telemetry_mode=telemetry_mode,
             storage_credentials=storage_credentials,
+            test_hooks=test_hooks,
             verify=verify,
             source_module=verify.__module__,
         )

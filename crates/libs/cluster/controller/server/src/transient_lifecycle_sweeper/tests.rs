@@ -46,6 +46,11 @@
 //! - V24 `v24_alive_routable_restoring_skips_routability_consult`
 //! - V25 `v25_routability_check_error_defers_without_converge`
 //!
+//! ## Crashed create — see `tests/crashed_create.rs`
+//! An alive `creating` row whose owner's activation lease expired a full age
+//! window ago fails and retires; one whose lease is live, or expired more
+//! recently, is never listed or failed.
+//!
 //! ## CRP — command-ready-pending reaper (heal vs reap)
 //! - CRP1 `crp1_ready_probe_heals_marker_without_reaping`
 //! - CRP2 `crp2_wedged_probe_reaps_and_cleans_up`
@@ -145,6 +150,8 @@ struct FakeSinkState {
     cleanup_pod_identity_changed: HashMap<SandboxId, PodFenceMismatch>,
     /// Failed active execution candidates, in their listed order.
     failed_cleanup_queue: Vec<FailedCleanupCandidate>,
+    /// What `first_activation` re-reads, when it differs from the listing.
+    first_activation_now: HashMap<SandboxId, Option<FirstActivation>>,
     /// Failed active execution IDs whose cleanup should return Err.
     failed_execution_cleanup_failures: BTreeSet<SandboxId>,
     /// All `(lifecycle, age)` pairs the sweeper listed, in order.
@@ -167,6 +174,7 @@ struct FakeSinkState {
     refusal_progress: HashMap<SandboxId, TeardownProgress>,
     /// All fail CAS attempts, in order.
     fail_calls: Vec<SandboxId>,
+    fail_guards: Vec<FailGuard>,
     /// All sandbox IDs the sweeper asked to clean up, in order.
     cleanup_calls: Vec<SandboxId>,
     /// The pod-identity fence the sweeper passed with each cleanup call, in
@@ -287,6 +295,16 @@ impl FakeSink {
         self.0.lock().unwrap().failed_cleanup_queue = candidates;
     }
 
+    /// Make `first_activation` re-read `now` for `sandbox_id` instead of what
+    /// the listing reported.
+    fn set_first_activation_now(&self, sandbox_id: SandboxId, now: Option<FirstActivation>) {
+        self.0
+            .lock()
+            .unwrap()
+            .first_activation_now
+            .insert(sandbox_id, now);
+    }
+
     fn enqueue_failed_execution_cleanup_failure(&self, sandbox_id: SandboxId) {
         self.0
             .lock()
@@ -347,6 +365,11 @@ impl FakeSink {
 
     fn fail_calls(&self) -> Vec<SandboxId> {
         self.0.lock().unwrap().fail_calls.clone()
+    }
+
+    /// The guard each fail CAS was asked to apply, in call order.
+    fn fail_guards(&self) -> Vec<FailGuard> {
+        self.0.lock().unwrap().fail_guards.clone()
     }
 
     fn cleanup_calls(&self) -> Vec<SandboxId> {
@@ -511,7 +534,7 @@ impl SweepSink for FakeSink {
         &self,
         sandbox_id: SandboxId,
         _lifecycle: SandboxLifecycle,
-        _write_token: &str,
+        _reverted: &RevertedToSuspended,
         _preserve_local_artifact: bool,
     ) -> Result<bool, sqlx::Error> {
         let mut state = self.0.lock().unwrap();
@@ -524,10 +547,16 @@ impl SweepSink for FakeSink {
         sandbox_id: SandboxId,
         _lifecycle: SandboxLifecycle,
         _age: PositiveDuration,
-    ) -> Result<Option<String>, sqlx::Error> {
+        _fence: &RetireFence,
+    ) -> Result<Option<RevertedToSuspended>, sqlx::Error> {
         let mut state = self.0.lock().unwrap();
         state.revert_calls.push(sandbox_id);
-        Ok((!state.cas_unclaimed.contains(&sandbox_id)).then(|| "revert-write".to_string()))
+        Ok(
+            (!state.cas_unclaimed.contains(&sandbox_id)).then(|| RevertedToSuspended {
+                write_token: "revert-write".to_string(),
+                prior_placement_changed_at: None,
+            }),
+        )
     }
 
     async fn fail_aged_candidate(
@@ -535,9 +564,11 @@ impl SweepSink for FakeSink {
         sandbox_id: SandboxId,
         _lifecycle: SandboxLifecycle,
         _age: PositiveDuration,
+        guard: FailGuard,
     ) -> Result<Option<String>, sqlx::Error> {
         let mut state = self.0.lock().unwrap();
         state.fail_calls.push(sandbox_id);
+        state.fail_guards.push(guard);
         Ok((!state.cas_unclaimed.contains(&sandbox_id)).then(|| "fail-write".to_string()))
     }
 
@@ -643,6 +674,21 @@ impl SweepSink for FakeSink {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    async fn first_activation(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<FirstActivation>, sqlx::Error> {
+        let state = self.0.lock().unwrap();
+        if let Some(now) = state.first_activation_now.get(&sandbox_id) {
+            return Ok(*now);
+        }
+        Ok(state
+            .failed_cleanup_queue
+            .iter()
+            .find(|candidate| candidate.sandbox_id == sandbox_id)
+            .map(|candidate| candidate.first_activation))
     }
 
     async fn note_failed_cleanup_attempt(&self, sandbox_id: SandboxId) -> Result<(), sqlx::Error> {
@@ -756,6 +802,7 @@ fn candidate(lifecycle: SandboxLifecycle) -> SweepCandidate {
         fork_restore: false,
         node_name: Some("node-a".to_string()),
         routable_execution: true,
+        activation_abandoned: false,
         pod_fence: pod_fence(),
     }
 }
@@ -775,6 +822,7 @@ fn failed_candidate(sandbox_id: SandboxId) -> FailedCleanupCandidate {
     FailedCleanupCandidate {
         sandbox_id,
         node_name: Some("node-a".to_string()),
+        first_activation: FirstActivation::Finished,
         pod_fence: pod_fence(),
     }
 }
@@ -829,6 +877,7 @@ fn config_with_all_overrides(age: PositiveDuration) -> ReconcilerConfig {
         .unwrap(),
         unrestorable_restoring_enabled: true,
         unrestorable_restoring_min_placement_age: age,
+        abandoned_restore_retirement: Default::default(),
     }
 }
 
@@ -2528,6 +2577,8 @@ fn f5_only_an_observed_pod_yields_a_verifiable_fence() {
 // R — Postgres-backed sink (drift safety + trigger semantics)
 // -----------------------------------------------------------------
 
+mod crashed_create;
+
 mod postgres_backed {
 
     use super::super::store::{
@@ -2749,14 +2800,15 @@ mod postgres_backed {
         lifecycle: SandboxLifecycle,
         age_secs: i64,
     ) -> TestResult<bool> {
-        let claimed: Option<String> =
-            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(fail_candidate_query(lifecycle)))
-                .bind("space")
-                .bind(lifecycle.to_string())
-                .bind(age_secs)
-                .bind(sandbox_id)
-                .fetch_optional(pool)
-                .await?;
+        let claimed: Option<String> = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+            fail_candidate_query(lifecycle, FailGuard::Aged),
+        ))
+        .bind("space")
+        .bind(lifecycle.to_string())
+        .bind(age_secs)
+        .bind(sandbox_id)
+        .fetch_optional(pool)
+        .await?;
         Ok(claimed.is_some())
     }
 
@@ -2939,7 +2991,7 @@ mod postgres_backed {
 
         // And the k8s-scoped fail CAS cannot claim the space-owned row.
         let claimed: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
-            fail_candidate_query(SandboxLifecycle::Pausing),
+            fail_candidate_query(SandboxLifecycle::Pausing, FailGuard::Aged),
         ))
         .bind("k8s")
         .bind(SandboxLifecycle::Pausing.to_string())
@@ -4116,6 +4168,7 @@ mod postgres_backed {
             .bind(SandboxLifecycle::Restoring.to_string())
             .bind(token)
             .bind(false)
+            .bind(None::<time::OffsetDateTime>)
             .fetch_optional(pool)
             .await
         };
@@ -4189,6 +4242,7 @@ mod postgres_backed {
                 .bind(SandboxLifecycle::Restoring.to_string())
                 .bind(write_token)
                 .bind(true)
+                .bind(None::<time::OffsetDateTime>)
                 .fetch_optional(pool)
                 .await?;
         assert!(restored.is_some(), "the undo must claim its own write");

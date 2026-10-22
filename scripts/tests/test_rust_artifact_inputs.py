@@ -114,7 +114,8 @@ def fixture_workspace(root: Path) -> None:
         "apps/other/Cargo.toml",
         '[package]\nname = "fixture-other"\nversion = "0.1.0"\nedition = "2021"\n'
         '[[bin]]\nname = "other-main"\npath = "src/main.rs"\n'
-        '[dependencies]\nunrelated = { path = "../../libs/unrelated", package = "fixture-unrelated" }\n',
+        '[dependencies]\nunrelated = { path = "../../libs/unrelated", package = "fixture-unrelated" }\n'
+        'anyhow = "1"\n',
     )
     for path in ("src/main.rs", "src/bin/other-tool.rs", "src/bin/sub/main.rs"):
         write(root, f"apps/other/{path}", "fn main() {}\n")
@@ -143,6 +144,10 @@ def fixture_workspace(root: Path) -> None:
             f"libs/{directory}/Cargo.toml",
             f'[package]\nname = "fixture-{directory}"\nversion = "0.1.0"\nedition = "2021"\n',
         )
+    # A member reached only through a dev-dependency still has its own
+    # dependencies' features unified into every lane.
+    with (root / "libs/test-only/Cargo.toml").open("a") as manifest:
+        manifest.write('[dependencies]\nanyhow = "1"\n')
     for directory in (root / "libs").iterdir():
         write(directory, "src/lib.rs")
 
@@ -237,6 +242,37 @@ def test_a_workspace_the_reader_cannot_cover_fails_loudly(tmp_path, path, old, n
     write(tmp_path, path, existing.replace(old, new, 1))
     with pytest.raises(SystemExit, match=error):
         bundle_builds.rust_workspace_packages(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("member", "source"),
+    [("apps/other", "src/main.rs"), ("libs/test-only", "src/lib.rs")],
+)
+def test_a_feature_edit_outside_a_lane_changes_its_digest(tmp_path, monkeypatch, member, source):
+    # The lane's build resolves features across every member, listed or not:
+    # a member outside the lane turning on an anyhow feature turns it on in
+    # fixture-tool too, though Cargo.lock does not change. That member's
+    # sources do not reach the lane.
+    fixture_workspace(tmp_path)
+    monkeypatch.setattr(bundle_builds, "RUST_ARTIFACT_BINARIES", {"tool": ("fixture-tool",)})
+    monkeypatch.setattr(bundle_builds, "RUST_ARTIFACT_EXTRA_INPUTS", {"tool": ()})
+    for path in bundle_builds.RUST_ARTIFACT_COMMON_INPUTS:
+        if not (tmp_path / path).exists():
+            write(tmp_path, str(path))
+
+    def digest() -> str:
+        return bundle_builds.repository_inputs_digest(
+            tmp_path, bundle_builds.rust_artifact_inputs("tool", tmp_path), namespace="tool"
+        )
+
+    before = digest()
+    write(tmp_path, f"{member}/{source}", "// changed\n")
+    assert digest() == before
+    manifest = tmp_path / member / "Cargo.toml"
+    manifest.write_text(
+        manifest.read_text().replace('anyhow = "1"', 'anyhow = { version = "1", features = ["backtrace"] }')
+    )
+    assert digest() != before
 
 
 def test_every_lane_resolves_and_hashes_on_this_workspace():

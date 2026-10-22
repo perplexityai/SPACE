@@ -13,6 +13,7 @@ import re
 import secrets
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import socket
@@ -92,6 +93,7 @@ from space_smoke.capabilities import (
     StorageObject,
     StorageRequestResult,
     StorageSession,
+    ReconcileQueueRef,
     ReleaseStorageRow,
     RestoreActivation,
     RestoreFailure,
@@ -102,6 +104,11 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
+from space_smoke.reconcile_queue_gc import (
+    GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
+    validate_marker,
+    validate_node_name,
+)
 from space_smoke.orphaned_restore_pod_gc import (
     GC_ENV_KEYS,
     GC_LOG_NEEDLE,
@@ -375,6 +382,33 @@ def _sql_identifier_ish(value: str) -> str:
     return value
 
 
+def _sql_uuid_list(values: Sequence[str]) -> str:
+    if not values:
+        raise ValueError("refusing an empty id list")
+    return ", ".join(f"'{_sql_uuid(value)}'" for value in values)
+
+
+# Two non-ready k8s nodes, each with a 25 h-old live ref; the live one also
+# holds a 25 h-old dead letter and a 1 h-old one (`space_smoke.reconcile_queue_gc`).
+RECONCILE_QUEUE_GC_SEED_SQL = """\
+BEGIN;
+INSERT INTO nodes (id, role, managed_by, state)
+VALUES ('{live_id}', 'worker', 'k8s', 'registered'),
+       ('{gone_id}', 'worker', 'k8s', 'registered');
+INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+VALUES ('{live_id}', '{live_name}', '{marker}'),
+       ('{gone_id}', '{gone_name}', '{marker}');
+INSERT INTO node_reconcile_queue (node_id, facet, element, requested_at, updated_at, dead_at, dead_reason)
+VALUES ('{live_id}', 'node-status', '', NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours', NULL, ''),
+       ('{gone_id}', 'node-status', '', NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours', NULL, ''),
+       ('{live_id}', 'sandbox-inventory', '', NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours',
+        NOW() - INTERVAL '25 hours', '{marker}'),
+       ('{live_id}', 'template-inventory', '', NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour',
+        NOW() - INTERVAL '1 hour', '{marker}');
+COMMIT;
+"""
+
+
 # Oldest-first so [0] is the pin target the retention scenario manufactures.
 READY_FULL_SNAPSHOTS_SQL = """\
 SELECT s.id,
@@ -474,6 +508,11 @@ APISERVER_PARKED_MANIFEST = "/etc/kubernetes/kube-apiserver.yaml.space-smoke-par
 KIND_WORKER_ROLE = "space-worker"
 KIND_BUILDER_ROLE = "space-builder"
 NODE_SANDBOX_MANAGER = "sandbox-manager"
+NODE_MANAGER = "node-manager"
+# The OTLP metric export interval and the SDKs' default for it
+# (docs/observability.md).
+OTEL_METRIC_EXPORT_INTERVAL_ENV = "OTEL_METRIC_EXPORT_INTERVAL"
+OTEL_METRIC_EXPORT_DEFAULT_SECONDS = 10.0
 NODE_TEMPLATE_MANAGER = "template-manager"
 NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
@@ -535,7 +574,8 @@ SELECTOR_LABELS_ENV = "SPACE_SANDBOX_NODE_SELECTOR_LABELS"
 ADMISSION_ENABLED_ENV = "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED"
 # Non-pool sandbox pods: `build_pool_pod` stamps `pool-role`, a user create does not.
 KIND_SANDBOX_POD_SELECTOR = "app.kubernetes.io/name=space-sandbox,!space.pplx.net/pool-role"
-KIND_WORKER_NODE_SELECTOR = "!node-role.kubernetes.io/control-plane"
+CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
+KIND_WORKER_NODE_SELECTOR = f"!{CONTROL_PLANE_LABEL}"
 SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
 """
@@ -559,7 +599,7 @@ SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
 # once a builder has accepted it (`record_accepted_build`).
 TEMPLATE_BUILD_JOB_SQL = """\
 SELECT coalesce(j.daemon_job_id, ''), coalesce(j.builder_node_id::text, ''),
-       coalesce(nk.k8s_node_name, '')
+       coalesce(nk.k8s_node_name, ''), j.build_id
   FROM template_build_jobs j LEFT JOIN node_k8s nk ON nk.node_id = j.builder_node_id
  WHERE j.template_id = '{template_id}' AND j.daemon_job_id IS NOT NULL
  ORDER BY j.created_at DESC LIMIT 1;
@@ -848,9 +888,6 @@ RETENTION_SWEEPER_ENV_KEYS: tuple[str, ...] = (
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN",
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS",
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS",
-)
-_RETENTION_SWEEPER_CONFIG_ENV_KEYS = (
-    *RETENTION_SWEEPER_ENV_KEYS,
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N",
 )
 _RETENTION_BOOLEAN_ENV_KEYS = {
@@ -871,6 +908,65 @@ _RETENTION_ENV_VALUE = re.compile(r"[a-z0-9]{1,16}")
 # Limiter values: booleans, small numbers, a redis:// URL, a client id.
 _LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@-]{1,64}")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
+
+
+def _env_flag_default(value: str | None, default: bool) -> bool:
+    """Match `env_flag`, the wider boolean vocabulary some controller knobs use."""
+
+    normalized = (value or "").strip().lower()
+    if value is not None and normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if value is not None and normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+def _literal_retention_env(entries: list[Any], source: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            continue
+        name = entry["name"]
+        value = entry.get("value")
+        if name in RETENTION_SWEEPER_ENV_KEYS and (
+            "valueFrom" in entry or not isinstance(value, str) or not value
+        ):
+            raise SmokeConfigurationError(
+                f"cannot safely read nonliteral or empty {source} env {name}"
+            )
+        if isinstance(value, str):
+            env[name] = value
+    return env
+
+
+def _retention_sweeper_config(env: Mapping[str, str]) -> RetentionSweeperConfig:
+    """Parse as `ReconcilerConfig::from_environment` does, knob by knob."""
+
+    min_age = env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS")
+    return RetentionSweeperConfig(
+        enabled=_truthy_default(env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED"), False),
+        # A test hook read through `env_flag`; unset is live.
+        dry_run=_env_flag_default(env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN"), False),
+        keep_n=_unsigned_default(
+            env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N"),
+            3,
+            maximum=(1 << 32) - 1,
+            allow_zero=False,
+        ),
+        tick_seconds=_unsigned_default(
+            env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS"),
+            300,
+            maximum=(1 << 64) - 1,
+            allow_zero=False,
+        ),
+        # `snapshot_sweeper_grace_seconds` trims; zero disables the grace.
+        min_age_seconds=_unsigned_default(
+            min_age.strip() if min_age is not None else None,
+            3600,
+            maximum=(1 << 64) - 1,
+            allow_zero=True,
+        ),
+    )
 
 
 def _unsigned_default(
@@ -1247,22 +1343,25 @@ class KindHarness:
             "jsonpath={.items[0].spec.template.spec.containers[0].env}",
         )
         _require_ok(result, "read cluster-controller deployment env")
-        entries = json.loads(result.stdout or "[]")
-        env: dict[str, str] = {}
-        for entry in entries:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-                continue
-            name = entry["name"]
-            value = entry.get("value")
-            if name in _RETENTION_SWEEPER_CONFIG_ENV_KEYS and (
-                "valueFrom" in entry or not isinstance(value, str) or not value
+        return _literal_retention_env(json.loads(result.stdout or "[]"), "deployment")
+
+    def _running_controller_envs(self) -> list[dict[str, str]]:
+        """The literal env of every running, not-terminating controller pod."""
+
+        result = self.kubectl(
+            "get", "pods", "-l", KIND_CONTROLLER_SELECTOR, "-o", "json", timeout=15
+        )
+        _require_ok(result, "read cluster-controller pods")
+        envs = []
+        for pod in json.loads(result.stdout or "{}").get("items", []):
+            metadata = pod.get("metadata") or {}
+            if (pod.get("status") or {}).get("phase") != "Running" or metadata.get(
+                "deletionTimestamp"
             ):
-                raise SmokeConfigurationError(
-                    f"cannot safely read nonliteral or empty deployment env {name}"
-                )
-            if isinstance(value, str):
-                env[name] = value
-        return env
+                continue
+            containers = (pod.get("spec") or {}).get("containers") or [{}]
+            envs.append(_literal_retention_env(containers[0].get("env") or [], "pod"))
+        return envs
 
     def _controller_deployment(self) -> str:
         result = self.kubectl(
@@ -1291,33 +1390,11 @@ class KindHarness:
         return name
 
     def retention_sweeper_config(self) -> RetentionSweeperConfig:
-        env = self._controller_env()
-        return RetentionSweeperConfig(
-            enabled=_truthy_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED"), False
-            ),
-            dry_run=_truthy_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN"), True
-            ),
-            keep_n=_unsigned_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N"),
-                3,
-                maximum=(1 << 32) - 1,
-                allow_zero=False,
-            ),
-            tick_seconds=_unsigned_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS"),
-                300,
-                maximum=(1 << 64) - 1,
-                allow_zero=False,
-            ),
-            min_age_seconds=_unsigned_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS"),
-                3600,
-                maximum=(1 << 64) - 1,
-                allow_zero=True,
-            ),
-        )
+        return _retention_sweeper_config(self._controller_env())
+
+    def running_retention_sweeper_config(self) -> RetentionSweeperConfig | None:
+        configs = {_retention_sweeper_config(env) for env in self._running_controller_envs()}
+        return configs.pop() if len(configs) == 1 else None
 
     # ----- Cluster-visible mutation Leases --------------------------------------
     #
@@ -2184,6 +2261,27 @@ ON CONFLICT (key_hash) DO NOTHING;
             if isinstance(entry, dict) and isinstance(entry.get("name"), str)
         }
 
+    def metric_export_interval_seconds(self, node_name: str, component: str) -> float:
+        """The OTLP metric export interval a node service's pod on `node_name` runs with.
+
+        `OTEL_METRIC_EXPORT_INTERVAL` in milliseconds; unset, the SDKs' 10 s.
+        """
+
+        raw = self._node_service_env(node_name, component).get(OTEL_METRIC_EXPORT_INTERVAL_ENV)
+        if raw is None or not raw.strip():
+            return OTEL_METRIC_EXPORT_DEFAULT_SECONDS
+        try:
+            millis = int(raw.strip())
+        except ValueError:
+            raise SmokeConfigurationError(
+                f"{component} on {node_name} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not milliseconds"
+            ) from None
+        if millis <= 0:
+            raise SmokeConfigurationError(
+                f"{component} on {node_name} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not positive"
+            )
+        return millis / 1000
+
     def template_cache_gc_config(self, node_name: str) -> TemplateCacheGcConfig:
         return _template_cache_gc_config_from_env(
             self._node_service_env(node_name, NODE_TEMPLATE_MANAGER)
@@ -2193,6 +2291,17 @@ ON CONFLICT (key_hash) DO NOTHING;
         return _cold_eviction_config_from_env(
             self._node_service_env(node_name, NODE_SANDBOX_MANAGER)
         )
+
+    def cluster_deleted_quiescence_seconds(self, node_name: str) -> int:
+        # `cluster_deleted_eviction_quiescence`: an unset, unparsable or zero
+        # value keeps the 600 s default.
+        raw = str(
+            self._node_service_env(node_name, NODE_SANDBOX_MANAGER).get(
+                "SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS"
+            )
+            or ""
+        )
+        return int(raw) if raw.isdigit() and int(raw) > 0 else 600
 
     def sandbox_cache_dir_present(self, node_name: str, sandbox_id: str) -> bool:
         path = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}"
@@ -2536,6 +2645,36 @@ ON CONFLICT (key_hash) DO NOTHING;
             script,
             timeout=timeout,
         )
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        """Have node-ctl on `node_name` publish an outbound facet now (`space-nodectl facet publish`).
+
+        Marks the whole facet dirty through node-ctl's own `MarkFacetDirty`, so
+        its next outbound sync is the same publication its poll would make:
+        `sandbox-inventory` a Full census, `template-inventory` with the node's
+        Kubernetes object reconciles.
+
+        Returns None once node-ctl has the request, or why it does not: a
+        failed exec or RPC (node-ctl restarting, a kubectl blip) is the
+        caller's to record and retry, since node-ctl's poll still publishes the
+        facet. A bench that is not an isolated Kind stack, or a node without
+        exactly one operator shell, still raises `SmokeConfigurationError`.
+        """
+
+        try:
+            result = self._node_shell_exec(
+                node_name, f"space-nodectl facet publish {shlex.quote(facet)}", timeout=30
+            )
+        except SmokeConfigurationError:
+            raise
+        except RuntimeError as error:
+            return f"publish node-ctl facet {facet} on {node_name}: {error}"
+        if result.returncode != 0:
+            return (
+                f"publish node-ctl facet {facet} on {node_name} failed "
+                f"({result.returncode}): {result.detail() or '<no output>'}"
+            )
+        return None
 
     def register_unpinned_template(
         self, node_name: str, template: str, size_bytes: int
@@ -4190,11 +4329,12 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         if not row:
             return None
-        job_id, node_id, node = (row.split("|") + ["", ""])[:3]
+        job_id, node_id, node, build_id = (row.split("|") + ["", "", ""])[:4]
         return TemplateBuildJob(
             daemon_job_id=job_id.strip(),
             builder_node_id=node_id.strip() or None,
             builder_node=node.strip() or None,
+            build_id=build_id.strip(),
         )
 
     def prepared_rootfs_handoff(self, node_name: str, *, window_seconds: int = 60) -> str | None:
@@ -4203,6 +4343,15 @@ ON CONFLICT (key_hash) DO NOTHING;
         script = _PREPARED_ROOTFS_HANDOFF_SCRIPT.replace("__WINDOW_SECONDS__", str(int(window_seconds)))
         result = self._node_shell_exec(node_name, script, timeout=window_seconds + 60)
         return None if result.returncode == 0 else (result.detail() or f"exit {result.returncode}")
+
+    def build_sandbox_started(self, node_name: str) -> bool:
+        result = self._node_shell_exec(node_name, _BUILD_SANDBOX_STARTED_SCRIPT, timeout=60)
+        if result.returncode not in (0, 3):
+            raise RuntimeError(
+                f"could not list the build sandbox on {node_name} ({result.returncode}): "
+                f"{result.detail() or '<no output>'}"
+            )
+        return result.returncode == 0
 
     def published_guest_metadata(self, node_name: str, alias: str) -> GuestMetadata:
         template_dir = shlex.quote(f"{TEMPLATE_CACHE_ROOT}/{_template_alias(alias)}")
@@ -4839,6 +4988,86 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"delete sandbox pod {pod}",
         )
 
+    # --- reconcile-queue GC -------------------------------------------------
+    #
+    # Named reads and the one seed; the rows' shape and the verdicts live in
+    # `space_smoke.reconcile_queue_gc`.
+
+    def reconcile_queue_gc_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), RECONCILE_QUEUE_GC_ENV_KEYS)
+
+    def unregistered_ready_node(self) -> str:
+        registered = set(
+            self._psql(
+                "SELECT DISTINCT k8s_node_name FROM node_k8s;\n",
+                action="list the node names SPACE rows carry",
+            ).split()
+        )
+        candidates = sorted(
+            (CONTROL_PLANE_LABEL not in node.labels, node.name)
+            for node in self.nodes_snapshot()
+            if node.ready and node.name not in registered
+        )
+        if not candidates:
+            raise SmokeConfigurationError("no Ready Kubernetes Node is free of SPACE node rows")
+        return validate_node_name(candidates[0][1])
+
+    def node_exists(self, name: str) -> bool:
+        result = self.kubectl(
+            "get", "node", validate_node_name(name), "--ignore-not-found", "-o", "name", timeout=15
+        )
+        _require_ok(result, f"look up node {name}")
+        return bool(result.stdout.strip())
+
+    def seed_reconcile_queue_gc_nodes(
+        self,
+        *,
+        live: tuple[str, str],
+        gone: tuple[str, str],
+        marker: str,
+    ) -> None:
+        self._require_isolated_kind("reconcile-queue GC seeding")
+        self._psql(
+            RECONCILE_QUEUE_GC_SEED_SQL.format(
+                live_id=_sql_uuid(live[0]),
+                live_name=validate_node_name(live[1]),
+                gone_id=_sql_uuid(gone[0]),
+                gone_name=validate_node_name(gone[1]),
+                marker=validate_marker(marker),
+            ),
+            action="seed the reconcile-queue GC's synthetic nodes",
+        )
+
+    def reconcile_queue_refs(self, node_ids: Sequence[str]) -> list[ReconcileQueueRef]:
+        out = self._psql(
+            "SELECT node_id, facet, dead_at IS NOT NULL FROM node_reconcile_queue "
+            f"WHERE node_id IN ({_sql_uuid_list(node_ids)}) ORDER BY 1, 2;\n",
+            action="read the seeded nodes' reconcile queue",
+        )
+        refs = []
+        for line in out.splitlines():
+            node_id, _, rest = line.strip().partition("|")
+            facet, _, dead = rest.partition("|")
+            if node_id:
+                refs.append(ReconcileQueueRef(node_id=node_id, facet=facet, dead=dead == "t"))
+        return refs
+
+    def delete_seeded_reconcile_queue_nodes(self, node_ids: Sequence[str], *, marker: str) -> int:
+        ids = _sql_uuid_list(node_ids)
+        out = self._psql(
+            "DELETE FROM nodes n USING node_k8s k WHERE k.node_id = n.id "
+            f"AND n.id IN ({ids}) AND k.k8s_node_uid = '{validate_marker(marker)}';\n"
+            f"SELECT COUNT(*) FROM nodes WHERE id IN ({ids});\n",
+            action="delete the reconcile-queue GC's synthetic nodes",
+        )
+        return int(out.splitlines()[-1])
+
+    def fake_ec2_log_tail(self) -> str:
+        result = self.kubectl(
+            "logs", "deployment/space-kind-fake-ec2", "--tail=40", "--timestamps", timeout=30
+        )
+        return result.stdout if result.returncode == 0 else result.stderr
+
     # --- orphaned-restore-pod GC ---------------------------------------------
     #
     # Thin kubectl wrappers; the key/value lists, the clone shape and the
@@ -5125,6 +5354,19 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"SPACE_TRACE_EXPORTER={traces or 'unset'}"
             )
         return mode
+
+    def rust_build(self) -> str:
+        # Read from the images every running SPACE Rust container runs, checked
+        # against the build each pod was rendered for; the bring-up uses the
+        # same reader.
+        result = self.executor.run(
+            [sys.executable, str(REPO_ROOT / "infra/space/kind/scripts/deployed-rust-build.py"),
+             "--cluster", self.config.cluster],
+            timeout=180,
+        )
+        if result.returncode != 0:
+            raise SmokeConfigurationError(f"the bench runs no single Rust build: {result.detail()}")
+        return result.stdout.strip()
 
     # --- cluster-controller leader election ------------------------------------
     #
@@ -6102,7 +6344,7 @@ def _routing_value(value: str) -> str:
 def _template_alias(value: str) -> str:
     """Only the scenario's own throwaway aliases reach a shell or a URL."""
 
-    if not re.fullmatch(r"space-smoke-oci-[0-9a-f]{8}", value):
+    if not re.fullmatch(r"space-smoke-(oci|parent)-[0-9a-f]{8}", value):
         raise ValueError(f"refusing template alias {value!r}")
     return value
 
@@ -6151,6 +6393,24 @@ while [ "$(date +%s)" -le "$deadline" ]; do
 done
 echo "committed prepared rootfs was not observed on the accepting builder" >&2
 exit 1
+"""
+
+# Exits 0 while the builder@local sandbox holding a committed prepared rootfs is
+# listed before or in its run (the build's RUN steps run in it), and 3 when
+# there is none, so a failed listing (any other exit, under `set -e`) is never
+# read as "the build finished". The list's cells are separated by `┆`.
+_BUILD_SANDBOX_STARTED_SCRIPT = r"""set -eu
+sandboxes="$(/space/bin/space-sbxmgr list)"
+for marker in /space/cache/firecracker/sandboxes/*/instance/.space-prepared-rootfs-ready; do
+  [ -f "$marker" ] || continue
+  sandbox_dir="${marker%/instance/.space-prepared-rootfs-ready}"
+  short_id="$(printf '%s' "${sandbox_dir##*/}" | cut -c 29-36)"
+  if printf '%s\n' "$sandboxes" | grep -F "$short_id" | grep -F 'builder@local' \
+      | grep -Eq '┆ *(creating|created|starting|started) *┆'; then
+    exit 0
+  fi
+done
+exit 3
 """
 
 # Prints three lines: the bundle version inside the rootfs, then metadata.json's
@@ -7449,8 +7709,12 @@ class EcwSdk:
                 template = template.set_envs(dict(recipe.envs))
             for command, user in recipe.run_cmds:
                 template = template.run_cmd(command, user=user)
-            final = template.set_start_cmd(
-                recipe.start_cmd, e2b.wait_for_timeout(recipe.ready_timeout_seconds)
+            final = (
+                template
+                if recipe.start_cmd is None
+                else template.set_start_cmd(
+                    recipe.start_cmd, e2b.wait_for_timeout(recipe.ready_timeout_seconds)
+                )
             )
             started = time.monotonic()
             info = e2b.Template.build(
@@ -7469,6 +7733,21 @@ class EcwSdk:
             elapsed_seconds=round(time.monotonic() - started, 1),
             log_tail=tuple(tail),
         )
+
+    def build_status(self, template_id: str, build_id: str) -> str:
+        info = _ecw_control_plane_json(
+            self.config,
+            "GET",
+            f"/templates/{quote(template_id, safe='')}/builds/{quote(build_id, safe='')}/status",
+            body=None,
+            idempotency_key=None,
+            expected_status=200,
+            timeout=30,
+        )
+        status = info.get("status") if isinstance(info, dict) else None
+        if not isinstance(status, str):
+            raise RuntimeError(f"the build status response carried no status: {info!r}")
+        return status
 
     def _build_sdk_options(self) -> dict[str, Any]:
         """SDK options for `Template.build`: the Host header is the API URL's own authority.
@@ -7752,10 +8031,12 @@ def _sdk_sandbox_info(info: Any) -> EcwSandboxInfo:
     raw_state = getattr(info, "state", None)
     state = EcwSandboxState(str(raw_state)) if raw_state is not None else None
     template_id = getattr(info, "template_id", None)
+    end_at = getattr(info, "end_at", None)
     return EcwSandboxInfo(
         sandbox_id=str(info.sandbox_id),
         template_id=str(template_id) if template_id is not None else None,
         state=state,
+        end_at=end_at if isinstance(end_at, datetime) else None,
     )
 
 

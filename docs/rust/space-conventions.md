@@ -127,7 +127,8 @@ Reach for `Mutex<HashMap<_, _>>` or `RwLock<HashMap<_, _>>` only when you genuin
 ## SQL statements: wrap in the `sql!` locator macro
 
 Every SQL statement handed to `sqlx::query*` is wrapped in
-`pplx_space_common_core::sql!` (re-exported from `pplx-space-common-svc`),
+`pplx_space_common_core::sql!` (defined in `pplx-space-sql-locator`;
+re-exported from `pplx-space-common-svc`),
 which prepends a `/*module_path:line*/` comment to the statement:
 
 ```rust

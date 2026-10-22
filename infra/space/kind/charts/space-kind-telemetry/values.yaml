@@ -23,5 +23,12 @@ telemetry:
   # (scripts/telemetry_config.py), because the local Collector forgets an idle
   # delta stream; the shim stays delta.
   otlpMetricsTemporality: ""
+  # OTEL_METRIC_EXPORT_INTERVAL, in milliseconds, for the Rust services;
+  # empty keeps their 10 s default. Bring-up sets 2000 in otel mode
+  # (scripts/telemetry_config.py), so a scenario that reads a metric back from
+  # the local Prometheus waits about 2 s for an export instead of 10 s.
+  # sandbox-manager forwards it to the host sidecars it launches; the shim and
+  # the runtime-supervisor keep 10 s.
+  otlpMetricExportIntervalMillis: ""
   traceSampler: ""
   excludeDatadogLogs: false

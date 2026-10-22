@@ -42,14 +42,20 @@ class RetentionGuardRegistration(unittest.TestCase):
 
 class RestoreSourceChoreography(unittest.TestCase):
     def test_history_is_pinned_before_the_sweeper_goes_live(self) -> None:
+        # An inert standing sweeper already holds off; any other is disabled.
+        for standing_inert in (False, True):
+            with self.subTest(standing_inert=standing_inert):
+                self._history_is_pinned_before_the_sweeper_goes_live(standing_inert)
+
+    def _history_is_pinned_before_the_sweeper_goes_live(self, standing_inert: bool) -> None:
         pinned = SnapshotRecord("pinned", "artifact", "full", "s3://pinned", 1)
         control = SnapshotRecord("control", "artifact", "full", "s3://control", 1)
         retention = mock.Mock()
         retention.scoped_sweeper_mutation.return_value = nullcontext()
-        retention.stage_smoke_sweeper.side_effect = [
-            _config(enabled=False, dry_run=True),
-            _config(),
-        ]
+        retention.standing_sweeper_is_inert.return_value = standing_inert
+        retention.stage_smoke_sweeper.side_effect = (
+            [_config()] if standing_inert else [_config(enabled=False, dry_run=True), _config()]
+        )
         retention.pin_to_oldest.return_value = pinned
         retention.oldest_unpinned.return_value = control
 
@@ -68,14 +74,18 @@ class RestoreSourceChoreography(unittest.TestCase):
         restore_source_guard.verify(cast(Any, fixture))
 
         calls = retention.method_calls
-        disabled = calls.index(
-            mock.call.stage_smoke_sweeper(enabled=False, dry_run=True)
+        held_off = calls.index(
+            mock.call.standing_sweeper_is_inert(for_seconds=1800)
+            if standing_inert
+            else mock.call.stage_smoke_sweeper(enabled=False, dry_run=True)
         )
         first_history_check = calls.index(mock.call.wait_for_ready_fulls(1))
+        last_history_check = calls.index(mock.call.wait_for_ready_fulls(3))
         pin = calls.index(mock.call.pin_to_oldest())
         live = calls.index(mock.call.stage_smoke_sweeper(enabled=True, dry_run=False))
-        prune = calls.index(mock.call.expect_pruned(control, timeout=140))
-        self.assertLess(disabled, first_history_check)
+        prune = calls.index(mock.call.expect_pruned(control, timeout=74))
+        self.assertLess(held_off, first_history_check)
+        self.assertLess(last_history_check, pin)
         self.assertLess(pin, live)
         self.assertLess(live, prune)
         retention.scoped_sweeper_mutation.assert_called_once_with()
@@ -126,8 +136,8 @@ class ClaimFinishForwardChoreography(unittest.TestCase):
         self.assertEqual(
             retention.expect_pruned.call_args_list,
             [
-                mock.call(after_claim, timeout=80),
-                mock.call(after_byte_delete, timeout=80),
+                mock.call(after_claim, timeout=64),
+                mock.call(after_byte_delete, timeout=64),
             ],
         )
         retention.scoped_sweeper_mutation.assert_called_once_with()
@@ -695,9 +705,9 @@ def _config(**overrides: Any) -> RetentionSweeperConfig:
     values: dict[str, Any] = {
         "enabled": True,
         "dry_run": False,
-        "keep_n": 3,
-        "tick_seconds": 5,
-        "min_age_seconds": 60,
+        "keep_n": 1,
+        "tick_seconds": 1,
+        "min_age_seconds": 10,
     }
     values.update(overrides)
     return RetentionSweeperConfig(**values)
@@ -717,6 +727,8 @@ class _StubControl:
         self.standing_reads = 0
         self.lock_acquisitions = 0
         self.lock_releases = 0
+        self.failing_restores = 0
+        self.events: list[str] = []
 
     def retention_sweeper_config(self) -> RetentionSweeperConfig:
         return self._configs.pop(0)
@@ -726,6 +738,7 @@ class _StubControl:
 
         def release() -> None:
             self.lock_releases += 1
+            self.events.append("unlock")
 
         return release
 
@@ -737,6 +750,11 @@ class _StubControl:
         self.applied.append(dict(overrides))
 
     def restore_retention_sweeper_env(self, standing: Any) -> None:
+        if self.failing_restores:
+            self.failing_restores -= 1
+            self.events.append("restore failed")
+            raise RuntimeError("rollout did not finish")
+        self.events.append("restore")
         self.applied.append(dict(standing))
 
 
@@ -746,6 +764,7 @@ class EnsureLiveSweeper(unittest.TestCase):
         "SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN": None,
         "SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS": None,
         "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS": "3600",
+        "SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N": None,
     }
 
     def _retention(
@@ -763,7 +782,7 @@ class EnsureLiveSweeper(unittest.TestCase):
         grace = env["SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS"]
         assert tick is not None and grace is not None
         self.assertLessEqual(int(tick), 30)
-        self.assertTrue(30 <= int(grace) <= 300)
+        self.assertTrue(1 <= int(grace) <= 300)
 
     def test_scopes_the_override_and_restores_the_standing_env(self) -> None:
         control = _StubControl(
@@ -775,7 +794,7 @@ class EnsureLiveSweeper(unittest.TestCase):
         )
         retention, scope = self._retention(control)
         config = retention.ensure_live_sweeper()
-        self.assertEqual(config.min_age_seconds, 60)
+        self.assertEqual(config.min_age_seconds, 10)
         self.assertEqual(control.applied, [SMOKE_SWEEPER_ENV])
         # The body restores eagerly; teardown must not restore a second time.
         retention.restore_standing_sweeper()
@@ -865,6 +884,25 @@ class EnsureLiveSweeper(unittest.TestCase):
         retention.restore_standing_sweeper()
         self.assertEqual(scope.close(), ())
         self.assertEqual(control.applied, [])
+
+    def test_a_failed_restore_keeps_the_lease_until_a_retry_lands(self) -> None:
+        control = _StubControl(
+            configs=[_config(dry_run=True, tick_seconds=300, min_age_seconds=3600), _config()],
+            standing=dict(self.STANDING),
+        )
+        control.failing_restores = 2
+        retention, scope = self._retention(control)
+
+        with self.assertRaisesRegex(RuntimeError, "rollout"), retention.scoped_sweeper_mutation():
+            retention.ensure_live_sweeper()
+            retention.restore_standing_sweeper()
+
+        # The body's restore and the unwind's retry both failed; neither let go
+        # of the Lease, so the scope's retry still runs under it.
+        self.assertEqual(control.events, ["restore failed", "restore failed"])
+        self.assertEqual(scope.close(), ())
+        self.assertEqual(control.events, ["restore failed", "restore failed", "restore", "unlock"])
+        self.assertEqual(control.applied[-1], self.STANDING)
 
     def test_still_restores_when_the_override_does_not_take(self) -> None:
         control = _StubControl(

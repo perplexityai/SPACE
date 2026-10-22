@@ -1094,7 +1094,8 @@ db_private_outside_tests! {
     /// The live and retry-owned states still have a suspend completion that can
     /// publish. A terminal missing-artifact failure cannot publish, but its
     /// retained rootfs may be the only copy of the sandbox's latest work. The
-    /// failure reason is the durable witness for that distinct safety condition.
+    /// failure reason is the legacy witness for that safety condition. Quarantine
+    /// episodes are also checked by [`crate::db::read::SandboxView::erase_safety`].
     fn sandbox_erase_safety(
         state: SandboxState,
         cleanup_completion: Option<CleanupCompletion>,

@@ -176,6 +176,37 @@ pub(super) fn ensure_wake_recovery_lifecycle(sandbox: &Sandbox) -> Result<(), Su
     }
 }
 
+/// What [`KubernetesSubstrate::reclaim_lapsed_restore`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LapsedRestoreReclaim {
+    /// This request drove the restore's wake under its own claim.
+    Reclaimed,
+    /// An owner holds the restore again; keep joining it.
+    OwnerReturned,
+    /// The row isn't this request's to reclaim (a drain owns it, it moved
+    /// on, or too little budget is left).
+    Declined,
+}
+
+/// Below this much of its readiness budget, a request joining a restore
+/// whose owner lapsed doesn't reclaim it: the claim would take the lease only
+/// to fail its wake at once.
+const MIN_RESTORE_RECLAIM_WINDOW: Duration = Duration::from_secs(1);
+
+/// The error for a request whose sandbox left `restoring` other than for
+/// `started`: the error a wake would give a state that can't be woken, and
+/// otherwise (a rollback to `suspended`, say) a retryable `RestoreInFlight`,
+/// so the retry acts on the current state.
+fn left_restoring_error(sandbox: &Sandbox) -> SubstrateError {
+    match ensure_wake_recovery_lifecycle(sandbox) {
+        Err(error) => error,
+        Ok(()) => SubstrateError::restore_in_flight(format!(
+            "sandbox {} went {} before its restore reached started; retry the same sandbox",
+            sandbox.id, sandbox.lifecycle
+        )),
+    }
+}
+
 #[derive(Clone)]
 struct RestoreClaimHandling {
     preclaimed: Option<RestoreClaim>,
@@ -368,6 +399,62 @@ impl KubernetesSubstrate {
         }
     }
 
+    /// Best-effort rollback of a failed fresh restore claim to `suspended`
+    /// (see [`K8sStore::revert_restore_claim_to_suspended`]). When the
+    /// rollback retired the claim's execution, its pod is deleted here too.
+    /// That delete is best-effort: a pod it misses belongs to no active
+    /// execution, so the orphaned-restore-pod GC and the next restore's
+    /// lingering-pod sweep both reap it.
+    pub(super) async fn revert_failed_restore_claim(
+        &self,
+        sandbox_id: SandboxId,
+        restore_claim: RestoreClaim,
+        activation_attempt: Option<(SandboxActivationAttemptId, i64)>,
+    ) {
+        let outcome = match self
+            .store
+            .revert_restore_claim_to_suspended(
+                sandbox_id,
+                restore_claim.restore_lease_token(),
+                activation_attempt,
+                self.k8s.abandoned_restore_retirement,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "failed to restore suspended lifecycle after Kubernetes restore failure"
+                );
+                return;
+            }
+        };
+        pplx_space_metrics::sandbox::restore::claim_reverted(outcome.metric_outcome());
+        match outcome {
+            RestoreClaimRevert::ExecutionRetired { pod_name } => {
+                // A retired generation is never reused, so the name can't
+                // belong to a successor.
+                if let Err(err) = self.delete_tracked_pods(vec![pod_name]).await {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "failed to delete the pod of an abandoned restore; it has no active \
+                         execution, so orphan GC or the next restore removes it"
+                    );
+                }
+            }
+            RestoreClaimRevert::ExecutionLeftActive => tracing::warn!(
+                sandbox_id = %sandbox_id,
+                "reverted a failed restore with an execution still active: either restore \
+                 selection isn't proven to choose a durable pre-restore source, or the claim \
+                 reused that execution rather than creating it"
+            ),
+            RestoreClaimRevert::LifecycleOnly | RestoreClaimRevert::NotReverted => {}
+        }
+    }
+
     /// Best-effort release of a restore claim whose deferred admission
     /// charge was rejected: a fresh suspended claim rolls back to
     /// `suspended`; a redrive keeps the row `restoring` and only frees the
@@ -379,13 +466,9 @@ impl KubernetesSubstrate {
     ) {
         let result = match restore_claim {
             RestoreClaim::FreshFromSuspended { .. } => {
-                self.store
-                    .revert_lifecycle_after_rollback_best_effort(
-                        sandbox_id,
-                        "suspended",
-                        restore_claim.restore_lease_token(),
-                    )
-                    .await
+                return self
+                    .revert_failed_restore_claim(sandbox_id, restore_claim, None)
+                    .await;
             }
             RestoreClaim::RedroveRestoring {
                 restore_lease_token: Some(token),
@@ -584,6 +667,31 @@ impl KubernetesSubstrate {
         })
     }
 
+    /// Redrive the restore of a sandbox whose started recovery a suspend
+    /// superseded, for an access request. The binding is handed out only once
+    /// the row is `started` (see `join_restore_before_dial`): if the redrive's
+    /// owner couldn't commit that, its restore may still be rolled back.
+    pub(super) async fn redrive_suspended_recovery_for_access(
+        &self,
+        sandbox: &Sandbox,
+        retired_generation: Option<i64>,
+        join_deadline: Instant,
+        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        charge: RecoveryCharge,
+    ) -> Result<ExecutionBinding, ControllerError> {
+        self.redrive_started_recovery_after_suspend(
+            sandbox,
+            retired_generation,
+            join_deadline,
+            metric_identity,
+            charge,
+            None,
+        )
+        .await
+        .map_err(ControllerError::from)?;
+        self.binding_once_started(sandbox.id, join_deadline).await
+    }
+
     /// Bounded follower join on the user restore lease. The process-wide
     /// restore poller batch-observes every pending sandbox; this request owns
     /// only a watch receiver until the owner publishes a routable outcome,
@@ -658,6 +766,223 @@ impl KubernetesSubstrate {
         }
     }
 
+    /// A request a user is waiting on never dials a sandbox's pod while the
+    /// sandbox is `restoring`: the restore can still fail and be rolled back,
+    /// and the rollback retires its execution and deletes the pod, discarding
+    /// whatever it served. Instead this joins the in-flight restore and, once
+    /// the sandbox is `started`, returns a client for the execution the row
+    /// routes to. A row the caller saw `restoring` that is already `started`
+    /// here is dialed the same way.
+    ///
+    /// It joins before it claims, waiting on the shared restore poller rather
+    /// than polling the row per request. Only a row still `restoring` once its
+    /// owner's lease and execution ownership have lapsed, and that no drain
+    /// owns, is reclaimed: this request takes the restoring lease itself and
+    /// drives the wake under that claim, whose owner commits `started`. A
+    /// follower whose owner rolled back to `suspended` gets `RestoreInFlight`
+    /// rather than starting a fresh restore that its caller's access-wake
+    /// policy and admission never approved. Past `timeout` this fails as
+    /// `RestoreInFlight` too, a retryable 503; a row that leaves for a state
+    /// that can't be woken gets that state's error.
+    pub(super) async fn join_restore_before_dial(
+        &self,
+        sandbox_id: SandboxId,
+        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        timeout: Duration,
+        charge: RecoveryCharge,
+    ) -> Result<crate::controllers::substrate::RuntimeClient, ControllerError> {
+        let (_, join_deadline) = ready_wait_bounds(timeout);
+        let sandbox = self
+            .store
+            .require_sandbox(sandbox_id)
+            .await
+            .map_err(ControllerError::from)?;
+        match parse_sandbox_lifecycle(&sandbox.lifecycle).map_err(ControllerError::from)? {
+            SandboxLifecycle::Started => {}
+            SandboxLifecycle::Restoring => {
+                let mut backoff = RecoveryJoinBackoff::new(self.recovery_join_backoff);
+                while let UserRestoreJoin::Claimable = self
+                    .wait_for_user_restore(sandbox_id, join_deadline, None, &mut backoff)
+                    .await
+                    .map_err(ControllerError::from)?
+                {
+                    let reclaim = self
+                        .reclaim_lapsed_restore(
+                            sandbox_id,
+                            join_deadline,
+                            metric_identity,
+                            charge.clone(),
+                        )
+                        .await?;
+                    if reclaim != LapsedRestoreReclaim::OwnerReturned {
+                        break;
+                    }
+                }
+            }
+            _ => return Err(ControllerError::from(left_restoring_error(&sandbox))),
+        }
+        self.dial_once_started(sandbox_id, join_deadline).await
+    }
+
+    /// Reclaim a `restoring` row whose owner's lease and execution ownership
+    /// lapsed, for [`Self::join_restore_before_dial`]. The lease claim matches
+    /// only a row still `restoring`, unowned and unmarked; this request then
+    /// drives the wake under that claim, and the wake's owner commits
+    /// `started`. A row a drain owns, or that moved on, is declined and left
+    /// to the caller's `started` wait.
+    async fn reclaim_lapsed_restore(
+        &self,
+        sandbox_id: SandboxId,
+        join_deadline: Instant,
+        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        charge: RecoveryCharge,
+    ) -> Result<LapsedRestoreReclaim, ControllerError> {
+        if remaining_ready_window(join_deadline) < MIN_RESTORE_RECLAIM_WINDOW {
+            return Ok(LapsedRestoreReclaim::Declined);
+        }
+        let restore_claim = match self
+            .store
+            .claim_markerless_restoring_restore_lease(sandbox_id)
+            .await
+        {
+            Ok(Some(restore_claim)) => restore_claim,
+            Ok(None) | Err(SubstrateError::Conflict { .. }) => {
+                return Ok(LapsedRestoreReclaim::Declined);
+            }
+            Err(SubstrateError::RestoreInFlight { .. }) => {
+                return Ok(LapsedRestoreReclaim::OwnerReturned);
+            }
+            Err(error) => return Err(ControllerError::from(error)),
+        };
+        if let Err(error) = charge.charge_restore_claim().await {
+            self.release_rejected_restore_claim(sandbox_id, restore_claim)
+                .await;
+            return Err(ControllerError::from(error));
+        }
+        let sandbox = self
+            .store
+            .require_sandbox(sandbox_id)
+            .await
+            .map_err(ControllerError::from)?;
+        // Only a writer that ignores the lease (the tokenless evacuation
+        // rollback) can move the row now; and the charge may have used up the
+        // budget. Either way, hand the restore back rather than drive it.
+        if !is_restoring_lifecycle(&sandbox.lifecycle)
+            || remaining_ready_window(join_deadline) < MIN_RESTORE_RECLAIM_WINDOW
+        {
+            self.release_rejected_restore_claim(sandbox_id, restore_claim)
+                .await;
+            return Ok(LapsedRestoreReclaim::Declined);
+        }
+        self.wake_execution_inner(
+            &sandbox,
+            remaining_ready_window(join_deadline),
+            metric_identity,
+            None,
+            WakeTarget::started(None),
+            RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
+        )
+        .await
+        .map_err(ControllerError::from)?;
+        Ok(LapsedRestoreReclaim::Reclaimed)
+    }
+
+    /// Wake a dormant sandbox for a user request and dial it once it is
+    /// `started`. A restore-shaped wake leaves the row `restoring` until its
+    /// owner commits `started` (or, for a joined run, its owner did), so the
+    /// binding the wake returns isn't dialed directly (see
+    /// `join_restore_before_dial`).
+    pub(super) async fn wake_and_dial_once_started(
+        &self,
+        sandbox: &Sandbox,
+        timeout: Duration,
+        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        charge: RecoveryCharge,
+    ) -> Result<crate::controllers::substrate::RuntimeClient, ControllerError> {
+        let (_, join_deadline) = ready_wait_bounds(timeout);
+        self.wake_execution_with_metric_identity(sandbox, timeout, metric_identity, charge)
+            .await
+            .map_err(ControllerError::from)?;
+        self.dial_once_started(sandbox.id, join_deadline).await
+    }
+
+    /// Dial the execution a sandbox routes to once the row is `started`,
+    /// polling with the recovery-join backoff until `deadline`. Observes before
+    /// each sleep, so a row that is already `started` is dialed at once. A
+    /// `restoring` row that reads as unowned is still waited on: a drain's
+    /// evacuation restore owns its row through the marker, not the lease, and
+    /// only the drain moves it to `started`.
+    async fn dial_once_started(
+        &self,
+        sandbox_id: SandboxId,
+        deadline: Instant,
+    ) -> Result<crate::controllers::substrate::RuntimeClient, ControllerError> {
+        let binding = self.binding_once_started(sandbox_id, deadline).await?;
+        crate::controllers::substrate::node_api_client::connect_worker(binding.runtime_endpoint)
+            .await
+    }
+
+    /// The binding [`Self::dial_once_started`] dials.
+    async fn binding_once_started(
+        &self,
+        sandbox_id: SandboxId,
+        deadline: Instant,
+    ) -> Result<ExecutionBinding, ControllerError> {
+        let mut backoff = RecoveryJoinBackoff::new(self.recovery_join_backoff);
+        loop {
+            match self
+                .store
+                .observe_user_restore(sandbox_id)
+                .await
+                .map_err(ControllerError::from)?
+            {
+                UserRestoreObservation::Routable {
+                    generation,
+                    pod_name,
+                    pod_ip,
+                } => {
+                    return self
+                        .binding_for_routable_pod(generation, pod_name, &pod_ip)
+                        .map_err(ControllerError::from);
+                }
+                UserRestoreObservation::InFlight { .. } => {}
+                UserRestoreObservation::Claimable => {
+                    let sandbox = self
+                        .store
+                        .require_sandbox(sandbox_id)
+                        .await
+                        .map_err(ControllerError::from)?;
+                    if normalize_lifecycle(&sandbox.lifecycle) == "started" {
+                        // Moved on since the observation: observe again now.
+                        continue;
+                    }
+                    if !is_restoring_lifecycle(&sandbox.lifecycle) {
+                        return Err(ControllerError::from(left_restoring_error(&sandbox)));
+                    }
+                }
+                UserRestoreObservation::StartedUnroutable => {
+                    return Err(ControllerError::from(SubstrateError::restore_in_flight(
+                        format!(
+                            "sandbox {sandbox_id} is started without a routable execution; \
+                             retry the same sandbox"
+                        ),
+                    )));
+                }
+            }
+            if tokio::time::timeout_at(deadline, tokio::time::sleep(backoff.next_delay()))
+                .await
+                .is_err()
+            {
+                return Err(ControllerError::from(SubstrateError::restore_in_flight(
+                    format!(
+                        "sandbox {sandbox_id}'s restore didn't reach started in time; \
+                         retry the same sandbox"
+                    ),
+                )));
+            }
+        }
+    }
+
     /// Claim or join started recovery. Followers wait without spending
     /// admission; owners charge before Pod creation and publish completion.
     /// The access path takes no caller-selected `suspend_restore_source_node`.
@@ -698,17 +1023,14 @@ impl KubernetesSubstrate {
                     retired_generation,
                 } => {
                     return self
-                        .redrive_started_recovery_after_suspend(
+                        .redrive_suspended_recovery_for_access(
                             &sandbox,
                             retired_generation,
                             join_deadline,
                             metric_identity,
                             charge,
-                            None,
                         )
-                        .await
-                        .map(|activation| activation.binding)
-                        .map_err(ControllerError::from);
+                        .await;
                 }
             }
         } else {
@@ -860,17 +1182,14 @@ impl KubernetesSubstrate {
                     .await;
             }
             return self
-                .redrive_started_recovery_after_suspend(
+                .redrive_suspended_recovery_for_access(
                     &sandbox,
                     Some(generation),
                     join_deadline,
                     metric_identity,
                     RecoveryCharge::Exempt,
-                    None,
                 )
-                .await
-                .map(|activation| activation.binding)
-                .map_err(ControllerError::from);
+                .await;
         }
 
         self.publish_started_recovery_result(
@@ -1909,22 +2228,14 @@ impl KubernetesSubstrate {
                 result.as_ref().err(),
                 wake_dispatch,
             )
-            && let Err(update_err) = self
-                .store
-                .revert_lifecycle_after_rollback_best_effort(
-                    sandbox_id,
-                    "suspended",
-                    prepared
-                        .restore_claim
-                        .and_then(RestoreClaim::restore_lease_token),
-                )
-                .await
+            && let Some(restore_claim) = prepared.restore_claim
         {
-            tracing::warn!(
-                sandbox_id = %sandbox_id,
-                error = %update_err,
-                "failed to restore suspended lifecycle after Kubernetes wake failure"
-            );
+            self.revert_failed_restore_claim(
+                sandbox_id,
+                restore_claim,
+                activation_assignment.assigned(),
+            )
+            .await;
         }
         if cleanup_on_failure
             && !restore_failure_should_revert_to_suspended(
@@ -1956,6 +2267,48 @@ impl KubernetesSubstrate {
                     *activation_attempt_id,
                 )
                 .await;
+        }
+        // The owner of a user restore commits `restoring -> started` itself,
+        // under its own lease, before handing out the binding: a user request
+        // never dials a `restoring` pod (see `join_restore_before_dial`), and
+        // on the access path no lifecycle-controller completion follows. A
+        // lost or failed CAS leaves the row to the controller's completion or
+        // the node's published state, which those requests then wait for.
+        if result.is_ok()
+            && target_state == SandboxLifecycle::Started
+            && evacuation_placement.is_none()
+            && let Some(restore_lease_token) = prepared
+                .restore_claim
+                .and_then(RestoreClaim::restore_lease_token)
+        {
+            match self
+                .store
+                .complete_owned_user_restore(sandbox_id, restore_lease_token)
+                .await
+            {
+                // Reported here, in the restore's detached task, so a caller
+                // that hung up can't drop it; the node's published state
+                // finds the row `started` and reports nothing. The lifecycle
+                // controller's actions report their own completion too, as
+                // for `WakeCompleted`.
+                Ok(true) => SandboxEvent::new(
+                    sandbox_id,
+                    SandboxEventType::RestoreCompleted,
+                    SandboxEventSource::Substrate,
+                )
+                .emit_with(
+                    SandboxEventDetails::default()
+                        .reason("restore_owner_completed")
+                        .with_from_state("restoring")
+                        .with_to_state("started"),
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    %error,
+                    "failed to commit started after an owned restore"
+                ),
+            }
         }
         result.map(|(binding, _)| ExecutionActivation::owned(binding))
     }

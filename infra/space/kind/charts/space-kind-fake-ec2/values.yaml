@@ -1,0 +1,40 @@
+# The in-repo fake EC2 endpoint (infra/space/kind/fake-ec2), standing in for
+# the EC2 API a deployment's cluster-controller asks whether a non-ready
+# node's instance is gone (Ec2Detector, reconcile_queue_gc/detector.rs). The
+# controller's reconcile-queue GC reaches it through AWS_ENDPOINT_URL_EC2
+# (charts/space-cluster-controller-local); it answers DescribeInstances by
+# private-dns-name from the Node of that name: Ready is running, not Ready is
+# stopped, absent is no instance.
+
+image:
+  repository: space-kind-fake-ec2
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+service:
+  # TLS with the internal RPC CA's leaf for `fake-ec2` (internal-rpc-tls.sh).
+  name: fake-ec2
+  port: 8443
+
+tlsSecretName: space-kind-fake-ec2-tls
+
+# The region requests must be signed for: the cluster-controller's AWS_REGION
+# (`snapshotRegion` in charts/space-cluster-controller-local).
+region: us-east-1
+
+# Stateless: every answer is read from the API server. One replica, replaced
+# at will.
+replicas: 1
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi

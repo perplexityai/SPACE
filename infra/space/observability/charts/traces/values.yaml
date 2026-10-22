@@ -39,6 +39,10 @@ tempo:
   # Block retention; Tempo also bounds ingestion and search in config/tempo.yaml.
   blockRetention: 6h
   maxSearchDuration: 6h
+  # Search never returns spans newer than this, whatever the requested end
+  # (`query_frontend.query_end_cutoff`). 30s is Tempo 3's own default, kept
+  # here so a reader sees freshly exported traces consistently.
+  queryEndCutoff: 30s
   resources:
     requests: {cpu: 250m, memory: 512Mi}
     limits: {cpu: "2", memory: 2Gi, ephemeral-storage: 256Mi}

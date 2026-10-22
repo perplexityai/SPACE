@@ -26,6 +26,9 @@ its description matches the task.
 ## Repository contracts
 
 - Never run `git merge`. Advance with `git pull --ff-only` or rebase.
+- Write pull request descriptions from `.github/pull_request_template.md` and
+  the rules under "Submit a pull request" in `CONTRIBUTING.md`. GitHub fills in
+  the template only in its web form.
 - Route database operations through the owning storage layer. The
   `space-data-store-development` skill defines the store boundary and guarded
   transition exceptions.

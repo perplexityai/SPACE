@@ -39,7 +39,7 @@ from space_smoke.node_fence import (
     residue,
     slots_repair_action,
 )
-from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
+from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope, SmokeConfigurationError
 
 NODE_CTL_HOST_CPU = "genuineintel-6-85-7"
 
@@ -121,6 +121,7 @@ class _Control:
         self.refuse_all = True
         self.reconcile_after_polls = 1
         self._polls = 0
+        self.publish_failure: str | None = None
 
     def acquire_worker_cordon_mutation(self):
         self.calls.append("lease")
@@ -229,6 +230,10 @@ class _Control:
 
     def node_ctl_log_tail(self, pod, lines):
         return ["denied"]
+
+    def publish_node_ctl_facet(self, node, facet):
+        self.calls.append(f"publish:{node}:{facet}")
+        return self.publish_failure
 
     # the fake node-ctl: writes back after N polls of node_label/node_capacity
     def tick(self) -> None:
@@ -469,6 +474,31 @@ class Convergence(unittest.TestCase):
         self.assertEqual(set(seen), {"label", "slots"})
         self.assertIn(f"admin-label:{OWN}:{OWNED_LABEL}=None", control.calls)
         self.assertIn(f"strip:{OWN}:{SLOTS_RESOURCE}", control.calls)
+        # The reconcile is requested from this node's node-ctl, after both strips.
+        request = f"publish:{OWN}:template-inventory"
+        self.assertIn(request, control.calls)
+        self.assertLess(control.calls.index(f"strip:{OWN}:{SLOTS_RESOURCE}"), control.calls.index(request))
+
+    def test_a_failed_reconcile_request_is_recorded_and_the_polled_writeback_still_passes(self) -> None:
+        # The request fails (node-ctl restarting, an exec blip); the fake
+        # node-ctl's poll still writes both canaries back.
+        control = _Control()
+        control.reconcile_after_polls = 3
+        control.publish_failure = f"publish node-ctl facet template-inventory on {OWN} failed (1): unavailable"
+        fixture, fence, _, control = _through_credential(control)
+        seen = fence.expect_node_ctl_reconciles(budget=60)
+        self.assertEqual(set(seen), {"label", "slots"})
+        self.assertEqual(
+            fixture.records["reconcile_request_failures"], [control.publish_failure]
+        )
+
+    def test_failed_reconcile_requests_and_no_writeback_still_fail(self) -> None:
+        control = _Control()
+        control.reconcile_after_polls = 10_000
+        control.publish_failure = f"publish node-ctl facet template-inventory on {OWN} failed (124): timed out"
+        _, fence, _, control = _through_credential(control)
+        with self.assertRaisesRegex(InvariantViolation, "did not write back"):
+            fence.expect_node_ctl_reconciles(budget=0)
 
     def test_a_stalled_node_ctl_fails_with_its_log_tail_and_the_slots_repair_restores(self) -> None:
         control = _Control()
@@ -602,3 +632,42 @@ class HarnessOps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishNodeCtlFacet(unittest.TestCase):
+    """`publish_node_ctl_facet` reports a transient failure and raises only on configuration."""
+
+    def _harness(self, results, **config) -> tuple[KindHarness, _ScriptedKubectl]:
+        kubectl = _ScriptedKubectl(results)
+        return KindHarness(kubectl, KindConfig(**config)), kubectl
+
+    def test_success_is_none_and_names_the_facet(self) -> None:
+        harness, kubectl = self._harness(
+            [CommandResult(ARGV, 0, "space-node-debug-a", ""), CommandResult(ARGV, 0, "facet publication enqueued\n", "")]
+        )
+        self.assertIsNone(harness.publish_node_ctl_facet(OWN, "template-inventory"))
+        self.assertEqual(kubectl.calls[-1][-1], "space-nodectl facet publish template-inventory")
+
+    def test_a_failed_publish_is_returned_not_raised(self) -> None:
+        harness, _ = self._harness(
+            [CommandResult(ARGV, 0, "space-node-debug-a", ""), CommandResult(ARGV, 1, "", "node-ctl worker stopped")]
+        )
+        failure = harness.publish_node_ctl_facet(OWN, "sandbox-inventory")
+        self.assertIsNotNone(failure)
+        self.assertIn("failed (1)", failure or "")
+        self.assertIn("node-ctl worker stopped", failure or "")
+
+    def test_a_failed_operator_shell_lookup_is_returned_not_raised(self) -> None:
+        harness, _ = self._harness([CommandResult(ARGV, 1, "", "connection refused")])
+        self.assertIn("connection refused", harness.publish_node_ctl_facet(OWN, "sandbox-inventory") or "")
+
+    def test_a_bench_that_is_not_isolated_kind_still_raises(self) -> None:
+        harness, kubectl = self._harness([], api_url="http://api.example.com:8080")
+        with self.assertRaises(SmokeConfigurationError):
+            harness.publish_node_ctl_facet(OWN, "sandbox-inventory")
+        self.assertEqual(kubectl.calls, [])
+
+    def test_a_node_without_one_operator_shell_still_raises(self) -> None:
+        harness, _ = self._harness([CommandResult(ARGV, 0, "", "")])
+        with self.assertRaises(SmokeConfigurationError):
+            harness.publish_node_ctl_facet(OWN, "sandbox-inventory")

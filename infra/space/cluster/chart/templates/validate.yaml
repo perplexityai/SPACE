@@ -120,6 +120,11 @@ rejects the Kind value itself.
 {{- if or (not $cc.snapshotEndpoint) (eq (toString $cc.snapshotEndpoint) "http://object-store:8333") -}}
 {{- $fail = append $fail "space-cluster-controller-local.snapshotEndpoint is required (the Kind object store is not installed)" -}}
 {{- end -}}
+{{- /* The fake's URL, the subchart's default, renders only while the switch is
+       on, so refusing the switch refuses the fake endpoint. */ -}}
+{{- if (($cc.ec2 | default dict).fakeEndpoint | default dict).enabled -}}
+{{- $fail = append $fail "space-cluster-controller-local.ec2.fakeEndpoint.enabled must be false: it points EC2 at the Kind fake EC2 endpoint (fake-ec2), which is not installed" -}}
+{{- end -}}
 {{- /* The rate limiters' Redis is optional; this installer provides none. */ -}}
 {{- $apiRedis := toString (($api.redis | default dict).url | default "") -}}
 {{- $ccRedis := toString (($cc.redis | default dict).url | default "") -}}

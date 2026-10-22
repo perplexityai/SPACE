@@ -237,7 +237,7 @@ env -i PATH="$stubs:$PATH" HOME="$work" DOCKER_LOG="$log" SPACE_MIRRORED_IMAGES=
 expected="docker/Dockerfile.worker
 docker/Dockerfile.ui
 /seed"
-[[ "$(builds | grep -oE 'docker/Dockerfile\.[a-z-]+|/seed$' | uniq)" == "$expected" ]] \
+[[ "$(builds | grep -oE 'docker/Dockerfile\.[a-z0-9-]+|/seed$' | uniq)" == "$expected" ]] \
     || fail "only Dockerfiles whose mirrored bases were all available may be exported" "$(builds)"
 grep -q "a mirrored base of docker/Dockerfile.api was unavailable" "$work/err" \
     || fail "a skipped export must say why" "$(cat "$work/err")"

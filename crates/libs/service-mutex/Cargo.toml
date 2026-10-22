@@ -1,0 +1,22 @@
+[package]
+name = "pplx-space-service-mutex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nix = { workspace = true, features = ["fs"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }

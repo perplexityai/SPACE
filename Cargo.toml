@@ -54,9 +54,12 @@ members = [
     "crates/libs/snapshot/retention",
     "crates/libs/sbx/mgr/client",
     "crates/libs/sbx/mgr/migrations",
+    "crates/libs/sbx/mgr/protocol",
     "crates/libs/sbx/mgr/server",
     "crates/libs/sbx/mgr/store",
     "crates/libs/rustls-provider",
+    "crates/libs/sql-locator",
+    "crates/libs/service-mutex",
     "crates/libs/sqlite",
     "crates/libs/unix-socket-path",
     "crates/libs/systemd-watchdog",
@@ -80,11 +83,15 @@ members = [
     "crates/libs/build/mgr/client",
     "crates/libs/build/mgr/server",
     "crates/libs/object-store",
+    "crates/libs/page-cache",
     "crates/libs/placement/executor",
     "crates/libs/placement/machine",
     "crates/libs/public/api",
     "crates/libs/api",
+    "crates/libs/byte-size",
     "crates/libs/common/core",
+    "crates/libs/semver",
+    "crates/libs/durations",
     "crates/libs/common/cli",
     "crates/libs/common/connection/admission",
     "crates/libs/common/grpc",
@@ -95,17 +102,22 @@ members = [
     "crates/libs/common/proto-build",
     "crates/libs/common/work-coalescer",
     "crates/libs/common/svc",
+    "crates/libs/content-digest",
+    "crates/libs/cpu-arch",
     "crates/libs/data/plane/server",
     "crates/libs/db-test-fixtures",
     "crates/libs/db/migrator",
     "crates/libs/dependency-drain",
+    "crates/libs/migration-checksums",
     "crates/libs/aws/client",
     "crates/libs/aws/s3-http-client",
+    "crates/libs/env-vars",
     "crates/libs/feature-flags",
     "crates/libs/events",
     "crates/libs/metrics",
     "crates/libs/observability",
     "crates/libs/internal/api/server",
+    "crates/libs/k8s-ids",
     "crates/libs/cluster/controller/server",
     "crates/libs/cluster/pool",
     "crates/libs/cluster/reconciler",
@@ -301,7 +313,9 @@ pplx-space-bearer-token = { path = "crates/libs/bearer-token" }
 pplx-space-build-mgr = { path = "crates/libs/build/mgr" }
 pplx-space-build-mgr-client = { path = "crates/libs/build/mgr/client" }
 pplx-space-build-mgr-server = { path = "crates/libs/build/mgr/server" }
+pplx-space-byte-size = { path = "crates/libs/byte-size" }
 pplx-space-common-core = { path = "crates/libs/common/core" }
+pplx-space-durations = { path = "crates/libs/durations" }
 pplx-space-common-cli = { path = "crates/libs/common/cli" }
 pplx-space-common-connection-admission = { path = "crates/libs/common/connection/admission" }
 pplx-space-common-grpc = { path = "crates/libs/common/grpc" }
@@ -312,10 +326,14 @@ pplx-space-common-lru-reaper = { path = "crates/libs/common/lru-reaper" }
 pplx-space-common-proto-build = { path = "crates/libs/common/proto-build" }
 pplx-space-common-svc = { path = "crates/libs/common/svc", default-features = false }
 pplx-space-common-work-coalescer = { path = "crates/libs/common/work-coalescer" }
+pplx-space-content-digest = { path = "crates/libs/content-digest" }
+pplx-space-cpu-arch = { path = "crates/libs/cpu-arch" }
 pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
 pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }
 pplx-space-dependency-drain = { path = "crates/libs/dependency-drain" }
+pplx-space-env-vars = { path = "crates/libs/env-vars" }
+pplx-space-migration-checksums = { path = "crates/libs/migration-checksums" }
 pplx-space-execution-common = { path = "crates/libs/execution/common" }
 pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
 pplx-space-events = { path = "crates/libs/events" }
@@ -343,12 +361,14 @@ pplx-space-node-runtime-manager-client = { path = "crates/libs/node/runtime/mana
 pplx-space-node-runtime-supervisor = { path = "crates/libs/node/runtime/supervisor" }
 pplx-space-net-common = { path = "crates/libs/net/common" }
 pplx-space-object-store = { path = "crates/libs/object-store" }
+pplx-space-page-cache = { path = "crates/libs/page-cache" }
 pplx-space-public-api = { path = "crates/libs/public/api" }
 pplx-space-metrics = { path = "crates/libs/metrics" }
 pplx-space-observability = { path = "crates/libs/observability", default-features = false }
 pplx-space-placement = { path = "crates/libs/placement/machine" }
 pplx-space-internal-api-server = { path = "crates/libs/internal/api/server" }
 pplx-space-internal-api-svc = { path = "crates/apps/internal/api/svc" }
+pplx-space-k8s-ids = { path = "crates/libs/k8s-ids" }
 pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
 pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }
@@ -362,8 +382,12 @@ pplx-space-snapshot-store = { path = "crates/libs/snapshot/store" }
 pplx-space-sbxmgr-migrations = { path = "crates/libs/sbx/mgr/migrations" }
 pplx-space-sbx-mgr = { path = "crates/libs/sbx/mgr/server" }
 pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
+pplx-space-sbx-mgr-protocol = { path = "crates/libs/sbx/mgr/protocol" }
 pplx-space-sbx-mgr-store = { path = "crates/libs/sbx/mgr/store" }
 pplx-space-rustls-provider = { path = "crates/libs/rustls-provider" }
+pplx-space-semver = { path = "crates/libs/semver" }
+pplx-space-sql-locator = { path = "crates/libs/sql-locator" }
+pplx-space-service-mutex = { path = "crates/libs/service-mutex" }
 pplx-space-sqlite = { path = "crates/libs/sqlite" }
 pplx-space-systemd-watchdog = { path = "crates/libs/systemd-watchdog" }
 pplx-space-spaced-build = { path = "crates/libs/spaced/build" }

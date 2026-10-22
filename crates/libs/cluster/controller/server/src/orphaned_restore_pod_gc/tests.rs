@@ -525,7 +525,6 @@ fn current_generation_pod_is_skipped() {
         SandboxLifecycle::Started,
         SandboxLifecycle::Paused,
         SandboxLifecycle::Failed,
-        SandboxLifecycle::Suspended,
     ] {
         let s = state(lifecycle, Some(POD_GEN));
         assert_eq!(
@@ -538,16 +537,16 @@ fn current_generation_pod_is_skipped() {
 
 #[test]
 fn same_generation_pod_is_never_reaped_even_when_row_reverted() {
-    // A same-generation pod on a reverted/dormant row whose execution was NOT
-    // retired (a failed teardown left it active) is left alone: a restore
-    // resuming that generation could still adopt this pod, so deleting it
-    // unlocked would race that adoption. Retiring the stale active execution is
-    // the suspended-execution convergence path's job; once it clears `active`,
-    // this loop reaps the pod as no-active-execution.
+    // A same-generation pod on a `suspended` row whose execution is still
+    // active is left alone: a restore resuming that generation could still
+    // adopt it, and a suspend that raced a wake leaves this same shape with
+    // the only copy of the sandbox's state in the pod. It's tallied apart from
+    // the live runtimes so the backlog is visible; once a revert retires the
+    // execution, this loop reaps the pod as no-active-execution.
     let s = state(SandboxLifecycle::Suspended, Some(POD_GEN));
     assert_eq!(
         classify_disposition(Some(&s), POD_GEN),
-        Disposition::Skip(SkipClass::ActiveRuntime)
+        Disposition::Skip(SkipClass::SuspendedSameGeneration)
     );
 }
 

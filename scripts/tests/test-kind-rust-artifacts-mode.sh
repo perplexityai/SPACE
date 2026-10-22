@@ -155,7 +155,7 @@ EOF
 chmod +x "$stubs/docker"
 guard_env() { # extra assignments...
     PATH="$(stub_path "$stubs")" REPO_ROOT="$repo_root" CHEF_IMAGE=x TARGET_DIR="$work" CARGO_HOME_DIR="$work" SRC_DIR="$work" \
-    RUNTIME_LIBC_IMAGE=runtime:test "$@"
+    RUNTIME_LIBC_IMAGE=runtime:test RELEASE_LTO=false "$@"
 }
 guard_body='
 set -euo pipefail

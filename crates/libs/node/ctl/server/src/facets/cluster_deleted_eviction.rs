@@ -24,15 +24,6 @@ pub(super) const CLUSTER_DELETED_CANDIDATE_WINDOW: usize = 100;
 pub(super) const CLUSTER_DELETED_EVICT_BACKOFF: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
 
-/// Slack added to a server-supplied retry horizon so the retry lands on a
-/// sync *after* the horizon passes rather than racing it. Sized to the
-/// deployed default poll interval as a fixed safety margin: the interval is
-/// runtime-configurable, so a shorter one just skips a few more syncs and a
-/// longer one still adds less than one interval of margin; neither breaks
-/// the schedule, it only shifts the retry by at most one extra sync.
-pub(super) const CLUSTER_DELETED_EVICT_RETRY_SLACK: std::time::Duration =
-    std::time::Duration::from_secs(crate::DEFAULT_POLL_INTERVAL_SECS);
-
 /// What one refused `EvictClusterDeletedSandbox` means for the per-id retry
 /// schedule (a successful claim needs no schedule: the teardown runs
 /// detached). Pure so the routing is testable without a live sbx-manager.
@@ -58,8 +49,16 @@ pub(super) enum ClusterDeletedEvictDisposition {
 /// cluster-deleted row is reclaimed at quiescence end (~11 min after the
 /// delete) instead of after the flat 30 min back-off that stays in place
 /// for refusals with no horizon. Everything else is a failure.
+///
+/// The slack added to a horizon is `sync_interval`, node-ctl's configured
+/// poll, so the retry waits for the window's end plus one poll: it lands on
+/// the first sync after that, normally the second sync after the window ends,
+/// never on one racing the end itself. Sized to the configured poll rather
+/// than the 60 s default, so a node polling every 20 s retries a refused
+/// eviction 20-40 s after the window ends instead of 60-80 s.
 pub(super) fn cluster_deleted_evict_refusal_disposition(
     status: &tonic::Status,
+    sync_interval: std::time::Duration,
 ) -> ClusterDeletedEvictDisposition {
     match status.code() {
         Code::Aborted => ClusterDeletedEvictDisposition::RetryNextSync,
@@ -69,7 +68,7 @@ pub(super) fn cluster_deleted_evict_refusal_disposition(
         | Code::Unavailable
         | Code::DeadlineExceeded => ClusterDeletedEvictDisposition::Deferred(
             pplx_space_common_grpc::retry_after(status)
-                .map(|horizon| horizon.saturating_add(CLUSTER_DELETED_EVICT_RETRY_SLACK))
+                .map(|horizon| horizon.saturating_add(sync_interval))
                 .map_or(CLUSTER_DELETED_EVICT_BACKOFF, |until| {
                     until.min(CLUSTER_DELETED_EVICT_BACKOFF)
                 }),

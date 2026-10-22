@@ -813,31 +813,39 @@ async fn gone_node_give_up_fails_only_resident_rows_of_the_node() -> TestResult 
 
 /// The gone-node mark-lost fails a row targeted at the node only out of
 /// `suspended`, from every stored lifecycle; the trigger clears the marker
-/// with it. `A`: failed; `.`: refused. The lifecycle is compared exactly, so
+/// with it. One column per seed: an unmarked row active and targeted on the
+/// node, then a row marked `started` and only targeted there. `A`: failed;
+/// `.`: refused, the row as it was. The lifecycle is compared exactly, so
 /// neither non-canonical value is failed.
+///
+/// Today's behaviour, pinned rather than endorsed: a failed `on_node` row
+/// keeps its active node and its `on_node` placement. The drained-node
+/// terminator's mark-lost does the opposite: it retires and unplaces such
+/// rows, and calls a dangling `active_node_id` a hazard.
 #[tokio::test(flavor = "current_thread")]
 async fn gone_node_mark_lost_fails_only_suspended_rows() -> TestResult {
     const EXPECTED: &[&str] = &[
-        "created           .",
-        "creating          .",
-        "starting          .",
-        "started           .",
-        "restoring         .",
-        "pausing           .",
-        "paused            .",
-        "resuming          .",
-        "suspending        .",
-        "suspended         A",
-        "stopping          .",
-        "stopped           .",
-        "deleting          .",
-        "checkpointing     .",
-        "quarantined       .",
-        "failed            .",
-        "deleted           .",
-        "cleanup_required  .",
-        "bogus             .",
-        "_Suspended_       .",
+        //                 on_node  marked
+        "created              .        .",
+        "creating             .        .",
+        "starting             .        .",
+        "started              .        .",
+        "restoring            .        .",
+        "pausing              .        .",
+        "paused               .        .",
+        "resuming             .        .",
+        "suspending           .        .",
+        "suspended            A        A",
+        "stopping             .        .",
+        "stopped              .        .",
+        "deleting             .        .",
+        "checkpointing        .        .",
+        "quarantined          .        .",
+        "failed               .        .",
+        "deleted              .        .",
+        "cleanup_required     .        .",
+        "bogus                .        .",
+        "_Suspended_          .        .",
     ];
     let db = pg_test_db().await?;
     let pool = &db.pool;
@@ -852,27 +860,35 @@ async fn gone_node_mark_lost_fails_only_suspended_rows() -> TestResult {
     .await?;
 
     let mut mismatches = Vec::new();
-    for (stored, [(_, fails)]) in stored_lifecycle_matrix(["mark_lost"], EXPECTED) {
-        let sandbox_id = SandboxId::new();
-        let seed = SandboxSeed::new(stored, "k8s").marked("started");
-        insert_sandbox(pool, sandbox_id, &seed).await?;
-        set_target_node(pool, sandbox_id, node_id).await?;
+    for (stored, cells) in stored_lifecycle_matrix([None, Some("started")], EXPECTED) {
+        for (marker, fails) in cells {
+            let sandbox_id = SandboxId::new();
+            // The unmarked row is resident on the node; the marked one is
+            // only targeted there.
+            let active_node_id = marker.is_none().then_some(node_id);
+            let seed = match marker {
+                Some(target) => SandboxSeed::new(stored, "k8s").marked(target),
+                None => SandboxSeed::new(stored, "k8s").on_node(node_id),
+            };
+            insert_sandbox(pool, sandbox_id, &seed).await?;
+            set_target_node(pool, sandbox_id, node_id).await?;
 
-        let flipped = sink
-            .mark_sandbox_lost_on_gone_node(sandbox_id, node_id, Some("uid-observed"))
-            .await?;
+            let flipped = sink
+                .mark_sandbox_lost_on_gone_node(sandbox_id, node_id, Some("uid-observed"))
+                .await?;
 
-        let accepts = fails.applies();
-        let expected = if accepts {
-            Row::new("failed", None, None)
-        } else {
-            Row::new(stored, Some("started"), None)
-        };
-        let actual = row(pool, sandbox_id).await?;
-        if flipped != u64::from(accepts) || actual != expected {
-            mismatches.push(format!(
-                "stored {stored}: flipped {flipped}, row {actual:?}"
-            ));
+            let accepts = fails.applies();
+            let expected = if accepts {
+                Row::new("failed", None, active_node_id)
+            } else {
+                Row::new(stored, marker, active_node_id)
+            };
+            let actual = row(pool, sandbox_id).await?;
+            if flipped != u64::from(accepts) || actual != expected {
+                mismatches.push(format!(
+                    "stored {stored}, marker {marker:?}: flipped {flipped}, row {actual:?}"
+                ));
+            }
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
@@ -978,7 +994,8 @@ async fn failed_on_node_give_up_claims_only_started_or_paused_residents() -> Tes
 /// node that is in a non-evacuable transient lifecycle, unmarked or a marked
 /// `suspending` with nothing to redrive, and nothing else: no other stored
 /// lifecycle, no marked row in any other lifecycle, no row resident
-/// elsewhere. A row only active or only targeted there counts as resident.
+/// elsewhere. Today a row only active or only targeted there is claimed too;
+/// that is pinned, not endorsed (see the rows seeded after the table).
 /// One column per marker: unmarked, then marked `started`. `A`:
 /// claimed and torn down; `.`: refused, the row as it was. The lifecycle is
 /// compared exactly, so neither non-canonical value is claimed.
@@ -1025,10 +1042,16 @@ async fn abandon_stale_claims_only_aged_unmarked_transients_of_the_node() -> Tes
     let elsewhere =
         insert_resident_without_execution(pool, NodeId::new(), "starting", None).await?;
     cases.push((elsewhere, row(pool, elsewhere).await?, false));
-    // The node predicate matches either column, so each of these is claimed:
-    // a row targeted at the node with no active node, one targeted at the node
-    // but still active on another node (its teardown clears that active node
-    // too), and one active on the node but targeted at another.
+    // Today's behaviour, pinned rather than endorsed: the node predicate
+    // matches `active_node_id` or `target_node_id`, so each of these rows is
+    // abandoned. That includes a row targeted at the draining node but still
+    // active on another node. These rows have no execution, so the test pins
+    // only that the teardown clears the row's active node. In production the
+    // teardown's unfenced `delete_execution` calls `forget_pod_tracking`,
+    // whose `clear_pod_tracking_in` matches `WHERE id = $1` alone, so it also
+    // retires the execution placed on that other node. The other two rows are
+    // targeted at the node with no active node, and active on the node but
+    // targeted at another.
     let elsewhere_node_id = NodeId::new();
     for (active_node_id, target_node_id) in [
         (None, node_id),

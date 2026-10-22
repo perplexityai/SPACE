@@ -19,6 +19,8 @@ FAIL_OPEN_CALLERS = 4
     # Two API rollouts (enable, restore), a Redis scale-down/up, and about ten
     # real sandbox boots.
     sandbox=smoke.SandboxConfig(timeout=1800),
+    test_hooks="SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST, which it shrinks to 2; "
+    "the release burst of 60 would need sixty real boots",
 )
 def rate_limiters_enforce_and_fail_open(test: smoke.KindEcw) -> None:
     """With both limiters' caps shrunk and per-client concurrency in enforce

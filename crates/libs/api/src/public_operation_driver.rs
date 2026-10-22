@@ -301,8 +301,8 @@ where
             } else {
                 None
             };
-            let deferral_exhausted =
-                deferred_for.is_some_and(|deferred_for| deferred_for >= DEFERRED_RETRY_WINDOW);
+            let deferral_exhausted_after =
+                deferred_for.filter(|deferred_for| *deferred_for >= DEFERRED_RETRY_WINDOW);
             let deadline = if is_native_m1_terminalized_kind(api_product, kind) {
                 config.m1_max_age
             } else {
@@ -367,36 +367,71 @@ where
                     );
                 }
                 updated
-            } else if deferral_exhausted
+            } else if deferral_exhausted_after.is_some()
                 || (!preserve_retry_budget
                     && retry_budget_exhausted(attempts, config.max_retry_attempts))
             {
                 let terminal_error_code = result
                     .terminal_error_code
                     .unwrap_or(PublicErrorCode::Internal);
-                let terminal_error_json = result.terminal_error_json.unwrap_or_else(|| {
+                let mut terminal_error_json = result.terminal_error_json.unwrap_or_else(|| {
                     serde_json::json!({
                         "operation_id": operation_id.to_string(),
                         "kind": kind.as_str(),
                         "reason": "retry_attempts_exhausted",
                         "retry_reason": retry_reason,
                         "attempts": attempts,
-                            "max_retry_attempts": config.max_retry_attempts.max(1),
+                        "max_retry_attempts": config.max_retry_attempts.max(1),
                     })
                 });
+                // Deferred retries give their attempts back, so the window,
+                // not the attempt count, is what ran out, whichever error
+                // the operation fails with.
+                if let (Some(elapsed), Some(fields)) = (
+                    deferral_exhausted_after,
+                    terminal_error_json.as_object_mut(),
+                ) {
+                    fields.insert(
+                        "deferred_retry_window_ms".to_owned(),
+                        serde_json::json!(DEFERRED_RETRY_WINDOW.as_millis()),
+                    );
+                    fields.insert(
+                        "elapsed_since_first_claim_ms".to_owned(),
+                        serde_json::json!(elapsed.as_millis()),
+                    );
+                }
+                let progress_message = match deferral_exhausted_after {
+                    Some(elapsed) => format!(
+                        "retry deferral window of {} exhausted {} after the first claim: \
+                         {progress_message}",
+                        format_simple_duration(DEFERRED_RETRY_WINDOW),
+                        format_simple_duration(Duration::from_secs(elapsed.as_secs())),
+                    ),
+                    None => format!(
+                        "retry attempts exhausted after {attempts} attempt(s): \
+                         {progress_message}"
+                    ),
+                };
                 let updated = store
                     .fail_claimed_operation(FailClaimedPublicOperation {
                         claim_token,
                         operation_id,
-                        progress_message: format!(
-                            "retry attempts exhausted after {attempts} attempt(s): \
-                             {progress_message}"
-                        ),
+                        progress_message,
                         terminal_error_code: terminal_error_code.clone(),
                         terminal_error_json,
                     })
                     .await?;
                 if updated {
+                    if let Some(elapsed) = deferral_exhausted_after {
+                        tracing::warn!(
+                            operation_id = %operation_id,
+                            api_product = api_product_label,
+                            kind = kind.as_str(),
+                            deferred_retry_window_ms = DEFERRED_RETRY_WINDOW.as_millis(),
+                            elapsed_since_first_claim_ms = elapsed.as_millis(),
+                            "public operation exhausted its retry deferral window"
+                        );
+                    }
                     report.failed += 1;
                     pplx_space_metrics::operations::failed(
                         api_product_label,
@@ -465,9 +500,12 @@ pub fn claim_renewal_interval(claim_stale_after: Duration) -> Duration {
 }
 
 /// The delay before re-driving an operation that deferred its retry wait:
-/// the executor's `hint` plus an equal-jittered eighth of how long it has
-/// been deferring, capped at a minute. A fence that clears quickly is retried
-/// within seconds; a long one is retried about once a minute.
+/// the executor's `hint` plus an equal-jittered eighth of `deferred_for`, the
+/// wall-clock time since its first claim. The jittered term is capped at a
+/// minute, so the longest delay is `hint` plus 60 s. An operation first
+/// claimed moments ago is retried within seconds; one first claimed eight
+/// minutes or more ago, however long it has been deferring, is retried about
+/// once a minute.
 pub fn deferred_retry_delay(
     operation_id: OperationId,
     deferred_for: Duration,

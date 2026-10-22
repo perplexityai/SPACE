@@ -133,12 +133,13 @@ fn native_action_metric(action_segment: &str) -> &'static str {
 fn ecw_route_metric(method: &Method, segments: &[&str]) -> Option<SandboxApiMetricIdentity> {
     let operation = match (method, segments) {
         (&Method::GET, ["sandboxes"]) | (&Method::GET, ["v2", "sandboxes"]) => "list",
-        (&Method::POST, ["sandboxes"]) => "create",
+        (&Method::POST, ["sandboxes"]) | (&Method::POST, ["v2", "sandboxes"]) => "create",
         (&Method::GET, ["sandboxes", _]) => "get",
         (&Method::DELETE, ["sandboxes", _]) => "delete",
         (&Method::POST, ["sandboxes", _, "pause"]) => "pause",
         (&Method::POST, ["sandboxes", _, "resume"]) => "resume",
-        (&Method::POST, ["sandboxes", _, "connect"]) => "connect",
+        (&Method::POST, ["sandboxes", _, "connect"])
+        | (&Method::POST, ["v2", "sandboxes", _, "connect"]) => "connect",
         (&Method::POST, ["sandboxes", _, "timeout"]) => "timeout",
         (&Method::POST, ["sandboxes", _, "refreshes"]) => "refresh",
         (&Method::POST, ["sandboxes", _, "fork"]) => "fork",

@@ -1075,6 +1075,11 @@ pub async fn run(
                         delete_failed = report.delete_failed,
                         rate_limited = report.rate_limited,
                         skipped = report.skipped_total(),
+                        suspended_same_generation = report
+                            .skipped
+                            .get(&SkipClass::SuspendedSameGeneration)
+                            .copied()
+                            .unwrap_or(0),
                         terminating = report.terminating,
                         missing_identity = report.missing_identity,
                         deferred = report.deferred,

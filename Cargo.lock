@@ -5223,6 +5223,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-byte-size"
+version = "0.8.0"
+dependencies = [
+ "bytesize",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-cluster-controller"
 version = "0.8.0"
 dependencies = [
@@ -5369,14 +5378,20 @@ version = "0.8.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
- "bytesize",
  "insta",
  "k8s-openapi",
  "libc",
  "nix 0.31.3",
+ "pplx-space-byte-size",
+ "pplx-space-content-digest",
+ "pplx-space-cpu-arch",
+ "pplx-space-durations",
+ "pplx-space-env-vars",
+ "pplx-space-k8s-ids",
  "pplx-space-net-common",
+ "pplx-space-semver",
+ "pplx-space-sql-locator",
  "rusqlite",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5509,8 +5524,11 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-dependency-drain",
  "pplx-space-metrics",
+ "pplx-space-migration-checksums",
  "pplx-space-observability",
+ "pplx-space-page-cache",
  "pplx-space-rustls-provider",
+ "pplx-space-service-mutex",
  "pplx-space-systemd-watchdog",
  "pplx-space-test-env",
  "pplx-space-tokio-runtime",
@@ -5528,7 +5546,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "toml",
  "tonic",
  "tonic-health",
  "tonic-prost",
@@ -5549,6 +5566,22 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-content-digest"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-cpu-arch"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5828,6 +5861,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-durations"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-env-vars"
+version = "0.8.0"
+
+[[package]]
 name = "pplx-space-events"
 version = "0.8.0"
 dependencies = [
@@ -5860,7 +5905,7 @@ dependencies = [
  "eppo",
  "open-feature",
  "open-feature-flagd",
- "pplx-space-common-core",
+ "pplx-space-env-vars",
  "pplx-space-metrics",
  "pplx-space-test-env",
  "serde",
@@ -5935,6 +5980,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-k8s-ids"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-metrics"
 version = "0.8.0"
 dependencies = [
@@ -5945,6 +5999,20 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-migration-checksums"
+version = "0.8.0"
+dependencies = [
+ "hex",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -6606,6 +6674,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-page-cache"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-placement"
 version = "0.8.0"
 dependencies = [
@@ -6832,9 +6910,20 @@ dependencies = [
 name = "pplx-space-sbx-mgr-client"
 version = "0.8.0"
 dependencies = [
- "anyhow",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-sbx-mgr-protocol",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "pplx-space-sbx-mgr-protocol"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "pplx-space-common-core",
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
  "pplx-space-net-common",
@@ -6844,7 +6933,6 @@ dependencies = [
  "prost",
  "prost-types",
  "thiserror 2.0.20",
- "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -6901,6 +6989,28 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-svc",
  "pplx-space-sbx-mgr",
+]
+
+[[package]]
+name = "pplx-space-semver"
+version = "0.8.0"
+dependencies = [
+ "semver",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-service-mutex"
+version = "0.8.0"
+dependencies = [
+ "nix 0.31.3",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -7222,13 +7332,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-sql-locator"
+version = "0.8.0"
+
+[[package]]
 name = "pplx-space-sqlite"
 version = "0.8.0"
 dependencies = [
  "hex",
- "pplx-space-common-core",
- "pplx-space-common-svc",
+ "pplx-space-migration-checksums",
  "pplx-space-observability",
+ "pplx-space-sql-locator",
  "rusqlite",
  "sqlx",
  "tempfile",
@@ -7359,7 +7473,7 @@ name = "pplx-space-test-env"
 version = "0.8.0"
 dependencies = [
  "nix 0.31.3",
- "pplx-space-common-core",
+ "pplx-space-env-vars",
  "tempfile",
 ]
 

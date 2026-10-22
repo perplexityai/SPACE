@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, BinaryIO, Generic, Protocol, TypeVar
 
@@ -258,6 +259,9 @@ class CommandSandboxFactory(Protocol):
 class EcwSandboxInfo(SandboxInfo):
     template_id: str | None
     state: EcwSandboxState | None = None
+    end_at: datetime | None = None
+    """The public `end_at`: the persisted timeout policy as an expiry from the
+    sandbox's start. It is not the node's live deadline."""
 
 
 class EcwSandboxPages(SandboxPages[EcwSandboxInfo]):
@@ -626,6 +630,73 @@ class PendingBackupControl(Protocol):
 
     def artifact_backed(self, sandbox_id: str, local_artifact_id: str) -> bool: ...
 
+    def sandbox_pod_placement(self, sandbox_id: str) -> SandboxPodPlacement | None: ...
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        """Have that node's node-ctl publish `facet` now instead of on its next poll.
+
+        None once node-ctl has the request; otherwise why a transient failure
+        kept it from node-ctl, for the caller to record and retry.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class ReconcileQueueRef:
+    """One `node_reconcile_queue` row: its node, facet and whether it is a dead letter."""
+
+    node_id: str
+    facet: str
+    dead: bool
+
+
+class ReconcileQueueGcControl(Protocol):
+    """Kind-only operations for the reconcile-queue GC scenario.
+
+    The GC prunes only rows a day old, a retention no public path can
+    produce, so the scenario seeds synthetic `managed_by='k8s'` node rows
+    with backdated queue refs (the stack's Postgres, as the retention
+    fixtures write it) and reads the queue back. Every seeded `node_k8s` row
+    carries the scenario's marker as its `k8s_node_uid`, which no real Node
+    has, and the deletion selects on it. The controller Deployment's env is
+    read, never changed; the fake EC2 endpoint's log is failure evidence
+    only.
+    """
+
+    def reconcile_queue_gc_env(self) -> dict[str, str | None]:
+        """The literal GC switch and EC2 endpoint on the controller Deployment, None if unset."""
+        ...
+
+    def unregistered_ready_node(self) -> str:
+        """A Ready Kubernetes Node no SPACE node row names; the scenario's live node."""
+        ...
+
+    def node_exists(self, name: str) -> bool: ...
+
+    def seed_reconcile_queue_gc_nodes(
+        self,
+        *,
+        live: tuple[str, str],
+        gone: tuple[str, str],
+        marker: str,
+    ) -> None:
+        """Insert two (node id, Kubernetes name) rows, non-ready, with their backdated refs.
+
+        Each gets a 25 h-old live `node-status` ref; the live node also gets a
+        25 h-old and a 1 h-old dead letter. One transaction.
+        """
+        ...
+
+    def reconcile_queue_refs(self, node_ids: Sequence[str]) -> list[ReconcileQueueRef]: ...
+
+    def delete_seeded_reconcile_queue_nodes(self, node_ids: Sequence[str], *, marker: str) -> int:
+        """Delete the marked node rows (their refs cascade); returns how many remain."""
+        ...
+
+    def fake_ec2_log_tail(self) -> str:
+        """The fake EC2 endpoint's recent requests. Failure evidence only."""
+        ...
+
 
 class OrphanedRestorePodGcControl(Protocol):
     """Kind-only operations for the orphaned-restore-pod GC scenario.
@@ -703,7 +774,8 @@ class TemplateRecipe:
     envs: Mapping[str, str]
     run_cmds: tuple[tuple[str, str], ...]
     """`(command, user)` pairs appended after the Dockerfile."""
-    start_cmd: str
+    start_cmd: str | None
+    """None builds without a start command (and so without a ready wait)."""
     ready_timeout_seconds: int
 
 
@@ -731,6 +803,10 @@ class TemplateBuilder(Protocol):
         """`Template.build` (blocking; the SDK polls build status) with the run's credentials."""
         ...
 
+    def build_status(self, template_id: str, build_id: str) -> str:
+        """The public build status the SDK polls: `waiting`, `building`, `ready` or `error`."""
+        ...
+
     def create(
         self,
         *,
@@ -748,6 +824,8 @@ class TemplateBuildJob:
     builder_node_id: str | None
     builder_node: str | None
     """The accepting builder's Kubernetes node, through `node_k8s`; `None` when unpinned."""
+    build_id: str = ""
+    """The public build id the SDK polls the status of."""
 
 
 @dataclass(frozen=True)
@@ -786,6 +864,13 @@ class TemplateBuildControl(Protocol):
     def prepared_rootfs_handoff(self, node_name: str, *, window_seconds: int = 60) -> str | None:
         """None once the builder committed a prepared rootfs for its build; else, after
         `window_seconds` without one, the failure text."""
+        ...
+
+    def build_sandbox_started(self, node_name: str) -> bool:
+        """Whether the builder still runs the build's own sandbox: the `builder@local`
+        sandbox holding the committed prepared rootfs, listed as not yet run or running.
+
+        A probe that could not list the sandboxes raises instead."""
         ...
 
     def published_guest_metadata(self, node_name: str, alias: str) -> GuestMetadata: ...
@@ -937,6 +1022,14 @@ class NodeFenceControl(Protocol):
 
     def node_capacity(self, node_name: str, resource: str) -> str | None:
         """`status.capacity[resource]`, None when absent or unreadable."""
+        ...
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        """Have that node's node-ctl publish `facet` now instead of on its next poll.
+
+        None once node-ctl has the request; otherwise why a transient failure
+        kept it from node-ctl, for the caller to record and retry.
+        """
         ...
 
     def patch_node_as(
@@ -1116,6 +1209,8 @@ class KindEnvironment(Protocol):
 
     def telemetry_mode(self) -> str: ...
 
+    def rust_build(self) -> str: ...
+
     def admin_request(
         self, method: str, resource: str, body: dict[str, object] | None = None,
         *, expected: tuple[int, ...] = (200, 201, 202, 204),
@@ -1165,6 +1260,10 @@ class ClusterRetentionControl(Protocol):
     """
 
     def retention_sweeper_config(self) -> RetentionSweeperConfig: ...
+
+    def running_retention_sweeper_config(self) -> RetentionSweeperConfig | None:
+        """The knobs the running controller pods started with; `None` unless they all agree."""
+        ...
 
     def acquire_retention_sweeper_mutation(self) -> Callable[[], None]:
         """Acquire exclusive ownership of shared controller sweeper settings.
@@ -1832,6 +1931,10 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         """Entries of the sandbox's canonical suspend snapshot directory on `node_name`."""
         ...
 
+    def metric_export_interval_seconds(self, node_name: str, component: str) -> float:
+        """The OTLP metric export interval `component`'s pod on `node_name` runs with."""
+        ...
+
     def transfer_jobs(self, node_name: str, sandbox_id: str) -> list[TransferJobView]:
         """The sandbox's volume-manager transfer jobs on `node_name`.
 
@@ -2006,6 +2109,11 @@ class ColdEvictionControl(RestoreStateRead, RestorePodRead, Protocol):
 
     def cold_eviction_config(self, node_name: str) -> ColdEvictionConfig:
         """The eviction knobs of the sandbox-manager pod on the sandbox's worker."""
+        ...
+
+    def cluster_deleted_quiescence_seconds(self, node_name: str) -> int:
+        """How long that worker's sandbox-manager refuses to evict a cluster-deleted
+        row after the row last moved (`SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS`)."""
         ...
 
     def sandbox_cache_dir_present(self, node_name: str, sandbox_id: str) -> bool:

@@ -53,6 +53,10 @@ class RunningPodWatch:
         self._seen: dict[str, SandboxPodView] = {}
         self._work = BackgroundWork("running-pod watch", self._run)
 
+    @property
+    def interval_seconds(self) -> float:
+        return self._interval
+
     def start(self) -> None:
         self._work.start()
 

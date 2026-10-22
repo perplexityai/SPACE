@@ -18,27 +18,30 @@ MARKER = "space-smoke-btrfs-send-pull-ok"
 # stream codec; this scenario covers the cold-node branch: the landing worker
 # has never seen the template.
 #
-# Forcing: with the source cordoned, the fixture's own template is removed
-# from the other sandbox-pool worker through template-manager's own
-# `delete-template`, immediately before the restore — template-manager's
-# prefetch would otherwise re-pull it within a tick. The proof is then the
-# landed pod on that node restoring from object storage, the parent build the
-# snapshot names back on that node as a subvolume with the expected received
-# UUID, the instance being a received subvolume, and the pre-suspend state
-# intact. Prefetch could land the parent too, masking a broken on-demand pull
-# behind the kubelet's retries of the restore pod, and nothing scoped to a
-# scenario keeps prefetch off one template (its tags are DaemonSet env read
-# at daemon start). So template-manager's own pull metric must count a
-# successful by-hash `trigger=on_demand` pull of the parent on that worker
-# above a baseline taken once the count had stopped moving before the
-# removal — read from the bench's Prometheus, which only `otel` mode runs.
+# Forcing: the sandbox is created from a minimal run-owned template (the base
+# image alone) rather than the seed. template-manager prefetches only the
+# names in `SPACE_TEMPLATE_PREFETCH_TAGS` and never an org-specific release, so
+# once the template is removed from the other sandbox-pool worker through
+# template-manager's own `delete-template`, with the source cordoned, nothing
+# puts it back before the restore asks for it. On the seed, a prefetch tick
+# landing between that removal and the restore re-installed the parent first,
+# and the restore then found it on disk (bench 2026-10-21). The template is also
+# a fraction of the seed's size, so the landing worker's pull is short. The proof
+# is then the landed pod on that node restoring from object storage, the parent
+# build the snapshot names back on that node as a subvolume with the expected
+# received UUID, the instance being a received subvolume, and the pre-suspend
+# state intact. template-manager's own pull metric must count a successful
+# by-hash `trigger=on_demand` pull of the parent on that worker above a
+# baseline taken once the count had stopped moving before the removal — read
+# from the bench's Prometheus, which only `otel` mode runs.
 @smoke.scenario(
     "local.btrfs_send_restore_pulls_parent_template",
     telemetry_mode="otel",
     # The codec is read from the snapshot's objects through the AWS CLI.
     required_tools=("aws",),
-    # A cross-node restore plus a ~460 MiB template pull on the landing worker.
-    sandbox=smoke.SandboxConfig(timeout=1200),
+    # A minimal template build, then a cross-node restore that pulls it on the
+    # landing worker.
+    sandbox=smoke.SandboxConfig(timeout=1200, kind_dedicated_template=True),
 )
 def btrfs_send_restore_pulls_parent_template(test: smoke.KindEcw) -> None:
     """A sandbox suspended with the production stream codec restores onto a

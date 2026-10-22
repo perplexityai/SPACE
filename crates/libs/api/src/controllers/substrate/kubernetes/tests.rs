@@ -16,7 +16,8 @@ pub(crate) use kubernetes_tests::{
     mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     running_pod_kubernetes_client, running_pod_kubernetes_client_with_create_barrier,
     sandbox_pod_on_node, substrate_with_inventory_caches_and_pool, substrate_with_store,
-    substrate_with_store_and_client, substrate_with_store_client_proxy_port_and_pod,
+    substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
+    substrate_with_store_client_proxy_port_and_pod,
     substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
 };
 
@@ -1870,6 +1871,23 @@ mod kubernetes_tests {
             sandbox_proxy_port,
             pods,
             Vec::new(),
+        )
+    }
+
+    /// [`substrate_with_store_and_client`] whose pod and Node reflectors start
+    /// warm with `pods` and `nodes`.
+    pub(crate) fn substrate_with_store_client_pods_and_nodes(
+        pool: PgPool,
+        client: Client,
+        pods: Vec<Pod>,
+        nodes: Vec<Node>,
+    ) -> KubernetesSubstrate {
+        substrate_with_store_client_proxy_port_pods_and_nodes(
+            pool,
+            client,
+            DEFAULT_SANDBOX_PROXY_PORT,
+            pods,
+            nodes,
         )
     }
 
@@ -5199,8 +5217,9 @@ mod kubernetes_tests {
     }
 
     /// Under the dispatcher's retry deferral the same fence-blocked re-drive
-    /// returns its retryable error at once instead of pacing laps through a
-    /// long readiness budget, so the caller can hand back its slot.
+    /// retries in place for the 2 s grace, then returns its retryable error
+    /// instead of pacing laps through a long readiness budget, so the caller
+    /// can hand back its slot.
     #[tokio::test(flavor = "current_thread")]
     async fn deferred_conflict_redrive_returns_without_waiting_out_the_budget()
     -> Result<(), BoxError> {
@@ -5420,6 +5439,172 @@ mod kubernetes_tests {
                 .len(),
             1,
         );
+        Ok(())
+    }
+
+    /// The owner of a user restore commits `restoring -> started` itself
+    /// before it returns, so the request it serves never dials a `restoring`
+    /// pod and no node publication has to arrive first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_owned_restore_commits_started_before_it_returns() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(200))
+            .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let sim_worker = start_sim_worker().await?;
+        let substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::new(Mutex::new(Vec::new())), "127.0.0.1"),
+            sim_worker.port(),
+        );
+
+        let binding = substrate
+            .wake_execution_with_metric_identity(
+                &sandbox,
+                Duration::from_secs(2),
+                SandboxApiMetricIdentity::ecw("connect"),
+                crate::controllers::substrate::RecoveryCharge::Exempt,
+            )
+            .await?;
+
+        assert_eq!(binding.completion, ActivationCompletion::Owned);
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(lifecycle, "started");
+        Ok(())
+    }
+
+    /// A user request on a `restoring` row whose owner lapsed reclaims the
+    /// restore under its own claim, drives it to `started` and only then
+    /// gets a client: it never dials the restoring pod.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_reclaims_a_lapsed_restore_and_dials_it_once_started() -> Result<(), BoxError>
+    {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(1))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
+        let sim_worker = start_sim_worker().await?;
+        let substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::clone(&captured_pod_creates), "127.0.0.1"),
+            sim_worker.port(),
+        );
+
+        let client = substrate
+            .join_restore_before_dial(
+                sandbox_id,
+                SandboxApiMetricIdentity::native("restoring_access"),
+                Duration::from_secs(5),
+                crate::controllers::substrate::RecoveryCharge::Exempt,
+            )
+            .await;
+
+        assert!(client.is_ok(), "{:?}", client.err());
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(lifecycle, "started");
+        assert_eq!(
+            captured_pod_creates
+                .lock()
+                .expect("capture mutex poisoned")
+                .len(),
+            1,
+            "the reclaim drives one restore"
+        );
+        Ok(())
+    }
+
+    /// A started recovery a suspend superseded redrives the sandbox's
+    /// restore. If the restore's owner can't commit `started` (here a
+    /// synthetic database failure on that write), the row stays `restoring`
+    /// and the access request gets no binding for the restored pod: a later
+    /// revert may still retire it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redriven_restore_hands_out_no_binding_until_it_is_started() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(1))
+            .await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(sql!(
+            "CREATE FUNCTION test_refuse_restored_started() RETURNS trigger AS $$
+             BEGIN
+                 IF OLD.lifecycle = 'restoring' AND NEW.lifecycle = 'started' THEN
+                     RAISE EXCEPTION 'synthetic started-commit failure';
+                 END IF;
+                 RETURN NEW;
+             END
+             $$ LANGUAGE plpgsql"
+        ))
+        .execute(&pool)
+        .await?;
+        sqlx::query(sql!(
+            "CREATE TRIGGER test_refuse_restored_started BEFORE UPDATE ON sandboxes
+             FOR EACH ROW EXECUTE FUNCTION test_refuse_restored_started()"
+        ))
+        .execute(&pool)
+        .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let sim_worker = start_sim_worker().await?;
+        let substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::new(Mutex::new(Vec::new())), "127.0.0.1"),
+            sim_worker.port(),
+        );
+
+        let binding = substrate
+            .redrive_suspended_recovery_for_access(
+                &sandbox,
+                Some(1),
+                tokio::time::Instant::now() + Duration::from_secs(3),
+                SandboxApiMetricIdentity::native("restoring_access"),
+                crate::controllers::substrate::RecoveryCharge::Exempt,
+            )
+            .await;
+
+        let error = binding.expect_err("a restoring execution must not be handed out");
+        assert_eq!(
+            error.retry_after_cause(),
+            Some(crate::controllers::ControllerRetryAfterCause::RestoreInFlight),
+            "{error:?}"
+        );
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(lifecycle, "restoring");
         Ok(())
     }
 

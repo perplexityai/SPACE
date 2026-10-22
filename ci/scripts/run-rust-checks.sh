@@ -364,7 +364,7 @@ run_clippy_checks() {
 
     # Built alone, so a sqlx or common-svc feature these crates need but only
     # get through unification with the rest of the workspace fails here.
-    echo "--- :rust: Running isolated SQLite helper clippy"
+    echo "--- :rust: Running isolated SQLite helper and migration-checksums clippy"
     CARGO_TARGET_DIR="${target_dir}" cargo clippy \
         --locked \
         -p pplx-space-sqlite \
@@ -376,6 +376,12 @@ run_clippy_checks() {
         -p pplx-space-common-svc \
         --no-default-features \
         --features migration-checksums \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-migration-checksums \
+        --lib \
         -- \
         -D warnings
 
@@ -434,6 +440,121 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone with no features and with all of them, so a serde or sqlx
+    # feature the semantic-version crate needs but only gets through
+    # common-core's features fails here.
+    echo "--- :rust: Running isolated semantic-version clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-semver \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-semver \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone, so a serde derive that only compiles through feature
+    # unification with common-core's dependents fails here.
+    echo "--- :rust: Running isolated content-digest clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-content-digest \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-content-digest \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone with no features and with all of them, so a dependency
+    # feature the duration types need but only get through unification with
+    # common-core or the rest of the workspace fails here.
+    echo "--- :rust: Running isolated durations clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-durations \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-durations \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone, so a tokio feature the service mutex needs but only gets
+    # through common-svc's broader tokio features fails here.
+    echo "--- :rust: Running isolated service mutex clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-service-mutex \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone, so a libc or nix feature the Linux-only page-cache calls
+    # need but only get through unification fails here.
+    echo "--- :rust: Running isolated page-cache clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-page-cache \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone, so a serde feature the CPU architecture crate needs but only
+    # gets through unification with common-core fails here.
+    echo "--- :rust: Running isolated CPU architecture clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-cpu-arch \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-cpu-arch \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone with and without its `serde` feature, so a dependency
+    # feature the byte-size types need but only get through unification with
+    # common-core or the rest of the workspace fails here.
+    echo "--- :rust: Running isolated byte-size clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-byte-size \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-byte-size \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching
@@ -445,6 +566,24 @@ run_clippy_checks() {
         --locked \
         -p pplx-space-feature-flags \
         --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone, so a serde or sqlx feature the Kubernetes identifier crate
+    # needs but only gets through unification with common-core fails here.
+    echo "--- :rust: Running isolated Kubernetes identifier clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-k8s-ids \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-k8s-ids \
+        --all-features \
         --all-targets \
         -- \
         -D warnings

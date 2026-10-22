@@ -14,6 +14,7 @@ mod create_readiness;
 mod durable_snapshot;
 mod hydration_and_suspend;
 mod pooled_adoption;
+mod restoring_access;
 
 use std::collections::BTreeMap;
 

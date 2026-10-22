@@ -46,6 +46,8 @@ MARKER = "space-smoke-snapshot-reaper-ok"
     # a few ticks; the sandbox itself is live throughout. 2400 s covers the
     # largest idle the fixture accepts.
     sandbox=smoke.SandboxConfig(timeout=2400),
+    test_hooks="the chart's SPACE_SBX_GC_TARGET_FRACTION, SPACE_SBX_GC_INTERVAL_SECS, "
+    "SPACE_SBX_GC_GRACE_SECS and SPACE_SBX_GC_IDLE_SECS; release waits a day's idle",
 )
 def snapshot_reaper_reclaims_backed_fork_snapshot(test: smoke.KindEcw) -> None:
     """sandbox-manager's snapshot artifact reaper, running with the knobs

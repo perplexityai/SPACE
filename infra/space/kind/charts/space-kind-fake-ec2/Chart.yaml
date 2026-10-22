@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-kind-fake-ec2
+description: Kind-only fake EC2 endpoint that answers the KinD SPACE cluster-controller reconcile-queue GC's DescribeInstances from the cluster's Nodes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

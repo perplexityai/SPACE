@@ -177,6 +177,12 @@ k8s:
   # labels the KinD workers before bringing the charts up.
   sandboxNodeSelectorKey: node.kubernetes.io/space-enabled
   sandboxNodeSelectorValue: "true"
+  # SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS: how long a create, join or
+  # wake waits for the sandbox pod's IP and proxy. Empty renders nothing, so
+  # the binary's 120 s default applies
+  # (crates/libs/api/src/controllers/substrate/kubernetes/mod.rs). The Kind
+  # bring-up sets it in values-kind.yaml.
+  createDataPlaneReadyTimeoutSecs: ""
 
 # Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
 priorityClassName: space-control-plane

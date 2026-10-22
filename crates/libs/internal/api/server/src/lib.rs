@@ -55,7 +55,7 @@ use pplx_space_common_core::types::{
 use pplx_space_common_svc::types::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
     FACET_TEMPLATE_BASE_SNAPSHOT_POLICY, FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
-    NODE_RECONCILE_CLAIM_STALE_SECS, NetworkPolicyTarget, ReconcileFacet, k8s::space_k8s_node_id,
+    NODE_RECONCILE_CLAIM_STALE_SECS, NetworkPolicyTarget, ReconcileFacet,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -348,15 +348,6 @@ struct OriginNode {
     display_id: String,
     address: Option<IpAddr>,
     role: SpaceNodeRole,
-    /// This call minted the registration rather than finding one.
-    ///
-    /// A Kubernetes node name resolves against `(k8s_node_name, role)`, so a
-    /// caller that supplies a role the name is not registered under bootstraps
-    /// a second node row — with that role and its own address — instead of
-    /// resolving the existing one. Every field a role check reads is therefore
-    /// self-asserted on this path, which is why callers that authorize
-    /// destructive work by role require a registration that already existed.
-    bootstrapped: bool,
 }
 
 /// Capture-time fields the `snapshots` row inherits from the source sandbox.
@@ -1370,11 +1361,14 @@ impl ClusterApiService {
         .map_err(|err| Status::internal(format!("query nodes: {err}")))
     }
 
+    /// Resolve a caller-named node to its existing registration. Rows are
+    /// created only by the cluster controller's Kubernetes node sync, sandbox
+    /// pod placement and Direct admin registration; a name with no row is
+    /// `NotFound`, never minted from the request.
     async fn resolve_origin_node_id(
         &self,
         value: &str,
         role_hint: Option<SpaceNodeRole>,
-        remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<OriginNode, Status> {
         let value = trimmed_required(value, "origin_node_id")?;
         if let Ok(node_id) = value.parse::<NodeId>() {
@@ -1407,14 +1401,9 @@ impl ClusterApiService {
         .await
         .map_err(|err| Status::internal(format!("resolve Kubernetes origin node: {err}")))?;
         let Some(row) = row else {
-            let Some(remote_addr) = remote_addr else {
-                return Err(Status::not_found(format!(
-                    "origin_node_id {value} is not registered"
-                )));
-            };
-            return self
-                .bootstrap_k8s_origin_node(&value, role_hint, normalize_ip(remote_addr.ip()))
-                .await;
+            return Err(Status::not_found(format!(
+                "origin_node_id {value} is not registered"
+            )));
         };
         let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
             Status::internal(format!(
@@ -1427,107 +1416,6 @@ impl ClusterApiService {
             display_id: value.to_string(),
             address: parse_origin_address(row.address.as_deref())?,
             role,
-            bootstrapped: false,
-        })
-    }
-
-    async fn bootstrap_k8s_origin_node(
-        &self,
-        node_name: &str,
-        role: SpaceNodeRole,
-        remote_ip: IpAddr,
-    ) -> Result<OriginNode, Status> {
-        let node_id = space_k8s_node_id(node_name, role.as_str());
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|err| Status::internal(format!("bootstrap Kubernetes node: {err}")))?;
-
-        // Refuse re-registration when the operator has already terminated
-        // this node. Without this, a worker daemon whose EC2 is in
-        // `shutting-down` keeps heartbeating until the OS finally reaps
-        // it, and each heartbeat resurrects the row that
-        // `delete_terminating_node` just dropped — the orchestrator then
-        // re-drains it on the next tick. The tombstone row stays after
-        // the cascade-delete on `nodes`, so we can detect this case.
-        //
-        // The check appears twice: once before the inserts (cheap; the
-        // common case is an already-tombstoned node) and once after the
-        // inserts, just before commit, to close the resurrection race —
-        // a concurrent `:terminate` that commits during this tx's
-        // insert-lock-wait will be visible to the post-insert read but
-        // wasn't to the pre-insert read. The committed-then-resurrected
-        // window is intentionally tight but not zero (postgres READ
-        // COMMITTED), so the second check is what makes the guard
-        // race-safe.
-        if let Some(terminated_at) = read_node_k8s_tombstone(&mut tx, node_id).await? {
-            return Err(Status::failed_precondition(format!(
-                "node {node_name} role {role} was terminated at {terminated_at} \
-                 and cannot re-register; daemon should stop heartbeating"
-            )));
-        }
-
-        let inserted = sqlx::query_scalar::<_, NodeId>(sql!(
-            "INSERT INTO nodes (id, address, role, managed_by, state, last_heartbeat)
-             VALUES ($1, $2::INET, $3, $4, 'registered', NOW())
-             ON CONFLICT (id) DO UPDATE
-             SET address = EXCLUDED.address,
-                 role = EXCLUDED.role,
-                 managed_by = EXCLUDED.managed_by,
-                 state = COALESCE(nodes.state, EXCLUDED.state),
-                 last_heartbeat = NOW()
-             WHERE nodes.managed_by = $4
-             RETURNING id"
-        ))
-        .bind(node_id)
-        .bind(remote_ip.to_string())
-        .bind(role.as_str())
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| Status::internal(format!("bootstrap Kubernetes node registry: {err}")))?;
-
-        if inserted.is_none() {
-            return Err(Status::failed_precondition(format!(
-                "origin_node_id {node_name} role {role} conflicts with a non-Kubernetes node"
-            )));
-        }
-
-        sqlx::query(sql!(
-            "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
-             VALUES ($1, $2, NULL)
-             ON CONFLICT (node_id) DO UPDATE
-             SET k8s_node_name = EXCLUDED.k8s_node_name,
-                 k8s_node_uid = COALESCE(node_k8s.k8s_node_uid, EXCLUDED.k8s_node_uid),
-                 updated_at = NOW()"
-        ))
-        .bind(node_id)
-        .bind(node_name)
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| Status::internal(format!("bootstrap Kubernetes node metadata: {err}")))?;
-
-        // Race-close re-check. Returning Err here drops `tx` without a
-        // commit, which postgres rolls back — the resurrection insert is
-        // undone before any other reader can observe it.
-        if let Some(terminated_at) = read_node_k8s_tombstone(&mut tx, node_id).await? {
-            return Err(Status::failed_precondition(format!(
-                "node {node_name} role {role} was terminated at {terminated_at} \
-                 during bootstrap; refusing to resurrect"
-            )));
-        }
-
-        tx.commit()
-            .await
-            .map_err(|err| Status::internal(format!("bootstrap Kubernetes node commit: {err}")))?;
-
-        Ok(OriginNode {
-            id: node_id,
-            display_id: node_name.to_string(),
-            address: Some(remote_ip),
-            role,
-            bootstrapped: true,
         })
     }
 
@@ -1537,9 +1425,7 @@ impl ClusterApiService {
         value: &str,
         role_hint: Option<SpaceNodeRole>,
     ) -> Result<OriginNode, Status> {
-        let origin = self
-            .resolve_origin_node_id(value, role_hint, request.remote_addr())
-            .await?;
+        let origin = self.resolve_origin_node_id(value, role_hint).await?;
         validate_origin_remote_addr(&origin, request.remote_addr())?;
         Ok(origin)
     }
@@ -1616,21 +1502,7 @@ async fn registered_origin_node(
         display_id: display_id.to_string(),
         address: parse_origin_address(row.address.as_deref())?,
         role,
-        bootstrapped: false,
     })
-}
-
-async fn read_node_k8s_tombstone(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    node_id: NodeId,
-) -> Result<Option<OffsetDateTime>, Status> {
-    sqlx::query_scalar(sql!(
-        "SELECT terminated_at FROM node_k8s_tombstones WHERE node_id = $1"
-    ))
-    .bind(node_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| Status::internal(format!("check node tombstone: {err}")))
 }
 
 fn parse_origin_address(value: Option<&str>) -> Result<Option<IpAddr>, Status> {

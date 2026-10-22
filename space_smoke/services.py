@@ -64,6 +64,7 @@ from space_smoke.runtime import (
     SmokeConfigurationError,
     SubprocessExecutor,
 )
+from space_smoke.template_build import build_dedicated_template
 
 
 class MissingToolError(RuntimeError):
@@ -137,6 +138,15 @@ class SmokeServices:
                 "the storage credentials mode is only readable on the kind backend"
             )
         return self.kind.storage_credentials_mode()
+
+    def rust_build(self) -> str:
+        """The Rust build (`test-hooks` or `release`) the Kind bench runs."""
+
+        if self.kind is None:
+            raise SmokeConfigurationError(
+                "the Rust build is only readable on the kind backend"
+            )
+        return self.kind.rust_build()
 
     def fixture(
         self,
@@ -233,6 +243,18 @@ class SmokeServices:
                         user_id=byok_identity.user_id,
                     )
         template = self.template_override or sandbox_config.template
+        if sandbox_config.kind_dedicated_template:
+            if kind is None or fixture_type is not KindEcw or self.ecw is None:
+                raise SmokeConfigurationError("a dedicated template requires KindEcw")
+            with context.phase("build the scenario-owned minimal template"):
+                built = build_dedicated_template(
+                    context.scope, cast(Any, kind), cast(Any, self.ecw)
+                )
+                template = built.alias
+                context.record(
+                    "dedicated_template",
+                    {"alias": built.alias, "build_seconds": built.elapsed_seconds},
+                )
         before_create = None
         warm_pool_candidate: WarmPoolCandidate | None = None
         if sandbox_config.kind_cold_create is not None:
@@ -335,6 +357,7 @@ class SmokeServices:
             fixture._node_fence_control = cast(Any, kind)
             fixture._pending_backup_control = cast(Any, kind)
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
+            fixture._reconcile_queue_gc_control = cast(Any, kind)
             fixture._template_build_control = cast(Any, kind)
             fixture._template_builder = cast(Any, self.ecw)
             fixture._rate_limit_probe = cast(Any, self.ecw)

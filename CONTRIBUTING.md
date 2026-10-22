@@ -96,11 +96,28 @@ which this does not turn on; see "Privileged tests and the CI host" in
 
 ## Submit a pull request
 
-Keep the change focused and link the relevant issue when there is one. In the
-pull request description, explain the problem, what changed, and how you
-validated it. Include your self-assessed severity and a brief reason, or say
-when severity does not apply. Disclose whether an AI agent drafted the pull
-request description or contributed to the change, and identify those parts.
+Keep the change focused and link the relevant issue when there is one. Start
+the pull request description from the
+[template](.github/pull_request_template.md). It asks what merging the change
+does and why, and how you validated it. It also asks for your self-assessed
+severity with a brief reason, or a note that severity does not apply, and what
+the change could break. Disclose whether an AI agent drafted the pull request
+description or contributed to the change, and identify those parts. Size the
+description to the risk of the change, not to the effort behind it.
+
+Many readers see the description long after the pull request merges, and they
+can see only this repository:
+
+- Describe what merging the pull request does, not how the pull request got
+  there. Answer review in comments and commits, and keep the description
+  current.
+- Link each reference to something a reader can open: an issue, a pull
+  request, a commit on `main`, or a file in this repository. Otherwise, state
+  the point directly.
+- Open an issue for each follow-up you find, and link it. Nobody tracks a
+  finding recorded only in a merged pull request's description.
+- Before you mark the pull request ready for review, check each claim, commit,
+  and result in the description against the current head.
 
 Run `cargo arch` to check the repository structure rules in
 [ARCHITECTURE.toml](ARCHITECTURE.toml); [archcheck](crates/tools/archcheck/README.md)

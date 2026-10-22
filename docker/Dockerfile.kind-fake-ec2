@@ -1,0 +1,31 @@
+# Kind-only: the in-repo fake EC2 endpoint (infra/space/kind/fake-ec2), which
+# answers the cluster-controller reconcile-queue GC's DescribeInstances from
+# the cluster's Node objects (infra/space/kind/charts/space-kind-fake-ec2). It
+# stands in for EC2; never deploy it outside a local cluster.
+FROM public.ecr.aws/docker/library/golang:1.25-bookworm AS build
+
+WORKDIR /src
+COPY infra/space/kind/fake-ec2/ ./
+# Standard library only: nothing to download.
+RUN test -z "$(gofmt -l .)" \
+    && go vet ./... \
+    && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/space-kind-fake-ec2 .
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+RUN groupadd --system --gid 65532 space-fake-ec2 \
+    && useradd --system --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin space-fake-ec2
+
+ARG SPACE_GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${SPACE_GIT_SHA}"
+RUN mkdir -p /etc/space && printf '%s\n' "${SPACE_GIT_SHA}" > /etc/space/build-git-sha
+
+LABEL org.opencontainers.image.title="space-kind-fake-ec2"
+LABEL org.opencontainers.image.description="Local-only SPACE fake EC2 endpoint for the kind stack."
+
+COPY --from=build /out/space-kind-fake-ec2 /usr/local/bin/space-kind-fake-ec2
+
+USER space-fake-ec2
+
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/space-kind-fake-ec2"]

@@ -57,9 +57,18 @@
 #   SPACE_KIND_PREBUILT_RUST_SHA       prebuilt mode: source commit of that image
 #   SPACE_KIND_PREBUILT_RUST_KEY       prebuilt mode: that image's Rust input key,
 #                                      checked when the commit is not this checkout's
+#   SPACE_KIND_RUST_BUILD           test-hooks (default) or release: the release
+#                                   lane builds without any `test-hooks` feature
+#                                   and with thin LTO
+#                                   (infra/space/kind/lib/rust-build.sh); the
+#                                   image's space.pplx.net/kind-rust-build label
+#                                   records which, and prebuilt mode checks it.
+#                                   The release lane never exports to the layer
+#                                   cache, whatever SPACE_KIND_BUILD_CACHE_WRITE says
 #   SPACE_KIND_RUST_PROFILE         incremental mode cargo profile: release
 #                                   (default, LTO off — the Docker path's shape)
-#                                   or dev-release (incremental codegen, debug=1)
+#                                   or dev-release (incremental codegen, debug=1;
+#                                   refused for the release lane)
 #   SPACE_KIND_RUST_TARGET_DIR      incremental mode target dir
 #                                   (default: ~/.space-devbox/kind/rust-target)
 #   SPACE_KIND_CARGO_HOME           incremental mode cargo home (registry + git
@@ -108,9 +117,35 @@ RUNTIME_LIBC_IMAGE="${SPACE_KIND_RUNTIME_LIBC_IMAGE:-public.ecr.aws/docker/libra
 source "$REPO_ROOT/infra/space/kind/lib/build-cache.sh"
 # shellcheck source=../lib/shared-build-inputs.sh
 source "$REPO_ROOT/infra/space/kind/lib/shared-build-inputs.sh"
+# shellcheck source=../lib/rust-build.sh
+source "$REPO_ROOT/infra/space/kind/lib/rust-build.sh"
 
 log() { printf '[rust-artifacts] %s\n' "$*"; }
 die() { printf '[rust-artifacts] ERROR: %s\n' "$*" >&2; exit 1; }
+
+RUST_BUILD="$(space_kind_rust_build)" || die "invalid SPACE_KIND_RUST_BUILD"
+# The release lane links with thin LTO (SPACE_CARGO_RELEASE_LTO in
+# docker/Dockerfile.rust-build-common); the default keeps LTO off.
+RELEASE_LTO=false
+# The workspace member the host builds leave out (SPACE_KIND_CARGO_EXCLUDE in
+# docker/Dockerfile.rust-build-kind): the release lane leaves out the
+# test-support member, so that no selected crate turns a `test-hooks` feature on.
+CARGO_EXCLUDE=""
+CARGO_SELECTION=()
+if [[ "$RUST_BUILD" == release ]]; then
+  RELEASE_LTO=thin
+  CARGO_EXCLUDE=pplx-space-db-test-fixtures
+  CARGO_SELECTION=(--workspace --exclude "$CARGO_EXCLUDE")
+  [[ "$PROFILE" == release ]] \
+    || die "SPACE_KIND_RUST_BUILD=release builds the release profile; unset SPACE_KIND_RUST_PROFILE (got '$PROFILE')"
+  # The shared layer cache holds the default build's layers; the release lane
+  # reads it but never replaces them with its own, in either mode and for
+  # every image this script builds (chef-base and the health probe included).
+  if [[ "${SPACE_KIND_BUILD_CACHE_WRITE:-0}" == 1 ]]; then
+    log "the release lane does not export to the layer cache; importing only"
+  fi
+  export SPACE_KIND_BUILD_CACHE_WRITE=0
+fi
 
 # ── Mode decision ─────────────────────────────────────────────────────────────
 
@@ -195,17 +230,31 @@ build_health_probe_image() {
 
 # ── Docker mode ───────────────────────────────────────────────────────────────
 
+# The Dockerfile's build arguments for this build: the release lane empties
+# both test-hook feature lists and narrows the package selection.
+rust_build_args() {
+  BUILD_ARGS=(--build-arg "SPACE_KIND_RUST_BUILD=$RUST_BUILD"
+    --build-arg "SPACE_CARGO_RELEASE_LTO=$RELEASE_LTO")
+  if [[ "$RUST_BUILD" == release ]]; then
+    BUILD_ARGS+=(--build-arg SPACE_KIND_TEST_HOOK_FEATURES=
+      --build-arg SPACE_KIND_GUEST_TEST_HOOK_FEATURES=
+      --build-arg "SPACE_KIND_CARGO_EXCLUDE=$CARGO_EXCLUDE")
+  fi
+}
+
 build_docker() {
-  log "docker mode: $ARTIFACT_IMAGE from $KIND_DOCKERFILE (one cook, one build, as BuildKit stages)"
+  log "docker mode: $ARTIFACT_IMAGE ($RUST_BUILD) from $KIND_DOCKERFILE (one cook, one build, as BuildKit stages)"
   build_chef_base_image
   build_health_probe_image
+  rust_build_args
   docker_cache_flags kind-rust-build
   if [[ "${SPACE_KIND_BUILD_CACHE_WRITE:-0}" == 1 ]]; then
     # Publish the reusable dependency graph, before adding this commit's
     # sources and compiled workspace. Exporting those large, per-commit layers
     # delays the artifact handoff without helping the next source build.
     # Keep the existing scope so readers can reuse already-published cook layers.
-    docker build -f "$KIND_DOCKERFILE" --target cook --output type=cacheonly "${CACHE_FLAGS[@]}" .
+    docker build -f "$KIND_DOCKERFILE" --target cook --output type=cacheonly \
+      "${BUILD_ARGS[@]}" "${CACHE_FLAGS[@]}" .
   fi
   SPACE_KIND_BUILD_CACHE_WRITE=0 docker_cache_flags kind-rust-build
   # Label the image with what it was built from, so main CI can publish it for
@@ -221,7 +270,7 @@ build_docker() {
   # One manifest, no attestation: the provenance attestation carries the build
   # time, and an index would split into several registry package versions.
   docker build -t "$ARTIFACT_IMAGE" -f "$KIND_DOCKERFILE" --provenance=false \
-    ${labels[@]+"${labels[@]}"} "${CACHE_FLAGS[@]}" .
+    "${BUILD_ARGS[@]}" ${labels[@]+"${labels[@]}"} "${CACHE_FLAGS[@]}" .
 }
 
 # ── Incremental mode ──────────────────────────────────────────────────────────
@@ -240,17 +289,25 @@ cargo_build_block() {
   build_stage | awk -v n="$1" '/^RUN cargo build/ { b++; on = b == n } on { print } on && /^$/ { on = 0 }'
 }
 
+# Its literal -F arguments; the test-hook list it expands is test_hook_features.
 main_build_features() {
-  cargo_build_block 1 | grep -oE -- '-F [^ \\]+' | awk '{print $2}'
+  cargo_build_block 1 | grep -oE -- '-F [^ \\]+' | awk '$2 !~ /\$/ { print $2 }'
+}
+
+# One feature per line from the default of a test-hook ARG ($1), and nothing
+# for the release lane, which builds with the list empty.
+test_hook_features() {
+  [[ "$RUST_BUILD" == test-hooks ]] || return 0
+  awk -F= -v name="ARG $1" '$1 == name && NF > 1 { print $2 }' "$KIND_DOCKERFILE" | tr ',' '\n'
 }
 
 main_build_bins() {
   cargo_build_block 1 | grep -oE -- '--bin [^ \\]+' | awk '{print $2}'
 }
 
-# The guest invocation's package, feature and bin arguments, as given.
+# The guest invocation's literal package, feature and bin arguments.
 guest_build_args() {
-  cargo_build_block 2 | grep -oE -- '(-p|-F|--bin) [^ \\]+'
+  cargo_build_block 2 | grep -oE -- '(-p|-F|--bin) [^ \\]+' | awk '!/\$/'
 }
 
 supervisor_features() {
@@ -342,6 +399,9 @@ rust_input_key() {
     || die "could not list the Rust build's ignore and attribute files"
   {
     echo "space-kind-rust-artifacts docker v1 $(uname -m)"
+    # The release lane builds other binaries from the same inputs; name it so its
+    # key never matches a test-hooks image's. The default build's key is unchanged.
+    [[ "$RUST_BUILD" == test-hooks ]] || echo "rust-build $RUST_BUILD"
     while read -r base; do
       pin="$(awk -v name="$base" '$1 == name { print $2 }' "$pins")"
       echo "base $base ${pin:-unpinned}"
@@ -386,7 +446,7 @@ in_builder() {
     -e HOME=/cargo-home \
     -e CARGO_HOME=/cargo-home \
     -e CARGO_TARGET_DIR=/workspace/target \
-    -e CARGO_PROFILE_RELEASE_LTO=false \
+    -e CARGO_PROFILE_RELEASE_LTO="$RELEASE_LTO" \
     -e CARGO_TERM_COLOR=never \
     -w /workspace \
     "$CHEF_IMAGE" "$@"
@@ -431,7 +491,7 @@ assert_glibc_compatible() {
 
 build_incremental() {
   local release_dir host_release_dir features bins sup_features stamp
-  mapfile -t features < <(main_build_features)
+  mapfile -t features < <(main_build_features; test_hook_features SPACE_KIND_TEST_HOOK_FEATURES)
   mapfile -t bins < <(main_build_bins)
   mapfile -t sup_features < <(supervisor_features)
   (( ${#features[@]} > 0 && ${#bins[@]} > 0 && ${#sup_features[@]} > 0 )) \
@@ -476,8 +536,8 @@ build_incremental() {
   release_dir="/workspace/target/$(profile_dir)"
   host_release_dir="$TARGET_DIR/$(profile_dir)"
 
-  log "incremental mode: cargo $(cargo_profile_flag) for ${#bins[@]} bins + runtime-supervisor inside $CHEF_IMAGE (target $TARGET_DIR)"
-  local cargo_args=(cargo build --locked "$(cargo_profile_flag)")
+  log "incremental mode: cargo $(cargo_profile_flag) ($RUST_BUILD, LTO $RELEASE_LTO) for ${#bins[@]} bins + runtime-supervisor inside $CHEF_IMAGE (target $TARGET_DIR)"
+  local cargo_args=(cargo build --locked "$(cargo_profile_flag)" ${CARGO_SELECTION[@]+"${CARGO_SELECTION[@]}"})
   local f b
   for f in "${features[@]}"; do cargo_args+=(-F "$f"); done
   for b in "${bins[@]}"; do cargo_args+=(--bin "$b"); done
@@ -490,6 +550,7 @@ build_incremental() {
     read -ra arg <<<"$arg"
     guest_args+=("${arg[@]}")
   done < <(guest_build_args)
+  while read -r f; do guest_args+=(-F "$f"); done < <(test_hook_features SPACE_KIND_GUEST_TEST_HOOK_FEATURES)
   (( ${#guest_args[@]} > 4 )) || die "could not read the guest build from $KIND_DOCKERFILE build stage"
   phase_started=$SECONDS
   in_builder "${guest_args[@]}"
@@ -497,7 +558,7 @@ build_incremental() {
 
   # As the production worker stage does: the supervisor is built through the
   # helper that writes its compatibility hash next to it.
-  local sup_args=(cargo build --locked "$(cargo_profile_flag)")
+  local sup_args=(cargo build --locked "$(cargo_profile_flag)" ${CARGO_SELECTION[@]+"${CARGO_SELECTION[@]}"})
   for f in "${sup_features[@]}"; do sup_args+=(-F "$f"); done
   sup_args+=(--bin space-runtime-supervisor-svc)
   phase_started=$SECONDS
@@ -526,23 +587,24 @@ build_incremental() {
   log "assembling $ARTIFACT_IMAGE from the staged build"
   docker build -t "$ARTIFACT_IMAGE" -f "$HOST_DOCKERFILE" \
     --build-arg "SPACE_GRPC_HEALTH_PROBE_IMAGE=$HEALTH_PROBE_IMAGE" \
+    --build-arg "SPACE_KIND_RUST_BUILD=$RUST_BUILD" \
     --build-context "artifacts=$STAGE_DIR/artifacts" .
   log "assembly: $((SECONDS - phase_started))s"
   stamp="$STAGE_DIR/.built-from"
-  printf 'mode=incremental profile=%s builder=%s target=%s at=%s\n' \
-    "$PROFILE" "$CHEF_IMAGE" "$TARGET_DIR" "$(date -u +%FT%TZ)" >"$stamp"
+  printf 'mode=incremental profile=%s build=%s builder=%s target=%s at=%s\n' \
+    "$PROFILE" "$RUST_BUILD" "$CHEF_IMAGE" "$TARGET_DIR" "$(date -u +%FT%TZ)" >"$stamp"
   printf '%s %s\n' "$key" "$(docker image inspect -f '{{.Id}}' "$ARTIFACT_IMAGE")" >"$assembled"
 }
 
 # What an assembly depends on besides the synced sources, by content: the
-# profile, the Dockerfiles that define the builder, the build lists, the
+# profile and Rust build, the Dockerfiles that define the builder, the build lists, the
 # packaging and the health probe, the wrapper the builder image carries, the
 # scripts that drive the build, and the libc image the glibc guard checked
 # against. File identity (inode, mtime) is deliberately not part of it: the
 # supervisor helper rewrites its compatibility file on every run.
 assembly_key() {
   {
-    echo "$PROFILE $RUNTIME_LIBC_IMAGE"
+    echo "$PROFILE $RUST_BUILD $RUNTIME_LIBC_IMAGE"
     sha256sum "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" "$HOST_DOCKERFILE" \
       docker/run-cargo-with-sccache.sh infra/space/kind/scripts/build-rust-artifacts.sh \
       infra/space/kind/scripts/sync-rust-sources.py
@@ -590,6 +652,9 @@ case "$MODE" in
       || die "prebuilt mode requires an image ID and source SHA from the CI artifact handoff"
     [[ "$(docker image inspect -f '{{.Id}}' "$ARTIFACT_IMAGE")" == "$SPACE_KIND_PREBUILT_RUST_IMAGE_ID" ]] \
       || die "prebuilt Rust image is missing or does not match the verified image ID"
+    prebuilt_build="$(docker image inspect -f '{{index .Config.Labels "space.pplx.net/kind-rust-build"}}' "$ARTIFACT_IMAGE")"
+    [[ "$prebuilt_build" == "$RUST_BUILD" ]] \
+      || die "prebuilt Rust image is the '${prebuilt_build:-unlabelled}' build; SPACE_KIND_RUST_BUILD asks for $RUST_BUILD"
     # An image main CI built from another commit is this checkout's build when
     # the image, the handoff and this checkout all name the same input key.
     if [[ "$(git rev-parse HEAD)" != "$SPACE_KIND_PREBUILT_RUST_SHA" ]]; then
@@ -605,4 +670,4 @@ case "$MODE" in
   docker) build_docker ;;
   incremental) build_incremental ;;
 esac
-log "ready: $ARTIFACT_IMAGE ($MODE, ${SECONDS}s)"
+log "ready: $ARTIFACT_IMAGE ($MODE, $RUST_BUILD, ${SECONDS}s)"

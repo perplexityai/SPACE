@@ -1,0 +1,21 @@
+name: Kind Release-Build CI
+
+# On demand only: the Kind smoke on binaries built without the `test-hooks`
+# feature and with release LTO, with no test hook rendered into the charts and
+# the scenarios that need one skipped (see "Release-build lane" in
+# infra/space/kind/README.md). No required check depends on it, and it never
+# writes the Kind layer cache.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  kind_release_smoke:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/kind-ci.yml
+    with:
+      rust_build: release

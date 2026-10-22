@@ -54,7 +54,7 @@ pub mod runtime;
 pub mod sandbox;
 #[cfg(feature = "serde")]
 pub mod sandbox_artifact;
-pub mod size;
+pub use pplx_space_byte_size as size;
 pub mod snapshot;
 #[cfg(feature = "rusqlite")]
 mod sqlite;
@@ -64,7 +64,7 @@ pub mod template;
 pub mod template_runtime;
 pub mod time;
 pub mod transport_vsock;
-pub mod version;
+pub use pplx_space_semver as version;
 
 #[cfg(feature = "serde")]
 pub use admin::*;

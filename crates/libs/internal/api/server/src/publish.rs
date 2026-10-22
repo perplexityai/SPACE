@@ -46,22 +46,6 @@ impl ClusterApiService {
                 "auto-lifecycle delete completions can only be published by worker nodes",
             ));
         }
-        // A role check is only as good as the registration it reads. Resolving a
-        // Kubernetes node name under a role it is not registered under mints a
-        // new row carrying that role, so the check above would pass on an
-        // identity the caller just asserted. A node with receipts to publish has
-        // been publishing state since long before it had any, so requiring a
-        // pre-existing registration costs a real worker nothing.
-        //
-        // This closes the mint-and-delete path within one call, not the general
-        // question of what authenticates a Kubernetes node's role — a caller
-        // that bootstraps on one publication can still send receipts on the
-        // next. That belongs to node registration, not here.
-        if publishes_delete_completions && origin.bootstrapped {
-            return Err(Status::permission_denied(
-                "auto-lifecycle delete completions require a node registration that predates this publication",
-            ));
-        }
         let request = request.into_inner();
         let node_status = request
             .node_status

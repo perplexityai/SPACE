@@ -58,11 +58,11 @@ pub const SPACE_FLAGD_ENABLED_ENV: &str = "SPACE_FLAGD_ENABLED";
 /// saying why.
 #[must_use]
 pub fn enabled_in_env() -> bool {
-    enabled_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    enabled_from_environment(&pplx_space_env_vars::ProcessEnvironment)
 }
 
-pub(super) fn enabled_from_environment(env: &dyn pplx_space_common_core::env::Environment) -> bool {
-    pplx_space_common_core::env::env_flag(env.var(SPACE_FLAGD_ENABLED_ENV).ok().as_deref(), false)
+pub(super) fn enabled_from_environment(env: &dyn pplx_space_env_vars::Environment) -> bool {
+    pplx_space_env_vars::env_flag(env.var(SPACE_FLAGD_ENABLED_ENV).ok().as_deref(), false)
 }
 
 /// Build a flagd-backed provider from the `FLAGD_*` environment.

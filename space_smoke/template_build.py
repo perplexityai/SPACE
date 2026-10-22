@@ -85,8 +85,11 @@ OCI_USER_MARKER_PATH = "/home/user/ecw-oci-user-marker.txt"
 OCI_DOCKERFILE_ENV_NAME = "ECW_OCI_DOCKERFILE_ENV"
 OCI_DOCKERFILE_ENV_VALUE = "from-dockerfile"
 # Widens the window between acceptance and completion so the Service can be
-# moved to the peer while the build is still running (the shell suite's 15 s).
-BUILD_DELAY_SECONDS = 15
+# moved to the peer while the build is still running. The reroute follows the
+# prepared-rootfs commit, ahead of the Dockerfile's RUN steps, so most of the
+# window is the build's own work; `build_through_sdk` fails a build that had
+# already finished when the Service moved.
+BUILD_DELAY_SECONDS = 5
 # The scope's cleanup budget is min(120 s, 10 % of the scenario timeout); every
 # compensation here must fit inside it together: settle ≤ 30 s, template delete
 # ≤ 60 s, route clear and sandbox kill a few seconds each.
@@ -135,6 +138,74 @@ def oci_recipe(image: str = OCI_IMAGE) -> TemplateRecipe:
         ),
         start_cmd=f"sh -c 'echo {START_MARKER_TEXT} > {START_MARKER_PATH}; tail -f /dev/null'",
         ready_timeout_seconds=2,
+    )
+
+
+def minimal_recipe(image: str = OCI_IMAGE) -> TemplateRecipe:
+    """The smallest template the builder makes: the base image and nothing else.
+
+    No build steps, files, envs or start command, so the build is the image
+    pull, the guest-bundle assembly and the publish, and the release is little
+    more than the base image. The image is the one `oci_recipe` already pulls on
+    the Kind builders (and ci/mirrored-images.txt mirrors), so it adds no new
+    external dependency.
+    """
+
+    return TemplateRecipe(
+        dockerfile=f"FROM {image}\n",
+        files={},
+        envs={},
+        run_cmds=(),
+        start_cmd=None,
+        ready_timeout_seconds=0,
+    )
+
+
+def delete_template_and_wait(
+    control: TemplateBuildControl,
+    alias: str,
+    *,
+    timeout: float = TEMPLATE_DELETE_BUDGET_SECONDS,
+) -> None:
+    """Delete a run-owned template through the admin API and wait for the operation."""
+
+    operation_id = control.delete_template_as_admin(alias)
+    if operation_id is None:
+        return
+    deadline = time.monotonic() + timeout
+    while True:
+        state = control.operation_state(operation_id)
+        if state == "succeeded":
+            return
+        if state in ("failed", "canceled", "expired") or time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"template delete operation {operation_id} for {alias} ended {state or 'pending'}"
+            )
+        time.sleep(0.5)
+
+
+def build_dedicated_template(
+    scope: ResourceScope,
+    control: TemplateBuildControl,
+    builder: TemplateBuilder,
+) -> TemplateBuildResult:
+    """Build a run-owned minimal template that only the calling scenario uses.
+
+    Its alias is not in template-manager's `SPACE_TEMPLATE_PREFETCH_TAGS` and
+    the release is org-specific, so no worker prefetches it: a worker it was
+    removed from stays without it until something asks for it. The delete is
+    armed before the build so a failed or ambiguous build cannot leak it, and
+    before the caller creates a sandbox from it so that sandbox unwinds first.
+    """
+
+    alias = f"space-smoke-parent-{secrets.token_hex(4)}"
+    scope.defer(
+        f"delete the scenario-owned template {alias}",
+        lambda: delete_template_and_wait(control, alias),
+        critical=True,
+    )
+    return builder.build_template(
+        minimal_recipe(), alias=alias, cpu_count=1, memory_mb=1024, tags=("latest",)
     )
 
 
@@ -377,13 +448,32 @@ class TemplateBuildAssertions:
             detail=handoff_error,
         )
         self._control.route_builder_service("poll-peer", other)
+        rerouted_at = time.monotonic()
         self._fixture.record("service_routed_to", other)
+        # A build that had already finished leaves no poll for the Service to
+        # misroute, and would pass vacuously. The public status alone cannot
+        # show it is still running: the API answers `building` when its poll
+        # of the builder fails transiently. The build's own sandbox, still
+        # started on the accepting builder, can.
+        status = self._builder.build_status(self.alias, job.build_id)
+        still_running = self._control.build_sandbox_started(accepted)
+        self._fixture.record("build_status_after_reroute", status)
+        self._fixture.record("build_sandbox_started_after_reroute", still_running)
+        self._fixture.verify(
+            status in ("waiting", "building") and still_running,
+            "the build was no longer running when the Service moved off the accepting builder",
+            build_status=status,
+            build_sandbox_started=still_running,
+            build_id=job.build_id,
+            build_delay_seconds=BUILD_DELAY_SECONDS,
+        )
         try:
             work.join(timeout=build_timeout)
         finally:
             if self._route_clear is not None:
                 clear, self._route_clear = self._route_clear, None
                 clear.release()
+        self._fixture.record("build_seconds_after_reroute", round(time.monotonic() - rerouted_at, 1))
         if self._settle_build is not None:
             self._settle_build.disarm()
             self._settle_build = None
@@ -521,19 +611,7 @@ class TemplateBuildAssertions:
             )
 
     def _delete_template(self, *, timeout: float = TEMPLATE_DELETE_BUDGET_SECONDS) -> None:
-        operation_id = self._control.delete_template_as_admin(self.alias)
-        if operation_id is None:
-            return
-        deadline = time.monotonic() + timeout
-        while True:
-            state = self._control.operation_state(operation_id)
-            if state == "succeeded":
-                return
-            if state in ("failed", "canceled", "expired") or time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"template delete operation {operation_id} for {self.alias} ended {state or 'pending'}"
-                )
-            time.sleep(3)
+        delete_template_and_wait(self._control, self.alias, timeout=timeout)
 
     def _require_accepted(self) -> str:
         if self._accepted is None:

@@ -1144,29 +1144,37 @@ fn publication_contention_is_retryable(#[case] lock: &'static str) -> TestResult
 }
 
 #[test]
-fn bootstrapped_publisher_waits_for_verified_inventory_uid() -> TestResult {
+fn publisher_without_inventory_uid_waits_for_verified_inventory_uid() -> TestResult {
     in_publication_process(|| async move {
         let mut fixture = PublicationServer::start().await?;
         let pool = &fixture.db.pool;
         let tenant = Uuid::from_u128(3);
-        let service = ClusterApiService::new(pool.clone());
-        service
-            .bootstrap_k8s_origin_node(
-                "publication-builder",
-                SpaceNodeRole::Builder,
-                "192.0.2.40".parse()?,
-            )
-            .await?;
-        let builder = space_k8s_node_id("publication-builder", "builder");
+        // A builder row node sync has registered but not yet stamped with its
+        // Kubernetes node UID.
+        let builder = NodeId::new();
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '192.0.2.40'::INET, 'builder', 'k8s', 'registered')"
+        ))
+        .bind(builder)
+        .execute(pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'publication-builder')"
+        ))
+        .bind(builder)
+        .execute(pool)
+        .await?;
         let grant = grant_tenant_publication(
             pool,
-            "bootstrap-output",
+            "pending-uid-output",
             tenant,
             Some(builder.as_uuid()),
             "0 seconds",
         )
         .await?;
-        let publication = tenant_registration("bootstrap-output", tenant, Some(grant.to_string()));
+        let publication =
+            tenant_registration("pending-uid-output", tenant, Some(grant.to_string()));
 
         let status = fixture
             .client
@@ -1179,7 +1187,7 @@ fn bootstrapped_publisher_waits_for_verified_inventory_uid() -> TestResult {
         );
         assert!(tenant_publication_grant_exists(pool, grant).await?);
         let exists: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (SELECT 1 FROM templates WHERE name = 'bootstrap-output')"
+            "SELECT EXISTS (SELECT 1 FROM templates WHERE name = 'pending-uid-output')"
         ))
         .fetch_one(pool)
         .await?;
@@ -1200,7 +1208,7 @@ fn bootstrapped_publisher_waits_for_verified_inventory_uid() -> TestResult {
         fixture
             .client
             .register_template_release(request(
-                tenant_release("bootstrap-output", tenant, 'a', Some(grant.to_string())),
+                tenant_release("pending-uid-output", tenant, 'a', Some(grant.to_string())),
                 "space-build-manager",
             ))
             .await?;

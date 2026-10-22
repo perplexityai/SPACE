@@ -13,10 +13,19 @@ use pplx_space_test_env::TestResult;
 mod cleanup_recovery_lifecycle_matrix_tests;
 mod lifecycle_writer_tests;
 mod materialization_record_tests;
+mod owned_restore_completion_tests;
+mod restore_revert_tests;
+mod started_recovery_observation_tests;
 mod stopped_evacuation_claim_tests;
 mod stopped_restore_selector_tests;
 mod substrate_scope_tests;
 mod suspend_lifecycle_matrix_tests;
+use owned_restore_completion_tests::owned_restore_completion_requires_its_lease_and_a_routable_execution;
+use restore_revert_tests::{
+    failed_restore_revert_retires_only_its_own_proven_execution,
+    without_retirement_a_failed_restore_revert_moves_only_the_lifecycle,
+};
+use started_recovery_observation_tests::started_recovery_followers_succeed_only_on_a_started_sandbox;
 use stopped_evacuation_claim_tests::{
     a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure,
     evacuation_claim_takes_only_a_released_stopped_evacuation,
@@ -1433,6 +1442,10 @@ async fn k8s_store_postgres_behaviors() -> TestResult {
     clean_redrive_failure_releases_restore_lease_for_immediate_retry(&fixture).await?;
     stale_restore_rollback_is_guarded_by_lease_token(&fixture).await?;
     restore_rollback_requires_fresh_claim_and_clean_failure(&fixture).await?;
+    failed_restore_revert_retires_only_its_own_proven_execution(&fixture).await?;
+    without_retirement_a_failed_restore_revert_moves_only_the_lifecycle(&fixture).await?;
+    owned_restore_completion_requires_its_lease_and_a_routable_execution(&fixture).await?;
+    started_recovery_followers_succeed_only_on_a_started_sandbox(&fixture).await?;
     prepare_wake_preserves_restore_source_boundary(&fixture).await?;
     prepare_wake_sandbox_restores_suspended_lifecycle(&fixture).await?;
     restored_generation_accepts_late_pod_metadata(&fixture).await?;
@@ -7781,15 +7794,12 @@ async fn begin_restore_lifecycle_preserves_retry_and_marker_claim_rules(
         .expect_err("started sandbox should not enter restore lifecycle");
     assert!(matches!(err, SubstrateError::Conflict { .. }));
 
-    // Test fixture setup: a fresh `started` row from `insert_sandbox`
-    // is never in a terminal lifecycle, so the rollback-best-effort
-    // helper is functionally equivalent to a plain UPDATE here. We
-    // reuse it rather than splitting into a separate test-only setter
-    // — keeping a single lifecycle-write API surface.
-    fixture
-        .store
-        .revert_lifecycle_after_rollback_best_effort(sandbox_id, "suspended", None)
-        .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
     let claim = fixture
         .store
         .begin_restore_lifecycle(sandbox_id, false)
@@ -8247,8 +8257,8 @@ async fn clean_redrive_failure_releases_restore_lease_for_immediate_retry(
 /// A stale clean-failure rollback (delayed past the lease TTL, carrying an
 /// OLD token) must not flip a row that a retry has already re-claimed with a
 /// NEW token back to `suspended` — that would orphan the newer live restore.
-/// The token-guarded `revert_lifecycle_after_rollback_best_effort` is a CAS
-/// on the claim's token; `None` (evacuation / test setup) stays unguarded.
+/// The token-guarded `revert_restore_claim_to_suspended` is a CAS on the
+/// claim's token; `None` (the tokenless evacuation claim) is unguarded.
 async fn stale_restore_rollback_is_guarded_by_lease_token(fixture: &PostgresStore) -> TestResult {
     let id = SandboxId::new();
     insert_sandbox(&fixture.pool, id, "restoring").await?;
@@ -8269,7 +8279,12 @@ async fn stale_restore_rollback_is_guarded_by_lease_token(fixture: &PostgresStor
     let old_token = Uuid::now_v7();
     fixture
         .store
-        .revert_lifecycle_after_rollback_best_effort(id, "suspended", Some(old_token))
+        .revert_restore_claim_to_suspended(
+            id,
+            Some(old_token),
+            None,
+            crate::controllers::substrate::AbandonedRestoreRetirement::Enabled,
+        )
         .await?;
     // A stale-token rollback must not flip the newer retry to `suspended`
     // nor clear its lease — the redaction asserts the token is exactly the
@@ -8292,7 +8307,12 @@ async fn stale_restore_rollback_is_guarded_by_lease_token(fixture: &PostgresStor
     // the clear-trigger drops the lease as the row leaves `restoring`).
     fixture
         .store
-        .revert_lifecycle_after_rollback_best_effort(id, "suspended", Some(new_token))
+        .revert_restore_claim_to_suspended(
+            id,
+            Some(new_token),
+            None,
+            crate::controllers::substrate::AbandonedRestoreRetirement::Enabled,
+        )
         .await?;
     // A matching-token rollback reverts, and leaving `restoring` clears the
     // lease (no run-varying value survives here, so a plain snapshot pins
@@ -8335,7 +8355,12 @@ async fn restore_rollback_requires_fresh_claim_and_clean_failure(
     ) {
         fixture
             .store
-            .revert_lifecycle_after_rollback_best_effort(fresh_clean_id, "suspended", None)
+            .revert_restore_claim_to_suspended(
+                fresh_clean_id,
+                None,
+                None,
+                crate::controllers::substrate::AbandonedRestoreRetirement::Enabled,
+            )
             .await?;
     }
     let lifecycle: String =
@@ -8415,7 +8440,12 @@ async fn restore_rollback_requires_fresh_claim_and_clean_failure(
     ) {
         fixture
             .store
-            .revert_lifecycle_after_rollback_best_effort(redrove_clean_id, "suspended", None)
+            .revert_restore_claim_to_suspended(
+                redrove_clean_id,
+                None,
+                None,
+                crate::controllers::substrate::AbandonedRestoreRetirement::Enabled,
+            )
             .await?;
     }
     let lifecycle: String =
@@ -8447,7 +8477,12 @@ async fn restore_rollback_requires_fresh_claim_and_clean_failure(
     ) {
         fixture
             .store
-            .revert_lifecycle_after_rollback_best_effort(fresh_timeout_id, "suspended", None)
+            .revert_restore_claim_to_suspended(
+                fresh_timeout_id,
+                None,
+                None,
+                crate::controllers::substrate::AbandonedRestoreRetirement::Enabled,
+            )
             .await?;
     }
     let lifecycle: String =
@@ -8492,7 +8527,12 @@ async fn restore_rollback_requires_fresh_claim_and_clean_failure(
     ) {
         fixture
             .store
-            .revert_lifecycle_after_rollback_best_effort(redrove_timeout_id, "suspended", None)
+            .revert_restore_claim_to_suspended(
+                redrove_timeout_id,
+                None,
+                None,
+                crate::controllers::substrate::AbandonedRestoreRetirement::Enabled,
+            )
             .await?;
     }
     let lifecycle: String =

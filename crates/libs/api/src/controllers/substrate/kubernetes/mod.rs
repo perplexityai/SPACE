@@ -70,8 +70,9 @@ use cancel_rate_tracker::CancelRateTracker;
 use restore_waiters::RestoreWaiters;
 use store::{
     ActiveExecutionState, K8sStore, NodeLifecycleState, NodeStateWrite, PlacementClock,
-    PreparedWakeSandbox, RestoreClaim, SandboxExecutionRow, StartedRecoveryClaim,
-    StartedRecoveryCompletion, StartedRecoveryObservation, UserRestoreObservation,
+    PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, SandboxExecutionRow,
+    StartedRecoveryClaim, StartedRecoveryCompletion, StartedRecoveryObservation,
+    UserRestoreObservation,
 };
 
 use crate::{
@@ -370,6 +371,10 @@ struct ResolvedPodInstance {
     ip: PodIp,
     pod_uid: Option<PodUid>,
     generation: i64,
+    /// The sandbox row read with the execution was `restoring`. A path that
+    /// serves a user request must not dial such a pod (see
+    /// `KubernetesSubstrate::join_restore_before_dial`).
+    sandbox_restoring: bool,
 }
 
 impl ResolvedPodInstance {
@@ -419,6 +424,9 @@ pub struct KubernetesState {
     /// plane does not publish `suspended` while kubelet/containerd teardown for
     /// the old sandbox pod can still run later.
     pub k8s_blocking_delete_timeout: Duration,
+    /// Whether a failed restore claim's rollback retires its execution
+    /// (`SPACE_ABANDONED_RESTORE_RETIREMENT_ENABLED`, default off).
+    pub abandoned_restore_retirement: super::AbandonedRestoreRetirement,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -471,6 +479,7 @@ impl KubernetesState {
             create_command_ready_timeout,
             create_data_plane_ready_timeout,
             k8s_blocking_delete_timeout: DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT,
+            abandoned_restore_retirement: super::AbandonedRestoreRetirement::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,
@@ -552,6 +561,10 @@ fn is_dormant_lifecycle(lifecycle: &str) -> bool {
 
 fn is_suspended_lifecycle(lifecycle: &str) -> bool {
     normalize_lifecycle(lifecycle) == "suspended"
+}
+
+fn is_restoring_lifecycle(lifecycle: &str) -> bool {
+    normalize_lifecycle(lifecycle) == "restoring"
 }
 
 fn is_recoverable_live_lifecycle(lifecycle: &str) -> bool {

@@ -158,7 +158,7 @@
 "crates/libs/api/src/controllers/substrate/kubernetes/store/execution_rows.rs" = 1
 "crates/libs/api/src/controllers/substrate/kubernetes/store/pod_placement.rs" = 1
 "crates/libs/api/src/controllers/substrate/kubernetes/store/pod_tracking.rs" = 5
-"crates/libs/api/src/controllers/substrate/kubernetes/store/restore_lease.rs" = 5
+"crates/libs/api/src/controllers/substrate/kubernetes/store/restore_lease.rs" = 8
 "crates/libs/api/src/controllers/substrate/kubernetes/store/suspend.rs" = 8
 "crates/libs/api/src/controllers/substrate/mod.rs" = 1
 "crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 2
@@ -169,7 +169,7 @@
 "crates/libs/cluster/controller/server/src/started_sandbox_repair/store.rs" = 3
 "crates/libs/cluster/controller/server/src/suspended_execution_reaper/store.rs" = 1
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
-"crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 10
+"crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 12
 "crates/libs/internal/api/server/src/data_plane_sessions/service_route.rs" = 1
 "crates/libs/internal/api/server/src/published_state.rs" = 9
 "crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 3

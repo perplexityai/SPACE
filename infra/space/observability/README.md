@@ -305,7 +305,8 @@ metrics pipeline at that port if you need the signal. Do not scale the
 Collector or Tempo horizontally without a state and routing design.
 
 Tempo 3's `query_frontend.query_end_cutoff` excludes the newest 30 seconds even
-with explicit end bounds, so freshly exported traces are briefly unsearchable.
+with explicit end bounds (`tempo.queryEndCutoff`; the Kind profile lowers it to
+5 seconds), so freshly exported traces are briefly unsearchable.
 Use a wide window and bounded polling; export acknowledgement is not evidence
 that a trace is queryable.
 
