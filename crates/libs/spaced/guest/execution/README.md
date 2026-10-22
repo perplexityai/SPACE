@@ -147,7 +147,8 @@ and error evolution, requires a separate crate-level policy before stabilization
 - Cancellation ends interrupted read/list streams with `Unavailable` after any
   buffered results, including when the output queue is full. Partial output is
   not successful completion. Graceful close allows admitted reads and lists to
-  finish; passive watches retire quietly during close/drain on both backends.
+  finish. Worker watches retire quietly at close; Direct watches retire quietly
+  during drain or cancellation.
 - Cancellation wakes uploads awaiting `Open` or subsequent input. Supervised
   filesystem mutations can finish during `cancellation_grace`; stalled identity
   workers are then terminated and the outcome may be unknown. Direct execution

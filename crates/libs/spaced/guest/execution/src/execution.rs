@@ -180,8 +180,9 @@ impl ExecutionService {
     }
 
     /// Close admission through every existing handle without cancelling admitted
-    /// work. This is idempotent; streams and processes already admitted can finish.
-    /// Use [`Self::cancel`] to request abortive shutdown.
+    /// work. This is idempotent; admitted reads, lists and processes can finish.
+    /// Worker watches retire quietly at close; Direct watches retire during
+    /// drain or cancellation. Use [`Self::cancel`] to request abortive shutdown.
     pub fn close(&self) {
         self.inner.lifecycle.close();
     }
