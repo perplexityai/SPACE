@@ -39,6 +39,7 @@ pub mod node_network;
 pub mod node_service_readiness;
 pub mod object_store;
 pub mod operations;
+pub mod payload;
 pub mod reconcile;
 pub mod response;
 pub mod sandbox;

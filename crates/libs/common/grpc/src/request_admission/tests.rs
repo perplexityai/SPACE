@@ -38,7 +38,8 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
         inner,
         QueuedSlots::new(slots.clone()),
         &[("Write", 1), ("WriteBatch", 4), ("Rename", 1)],
-    );
+    )
+    .with_observation(Budget::GuestFilesystem);
     let mut other_listener = service.clone();
     let pending = service.call(request("WriteBatch"));
     for method in ["Write", "WriteBatch", "Rename"] {
@@ -204,12 +205,20 @@ fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
         } else {
             Arc::new(Semaphore::new(2))
         };
-        let held = RequestPermit::try_acquire(origin.clone(), held_weight, None).unwrap();
+        let held = RequestPermit::try_acquire_observed(
+            origin.clone(),
+            held_weight,
+            None,
+            Budget::GuestProcess,
+        )
+        .unwrap();
+        let lifetime = held.request_lifetime();
         let observed = held.clone();
         if closed {
             slots.close();
         }
-        let result = RequestPermit::try_acquire(slots.clone(), 2, Some(held));
+        let result =
+            RequestPermit::try_acquire_observed(slots.clone(), 2, Some(held), Budget::GuestProcess);
         assert_eq!(result.is_ok(), admitted);
         if admitted {
             assert_eq!(
@@ -221,6 +230,11 @@ fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
         drop(result);
         assert_eq!(origin.available_permits(), 2 - held_weight as usize);
         drop(observed);
-        assert_eq!(origin.available_permits(), 2);
+        assert_eq!(
+            origin.available_permits(),
+            2,
+            "request observation must not retain admission"
+        );
+        drop(lifetime);
     }
 }

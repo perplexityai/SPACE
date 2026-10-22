@@ -221,6 +221,7 @@ impl FilesystemHandle {
             pplx_space_common_grpc::QueuedSlots::new(self.payload_slots.clone()),
             filesystem_limits::PAYLOAD_METHODS,
         )
+        .with_observation(pplx_space_metrics::payload::Budget::GuestFilesystem)
     }
 
     pub(crate) async fn drain(&self) {
@@ -268,6 +269,7 @@ impl FilesystemHandle {
             // payloads, outstanding file I/O, and worker termination/reaping.
             let _permits = permits;
             if cancelled.is_cancelled() {
+                _permits.1.observe_cancellation();
                 return Err(Status::cancelled("filesystem dispatch cancelled before execution"));
             }
             let execution = reservation.dispatch();
@@ -277,6 +279,7 @@ impl FilesystemHandle {
                 tokio::select! {
                     result = &mut call => result,
                     _ = cancelled.cancelled() => {
+                        _permits.1.observe_cancellation();
                         match tokio::time::timeout(cancellation_grace, &mut call).await {
                             Ok(result) => result,
                             Err(_) => {
@@ -340,15 +343,17 @@ impl FilesystemHandle {
         let executor = self.executor(user).await?;
         let cancelled = self.shutdown.child_token();
         let _on_drop = cancelled.clone().drop_guard();
-        self.supervise(
-            executor,
-            reservation,
-            command,
-            cancelled,
-            (permit, admission),
-        )
-        .await
-        .map_err(|_| operations::unknown_outcome())?
+        let request_lifetime = admission.request_lifetime();
+        request_lifetime
+            .observe(self.supervise(
+                executor,
+                reservation,
+                command,
+                cancelled,
+                (permit, admission),
+            ))
+            .await
+            .map_err(|_| operations::unknown_outcome())?
     }
 
     pub(crate) async fn write_from_stream<S>(
@@ -362,11 +367,15 @@ impl FilesystemHandle {
         let admission = crate::payload::acquire(
             &self.payload_slots,
             1,
+            pplx_space_metrics::payload::Budget::GuestFilesystem,
             request.extensions_mut().remove::<RequestPermit>(),
         )?;
         let incoming = request.into_inner();
         tokio::pin!(incoming);
-        self.write_stream(incoming.as_mut(), admission).await
+        admission
+            .request_lifetime()
+            .observe(self.write_stream(incoming.as_mut(), admission))
+            .await
     }
 
     async fn write_stream(
@@ -1183,6 +1192,7 @@ impl Filesystem for FilesystemHandle {
             &mut request,
             &self.payload_slots,
             filesystem_limits::BATCH_REQUEST_WEIGHT,
+            pplx_space_metrics::payload::Budget::GuestFilesystem,
             filesystem_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
@@ -1266,6 +1276,7 @@ impl Filesystem for FilesystemHandle {
             &mut request,
             &self.payload_slots,
             1,
+            pplx_space_metrics::payload::Budget::GuestFilesystem,
             filesystem_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
