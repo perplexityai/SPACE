@@ -1213,7 +1213,7 @@ fn supported_error_examples_match_envelopes_status_and_retryability() {
     );
     assert_eq!(
         examples("/sandboxes/{sandbox_id}/commands", "post", "409"),
-        ["idempotency_conflict"]
+        ["conflict", "idempotency_conflict"]
     );
     assert_eq!(
         examples("/sandboxes/{sandbox_id}/processes", "get", "409"),
