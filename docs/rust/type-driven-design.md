@@ -48,7 +48,7 @@ impl AsRef<str> for SandboxId { fn as_ref(&self) -> &str { &self.0 } }
 - Implement `From<NewType> for String` (or the inner type) so re-serializing onto a wire is free.
 - Don't implement `Deref<Target=str>`. It papers over the distinction the newtype was created to enforce.
 - Prefer immutability: `pub struct SandboxId(String);` not `pub struct SandboxId { pub inner: String }`.
-- Share newtypes in `common-core`/`common-svc`. Don't fork parallel types per crate; that fragments the vocabulary and forces lossy conversions at every boundary (this is the lesson behind the existing `crates/libs/common/core/src/types/` directory — extend it instead of duplicating).
+- Share each newtype from the crate that owns its concept, and extend it there instead of duplicating it. Don't fork parallel types per crate; that fragments the vocabulary and forces lossy conversions at every boundary. A new shared type goes in its owning crate (a protocol, value-type or service crate) or a new single-responsibility crate, not in `common-core`/`common-svc`.
 
 ---
 
@@ -178,7 +178,7 @@ For raw text conversion APIs, `impl AsRef<str>` or `impl Into<String>` can let t
 
 Before sending the PR, scan the diff and ask:
 
-- [ ] Every `&str`/`String` parameter at an inter-module function boundary: would a newtype from `common-core/types/` say what this is?
+- [ ] Every `&str`/`String` parameter at an inter-module function boundary: would a newtype from the crate that owns the concept say what this is?
 - [ ] Every `Option<T>` field: is it `Some` iff some other field is `Some`/has a particular value? If yes, lift to an enum.
 - [ ] Every `String` constant or `match` over string literals (`"start" | "stop" | …`): replace with an enum (`#[serde(rename_all=…)]` if it's serialized).
 - [ ] Every `Vec<T>` or `HashMap<K,V>` returned from a function that the caller will treat as nonempty / unique-keyed: encode that in the type (`NonEmpty<T>`, an index-typed set).
