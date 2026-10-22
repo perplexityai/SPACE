@@ -310,11 +310,13 @@ pub(crate) enum ProcessEventId {
 const PROCESS_EVENT_ID_TAG_BIT: u32 = 52;
 const PROCESS_EVENT_ID_TAG: u64 = 1 << PROCESS_EVENT_ID_TAG_BIT;
 const PROCESS_EVENT_ID_GUARD_BITS: u32 = 16;
-/// Identified frames at one position: output moves it, so only
-/// `resync_required` frames share one (see [`process_frame_has_event_id`]).
-/// The rest of the 36 bits below the tag go to positions: ids carry one for a
-/// process's first 2^27 - 1 outputs.
-const PROCESS_EVENT_ID_FRAME_BITS: u32 = 8;
+/// Identified frames at one position: output moves it, and so does every gap
+/// that keeps it, so a position has at most two ids, the unsent
+/// [`ProcessEventId::START`] and the `resync_required` that starts a replay
+/// for an id without a position (see [`process_frame_has_event_id`]). The
+/// rest of the 36 bits below the tag go to positions: ids carry one for a
+/// process's first 2^33 - 1 outputs.
+const PROCESS_EVENT_ID_FRAME_BITS: u32 = 2;
 const PROCESS_EVENT_ID_FIELD_SHIFT: u32 = PROCESS_EVENT_ID_GUARD_BITS + PROCESS_EVENT_ID_FRAME_BITS;
 const PROCESS_EVENT_ID_FIELD_BITS: u32 = PROCESS_EVENT_ID_TAG_BIT - PROCESS_EVENT_ID_FIELD_SHIFT;
 const PROCESS_EVENT_ID_FIELD_MASK: u64 = (1 << PROCESS_EVENT_ID_FIELD_BITS) - 1;
@@ -322,7 +324,7 @@ const PROCESS_EVENT_ID_MAX_FRAME: u64 = (1 << PROCESS_EVENT_ID_FRAME_BITS) - 1;
 const PROCESS_EVENT_ID_UNKNOWN: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 1);
 const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
 /// The highest block a resumed stream starts in: half the blocks, so every
-/// stream has at least 2^(field + frame - 2) ids left to send.
+/// stream has at least 2^(field + frame - 2) = 2^34 ids left to send.
 const PROCESS_EVENT_ID_MAX_RESUME_BLOCK: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 2);
 
 const _: () = {
@@ -330,7 +332,8 @@ const _: () = {
     // and an id, whose bits all lie at or below the tag, is below 2^53.
     assert!(PROCESS_EVENT_ID_FIELD_BITS > 2);
     assert!(PROCESS_EVENT_ID_TAG_BIT < 53);
-    // A stream that starts in the highest resume block cannot run out.
+    // A stream that starts in the highest resume block has blocks left. They
+    // are finite: one that sent 2^34 ids without a position would wrap.
     assert!(PROCESS_EVENT_ID_MAX_RESUME_BLOCK < PROCESS_EVENT_ID_MAX_POSITION);
 };
 
@@ -406,7 +409,8 @@ impl ProcessEventId {
     }
 
     /// The id of the next frame, once the client has received output up to
-    /// `position`. Always greater than this one.
+    /// `position`. Greater than this one while the blocks without a position
+    /// last: a stream has at least 2^34 ids after the block it starts in.
     fn next(self, position: Option<u64>) -> Self {
         match self {
             Self::Position {
@@ -433,7 +437,7 @@ impl ProcessEventId {
             },
             // A resumed stream starts at most at block
             // `PROCESS_EVENT_ID_MAX_RESUME_BLOCK` (`first_after`), and would
-            // need 2^34 frames to exhaust the rest.
+            // need 2^34 frames to exhaust the rest; past them this wraps.
             Self::Unknown { block, .. } => Self::Unknown {
                 block: block + 1,
                 frame: 0,

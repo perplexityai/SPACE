@@ -88,7 +88,7 @@ fn openapi_identifier(value: &str) -> String {
 
 pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
     let response = json!({
-        "description": "### Read the stream\n\n- Each SSE event carries one `DataPlaneServerFrame` JSON object. Ignore comment heartbeats.\n- Decode stdout and stderr's `data_base64` using standard base64.\n- Success requires `process_exited` with exit code zero and no error or missing output. HTTP 200 or a closed stream alone is not success.\n\n### Example output\n\nExcerpt, not a complete stream:\n\n```text\nid: 4503599644147712\nevent: stdout\ndata: {\"type\":\"stdout\",\"seq\":1,\"data_base64\":\"SGVsbG8gZnJvbSBTUEFDRQo=\"}\n\nevent: process_exited\ndata: {\"type\":\"process_exited\",\"process_id\":\"proc_00000000-0000-0000-0000-000000000000\",\"exit_code\":0,\"status\":\"exited\"}\n\n```",
+        "description": "### Read the stream\n\n- Each SSE event carries one `DataPlaneServerFrame` JSON object. Ignore comment heartbeats.\n- Decode stdout and stderr's `data_base64` using standard base64.\n- Success requires `process_exited` with exit code zero and no error or missing output. HTTP 200 or a closed stream alone is not success.\n\n### Example output\n\nExcerpt, not a complete stream:\n\n```text\nid: 4503599627632640\nevent: stdout\ndata: {\"type\":\"stdout\",\"seq\":1,\"data_base64\":\"SGVsbG8gZnJvbSBTUEFDRQo=\"}\n\nevent: process_exited\ndata: {\"type\":\"process_exited\",\"process_id\":\"proc_00000000-0000-0000-0000-000000000000\",\"exit_code\":0,\"status\":\"exited\"}\n\n```",
         "content": {
             "text/event-stream": {
                 "schema": { "type": "string" },

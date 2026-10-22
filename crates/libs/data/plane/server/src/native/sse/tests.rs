@@ -213,3 +213,32 @@ fn process_event_ids_increase_and_carry_the_output_position() {
         assert_eq!((id as f64).to_string(), id.to_string());
     }
 }
+
+/// Ids carry the output position for a process's first 2^33 - 1 outputs, as
+/// the API docs publish, and none after; the id the docs show for the first
+/// output decodes to it.
+#[test]
+fn process_event_ids_carry_positions_up_to_the_published_limit() {
+    let last = (1 << 33) - 1;
+    let id = ProcessEventId::START.next(Some(last));
+    assert_eq!(
+        id,
+        ProcessEventId::Position {
+            position: last,
+            frame: 0
+        }
+    );
+    assert_eq!(ProcessEventId::decode(id.encode()), Some(id));
+    assert!(matches!(
+        id.next(Some(last + 1)),
+        ProcessEventId::Unknown { .. }
+    ));
+
+    assert_eq!(
+        ProcessEventId::decode(4_503_599_627_632_640),
+        Some(ProcessEventId::Position {
+            position: 1,
+            frame: 0
+        })
+    );
+}
