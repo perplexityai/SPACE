@@ -1,3 +1,4 @@
+mod published_suspend;
 mod state_writer_refusal;
 
 pub(crate) use super::test_fixtures::{

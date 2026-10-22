@@ -42,3 +42,8 @@ pub fn local_artifact_unowned(
 ) -> Result<bool> {
     crate::db::local_artifact_leases::gc_staging_is_unowned(conn, &local_artifact_id.to_string())
 }
+
+/// Whether the upload worker recorded a completed remote backup for this exact artifact.
+pub fn local_artifact_backup_completed(conn: &Connection, id: LocalArtifactId) -> Result<bool> {
+    crate::db::local_artifact_backup_completed(conn, id)
+}

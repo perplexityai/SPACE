@@ -336,19 +336,35 @@ pub(super) const AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA: &str =
     "x-space-auto-lifecycle-suspend-backup-fence-failed";
 
 #[derive(Debug, thiserror::Error)]
-enum ArtifactBackupSubmissionError {
+pub(super) enum ArtifactBackupSubmissionError {
     #[error("{0}")]
     Other(String),
+    #[error("artifact backup permanently refused: {0}")]
+    RefusedArtifact(String),
     /// `superseded_generation` is the generation the control plane named
     /// when it refused the registration as superseded.
     #[error("begin restore-visible snapshot backup: {error}")]
     Begin {
         #[source]
         error: pplx_space_common_jobs::JobError,
+        refuses_artifact: bool,
         superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     },
     #[error(transparent)]
     RetainedUpload(#[from] suspend_snapshot::RetainedUploadError),
+}
+
+impl ArtifactBackupSubmissionError {
+    pub(super) fn refuses_artifact(&self) -> bool {
+        matches!(
+            self,
+            Self::RefusedArtifact(_)
+                | Self::Begin {
+                    refuses_artifact: true,
+                    ..
+                }
+        )
+    }
 }
 
 impl From<String> for ArtifactBackupSubmissionError {
