@@ -31,6 +31,7 @@ pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-network-roles = { workspace = true }
 pplx-space-pii = { workspace = true }
+pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 rusqlite = { workspace = true, optional = true }

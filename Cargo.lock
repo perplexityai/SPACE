@@ -5453,6 +5453,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-network-roles",
  "pplx-space-pii",
+ "pplx-space-rpc-contracts",
  "pplx-space-semver",
  "pplx-space-sql-locator",
  "rusqlite",
@@ -6967,6 +6968,13 @@ name = "pplx-space-request-id"
 version = "0.8.0"
 dependencies = [
  "http 1.5.0",
+]
+
+[[package]]
+name = "pplx-space-rpc-contracts"
+version = "0.8.0"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]
