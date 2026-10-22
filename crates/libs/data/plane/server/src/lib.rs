@@ -149,12 +149,13 @@ const REVOCATION_MAX_STALENESS: Duration = Duration::from_secs(60);
 /// How long one revocation check may wait on the cluster API, across all of
 /// its reads. A check that takes longer counts as unavailable.
 const REVOCATION_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
-/// The longest revocation check interval the service accepts: a third of the
-/// staleness bound less one check timeout. A failed check keeps a verdict
-/// until it is that bound less one interval and one timeout old, so at this
-/// interval or below that is at least two intervals: a stream rides out at
-/// least the first failed check after a confirmed one, and a refresh another
-/// stream has in flight can still answer for it.
+/// The longest revocation check interval the service accepts: a third of
+/// what is left of the staleness bound after one check timeout, 19 s at the
+/// defaults. A failed check keeps a verdict until it is that bound less one
+/// interval and one timeout old, so at this interval or below that is at
+/// least two intervals: a stream rides out at least the first failed check
+/// after a confirmed one, and a refresh another stream has in flight can
+/// still answer for it.
 pub const MAX_REVOCATION_CHECK_INTERVAL_MS: u64 =
     ((REVOCATION_MAX_STALENESS.as_millis() - REVOCATION_CHECK_TIMEOUT.as_millis()) / 3) as u64;
 /// The shortest drain deadline the service accepts: the 8-second stream-open

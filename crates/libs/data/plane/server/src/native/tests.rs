@@ -1509,8 +1509,11 @@ async fn route_cache_hit_does_not_confirm_the_revocation_verdict() {
         RevocationProbe::Fresh(true)
     ));
     // The resolve set the next refresh just under one interval after it
-    // began; the cache hit must not have moved it later.
-    tokio::time::advance(interval - tolerance).await;
+    // began; the cache hit must not have moved it later. This lands a
+    // tolerance past that refresh, and a tolerance short of where one set by
+    // the cache hit would fall.
+    let fresh_for = interval - interval / 10;
+    tokio::time::advance(fresh_for - tolerance).await;
     assert!(
         matches!(
             state

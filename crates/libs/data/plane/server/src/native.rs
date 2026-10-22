@@ -791,10 +791,10 @@ pub(super) fn revocation_check_interval(state: &DataPlaneState) -> tokio::time::
 /// A check the cluster API could not answer keeps the session's last
 /// confirmed verdict while that verdict is young enough, so a brief cluster
 /// API or database outage does not end every attached stream. Once it is not,
-/// the error is returned and the stream fails closed: the first check that
-/// starts once the verdict is older than [`revocation_tolerance`] ends it, at
-/// most the staleness bound ([`REVOCATION_MAX_STALENESS`]) after the read that
-/// confirmed it. The verdict's age is its org entry's; see
+/// the error is returned and the stream fails closed: the first failed check
+/// that finishes once the verdict is older than [`revocation_tolerance`] ends
+/// it, at most the staleness bound ([`REVOCATION_MAX_STALENESS`]) after the
+/// read that confirmed it. The verdict's age is its org entry's; see
 /// [`RevocationCache::confirmed_active`]. Any other failure, such as a
 /// malformed answer, fails closed at once, and so does a confirmed revocation.
 pub(super) async fn session_is_revoked(
