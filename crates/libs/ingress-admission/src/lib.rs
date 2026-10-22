@@ -1,4 +1,7 @@
 //! Request-scoped bounds on ingress preparation, independent of activation admission.
+//!
+//! It is its own crate so ingress callers can share the per-process waiter
+//! limits without depending on the rest of the service host.
 use pplx_space_common_core::types::SandboxId;
 use std::{
     collections::BTreeMap,

@@ -5588,6 +5588,7 @@ dependencies = [
  "pplx-space-ecw-credential",
  "pplx-space-federated-grant-store",
  "pplx-space-federated-identity",
+ "pplx-space-ingress-admission",
  "pplx-space-k8s-node-id",
  "pplx-space-kube-client",
  "pplx-space-metrics",
@@ -6055,6 +6056,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-ingress-admission"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-metrics",
+ "tonic",
 ]
 
 [[package]]

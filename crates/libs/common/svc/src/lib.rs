@@ -154,4 +154,4 @@ pub use peer_auth::{
     peer_may_set_local_authority, require_local_authority_peer,
 };
 
-pub mod ingress_admission;
+pub use pplx_space_ingress_admission as ingress_admission;

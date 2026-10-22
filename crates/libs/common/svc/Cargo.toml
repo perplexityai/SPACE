@@ -78,6 +78,7 @@ pplx-space-dependency-drain = { workspace = true }
 pplx-space-ecw-credential = { workspace = true }
 pplx-space-federated-grant-store = { workspace = true }
 pplx-space-federated-identity = { workspace = true }
+pplx-space-ingress-admission = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
