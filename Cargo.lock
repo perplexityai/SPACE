@@ -5423,6 +5423,7 @@ dependencies = [
  "pplx-space-cpu-arch",
  "pplx-space-durations",
  "pplx-space-env-vars",
+ "pplx-space-guest-process",
  "pplx-space-k8s-ids",
  "pplx-space-net-common",
  "pplx-space-semver",
@@ -5998,6 +5999,17 @@ name = "pplx-space-grpc-metrics"
 version = "0.8.0"
 dependencies = [
  "pplx-space-metrics-emit",
+]
+
+[[package]]
+name = "pplx-space-guest-process"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-durations",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

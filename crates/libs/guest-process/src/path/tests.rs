@@ -3,7 +3,7 @@ use super::{
     MAX_SAFE_PATH_COMPONENT_BYTES, RelativeGlobPattern, RelativeGuestPath, SafePathComponent,
     conventional_linux_guest_home, normalize_linux_guest_path,
 };
-use crate::types::GuestUserName;
+use crate::GuestUserName;
 
 #[test]
 fn guest_paths_reject_controls_and_excessive_length() {

@@ -883,6 +883,25 @@ run_clippy_checks() {
         --lib \
         -- \
         -D warnings
+
+    # Built alone, so a serde feature the guest process crate needs but only
+    # gets through unification with common-core fails here. `serde` is its
+    # only feature, so `--all-features` also covers it alone.
+    echo "--- :rust: Running isolated guest process clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-guest-process \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-guest-process \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

@@ -22,6 +22,7 @@ pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-guest-process = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-semver = { workspace = true }
@@ -57,6 +58,7 @@ serde = [
     "pplx-space-cpu-arch/serde",
     "pplx-space-k8s-ids/serde",
     "pplx-space-cluster-id/serde",
+    "pplx-space-guest-process/serde",
 ]
 sqlx = ["dep:sqlx", "pplx-space-semver/sqlx", "pplx-space-k8s-ids/sqlx"]
 rusqlite = ["dep:rusqlite"]
