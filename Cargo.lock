@@ -5452,6 +5452,7 @@ dependencies = [
  "pplx-space-linux-ids",
  "pplx-space-net-common",
  "pplx-space-network-roles",
+ "pplx-space-pii",
  "pplx-space-semver",
  "pplx-space-sql-locator",
  "rusqlite",
@@ -6905,6 +6906,10 @@ dependencies = [
  "tempfile",
  "tracing",
 ]
+
+[[package]]
+name = "pplx-space-pii"
+version = "0.8.0"
 
 [[package]]
 name = "pplx-space-placement"
