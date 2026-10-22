@@ -1,6 +1,6 @@
 use super::*;
 use crate::QueuedSlots;
-use pplx_space_metrics::test_capture::capture_counters_guard;
+use pplx_space_metrics::test_capture::{capture_counters_guard, capture_values_guard};
 use std::convert::Infallible;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,6 +17,7 @@ fn request(method: &str) -> http::Request<Body> {
 #[tokio::test(flavor = "current_thread")]
 async fn overload_never_enters_decoder_and_execution_retains_admission_after_cancellation() {
     let capture = capture_counters_guard();
+    let values = capture_values_guard();
     let slots = Arc::new(Semaphore::new(4));
     let handler_slots = slots.clone();
     let entered = Arc::new(AtomicUsize::new(0));
@@ -85,10 +86,32 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
         0,
         "execution still owns the payload"
     );
-    let permit = execution.lock().expect("execution").take().unwrap();
+    let mut permit = execution.lock().expect("execution").take().unwrap();
+    assert!(
+        permit.inner.cancelled_at.get().is_some(),
+        "dropping the request must record cancellation before the supervisor does"
+    );
+    // Inject elapsed retention time instead of sleeping on the wall clock.
+    let started = Instant::now() - Duration::from_secs(2);
+    *Arc::get_mut(&mut permit.inner)
+        .expect("execution is the remaining permit owner")
+        .cancelled_at
+        .get_mut()
+        .unwrap() = started;
     // Supervisor and caller can observe the same cancellation; count it once.
     permit.observe_cancellation();
+    let minimum_ms = started.elapsed().as_secs_f64() * 1000.0;
     drop(permit);
+    let maximum_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let values = values.finish();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].name, "spaced.guest.payload.cancelled_hold_ms");
+    assert_eq!(values[1].name, "spaced.guest.payload.cancelled_slot_ms");
+    for value in &values {
+        assert_eq!(value.tags, ["budget:guest_filesystem"]);
+    }
+    assert!((minimum_ms..=maximum_ms).contains(&values[0].value));
+    assert_eq!(values[1].value, values[0].value * 4.0);
     assert_eq!(slots.available_permits(), 4);
     let response = other_listener
         .call(request("Write"))
