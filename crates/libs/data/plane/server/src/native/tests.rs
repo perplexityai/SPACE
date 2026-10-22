@@ -1711,9 +1711,23 @@ fn started() -> FakeReply {
     ))
 }
 
+/// A reconnect's first event, from a guest that does not say where the
+/// stream starts.
 fn connected() -> FakeReply {
     FakeReply::Event(spaced_process_event::Event::Connected(
-        pplx_space_sbx_mgr_client::operations::ProcessConnected {},
+        pplx_space_sbx_mgr_client::operations::ProcessConnected {
+            output_cursor: None,
+        },
+    ))
+}
+
+/// A reconnect's first event, from a guest that started the stream at
+/// `start`, its oldest retained output, because the cursor's was evicted.
+fn connected_at(start: u64) -> FakeReply {
+    FakeReply::Event(spaced_process_event::Event::Connected(
+        pplx_space_sbx_mgr_client::operations::ProcessConnected {
+            output_cursor: Some(start),
+        },
     ))
 }
 
@@ -1851,13 +1865,15 @@ async fn spawn_process_fake(
                     "unexpected call {path}"
                 );
                 let body = request.into_body().collect().await.unwrap().to_bytes();
-                FakeOpen::Connect(
-                    SpacedConnectProcessRequest::decode(&body[5..])
-                        .unwrap()
-                        .operation
-                        .unwrap()
-                        .output_cursor,
-                )
+                let operation = SpacedConnectProcessRequest::decode(&body[5..])
+                    .unwrap()
+                    .operation
+                    .unwrap();
+                assert!(
+                    operation.resume_from_oldest_retained,
+                    "a connect asks to start at the oldest retained output"
+                );
+                FakeOpen::Connect(operation.output_cursor)
             };
             let opened = {
                 let mut opens = opens.lock().unwrap();
@@ -2114,6 +2130,50 @@ async fn evicted_process_output_continues_from_the_oldest_retained_output() {
     );
 }
 
+/// A guest that starts a lagged connect at its oldest retained output, and
+/// says so, needs no reopen: the stream reports the gap once and continues
+/// from there, with ids that keep their positions.
+#[tokio::test]
+async fn evicted_output_continues_where_the_guest_reports_the_stream_starts() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| match open {
+            FakeOpen::Connect(Some(cursor)) if cursor < 2 => {
+                let mut replies = vec![connected_at(2)];
+                replies.extend(
+                    journal_replay(&JOURNAL, FakeOpen::Connect(Some(2)))
+                        .into_iter()
+                        .skip(1),
+                );
+                replies
+            }
+            open => journal_replay(&JOURNAL, open),
+        }),
+    )
+    .await;
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+    assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
+    assert_eq!(stdout_text(&frames), "three\nfour\n");
+    assert_eq!(frames_of_type(&frames, "process_started").count(), 1);
+
+    let gap = frames_of_type(&frames, "resync_required")
+        .next()
+        .unwrap()
+        .0
+        .unwrap();
+    let resumed = process_events_to_close(&fake.endpoint, session_id, Some(gap)).await;
+    assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+    assert_eq!(stdout_text(&resumed), "three\nfour\n");
+    assert_ids_above(&resumed, gap);
+    assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), Some(2)]));
+}
+
 /// A guest older than the lag reason does not say where its retained output
 /// starts: the stream reports the gap once, follows the live tail without
 /// reporting the process start again, and a resume from what it sent next
@@ -2191,69 +2251,148 @@ async fn untagged_resource_exhausted_is_not_an_output_gap() {
 }
 
 /// A cursor past the output restarts at the start; when the start has been
-/// evicted too, that is the same gap, reported once.
+/// evicted too, that is the same gap, reported once, whether the guest ends
+/// the stream as lagged or starts it at its oldest retained output.
 #[tokio::test]
 async fn cursor_ahead_then_evicted_start_reports_one_gap() {
     if !binding_fake_test_process() {
         return;
     }
-    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
-    let fake = spawn_journal_fake(
-        session_id,
-        true,
-        Arc::new(|_, open| match open {
-            FakeOpen::Connect(Some(cursor)) if cursor < 2 => vec![connected(), lagged(Some(2))],
-            open => journal_replay(&JOURNAL, open),
-        }),
-    )
-    .await;
-    let ahead = ProcessEventId::Position {
-        position: 10,
-        frame: 0,
+    for reports_start in [false, true] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake = spawn_journal_fake(
+            session_id,
+            true,
+            Arc::new(move |_, open| match open {
+                FakeOpen::Connect(Some(cursor)) if cursor < 2 && reports_start => {
+                    let mut replies = vec![connected_at(2)];
+                    replies.extend(
+                        journal_replay(&JOURNAL, FakeOpen::Connect(Some(2)))
+                            .into_iter()
+                            .skip(1),
+                    );
+                    replies
+                }
+                FakeOpen::Connect(Some(cursor)) if cursor < 2 => vec![connected(), lagged(Some(2))],
+                open => journal_replay(&JOURNAL, open),
+            }),
+        )
+        .await;
+        let ahead = ProcessEventId::Position {
+            position: 10,
+            frame: 0,
+        }
+        .encode();
+
+        let frames = process_events_to_close(&fake.endpoint, session_id, Some(ahead)).await;
+
+        assert_eq!(
+            resync_reasons(&frames),
+            ["cursor_out_of_window"],
+            "{reports_start}"
+        );
+        assert_eq!(stdout_text(&frames), "three\nfour\n");
+        assert_ids_above(&frames, ahead);
+        let opens = if reports_start {
+            connects(&[Some(10), Some(0)])
+        } else {
+            connects(&[Some(10), Some(0), Some(2)])
+        };
+        assert_eq!(*fake.opens.lock().unwrap(), opens);
     }
-    .encode();
+}
 
-    let frames = process_events_to_close(&fake.endpoint, session_id, Some(ahead)).await;
+/// A process that keeps writing can evict its oldest retained output before
+/// a stream that moved there reads it, when the guest could not make the
+/// stream its primary reader. Chasing the next oldest would lose that race
+/// on every reopen, so the stream follows the live tail instead, whether the
+/// guest reported the start or ended the stream as lagged.
+#[tokio::test]
+async fn evicted_output_that_falls_behind_again_follows_the_live_tail() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    for reports_start in [false, true] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake = spawn_journal_fake(
+            session_id,
+            true,
+            // The oldest retained output moves past every cursor connected at.
+            Arc::new(move |_, open| match open {
+                FakeOpen::Connect(Some(cursor)) if reports_start => {
+                    vec![connected_at(cursor + 1), lagged(Some(cursor + 2))]
+                }
+                FakeOpen::Connect(Some(cursor)) => vec![connected(), lagged(Some(cursor + 1))],
+                FakeOpen::Connect(None) => vec![connected(), stdout("live\n"), exited()],
+                FakeOpen::Start => panic!("unexpected start"),
+            }),
+        )
+        .await;
 
-    assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
-    assert_eq!(stdout_text(&frames), "three\nfour\n");
-    assert_ids_above(&frames, ahead);
-    assert_eq!(
-        *fake.opens.lock().unwrap(),
-        connects(&[Some(10), Some(0), Some(2)])
-    );
+        let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+
+        assert!(
+            frames_of_type(&frames, "error").next().is_none(),
+            "{frames:?}"
+        );
+        assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
+        assert_eq!(stdout_text(&frames), "live\n");
+        let opens = if reports_start {
+            connects(&[Some(0), None])
+        } else {
+            connects(&[Some(0), Some(1), None])
+        };
+        assert_eq!(*fake.opens.lock().unwrap(), opens, "{reports_start}");
+    }
 }
 
 /// A guest that keeps refusing the cursor without ever sending output does
-/// not keep the stream reopening: after a few reopens it ends with an error.
+/// not keep the stream reopening: a start that is past the output too, a
+/// guest that keeps moving the start past the output, and a live tail that
+/// keeps falling behind, end with an error.
 #[tokio::test]
 async fn window_miss_reopens_without_progress_are_capped() {
     if !binding_fake_test_process() {
         return;
     }
-    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
-    let fake = spawn_journal_fake(
-        session_id,
-        true,
-        Arc::new(|_, open| {
-            let FakeOpen::Connect(Some(cursor)) = open else {
-                panic!("unexpected open {open:?}");
-            };
-            vec![connected(), lagged(Some(cursor + 1))]
-        }),
-    )
-    .await;
+    let ahead = ProcessEventId::Position {
+        position: 10,
+        frame: 0,
+    }
+    .encode();
+    for (last_event_id, replies, opens) in [
+        (
+            Some(ahead),
+            (|_| vec![connected(), cursor_ahead()]) as fn(FakeOpen) -> Vec<FakeReply>,
+            connects(&[Some(10), Some(0)]),
+        ),
+        (
+            Some(ahead),
+            |open| match open {
+                FakeOpen::Connect(Some(0)) => vec![connected_at(5), cursor_ahead()],
+                _ => vec![connected(), cursor_ahead()],
+            },
+            connects(&[Some(10), Some(0), Some(0), Some(0)]),
+        ),
+        (
+            None,
+            |_| vec![connected(), lagged(None)],
+            connects(&[Some(0), None, None, None]),
+        ),
+    ] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake =
+            spawn_journal_fake(session_id, true, Arc::new(move |_, open| replies(open))).await;
 
-    let (_state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
-    let mut seen = String::new();
-    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
-    let frames = sse_frames(&seen);
+        let (_state, mut chunks) =
+            open_process_events(&fake.endpoint, session_id, last_event_id).await;
+        let mut seen = String::new();
+        read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+        let frames = sse_frames(&seen);
 
-    assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
-    assert_eq!(
-        *fake.opens.lock().unwrap(),
-        connects(&[Some(0), Some(1), Some(2), Some(3)])
-    );
+        assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
+        assert_eq!(*fake.opens.lock().unwrap(), opens);
+    }
 }
 
 /// Output between window misses is progress: a stream that keeps falling

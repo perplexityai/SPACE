@@ -265,6 +265,32 @@ fn process_info_to_spaced_preserves_process_config() {
     assert_eq!(spaced.pty, Some(true));
 }
 
+/// The guest's report of where a reconnected stream starts reaches the data
+/// plane, which relies on it to tell evicted output apart.
+#[test]
+fn process_event_to_spaced_keeps_the_connected_output_cursor() {
+    let event = host_proto::ProcessEvent {
+        process_id: "proc-1".to_string(),
+        pid: Some(123),
+        event: Some(host_proto::process_event::Event::Connected(
+            host_proto::ProcessConnected {
+                output_cursor: Some(9),
+            },
+        )),
+    };
+
+    let spaced = process_event_to_spaced(event).unwrap();
+
+    assert_eq!(
+        spaced.event,
+        Some(crate::proto::spaced_process_event::Event::Connected(
+            SpacedProcessConnected {
+                output_cursor: Some(9)
+            }
+        ))
+    );
+}
+
 #[tokio::test]
 async fn identity_fence_aborts_an_idle_stream() {
     let fence = RouteStreamFence::new();

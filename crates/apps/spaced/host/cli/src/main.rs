@@ -288,7 +288,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Commands::Connect { process_id } => {
             let mut stream = client
-                .connect_process_stream_with_cursor(process_id, None, None)
+                .connect_process_stream_with_cursor(process_id, None, None, false)
                 .await?;
             while let Some(event) = stream.message().await? {
                 print_process_event(event).await?;

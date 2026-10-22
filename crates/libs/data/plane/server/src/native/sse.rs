@@ -240,6 +240,10 @@ pub(crate) struct ProcessSseState {
     /// `resync_required(cursor_out_of_window)` was sent and no output has
     /// followed it, so another gap before any output is the same one.
     gap_reported: bool,
+    /// The stream moved to the oldest output the guest retains after an
+    /// eviction, and no output has followed. Falling behind again before any
+    /// does is a race the stream keeps losing, so it follows the live tail.
+    at_oldest_retained: bool,
     /// Backend reopens after an output window miss since the last output or
     /// exit, capped at [`PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`].
     window_reopens_without_progress: u32,
@@ -515,6 +519,7 @@ impl ProcessSseState {
             binding: None,
             started_sent: false,
             gap_reported: false,
+            at_oldest_retained: false,
             window_reopens_without_progress: 0,
             revocation_tick,
             pending,
@@ -591,37 +596,60 @@ impl ProcessSseState {
         });
     }
 
+    /// Continues at `start`, where the guest reports a backend stream starts:
+    /// past the client's position when the output there was evicted. The guest
+    /// chose it under the lock that makes the stream its primary reader, so
+    /// unless another reader holds that place, the output there stays until
+    /// the stream reads it.
+    fn continue_at_reported_start(&mut self, start: u64) {
+        if self
+            .backend_output_cursor
+            .is_some_and(|cursor| start > cursor)
+        {
+            self.continue_after_gap(Some(start), "output_evicted");
+            self.at_oldest_retained = true;
+        }
+    }
+
     /// Reopens the backend stream after the guest refused its cursor as
     /// outside the retained output, behind one
     /// `resync_required(cursor_out_of_window)` for the gap: from the start of
-    /// the output when the cursor was past its end, from the oldest output the
-    /// guest still retains when it reports it, else at the live tail.
+    /// the output when the cursor was past its end, and from the oldest output
+    /// the guest still retains when it reports it. The stream follows the live
+    /// tail instead when the guest does not report it, or when the stream
+    /// already moved there and fell behind again before any output. After
+    /// [`PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`] reopens, a cursor
+    /// past the output, or a live tail that falls behind, ends the stream.
     async fn reopen_after_window_miss(&mut self, status: tonic::Status, miss: OutputWindowMiss) {
         let Some(process_id) = self.process_id.clone() else {
             self.finish_with_error(StreamBridgeError::BackendStatus(status));
             return;
         };
-        if self.window_reopens_without_progress >= PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS {
-            self.finish_with_error(StreamBridgeError::BackendStatus(status));
-            return;
-        }
+        let out_of_reopens =
+            self.window_reopens_without_progress >= PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS;
         match (miss, self.backend_output_cursor) {
             // Only a position the client resumed from can be past the output.
-            (OutputWindowMiss::CursorAhead, Some(cursor)) if cursor > 0 => {
+            (OutputWindowMiss::CursorAhead, Some(cursor)) if cursor > 0 && !out_of_reopens => {
                 self.restart_from_output_start("cursor_ahead");
-            }
-            (OutputWindowMiss::CursorAhead, _) => {
-                self.finish_with_error(StreamBridgeError::BackendStatus(status));
-                return;
             }
             (
                 OutputWindowMiss::Evicted {
                     first_retained: Some(first),
                 },
                 Some(cursor),
-            ) if first > cursor => self.continue_after_gap(Some(first), "output_evicted"),
-            (OutputWindowMiss::Evicted { .. }, _) => {
+            ) if first > cursor && !self.at_oldest_retained => {
+                self.continue_after_gap(Some(first), "output_evicted");
+                self.at_oldest_retained = true;
+            }
+            (OutputWindowMiss::Evicted { .. }, Some(_)) => {
                 self.continue_after_gap(None, "output_evicted");
+            }
+            (OutputWindowMiss::Evicted { .. }, None) if !out_of_reopens => {
+                self.continue_after_gap(None, "output_evicted");
+            }
+            _ => {
+                self.finish_with_error(StreamBridgeError::BackendStatus(status));
+                return;
             }
         }
         self.window_reopens_without_progress += 1;
@@ -828,6 +856,12 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                                 ));
                             }
                         }
+                        let reported_start = match &event.event {
+                            Some(spaced_process_event::Event::Connected(connected)) => {
+                                connected.output_cursor
+                            }
+                            _ => None,
+                        };
                         let mut output_seq = state.output_seq;
                         let batch = process_event_frames(event, &mut output_seq);
                         if batch
@@ -851,6 +885,7 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             }
                             if process_frame_advances_backend_cursor(&frame) || exited {
                                 state.gap_reported = false;
+                                state.at_oldest_retained = false;
                                 state.window_reopens_without_progress = 0;
                             }
                             state.push_frame(frame);
@@ -860,6 +895,9 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                                 });
                                 state.finish("backend_closed");
                             }
+                        }
+                        if let Some(start) = reported_start {
+                            state.continue_at_reported_start(start);
                         }
                         if let Some(event) = state.pending.pop_front() {
                             return Some(event);
@@ -901,9 +939,11 @@ fn process_frame_has_event_id(frame: &DataPlaneServerFrame) -> bool {
 }
 
 /// Backend reopens after an output window miss, without output or an exit
-/// in between, before the stream ends with an error. A cursor past the output
-/// restarts at the start, which the guest may in turn report as evicted, so
-/// two in a row are expected.
+/// in between, after which a cursor past the output, or a live tail that
+/// falls behind, ends the stream with an error; evicted output still
+/// continues at the live tail. A cursor past the output restarts at the
+/// start, which a guest may in turn report as evicted, so two in a row are
+/// expected.
 const PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS: u32 = 3;
 
 /// Why the guest ended a process stream because its cursor is outside the

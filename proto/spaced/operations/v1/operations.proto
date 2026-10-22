@@ -240,6 +240,12 @@ message ConnectProcessRequest {
   // Older guests end a lagged stream with RESOURCE_EXHAUSTED and no reason,
   // and wait for output to reach a cursor past it.
   optional uint64 output_cursor = 3;
+  // With `output_cursor` before the oldest output the guest still retains,
+  // start the stream at that oldest output instead of ending it as lagged.
+  // The guest chooses the start under the lock that also gives the stream
+  // its reader position, so output written meanwhile cannot evict it, and
+  // reports it in `ProcessConnected.output_cursor`. Older guests ignore it.
+  bool resume_from_oldest_retained = 4;
 }
 message ListProcessesRequest {}
 message ProcessInfo {
@@ -287,7 +293,13 @@ message ProcessEvent {
   }
 }
 message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
-message ProcessConnected {}
+message ProcessConnected {
+  // The journal cursor of the first output this stream sends, when the
+  // request set `output_cursor`: that cursor, or a later one when
+  // `resume_from_oldest_retained` moved the start past evicted output.
+  // Unset by older guests.
+  optional uint64 output_cursor = 1;
+}
 message ProcessOutput { bytes data = 1; }
 message ProcessExit {
   oneof outcome {

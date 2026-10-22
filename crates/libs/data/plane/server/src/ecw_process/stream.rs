@@ -449,6 +449,7 @@ pub(super) fn build_process_start_resume_request(
                 .as_ref()
                 .and_then(|operation| operation.timeout),
             output_cursor: Some(output_cursor),
+            resume_from_oldest_retained: false,
         }),
     }
 }

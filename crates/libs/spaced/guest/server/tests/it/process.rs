@@ -191,6 +191,7 @@ async fn bridge_guest_process_stalled_stream_does_not_block_reconnect_exit() {
             process_id: started.process_id,
             timeout: None,
             output_cursor: None,
+            resume_from_oldest_retained: false,
         }))
         .await
         .expect("connect response")
@@ -244,10 +245,23 @@ async fn bridge_guest_process_connect_replays_from_output_cursor() {
             process_id: started.process_id,
             timeout: None,
             output_cursor: Some(0),
+            resume_from_oldest_retained: true,
         }))
         .await
         .expect("connect response")
         .into_inner();
+    let first = connected
+        .next()
+        .await
+        .expect("connected event")
+        .expect("connected event response");
+    assert_eq!(
+        first.event,
+        Some(Event::Connected(bridge_guest::ProcessConnected {
+            output_cursor: Some(0)
+        })),
+        "the stream reports where it starts"
+    );
 
     let mut replayed = Vec::new();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -545,6 +559,7 @@ async fn bridge_guest_process_start_replays_output_while_cursorless_connect_retu
                     process_id: started.process_id.clone(),
                     timeout: None,
                     output_cursor: None,
+                    resume_from_oldest_retained: false,
                 })
                 .await
                 .expect("connect exited process")
@@ -699,6 +714,7 @@ async fn bridge_guest_process_connect_and_signal_validation_work() {
                 process_id: process_id.clone(),
                 timeout: None,
                 output_cursor: None,
+                resume_from_oldest_retained: false,
             })
             .await
             .expect("connect process")
@@ -798,6 +814,7 @@ async fn bridge_guest_process_connect_unknown_returns_not_found() {
             process_id: "missing".into(),
             timeout: None,
             output_cursor: None,
+            resume_from_oldest_retained: false,
         })
         .await
         .expect_err("missing process rejected");

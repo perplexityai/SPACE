@@ -12,7 +12,8 @@
 //! `output_cursor` replays every record at or after that sequence, a cursor
 //! past the output ends the stream with the guest's tagged `OUT_OF_RANGE`,
 //! and a connect without one follows the live tail and replays nothing. The
-//! simulator retains all output, so it never reports a cursor as evicted. The
+//! simulator retains all output, so it never reports a cursor as evicted, and
+//! `ProcessConnected` reports that the stream starts at the cursor. The
 //! process table is per sandbox and is dropped with the sandbox.
 
 use std::collections::HashMap;
@@ -251,8 +252,11 @@ fn event_stream(process: &SimProcess, mode: ConnectMode) -> SimProcessEventStrea
             (started, 0)
         }
         ConnectMode::Connect { output_cursor } => {
+            // Nothing is evicted, so the stream starts at the cursor.
             let connected =
-                sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {});
+                sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {
+                    output_cursor,
+                });
             if output_cursor.is_some_and(|cursor| cursor > tail) {
                 return Box::pin(tokio_stream::iter(vec![
                     Ok(event(&process_id, Some(pid), connected)),

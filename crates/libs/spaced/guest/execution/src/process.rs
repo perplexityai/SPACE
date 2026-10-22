@@ -427,7 +427,7 @@ impl ProcessLaunch {
         ));
         claim.publish(Arc::clone(&record));
 
-        let cursor = record.journal.cursor(Some(0));
+        let cursor = record.journal.cursor(Some(0), false);
         let mut output_tasks = VecDeque::new();
         if let Some(reader) = pty_reader {
             output_tasks.push_back(spawn_process_output_reader(
@@ -1028,12 +1028,25 @@ impl ProcessEventJournal {
             .completed_at
     }
 
-    fn cursor(self: &Arc<Self>, requested: Option<u64>) -> ProcessJournalCursor {
+    /// A reader from `requested`, or from the live tail when `None`. With
+    /// `from_oldest_retained`, a cursor before the oldest retained output
+    /// starts there instead of lagging. That start is chosen under the lock
+    /// that also claims the primary reader's place, so no output written
+    /// meanwhile can evict it.
+    fn cursor(
+        self: &Arc<Self>,
+        requested: Option<u64>,
+        from_oldest_retained: bool,
+    ) -> ProcessJournalCursor {
         let mut state = self
             .state
             .lock()
             .expect("process output journal lock poisoned");
-        let next_sequence = requested.unwrap_or(state.next_sequence);
+        let next_sequence = match requested {
+            Some(cursor) if from_oldest_retained => cursor.max(state.first_sequence),
+            Some(cursor) => cursor,
+            None => state.next_sequence,
+        };
         // Only one reader controls the producer. Observers cannot stall an
         // existing consumer; after disconnect a new attachment can take over.
         let primary = if !state.backpressure_disabled
@@ -1416,7 +1429,12 @@ impl ProcessRegistry {
         Some(record)
     }
 
-    fn replay(&self, process_id: &ProcessId, output_cursor: Option<u64>) -> Option<ProcessReplay> {
+    fn replay(
+        &self,
+        process_id: &ProcessId,
+        output_cursor: Option<u64>,
+        from_oldest_retained: bool,
+    ) -> Option<ProcessReplay> {
         let record = self.get_record(process_id)?;
         if output_cursor.is_none()
             && let Some(exit) = record.journal.exit()
@@ -1428,7 +1446,7 @@ impl ProcessRegistry {
         }
         Some(ProcessReplay::Running {
             started: record.started.clone(),
-            cursor: record.journal.cursor(output_cursor),
+            cursor: record.journal.cursor(output_cursor, from_oldest_retained),
         })
     }
 
@@ -1626,13 +1644,19 @@ fn process_started_event(process_id: &ProcessId, pid: Option<u32>) -> Result<Pro
     })
 }
 
-fn process_connected_event(process_id: &ProcessId, pid: Option<u32>) -> ProcessEvent {
+fn process_connected_event(
+    process_id: &ProcessId,
+    pid: Option<u32>,
+    output_cursor: Option<u64>,
+) -> ProcessEvent {
     ProcessEvent {
         process_id: process_id.as_str().to_string(),
         pid,
         event: Some(
             pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Connected(
-                pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {},
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {
+                    output_cursor,
+                },
             ),
         ),
     }
@@ -2107,7 +2131,7 @@ impl Process for ExecutionService {
                 let replay = self
                     .inner
                     .processes
-                    .replay(&process_id, Some(0))
+                    .replay(&process_id, Some(0), false)
                     .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
                 return Ok(Response::new(
                     replay_process_event_stream(replay) as Self::StartStream
@@ -2234,7 +2258,11 @@ impl Process for ExecutionService {
         let replay = self
             .inner
             .processes
-            .replay(&process_id, request.output_cursor)
+            .replay(
+                &process_id,
+                request.output_cursor,
+                request.resume_from_oldest_retained,
+            )
             .ok_or_else(|| Status::not_found("process not found"))?;
         let pid = match &replay {
             ProcessReplay::Running { started, .. } | ProcessReplay::Completed { started, .. } => {
@@ -2242,10 +2270,13 @@ impl Process for ExecutionService {
             }
         };
         let stream = match replay {
-            ProcessReplay::Running { cursor, .. } => process_event_stream_with_prefix(
-                vec![process_connected_event(&process_id, pid)],
-                Some(cursor),
-            ),
+            ProcessReplay::Running { cursor, .. } => {
+                let output_cursor = request.output_cursor.map(|_| cursor.next_sequence);
+                process_event_stream_with_prefix(
+                    vec![process_connected_event(&process_id, pid, output_cursor)],
+                    Some(cursor),
+                )
+            }
             replay @ ProcessReplay::Completed { .. } => replay_process_event_stream(replay),
         };
         tracing::debug!(

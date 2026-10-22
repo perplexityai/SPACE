@@ -12,11 +12,13 @@ pub(super) fn connect_process_request(
     process_id: &ProcessId,
     timeout: Option<ReadyTimeout>,
     output_cursor: Option<u64>,
+    resume_from_oldest_retained: bool,
 ) -> ConnectProcessRequest {
     ConnectProcessRequest {
         process_id: process_id.as_str().to_string(),
         timeout: timeout.map(proto_duration),
         output_cursor,
+        resume_from_oldest_retained,
     }
 }
 
@@ -89,6 +91,7 @@ impl SpacedHostClient {
         process_id: String,
         timeout: Option<std::time::Duration>,
         output_cursor: Option<u64>,
+        resume_from_oldest_retained: bool,
     ) -> Result<tonic::Streaming<proto::ProcessEvent>, tonic::Status> {
         let process_id = ProcessId::parse(process_id).map_err(invalid_argument_status)?;
         let timeout = timeout
@@ -108,6 +111,7 @@ impl SpacedHostClient {
                             &process_id,
                             timeout,
                             output_cursor,
+                            resume_from_oldest_retained,
                         ))
                         .await
                         .map(Response::into_inner)

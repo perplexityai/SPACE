@@ -271,6 +271,9 @@ pub(crate) async fn connect_process_stream(
                 process_id: process_id.to_string(),
                 timeout: None,
                 output_cursor,
+                // A cursor whose output was evicted starts at the oldest
+                // output retained, which `ProcessConnected` reports.
+                resume_from_oldest_retained: true,
             }),
         },
         route_token,

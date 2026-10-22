@@ -73,7 +73,9 @@ fn connected_process_event(process_id: &ProcessId) -> SpacedProcessEvent {
         process_id: process_id.to_string(),
         pid: Some(123),
         event: Some(spaced_ops::process_event::Event::Connected(
-            spaced_ops::ProcessConnected {},
+            spaced_ops::ProcessConnected {
+                output_cursor: None,
+            },
         )),
     }
 }
