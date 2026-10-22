@@ -9,15 +9,31 @@ use std::time::{Duration, Instant};
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
 use pplx_space_common_core::types::{PodUid, SandboxId};
 use pplx_space_metrics::cluster_reconciler as metrics;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use super::backend::{DeleteOutcome, GcBackend, KubernetesGcBackend};
-use super::classify::{NodeEligibility, PodSnapshot, is_stuck_shaped};
+use super::classify::{MarkerOwnership, NodeEligibility, PodSnapshot, is_stuck_shaped};
 use super::config::ReconcilerConfig;
 use super::events::{CleanupOutcome, emit_cleanup_event};
+use super::store::{GcStore, PostgresGcStore};
 
 /// Rolling window the `max_deletes_per_minute` budget is measured over.
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Wall-clock bound on one marker-ownership lookup, clamped to the tick budget.
+///
+/// The lookups are indexed point reads, so this is already generous. The batch
+/// lookup runs before the action deadline is set, so it adds at most this much
+/// to a tick (5s + the 45s default tick budget, inside the 60s interval). Each
+/// pre-delete re-read is held to this budget *within* the action deadline, so
+/// one stalled re-read costs at most this much of it. Without a budget of its
+/// own, a stalled query could consume the whole action deadline, the candidate
+/// loop would exit at its first deadline check, and *every* pod would defer —
+/// including the unmarked majority that need no lookup at all. This GC exists to relieve a
+/// storm, so it has to keep clearing the ordinary backlog while the database is
+/// unhappy.
+pub(super) const MARKER_LOOKUP_BUDGET: Duration = Duration::from_secs(5);
 
 /// Why a stuck candidate was not deleted this tick. Internal accounting only:
 /// the [`TickReport::skipped`] tally that feeds the tick-complete log line's
@@ -81,11 +97,25 @@ impl TickReport {
 /// deterministic.
 pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
-pub struct Reconciler<B: GcBackend> {
+/// A stuck pod that has held the shape past the threshold, paired with the
+/// identity and age the action phase needs. Also the fairness cursor's index
+/// space.
+struct Candidate {
+    pod: PodSnapshot,
+    uid: PodUid,
+    observed_age: i64,
+}
+
+pub struct Reconciler<B: GcBackend, S: GcStore> {
     config: ReconcilerConfig,
     /// `pub(crate)` so the test module (a sibling of this one) can inspect the
     /// injected fake backend — the test/backend seam the split preserves.
     pub(crate) backend: B,
+    /// Postgres reads behind the restore / warm-pool marker exclusions: the pod
+    /// markers are never cleared, so only the live row says whether the marked
+    /// owner still owns the pod. `pub(crate)` for the same test-seam reason as
+    /// `backend`.
+    pub(crate) store: S,
     /// Monotonic instants of candidates committed to, within the rolling
     /// window. Each committed candidate costs at most one apiserver GET (verify) plus one
     /// DELETE, so this bounds *all* apiserver work, not just successful
@@ -112,22 +142,22 @@ pub struct Reconciler<B: GcBackend> {
     ///
     /// Limitation: keyed on UID and driven by the periodic scan of the
     /// watch-coalesced reflector store, so a pod that leaves and re-enters
-    /// `ContainerCreating` entirely *between* scans (a sub-interval flap the
-    /// store never surfaces as not-stuck) keeps its old first-seen time and can
-    /// cross the threshold on age it didn't continuously hold. Recoveries the
-    /// store or the fresh GET *do* observe already reset the clock; catching the
-    /// unobserved flap needs a resourceVersion / watch-event signal rather than
-    /// the store snapshot — a follow-up, and low-harm here (dry-run-first, and a
-    /// pod flapping in/out of `ContainerCreating` is itself unhealthy).
+    /// `ContainerCreating` entirely *between* scans keeps its old first-seen
+    /// time and can cross the threshold on age it didn't continuously hold.
+    /// Recoveries the store or the fresh GET *do* observe already reset the
+    /// clock; proving continuity across an *unobserved* flap needs a signal the
+    /// store snapshot doesn't carry, which is tracked separately. Low-harm here:
+    /// a pod flapping in and out of `ContainerCreating` is itself unhealthy.
     first_seen_stuck: HashMap<PodUid, Instant>,
     clock: Clock,
 }
 
-impl<B: GcBackend> Reconciler<B> {
-    pub fn new(config: ReconcilerConfig, backend: B) -> Self {
+impl<B: GcBackend, S: GcStore> Reconciler<B, S> {
+    pub fn new(config: ReconcilerConfig, backend: B, store: S) -> Self {
         Self {
             config,
             backend,
+            store,
             delete_history: VecDeque::new(),
             scan_offset: 0,
             first_seen_stuck: HashMap::new(),
@@ -276,7 +306,7 @@ impl<B: GcBackend> Reconciler<B> {
         // becomes the rotation-cursor's index space, so a budget-sized prefix of
         // repeatedly-failing candidates can't starve the ones behind it.
         let threshold = self.config.threshold;
-        let mut candidates: Vec<(PodSnapshot, PodUid, i64)> = Vec::new();
+        let mut candidates: Vec<Candidate> = Vec::new();
         let mut still_stuck: HashSet<PodUid> = HashSet::new();
         for pod in pods {
             if !is_stuck_shaped(&pod) {
@@ -310,7 +340,11 @@ impl<B: GcBackend> Reconciler<B> {
             let observed = now.duration_since(first_seen);
             if observed >= threshold {
                 let age_secs = i64::try_from(observed.as_secs()).unwrap_or(i64::MAX);
-                candidates.push((pod, uid, age_secs));
+                candidates.push(Candidate {
+                    pod,
+                    uid,
+                    observed_age: age_secs,
+                });
             } else {
                 report.too_young += 1;
             }
@@ -333,6 +367,27 @@ impl<B: GcBackend> Reconciler<B> {
             );
         }
 
+        // Resolve the marker exclusions against live rows once for the whole
+        // candidate set — two queries per tick rather than two per candidate.
+        // Both markers are pod-build-time stamps that are never cleared, so
+        // without this a restored or claimed pod stays excluded forever.
+        //
+        // Bounded by its own budget, not the tick's: a stalled query must not
+        // spend the action phase's deadline before the loop has deleted
+        // anything. It still has to be bounded at all — `run` awaits `tick()`
+        // inside its `select!` arm, so an unbounded await would take the
+        // shutdown token with it.
+        let ownership = self.load_marker_ownership(&candidates).await;
+
+        // Monotonic wall-clock deadline for the per-candidate action phase.
+        // Bounds tick duration when the apiserver is slow — each verify GET /
+        // DELETE runs under it via `timeout_at`, and it is re-checked between
+        // candidates — so a single hung request can't block the loop (and
+        // shutdown) for the kube client's multi-minute timeout. Remaining
+        // candidates roll to the next tick; the cursor then advances past the
+        // ones handled this tick, so the deferred tail isn't starved.
+        let deadline = tokio::time::Instant::now() + self.config.tick_budget;
+
         let candidate_count = candidates.len();
         if candidate_count > 0 {
             candidates.rotate_left(self.scan_offset % candidate_count);
@@ -343,16 +398,6 @@ impl<B: GcBackend> Reconciler<B> {
         // during the action phase, and a net-length delta would mis-count
         // commitments and mis-advance the fairness cursor.
         let mut committed = 0usize;
-        // Monotonic wall-clock deadline for the whole action phase. Bounds tick
-        // duration when the apiserver is slow — each verify GET / DELETE is run
-        // under this deadline via `timeout_at`, and it is re-checked between
-        // candidates — so a single hung request can't block the loop (and
-        // shutdown) for the kube client's multi-minute timeout. Remaining
-        // candidates roll to the next tick; the cursor then advances past the
-        // ones handled this tick (see below), so the deferred tail isn't
-        // starved.
-        let deadline = tokio::time::Instant::now() + self.config.tick_budget;
-
         let mut processed = 0usize;
         // 1-based index just past the last candidate that consumed budget. The
         // fairness cursor advances to here (not by the commitment *count*): a
@@ -361,20 +406,13 @@ impl<B: GcBackend> Reconciler<B> {
         // re-process the same failing committed block ahead of the rate-limited
         // tail every tick, starving it.
         let mut last_committed_pos = 0usize;
-        for (candidate, uid, observed_age) in &candidates {
+        for candidate in &candidates {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
             let committed_before = committed;
             let flow = self
-                .handle_stuck(
-                    candidate,
-                    uid,
-                    *observed_age,
-                    deadline,
-                    &mut committed,
-                    &mut report,
-                )
+                .handle_stuck(candidate, deadline, &ownership, &mut committed, &mut report)
                 .await;
             processed += 1;
             if committed > committed_before {
@@ -391,13 +429,13 @@ impl<B: GcBackend> Reconciler<B> {
         // holds even under apiserver pressure.
         report.deferred =
             u32::try_from(candidate_count.saturating_sub(processed)).unwrap_or(u32::MAX);
-        for (candidate, _uid, observed_age) in candidates.iter().skip(processed) {
+        for candidate in candidates.iter().skip(processed) {
             self.emit_outcome(
                 metrics::StuckPodGcOutcome::Deferred,
-                candidate,
-                candidate.sandbox_id,
-                candidate.node_name.as_deref(),
-                Some(*observed_age),
+                &candidate.pod,
+                candidate.pod.sandbox_id,
+                candidate.pod.node_name.as_deref(),
+                Some(candidate.observed_age),
             );
         }
         if report.deferred > 0 {
@@ -429,22 +467,186 @@ impl<B: GcBackend> Reconciler<B> {
         report
     }
 
+    /// Marker-ownership keys for a set of pods: the sandbox ids of the ones
+    /// carrying either marker, and the pod names of the ones carrying a
+    /// pool-role label. A pod with neither contributes nothing, so its exclusion
+    /// question is never asked.
+    fn marker_keys<'a>(
+        pods: impl Iterator<Item = &'a PodSnapshot>,
+    ) -> (Vec<SandboxId>, Vec<String>) {
+        let mut sandbox_ids = Vec::new();
+        let mut pod_names = Vec::new();
+        for pod in pods {
+            // Any marker at all selects the sandbox: a restore or started
+            // recovery can own a *pooled* pod too, and it leaves no annotation
+            // on it to select by. See `MarkerOwnership::restore_excludes`.
+            if (pod.is_restore || pod.is_warm_pool)
+                && let Some(sandbox_id) = pod.sandbox_id
+            {
+                sandbox_ids.push(sandbox_id);
+            }
+            if pod.is_warm_pool {
+                pod_names.push(pod.pod_name.clone());
+            }
+        }
+        (sandbox_ids, pod_names)
+    }
+
+    /// Resolve whether the given markers still have a live owner behind them.
+    /// The two queries are independent, so they cost one round-trip rather than
+    /// two. A failed query contributes an empty map, which reads back as
+    /// [`super::classify::Lookup::Unknown`] and keeps the marker authoritative —
+    /// the pre-existing, over-excluding behavior.
+    ///
+    /// `context` names the caller in the failure logs, which is the only thing
+    /// that differs between the per-tick batch and the pre-delete re-read.
+    /// `Err` means `deadline` passed first and there is no answer at all.
+    async fn fetch_marker_ownership(
+        &self,
+        sandbox_ids: &[SandboxId],
+        pod_names: &[String],
+        context: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<MarkerOwnership, tokio::time::error::Elapsed> {
+        let (restores, slots) = tokio::time::timeout_at(deadline, async {
+            tokio::join!(
+                self.store.restore_owners(sandbox_ids),
+                self.store.warm_pool_owners(pod_names),
+            )
+        })
+        .await?;
+        Ok(MarkerOwnership {
+            restores: restores.unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    context,
+                    restore_candidates = sandbox_ids.len(),
+                    "stuck_container_creating_gc: sandbox lifecycle lookup failed; \
+                     restore-annotated pods stay excluded"
+                );
+                HashMap::new()
+            }),
+            slots: slots.unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    context,
+                    warm_pool_candidates = pod_names.len(),
+                    "stuck_container_creating_gc: warm-pool slot lookup failed; \
+                     pool-labelled pods stay excluded"
+                );
+                HashMap::new()
+            }),
+        })
+    }
+
+    /// Deadline for one marker-ownership lookup: [`MARKER_LOOKUP_BUDGET`],
+    /// clamped so a tick budget smaller than it still bounds the lookup.
+    fn marker_lookup_budget(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.config.tick_budget.min(MARKER_LOOKUP_BUDGET)
+    }
+
+    /// Resolve every marker in this tick's candidate set in one pair of queries.
+    ///
+    /// A candidate can reveal a marker only on the fresh GET (the cached scan
+    /// object predated the annotation); those aren't in either key list, so the
+    /// lookup misses and `MarkerOwnership` reports `Unknown`. The pre-delete
+    /// re-read then asks about them properly. A lookup that outruns
+    /// [`Self::marker_lookup_budget`] yields empty maps, which read `Unknown` for
+    /// every key and keep every marker exclusion — the same fail-closed direction
+    /// as a query error.
+    async fn load_marker_ownership(&self, candidates: &[Candidate]) -> MarkerOwnership {
+        let (sandbox_ids, pod_names) =
+            Self::marker_keys(candidates.iter().map(|candidate| &candidate.pod));
+        self.fetch_marker_ownership(
+            &sandbox_ids,
+            &pod_names,
+            "tick_scan",
+            self.marker_lookup_budget(),
+        )
+        .await
+        .unwrap_or_else(|_elapsed| {
+            tracing::warn!(
+                restore_candidates = sandbox_ids.len(),
+                warm_pool_candidates = pod_names.len(),
+                lookup_budget_secs = self.config.tick_budget.min(MARKER_LOOKUP_BUDGET).as_secs(),
+                "stuck_container_creating_gc: marker ownership lookup exceeded its budget; \
+                 every marker stays excluded this tick"
+            );
+            MarkerOwnership::default()
+        })
+    }
+
+    /// Ownership for one candidate, re-read from Postgres immediately before the
+    /// destructive act, because the tick's batch answer can be a whole tick
+    /// budget old by now.
+    ///
+    /// A point-in-time re-check, not a lock held across the delete: the residual
+    /// window is the gap between this returning and the DELETE landing, and
+    /// closing it would mean holding a row lock and a pooled connection across
+    /// an external Kubernetes call. The warm-pool reaper — which owns these very
+    /// slots and deletes their pods — resolves the identical race the same way
+    /// and documents why (`WarmPoolStore::stale_unbound_claimed_slot_exists`). Its
+    /// short locked bookkeeping transaction afterwards has no analogue here,
+    /// since this loop never writes Postgres.
+    ///
+    /// An `Err` means the read produced no answer, which fails closed on this
+    /// pod; the flow it carries says whether anything behind it can still be
+    /// processed.
+    /// Either way the caller reports a timeout rather than an exclusion, so a
+    /// slow re-read doesn't read as a restore-pod skip. (A failed *batch* lookup
+    /// does report its marked pods as exclusions: it never got an answer.)
+    async fn live_marker_ownership(
+        &self,
+        candidate: &PodSnapshot,
+        action_deadline: tokio::time::Instant,
+    ) -> Result<MarkerOwnership, CandidateFlow> {
+        // Held to the same lookup budget as the batch read, and never past the
+        // action deadline: one marked candidate's slow re-read must not spend
+        // what is left of the tick on behalf of the candidates behind it.
+        let deadline = action_deadline.min(self.marker_lookup_budget());
+        // Only marker-carrying pods have anything to re-validate, and the
+        // overwhelming majority of candidates carry neither marker. An empty
+        // answer is all the exclusion predicates need: both short-circuit on the
+        // pod's own flags before consulting a map.
+        let (sandbox_ids, pod_names) = Self::marker_keys(std::iter::once(candidate));
+        if sandbox_ids.is_empty() && pod_names.is_empty() {
+            return Ok(MarkerOwnership::default());
+        }
+        self.fetch_marker_ownership(&sandbox_ids, &pod_names, "pre_delete_recheck", deadline)
+            .await
+            .map_err(|_elapsed| {
+                // Only the action deadline expiring stops the tick; the lookup's
+                // own budget expiring leaves time for the candidates behind it.
+                if deadline < action_deadline {
+                    CandidateFlow::Processed
+                } else {
+                    CandidateFlow::DeadlineExceeded
+                }
+            })
+    }
+
     async fn handle_stuck(
         &mut self,
-        pod: &PodSnapshot,
-        pod_uid: &PodUid,
-        observed_age: i64,
+        candidate: &Candidate,
         deadline: tokio::time::Instant,
+        ownership: &MarkerOwnership,
         committed: &mut usize,
         report: &mut TickReport,
     ) -> CandidateFlow {
         use metrics::StuckPodGcOutcome as Gc;
 
-        // Restore pods carry durable snapshot state and land in `restoring`,
-        // which the orphaned-sandbox convergence prerequisite doesn't handle;
-        // deleting them here would strand the row. A restore-aware path owns
-        // them, so exclude them (detected purely from the pod annotation).
-        if pod.is_restore {
+        let &Candidate {
+            ref pod,
+            uid: ref pod_uid,
+            observed_age,
+        } = candidate;
+
+        // A pod whose sandbox is still `restoring` carries in-flight snapshot
+        // state and sits in the one lifecycle the orphaned-sandbox convergence
+        // prerequisite doesn't handle; deleting it would strand the row. Keyed
+        // on the live row rather than the annotation, which the restore path
+        // leaves behind: a pod whose restore finished is an ordinary candidate.
+        if ownership.restore_excludes(pod) {
             report.record_skip(SkipReason::RestorePod);
             self.emit_outcome(
                 Gc::RestorePod,
@@ -455,11 +657,14 @@ impl<B: GcBackend> Reconciler<B> {
             );
             return CandidateFlow::Processed;
         }
-        // Warm-pool slot pods are owned by the warm-pool reconciler and have no
-        // logical `sandboxes` row for either convergence reconciler to retire;
-        // deleting one here would leave a `warming` slot pinned against pool
-        // capacity. Detected purely from the pool-role label.
-        if pod.is_warm_pool {
+        // A pod the warm pool still holds — inventory, or a claim whose bind
+        // hasn't committed — is the warm-pool reconciler's (which deletes it
+        // under a Postgres slot lock) and has no logical `sandboxes` row for
+        // either convergence reconciler to retire; deleting one here would
+        // leave a slot pinned against pool capacity. Keyed on the live slot row
+        // rather than the label, which survives the bind: once a sandbox holds
+        // the pod it's a candidate like any other.
+        if ownership.warm_pool_excludes(pod) {
             report.record_skip(SkipReason::WarmPool);
             self.emit_outcome(
                 Gc::WarmPool,
@@ -552,7 +757,7 @@ impl<B: GcBackend> Reconciler<B> {
         // slow/hung apiserver can't stall the loop on this one call.
         let read =
             tokio::time::timeout_at(deadline, self.backend.read_pod_fresh(&pod.pod_name)).await;
-        let fresh = match read {
+        let mut fresh = match read {
             Ok(Ok(Some(fresh))) => fresh,
             Ok(Ok(None)) => {
                 report.record_skip(SkipReason::AlreadyGone);
@@ -571,15 +776,35 @@ impl<B: GcBackend> Reconciler<B> {
             }
         };
         // Re-apply every destructive-eligibility guard to the authoritative
-        // object, not just to the cached scan snapshot, so scan and verify
-        // can't drift: a pod that reveals itself as a restore on the fresh read
-        // (its annotation wasn't in the stale cache) must not be deleted.
-        if fresh.is_restore {
+        // object, not just to the cached scan snapshot, so scan and verify can't
+        // drift: a pod that reveals itself as a restore on the fresh read (its
+        // annotation wasn't in the stale cache) must not be deleted.
+        //
+        // The *rows* behind those markers are re-read too, not just the pod. The
+        // tick's batch lookup can be a whole tick budget old by now, and both
+        // ownership transitions are Postgres-only — a claimed slot released back
+        // to `ready`, a sandbox entering `restoring` — so neither the verify GET
+        // nor the UID/resourceVersion delete precondition can catch them.
+        // Marker-carrying candidates are the only ones that pay the extra query,
+        // and the delete budget bounds how many of those run per minute.
+        fresh.absorb_markers(pod);
+        let live = match self.live_marker_ownership(&fresh, deadline).await {
+            Ok(live) => live,
+            Err(flow) => {
+                report.record_skip(SkipReason::TimedOut);
+                self.emit_outcome(Gc::TimedOut, pod, Some(sandbox_id), node, Some(age_secs));
+                // A re-read that outran its own budget leaves the tick's action
+                // deadline intact, so the candidates behind this one — mostly
+                // unmarked, needing no lookup at all — still get processed.
+                return flow;
+            }
+        };
+        if live.restore_excludes(&fresh) {
             report.record_skip(SkipReason::RestorePod);
             self.emit_outcome(Gc::RestorePod, pod, Some(sandbox_id), node, Some(age_secs));
             return CandidateFlow::Processed;
         }
-        if fresh.is_warm_pool {
+        if live.warm_pool_excludes(&fresh) {
             report.record_skip(SkipReason::WarmPool);
             self.emit_outcome(Gc::WarmPool, pod, Some(sandbox_id), node, Some(age_secs));
             return CandidateFlow::Processed;
@@ -817,6 +1042,7 @@ fn transient_sweeper_covers_gc_lifecycles() -> bool {
 /// Spawned by the cluster-singleton `space-cluster-controller` binary.
 pub async fn run(
     kube: Arc<KubernetesSubstrate>,
+    pool: PgPool,
     config: ReconcilerConfig,
     shutdown_token: CancellationToken,
 ) {
@@ -830,12 +1056,12 @@ pub async fn run(
     }
 
     // Fail closed: live deletion is only safe when both convergence paths are
-    // live to retire the sandbox row once its pod is gone (this loop never
-    // touches Postgres). The orphaned-sandbox reconciler covers
+    // live to retire the sandbox row once its pod is gone (this loop reads
+    // Postgres but never writes it). The orphaned-sandbox reconciler covers
     // `creating`/`starting`/`started`; the transient-lifecycle sweeper covers a
     // row a user action raced into `suspending`/`checkpointing`, plus a `failed`
     // row whose execution retirement didn't finish. If either path is down,
-    // force dry-run rather than strand a drifted row on a config mistake.
+    // refuse to run rather than strand a drifted row on a config mistake.
     //
     // This guards against *misconfiguration* (a convergence reconciler disabled
     // or left in dry-run), read once at startup from the same env the sibling
@@ -871,7 +1097,8 @@ pub async fn run(
     );
 
     let backend = KubernetesGcBackend::new(kube);
-    let mut reconciler = Reconciler::new(config.clone(), backend);
+    let store = PostgresGcStore::new(pool);
+    let mut reconciler = Reconciler::new(config.clone(), backend, store);
 
     let mut interval = tokio::time::interval(config.interval);
     // Backoff, not burst catch-up, when a tick runs long under apiserver

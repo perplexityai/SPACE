@@ -1,7 +1,8 @@
 //! Pure classification vocabulary: the reflector-object → [`PodSnapshot`]
-//! extraction, the "is this pod wedged in `ContainerCreating`" shape check, and
-//! node eligibility. No kube client and no async — everything here is a pure
-//! function of the pod object, which keeps it trivially unit-testable.
+//! extraction, the "is this pod wedged in `ContainerCreating`" shape check,
+//! node eligibility, and the marker-ownership decisions the [`super::store`]
+//! lookups feed. No kube client and no async — everything here is a pure
+//! function of its inputs, which keeps it trivially unit-testable.
 //!
 //! Note there is no age here: how long a pod has been wedged is **not** a
 //! reliable pod-object property (`status.startTime` is the pod's lifetime, not
@@ -9,6 +10,8 @@
 //! `ImagePullBackOff`, or was recreated after a kubelet restart, keeps its
 //! original `startTime`). The reconciler measures continuous-`ContainerCreating`
 //! age with an in-memory observation clock instead.
+
+use std::collections::HashMap;
 
 use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
 use pplx_space_common_core::kubernetes::SANDBOX_POOL_ROLE_WARM;
@@ -39,31 +42,12 @@ pub struct PodSnapshot {
     pub sandbox_id: Option<SandboxId>,
     pub node_name: Option<String>,
     /// The pod carries a restore annotation (checkpoint, or a suspend-restore
-    /// source-node / storage-URI) — it is a user-restore pod. Those are
-    /// excluded from the GC: their sandbox sits in `restoring`, which the
-    /// orphaned-sandbox convergence prerequisite does not handle, and they
-    /// carry snapshot state, so a restore-aware path (not this loop) owns them.
-    ///
-    /// Conservative by design: the annotation persists after a restore
-    /// completes, so a restored sandbox that later re-wedges in
-    /// `ContainerCreating` is still excluded. This is the safe direction (the
-    /// GC never deletes a pod that ever restored), at the cost of not cleaning
-    /// that edge case — a re-wedged formerly-restore pod. Basing the exclusion
-    /// on live restore state (clearing the marker on restore completion) is a
-    /// restore-subsystem change tracked as a follow-up, out of scope here.
+    /// source-node / storage-URI). A build-time marker, never cleared — see
+    /// [`MarkerOwnership::restore_excludes`] for what actually decides the
+    /// exclusion.
     pub is_restore: bool,
-    /// The pod carries `space.pplx.net/pool-role=warm` — a warm-pool slot pod
-    /// owned by the warm-pool reconciler (which deletes it under a Postgres
-    /// slot lock). No logical `sandboxes` row exists for a warming slot yet, so
-    /// neither convergence reconciler can retire it; deleting it here would
-    /// leave a `warming` slot counted against pool capacity. Excluded from the
-    /// GC — the warm-pool reconciler's own timeout cleanup owns these.
-    ///
-    /// Conservative by design: claiming a slot updates Postgres but not this
-    /// label, so a claimed-then-wedged pod (now a logical sandbox) is still
-    /// excluded. Safe direction (never deletes a pool pod), at the cost of not
-    /// cleaning that edge case. Relabelling on claim is a warm-pool-subsystem
-    /// change tracked as a follow-up, out of scope here.
+    /// The pod carries `space.pplx.net/pool-role=warm`. Also build-time only —
+    /// see [`MarkerOwnership::warm_pool_excludes`].
     pub is_warm_pool: bool,
     /// `metadata.deletionTimestamp` is set — the pod is already terminating.
     pub terminating: bool,
@@ -77,6 +61,15 @@ pub struct PodSnapshot {
 }
 
 impl PodSnapshot {
+    /// Fold `other`'s markers into this snapshot. A stale view can only ever
+    /// *miss* a marker, never invent one, so the union of the cached scan object
+    /// and the authoritative re-read is the conservative view to resolve
+    /// ownership against.
+    pub(crate) fn absorb_markers(&mut self, other: &Self) {
+        self.is_restore |= other.is_restore;
+        self.is_warm_pool |= other.is_warm_pool;
+    }
+
     pub(crate) fn from_pod(pod: &SandboxPodView) -> Self {
         // The shared pod builder stamps the sandbox id into both the annotation
         // and a same-keyed label; the constant is documented as an annotation,
@@ -145,6 +138,108 @@ pub(crate) fn is_stuck_shaped(snapshot: &PodSnapshot) -> bool {
         && snapshot.phase_pending
         && snapshot.has_container_creating
         && !snapshot.any_container_running
+}
+
+/// Result of asking the database whether a pod's build-time marker still has a
+/// live owner behind it.
+///
+/// Distinguishing [`Self::Unknown`] from [`Self::Absent`] is what keeps the
+/// fallback safe: an answer we couldn't get must not read as "no row, therefore
+/// the marker is stale, therefore delete".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lookup<T> {
+    /// Not asked, not answerable, or a value this build doesn't recognize.
+    Unknown,
+    /// The lookup succeeded and no row exists.
+    Absent,
+    Known(T),
+}
+
+/// What the live rows say about who owns a marked pod.
+///
+/// For a restore-annotated pod the rows are the sandbox's: it's `InFlight` while
+/// the row is `restoring` or a started recovery holds a fresh lease on its
+/// execution, since a started recovery deliberately leaves the row in `started`
+/// (`claim_started_recovery`). For a `pool-role=warm` pod it's the slot row, as
+/// [`pplx_space_cluster_pool::SlotOwnership::pool_owns_pod`] decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// The restore path or the warm-pool reconciler still owns the pod.
+    InFlight,
+    /// Ownership has moved on — the marker is a leftover.
+    Released,
+}
+
+impl Lookup<Owner> {
+    /// Whether this answer keeps the marker's exclusion. Only a successful
+    /// lookup releases the pod: no row, or a row saying ownership moved on.
+    fn excludes(self) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Absent => false,
+            Self::Known(owner) => owner == Owner::InFlight,
+        }
+    }
+}
+
+/// One tick's ownership answers, keyed the way the reconciler asks for them. A
+/// key is present only if it was both requested and resolved, so a map miss is
+/// [`Lookup::Unknown`] — which covers a failed query, a pod whose marker only
+/// surfaced on the authoritative re-read, and a pod with no sandbox id, without
+/// any of them needing a special case.
+#[derive(Debug, Default)]
+pub(crate) struct MarkerOwnership {
+    pub(crate) restores: HashMap<SandboxId, Lookup<Owner>>,
+    pub(crate) slots: HashMap<String, Lookup<Owner>>,
+}
+
+impl MarkerOwnership {
+    /// Whether a restore or started recovery still owns this pod.
+    ///
+    /// Only an in-flight one does — a `restoring` row, or a started recovery
+    /// holding a fresh lease. Those hold snapshot state mid-transition and sit
+    /// outside what the orphaned-sandbox convergence prerequisite covers. Once
+    /// the restore has finished, or the sandbox was retired, the marker is a
+    /// leftover and the pod is an ordinary candidate. A row that vanished
+    /// releases the pod too: no row means nothing to strand, which is already
+    /// how the GC treats an unmarked pod.
+    ///
+    /// This asks about the *sandbox*, so it covers pooled pods as well. A
+    /// started recovery adopts the wedged pod under its existing generation
+    /// rather than creating a replacement, and a pooled pod carries no restore
+    /// annotation, so its slot row releasing it does not mean nothing owns it.
+    /// The marker gate below is only a cost bound — unmarked pods are the
+    /// overwhelming majority and are never looked up.
+    pub(crate) fn restore_excludes(&self, pod: &PodSnapshot) -> bool {
+        if !pod.is_restore && !pod.is_warm_pool {
+            return false;
+        }
+        self.restore_owner(pod.sandbox_id).excludes()
+    }
+
+    /// Whether the pod's `pool-role=warm` label still means "the warm-pool
+    /// reconciler owns this pod".
+    ///
+    /// It does while the pool still holds the pod — see
+    /// [`pplx_space_cluster_pool::SlotOwnership::pool_owns_pod`] for which slot
+    /// states that covers and why the state alone can't decide it.
+    /// No slot row at all means the pool has finished with the pod entirely.
+    pub(crate) fn warm_pool_excludes(&self, pod: &PodSnapshot) -> bool {
+        if !pod.is_warm_pool {
+            return false;
+        }
+        self.warm_pool_owner(&pod.pod_name).excludes()
+    }
+
+    fn restore_owner(&self, sandbox_id: Option<SandboxId>) -> Lookup<Owner> {
+        sandbox_id
+            .and_then(|id| self.restores.get(&id).copied())
+            .unwrap_or(Lookup::Unknown)
+    }
+
+    fn warm_pool_owner(&self, pod_name: &str) -> Lookup<Owner> {
+        self.slots.get(pod_name).copied().unwrap_or(Lookup::Unknown)
+    }
 }
 
 /// Whether the pod's node is fit for the GC to act on the pod.

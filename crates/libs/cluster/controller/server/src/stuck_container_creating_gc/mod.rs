@@ -28,23 +28,37 @@
 //! a default large enough to prevent timely cleanup — and failed-sandbox cleanup
 //! enabled).
 //! Otherwise a deleted pod's row can be left stuck with no reconciler to retire
-//! it** (this loop deliberately never touches Postgres). This is enforced at
-//! runtime: a live GC missing either convergence path fails closed and forces
-//! itself to dry-run.
+//! it** (this loop reads Postgres but never writes it). This is enforced at
+//! runtime: a GC missing either convergence path fails closed and refuses to
+//! run.
 //!
 //! Safeguards, in order of application:
-//! - **Restore exclusion.** User-restore pods (marked by a restore annotation
-//!   — checkpoint, or a suspend-restore source-node / storage-URI, covering
-//!   both node-local and remote restores) are never touched: their sandbox
-//!   sits in `restoring`, which the orphaned-sandbox convergence prerequisite
-//!   doesn't handle, and they hold snapshot state, so a restore-aware path owns
-//!   them.
-//! - **Warm-pool exclusion.** Warm-pool slot pods (labelled
-//!   `space.pplx.net/pool-role=warm`) are never touched: they are owned by the
-//!   warm-pool reconciler (which deletes them under a Postgres slot lock), and
-//!   a warming slot has no logical `sandboxes` row for either convergence
-//!   reconciler to retire — deleting one here would leave a `warming` slot
-//!   pinned against pool capacity. Their own timeout cleanup owns them.
+//! - **Restore exclusion.** A pod whose restore is still in flight is never
+//!   touched: it holds snapshot state mid-transition, and its state is one the
+//!   orphaned-sandbox convergence prerequisite doesn't handle. The pod's restore
+//!   annotations (checkpoint, or a suspend-restore source-node / storage-URI,
+//!   covering both node-local and remote restores) select *which* pods to
+//!   check, but the live rows decide: those annotations are stamped at build
+//!   time and never cleared, so on their own they would exclude a
+//!   long-since-restored pod for the rest of its life. "In flight" is two
+//!   things, not one — a `restoring` row, **or** a started recovery, which
+//!   deliberately leaves the row in `started` and records ownership on a
+//!   `recovering` execution lease instead. Reading only the lifecycle would
+//!   delete the pod a live started recovery is in the middle of creating.
+//! - **Warm-pool exclusion.** A pod the warm pool still holds — inventory, a
+//!   claim whose bind hasn't committed, or a slot the pool still owes a delete
+//!   for — is never touched: the warm-pool reconciler owns it (deleting it
+//!   under a Postgres slot lock), and such a slot has no logical `sandboxes`
+//!   row for either convergence reconciler to retire, so deleting one here
+//!   would leave a slot pinned against pool capacity. As with restores, the
+//!   `space.pplx.net/pool-role=warm` label survives the bind, so the live slot
+//!   row is what decides.
+//! - **Fail-closed marker resolution.** Both exclusions above resolve against
+//!   Postgres. Any answer the database can't give — a failed or timed-out
+//!   query, a row whose state this build doesn't recognize, or a pod with no
+//!   sandbox id — keeps the exclusion, so the fallback is always the
+//!   over-excluding direction. A marker that only appears on the authoritative
+//!   re-read is looked up there, before the delete.
 //! - **Progress guard.** A pod is a candidate only if it is `Pending`, has a
 //!   container waiting with reason `ContainerCreating`, and has **no** running
 //!   container (an init or app container that is already `Running` means the
@@ -56,7 +70,12 @@
 //!   candidate only once it has held the stuck shape continuously for
 //!   `threshold`. The clock resets on controller restart (the backlog then
 //!   re-ages over one threshold before any deletion), which is the safe
-//!   direction; a pod with no UID to anchor the clock is never acted on.
+//!   direction; a pod with no UID to anchor the clock is never acted on. The
+//!   clock is driven by the periodic scan of the watch-coalesced reflector
+//!   store, so a pod that leaves and re-enters `ContainerCreating` entirely
+//!   *between* scans keeps its old first-seen time; proving continuity across
+//!   an unobserved flap needs a signal the store snapshot doesn't carry and is
+//!   tracked separately.
 //! - **Node-state probe.** The pod's node must be present in the node reflector
 //!   cache, `Ready`, and schedulable. A `NotReady` node's stuck pods are a
 //!   node-level failure that node-drain / node remediation owns; a cordoned
@@ -99,6 +118,8 @@
 //!   stuck / node-eligibility vocabulary.
 //! - [`backend`] — the `GcBackend` dependency-injection seam and its live
 //!   Kubernetes implementation.
+//! - [`store`] — the `GcStore` seam: the Postgres lookups that turn the
+//!   build-time pod markers into live ownership answers.
 //! - [`events`] — `cleanup_*` sandbox-event emission.
 //! - [`reconciler`] — the tick loop (rate-limit budget, fairness cursor,
 //!   verify-then-delete action flow) and the `run` entrypoint.
@@ -108,6 +129,7 @@ mod classify;
 mod config;
 mod events;
 mod reconciler;
+mod store;
 
 #[cfg(test)]
 mod tests;
@@ -119,10 +141,14 @@ pub use reconciler::run;
 #[cfg(test)]
 pub(crate) use backend::{BackendError, DeleteOutcome, GcBackend};
 #[cfg(test)]
-pub(crate) use classify::{NodeEligibility, PodSnapshot, is_stuck_shaped};
+pub(crate) use classify::{
+    Lookup, MarkerOwnership, NodeEligibility, Owner, PodSnapshot, is_stuck_shaped,
+};
 #[cfg(test)]
 pub(crate) use config::DEFAULT_INTERVAL;
 #[cfg(test)]
 pub(crate) use reconciler::{
     Clock, Reconciler, SkipReason, TickReport, convergence_allows_live, transient_lifecycle_covered,
 };
+#[cfg(test)]
+pub(crate) use store::{GcStore, PostgresGcStore, StoreError};
