@@ -22,7 +22,7 @@ k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
 migration-checksums = ["dep:pplx-space-migration-checksums"]
 # Exposes shared route and authentication test helpers to other crates.
 # Unit tests get them under `cfg(test)`; external test suites opt in through
-# a dev-dependency. Mirrors `pplx-space-metrics`'s `test-capture`.
+# a dev-dependency. Mirrors `pplx-space-metrics-emit`'s `test-capture`.
 test-support = []
 # Enables the test-only environment overrides (see `pplx_space_common_core::env::test_hook`).
 test-hooks = ["pplx-space-common-core/test-hooks"]

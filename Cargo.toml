@@ -118,6 +118,7 @@ members = [
     "crates/libs/feature-flags",
     "crates/libs/events",
     "crates/libs/metrics",
+    "crates/libs/metrics-emit",
     "crates/libs/observability",
     "crates/libs/internal/api/server",
     "crates/libs/k8s-ids",
@@ -371,6 +372,7 @@ pplx-space-object-store = { path = "crates/libs/object-store" }
 pplx-space-page-cache = { path = "crates/libs/page-cache" }
 pplx-space-public-api = { path = "crates/libs/public/api" }
 pplx-space-metrics = { path = "crates/libs/metrics" }
+pplx-space-metrics-emit = { path = "crates/libs/metrics-emit" }
 pplx-space-observability = { path = "crates/libs/observability", default-features = false }
 pplx-space-placement = { path = "crates/libs/placement/machine" }
 pplx-space-internal-api-server = { path = "crates/libs/internal/api/server" }

@@ -1,0 +1,18 @@
+[package]
+name = "pplx-space-metrics-emit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+test-capture = []
+
+[dependencies]
+# internal
+pplx-space-observability = { workspace = true, default-features = false }

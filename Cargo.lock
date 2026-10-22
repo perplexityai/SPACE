@@ -6036,11 +6036,19 @@ version = "0.8.0"
 dependencies = [
  "metrics",
  "pplx-space-common-core",
+ "pplx-space-metrics-emit",
  "pplx-space-observability",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-metrics-emit"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-observability",
 ]
 
 [[package]]
