@@ -5,8 +5,18 @@ package space.node.api.v1;
 // route resolvers may call this service, after authorizing client access.
 service IngressActivationApi {
   rpc PrepareIngress(PrepareIngressRequest) returns (PrepareIngressResponse);
+  // Queue, or join, the system's wake of a sandbox at rest whose wake policy
+  // lets a command wake it, for a session waiting on it. Never waits for it.
+  rpc QueueImplicitWake(QueueImplicitWakeRequest) returns (QueueImplicitWakeResponse);
 }
 message PrepareIngressRequest {
   string sandbox_id = 1;
 }
 message PrepareIngressResponse {}
+message QueueImplicitWakeRequest {
+  string sandbox_id = 1;
+}
+message QueueImplicitWakeResponse {
+  // Whether a wake is now queued or running for the sandbox.
+  bool queued = 1;
+}
