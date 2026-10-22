@@ -24,7 +24,7 @@ pub mod paths {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::guest::linux::paths::default_guest_uds_path;
+    /// # use pplx_space_host_paths::guest::paths::default_guest_uds_path;
     /// assert!(default_guest_uds_path("spaced.sock").ends_with("spaced.sock"));
     /// ```
     pub fn default_guest_uds_path(socket_file: &str) -> PathBuf {
@@ -36,7 +36,7 @@ pub mod paths {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::guest::linux::paths::default_uds_path;
+    /// # use pplx_space_host_paths::guest::paths::default_uds_path;
     /// assert!(default_uds_path("/run", "svc.sock").ends_with("svc.sock"));
     /// ```
     pub fn default_uds_path(linux_socket_dir: &str, socket_file: &str) -> PathBuf {

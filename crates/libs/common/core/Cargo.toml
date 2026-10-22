@@ -22,6 +22,7 @@ pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-host-paths = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-semver = { workspace = true }

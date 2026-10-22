@@ -5399,6 +5399,7 @@ dependencies = [
  "pplx-space-cpu-arch",
  "pplx-space-durations",
  "pplx-space-env-vars",
+ "pplx-space-host-paths",
  "pplx-space-k8s-ids",
  "pplx-space-net-common",
  "pplx-space-semver",
@@ -5927,6 +5928,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-host-paths"
+version = "0.8.0"
+dependencies = [
+ "uuid",
 ]
 
 [[package]]
