@@ -18,6 +18,7 @@ libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl"] }
 pplx-space-accounts = { workspace = true }
 pplx-space-auto-lifecycle = { workspace = true }
+pplx-space-btrfs = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }

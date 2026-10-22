@@ -1180,6 +1180,33 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a nix or uuid feature the btrfs helpers need but only get
+    # through unification with common-core fails here. The library is also
+    # linted without its tests because the tempfile dev-dependency enables
+    # features in the library's dependency graph.
+    echo "--- :rust: Running isolated btrfs helper clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-btrfs \
+        --no-default-features \
+        --lib \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-btrfs \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-btrfs \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {
