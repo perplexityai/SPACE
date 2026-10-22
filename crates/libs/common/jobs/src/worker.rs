@@ -386,6 +386,9 @@ pub struct BackgroundWorker<E> {
     db: Arc<Mutex<rusqlite::Connection>>,
     executor: E,
     schedulers: Arc<HashMap<String, Arc<PriorityScheduler>>>,
+    /// Kinds whose `jobs.queue.oldest_pending_age_seconds` this worker has
+    /// emitted; they keep reporting 0 once drained.
+    reported_pending_kinds: Arc<Mutex<std::collections::BTreeSet<String>>>,
     priority_bands: Arc<HashMap<String, Vec<PriorityBand>>>,
     active_job_limits: Arc<HashMap<String, usize>>,
     recovery_job_kinds: Arc<Vec<String>>,
@@ -464,6 +467,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             db,
             executor,
             schedulers: Arc::new(schedulers),
+            reported_pending_kinds: Arc::default(),
             priority_bands: Arc::new(priority_bands),
             active_job_limits: Arc::new(active_job_limits),
             recovery_job_kinds: Arc::new(config.recovery_job_kinds),
@@ -1256,8 +1260,23 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 db::nonnegative_i64_to_u64(count),
             );
         }
+        // The query only returns kinds with a pending row. Report 0 for every
+        // other kind this worker has reported or is configured for, so a
+        // drained queue reads 0 rather than freezing at its last value.
+        let mut reported = self
+            .reported_pending_kinds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reported.extend(self.schedulers.keys().cloned());
+        let mut drained = reported.clone();
         for (kind, age) in oldest {
+            drained.remove(&kind);
             pplx_space_metrics::jobs::queue_oldest_pending_age_seconds(&kind, age.max(0) as f64);
+            reported.insert(kind);
+        }
+        drop(reported);
+        for kind in drained {
+            pplx_space_metrics::jobs::queue_oldest_pending_age_seconds(&kind, 0.0);
         }
         for (kind, count) in perm {
             pplx_space_metrics::jobs::permanent_failures(&kind, db::nonnegative_i64_to_u64(count));
@@ -2017,6 +2036,9 @@ mod submit_and_wait_tests;
 
 #[cfg(test)]
 mod wait_for_job_tests;
+
+#[cfg(test)]
+mod queue_metrics_tests;
 
 #[cfg(test)]
 mod tests;
