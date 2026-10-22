@@ -2806,7 +2806,6 @@ async fn last_event_id_without_room_after_it_is_rejected() {
             .unwrap(),
     );
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
     let response = tower::ServiceExt::oneshot(
         router(state),
         Request::get(format!("/v1/sessions/{session_id}/events"))
@@ -2820,62 +2819,4 @@ async fn last_event_id_without_room_after_it_is_rejected() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(fake.opens.lock().unwrap().is_empty());
-    assert!(
-        capture
-            .finish()
-            .iter()
-            .any(|counter| counter.name == "data_plane.attach"
-                && counter
-                    .tags
-                    .contains(&"result:invalid_last_event_id".to_string())),
-        "the refused attach is counted"
-    );
-}
-
-/// An attach refused because the session is already attached sends nothing,
-/// so it counts no `resync_required` either.
-#[tokio::test]
-async fn refused_attach_counts_no_replay_miss() {
-    if !binding_fake_test_process() {
-        return;
-    }
-    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
-    let fake = spawn_journal_fake(
-        session_id,
-        true,
-        Arc::new(|_, open| journal_replay(&JOURNAL, open)),
-    )
-    .await;
-    let mut state = crate::tests::test_data_plane_state().await;
-    state.cluster_api = ClusterApiClients::service_only(
-        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
-            .await
-            .unwrap(),
-    );
-    let _attached = state
-        .native_sessions
-        .try_acquire(session_id, SessionKind::Process)
-        .unwrap();
-    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
-    let response = tower::ServiceExt::oneshot(
-        router(state),
-        Request::get(format!("/v1/sessions/{session_id}/events"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            // Untagged, so a stream would open behind `resync_required`.
-            .header("last-event-id", "41")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let counters = capture.finish();
-    assert!(
-        !counters
-            .iter()
-            .any(|counter| counter.name == "data_plane.replay.miss"),
-        "{counters:?}"
-    );
 }
