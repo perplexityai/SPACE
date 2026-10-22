@@ -153,7 +153,7 @@ pub async fn create_command(
     let idempotency_key = idempotency_key(&headers)?;
     let event_stream = accepts_event_stream(&headers);
     if event_stream {
-        reject_streamed_input(&request)?;
+        reject_streamed_pty(&request)?;
     }
     let command = create_command_session(
         &state.public_session_store(),
@@ -167,7 +167,7 @@ pub async fn create_command(
 
     // Streaming is negotiated after the create, so validation, owner scope,
     // idempotency replay, and their errors are identical in both modes, apart
-    // from the input check above.
+    // from the pty check above.
     if event_stream
         && let Some(proxy) = state.command_stream.as_ref()
         && let Some(response) = proxy.stream(&command).await
@@ -596,24 +596,17 @@ fn validate_terminal_size(size: Option<&TerminalSize>) -> Result<(), PublicApiEr
     Ok(())
 }
 
-/// Server-sent events carry no input, so a streamed command that asks for
-/// stdin or a terminal would wait on input that never arrives. Checked before
-/// the create, whether or not the stream then opens, so nothing is persisted.
-fn reject_streamed_input(request: &CreateCommandRequest) -> Result<(), PublicApiError> {
-    let fields: Vec<&str> = [
-        ("stdin", request.stdin == Some(true)),
-        ("pty", request.pty.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(field, requested)| requested.then_some(field))
-    .collect();
-    if fields.is_empty() {
+/// Server-sent events carry no input, so a streamed command with a pty would
+/// wait on terminal input that never arrives. Unlike stdin, which the stream
+/// starts at EOF, a pty cannot be closed. Checked before the create,
+/// whether or not the stream then opens, so nothing is persisted.
+fn reject_streamed_pty(request: &CreateCommandRequest) -> Result<(), PublicApiError> {
+    if request.pty.is_none() {
         return Ok(());
     }
-    Err(PublicApiError::invalid_fields(
-        "an event-stream command cannot use stdin or pty; create it without them, \
+    Err(PublicApiError::invalid_pty_field(
+        "an event-stream command cannot use pty; create it without one, \
          or attach over WebSocket",
-        &fields,
     ))
 }
 

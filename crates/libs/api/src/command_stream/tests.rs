@@ -366,21 +366,15 @@ async fn create_errors_are_unchanged_and_never_open_a_stream() -> TestDbResult<(
 }
 
 #[tokio::test]
-async fn streamed_commands_that_ask_for_input_are_refused_before_the_create() -> TestDbResult<()> {
+async fn streamed_commands_with_a_pty_are_refused_before_the_create() -> TestDbResult<()> {
     let (origin, seen) = spawn_data_plane(DataPlaneMode::Stream).await;
     let fixture = fixture(Some(proxy(&origin))).await?;
     let pty = json!({"rows": 24, "cols": 80});
-    for (key, body, fields) in [
+    for (key, body) in [
+        ("pty", json!({"command": ["sh"], "pty": pty})),
         (
-            "stdin",
-            json!({"command": ["cat"], "stdin": true}),
-            vec!["stdin"],
-        ),
-        ("pty", json!({"command": ["sh"], "pty": pty}), vec!["pty"]),
-        (
-            "both",
+            "stdin-and-pty",
             json!({"command": ["sh"], "stdin": true, "pty": pty}),
-            vec!["stdin", "pty"],
         ),
     ] {
         let refused =
@@ -389,17 +383,17 @@ async fn streamed_commands_that_ask_for_input_are_refused_before_the_create() ->
         let envelope: Value = serde_json::from_str(&refused.body)?;
         assert_eq!(envelope["code"], "invalid_request", "{envelope}");
         assert_eq!(envelope["retryable"], false, "{envelope}");
-        let expected: Vec<Value> = fields
-            .iter()
-            .map(|field| json!({"key": "field", "value": field}))
-            .collect();
-        assert_eq!(envelope["details"], json!(expected), "{envelope}");
+        assert_eq!(
+            envelope["details"],
+            json!([{"key": "field", "value": "pty"}]),
+            "{envelope}"
+        );
 
         // Nothing was stored under the key: a different body reusing it
         // creates a command instead of answering idempotency_conflict.
         let reused = post_command(&fixture, Some(key), None).await?;
         assert_eq!(reused.status, StatusCode::CREATED, "{}", reused.body);
-        // A JSON create keeps accepting input, for callers that attach over
+        // A JSON create keeps accepting a pty, for callers that attach over
         // WebSocket.
         let json_create =
             post_command_body(&fixture, Some(&format!("{key}-json")), None, &body).await?;
@@ -410,38 +404,31 @@ async fn streamed_commands_that_ask_for_input_are_refused_before_the_create() ->
             json_create.body
         );
     }
-    assert!(seen.lock().unwrap().is_empty());
 
-    // A zero-weight event stream is a JSON create, which keeps accepting input.
+    // A zero-weight event stream is a JSON create, which keeps accepting a pty.
     let declined = post_command_body(
         &fixture,
         Some("declined-stream"),
         Some("text/event-stream;q=0, application/json"),
-        &json!({"command": ["cat"], "stdin": true}),
+        &json!({"command": ["sh"], "pty": pty}),
     )
     .await?;
     assert_eq!(declined.status, StatusCode::CREATED, "{}", declined.body);
     assert_eq!(declined.content_type.as_deref(), Some("application/json"));
     assert!(seen.lock().unwrap().is_empty());
 
-    // `stdin: false` asks for no input.
-    let closed_stdin = post_command_body(
-        &fixture,
-        Some("closed-stdin"),
-        Some("text/event-stream"),
-        &json!({"command": ["true"], "stdin": false}),
-    )
-    .await?;
-    assert_eq!(
-        closed_stdin.status,
-        StatusCode::CREATED,
-        "{}",
-        closed_stdin.body
-    );
-    assert_eq!(
-        closed_stdin.content_type.as_deref(),
-        Some("text/event-stream")
-    );
+    // Stdin alone streams: the events stream starts it at EOF.
+    for (key, stdin) in [("stdin", true), ("no-stdin", false)] {
+        let streamed = post_command_body(
+            &fixture,
+            Some(key),
+            Some("text/event-stream"),
+            &json!({"command": ["cat"], "stdin": stdin}),
+        )
+        .await?;
+        assert_eq!(streamed.status, StatusCode::CREATED, "{}", streamed.body);
+        assert_eq!(streamed.content_type.as_deref(), Some("text/event-stream"));
+    }
     Ok(())
 }
 
