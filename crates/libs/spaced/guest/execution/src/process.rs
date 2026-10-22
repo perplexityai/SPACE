@@ -114,6 +114,8 @@ struct ProcessSupervision {
     process_id: ProcessId,
     pid: u32,
     registry: ProcessRegistry,
+    retained_tasks: tokio_util::task::TaskTracker,
+    closed: CancellationToken,
 }
 
 impl ProcessSupervision {
@@ -128,6 +130,8 @@ impl ProcessSupervision {
             process_id,
             pid,
             registry,
+            retained_tasks,
+            closed,
         } = self;
         let completion = async {
             #[cfg(target_os = "linux")]
@@ -218,7 +222,7 @@ impl ProcessSupervision {
         // ~48 MiB at 450 starts/s with a 60 s retention, though at most 128
         // records exist.
         drop(process_id);
-        registry.ensure_reaper(shutdown);
+        registry.ensure_reaper(closed, &retained_tasks);
     }
 }
 
@@ -370,13 +374,13 @@ impl ProcessLaunch {
         let (spawn_result, mut prepared_pty) = spawned?;
         let mut child = spawn_result.map_err(map_io_error)?;
         let Some(pid) = child.id() else {
-            terminate_and_reap_failed_start(child, process_reservation);
+            terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
             return Err(Status::internal("spawned child has no pid"));
         };
         let (signal_handle, exit_observer) = match ProcessSignalHandle::open(pid) {
             Ok(handle) => handle,
             Err(error) => {
-                terminate_and_reap_failed_start(child, process_reservation);
+                terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
                 return Err(Status::internal(format!(
                     "failed to create safe handle for spawned process: {error}"
                 )));
@@ -422,14 +426,14 @@ impl ProcessLaunch {
         {
             Ok(sources) => sources,
             Err(error) => {
-                terminate_and_reap_failed_start(child, process_reservation);
+                terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
                 return Err(map_io_error(error));
             }
         };
         let started = match process_started_event(&process_id, Some(pid)) {
             Ok(started) => started,
             Err(status) => {
-                terminate_and_reap_failed_start(child, process_reservation);
+                terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
                 return Err(status);
             }
         };
@@ -487,6 +491,8 @@ impl ProcessLaunch {
             output_tasks,
             timeout,
             shutdown: inner.shutdown.clone(),
+            closed: inner.lifecycle.closed(),
+            retained_tasks: inner.process_tasks.clone(),
             record: Arc::clone(&record),
             process_id,
             pid,
@@ -521,6 +527,7 @@ impl ExecutionService {
 }
 
 async fn resolve_process_account(
+    tasks: tokio_util::task::TaskTracker,
     slots: Arc<Semaphore>,
     ingress: Option<pplx_space_common_grpc::RequestPermit>,
     resolve: impl FnOnce() -> Result<GuestAccount, Status> + Send + 'static,
@@ -532,7 +539,8 @@ async fn resolve_process_account(
     )?;
     // NSS may block on external account providers. Keep the existing Start
     // admission with the physical lookup even if its requesting future drops.
-    tokio::task::spawn_blocking(move || resolve().map(|account| (account, admission)))
+    tasks
+        .spawn_blocking(move || resolve().map(|account| (account, admission)))
         .await
         .map_err(|error| Status::internal(format!("guest account lookup task failed: {error}")))?
 }
@@ -1667,7 +1675,11 @@ impl ProcessRegistry {
     /// it sleeps until the earliest record expires and exits when no completed
     /// record is retained; the next process to complete starts it again, or
     /// wakes it to recompute that deadline.
-    fn ensure_reaper(&self, shutdown: tokio_util::sync::CancellationToken) {
+    fn ensure_reaper(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+        tasks: &tokio_util::task::TaskTracker,
+    ) {
         use std::sync::atomic::Ordering;
         if self.reaper_running.swap(true, Ordering::AcqRel) {
             // The permit is kept if the reaper is between sleeps, so it looks
@@ -1676,7 +1688,7 @@ impl ProcessRegistry {
             return;
         }
         let registry = self.clone();
-        drop(tokio::spawn(async move {
+        drop(tasks.spawn(async move {
             loop {
                 registry.remove_expired();
                 let Some(next) = registry.next_expiry() else {
@@ -2115,6 +2127,7 @@ fn process_status_outcome(status: Option<std::process::ExitStatus>) -> ProcessEx
 fn terminate_and_reap_failed_start(
     mut child: tokio::process::Child,
     process_reservation: ProcessRecordReservation,
+    tasks: &tokio_util::task::TaskTracker,
 ) {
     let pid = child.id();
     if let Some(pid) = pid {
@@ -2140,7 +2153,7 @@ fn terminate_and_reap_failed_start(
 
     // Cleanup outlives the request and retains admission until reaping finishes.
     // A slow or failed kill must not allow unbounded unreaped failed starts.
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let _process_reservation = process_reservation;
         if let Err(error) = child.wait().await {
             tracing::warn!(%error, ?pid, "failed to reap child after start failure");
@@ -2205,7 +2218,7 @@ impl Process for ExecutionService {
         &self,
         mut request: Request<StartRequest>,
     ) -> Result<Response<Self::StartStream>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -2257,6 +2270,7 @@ impl Process for ExecutionService {
         }
         let account_name = user.unwrap_or_else(|| self.inner.default_operation_user.clone());
         let (account, _start_admission) = resolve_process_account(
+            self.inner.process_tasks.clone(),
             self.inner.process_payload_slots.clone(),
             ingress,
             move || {
@@ -2407,7 +2421,7 @@ impl Process for ExecutionService {
             .start_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.require_running()?;
+        crate::execution::require_running(&self.inner.shutdown)?;
         // Re-claim the identity inside the gate. The check at the top of this
         // handler is reachable across suspension points, so on its own it would
         // let two starts carrying the same assigned id both pass and have the
@@ -2492,7 +2506,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<ConnectProcessRequest>,
     ) -> Result<Response<Self::ConnectProcessStream>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -2541,7 +2555,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<ListProcessesRequest>,
     ) -> Result<Response<Self::ListProcessesStream>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -2566,7 +2580,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<SendSignalRequest>,
     ) -> Result<Response<SendSignalResponse>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -2603,7 +2617,7 @@ impl Process for ExecutionService {
         &self,
         mut request: Request<SendInputRequest>,
     ) -> Result<Response<SendInputResponse>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         let _admission = crate::payload::admit(
             &mut request,
             &self.inner.process_payload_slots,
@@ -2632,7 +2646,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<CloseStdinRequest>,
     ) -> Result<Response<CloseStdinResponse>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -2657,7 +2671,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<ResizePtyRequest>,
     ) -> Result<Response<ResizePtyResponse>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,

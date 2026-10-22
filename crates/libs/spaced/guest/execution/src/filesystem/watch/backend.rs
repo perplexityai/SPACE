@@ -78,6 +78,9 @@ struct BlockingWatcher {
         tokio::sync::OwnedSemaphorePermit,
     )>,
     runtime: tokio::runtime::Handle,
+    tasks: tokio_util::task::TaskTracker,
+    // Ownership survives a blocking task returning an unconsumed result.
+    _ownership: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 
 impl BlockingWatcher {
@@ -109,10 +112,14 @@ impl BlockingWatcher {
         let mut owned = Self {
             inner: self.inner.take(),
             runtime: self.runtime.clone(),
+            tasks: self.tasks.clone(),
+            _ownership: self.tasks.token(),
         };
+        let operation = self.tasks.token();
         let (owned, result) = self
             .runtime
             .spawn_blocking(move || {
+                let _operation = operation;
                 let result = update(
                     &mut owned
                         .inner
@@ -134,7 +141,11 @@ impl BlockingWatcher {
 impl Drop for BlockingWatcher {
     fn drop(&mut self) {
         if let Some(owned) = self.inner.take() {
-            self.runtime.spawn_blocking(move || drop(owned));
+            let operation = self.tasks.token();
+            self.runtime.spawn_blocking(move || {
+                let _operation = operation;
+                drop(owned);
+            });
         }
     }
 }
@@ -152,7 +163,10 @@ impl RegisteredWatch {
         self.directories.len()
     }
 
-    pub(super) async fn prepare(plan: WatchRegistrationPlan) -> Result<Self, Status> {
+    pub(super) async fn prepare(
+        plan: WatchRegistrationPlan,
+        tasks: tokio_util::task::TaskTracker,
+    ) -> Result<Self, Status> {
         let root = plan.root.clone();
         let directories = plan.into_directories();
         let slot = WATCH_BACKEND_SLOTS
@@ -165,47 +179,51 @@ impl RegisteredWatch {
             })?;
         let directory_slot = directory_admission(directories.len())?;
         let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            validate_watch_root(&root)?;
-            let (raw_tx, raw_rx) = mpsc::channel(RAW_EVENT_BUFFER_CAPACITY);
-            let raw_overflowed = Arc::new(AtomicBool::new(false));
-            let raw_overflow_notify = Arc::new(Notify::new());
-            let callback_overflowed = raw_overflowed.clone();
-            let callback_notify = raw_overflow_notify.clone();
-            let mut watcher = notify::RecommendedWatcher::new(
-                move |result| {
-                    if matches!(
-                        raw_tx.try_send(result),
-                        Err(mpsc::error::TrySendError::Full(_))
-                    ) {
-                        callback_overflowed.store(true, Ordering::Release);
-                        callback_notify.notify_one();
-                    }
-                },
-                notify::Config::default().with_follow_symlinks(false),
-            )
-            .map_err(|error| Status::internal(format!("create file watcher: {error}")))?;
-            for path in &directories {
-                watcher
-                    .watch(path, RecursiveMode::NonRecursive)
-                    .map_err(|error| {
-                        Status::internal(format!("watch {}: {error}", path.display()))
-                    })?;
-            }
-            validate_watch_root(&root)?;
-            Ok(Self {
-                watcher: BlockingWatcher {
-                    inner: Some((watcher, slot, directory_slot)),
-                    runtime,
-                },
-                raw_rx,
-                raw_overflowed,
-                raw_overflow_notify,
-                directories,
+        tasks
+            .clone()
+            .spawn_blocking(move || {
+                validate_watch_root(&root)?;
+                let (raw_tx, raw_rx) = mpsc::channel(RAW_EVENT_BUFFER_CAPACITY);
+                let raw_overflowed = Arc::new(AtomicBool::new(false));
+                let raw_overflow_notify = Arc::new(Notify::new());
+                let callback_overflowed = raw_overflowed.clone();
+                let callback_notify = raw_overflow_notify.clone();
+                let mut watcher = notify::RecommendedWatcher::new(
+                    move |result| {
+                        if matches!(
+                            raw_tx.try_send(result),
+                            Err(mpsc::error::TrySendError::Full(_))
+                        ) {
+                            callback_overflowed.store(true, Ordering::Release);
+                            callback_notify.notify_one();
+                        }
+                    },
+                    notify::Config::default().with_follow_symlinks(false),
+                )
+                .map_err(|error| Status::internal(format!("create file watcher: {error}")))?;
+                for path in &directories {
+                    watcher
+                        .watch(path, RecursiveMode::NonRecursive)
+                        .map_err(|error| {
+                            Status::internal(format!("watch {}: {error}", path.display()))
+                        })?;
+                }
+                validate_watch_root(&root)?;
+                Ok(Self {
+                    watcher: BlockingWatcher {
+                        inner: Some((watcher, slot, directory_slot)),
+                        runtime,
+                        _ownership: tasks.token(),
+                        tasks,
+                    },
+                    raw_rx,
+                    raw_overflowed,
+                    raw_overflow_notify,
+                    directories,
+                })
             })
-        })
-        .await
-        .map_err(|error| Status::internal(format!("watch registration failed: {error}")))?
+            .await
+            .map_err(|error| Status::internal(format!("watch registration failed: {error}")))?
     }
 }
 
@@ -231,25 +249,28 @@ pub(super) fn spawn_notify_task<F, Fut, D, DFut>(
     D: FnMut(usize, usize, Option<bool>) -> DFut + Send + 'static,
     DFut: std::future::Future<Output = DirectoryAdjustment> + Send + 'static,
 {
+    let scanner_tasks = config.tasks.clone();
     spawn_notify_task_with_scanner(
         config,
         on_event,
         adjust_directories,
         Arc::new(move |root, filter, candidates| {
             let scan_slots = Arc::clone(&scan_slots);
-            tokio::spawn(async move {
+            let tasks = scanner_tasks.clone();
+            scanner_tasks.spawn(async move {
                 let scan_slot = scan_slots
                     .acquire_owned()
                     .await
                     .map_err(|_| Status::unavailable("file watcher directory scanner closed"))?;
-                tokio::task::spawn_blocking(move || {
-                    let _scan_slot = scan_slot;
-                    scan_directory_candidates(&root, &filter, &candidates)
-                })
-                .await
-                .map_err(|error| {
-                    Status::internal(format!("file watcher directory scan failed: {error}"))
-                })?
+                tasks
+                    .spawn_blocking(move || {
+                        let _scan_slot = scan_slot;
+                        scan_directory_candidates(&root, &filter, &candidates)
+                    })
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!("file watcher directory scan failed: {error}"))
+                    })?
             })
         }),
     )

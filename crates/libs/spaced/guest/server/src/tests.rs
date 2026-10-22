@@ -379,5 +379,5 @@ async fn daemon_payload_adapters_reuse_transport_admission() {
     }
     shutdown.cancel();
     server.await.unwrap().unwrap();
-    execution.drain().await;
+    execution.drain().await.expect("complete drain");
 }

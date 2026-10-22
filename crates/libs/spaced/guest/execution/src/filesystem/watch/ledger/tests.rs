@@ -17,7 +17,11 @@ async fn lossy_names_keep_distinct_file_identity_and_classify_hard_links() {
         std::fs::hard_link(&source, &path).unwrap();
         std::fs::write(&path, b"after").unwrap();
         let event = WatchEvent::new(path, relative, FileEventKind::Modified, 1_100);
-        let is_file = super::super::classify_ledger_event_regular_file(&event).await;
+        let is_file = super::super::classify_ledger_event_regular_file(
+            &event,
+            &tokio_util::task::TaskTracker::new(),
+        )
+        .await;
         assert!(is_file, "stat must use the raw path, not its display name");
         ledger.record_event(root, &event, is_file);
     }

@@ -124,27 +124,37 @@ and error evolution, requires a separate crate-level policy before stabilization
   selection does not change environment semantics. Callers requiring rejection
   should validate with `EnvMap::try_from` before constructing `StartRequest.env`
   (use `pplx_space_spaced_guest_protocol::proto_env` to convert the validated map).
-- `close()` closes operation admission and signals cancellation across existing
-  clones and filesystem handles. Execution entrypoints refuse new process,
-  filesystem and environment-update calls with `Unavailable`; transport admission
-  retains its earlier rejections. Uploads waiting for their first message wake
-  on cancellation. The service owns a child of the supplied token: caller
-  cancellation closes admission, but `close()` and `drain()` do not cancel the
-  caller's token. Closure signals cancellation of admitted work immediately;
-  service or parent-token cancellation can terminate identity workers immediately,
-  leaving outcomes unknown. `cancellation_grace` applies to supervised work after
-  request cancellation, not service shutdown. Direct execution still waits for
-  outstanding I/O. This is abortive shutdown, not graceful
-  admission-only closure; it neither waits nor rolls back effects. Already-admitted
+- `close()` closes admission across existing clones and filesystem handles without
+  cancelling admitted work. Every new process, filesystem and environment call
+  returns a refused `Unavailable`; transport admission retains its earlier
+  rejections. `cancel()` closes admission and requests cancellation immediately.
+  Caller token cancellation has the same effect, but the service owns a child
+  token: neither method nor drain cancels the caller's token.
+- `drain()` closes admission and waits up to ten seconds; `drain_with_timeout`
+  accepts another duration. Success means admitted operations, physical I/O,
+  worker startup/retirement, watch teardown and command supervisors have settled,
+  and owned filesystem workers have been reaped. Passive watches are retired
+  during drain. A caller must continue polling or drop its admitted futures and
+  consume or drop its read/list/process output streams; otherwise graceful drain
+  can wait for their input or backpressure. Do not try to finish a process with a
+  new `send_input` call after closure: it will be refused along with other calls.
+- Expiry requests cancellation and returns `IncompleteExecutionDrain`. It bounds
+  waiting, not OS completion, and does not prove that effects have stopped. Keep
+  the Tokio runtime alive and call drain again; concurrent and repeated drains
+  observe retained ownership. Dropping a drain future keeps admission closed,
+  without implicitly cancelling work. Dropping service handles or the runtime is
+  not a substitute for successful drain.
+- Cancellation wakes uploads awaiting `Open` or subsequent input. Supervised
+  filesystem mutations can finish during `cancellation_grace`; stalled identity
+  workers are then terminated and the outcome may be unknown. Direct execution
+  waits for outstanding I/O, which may outlast any deadline. Already-admitted
   same-key retries can still wait for the owner or the retry retention deadline;
-  closure does not directly wake them.
-- The daemon coordinates listener shutdown with `drain()`, which first closes
-  admission and then joins its tracked work. The filesystem drain still logs an
-  internal timeout rather than reporting incomplete cleanup, and some detached
-  or blocking work is not covered by its trackers. A complete embedding drain
-  contract, including graceful admission-only closure and explicit deadline-driven
-  cancellation, remains follow-up work. Returning from `drain()` is not yet proof
-  that every previously admitted effect has settled.
+  closure does not directly wake them. Cancellation does not undo effects or make
+  a fresh-key retry safe. Successful drain implies neither flush nor persistence.
+- The daemon still cancels its own token before draining and retains its overall
+  shutdown deadline. Active requests, wire schemas, identity policy and process
+  exit semantics are unchanged. Admission-only close is for hosts that choose a
+  graceful wait before requesting cancellation.
 - Linux PTY descriptors are created with close-on-exec atomically. Other Unix
   targets serialize PTY allocation and workload spawning through a private lock;
   unrelated spawners do not participate in that coordination.
@@ -165,24 +175,32 @@ and error evolution, requires a separate crate-level policy before stabilization
   when it returns. A caller-assigned process id stays in use for the whole
   window. Records live in daemon memory and do not survive a daemon restart.
 
-This crate retains the running daemon contract. Complete drain semantics and
-operation acceptance remain follow-up work. General application embedding also
-requires stronger descendant ownership. Explicit launching alone does not
-establish those guarantees or advertise general embedding support.
+This crate retains the running daemon contract. Embedders must provide isolation,
+authorization, account provisioning, final descendant teardown and a Tokio runtime
+with I/O, timers and process support alive through drain. Do not reap owned children
+from another component. Tokio may install a process-wide `SIGCHLD` handler that
+outlives the service; signal-handler neutrality is not promised. The Linux profile
+requires real identity workers and non-root workload accounts. This is not a
+standalone isolation boundary or a portability guarantee.
 
 The Linux `embedding` integration in the worker app uses the execution crate
 without the guest server. It covers a separate worker artifact, atomic path
 replacement, account-specific writes, idempotency, process output, failed startup,
-cancelled callers and worker reaping. It checks child IDs/groups and capability
-sets with and without a PTY, set-ID/file-capability privilege suppression,
+cancelled callers, graceful/repeated drain and worker reaping. It checks child
+IDs/groups and capability sets with and without a PTY, set-ID/file-capability privilege suppression,
 root-account and launcher rejection, working-directory traversal, late worker
 entrypoint rejection, and unchanged authority on every surviving host thread.
 Run it as root in a disposable environment with a provisioned `nobody` account,
 `CAP_NET_RAW` and `CAP_SETFCAP`, and a writable filesystem that supports executable
 set-ID and file capabilities (not `nosuid`), using
 `cargo test -p pplx-space-spaced-guest-worker --test embedding`.
-CI assigns it to the privileged test group. Broader embedding acceptance remains
-tracked by the RFC.
+CI assigns it to the privileged test group. Library regressions also hold account
+lookup and filesystem syscalls open across cancellation, assert incomplete drain,
+and then release them to observe completion. They cover every closed entrypoint,
+borrowed uploads and output backpressure. Kind/Firecracker covers the daemon
+integration separately; privileged container tests do not replace it. Other Linux
+architectures, real caller cgroup placement and downstream packaging require their
+own acceptance evidence.
 
 The proposed support profile, ownership contract, and implementation acceptance
 criteria are in the [embedding RFC](../../../../../docs/space/rfcs/2026-10-06-guest-execution-embedding.md).

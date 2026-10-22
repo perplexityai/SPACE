@@ -17,6 +17,8 @@ pub(super) async fn read_stream(
     offset: u64,
     length: Option<u64>,
     stream_slot: OwnedSemaphorePermit,
+    tasks: tokio_util::task::TaskTracker,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<GuestFileChunkStream, Status> {
     let (file, stream_slot) = open_for_read(path, offset, stream_slot).await?;
     Ok(stream_file(
@@ -24,6 +26,8 @@ pub(super) async fn read_stream(
         length,
         stream_slot,
         std::future::pending(),
+        tasks,
+        shutdown,
     ))
 }
 
@@ -72,6 +76,8 @@ pub(super) fn stream_file(
     length: Option<u64>,
     guard: impl Send + 'static,
     ended: impl std::future::Future<Output = Status> + Send + 'static,
+    tasks: tokio_util::task::TaskTracker,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> GuestFileChunkStream {
     use futures_util::StreamExt;
     let mut file = tokio::fs::File::from_std(file);
@@ -81,7 +87,7 @@ pub(super) fn stream_file(
     // The terminal failure travels beside the queue, so that ending the read
     // never waits for room in it.
     let (failure_tx, failure_rx) = tokio::sync::oneshot::channel::<Status>();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let _guard = guard;
         let mut ended = std::pin::pin!(ended);
         let mut remaining = length;
@@ -99,6 +105,8 @@ pub(super) fn stream_file(
             let mut limited = (&mut file).take(read_len as u64);
             let read = tokio::select! {
                 biased;
+                _ = shutdown.cancelled() => break Some(Status::unavailable("file read cancelled")),
+                _ = chunks_tx.closed() => break None,
                 status = &mut ended => break Some(status),
                 read = limited.read_buf(&mut data) => read,
             };
@@ -114,6 +122,8 @@ pub(super) fn stream_file(
             let chunk = FileChunk { data: data.into() };
             tokio::select! {
                 biased;
+                _ = shutdown.cancelled() => break Some(Status::unavailable("file read cancelled")),
+                _ = chunks_tx.closed() => break None,
                 status = &mut ended => break Some(status),
                 sent = chunks_tx.send(chunk) => {
                     if sent.is_err() {
@@ -122,6 +132,9 @@ pub(super) fn stream_file(
                 }
             }
         };
+        // A cancelled async read can still have physical I/O in Tokio's blocking
+        // pool. Retain the task and descriptor lease until that I/O has settled.
+        drop(file.into_std().await);
         if let Some(status) = failure {
             let _ = failure_tx.send(status);
         }

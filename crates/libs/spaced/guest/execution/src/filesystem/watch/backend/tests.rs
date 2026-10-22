@@ -522,10 +522,13 @@ async fn moved_subtrees_wait_for_admission_while_existing_events_progress() {
                 recursive: true,
                 include_metadata_events: false,
                 filter,
-                registration: RegisteredWatch::prepare(WatchRegistrationPlan {
-                    root: root.clone(),
-                    descendants: vec![],
-                })
+                registration: RegisteredWatch::prepare(
+                    WatchRegistrationPlan {
+                        root: root.clone(),
+                        descendants: vec![],
+                    },
+                    tokio_util::task::TaskTracker::new(),
+                )
                 .await
                 .expect("registration"),
                 shutdown: shutdown.clone(),
@@ -645,10 +648,13 @@ async fn registration_does_not_follow_directory_symlinks() {
     let link = watched.path().join("link");
     std::os::unix::fs::symlink(external.path(), &link).expect("directory symlink");
     let root = watched.path().to_path_buf();
-    let mut registration = RegisteredWatch::prepare(WatchRegistrationPlan {
-        root: root.clone(),
-        descendants: vec![],
-    })
+    let mut registration = RegisteredWatch::prepare(
+        WatchRegistrationPlan {
+            root: root.clone(),
+            descendants: vec![],
+        },
+        tokio_util::task::TaskTracker::new(),
+    )
     .await
     .expect("registration");
     assert_eq!(registration.directory_count(), 1);
@@ -683,11 +689,15 @@ async fn registration_does_not_follow_directory_symlinks() {
 
 #[tokio::test]
 async fn failed_registration_and_cancelled_operation_retain_physical_admission() {
+    let tasks = tokio_util::task::TaskTracker::new();
     let directory = tempfile::tempdir().unwrap();
-    let mut registration = RegisteredWatch::prepare(WatchRegistrationPlan {
-        root: directory.path().to_path_buf(),
-        descendants: vec![],
-    })
+    let mut registration = RegisteredWatch::prepare(
+        WatchRegistrationPlan {
+            root: directory.path().to_path_buf(),
+            descendants: vec![],
+        },
+        tasks.clone(),
+    )
     .await
     .expect("registered root");
     let _result = apply_discovered_directories(
@@ -732,11 +742,16 @@ async fn failed_registration_and_cancelled_operation_retain_physical_admission()
     caller.abort();
     caller.await.expect_err("caller cancelled");
     assert_eq!(admission.available_permits(), 0);
+    tasks.close();
+    assert!(futures_util::poll!(Box::pin(tasks.wait())).is_pending());
     release_tx.send(()).expect("release blocking owner");
     let _returned = tokio::time::timeout(std::time::Duration::from_secs(5), admission.acquire())
         .await
         .expect("retirement completes")
         .expect("admission open");
+    tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
+        .await
+        .expect("drain includes backend teardown");
 }
 
 #[test]
@@ -780,10 +795,13 @@ async fn verification_root_loss_is_terminal_without_a_backend_event() {
             true,
             &filter,
             &super::super::paths::new_watch_directory_scan_slots(),
+            &tokio_util::task::TaskTracker::new(),
         )
         .await
         .unwrap();
-        let mut registration = RegisteredWatch::prepare(plan).await.unwrap();
+        let mut registration = RegisteredWatch::prepare(plan, tokio_util::task::TaskTracker::new())
+            .await
+            .unwrap();
         // Suppress OS delivery to prove that verification itself detects loss.
         let (_raw_tx, raw_rx) = mpsc::channel(1);
         registration.raw_rx = raw_rx;
@@ -863,6 +881,7 @@ async fn registration_rejects_a_root_lost_after_planning() {
             true,
             &filter,
             &super::super::paths::new_watch_directory_scan_slots(),
+            &tokio_util::task::TaskTracker::new(),
         )
         .await
         .unwrap();
@@ -870,7 +889,11 @@ async fn registration_rejects_a_root_lost_after_planning() {
         if replace_with_file {
             std::fs::write(&root, b"replacement").unwrap();
         }
-        assert!(RegisteredWatch::prepare(plan).await.is_err());
+        assert!(
+            RegisteredWatch::prepare(plan, tokio_util::task::TaskTracker::new())
+                .await
+                .is_err()
+        );
         if replace_with_file {
             std::fs::remove_file(&root).unwrap();
         }
@@ -881,11 +904,14 @@ async fn registration_rejects_a_root_lost_after_planning() {
         true,
         &filter,
         &super::super::paths::new_watch_directory_scan_slots(),
+        &tokio_util::task::TaskTracker::new(),
     )
     .await
     .unwrap();
     assert!(
-        RegisteredWatch::prepare(plan).await.is_ok(),
+        RegisteredWatch::prepare(plan, tokio_util::task::TaskTracker::new())
+            .await
+            .is_ok(),
         "fresh setup can recover"
     );
 }

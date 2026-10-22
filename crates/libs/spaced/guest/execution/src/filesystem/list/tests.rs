@@ -37,7 +37,15 @@ async fn list_stream_holds_its_shared_slot_until_the_stream_is_dropped() {
         .expect("first stream slot");
     let path = GuestPath::parse(temp_dir.path().display().to_string()).expect("guest path");
 
-    let stream = list_stream(path, None, permit).await.expect("list stream");
+    let stream = list_stream(
+        path,
+        None,
+        permit,
+        tokio_util::task::TaskTracker::new(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("list stream");
     assert!(
         Arc::clone(&slots).try_acquire_owned().is_err(),
         "a live response stream must retain its slot"

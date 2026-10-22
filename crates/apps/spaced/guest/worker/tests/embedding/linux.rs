@@ -67,10 +67,13 @@ async fn stop(service: ExecutionService, shutdown: CancellationToken, server: Se
         .await
         .expect_err("closed identity service must reject new work");
     assert_eq!(error.code(), tonic::Code::Unavailable);
-    shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(3), service.drain())
         .await
-        .expect("drain reaps workers promptly");
+        .expect("drain reaps workers promptly")
+        .expect("cleanup complete");
+    service.drain().await.expect("repeated drain");
+    assert!(!shutdown.is_cancelled(), "drain must not cancel the host");
+    shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(3), server)
         .await
         .expect("server stops")
