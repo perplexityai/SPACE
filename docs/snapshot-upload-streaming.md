@@ -536,3 +536,36 @@ Before widening enablement, use a small canary and matched controls to verify:
 Broad enablement remains pending these measurements. Disabling new captures
 stops further accumulation; existing bundles and leases still follow their
 normal ownership and retirement rules.
+
+## Completion evidence
+
+File-backed snapshot uploads hash the logical reads that feed compression and
+optional envelope encryption. A digest is published only after EOF, logical size
+agreement, and successful verification of the uploaded object's wire size.
+Already-owned immutable raw staging is hashed in place; legacy unowned raw
+sources need a private copy to bind the bytes uploaded. Generated btrfs-send
+sources do not acquire proof from an unrelated local file.
+
+The common job worker merges a versioned completion result into the latest
+intent payload in the same attempt/lease-fenced SQLite completion write.
+Consumers require its producing attempt to match the completed job. Missing,
+unknown, or malformed optional evidence leaves ordinary completion readable.
+Ambiguous artifact roles produce no certified evidence. Sandbox-manager forwards
+logical digests to the catalog for restore verification; optional metadata and
+object identity are stored alongside them. ETags are provider identity tokens,
+not cryptographic hashes. The current object-store adapter exposes no version
+ID, so that optional field remains absent.
+
+This establishes evidence on the authenticated, honest-worker path. It does not
+independently attest object plaintext against a malicious uploader. Recovery
+requiring exact evidence must reject absent or mismatching proofs and retain
+its original source.
+
+An opt-in measurement is available with
+`SPACE_MEASURE_UPLOAD_EVIDENCE=1 cargo test -p pplx-space-volmgr --lib measure_upload_evidence_cost -- --nocapture`.
+On a local debug build using 16 MiB of synthetic incompressible input, SHA-256
+added roughly 56–84 ms of process CPU across raw, compressed, and encrypted
+compressed paths. Owned raw input used no additional temporary disk; legacy raw
+used one logical-size copy. Compression and encryption used their existing wire
+staging, with no extra proof copy. These are local transform measurements, not
+production throughput or network latency estimates.

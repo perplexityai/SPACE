@@ -605,5 +605,60 @@ impl FromStr for ExactStorageUri {
     }
 }
 
+/// Canonical stable snapshot metadata for an operator recovery approval.
+/// Generated transport timestamps/sizes and node-local send-source handles are
+/// deliberately excluded. Every other field, including future fields, is bound.
+#[cfg(feature = "serde")]
+pub fn snapshot_metadata_binding(bytes: &[u8]) -> Result<Vec<u8>, SnapshotMetadataBindingError> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let map = value
+        .as_object_mut()
+        .ok_or(SnapshotMetadataBindingError::Shape)?;
+    if map.get("version").and_then(serde_json::Value::as_u64) != Some(2)
+        || [
+            "sandbox_id",
+            "local_artifact_id",
+            "artifact_kind",
+            "artifact_origin",
+            "execution",
+            "source",
+        ]
+        .iter()
+        .any(|key| map.get(*key).is_none_or(serde_json::Value::is_null))
+    {
+        return Err(SnapshotMetadataBindingError::Shape);
+    }
+    for key in ["created_at", "size_bytes", "rootfs_send_source_id"] {
+        map.remove(key);
+    }
+    fn sort(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for child in map.values_mut() {
+                    sort(child);
+                }
+                map.sort_keys();
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    sort(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    sort(&mut value);
+    Ok(serde_json::to_vec(&value)?)
+}
+
+#[cfg(feature = "serde")]
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotMetadataBindingError {
+    #[error("recovery requires version 2 artifact identity and execution metadata")]
+    Shape,
+    #[error("invalid snapshot metadata: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
 #[cfg(test)]
 mod tests;

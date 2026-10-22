@@ -1,5 +1,7 @@
 pub(crate) mod copy;
 mod decode_admission;
+pub(crate) mod logical_digest;
+use logical_digest::{DigestReader, DigestSink, LogicalArtifactDigest};
 mod stream_push;
 use decode_admission::{
     CappedDecode, DecodeGate, DecodedOutputCap, copy_decode_capped, is_output_cap_exceeded,
@@ -538,6 +540,11 @@ fn ensure_pull_failure_reason(error: JobError) -> JobError {
     error.with_default_failure_reason(JobFailureReason::Internal)
 }
 
+struct TransformInput {
+    codec_permit: Option<CodecPermit>,
+    digest: Option<DigestSink>,
+}
+
 /// Compress `src` to a sibling `.zst.tmp` file using zstd.
 /// Returns the temp path and the original (uncompressed) size.
 /// The caller is responsible for deleting the temp file.
@@ -546,10 +553,7 @@ fn ensure_pull_failure_reason(error: JobError) -> JobError {
 /// task and released only when the CPU pass exits, so a cancelled caller
 /// cannot free the permit while the detached `spawn_blocking` keeps
 /// burning CPU.
-async fn compress_to_temp(
-    src: &Path,
-    codec_permit: Option<CodecPermit>,
-) -> Result<(PathBuf, u64), JobError> {
+async fn compress_to_temp(src: &Path, input: TransformInput) -> Result<(PathBuf, u64), JobError> {
     let original_size = tokio::fs::metadata(src)
         .await
         .map(|m| m.len())
@@ -561,14 +565,15 @@ async fn compress_to_temp(
     let tmp = tmp_path.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), JobError> {
-        let _codec_permit = codec_permit;
-        let mut reader = std::fs::File::open(&src)
+        let _codec_permit = input.codec_permit;
+        let reader = std::fs::File::open(&src)
             .map_err(|e| JobError::Permanent(format!("open source for compression: {e}")))?;
+        let mut reader = DigestReader::new(reader, input.digest);
         let mut writer = std::fs::File::create(&tmp)
             .map_err(|e| JobError::Permanent(format!("create compression temp file: {e}")))?;
         zstd::stream::copy_encode(&mut reader, &mut writer, ZSTD_LEVEL)
             .map_err(|e| JobError::Permanent(format!("zstd compress: {e}")))?;
-        page_cache::advise_dontneed(&reader, &src, "compress volume upload input");
+        page_cache::advise_dontneed(reader.inner(), &src, "compress volume upload input");
         page_cache::advise_dontneed(&writer, &tmp, "write compressed volume upload temp");
         Ok(())
     })
@@ -1024,6 +1029,7 @@ async fn apply_file_mode(
 /// `Clone` is cheap — `S3ObjectStore` is internally `Arc`-wrapped.
 #[derive(Clone)]
 pub struct TransferExecutor {
+    logical_digests: Option<Arc<std::sync::Mutex<Vec<LogicalArtifactDigest>>>>,
     node_manager: Option<pplx_space_node_mgr_client::NodeManagerGrpcClient>,
     store: Arc<dyn ObjectStore>,
     config: TransferExecutorConfig,
@@ -1109,6 +1115,7 @@ impl TransferExecutor {
         };
         let shadow_comparisons = ShadowComparisonController::new();
         Self {
+            logical_digests: None,
             node_manager: None,
             stream_push: StreamPushConfig::new(&config.snapshot_upload_mode, total),
             store,
@@ -1263,6 +1270,36 @@ impl JobExecutor for TransferExecutor {
             }
             other => Err(JobError::Permanent(format!("unknown kind: {other}"))),
         }
+    }
+
+    async fn execute_with_completion(
+        &self,
+        job: &Job,
+        cancellation: CancellationToken,
+    ) -> Result<pplx_space_common_jobs::JobCompletion, JobError> {
+        let mut executor = self.clone();
+        let digests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        executor.logical_digests = Some(digests.clone());
+        let bytes_processed = executor.execute(job, cancellation).await?;
+        let mut proofs = digests
+            .lock()
+            .map(|proofs| proofs.clone())
+            .unwrap_or_default();
+        proofs.sort_by_key(|entry| entry.artifact);
+        let ambiguous = proofs
+            .windows(2)
+            .any(|pair| matches!(pair, [a,b] if a.artifact == b.artifact));
+        let result = if proofs.is_empty() || ambiguous {
+            None
+        } else {
+            serde_json::to_value(proofs)
+                .ok()
+                .map(|proofs| serde_json::json!({"logical_artifact_digests":proofs}))
+        };
+        Ok(pplx_space_common_jobs::JobCompletion {
+            bytes_processed,
+            result,
+        })
     }
 
     async fn cleanup_cancelled(&self, job: &Job) -> Result<(), JobError> {
@@ -1854,7 +1891,7 @@ async fn stage_encrypted_temp(
     src_path: &Path,
     compress: bool,
     resolved_dek: Option<&[u8]>,
-    codec_permit: Option<CodecPermit>,
+    input: TransformInput,
 ) -> Result<PathBuf, (PathBuf, JobError)> {
     let enc_path = encrypted_sibling(src_path);
     let src_path_buf = src_path.to_path_buf();
@@ -1891,11 +1928,13 @@ async fn stage_encrypted_temp(
         );
         let job_id = job.job_id;
         tokio::task::spawn_blocking(move || -> Result<(), JobError> {
-            let _codec_permit = codec_permit;
+            let _codec_permit = input.codec_permit;
             let src_file = std::fs::File::open(&src_path_buf)
                 .map_err(|e| JobError::Permanent(format!("open source for encrypt: {e}")))?;
-            let buf_reader =
-                std::io::BufReader::with_capacity(ENCRYPT_PUSH_READ_BUF_BYTES, src_file);
+            let buf_reader = std::io::BufReader::with_capacity(
+                ENCRYPT_PUSH_READ_BUF_BYTES,
+                DigestReader::new(src_file, input.digest),
+            );
             let mut dst_file = std::fs::File::create(&enc_path_buf)
                 .map_err(|e| JobError::Permanent(format!("create enc temp: {e}")))?;
             if compress {
@@ -1929,6 +1968,12 @@ async fn stage_encrypted_temp(
     }
 }
 
+struct PushReadContext<'a> {
+    resolved_dek: Option<&'a [u8]>,
+    cancellation: CancellationToken,
+    digest: Option<DigestSink>,
+}
+
 struct PushExecutionOptions<'a> {
     cleanup_staged: bool,
     resolved_dek: Option<&'a [u8]>,
@@ -1944,16 +1989,47 @@ impl TransferExecutor {
         target: ObjectTarget<'_>,
         options: PushExecutionOptions<'_>,
     ) -> Result<i64, JobError> {
+        let artifact = p.effective_snapshot_artifact();
+        let digest = self
+            .logical_digests
+            .as_ref()
+            .and_then(|_| artifact.map(DigestSink::for_artifact));
         let result = self
             .execute_push_inner(
                 job,
                 p,
                 creds,
                 target,
-                options.resolved_dek,
-                options.cancellation,
+                PushReadContext {
+                    resolved_dek: options.resolved_dek,
+                    cancellation: options.cancellation,
+                    digest: digest.clone(),
+                },
             )
             .await;
+        if let (Ok(bytes), Some(sink), Some(artifact), Some(collection)) =
+            (&result, digest, artifact, &self.logical_digests)
+        {
+            // Optional evidence never changes a successful transfer into failure.
+            // Incomplete reads and size disagreements leave the transfer uncertified.
+            if let Ok((digest, size_bytes, metadata_binding_digest)) = sink.completed()
+                && i64::try_from(size_bytes).ok() == Some(*bytes)
+                && let Some(object) = sink.object()
+                && let Ok(mut proofs) = collection.lock()
+            {
+                proofs.push(LogicalArtifactDigest {
+                    artifact,
+                    digest,
+                    size_bytes,
+                    metadata_binding_digest,
+                    object_key: object.key,
+                    wire_size_bytes: object.size,
+                    etag: object.etag,
+                    version_id: None,
+                });
+            }
+        }
+
         // Single-file pushes clean their staged source here. Artifact entries
         // pass `cleanup_staged = false`: a per-entry success is NOT terminal
         // for the artifact (a sibling may force a retry that must re-read this
@@ -1971,9 +2047,13 @@ impl TransferExecutor {
         p: &TransferPayload,
         creds: &pplx_space_object_store::ObjectCredentials,
         target: ObjectTarget<'_>,
-        resolved_dek: Option<&[u8]>,
-        cancellation: CancellationToken,
+        read: PushReadContext<'_>,
     ) -> Result<i64, JobError> {
+        let PushReadContext {
+            resolved_dek,
+            cancellation,
+            digest,
+        } = read;
         // Prefer the staged copy when set: bytes there are immune to a later
         // unlink of the caller's original path between submit and execute.
         // Legacy jobs queued before the staging field existed fall back to
@@ -2034,6 +2114,7 @@ impl TransferExecutor {
                         options,
                         original_size,
                         cancellation,
+                        digest,
                     },
                 )
                 .await;
@@ -2052,6 +2133,7 @@ impl TransferExecutor {
         // Ineligible sources and stores without streaming support retain the
         // file-backed transform and upload path.
         let mut transient_temps: Vec<PathBuf> = Vec::new();
+        let mut raw_digest_temp = None;
 
         let put_source: PathBuf = match &p.encryption {
             None => {
@@ -2070,7 +2152,14 @@ impl TransferExecutor {
                             codec_wait_started_at,
                         );
                     }
-                    let (zst_path, _) = compress_to_temp(upload_path, codec_permit).await?;
+                    let (zst_path, _) = compress_to_temp(
+                        upload_path,
+                        TransformInput {
+                            codec_permit,
+                            digest: digest.clone(),
+                        },
+                    )
+                    .await?;
                     tracing::debug!(
                         job_id = %job.job_id,
                         subject_id = %p.subject_id,
@@ -2082,7 +2171,44 @@ impl TransferExecutor {
                     transient_temps.push(zst_path.clone());
                     zst_path
                 } else {
-                    upload_path.to_path_buf()
+                    if let Some(sink) = digest.clone() {
+                        let source = upload_path.to_owned();
+                        let owned = p.staged_path.is_some();
+                        let staged = tokio::task::spawn_blocking(move || {
+                            let file = std::fs::File::open(&source)?;
+                            let mut reader = DigestReader::new(file, Some(sink));
+                            if owned {
+                                // Staging owns an immutable inode: no second full copy.
+                                std::io::copy(&mut reader, &mut std::io::sink())?;
+                                Ok::<_, std::io::Error>(None)
+                            } else {
+                                let mut temp =
+                                    tempfile::NamedTempFile::new_in(source.parent().ok_or_else(
+                                        || std::io::Error::other("upload source has no parent"),
+                                    )?)?;
+                                std::io::copy(&mut reader, &mut temp)?;
+                                temp.as_file_mut().flush()?;
+                                Ok(Some(temp))
+                            }
+                        })
+                        .await;
+                        match staged {
+                            Ok(Ok(Some(temp))) => {
+                                let path = temp.path().to_owned();
+                                raw_digest_temp = Some(temp);
+                                path
+                            }
+                            Ok(Ok(None)) => upload_path.to_path_buf(),
+                            _ => {
+                                if let Some(sink) = &digest {
+                                    sink.invalidate();
+                                }
+                                upload_path.to_path_buf()
+                            }
+                        }
+                    } else {
+                        upload_path.to_path_buf()
+                    }
                 }
             }
             Some(enc) => {
@@ -2121,7 +2247,10 @@ impl TransferExecutor {
                     upload_path,
                     self.config.compress,
                     resolved_dek,
-                    codec_permit,
+                    TransformInput {
+                        codec_permit,
+                        digest: digest.clone(),
+                    },
                 )
                 .await
                 {
@@ -2187,6 +2316,9 @@ impl TransferExecutor {
                     // to a corrupt artifact.
                     Ok(_) => match self.store.head(creds, target).await {
                         Ok(Some(durable)) if durable.size == wire_size => {
+                            if let Some(sink) = &digest {
+                                sink.record_object(target.key, &durable);
+                            }
                             push_payload(
                                 artifact,
                                 encoding,
@@ -2225,6 +2357,7 @@ impl TransferExecutor {
             unlink_crypto_tmp(tmp, &job.job_id, &p.subject_id, "post_upload_cleanup").await;
         }
 
+        drop(raw_digest_temp);
         upload_result
     }
 

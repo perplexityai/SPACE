@@ -88,6 +88,8 @@ fn common_object_parent_stays_within_one_artifact_directory() {
     assert_eq!(common_object_parent(divergent.into_iter()), None);
 }
 
+type CapturedUploads = Arc<Mutex<Vec<(PathBuf, Vec<u8>)>>>;
+
 #[derive(Default)]
 pub(super) struct MockObjectStore {
     heads: Mutex<VecDeque<Option<ObjectMeta>>>,
@@ -95,6 +97,7 @@ pub(super) struct MockObjectStore {
     head_calls: AtomicUsize,
     get_calls: AtomicUsize,
     put_calls: AtomicUsize,
+    captured: Option<CapturedUploads>,
 }
 
 impl MockObjectStore {
@@ -108,6 +111,7 @@ impl MockObjectStore {
             head_calls: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
+            captured: None,
         }
     }
 
@@ -168,6 +172,10 @@ impl ObjectStore for MockObjectStore {
         // so a test can simulate a put that "succeeds" yet leaves a
         // truncated object behind.
         self.put_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(captured) = &self.captured {
+            let bytes = tokio::fs::read(src).await?;
+            captured.lock().unwrap().push((src.to_owned(), bytes));
+        }
         let len = tokio::fs::metadata(src).await?.len();
         Ok(len)
     }
@@ -1123,8 +1131,11 @@ async fn push_rejects_truncated_durable_object() {
             &payload,
             &test_creds(),
             test_target(),
-            None,
-            CancellationToken::new(),
+            PushReadContext {
+                resolved_dek: None,
+                cancellation: CancellationToken::new(),
+                digest: None,
+            },
         )
         .await;
 
@@ -1161,8 +1172,11 @@ async fn push_accepts_fully_durable_object() {
             &payload,
             &test_creds(),
             test_target(),
-            None,
-            CancellationToken::new(),
+            PushReadContext {
+                resolved_dek: None,
+                cancellation: CancellationToken::new(),
+                digest: None,
+            },
         )
         .await
         .expect("a fully durable object must finalize successfully");
@@ -4500,7 +4514,19 @@ async fn stage_encrypted_temp_returns_partial_enc_path_on_aad_derivation_error()
     // `compress = false` so the test exercises the AAD-derivation
     // failure before any zstd init; the early-Err path is the same
     // regardless of the compress branch.
-    let result = stage_encrypted_temp(&job, &p, &enc, &post_compress, false, None, None).await;
+    let result = stage_encrypted_temp(
+        &job,
+        &p,
+        &enc,
+        &post_compress,
+        false,
+        None,
+        TransformInput {
+            codec_permit: None,
+            digest: None,
+        },
+    )
+    .await;
     let (partial_enc_path, err) =
         result.expect_err("template subject must fail derive_artifact_aads");
     assert_eq!(
@@ -4915,4 +4941,231 @@ fn benchmark_production_shaped_sparse_accounting_with_metrics() {
         accounting_cpu_us / 1_000,
         outstanding_metric_calls.load(Ordering::Relaxed),
     );
+}
+
+#[tokio::test]
+async fn logical_upload_proof_survives_raw_compressed_and_encrypted_transforms() {
+    use pplx_space_common_core::types::Digest as ContentDigest;
+    use sha2::{Digest as _, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("memory");
+    let bytes = b"the exact retained guest memory";
+    tokio::fs::write(&source, bytes).await.unwrap();
+    let expected = ContentDigest::sha256(Sha256::digest(bytes).into());
+    let payload = push_payload(&source);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut mock = MockObjectStore::new(
+        [Some(ObjectMeta {
+            size: bytes.len() as u64,
+            etag: None,
+        })],
+        Vec::new(),
+    );
+    mock.captured = Some(captured.clone());
+    let store = Arc::new(mock);
+    let mut job = test_job("push");
+    job.payload = payload.to_json();
+    let completion = test_executor(store)
+        .execute_with_completion(&job, CancellationToken::new())
+        .await
+        .unwrap();
+    let body = completion.result.unwrap();
+    let proofs: Vec<LogicalArtifactDigest> =
+        serde_json::from_value(body["logical_artifact_digests"].clone()).unwrap();
+    assert_eq!(captured.lock().unwrap()[0].1, bytes);
+    assert_ne!(
+        captured.lock().unwrap()[0].0,
+        source,
+        "legacy raw source must use an owned copy"
+    );
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(proofs[0].wire_size_bytes, bytes.len() as u64);
+    assert!(!proofs[0].object_key.is_empty());
+    assert_eq!(proofs[0].digest, expected);
+    assert_eq!(proofs[0].size_bytes, bytes.len() as u64);
+    let sink = DigestSink::default();
+    let (compressed, _) = compress_to_temp(
+        &source,
+        TransformInput {
+            codec_permit: None,
+            digest: Some(sink.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        zstd::decode_all(std::fs::File::open(compressed).unwrap()).unwrap(),
+        bytes
+    );
+    assert_eq!(sink.completed().unwrap().0, expected);
+    let mut payload = payload;
+    payload.artifact_id = Some("019e9000-0000-7000-8000-000000000001".into());
+    payload.entry_role = Some("memfile".into());
+    let encryption = TransferEncryption {
+        organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
+        provider: KekProvider::InMemory,
+        master_key_identifier: "test/key-1".parse().unwrap(),
+        wrapped_dek: vec![0; 16],
+    };
+    for compress in [false, true] {
+        let sink = DigestSink::default();
+        let encrypted = stage_encrypted_temp(
+            &job,
+            &payload,
+            &encryption,
+            &source,
+            compress,
+            Some(&[7; 32]),
+            TransformInput {
+                codec_permit: None,
+                digest: Some(sink.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(std::fs::read(encrypted).unwrap(), bytes);
+        assert_eq!(
+            sink.completed().unwrap().0,
+            expected,
+            "logical hash precedes both transforms"
+        );
+        assert_eq!(sink.completed().unwrap().1, bytes.len() as u64);
+    }
+}
+
+#[tokio::test]
+async fn owned_raw_upload_hashes_in_place_including_empty_files() {
+    for bytes in [b"".as_slice(), b"retained immutable bytes".as_slice()] {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, bytes).unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut store = MockObjectStore::new(
+            [Some(ObjectMeta {
+                size: bytes.len() as u64,
+                etag: Some("synthetic-etag".into()),
+            })],
+            Vec::new(),
+        );
+        store.captured = Some(captured.clone());
+        let mut payload = push_payload(&dir.path().join("original-already-unlinked"));
+        payload.staged_path = Some(staged.to_string_lossy().into());
+        let mut job = test_job("push");
+        job.payload = payload.to_json();
+        let completion = test_executor(Arc::new(store))
+            .execute_with_completion(&job, CancellationToken::new())
+            .await
+            .unwrap();
+        let proofs: Vec<LogicalArtifactDigest> =
+            serde_json::from_value(completion.result.unwrap()["logical_artifact_digests"].clone())
+                .unwrap();
+        assert_eq!(captured.lock().unwrap()[0], (staged, bytes.to_vec()));
+        assert_eq!(
+            proofs[0].digest,
+            pplx_space_common_core::types::Digest::sha256(sha2::Sha256::digest(bytes).into())
+        );
+        assert_eq!(proofs[0].size_bytes, bytes.len() as u64);
+        assert_eq!(proofs[0].etag.as_deref(), Some("synthetic-etag"));
+    }
+}
+
+/// Opt-in local cost measurement; independent of CI's ignored-test selection.
+#[tokio::test]
+async fn measure_upload_evidence_cost() {
+    if std::env::var_os("SPACE_MEASURE_UPLOAD_EVIDENCE").is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("logical-input");
+    let mut bytes = vec![0u8; 16 * 1024 * 1024];
+    let mut state = 17_u64;
+    for byte in &mut bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+    std::fs::write(&source, &bytes).unwrap();
+    let cpu = || {
+        let value = nix::time::clock_gettime(nix::time::ClockId::CLOCK_PROCESS_CPUTIME_ID).unwrap();
+        u128::try_from(value.tv_sec()).unwrap() * 1_000_000_000
+            + u128::try_from(value.tv_nsec()).unwrap()
+    };
+    for mode in [
+        "owned_raw",
+        "legacy_raw",
+        "compressed",
+        "encrypted_compressed",
+    ] {
+        for hashing in [false, true] {
+            let sink = hashing.then(DigestSink::default);
+            let started = Instant::now();
+            let cpu_started = cpu();
+            let staged_bytes = match mode {
+                "owned_raw" => {
+                    let mut reader =
+                        DigestReader::new(std::fs::File::open(&source).unwrap(), sink.clone());
+                    std::io::copy(&mut reader, &mut std::io::sink()).unwrap();
+                    0
+                }
+                "legacy_raw" => {
+                    let mut reader =
+                        DigestReader::new(std::fs::File::open(&source).unwrap(), sink.clone());
+                    let mut temp = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+                    std::io::copy(&mut reader, &mut temp).unwrap()
+                }
+                "compressed" => {
+                    let (path, _) = compress_to_temp(
+                        &source,
+                        TransformInput {
+                            codec_permit: None,
+                            digest: sink.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let size = std::fs::metadata(&path).unwrap().len();
+                    std::fs::remove_file(path).unwrap();
+                    size
+                }
+                _ => {
+                    let mut payload = push_payload(&source);
+                    payload.artifact_id = Some("019e9000-0000-7000-8000-000000000001".into());
+                    payload.entry_role = Some("memfile".into());
+                    let encryption = TransferEncryption {
+                        organization_id: "019e9000-0000-7000-8000-000000000002".parse().unwrap(),
+                        provider: KekProvider::InMemory,
+                        master_key_identifier: "test/key-1".parse().unwrap(),
+                        wrapped_dek: vec![0; 16],
+                    };
+                    let path = stage_encrypted_temp(
+                        &test_job("push"),
+                        &payload,
+                        &encryption,
+                        &source,
+                        true,
+                        Some(&[7; 32]),
+                        TransformInput {
+                            codec_permit: None,
+                            digest: sink.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let size = std::fs::metadata(&path).unwrap().len();
+                    std::fs::remove_file(path).unwrap();
+                    size
+                }
+            };
+            let cpu_ms = (cpu() - cpu_started) / 1_000_000;
+            if let Some(sink) = sink {
+                assert_eq!(sink.completed().unwrap().1, bytes.len() as u64);
+            }
+            println!(
+                "UPLOAD_EVIDENCE_COST mode={mode} hashing={hashing} logical_bytes={} transient_bytes={staged_bytes} wall_ms={} cpu_ms={cpu_ms}",
+                bytes.len(),
+                started.elapsed().as_millis()
+            );
+        }
+    }
 }

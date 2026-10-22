@@ -316,7 +316,8 @@ impl JobExecutor for SnapshotUploadExecutor {
             .collect::<Vec<_>>();
         let vm_total_bytes = vm_artifact_total_bytes(&artifact_bytes, vm_artifact_count);
         let finalize_started_at = Instant::now();
-        let finalize_result = finalize_with_cluster_api_ready(&snapshot_id, vm_total_bytes).await;
+        let finalize_result =
+            finalize_with_cluster_api_ready(&snapshot_id, vm_total_bytes, &artifact_results).await;
         pplx_space_metrics::snapshot::delivery_duration_ms(
             "cluster_finalize",
             origin,
@@ -1041,8 +1042,9 @@ fn vm_artifact_total_bytes(polled_bytes: &[u64], vm_artifact_count: usize) -> u6
 }
 
 /// Completed transfer bytes and persisted queue/transfer timing.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ArtifactTransferObservation {
+    proofs: Vec<pplx_space_volmgr_client::proto::LogicalArtifactDigest>,
     bytes: u64,
     queue_duration_ms: Option<f64>,
     transfer_duration_ms: Option<f64>,
@@ -1140,6 +1142,7 @@ async fn poll_artifact_job(
                         sqlite_duration_ms(started_at, completed_at)
                     });
                 return Ok(ArtifactTransferObservation {
+                    proofs: job.logical_artifact_digests,
                     bytes: job.bytes_transferred,
                     queue_duration_ms,
                     transfer_duration_ms,
@@ -1354,11 +1357,49 @@ fn begin_artifact_backup_request(
     }
 }
 
+fn transfer_digests(
+    transfers: &[ArtifactTransferObservation],
+) -> Vec<pplx_space_node_api_client::proto::SnapshotArtifactDigest> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut digests = Vec::new();
+    for proof in transfers.iter().flat_map(|transfer| &transfer.proofs) {
+        let Ok(role) = pplx_space_volmgr_client::proto::SnapshotArtifact::try_from(proof.artifact)
+        else {
+            return Vec::new();
+        };
+        let Some(artifact) = pplx_space_volmgr_client::snapshot_artifact_from_proto(role) else {
+            return Vec::new();
+        };
+        if !seen.insert(artifact)
+            || proof
+                .digest
+                .parse::<pplx_space_common_core::types::Digest>()
+                .is_err()
+        {
+            return Vec::new();
+        }
+        digests.push(pplx_space_node_api_client::proto::SnapshotArtifactDigest {
+            artifact: artifact.file_name().into(),
+            digest: proof.digest.clone(),
+            size_bytes: proof.size_bytes,
+            upload_evidence: Some(pplx_space_node_api_client::proto::SnapshotUploadEvidence {
+                object_key: proof.object_key.clone(),
+                wire_size_bytes: proof.wire_size_bytes,
+                etag: proof.etag.clone(),
+                version_id: proof.version_id.clone(),
+                metadata_binding_digest: proof.metadata_binding_digest.clone(),
+            }),
+        });
+    }
+    digests
+}
+
 /// Flip the backup row to `state='ready'`. This is the terminal step of the
 /// durable worker's `execute` and makes the row visible to restore.
 async fn finalize_with_cluster_api_ready(
     snapshot_id: &str,
     bytes_uploaded: u64,
+    transfers: &[ArtifactTransferObservation],
 ) -> Result<(), JobError> {
     let bytes = bytes_uploaded_i64(snapshot_id, bytes_uploaded);
     let mut client = connect_cluster_api().await?;
@@ -1367,7 +1408,7 @@ async fn finalize_with_cluster_api_ready(
         target_state: pplx_space_node_api_client::proto::SuspendSnapshotTerminalState::Ready as i32,
         bytes_uploaded: bytes,
         failure_reason: None,
-        artifact_digests: Vec::new(),
+        artifact_digests: transfer_digests(transfers),
     };
 
     match client.finalize_artifact_backup(req).await {

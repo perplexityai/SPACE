@@ -1282,3 +1282,72 @@ async fn serialized_subjects_do_not_starve_other_subjects() {
     driver.await.expect("queue driver task should not panic");
     remove_test_db(path);
 }
+
+#[derive(Clone)]
+struct EvidenceExecutor {
+    inner: TestExecutor,
+}
+#[async_trait]
+impl JobExecutor for EvidenceExecutor {
+    async fn execute(&self, job: &Job, cancellation: CancellationToken) -> Result<i64, JobError> {
+        self.inner.execute(job, cancellation).await
+    }
+    async fn execute_with_completion(
+        &self,
+        job: &Job,
+        cancellation: CancellationToken,
+    ) -> Result<crate::JobCompletion, JobError> {
+        let bytes_processed = self.execute(job, cancellation).await?;
+        Ok(crate::JobCompletion {
+            bytes_processed,
+            result: Some(serde_json::json!({"digest":"synthetic-content-proof"})),
+        })
+    }
+}
+
+#[tokio::test]
+async fn worker_merges_completion_with_concurrent_intent_and_refuses_stale_execution() {
+    for superseded in [false, true] {
+        let path = test_db_path("completion-evidence");
+        let db = Arc::new(Mutex::new(open_test_db(&path)));
+        let executor = EvidenceExecutor {
+            inner: TestExecutor::blocking(),
+        };
+        let worker = BackgroundWorker::new(
+            db.clone(),
+            executor.clone(),
+            WorkerConfig::new(1, Duration::from_secs(5), 3),
+        );
+        let id = worker.submit("test", "{\"intent\":1}", None, None).unwrap();
+        executor.inner.wait_started(1).await;
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("UPDATE jobs SET payload=json_set(payload,'$.late_intent',2),attempts=attempts+?2 WHERE job_id=?1",rusqlite::params![id,i32::from(superseded)]).unwrap();
+        }
+        executor.inner.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while worker.inflight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(worker.inflight(), 0);
+        let job = worker.get_job(&id).unwrap().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&job.payload).unwrap();
+        assert_eq!(payload["late_intent"], 2);
+        if superseded {
+            assert_eq!(job.status, "running");
+            assert!(crate::completion_result::<serde_json::Value>(&job).is_none());
+        } else {
+            assert_eq!(job.status, "completed");
+            assert_eq!(
+                crate::completion_result::<serde_json::Value>(&job).unwrap()["digest"],
+                "synthetic-content-proof"
+            );
+        }
+        drop(worker);
+        drop(db);
+        remove_test_db(path);
+    }
+}

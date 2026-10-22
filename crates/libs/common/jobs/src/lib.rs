@@ -368,6 +368,31 @@ impl JobError {
     }
 }
 
+/// A successful execution and an optional service-owned result containing its
+/// completion evidence. The worker publishes both in the same fenced SQLite
+/// transition; partial or superseded executions never publish their evidence.
+#[derive(Debug)]
+pub struct JobCompletion {
+    pub bytes_processed: i64,
+    pub result: Option<serde_json::Value>,
+}
+
+/// Read optional completion evidence only when its schema and producing attempt
+/// match. Old workers, malformed results and rollback schemas remain readable.
+pub fn completion_result<T: serde::de::DeserializeOwned>(job: &Job) -> Option<T> {
+    if job.status != "completed" {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_str(&job.payload).ok()?;
+    let envelope = payload.get("completion_result")?;
+    if envelope.get("version")?.as_u64()? != 1
+        || envelope.get("attempt")?.as_i64()? != i64::from(job.attempts)
+    {
+        return None;
+    }
+    serde_json::from_value(envelope.get("value")?.clone()).ok()
+}
+
 /// Defines the execution logic for a job kind.
 ///
 /// Implementations must be `Clone` + `Send` + `Sync` + `'static` so they
@@ -380,6 +405,21 @@ pub trait JobExecutor: Clone + Send + Sync + 'static {
         job: &Job,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<i64, JobError>;
+
+    /// Executors may return evidence merged into the current intent at completion.
+    /// Existing executors preserve their intent payload unchanged.
+    async fn execute_with_completion(
+        &self,
+        job: &Job,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<JobCompletion, JobError> {
+        self.execute(job, cancellation)
+            .await
+            .map(|bytes_processed| JobCompletion {
+                bytes_processed,
+                result: None,
+            })
+    }
 
     /// Remove executor-owned partial state after cancellation. This runs only
     /// after the execute future has stopped, so cleanup cannot race a writer.
