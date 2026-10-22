@@ -47,10 +47,14 @@
 //! create is answered [`SandboxQuotaOutcome::Contended`] and the caller
 //! retries; the retry counts near the limit and takes the lock exclusively.
 //!
-//! Each lock wait is bounded by [`QUOTA_LOCK_TIMEOUT`]. Near a limit creates
-//! queue on the exclusive lock, each holding its pooled connection while it
-//! waits; past the bound the wait ends as [`SandboxQuotaOutcome::Contended`]
-//! too, so a burst at one org parks connections for at most that long.
+//! Each lock statement's wait is bounded by [`QUOTA_LOCK_TIMEOUT`]. Near a
+//! limit creates queue on the exclusive lock, each holding its pooled
+//! connection while it waits; past the bound the wait ends as
+//! [`SandboxQuotaOutcome::Contended`] too. A create takes one lock per limit
+//! that applies, so a federated caller with both an org and a per-user limit
+//! can wait up to twice the bound, and a burst at one org parks connections
+//! for at most that long. Afterwards the transaction's earlier `lock_timeout`
+//! is restored, not reset to the role's default.
 //!
 //! Locks are taken subject first, then org, after the idempotency-key lock,
 //! on every create, so they cannot deadlock. Deletes take none; one landing
@@ -264,7 +268,7 @@ impl PublicOperationAdmission {
             plan.org
                 .map(|(_, mode)| (plan.org_id.as_uuid(), ORG_LOCK_SEED, mode)),
         ];
-        set_lock_timeout_tx(&mut self.tx, Some(QUOTA_LOCK_TIMEOUT)).await?;
+        let lock_timeout = bound_lock_timeout_tx(&mut self.tx, QUOTA_LOCK_TIMEOUT).await?;
         for (id, seed, mode) in locks.into_iter().flatten() {
             match lock_tx(&mut self.tx, id, seed, mode).await {
                 Ok(()) => {}
@@ -282,7 +286,7 @@ impl PublicOperationAdmission {
                 Err(error) => return Err(error.into()),
             }
         }
-        set_lock_timeout_tx(&mut self.tx, None).await?;
+        restore_lock_timeout_tx(&mut self.tx, &lock_timeout).await?;
         let subject_id = plan.subject.map(|(user_id, _, _)| user_id);
         let held = sandboxes_held_tx(&mut self.tx, plan.org_id, subject_id).await?;
         let org = plan.org.map(|(limit, mode)| {
@@ -311,31 +315,39 @@ impl PublicOperationAdmission {
 }
 
 /// Bound this transaction's lock waits by `timeout` unless a shorter bound
-/// is already set, or with `None` return them to the session default, the
-/// role's `lock_timeout`; the API sets none of its own on a session.
-async fn set_lock_timeout_tx(
+/// is already set. Returns the `lock_timeout` in force before the call, for
+/// [`restore_lock_timeout_tx`].
+async fn bound_lock_timeout_tx(
     tx: &mut Transaction<'_, Postgres>,
-    timeout: Option<Duration>,
+    timeout: Duration,
+) -> Result<String, sqlx::Error> {
+    let previous: String = sqlx::query_scalar(sql!("SELECT current_setting('lock_timeout')"))
+        .fetch_one(&mut **tx)
+        .await?;
+    // `set_config(..., is_local => true)` is `SET LOCAL` with a bind
+    // parameter. `0` is no bound.
+    sqlx::query(sql!(
+        "SELECT set_config('lock_timeout', $1::text, TRUE)
+          WHERE current_setting('lock_timeout')::interval = interval '0'
+             OR current_setting('lock_timeout')::interval > $1::text::interval"
+    ))
+    .bind(format!("{}ms", timeout.as_millis()))
+    .execute(&mut **tx)
+    .await?;
+    Ok(previous)
+}
+
+/// Return this transaction's `lock_timeout` to `previous`, as read by
+/// [`bound_lock_timeout_tx`], keeping any value the caller had set for the
+/// transaction or the session.
+async fn restore_lock_timeout_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    previous: &str,
 ) -> Result<(), sqlx::Error> {
-    match timeout {
-        // `set_config(..., is_local => true)` is `SET LOCAL` with a bind
-        // parameter. `0` is no bound.
-        Some(timeout) => {
-            sqlx::query(sql!(
-                "SELECT set_config('lock_timeout', $1::text, TRUE)
-                  WHERE current_setting('lock_timeout')::interval = interval '0'
-                     OR current_setting('lock_timeout')::interval > $1::text::interval"
-            ))
-            .bind(format!("{}ms", timeout.as_millis()))
-            .execute(&mut **tx)
-            .await?
-        }
-        None => {
-            sqlx::query(sql!("SET LOCAL lock_timeout TO DEFAULT"))
-                .execute(&mut **tx)
-                .await?
-        }
-    };
+    sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
+        .bind(previous)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 

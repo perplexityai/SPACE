@@ -416,6 +416,25 @@ async fn a_long_quota_lock_wait_ends_contended() -> TestResult {
         .fetch_one(&mut *admitted.tx)
         .await?;
     assert_eq!(after, session_default);
+    drop(admitted);
+
+    // A bound the caller set earlier in the transaction, longer or shorter
+    // than ours, is back in force once the locks are held.
+    for earlier in ["7s", "100ms"] {
+        let mut admitted = begin(&store, org_id, "earlier-lock-timeout").await?;
+        sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
+            .bind(earlier)
+            .execute(&mut *admitted.tx)
+            .await?;
+        assert_eq!(
+            admitted.admit_new_create(quota).await?,
+            SandboxQuotaOutcome::Admit
+        );
+        let after: String = sqlx::query_scalar(show)
+            .fetch_one(&mut *admitted.tx)
+            .await?;
+        assert_eq!(after, earlier);
+    }
     Ok(())
 }
 
