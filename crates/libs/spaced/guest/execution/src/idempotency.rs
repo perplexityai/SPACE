@@ -6,15 +6,21 @@ use std::sync::{Mutex, MutexGuard};
 
 // Retry evidence belongs to this daemon lifetime. A restart loses these records;
 // callers cannot infer exactly-once execution across that boundary.
-// Every record is kept for `IDEMPOTENCY_RECORD_TTL`, so this caps the
+// Every completed record is kept for the store's window, so this caps the
 // sustained rate of keyed operations (process starts, file mutations) at
-// MAX / TTL per second. Records are small; `MAX_IDEMPOTENCY_KEY_BYTES` bounds
+// MAX / window per second. Records are small; `MAX_IDEMPOTENCY_KEY_BYTES` bounds
 // their memory.
 const MAX_IDEMPOTENCY_RECORDS: usize = 16_384;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_IDEMPOTENCY_LOOKUPS: usize = 1_024;
 const IDEMPOTENCY_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const CAPACITY_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+// An operation is in progress only until it publishes its result, so this bound
+// does not follow the configurable completed-record window. It limits how long
+// a duplicate waits behind a stalled original while holding a lookup slot, and
+// when that original is treated as abandoned.
+const IN_PROGRESS_LIMIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(super) struct IdempotencyStore {
@@ -37,10 +43,15 @@ struct RejectionDiagnostics {
 }
 
 impl IdempotencyStore {
+    #[cfg(test)]
     pub(super) fn new(scope: &'static str) -> Self {
+        Self::with_window(scope, DEFAULT_RETENTION)
+    }
+
+    pub(super) fn with_window(scope: &'static str, window: Duration) -> Self {
         Self {
             scope,
-            inner: Arc::new(Mutex::new(IdempotencyState::default())),
+            inner: Arc::new(Mutex::new(IdempotencyState::with_window(window))),
             lookup_slots: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_IDEMPOTENCY_LOOKUPS,
             )),
@@ -63,11 +74,17 @@ impl IdempotencyStore {
     }
 }
 
-#[derive(Default)]
 struct IdempotencyState {
     records: HashMap<IdempotencyKey, StoredIdempotencyRecord>,
     key_bytes: usize,
     last_pruned_at: Option<Instant>,
+    window: Duration,
+}
+
+impl Default for IdempotencyState {
+    fn default() -> Self {
+        Self::with_window(DEFAULT_RETENTION)
+    }
 }
 
 #[derive(Clone)]
@@ -131,11 +148,12 @@ impl IdempotencyStore {
         loop {
             let notify = {
                 let mut state = self.state();
+                let window = state.window;
                 let now = Instant::now();
                 state.prune_if_due(now);
                 match state.records.get(&key) {
                     Some(StoredIdempotencyRecord::Completed { result, created_at }) => {
-                        if created_at.elapsed() > IDEMPOTENCY_RECORD_TTL {
+                        if created_at.elapsed() > window {
                             state.records.insert(
                                 key,
                                 StoredIdempotencyRecord::Expired {
@@ -148,7 +166,7 @@ impl IdempotencyStore {
                         return Ok(IdempotencyLookup::Completed(result.clone()));
                     }
                     Some(StoredIdempotencyRecord::InProgress { created_at, notify }) => {
-                        if created_at.elapsed() > IDEMPOTENCY_RECORD_TTL {
+                        if created_at.elapsed() > IN_PROGRESS_LIMIT {
                             let notify = notify.clone();
                             notify.notify_waiters();
                             state.records.insert(
@@ -163,7 +181,7 @@ impl IdempotencyStore {
                         // Register under the state lock. `notify_waiters` does
                         // not retain a permit for a future waiter, so creating
                         // this only after unlocking can lose completion and
-                        // sleep until the full TTL timeout.
+                        // sleep until the full limit.
                         enabled_notification(notify.clone())
                     }
                     Some(StoredIdempotencyRecord::Expired { .. }) => {
@@ -200,7 +218,7 @@ impl IdempotencyStore {
                     }
                 }
             };
-            match tokio::time::timeout(IDEMPOTENCY_RECORD_TTL, notify).await {
+            match tokio::time::timeout(IN_PROGRESS_LIMIT, notify).await {
                 Ok(()) | Err(_) => {}
             }
         }
@@ -278,7 +296,7 @@ impl IdempotencyStore {
             key,
             StoredIdempotencyRecord::Completed {
                 result: Ok(record),
-                created_at: Instant::now() - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1),
+                created_at: Instant::now() - DEFAULT_RETENTION - Duration::from_secs(1),
             },
         );
     }
@@ -341,6 +359,15 @@ impl RejectionDiagnostics {
 }
 
 impl IdempotencyState {
+    fn with_window(window: Duration) -> Self {
+        Self {
+            records: HashMap::new(),
+            key_bytes: 0,
+            last_pruned_at: None,
+            window,
+        }
+    }
+
     fn can_insert(&self, key: &IdempotencyKey) -> bool {
         self.records.len() < MAX_IDEMPOTENCY_RECORDS
             && self.key_bytes.saturating_add(key.as_str().len()) <= MAX_IDEMPOTENCY_KEY_BYTES
@@ -355,13 +382,14 @@ impl IdempotencyState {
 
     fn prune(&mut self, now: Instant) {
         self.last_pruned_at = Some(now);
+        let window = self.window;
         let mut notify = Vec::new();
         for record in self.records.values_mut() {
             match record {
                 StoredIdempotencyRecord::InProgress {
                     created_at,
                     notify: waiter,
-                } if now.duration_since(*created_at) > IDEMPOTENCY_RECORD_TTL => {
+                } if now.duration_since(*created_at) > IN_PROGRESS_LIMIT => {
                     notify.push(waiter.clone());
                     *record = StoredIdempotencyRecord::Expired {
                         expired_at: now,
@@ -369,7 +397,7 @@ impl IdempotencyState {
                     };
                 }
                 StoredIdempotencyRecord::Completed { created_at, .. }
-                    if now.duration_since(*created_at) > IDEMPOTENCY_RECORD_TTL =>
+                    if now.duration_since(*created_at) > window =>
                 {
                     *record = StoredIdempotencyRecord::Expired {
                         expired_at: now,
@@ -442,7 +470,7 @@ impl IdempotencyReservation {
             claim.store.state().records.get(&claim.key),
             Some(StoredIdempotencyRecord::InProgress { created_at, notify, .. })
                 if Arc::ptr_eq(notify, &claim.generation)
-                    && created_at.elapsed() <= IDEMPOTENCY_RECORD_TTL
+                    && created_at.elapsed() <= IN_PROGRESS_LIMIT
         );
         if !current {
             return Err(Status::failed_precondition("idempotency_key expired"));

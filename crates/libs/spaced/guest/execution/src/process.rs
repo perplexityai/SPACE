@@ -196,7 +196,7 @@ impl ProcessSupervision {
         drop(exit_observer);
         #[cfg(not(target_os = "linux"))]
         let () = exit_observer;
-        // The record stays for `IDEMPOTENCY_RECORD_TTL`; the registry's single
+        // The record stays for the completed retention; the registry's single
         // reaper removes it. Waiting here instead kept this whole task (its
         // future, about 2 KiB) alive for the retention of every start, so at
         // sustained start rates spaced held starts/s x 60 s of them: ~48 MiB
@@ -533,6 +533,7 @@ pub(super) struct ProcessRegistry {
     /// completed record is retained, so an idle daemon has no timer.
     reaper_running: Arc<std::sync::atomic::AtomicBool>,
     output_budget: ProcessOutputBudget,
+    completed_retention: Duration,
 }
 
 /// A process id in use: by an admitted start that has not published its
@@ -632,18 +633,22 @@ impl ProcessRecord {
 impl Default for ProcessRegistry {
     /// The budget of a guest of unknown size: the full 64 MiB.
     fn default() -> Self {
-        Self::new(ProcessOutputBudget::for_guest_memory(None))
+        Self::new(
+            ProcessOutputBudget::for_guest_memory(None),
+            DEFAULT_RETENTION,
+        )
     }
 }
 
 impl ProcessRegistry {
-    pub(super) fn new(output_budget: ProcessOutputBudget) -> Self {
+    pub(super) fn new(output_budget: ProcessOutputBudget, completed_retention: Duration) -> Self {
         Self {
             records: Arc::new(DashMap::new()),
             record_slots: Arc::new(Semaphore::new(PROCESS_RECORD_LIMIT)),
             shared_output_slots: Arc::new(Semaphore::new(output_budget.shared)),
             reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             output_budget,
+            completed_retention,
         }
     }
 }
@@ -1003,12 +1008,12 @@ impl ProcessEventJournal {
             .is_some()
     }
 
-    fn is_expired(&self) -> bool {
+    fn is_expired(&self, retention: Duration) -> bool {
         self.state
             .lock()
             .expect("process output journal lock poisoned")
             .completed_at
-            .is_some_and(|completed_at| completed_at.elapsed() > IDEMPOTENCY_RECORD_TTL)
+            .is_some_and(|completed_at| completed_at.elapsed() > retention)
     }
 
     /// Moves the completion time back, as if `by` had passed since.
@@ -1392,7 +1397,7 @@ impl ProcessRegistry {
             .records
             .get(process_id)
             .and_then(|entry| entry.record().cloned())?;
-        if record.journal.is_expired() {
+        if record.journal.is_expired(self.completed_retention) {
             self.records.remove(process_id);
             return None;
         }
@@ -1461,7 +1466,7 @@ impl ProcessRegistry {
         self.records.retain(|_, entry| {
             !entry
                 .record()
-                .is_some_and(|record| record.journal.is_expired())
+                .is_some_and(|record| record.journal.is_expired(self.completed_retention))
         });
     }
 
@@ -1472,7 +1477,7 @@ impl ProcessRegistry {
             .iter()
             .filter_map(|entry| entry.record()?.journal.completed_at())
             .min()
-            .map(|completed_at| completed_at + IDEMPOTENCY_RECORD_TTL + Duration::from_millis(1))
+            .map(|completed_at| completed_at + self.completed_retention + Duration::from_millis(1))
     }
 
     fn list(&self) -> Vec<ProcessInfo> {
@@ -1482,7 +1487,7 @@ impl ProcessRegistry {
             .iter()
             .filter_map(|entry| {
                 let record = entry.record()?;
-                if record.journal.is_expired() {
+                if record.journal.is_expired(self.completed_retention) {
                     expired.push(entry.key().clone());
                     return None;
                 }
@@ -1937,9 +1942,9 @@ impl Process for ExecutionService {
         // session, which is what a timed-out start leaves behind. Every later
         // step can fail or stall for such a retry of a still-running process:
         // the account lookup or PTY setup hits the descriptor limit,
-        // `reserve_or_get` fails an idempotency key past
-        // `IDEMPOTENCY_RECORD_TTL`, and `reserve` reports exhaustion when every
-        // record slot holds a running process. Answering here also keeps the
+        // `reserve_or_get` fails an idempotency key past its window, and
+        // `reserve` reports exhaustion when every record slot holds a running
+        // process. Answering here also keeps the
         // outcome independent of the idempotency record's lifetime. Payload
         // admission in front of this handler, here and in spaced-host, still
         // applies: it runs before the request is decoded, so while every start

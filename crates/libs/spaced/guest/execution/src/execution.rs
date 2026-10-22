@@ -21,6 +21,45 @@ pub struct ExecutionServiceConfig {
     pub cancellation_grace: Duration,
     /// Guest memory used to size retained process output; None uses the fallback budget.
     pub guest_memory_bytes: Option<u64>,
+    /// How long completed processes and keyed starts are kept for callers.
+    pub process_retention: ProcessRetention,
+}
+
+/// How long this service lifetime keeps what a retrying or reconnecting caller
+/// needs. A restart loses both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessRetention {
+    /// How long a completed process's exit and retained output stay
+    /// replayable. When every record slot is held, the record that completed
+    /// first is evicted to admit a new start. Retained output keeps its share
+    /// of the output budget until then, so a longer window leaves less shared
+    /// budget to running processes.
+    pub completed: Duration,
+    /// How long a completed keyed start is remembered. The key store's fixed
+    /// capacity divided by this window bounds the sustained rate of keyed
+    /// starts. A start still in progress is not affected: its duplicates wait
+    /// at most 60 seconds for it.
+    pub idempotency: Duration,
+}
+
+impl Default for ProcessRetention {
+    fn default() -> Self {
+        Self {
+            completed: DEFAULT_RETENTION,
+            idempotency: DEFAULT_RETENTION,
+        }
+    }
+}
+
+impl ProcessRetention {
+    fn validate(self) -> Result<(), CreateExecutionServiceError> {
+        let valid = |window: Duration| !window.is_zero() && window <= MAX_RETENTION;
+        if valid(self.completed) && valid(self.idempotency) {
+            Ok(())
+        } else {
+            Err(CreateExecutionServiceError::InvalidProcessRetention)
+        }
+    }
 }
 
 impl Default for ExecutionServiceConfig {
@@ -35,6 +74,7 @@ impl Default for ExecutionServiceConfig {
             },
             cancellation_grace: filesystem::router::DEFAULT_CANCELLATION_GRACE,
             guest_memory_bytes: None,
+            process_retention: ProcessRetention::default(),
             worker_executable: None,
             identity_policy: if cfg!(target_os = "linux") {
                 IdentityPolicy::Restricted
@@ -57,6 +97,8 @@ pub enum CreateExecutionServiceError {
     RestrictedRequiresPrivilege,
     #[error("cannot inspect launcher capabilities: {0}")]
     InspectPrivileges(#[source] std::io::Error),
+    #[error("process retention windows must be nonzero and at most seven days")]
+    InvalidProcessRetention,
 }
 
 #[derive(Clone)]
@@ -110,6 +152,7 @@ impl ExecutionService {
         config: ExecutionServiceConfig,
         guest_cgroups: Option<Arc<ExecutionCgroups>>,
     ) -> Result<Self, CreateExecutionServiceError> {
+        config.process_retention.validate()?;
         let filesystem = filesystem::FilesystemRouter::new(
             config.filesystem_execution,
             config.worker_executable,
@@ -133,10 +176,14 @@ impl ExecutionService {
                 default_operation_user: config.default_operation_user,
                 identity_policy: config.identity_policy,
                 process_env: RwLock::new(EnvMap::empty()),
-                processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(
-                    config.guest_memory_bytes,
-                )),
-                idempotency: IdempotencyStore::new("process"),
+                processes: ProcessRegistry::new(
+                    process::ProcessOutputBudget::for_guest_memory(config.guest_memory_bytes),
+                    config.process_retention.completed,
+                ),
+                idempotency: IdempotencyStore::with_window(
+                    "process",
+                    config.process_retention.idempotency,
+                ),
                 filesystem,
                 guest_cgroups,
             }),
