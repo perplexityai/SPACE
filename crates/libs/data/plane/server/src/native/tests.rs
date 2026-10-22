@@ -422,7 +422,10 @@ enum FakeBind {
 #[derive(Clone, Copy)]
 enum FakeProcess {
     Running,
+    /// The guest has no such process.
     Missing,
+    /// The node has no such sandbox.
+    SandboxMissing,
     Unreachable,
 }
 
@@ -593,7 +596,13 @@ async fn spawn_session_fake(session_id: DataPlaneSessionId, session: FakeSession
                 match process {
                     FakeProcess::Running => connected_events,
                     FakeProcess::Missing => {
-                        return tonic::Status::not_found("process not found").into_http::<Body>();
+                        return pplx_space_common_grpc::mark_guest_process_error(
+                            tonic::Status::not_found("process not found"),
+                        )
+                        .into_http::<Body>();
+                    }
+                    FakeProcess::SandboxMissing => {
+                        return tonic::Status::not_found("sandbox not found").into_http::<Body>();
                     }
                     FakeProcess::Unreachable => {
                         return tonic::Status::unavailable("worker unreachable")
@@ -871,7 +880,8 @@ async fn events_stream_refuses_to_start_pty_process_sessions() {
 
 /// A WebSocket start reports the process before its binding commits. While
 /// the route still says unbound, the worker's running process is resumed
-/// rather than refused.
+/// rather than refused, through the one connect that also asked whether it
+/// runs, and this stream commits the binding.
 #[tokio::test]
 async fn events_stream_resumes_a_running_pty_process_before_its_binding_commits() {
     if !binding_fake_test_process() {
@@ -892,18 +902,61 @@ async fn events_stream_resumes_a_running_pty_process_before_its_binding_commits(
     let (_state, mut chunks) = open_process_events(&fake, session_id, None).await;
     let mut seen = String::new();
 
+    fake.release.add_permits(1);
     read_until(&mut chunks, &mut seen, "process_exited").await;
-    assert!(!fake.called("/SpacedStartProcess"), "nothing was started");
+    let calls = fake.calls.lock().unwrap();
+    let connects = calls
+        .iter()
+        .filter(|path| path.ends_with("/SpacedConnectProcess"))
+        .count();
+    assert_eq!(connects, 1, "the stream is the first connect: {calls:?}");
     assert!(
-        fake.bound_process_ids.lock().unwrap().is_empty(),
-        "the starter owns the binding"
+        !calls
+            .iter()
+            .any(|path| path.ends_with("/SpacedStartProcess")),
+        "nothing was started"
     );
+    assert_eq!(
+        *fake.bound_process_ids.lock().unwrap(),
+        vec![pplx_space_public_api::process_id_for_session(session_id).to_string()],
+        "the resumed process was bound"
+    );
+}
+
+/// A `NotFound` from the node, such as for a missing sandbox, is not the
+/// guest saying it has no process, so the attach keeps the answer a start
+/// gets rather than the pty refusal.
+#[tokio::test]
+async fn events_stream_does_not_refuse_a_pty_session_whose_sandbox_is_missing() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: PTY_SESSION,
+            bound: &[false],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::SandboxMissing,
+        },
+    )
+    .await;
+    let state = binding_fake_state(&fake).await;
+    let response = get_session_events(&state, session_id, None).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = error_body(response).await;
+    assert_eq!(body["error"]["code"], "stream_unavailable", "{body}");
+    assert_eq!(body["error"]["retryable"], true, "{body}");
+    assert!(!fake.called("/SpacedStartProcess"), "nothing was started");
 }
 
 /// When the worker cannot say whether the session's process exists, the
 /// attach is answered as retryable rather than refused.
 #[tokio::test]
-async fn events_stream_answers_a_failed_process_probe_as_retryable() {
+async fn events_stream_answers_a_failed_process_connect_as_retryable() {
     if !binding_fake_test_process() {
         return;
     }
@@ -990,7 +1043,7 @@ async fn events_stream_resumes_started_pty_process_sessions() {
 
 /// The cached route can predate a binding another attach just made. An
 /// unbound pty route is read again, and a process bound in the meantime is
-/// resumed without asking the worker first.
+/// resumed through its binding, which is not written again.
 #[tokio::test]
 async fn events_stream_rereads_an_unbound_pty_route_before_refusing() {
     if !binding_fake_test_process() {
@@ -1011,21 +1064,23 @@ async fn events_stream_rereads_an_unbound_pty_route_before_refusing() {
     let (_state, mut chunks) = open_process_events(&fake, session_id, None).await;
     let mut seen = String::new();
 
+    fake.release.add_permits(1);
     read_until(&mut chunks, &mut seen, "process_exited").await;
     let calls = fake.calls.lock().unwrap();
     let connects = calls
         .iter()
         .filter(|path| path.ends_with("/SpacedConnectProcess"))
         .count();
-    assert_eq!(
-        connects, 1,
-        "resumed from the re-read route, unprobed: {calls:?}"
-    );
+    assert_eq!(connects, 1, "resumed from the re-read route: {calls:?}");
     assert!(
         !calls
             .iter()
             .any(|path| path.ends_with("/SpacedStartProcess")),
         "nothing was started"
+    );
+    assert!(
+        fake.bound_process_ids.lock().unwrap().is_empty(),
+        "already bound"
     );
 }
 

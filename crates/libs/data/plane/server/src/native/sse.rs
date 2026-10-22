@@ -111,68 +111,33 @@ pub(crate) async fn session_events(
                     );
                 }
             };
-            // Refused only when this attach would start a pty process, whose
-            // input this stream can neither deliver nor close, so it would
-            // wait and outlive the request. A process already bound to the
-            // session reconnects as usual: reading its output starts nothing.
-            // The cached route can predate a binding just made elsewhere, so
-            // an unbound one is read again; and a WebSocket start reports the
-            // process before its binding commits, so the worker is asked for
-            // the session's process before refusing.
-            let attached = if attached.backend_process_id.is_none()
+            // A pty process is never started here: this stream can neither
+            // deliver nor close its input, so it would wait and outlive the
+            // request. A process already bound to the session reconnects as
+            // usual, since reading its output starts nothing. The cached route
+            // can predate a binding just made elsewhere, so an unbound one is
+            // read again; and a WebSocket start reports the process before its
+            // binding commits, so a still-unbound session connects to its
+            // derived process id, keeps that stream and binds it, and is
+            // refused only when the guest has no such process.
+            let (attached, input) = if attached.backend_process_id.is_none()
                 && process_session_needs_pty(&attached)
             {
-                let mut current =
-                    match resolve_session_route_with_cache(&state, session_id, &token, false).await
-                    {
-                        Ok(current) => current,
-                        Err(error) => {
-                            pplx_space_metrics::data_plane::attach(
-                                session_id.kind().as_str(),
-                                error.metric_label(),
-                            );
-                            return route_resolution_http_error(error);
-                        }
-                    };
-                if current.backend_process_id.is_none() {
-                    let probe = before_stream_deadline(
-                        &state.stream_shutdown_token,
-                        probe_session_process(&state, session_id, &mut current),
-                    )
-                    .await;
-                    let Some(probe) = probe else {
-                        return native_draining_response(session_id.kind().as_str());
-                    };
-                    match probe {
-                        Ok(Some(process_id)) => current.backend_process_id = Some(process_id),
-                        Ok(None) => {
-                            pplx_space_metrics::data_plane::attach(
-                                session_id.kind().as_str(),
-                                "input_unsupported",
-                            );
-                            return data_plane_http_error(
-                                StatusCode::BAD_REQUEST,
-                                DataPlaneHttpErrorCode::InvalidRequest,
-                                "events stream cannot send input; attach a pty process session over WebSocket",
-                                false,
-                                ResponseOrigin::Client,
-                                ResponseKind::Validation,
-                            );
-                        }
-                        Err(error) => {
-                            let result = stream_bridge_error_label(&error);
-                            pplx_space_metrics::data_plane::attach(
-                                session_id.kind().as_str(),
-                                result,
-                            );
-                            tracing::warn!(%error, "failed to probe process session");
-                            return process_stream_start_http_error(&error);
-                        }
+                match resolve_session_route_with_cache(&state, session_id, &token, false).await {
+                    Ok(current) if current.backend_process_id.is_some() => {
+                        (current, ProcessInput::Closed)
+                    }
+                    Ok(current) => (current, ProcessInput::ConnectOnly),
+                    Err(error) => {
+                        pplx_space_metrics::data_plane::attach(
+                            session_id.kind().as_str(),
+                            error.metric_label(),
+                        );
+                        return route_resolution_http_error(error);
                     }
                 }
-                current
             } else {
-                attached
+                (attached, ProcessInput::Closed)
             };
             let stream_shutdown_token = state.stream_shutdown_token.clone();
             let opened = before_stream_deadline(
@@ -182,6 +147,7 @@ pub(crate) async fn session_events(
                     session_id,
                     attached,
                     last_event_id,
+                    input,
                     stream_permit,
                     start_permit,
                 ),
@@ -192,6 +158,22 @@ pub(crate) async fn session_events(
             };
             match opened {
                 Ok(stream_state) => SessionSseState::Process(stream_state),
+                Err(error)
+                    if input == ProcessInput::ConnectOnly && is_missing_guest_process(&error) =>
+                {
+                    pplx_space_metrics::data_plane::attach(
+                        session_id.kind().as_str(),
+                        "input_unsupported",
+                    );
+                    return data_plane_http_error(
+                        StatusCode::BAD_REQUEST,
+                        DataPlaneHttpErrorCode::InvalidRequest,
+                        "events stream cannot send input; attach a pty process session over WebSocket",
+                        false,
+                        ResponseOrigin::Client,
+                        ResponseKind::Validation,
+                    );
+                }
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
@@ -346,6 +328,7 @@ impl ProcessSseState {
         session_id: DataPlaneSessionId,
         mut attached: AttachedSession,
         last_event_id: Option<u64>,
+        input: ProcessInput,
         stream_permit: AttachedStreamPermit,
         start_permit: Option<NativeSessionAttachPermit>,
     ) -> Result<Self, StreamBridgeError> {
@@ -355,7 +338,7 @@ impl ProcessSseState {
             session_id,
             &mut attached,
             replay.backend_output_cursor,
-            ProcessInput::Closed,
+            input,
         )
         .await?;
         let mut pending = VecDeque::new();

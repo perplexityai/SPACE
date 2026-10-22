@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Whether the attach that may start a process can write its input.
+/// What the attach that may start a process can do with its input.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProcessInput {
     /// A WebSocket attach forwards stdin frames to the process.
@@ -11,6 +11,22 @@ pub(super) enum ProcessInput {
     /// An SSE stream carries no input, so a requested stdin starts at EOF
     /// instead of as a pipe that nothing can write to or close.
     Closed,
+    /// An SSE stream can neither write nor close a pty's input, so it never
+    /// starts the process: it only connects to one the guest already runs
+    /// under the session's derived id. When the guest has none, the open
+    /// fails with an error [`is_missing_guest_process`] recognizes.
+    ConnectOnly,
+}
+
+/// The guest's own answer that it has no such process, as opposed to a
+/// `NotFound` from the node, such as a missing sandbox.
+pub(super) fn is_missing_guest_process(error: &StreamBridgeError) -> bool {
+    matches!(
+        error,
+        StreamBridgeError::BackendStatus(status)
+            if status.code() == tonic::Code::NotFound
+                && pplx_space_common_grpc::is_terminal_guest_process_error(status)
+    )
 }
 
 pub(super) async fn initial_process_stream(
@@ -25,6 +41,17 @@ pub(super) async fn initial_process_stream(
             client,
             &attached.sandbox_id,
             process_id,
+            output_cursor,
+            attached.space_api_route_token.as_ref(),
+        )
+        .await;
+    }
+
+    if input == ProcessInput::ConnectOnly {
+        return connect_process_stream(
+            client,
+            &attached.sandbox_id,
+            &process_id_for_session(session_id),
             output_cursor,
             attached.space_api_route_token.as_ref(),
         )
@@ -89,48 +116,6 @@ pub(super) async fn open_native_process_stream(
         Ok((client, stream))
     })
     .await
-}
-
-/// Asks the worker whether it already runs the process this session would
-/// start, under the session's derived process id. `None` when the guest
-/// reports no such process; any other failure, including running past the
-/// attach deadline, is an error.
-pub(super) async fn probe_session_process(
-    state: &DataPlaneState,
-    session_id: DataPlaneSessionId,
-    attached: &mut AttachedSession,
-) -> Result<Option<ProcessId>, StreamBridgeError> {
-    let process_id = process_id_for_session(session_id);
-    let probe = native_route_call(state, attached, |route| {
-        let process_id = process_id.clone();
-        async move {
-            let channel = state
-                .backend_channels
-                .channel(&route.backend_endpoint, session_id)
-                .await?;
-            let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-            connect_process_stream(
-                &mut client,
-                &route.sandbox_id,
-                &process_id,
-                None,
-                route.space_api_route_token.as_ref(),
-            )
-            .await
-        }
-    });
-    match tokio::time::timeout(state.attach_deadline, probe).await {
-        Ok(Ok(_stream)) => Ok(Some(process_id)),
-        Ok(Err(StreamBridgeError::BackendStatus(status)))
-            if status.code() == tonic::Code::NotFound =>
-        {
-            Ok(None)
-        }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(StreamBridgeError::BackendStatus(
-            tonic::Status::deadline_exceeded("process probe deadline exceeded"),
-        )),
-    }
 }
 
 /// A backend refusal made before this request did anything (an admission
