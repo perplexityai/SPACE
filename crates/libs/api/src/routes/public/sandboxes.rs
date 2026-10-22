@@ -114,7 +114,7 @@ pub async fn create_sandbox(
         federated_create,
         pool_claims,
         state
-            .org_sandbox_quota
+            .native_sandbox_limits
             .for_create(org.id, owner.is_some().then_some(actor.id)),
     )
     .await?;

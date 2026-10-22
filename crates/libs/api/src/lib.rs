@@ -23,13 +23,13 @@ pub mod fork_operations;
 pub(crate) mod limiter_liveness;
 pub mod middleware;
 pub mod models;
+pub mod native_sandbox_limits;
 // Resolving a node-group candidate set produces a `NodeGroupPlacement`, which
 // lives behind common-core's `kubernetes` feature.
 mod credential_injection;
 mod ingress_activation;
 #[cfg(feature = "kubernetes")]
 pub mod node_group_placement;
-pub mod org_sandbox_quota;
 pub mod public_operation_driver;
 pub mod public_operations;
 pub mod public_sandbox_operations;

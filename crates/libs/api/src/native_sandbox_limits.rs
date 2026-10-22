@@ -20,14 +20,14 @@ const OVERRIDES_ENV: &str = "SPACE_NATIVE_ORG_SANDBOX_LIMIT_OVERRIDES";
 const SUBJECT_LIMIT_ENV: &str = "SPACE_NATIVE_SUBJECT_SANDBOX_LIMIT";
 
 #[derive(Clone, Debug, Default)]
-pub struct OrgSandboxQuota {
+pub struct NativeSandboxLimits {
     default_limit: Option<u32>,
     overrides: Arc<BTreeMap<OrgId, u32>>,
     subject_limit: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum OrgSandboxQuotaConfigError {
+pub enum NativeSandboxLimitsConfigError {
     #[error("{0} is not valid Unicode")]
     NonUnicode(&'static str),
     #[error("invalid {DEFAULT_LIMIT_ENV}: {0}")]
@@ -38,8 +38,8 @@ pub enum OrgSandboxQuotaConfigError {
     SubjectLimit(#[source] std::num::ParseIntError),
 }
 
-impl OrgSandboxQuota {
-    pub fn from_env() -> Result<Self, OrgSandboxQuotaConfigError> {
+impl NativeSandboxLimits {
+    pub fn from_env() -> Result<Self, NativeSandboxLimitsConfigError> {
         Self::parse(
             env_var(DEFAULT_LIMIT_ENV)?.as_deref(),
             env_var(OVERRIDES_ENV)?.as_deref(),
@@ -51,17 +51,17 @@ impl OrgSandboxQuota {
         default_limit: Option<&str>,
         overrides: Option<&str>,
         subject_limit: Option<&str>,
-    ) -> Result<Self, OrgSandboxQuotaConfigError> {
+    ) -> Result<Self, NativeSandboxLimitsConfigError> {
         let default_limit =
-            parse_limit(default_limit).map_err(OrgSandboxQuotaConfigError::DefaultLimit)?;
+            parse_limit(default_limit).map_err(NativeSandboxLimitsConfigError::DefaultLimit)?;
         let subject_limit =
-            parse_limit(subject_limit).map_err(OrgSandboxQuotaConfigError::SubjectLimit)?;
+            parse_limit(subject_limit).map_err(NativeSandboxLimitsConfigError::SubjectLimit)?;
         let overrides = overrides
             .map(str::trim)
             .filter(|raw| !raw.is_empty())
             .map(serde_json::from_str)
             .transpose()
-            .map_err(OrgSandboxQuotaConfigError::Overrides)?
+            .map_err(NativeSandboxLimitsConfigError::Overrides)?
             .unwrap_or_default();
         Ok(Self {
             default_limit,
@@ -101,11 +101,13 @@ fn parse_limit(raw: Option<&str>) -> Result<Option<u32>, std::num::ParseIntError
         .transpose()
 }
 
-fn env_var(name: &'static str) -> Result<Option<String>, OrgSandboxQuotaConfigError> {
+fn env_var(name: &'static str) -> Result<Option<String>, NativeSandboxLimitsConfigError> {
     match std::env::var(name) {
         Ok(raw) => Ok(Some(raw)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(OrgSandboxQuotaConfigError::NonUnicode(name)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(NativeSandboxLimitsConfigError::NonUnicode(name))
+        }
     }
 }
 

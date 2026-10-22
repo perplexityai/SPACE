@@ -42,9 +42,9 @@ pub struct AppState {
     /// reconnect operations. Guardrail against a single client saturating the
     /// Kubernetes control-plane API. See [`crate::client_concurrency`].
     pub client_concurrency: crate::client_concurrency::ClientConcurrencyLimiter,
-    /// Per-org live-sandbox cap for native creates. See
-    /// [`crate::org_sandbox_quota`].
-    pub org_sandbox_quota: crate::org_sandbox_quota::OrgSandboxQuota,
+    /// Per-org and per-user live-sandbox limits for native creates. See
+    /// [`crate::native_sandbox_limits`].
+    pub native_sandbox_limits: crate::native_sandbox_limits::NativeSandboxLimits,
     /// Flipped to `true` once the sandbox pod reflector has completed its
     /// initial `LIST`. `/readyz` gates the Service endpoint on this so a
     /// fresh replica does not receive traffic with a cold cache.
@@ -87,7 +87,7 @@ pub enum AppStateError {
     #[error("client classification configuration failed: {0}")]
     ClientClassification(#[from] crate::client_classification::ClientClassificationError),
     #[error(transparent)]
-    OrgSandboxQuota(#[from] crate::org_sandbox_quota::OrgSandboxQuotaConfigError),
+    NativeSandboxLimits(#[from] crate::native_sandbox_limits::NativeSandboxLimitsConfigError),
     #[error(transparent)]
     CommandStream(#[from] crate::command_stream::CommandStreamConfigError),
     #[error(transparent)]
@@ -130,7 +130,7 @@ impl AppState {
         let feature_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
         let native_hidden_operations = public::hidden_operations::HiddenOperationsGate::from_env()?;
         let client_classification = crate::client_classification::ClientClassification::from_env()?;
-        let org_sandbox_quota = crate::org_sandbox_quota::OrgSandboxQuota::from_env()?;
+        let native_sandbox_limits = crate::native_sandbox_limits::NativeSandboxLimits::from_env()?;
         // Cloned into the substrate, which consumes both, so the limiter
         // heartbeats below can still be spawned from the originals.
         let substrate = crate::controllers::substrate::Substrate::from_env_with_lifecycle(
@@ -183,7 +183,7 @@ impl AppState {
             template_controller,
             client_classification,
             client_concurrency,
-            org_sandbox_quota,
+            native_sandbox_limits,
             readiness,
             drain_signal,
             template_build_state,

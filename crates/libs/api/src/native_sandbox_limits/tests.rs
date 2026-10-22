@@ -1,6 +1,6 @@
 use pplx_space_common_core::types::{OrgId, UserId};
 
-use super::OrgSandboxQuota;
+use super::NativeSandboxLimits;
 use crate::public_operations::{SandboxQuota, SubjectSandboxQuota};
 
 #[test]
@@ -9,7 +9,7 @@ fn unset_or_empty_configuration_limits_no_caller() {
     for (default_limit, overrides, subject_limit) in
         [(None, None, None), (Some(""), Some("  "), Some(""))]
     {
-        let quota = OrgSandboxQuota::parse(default_limit, overrides, subject_limit).unwrap();
+        let quota = NativeSandboxLimits::parse(default_limit, overrides, subject_limit).unwrap();
         assert_eq!(quota.for_create(org, None), None);
         assert_eq!(quota.for_create(org, Some(UserId::new())), None);
     }
@@ -21,11 +21,11 @@ fn an_org_override_takes_precedence_over_the_default() {
     let other = OrgId::new();
     let overrides = format!(r#"{{"{capped}": 3}}"#);
 
-    let quota = OrgSandboxQuota::parse(None, Some(&overrides), None).unwrap();
+    let quota = NativeSandboxLimits::parse(None, Some(&overrides), None).unwrap();
     assert_eq!(quota.limit_for(capped), Some(3));
     assert_eq!(quota.limit_for(other), None);
 
-    let quota = OrgSandboxQuota::parse(Some("100"), Some(&overrides), None).unwrap();
+    let quota = NativeSandboxLimits::parse(Some("100"), Some(&overrides), None).unwrap();
     assert_eq!(quota.limit_for(capped), Some(3));
     assert_eq!(quota.limit_for(other), Some(100));
 }
@@ -34,7 +34,7 @@ fn an_org_override_takes_precedence_over_the_default() {
 fn only_a_federated_caller_has_a_subject_limit() {
     let org = OrgId::new();
     let subject = UserId::new();
-    let subject_only = OrgSandboxQuota::parse(None, None, Some("5")).unwrap();
+    let subject_only = NativeSandboxLimits::parse(None, None, Some("5")).unwrap();
     assert_eq!(subject_only.for_create(org, None), None);
     assert_eq!(
         subject_only.for_create(org, Some(subject)),
@@ -47,7 +47,7 @@ fn only_a_federated_caller_has_a_subject_limit() {
         })
     );
 
-    let both = OrgSandboxQuota::parse(Some("100"), None, Some("5")).unwrap();
+    let both = NativeSandboxLimits::parse(Some("100"), None, Some("5")).unwrap();
     assert_eq!(
         both.for_create(org, None),
         Some(SandboxQuota {
@@ -77,7 +77,7 @@ fn malformed_configuration_is_rejected() {
         (None, None, Some("five")),
     ] {
         assert!(
-            OrgSandboxQuota::parse(default_limit, overrides, subject_limit).is_err(),
+            NativeSandboxLimits::parse(default_limit, overrides, subject_limit).is_err(),
             "{default_limit:?} {overrides:?} {subject_limit:?}"
         );
     }
