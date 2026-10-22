@@ -76,9 +76,9 @@ impl ClusterApiService {
     /// `caller_org_id` on the lookup requests is caller-asserted and the node
     /// pull path omits it, so it cannot authorize anything. A node-scoped
     /// caller (every TokenReview identity, and the static token once
-    /// TokenReview is configured) is instead bound to the nodes registered at
-    /// its remote address, the same binding `validate_origin_remote_addr`
-    /// applies to node-bound RPCs; a caller with no registered node resolves
+    /// TokenReview is configured) is instead bound to registered nodes. Pod-bound
+    /// tokens use the reviewed node name and UID; static-token callers use the
+    /// remote address. A caller with no matching registered node resolves
     /// generic templates only. A request that reached the handler without the
     /// auth layer (tests, local simulators) is unscoped, matching how the
     /// other narrow authorities treat a missing extension.
@@ -88,17 +88,31 @@ impl ClusterApiService {
     ) -> Result<super::template_releases_store::TemplateReadScope, Status> {
         use super::template_releases_store::TemplateReadScope;
         use pplx_space_common_svc::auth::{
-            NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
+            AuthenticatedNodeIdentity, NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
         };
 
-        let node_scoped = request
-            .extensions()
-            .get::<NodeApiAuthenticatedCaller>()
-            .is_some_and(|caller| {
-                caller.template_release_read_authority() == TemplateReleaseReadAuthority::NodeScoped
-            });
-        if !node_scoped {
+        let Some(caller) = request.extensions().get::<NodeApiAuthenticatedCaller>() else {
             return Ok(TemplateReadScope::Unscoped);
+        };
+        if caller.template_release_read_authority() == TemplateReleaseReadAuthority::Unscoped {
+            return Ok(TemplateReadScope::Unscoped);
+        }
+        match caller.node_identity() {
+            AuthenticatedNodeIdentity::Kubernetes(Some(node)) => {
+                return self
+                    .template_releases_store
+                    .node_scope_for_identity(node)
+                    .await
+                    .map_err(|err| {
+                        Status::internal(format!("resolve caller node identity: {err}"))
+                    });
+            }
+            AuthenticatedNodeIdentity::Kubernetes(None) => {
+                return Ok(TemplateReadScope::NodeScoped {
+                    node_ids: Vec::new(),
+                });
+            }
+            AuthenticatedNodeIdentity::RemoteAddress => {}
         }
         let Some(remote_addr) = request.remote_addr() else {
             return Ok(TemplateReadScope::NodeScoped {

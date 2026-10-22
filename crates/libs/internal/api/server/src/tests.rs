@@ -1,6 +1,8 @@
 mod prefetch_catalog;
 mod reconcile_claim_origins;
 mod substrate_scope;
+#[cfg(feature = "kubernetes")]
+mod template_node_identity;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, OrgId, SnapshotId, UserId};
 
 use super::metadata::*;
