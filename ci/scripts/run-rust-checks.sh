@@ -510,8 +510,17 @@ run_clippy_checks() {
         -D warnings
 
     # Built alone, so a tokio feature the service lifecycle helpers need but
-    # only get through common-svc's broader tokio features fails here.
+    # only get through common-svc's broader tokio features fails here. The
+    # library is also built without its tests, whose nix dev-dependency adds
+    # libc features to the library's dependency graph.
     echo "--- :rust: Running isolated service lifecycle clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-service-lifecycle \
+        --no-default-features \
+        --lib \
+        -- \
+        -D warnings
     CARGO_TARGET_DIR="${target_dir}" cargo clippy \
         --locked \
         -p pplx-space-service-lifecycle \

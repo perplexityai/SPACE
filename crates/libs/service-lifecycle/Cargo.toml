@@ -11,9 +11,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "time"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "signal", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+nix = { workspace = true, features = ["signal"] }
 tokio = { workspace = true, features = ["rt"] }

@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use axum::extract::MatchedPath;
 use http::{HeaderMap, Method, Request as HttpRequest, Response as HttpResponse};
-use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tower_http::classify::{
     GrpcCode, GrpcErrorsAsFailures, GrpcFailureClass, ServerErrorsAsFailures,
@@ -29,12 +28,11 @@ pub use pplx_space_unix_socket_bind::{
 mod grpc_request_params;
 mod grpc_trace;
 mod http_trace;
-mod shutdown;
 
 pub use grpc_request_params::*;
 pub use grpc_trace::*;
 pub use http_trace::*;
-pub use shutdown::*;
+pub use pplx_space_service_lifecycle::shutdown::*;
 
 pub const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const GRPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);

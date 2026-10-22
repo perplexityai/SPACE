@@ -7278,6 +7278,8 @@ dependencies = [
 name = "pplx-space-service-lifecycle"
 version = "0.8.0"
 dependencies = [
+ "nix 0.31.3",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",

@@ -1,6 +1,6 @@
 //! Process shutdown: SIGINT and SIGTERM handling and the cancellation tokens services drain on.
 
-use super::*;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WaitForSignalError {
@@ -31,7 +31,7 @@ pub fn shutdown_token() -> CancellationToken {
     shutdown_token_with_drain_signal(None)
 }
 
-pub fn shutdown_token_with_drain(drain_signal: crate::lifecycle::DrainSignal) -> CancellationToken {
+pub fn shutdown_token_with_drain(drain_signal: crate::DrainSignal) -> CancellationToken {
     shutdown_token_with_drain_signal(Some(drain_signal))
 }
 
@@ -53,7 +53,7 @@ pub fn stop_tokens() -> StopTokens {
 }
 
 pub(super) fn shutdown_token_with_drain_signal(
-    drain_signal: Option<crate::lifecycle::DrainSignal>,
+    drain_signal: Option<crate::DrainSignal>,
 ) -> CancellationToken {
     let token = CancellationToken::new();
     spawn_stop_signal_task(drain_signal, token.clone(), None);
@@ -61,7 +61,7 @@ pub(super) fn shutdown_token_with_drain_signal(
 }
 
 fn spawn_stop_signal_task(
-    drain_signal: Option<crate::lifecycle::DrainSignal>,
+    drain_signal: Option<crate::DrainSignal>,
     token: CancellationToken,
     forced: Option<CancellationToken>,
 ) {
@@ -142,3 +142,6 @@ impl StopSignals {
         tracing::info!("received Ctrl-C, {action}");
     }
 }
+
+#[cfg(test)]
+mod tests;
