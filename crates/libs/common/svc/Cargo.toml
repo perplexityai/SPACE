@@ -22,8 +22,12 @@ k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
 migration-checksums = ["dep:pplx-space-migration-checksums"]
 # Exposes shared route and authentication test helpers to other crates.
 # Unit tests get them under `cfg(test)`; external test suites opt in through
-# a dev-dependency. Mirrors `pplx-space-metrics-emit`'s `test-capture`.
-test-support = []
+# a dev-dependency. Mirrors `pplx-space-metrics-emit`'s `test-capture`. Also
+# forwards `pplx-space-ecw-credential/test-support`, which exposes
+# `EcwCredentialKeyring::from_current_key_for_test`; this crate's `cfg(test)`
+# does not cover that constructor, so its unit tests get it only with this
+# feature.
+test-support = ["pplx-space-ecw-credential/test-support"]
 # Enables the test-only environment overrides (see `pplx_space_common_core::env::test_hook`).
 test-hooks = ["pplx-space-common-core/test-hooks"]
 
@@ -32,8 +36,6 @@ aws-lc-rs = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-hmac = { workspace = true }
-hex = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 jiff = { workspace = true }
@@ -66,6 +68,7 @@ pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
+pplx-space-ecw-credential = { workspace = true }
 pplx-space-federated-identity = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }

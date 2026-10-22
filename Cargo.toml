@@ -111,6 +111,7 @@ members = [
     "crates/libs/db-test-fixtures",
     "crates/libs/db/migrator",
     "crates/libs/dependency-drain",
+    "crates/libs/ecw-credential",
     "crates/libs/migration-checksums",
     "crates/libs/aws/client",
     "crates/libs/aws/s3-http-client",
@@ -339,6 +340,7 @@ pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
 pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }
 pplx-space-dependency-drain = { path = "crates/libs/dependency-drain" }
+pplx-space-ecw-credential = { path = "crates/libs/ecw-credential" }
 pplx-space-env-vars = { path = "crates/libs/env-vars" }
 pplx-space-migration-checksums = { path = "crates/libs/migration-checksums" }
 pplx-space-execution-common = { path = "crates/libs/execution/common" }

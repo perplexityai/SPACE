@@ -19,7 +19,7 @@ pub use pplx_space_bearer_token as bearer_token;
 pub mod bootstrap;
 pub use pplx_space_dependency_drain as dependency_drain;
 pub mod disk_admission;
-pub mod ecw_credential;
+pub use pplx_space_ecw_credential as ecw_credential;
 pub use pplx_space_federated_identity as federated_identity;
 pub mod http_listener;
 #[cfg(feature = "k8s")]

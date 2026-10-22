@@ -5518,8 +5518,6 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bytes",
- "hex",
- "hmac 0.13.0",
  "http 1.5.0",
  "http-body 1.1.0",
  "jiff",
@@ -5534,6 +5532,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-db-test-fixtures",
  "pplx-space-dependency-drain",
+ "pplx-space-ecw-credential",
  "pplx-space-federated-identity",
  "pplx-space-kube-client",
  "pplx-space-metrics",
@@ -5878,6 +5877,20 @@ name = "pplx-space-durations"
 version = "0.8.0"
 dependencies = [
  "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-ecw-credential"
+version = "0.8.0"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "hmac 0.13.0",
+ "pplx-space-common-core",
+ "pplx-space-test-env",
+ "sha2 0.11.0",
+ "subtle",
  "thiserror 2.0.20",
 ]
 

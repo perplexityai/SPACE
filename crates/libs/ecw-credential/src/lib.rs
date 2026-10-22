@@ -1,3 +1,10 @@
+//! ECW credential keys and tokens: loads the current and previous HMAC keys
+//! from the environment, mints per-sandbox envd and traffic credentials, and
+//! matches a presented credential's SHA-256 digest against them.
+//!
+//! It is its own crate so a service can mint and check ECW credentials without
+//! depending on the rest of `pplx-space-common-svc`.
+
 use std::fmt;
 use std::path::PathBuf;
 
@@ -7,7 +14,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::core::types::{EcwCredentialEpoch, SandboxId};
+use pplx_space_common_core::types::{EcwCredentialEpoch, SandboxId};
 
 type HmacSha256 = Hmac<Sha256>;
 
