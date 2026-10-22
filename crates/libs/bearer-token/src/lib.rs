@@ -107,14 +107,13 @@ pub(crate) fn space_bearer_token_from_environment(
     kind: SpaceBearerToken,
     env: &dyn pplx_space_common_core::env::Environment,
 ) -> Result<String, BearerTokenError> {
-    let path = env
+    let configured_path = env
         .var(kind.path_env())
         .ok()
         .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| kind.default_path());
-
-    let explicit_path = env.var_os(kind.path_env()).is_some();
+        .map(PathBuf::from);
+    let explicit_path = configured_path.is_some();
+    let path = configured_path.unwrap_or_else(|| kind.default_path());
     match read_token_file(&path) {
         Ok(Some(token)) => return Ok(token),
         Ok(None) if explicit_path => return Err(BearerTokenError::MissingFile { path }),
