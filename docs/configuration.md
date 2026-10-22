@@ -108,7 +108,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC`, `SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` | unset | Set both or neither. Caps explicit warm-pool policy limits; unset, the cap is the platform default of 10,000 operations/s and 100 MiB/s. A value below the default leaves that dimension at the default. |
 | `SPACE_NODE_DISK_ADMISSION_MIN_AVAILABLE_BYTES` | 50 GiB | Hard free-space floor. Lower it on small disks. |
 | `SPACE_BUILDER_BLOB_MIN_AVAILABLE_BYTES` | 50 GiB | |
-| `SPACE_NODE_API_UDS_PER_SANDBOX` | 64 | Per-sandbox node-api permits shared by streams and unary calls, `1..=2048` (the node-wide permit count). Process kill, signal and listing and sandbox kill have 16 further permits of their own, which this setting does not change. |
+| `SPACE_NODE_API_UDS_PER_SANDBOX` | 64 | Per-sandbox node-api permits shared by streams and unary calls, `1..=2048` (the node-wide permit count). Process kill, signal and listing have 16 further permits of their own, which this setting does not change. Sandbox stop, kill and delete take no per-sandbox permit. |
 | `SPACE_INTERNAL_API_VISIBILITY_CACHE_TTL_SECS`, `SPACE_INTERNAL_API_VISIBILITY_CACHE_STALE_CEILING_SECS` | built-in | Template visibility cache freshness and stale ceiling. |
 | `SPACE_SBXMGR_ACTIVATION_ADMISSION_MAX_CONCURRENT` | 5 | |
 | `SPACE_SBX_EVICT_ENABLED`, `SPACE_SBX_EVICT_ENGAGE_FRACTION`, `SPACE_SBX_EVICT_TARGET_FRACTION`, `SPACE_SBX_EVICT_MIN_IDLE_SECS` | off, 0.75, 0.70, 25 h | |

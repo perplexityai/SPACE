@@ -10,13 +10,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::timeout;
 use tonic::{Code, Status};
 
-/// Per-sandbox permits shared by every sandbox-scoped call except process and
-/// sandbox control calls; `SPACE_NODE_API_UDS_PER_SANDBOX` overrides it.
+/// Per-sandbox permits for calls on the shared budget, streams included;
+/// `SPACE_NODE_API_UDS_PER_SANDBOX` overrides it.
 const UDS_PER_SANDBOX_PERMITS: usize = 64;
-/// Per-sandbox permits, on top of the shared ones, that only control calls
-/// (`SandboxBudget::Control`) take. Streams and long unary calls can fill the
-/// shared permits; these keep kill, signal and process listing available.
-const UDS_PER_SANDBOX_CONTROL_PERMITS: usize = 16;
+/// Per-sandbox permits, on top of the shared ones, for calls on the reserved
+/// budget. Streams and long unary calls can fill the shared permits; these keep
+/// process control available.
+const UDS_PER_SANDBOX_RESERVED_PERMITS: usize = 16;
 const UDS_PER_SANDBOX_ENV: &str = "SPACE_NODE_API_UDS_PER_SANDBOX";
 const DEFAULT_PER_SANDBOX_PERMITS: usize = 64;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -31,18 +31,19 @@ pub struct UdsPerSandboxLimiter {
 struct UdsPerSandboxLimiterInner {
     node: Arc<LimitSlot>,
     sandboxes: SandboxSlots,
-    /// Absent where no call takes the control budget (service-port ingress).
-    control: Option<SandboxSlots>,
+    /// Absent where no call takes the reserved budget (service-port ingress).
+    reserved: Option<SandboxSlots>,
     acquire_timeout: Duration,
     metric_scope: LimiterMetricScope,
 }
 
 impl UdsPerSandboxLimiterInner {
-    fn sandbox_slots(&self, scope: SlotScope) -> Option<&SandboxSlots> {
-        match scope {
-            SlotScope::Node => None,
-            SlotScope::Sandbox => Some(&self.sandboxes),
-            SlotScope::SandboxControl => self.control.as_ref(),
+    /// The per-sandbox slots `budget` admits from, for acquisition and for
+    /// reclamation alike. A limiter without a reserved budget uses the shared one.
+    fn sandbox_slots(&self, budget: SandboxBudget) -> &SandboxSlots {
+        match budget {
+            SandboxBudget::Shared => &self.sandboxes,
+            SandboxBudget::Reserved => self.reserved.as_ref().unwrap_or(&self.sandboxes),
         }
     }
 }
@@ -74,12 +75,11 @@ impl SandboxSlots {
 /// Which per-sandbox permits a call takes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SandboxBudget {
-    /// Streams and every unary call that is not a control call.
+    /// Streams and every unary call not on the reserved budget.
     Shared,
-    /// Short calls that stop or inspect a sandbox's work: process kill, signal
-    /// and listing, and sandbox kill. A limiter without a control budget
-    /// admits them from the shared permits.
-    Control,
+    /// Calls that stop or inspect a sandbox's processes, routed through
+    /// `fwd_sbx_reserved!` in `worker.rs`.
+    Reserved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,9 +90,13 @@ struct SlotLimits {
 
 impl UdsPerSandboxLimiter {
     pub fn control() -> Self {
+        Self::control_with_shared_permits(uds_per_sandbox_permits())
+    }
+
+    fn control_with_shared_permits(shared_permits: usize) -> Self {
         Self::new(
-            per_sandbox_limits(uds_per_sandbox_permits()),
-            Some(per_sandbox_limits(UDS_PER_SANDBOX_CONTROL_PERMITS)),
+            per_sandbox_limits(shared_permits),
+            Some(per_sandbox_limits(UDS_PER_SANDBOX_RESERVED_PERMITS)),
             SlotLimits {
                 permits: NODE_PERMITS,
                 waiters: NODE_PERMITS,
@@ -118,7 +122,7 @@ impl UdsPerSandboxLimiter {
 
     fn new(
         per_sandbox_limits: SlotLimits,
-        per_sandbox_control_limits: Option<SlotLimits>,
+        per_sandbox_reserved_limits: Option<SlotLimits>,
         node_limits: SlotLimits,
         acquire_timeout: Duration,
         metric_scope: LimiterMetricScope,
@@ -127,8 +131,8 @@ impl UdsPerSandboxLimiter {
             inner: Arc::new(UdsPerSandboxLimiterInner {
                 node: Arc::new(LimitSlot::new(SlotScope::Node, node_limits, metric_scope)),
                 sandboxes: SandboxSlots::new(SlotScope::Sandbox, per_sandbox_limits),
-                control: per_sandbox_control_limits
-                    .map(|limits| SandboxSlots::new(SlotScope::SandboxControl, limits)),
+                reserved: per_sandbox_reserved_limits
+                    .map(|limits| SandboxSlots::new(SlotScope::SandboxReserved, limits)),
                 acquire_timeout,
                 metric_scope,
             }),
@@ -191,14 +195,14 @@ impl UdsPerSandboxLimiter {
             Some(node) => node.0,
             None => self.acquire_node(method).await?.0,
         };
-        let slots = match (budget, &self.inner.control) {
-            (SandboxBudget::Control, Some(control)) => control,
-            _ => &self.inner.sandboxes,
-        };
-        let sandbox_slot = slots.slot(sandbox_id, self.inner.metric_scope);
+        let sandbox_slot = self
+            .inner
+            .sandbox_slots(budget)
+            .slot(sandbox_id, self.inner.metric_scope);
         let sandbox_cleanup = SlotCleanup {
             inner: Arc::clone(&self.inner),
             sandbox_id,
+            budget,
         };
         let sandbox_permit = match sandbox_slot
             .acquire(Some(sandbox_cleanup), self.inner.acquire_timeout)
@@ -281,14 +285,14 @@ impl UdsPerSandboxLimiter {
     }
 
     #[cfg(test)]
-    fn for_tests_with_control(
+    pub(crate) fn for_tests_with_reserved(
         per_sandbox_permits: usize,
-        control_permits: usize,
+        reserved_permits: usize,
         node_permits: usize,
     ) -> Self {
         Self::new(
             per_sandbox_limits(per_sandbox_permits),
-            Some(per_sandbox_limits(control_permits)),
+            Some(per_sandbox_limits(reserved_permits)),
             per_sandbox_limits(node_permits),
             Duration::ZERO,
             LimiterMetricScope::Control,
@@ -314,9 +318,9 @@ impl UdsPerSandboxLimiter {
     }
 
     #[cfg(test)]
-    fn control_snapshot(&self, sandbox_id: &str) -> Option<usize> {
+    fn reserved_snapshot(&self, sandbox_id: &str) -> Option<usize> {
         self.inner
-            .control
+            .reserved
             .as_ref()?
             .slots
             .get(&sandbox_id.parse::<SandboxId>().ok()?)
@@ -492,13 +496,12 @@ impl Drop for SlotPermit {
 struct SlotCleanup {
     inner: Arc<UdsPerSandboxLimiterInner>,
     sandbox_id: SandboxId,
+    budget: SandboxBudget,
 }
 
 impl SlotCleanup {
     fn reclaim_if_idle(&self, slot: &Arc<LimitSlot>) {
-        let Some(slots) = self.inner.sandbox_slots(slot.scope) else {
-            return;
-        };
+        let slots = self.inner.sandbox_slots(self.budget);
         slots.slots.remove_if(&self.sandbox_id, |_, current| {
             Arc::ptr_eq(current, slot)
                 && current.in_flight.load(Ordering::SeqCst) == 0
@@ -512,7 +515,7 @@ impl SlotCleanup {
 enum SlotScope {
     Node,
     Sandbox,
-    SandboxControl,
+    SandboxReserved,
 }
 
 impl SlotScope {
@@ -520,7 +523,7 @@ impl SlotScope {
         match self {
             Self::Node => "node",
             Self::Sandbox => "sandbox",
-            Self::SandboxControl => "sandbox_control",
+            Self::SandboxReserved => "sandbox_reserved",
         }
     }
 }
