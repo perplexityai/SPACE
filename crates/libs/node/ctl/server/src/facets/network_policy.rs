@@ -92,15 +92,15 @@ pub(super) async fn refresh_network_policy(
     node_role: Option<NodeRole>,
     scope: FacetScope,
     progress: crate::FacetProgress,
-) -> Result<ReconcileStats, String> {
+) -> Result<InboundFacetResult, String> {
     let (templates, sandbox_ids) = resolve_network_policy_scope(scope).await?;
-    let mut stats = ReconcileStats {
+    let mut result = InboundFacetResult::from_stats(ReconcileStats {
         templates_seen: templates.len() as u64,
         sandboxes_seen: sandbox_ids.len() as u64,
         ..ReconcileStats::default()
-    };
+    });
     if templates.is_empty() && sandbox_ids.is_empty() {
-        return Ok(stats);
+        return Ok(result);
     }
 
     let requests = network_policy_state_requests(
@@ -119,18 +119,18 @@ pub(super) async fn refresh_network_policy(
             .await
             .map_err(|error| format!("cluster network policy refresh failed: {error}"))?
             .into_inner();
-        apply_network_policy_state(response, &mut stats).await?;
+        apply_network_policy_state(response, &mut result).await?;
         // Each fetched-and-applied batch is forward progress; the facet
         // watchdog budgets time-per-batch, not time-per-run, so large nodes
         // don't hit a fixed whole-run deadline.
         progress.touch();
     }
-    Ok(stats)
+    Ok(result)
 }
 
 pub(super) async fn apply_network_policy_state(
     response: GetNodeNetworkPolicyStateResponse,
-    stats: &mut ReconcileStats,
+    result: &mut InboundFacetResult,
 ) -> Result<(), String> {
     for template in response.templates {
         let Some(policy) = template.policy else {
@@ -139,7 +139,8 @@ pub(super) async fn apply_network_policy_state(
         match apply_template_policy(&template.template, policy, template.generation, false).await {
             Ok(decision) => {
                 if apply_decision_counts_as_applied(decision) {
-                    stats.templates_applied = stats.templates_applied.saturating_add(1);
+                    result.stats.templates_applied =
+                        result.stats.templates_applied.saturating_add(1);
                 }
             }
             Err(error) => {
@@ -152,10 +153,31 @@ pub(super) async fn apply_network_policy_state(
     }
     let sandboxes = response.sandboxes;
     let local_sandbox_policies = fetch_local_sandbox_network_policies(&sandboxes).await?;
+    apply_sandbox_network_policy_state(
+        sandboxes,
+        &local_sandbox_policies,
+        result,
+        |sandbox_id, policy, inherit_template, generation| async move {
+            apply_sandbox_policy(&sandbox_id, policy, inherit_template, generation, false).await
+        },
+    )
+    .await
+}
+
+pub(super) async fn apply_sandbox_network_policy_state<F, Fut>(
+    sandboxes: Vec<SandboxNetworkPolicyState>,
+    local_sandbox_policies: &LocalSandboxNetworkPolicies,
+    result: &mut InboundFacetResult,
+    mut apply: F,
+) -> Result<(), String>
+where
+    F: FnMut(String, Option<ProtoNetworkPolicyV1>, bool, u64) -> Fut,
+    Fut: Future<Output = Result<NetworkPolicyApplyDecision, String>>,
+{
     for sandbox in sandboxes {
         let sandbox_id =
             parse_sandbox_id(&sandbox.sandbox_id).map_err(|error| error.to_string())?;
-        if sandbox_policy_reconcile_action(&sandbox, &sandbox_id, &local_sandbox_policies)
+        if sandbox_policy_reconcile_action(&sandbox, &sandbox_id, local_sandbox_policies)
             == SandboxPolicyReconcileAction::Skip
         {
             continue;
@@ -168,25 +190,29 @@ pub(super) async fn apply_network_policy_state(
         } else {
             sandbox.policy
         };
-        match apply_sandbox_policy(
-            &sandbox.sandbox_id,
+        match apply(
+            sandbox.sandbox_id.clone(),
             policy,
             inherit_template,
             sandbox.generation,
-            false,
         )
         .await
         {
             Ok(decision) => {
                 if apply_decision_counts_as_applied(decision) {
-                    stats.sandboxes_applied = stats.sandboxes_applied.saturating_add(1);
+                    result.stats.sandboxes_applied =
+                        result.stats.sandboxes_applied.saturating_add(1);
                 }
             }
             Err(error) => {
-                return Err(format!(
-                    "failed to apply sandbox network policy {}: {error}",
-                    sandbox.sandbox_id
-                ));
+                record_element_error(
+                    &mut result.element_errors,
+                    &NetworkPolicyTarget::sandbox(sandbox_id).to_string(),
+                    &format!(
+                        "failed to apply sandbox network policy {}: {error}",
+                        sandbox.sandbox_id
+                    ),
+                );
             }
         }
     }
