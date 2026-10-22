@@ -19,7 +19,7 @@
 //!   [`OP_SNAPSHOT_VOLUME`] (the encrypted filesystem a suspend's vmstate
 //!   and memory are written into), [`OP_POOL_ROOTFS`] (the same composite
 //!   over a plaintext COW — the warm-pool member shape).
-//! - `phase` — where in the prepare/release the failure happened, derived
+//! - `phase` — where in the prepare/release/stage the failure happened, derived
 //!   from the primitive's error type rather than from a message string, so
 //!   a new error variant cannot silently land in the wrong bucket.
 //! - `reason` — for DEK fetches, whether credmgr was unreachable, refused,
@@ -54,9 +54,9 @@ pub const PHASE_PARAMS: &str = "params";
 /// A `cryptsetup`/`dmsetup`/`losetup`/`mkfs`/`mount` invocation failed, or
 /// I/O around one did. The catch-all for real device trouble.
 pub const PHASE_DEVICE: &str = "device";
-/// Copying the sealed (ciphertext) artifacts out to the caller's publication
-/// staging dir failed. Distinct from `device` because the volume itself
-/// sealed correctly — what failed is handing the artifacts onward, which is
+/// Copying the sealed or staged (ciphertext) artifacts out to the caller's
+/// publication staging dir failed. Distinct from `device` because the volume
+/// itself sealed or was made read-only correctly — what failed is handing the artifacts onward, which is
 /// the step a suspend's durability depends on next.
 pub const PHASE_STAGE: &str = "stage";
 
@@ -121,6 +121,23 @@ pub fn device_release_attempted(op: &str) {
 pub fn device_release_failed(op: &str, phase: &str) {
     counter(
         "byok.device_release.failed",
+        1,
+        &[tag("op", op), tag("phase", phase)],
+    );
+}
+
+/// One encrypted volume was staged while open (flushed, made read-only and
+/// copied for publication without closing it) was attempted.
+pub fn device_stage_attempted(op: &str) {
+    counter("byok.device_stage.attempted", 1, &[tag("op", op)]);
+}
+
+/// One open-volume staging failed, bucketed by `phase`. Like a release
+/// failure, it leaves a suspend without staged ciphertext; unlike one, the
+/// runtime is still live, so the suspend rolls back and retries.
+pub fn device_stage_failed(op: &str, phase: &str) {
+    counter(
+        "byok.device_stage.failed",
         1,
         &[tag("op", op), tag("phase", phase)],
     );

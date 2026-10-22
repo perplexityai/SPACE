@@ -326,6 +326,16 @@ service NodeManager {
   rpc ReleaseEncryptedVolume(ReleaseEncryptedVolumeRequest)
       returns (ReleaseEncryptedVolumeResponse);
 
+  // Stage a mounted encrypted data volume without closing it, for a suspend
+  // whose runtime is still live: flush the volume's filesystem and hold it
+  // read-only, flush the sandbox's encrypted rootfs composite into its COW
+  // backing, reflink-copy each requested artifact into the suspend's
+  // publication staging dir, then make the volume writable again. The volume
+  // stays open until sandbox cleanup closes it, so a live Firecracker may keep
+  // it mapped.
+  rpc StageEncryptedVolume(StageEncryptedVolumeRequest)
+      returns (StageEncryptedVolumeResponse);
+
   // Bring up the same dm-snapshot composite as PrepareEncryptedRootfs but
   // with a PLAINTEXT COW: the shape a warm-pool member boots on before it
   // has an owner. No org exists at fill time, so no DEK can be issued and
@@ -917,8 +927,17 @@ message CreateSnapshotRequest {
   // Bound non-default captures leave sandbox_id empty. Older nodes must reject
   // the missing legacy identity before capture, including encrypted teardown.
   EnvironmentSnapshotInput environment = 7;
+  // Encrypted capture only: leave the runtime running after the capture. The
+  // caller stages the volume with StageEncryptedVolume and stops the runtime
+  // through cleanup. Unset, the capture stops the runtime so the caller can
+  // seal the volume with ReleaseEncryptedVolume.
+  bool retain_runtime = 8;
 }
-message CreateSnapshotResponse {}
+message CreateSnapshotResponse {
+  // The capture left the runtime running, as `retain_runtime` asked. Nodes that
+  // predate `retain_runtime` leave it false and have stopped the runtime.
+  bool runtime_retained = 1;
+}
 
 message EnvironmentSnapshotInput {
   string sandbox_id = 1;
@@ -1287,6 +1306,28 @@ message ReleaseEncryptedVolumeRequest {
 }
 
 message ReleaseEncryptedVolumeResponse {}
+
+message StageEncryptedVolumeRequest {
+  string sandbox_id = 1;
+  string volume_name = 2;
+  // The suspend capture being published. node-manager stages into that
+  // capture's publication staging dir, which the caller has created.
+  string local_artifact_id = 3;
+  repeated EncryptedStagedArtifactRole artifacts = 4;
+  ExecutionFence execution_fence = 5;
+}
+
+// A ciphertext artifact an encrypted suspend publishes. node-manager derives
+// each one's source path and staged name from the sandbox and volume.
+enum EncryptedStagedArtifactRole {
+  ENCRYPTED_STAGED_ARTIFACT_ROLE_UNSPECIFIED = 0;
+  // The volume's own LUKS2 backing, staged as `<volume_name>.luks`.
+  ENCRYPTED_STAGED_ARTIFACT_ROLE_VOLUME_BACKING = 1;
+  // The encrypted rootfs COW backing, staged as `cow.luks`.
+  ENCRYPTED_STAGED_ARTIFACT_ROLE_ROOTFS_COW = 2;
+}
+
+message StageEncryptedVolumeResponse {}
 
 message BtrfsDeleteSandboxInstanceRequest {
   string sandbox_id = 1;

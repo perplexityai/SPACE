@@ -343,7 +343,7 @@ impl NodeManagerService {
             .filter(|p| !p.is_empty())
         {
             return self
-                .create_encrypted_snapshot(&req.sandbox_id, mount_dir)
+                .create_encrypted_snapshot(&req.sandbox_id, mount_dir, req.retain_runtime)
                 .await;
         }
 
@@ -432,7 +432,7 @@ impl NodeManagerService {
             elapsed_ms = total_started.elapsed().as_millis(),
             "node snapshot create complete"
         );
-        Ok(Response::new(CreateSnapshotResponse {}))
+        Ok(Response::new(CreateSnapshotResponse::default()))
     }
 
     /// BYOK snapshot create: bind-mount the already-mounted encrypted volume
@@ -442,10 +442,16 @@ impl NodeManagerService {
     /// is no plaintext copy and no reflink to a plaintext `dest_dir`. The jail
     /// bind is removed before returning so the caller can unmount/seal the
     /// volume; the vmstate+memory files persist in the volume at `mount_dir`.
+    ///
+    /// With `retain_runtime` the runtime stays up (paused) after the capture:
+    /// the caller stages the open volume and stops the runtime through cleanup,
+    /// so a capture that outlives this RPC leaves a live, retryable sandbox.
+    /// Without it, the capture stops the runtime so the caller can seal it.
     async fn create_encrypted_snapshot(
         &self,
         sandbox_id: &str,
         mount_dir: &str,
+        retain_runtime: bool,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         let typed_sandbox_id = sandbox_id
             .parse::<SandboxId>()
@@ -541,6 +547,9 @@ impl NodeManagerService {
                 }
                 create_result?;
                 service.adopt_validated_lease(&sandbox_id, &lease)?;
+                if retain_runtime {
+                    return Ok::<(), Status>(());
+                }
 
                 // A restored sandbox's Firecracker holds the snapshot volume's
                 // memory file mmap'd and the restore-time jail bind still
@@ -580,9 +589,12 @@ impl NodeManagerService {
         tracing::debug!(
             sandbox_id,
             mount_dir,
+            retain_runtime,
             "encrypted snapshot written (vmstate+memory compressed+encrypted at t0)"
         );
-        Ok(Response::new(CreateSnapshotResponse {}))
+        Ok(Response::new(CreateSnapshotResponse {
+            runtime_retained: retain_runtime,
+        }))
     }
 
     pub(super) async fn load_snapshot(

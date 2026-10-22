@@ -199,6 +199,86 @@ pub(crate) fn sealing_node_manager_builder(refusals: usize) -> FakeNodeManager {
     )
 }
 
+/// A capture whose runtime node-manager kept stages the still-open volume
+/// instead of sealing it, and leaves a staging directory that publishes as a
+/// complete capture with no record for recovery to seal.
+#[tokio::test]
+async fn retained_encrypted_capture_stages_the_open_volume_and_publishes() {
+    use crate::service::suspend_snapshot_publication as publication;
+    use pplx_space_node_mgr_client::proto::{
+        StageEncryptedVolumeRequest, StageEncryptedVolumeResponse,
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let staged_into = Arc::new(Mutex::new(None));
+    let node_manager = FakeNodeManager::default()
+        .unary("StageEncryptedVolume", {
+            let requests = Arc::clone(&requests);
+            let staged_into = Arc::clone(&staged_into);
+            move |request: StageEncryptedVolumeRequest| {
+                // node-manager derives this dir from the local artifact id.
+                let staging: std::path::PathBuf = staged_into.lock().unwrap().clone().unwrap();
+                for name in ["snapshot.luks", "cow.luks"] {
+                    std::fs::write(staging.join(name), b"ciphertext").unwrap();
+                }
+                requests.lock().unwrap().push(request);
+                Ok(StageEncryptedVolumeResponse::default())
+            }
+        })
+        .serve();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let cache = tempfile::tempdir().unwrap();
+    let (capture, staging) =
+        record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO, false);
+    let intent = std::fs::read_dir(&staging)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let metadata: crate::snapshot_upload::SnapshotMeta =
+        serde_json::from_slice(&std::fs::read(&intent).unwrap()).unwrap();
+    *staged_into.lock().unwrap() = Some(staging.clone());
+    let service = service_with_node_manager(conn, node_manager.connector());
+    let sandbox = service.lookup_sandbox(&id).unwrap();
+
+    service
+        .stage_retained_encrypted_capture(&sandbox, capture, &staging, &metadata)
+        .await
+        .unwrap();
+
+    assert_eq!(node_manager.calls(), ["StageEncryptedVolume"]);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].sandbox_id, id);
+    assert_eq!(requests[0].volume_name, "snapshot");
+    assert_eq!(requests[0].local_artifact_id, capture.to_string());
+    assert_eq!(
+        requests[0].artifacts,
+        [
+            pplx_space_node_mgr_client::proto::EncryptedStagedArtifactRole::VolumeBacking as i32,
+            pplx_space_node_mgr_client::proto::EncryptedStagedArtifactRole::RootfsCow as i32,
+        ]
+    );
+    assert!(
+        !intent.exists(),
+        "a retained capture keeps no record to seal"
+    );
+    assert!(!staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
+    let complete = publication::find_complete_suspend_snapshot_staging_dir(
+        &cache.path().join(&id),
+        &Default::default(),
+    )
+    .unwrap()
+    .expect("the staged capture is complete");
+    assert_eq!(complete.local_artifact_id, capture);
+    let sidecar: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(staging.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME)).unwrap(),
+    )
+    .unwrap();
+    assert!(sidecar.encrypted);
+    assert_eq!(sidecar.local_artifact_id, Some(capture));
+}
+
 /// One periodic publication-recovery pass over the row, including the seal
 /// task it spawns, which finishes before the next tick in these tests.
 async fn recover_batch(service: &SandboxManagerService, cache: &Path, id: &str) {

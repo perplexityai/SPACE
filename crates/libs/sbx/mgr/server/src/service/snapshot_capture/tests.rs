@@ -26,7 +26,7 @@ async fn mixed_version_capture_cannot_reach_old_nodes_with_a_bound_identity() {
                     request.sandbox_id.parse::<SandboxId>().map_err(|_| {
                         tonic::Status::invalid_argument("sandbox_id must be a UUID")
                     })?;
-                    Ok(CreateSnapshotResponse {})
+                    Ok(CreateSnapshotResponse::default())
                 })
                 .serve();
             let id = SandboxId::new();

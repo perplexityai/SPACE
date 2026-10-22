@@ -590,4 +590,17 @@ impl NodeManager for NodeManagerService {
         )
         .await
     }
+
+    async fn stage_encrypted_volume(
+        &self,
+        request: Request<StageEncryptedVolumeRequest>,
+    ) -> Result<Response<StageEncryptedVolumeResponse>, Status> {
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        observe_rpc(
+            "StageEncryptedVolume",
+            sandbox_id,
+            NodeManagerService::stage_encrypted_volume(self, request),
+        )
+        .await
+    }
 }

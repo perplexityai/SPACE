@@ -1884,6 +1884,7 @@ impl SandboxManagerService {
                         dest_dir: Some(staging_dir.clone()),
                         snapshot_volume_mount_dir: None,
                         environment: None,
+                        retain_runtime: false,
                     },
                     sandbox.execution_metadata.as_ref(),
                 ))

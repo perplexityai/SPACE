@@ -166,3 +166,43 @@ pub(crate) async fn release_encrypted_snapshot_volume(
     })?;
     Ok(())
 }
+
+/// Stage the still-open encrypted snapshot volume into the publication
+/// staging dir of capture `local_artifact_id` without closing it: node-mgr
+/// flushes it, holds it read-only while it copies the same two ciphertext
+/// artifacts a release stages, and derives every path itself. Call after
+/// Firecracker has finished writing vmstate+memory into it and while the
+/// runtime is still up.
+pub(crate) async fn stage_encrypted_snapshot_volume(
+    sandbox_id: &str,
+    execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence>,
+    local_artifact_id: pplx_space_common_core::types::LocalArtifactId,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) -> Result<(), String> {
+    use pplx_space_node_mgr_client::proto::EncryptedStagedArtifactRole;
+    let mut node = node_manager
+        .connect()
+        .await
+        .map_err(|e| format!("node-manager connect for snapshot-volume staging: {e}"))?;
+    node.stage_encrypted_volume(
+        pplx_space_node_mgr_client::proto::StageEncryptedVolumeRequest {
+            execution_fence,
+            sandbox_id: sandbox_id.to_string(),
+            volume_name: SNAPSHOT_VOLUME_NAME.to_string(),
+            local_artifact_id: local_artifact_id.to_string(),
+            artifacts: vec![
+                EncryptedStagedArtifactRole::VolumeBacking as i32,
+                EncryptedStagedArtifactRole::RootfsCow as i32,
+            ],
+        },
+    )
+    .await
+    .map_err(|s| {
+        format!(
+            "node-manager StageEncryptedVolume ({:?}): {}",
+            s.code(),
+            s.message()
+        )
+    })?;
+    Ok(())
+}
