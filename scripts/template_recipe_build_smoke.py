@@ -383,8 +383,10 @@ class TemplateRecipeSmoke:
         self.seed_name = os.environ.get(
             "SPACE_TEMPLATE_RECIPE_BUILD_SEED_ID", f"seed-bk-smoke-{stamp}"
         )
-        self.profile = os.environ.get(
-            "SPACE_TEMPLATE_RECIPE_BUILD_PROFILE", DEFAULT_DERIVED_PROFILE
+        # An empty value (e.g. a Buildkite env passed through unset) is the default.
+        self.profile = (
+            os.environ.get("SPACE_TEMPLATE_RECIPE_BUILD_PROFILE")
+            or DEFAULT_DERIVED_PROFILE
         )
         if self.profile not in DERIVED_PROFILES:
             raise SmokeFailure(

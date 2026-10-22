@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Guards for the template recipe build smoke's derived-recipe profiles.
 
 The per-deploy smoke defaults to an offline derived recipe so an upstream
@@ -55,6 +54,11 @@ def test_default_profile_is_offline() -> None:
     assert run.evidence["templates"]["code_runtime"]["recipe"] == (
         "templates/firecracker/recipes/build-pipeline-smoke.toml"
     )
+
+
+def test_empty_profile_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPACE_TEMPLATE_RECIPE_BUILD_PROFILE", "")
+    assert smoke.TemplateRecipeSmoke(REPO_ROOT).profile == "offline"
 
 
 def test_code_runtime_profile_keeps_existing_names(
