@@ -20,6 +20,8 @@ async fn fifo_read_rejects_without_a_writer_and_returns_admission() {
             0,
             None,
             slots.clone().try_acquire_owned().expect("admission"),
+            tokio_util::task::TaskTracker::new(),
+            tokio_util::sync::CancellationToken::new(),
         ),
     )
     .await;
@@ -47,6 +49,8 @@ async fn fifo_read_rejects_without_a_writer_and_returns_admission() {
             .clone()
             .try_acquire_owned()
             .expect("recovered admission"),
+        tokio_util::task::TaskTracker::new(),
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect("normal read");
@@ -79,6 +83,8 @@ async fn a_stalled_read_releases_its_guard_when_it_ends() {
             let _ = ended.await;
             Status::unavailable("worker ended")
         },
+        tokio_util::task::TaskTracker::new(),
+        tokio_util::sync::CancellationToken::new(),
     );
     // Take nothing, so the queue fills and the read waits for room in it.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

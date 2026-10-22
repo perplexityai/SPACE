@@ -518,7 +518,11 @@ impl SpacedGuestService {
         let mut bridge_error = None;
         let drain = async {
             tokio::join!(
-                self.inner.execution.drain(),
+                async {
+                    if let Err(error) = self.inner.execution.drain().await {
+                        tracing::warn!(%error, "guest execution cleanup remains pending");
+                    }
+                },
                 self.inner.loopback_bridge.shutdown(),
                 async {
                     if !local_done {

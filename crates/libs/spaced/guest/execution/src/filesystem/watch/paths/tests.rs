@@ -27,6 +27,7 @@ async fn registration_plans_bound_nonrecursive_and_filtered_walks() {
             recursive,
             &filter,
             &new_watch_directory_scan_slots(),
+            &tokio_util::task::TaskTracker::new(),
         )
         .await
         .expect("plan")
@@ -127,7 +128,8 @@ async fn required_root_cannot_disappear_or_be_filtered_out_of_a_plan() {
                 &normalized,
                 true,
                 &filter,
-                &new_watch_directory_scan_slots()
+                &new_watch_directory_scan_slots(),
+                &tokio_util::task::TaskTracker::new()
             )
             .await
             .is_err(),
@@ -141,16 +143,28 @@ async fn required_root_cannot_disappear_or_be_filtered_out_of_a_plan() {
     let filter =
         WatchFilter::compile(WatchFilterConfig::new(vec![], vec![glob(".")], false).unwrap())
             .unwrap();
-    let plan = plan_watch_registration(&root, true, &filter, &new_watch_directory_scan_slots())
-        .await
-        .unwrap();
+    let plan = plan_watch_registration(
+        &root,
+        true,
+        &filter,
+        &new_watch_directory_scan_slots(),
+        &tokio_util::task::TaskTracker::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(plan.len(), 1, "filters must retain root lifecycle coverage");
 
     // A glob that excludes only the root must not hide existing children.
     std::fs::create_dir_all(root.join("existing/nested")).unwrap();
-    let plan = plan_watch_registration(&root, true, &filter, &new_watch_directory_scan_slots())
-        .await
-        .unwrap();
+    let plan = plan_watch_registration(
+        &root,
+        true,
+        &filter,
+        &new_watch_directory_scan_slots(),
+        &tokio_util::task::TaskTracker::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(plan.root, root);
     let mut descendants = plan.descendants;
     descendants.sort();

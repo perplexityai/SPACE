@@ -124,8 +124,10 @@ that outlives the service. Signal-handler neutrality is not promised.
 
 Order operation registration with admission closure: **running → closing → drained**.
 Closing rejects every new operation, including reads, mutations, watches and
-environment updates. Repeated shutdown observes the same transition. Successful
-drain means owned operations, worker startup/cleanup and command supervisors have
+environment updates, without cancelling work already admitted. Explicit
+cancellation or a drain deadline requests abortive cleanup; caller cancellation
+propagates into the service, never from the service into its caller. Repeated
+shutdown observes the same transition. Successful drain means owned operations, worker startup/cleanup and command supervisors have
 settled, filesystem workers are reaped, and no later library-dispatched effects
 can begin.
 

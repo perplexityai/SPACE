@@ -31,6 +31,8 @@ pub(super) async fn list_stream(
     path: GuestPath,
     depth: Option<u32>,
     stream_slot: OwnedSemaphorePermit,
+    tasks: tokio_util::task::TaskTracker,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<GuestFileInfoStream, Status> {
     let root = PathBuf::from(path.expose());
     tokio::fs::symlink_metadata(&root)
@@ -44,24 +46,30 @@ pub(super) async fn list_stream(
     let mut pending = vec![(root, 1_u32)];
     let mut directories_enqueued = 1_usize;
     let (tx, rx) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let _stream_slot = stream_slot;
         while let Some((directory, depth)) = pending.pop() {
+            if shutdown.is_cancelled() || tx.is_closed() {
+                return;
+            }
             let mut read_dir = match tokio::fs::read_dir(&directory).await {
                 Ok(read_dir) => read_dir,
                 Err(error) => {
-                    let _ = tx.send(Err(map_io_error(error))).await;
+                    let _ = send(&tx, &shutdown, Err(map_io_error(error))).await;
                     return;
                 }
             };
             loop {
+                if shutdown.is_cancelled() || tx.is_closed() {
+                    return;
+                }
                 match read_dir.next_entry().await {
                     Ok(Some(entry)) => {
                         let entry_path = entry.path();
                         let entry = match file_info_from_path(&entry_path).await {
                             Ok(entry) => entry,
                             Err(error) => {
-                                let _ = tx.send(Err(error)).await;
+                                let _ = send(&tx, &shutdown, Err(error)).await;
                                 return;
                             }
                         };
@@ -74,16 +82,16 @@ pub(super) async fn list_stream(
                                 depth + 1,
                             )
                         {
-                            let _ = tx.send(Err(status)).await;
+                            let _ = send(&tx, &shutdown, Err(status)).await;
                             return;
                         }
-                        if tx.send(Ok(entry)).await.is_err() {
+                        if send(&tx, &shutdown, Ok(entry)).await.is_err() {
                             return;
                         }
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = tx.send(Err(map_io_error(error))).await;
+                        let _ = send(&tx, &shutdown, Err(map_io_error(error))).await;
                         return;
                     }
                 }
@@ -91,6 +99,18 @@ pub(super) async fn list_stream(
         }
     });
     Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)) as GuestFileInfoStream)
+}
+
+async fn send<T>(
+    tx: &tokio::sync::mpsc::Sender<T>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    value: T,
+) -> Result<(), ()> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Err(()),
+        result = tx.send(value) => result.map_err(|_| ()),
+    }
 }
 
 #[cfg(test)]

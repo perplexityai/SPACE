@@ -366,13 +366,11 @@ fn dropping_watch_stream_outside_runtime_does_not_panic() {
             .await
             .expect("worker routed");
         (
-            FailureAwareStream {
-                inner: Box::pin(tokio_stream::empty::<Result<(), Status>>()),
-                router: router.clone(),
+            router.forward_stream(
+                tokio_stream::pending::<Result<(), Status>>(),
                 worker,
-                runtime_handle: tokio::runtime::Handle::current(),
-                failure_recorded: false,
-            },
+                router.shutdown.clone(),
+            ),
             router.worker_pool().expect("worker backend").clone(),
             user,
         )
@@ -384,10 +382,13 @@ fn dropping_watch_stream_outside_runtime_does_not_panic() {
     );
     drop(stream);
     runtime.block_on(async {
-        assert!(
-            pool.is_idle_test(&user).await,
-            "dropping a watch stream releases worker accounting"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.is_idle_test(&user).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping a watch stream releases worker accounting");
     });
 }
 
@@ -1036,4 +1037,43 @@ async fn ledger_identity_capacity_preserves_loss_and_heals_through_reenable_disa
         MAX_LEDGER_IDENTITIES - 1
     );
     stop_worker(proxy, server).await;
+}
+
+#[tokio::test]
+async fn drain_settles_stream_failure_before_the_caller_polls_it() {
+    let router = identity_router();
+    let pool = router.worker_pool().unwrap();
+    let user = current_user();
+    pool.insert_test_client(
+        user.clone(),
+        Endpoint::from_static("http://[::]:50051").connect_lazy(),
+    )
+    .await
+    .unwrap();
+    let worker = pool.client_for(user.clone()).await.unwrap();
+    pool.set_ledger_enabled(&worker, true).await;
+    router
+        .ledger_evidence
+        .lock()
+        .await
+        .insert(user.clone(), LedgerEvidence::Tracking);
+    let mut stream = router.forward_stream(
+        futures_util::stream::iter([Err::<(), _>(Status::unavailable("worker connection lost"))]),
+        worker,
+        router.shutdown.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), router.drain())
+        .await
+        .expect("stream failure cleanup must not depend on the consumer polling");
+    assert!(router.ledger_evidence.lock().await.get(&user) == Some(&LedgerEvidence::Lost));
+    assert!(router.tasks.is_empty());
+    assert_eq!(
+        stream.next().await.unwrap().unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
+    assert!(stream.next().await.is_none());
+    assert!(
+        router.tasks.is_empty(),
+        "reading a buffered error after drain cannot dispatch cleanup"
+    );
 }
