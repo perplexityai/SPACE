@@ -150,7 +150,7 @@ edition = "2024"
 # on): that is the minimum we can prove green. Raise both together when bumping.
 # Edition 2024 independently requires >=1.85. Members inherit via
 # `rust-version.workspace = true`.
-rust-version = "1.97"
+rust-version = "1.99.1"
 authors = ["Perplexity AI"]
 license = "Apache-2.0"
 publish = false

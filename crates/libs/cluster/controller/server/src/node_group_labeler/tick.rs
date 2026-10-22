@@ -14,7 +14,7 @@ use super::*;
 /// the aggregate counters carry the rest.
 pub(super) fn claim_log_budget(budget: &std::sync::atomic::AtomicUsize) -> bool {
     budget
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |remaining| remaining.checked_sub(1),

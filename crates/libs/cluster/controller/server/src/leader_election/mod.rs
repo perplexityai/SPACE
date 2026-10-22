@@ -656,17 +656,15 @@ fn spread_across_replicas(grace: PositiveDuration, identity: &str) -> PositiveDu
     PositiveDuration::new_panic(grace.get().saturating_add(added))
 }
 
-/// Resolve the election identity: the explicit env var, else the pod's
-/// `HOSTNAME` (Kubernetes sets it to the pod name), else a random UUID so two
+/// Resolve the election identity from the pod's `HOSTNAME` (Kubernetes sets it
+/// to the pod name), else a fresh UUID so two
 /// replicas can never accidentally share an identity and both believe they
 /// hold the lease.
 fn election_identity(env: &dyn pplx_space_common_core::env::Environment) -> String {
-    for var in ["HOSTNAME"] {
-        if let Ok(value) = env.var(var) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
+    if let Ok(value) = env.var("HOSTNAME") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
         }
     }
     uuid::Uuid::now_v7().to_string()
