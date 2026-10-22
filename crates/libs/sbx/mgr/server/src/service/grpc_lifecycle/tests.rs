@@ -1705,6 +1705,7 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
         ArtifactBackupSubmissionError::Begin {
             error: pplx_space_common_jobs::JobError::permanent("registration refused"),
             superseded_generation: None,
+            refuses_artifact: false,
         },
         failed_artifact,
     );
@@ -1712,6 +1713,7 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
         ArtifactBackupSubmissionError::Begin {
             error: pplx_space_common_jobs::JobError::retriable("connection unavailable"),
             superseded_generation: None,
+            refuses_artifact: false,
         },
         failed_artifact,
     );
