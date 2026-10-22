@@ -80,10 +80,10 @@ fn node_local_suspend_registers_under_its_kubernetes_execution() {
 /// The node-local suspend path end to end, up to the runtime it keeps: the
 /// upload it persists carries the sandbox's Kubernetes execution generation,
 /// the cluster's refusal of that generation comes back as a backup-fence
-/// failure, and that failure rolls the suspend back to `paused` with the
-/// runtime still resident.
+/// failure. The published artifact retains its cleanup intent and runtime
+/// until an operator resolves the registration fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
+async fn node_local_suspend_of_a_superseded_execution_retains_its_published_artifact() {
     with_cluster_api(RETIRING, async || {
         use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
         let conn = crate::db::test_conn();
@@ -105,12 +105,19 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
             b"node-local-capture",
         );
 
+        crate::db::pin_suspended_artifact_for_cleanup(
+            &service.db.lock().unwrap(),
+            &sandbox_id,
+            local_artifact_id,
+            snapshot_dir.to_str().unwrap(),
+        )
+        .unwrap();
         let refused = service
             .enqueue_node_local_suspend_backup(
                 &sandbox,
                 local_artifact_id,
                 snapshot_dir.to_str().unwrap(),
-                SuspendSnapshotFormat::Full,
+                Some(SuspendSnapshotFormat::Full),
             )
             .await
             .expect_err("the cluster refuses a superseded execution's capture");
@@ -137,11 +144,13 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
             serde_json::from_str(&payload).unwrap();
         assert_eq!(payload.execution_generation, Some(generation(GENERATION)));
 
-        service
-            .require_node_local_backup_handoff(&sandbox_id, local_artifact_id, Err(refused))
-            .expect_err("a refused handoff must stop before runtime finalization");
         let row = service.lookup_sandbox(&sandbox_id).unwrap();
-        assert_eq!(row.state, SandboxState::Paused);
+        assert_eq!(row.state, SandboxState::CleanupRequired);
+        assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
+        assert_eq!(
+            row.cleanup_completion,
+            Some(crate::db::CleanupCompletion::MarkSuspended)
+        );
         assert_eq!(row.pid, Some(std::process::id()));
         drain(&service).await;
     })

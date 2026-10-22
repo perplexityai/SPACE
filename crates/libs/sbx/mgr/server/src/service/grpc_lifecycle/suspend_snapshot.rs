@@ -1115,30 +1115,17 @@ impl SandboxManagerService {
                 .await?;
             }
 
-            // Node-local auto-suspend must hand the exact published artifact to a
-            // durable owner before runtime cleanup releases its rootfs. A missing
-            // upload destination is an intentional local-only configuration; when
-            // a destination exists, failure to persist the worker intent leaves
-            // the runtime intact and makes this suspend retryable.
-            let upload_queue_started_at = std::time::Instant::now();
+            // The published artifact and MarkSuspended intent own retries before
+            // any remote backup work or runtime teardown. Cleanup establishes
+            // durable upload ownership before it releases worker resources.
             if durability == SuspendDurability::NodeLocal {
-                let enqueue_result = self
-                    .enqueue_node_local_suspend_backup(
-                        &sandbox,
-                        local_artifact_id,
-                        &snapshot_dir_string,
-                        published_format,
-                    )
-                    .await;
-                self.require_node_local_backup_handoff(&sandbox.id, local_artifact_id, enqueue_result)?;
+                let db = self.db_conn()?;
+                crate::db::pin_suspended_artifact_for_cleanup(
+                    &db, &sandbox.id, local_artifact_id, &snapshot_dir_string,
+                ).map_err(|error| Status::unavailable(format!(
+                    "published suspend artifact awaits its cleanup owner: {error}"
+                )))?;
             }
-            pplx_space_metrics::snapshot::create_step(
-                create_kind,
-                create_codec,
-                sandbox.volume_encryption,
-                "upload_queue",
-                upload_queue_started_at,
-            );
 
             let cleanup_started_at = std::time::Instant::now();
             self.ensure_teardown_suspend_owner_for_durability(&sandbox.id, durability)?;
