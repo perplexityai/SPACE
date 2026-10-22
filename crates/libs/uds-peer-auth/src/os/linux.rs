@@ -13,7 +13,7 @@ use pplx_space_common_core::host::linux::paths::{exe_link_was_deleted, strip_exe
 use super::super::PeerProcessSnapshot;
 
 /// `/proc/<pid>/{status,exe}` snapshot for a peer pid.
-pub(in crate::peer_auth) fn read_peer_process(pid: i32) -> std::io::Result<PeerProcessSnapshot> {
+pub(crate) fn read_peer_process(pid: i32) -> std::io::Result<PeerProcessSnapshot> {
     let status_text = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
     let parsed = parse_proc_status(&status_text).ok_or_else(|| {
         std::io::Error::new(
@@ -32,7 +32,7 @@ pub(in crate::peer_auth) fn read_peer_process(pid: i32) -> std::io::Result<PeerP
 
 /// `CapEff:` of this process, for the cross-uid readability preflight.
 /// `None` when `/proc/self/status` cannot be read or parsed.
-pub(in crate::peer_auth) fn current_process_cap_effective() -> Option<u64> {
+pub(crate) fn current_process_cap_effective() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     Some(parse_proc_status(&status)?.cap_effective)
 }

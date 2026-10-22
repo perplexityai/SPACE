@@ -746,6 +746,18 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a nix or tonic feature the UDS peer authorizer needs but
+    # only gets through unification with common-svc fails here; its `/proc`
+    # process inspection is Linux-specific.
+    echo "--- :rust: Running isolated UDS peer auth clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-uds-peer-auth \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

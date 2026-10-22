@@ -27,7 +27,7 @@ pub use pplx_space_kube_client as kube_client;
 pub use pplx_space_service_lifecycle as lifecycle;
 pub mod local_health;
 pub use pplx_space_page_cache as page_cache;
-pub mod peer_auth;
+pub use pplx_space_uds_peer_auth as peer_auth;
 pub mod rate_limiter;
 pub use pplx_space_service_mutex as service_mutex;
 pub use pplx_space_valkey::redis;

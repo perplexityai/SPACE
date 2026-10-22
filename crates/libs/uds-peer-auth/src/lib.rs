@@ -4,6 +4,9 @@
 //! narrower service question "which local principal is this request from, and
 //! is it allowed to perform this operation?".
 //!
+//! It is its own crate so a service can authorize UDS peers without
+//! depending on the rest of `pplx-space-common-svc`.
+//!
 //! Authentication layers, weakest to strongest:
 //!
 //! 1. **Filesystem permissions** — the UDS itself is mode `0o770` with a
@@ -843,7 +846,7 @@ pub fn peer_identity_from_tonic_request<T>(request: &TonicRequest<T>) -> Option<
         .and_then(peer_identity_from_uds_connect_info)
 }
 
-pub(crate) fn peer_identity_from_http_request<T>(request: &HttpRequest<T>) -> Option<PeerIdentity> {
+pub fn peer_identity_from_http_request<T>(request: &HttpRequest<T>) -> Option<PeerIdentity> {
     if let Some(identity) = request.extensions().get::<PeerIdentity>() {
         return Some(identity.clone());
     }

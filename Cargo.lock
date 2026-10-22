@@ -5559,6 +5559,7 @@ dependencies = [
  "pplx-space-systemd-watchdog",
  "pplx-space-test-env",
  "pplx-space-tokio-runtime",
+ "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-path",
  "pplx-space-valkey",
  "rand 0.10.2",
@@ -7609,6 +7610,21 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-uds-peer-auth"
+version = "0.8.0"
+dependencies = [
+ "http 1.5.0",
+ "nix 0.31.3",
+ "pplx-space-common-core",
+ "pplx-space-metrics",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

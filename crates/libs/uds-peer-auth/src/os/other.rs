@@ -8,7 +8,7 @@
 
 use super::super::PeerProcessSnapshot;
 
-pub(in crate::peer_auth) fn read_peer_process(_pid: i32) -> std::io::Result<PeerProcessSnapshot> {
+pub(crate) fn read_peer_process(_pid: i32) -> std::io::Result<PeerProcessSnapshot> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "peer process inspection requires Linux /proc",

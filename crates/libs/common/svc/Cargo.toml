@@ -86,6 +86,7 @@ pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-systemd-watchdog = { workspace = true }
 pplx-space-tokio-runtime = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-path = { workspace = true }
 pplx-space-valkey = { workspace = true }
 
