@@ -111,7 +111,11 @@ pub(super) fn assemble_substrate(
             caches,
         },
         restore_waiters: RestoreWaiters::new(
-            K8sStore::new(pool.clone(), TEST_SANDBOX_NAMESPACE.to_string()),
+            K8sStore::new(
+                pool.clone(),
+                TEST_SANDBOX_NAMESPACE.to_string(),
+                super::store::MaterializationMode::Fenced,
+            ),
             shutdown_token.clone(),
             task_tracker.clone(),
         ),
@@ -119,7 +123,11 @@ pub(super) fn assemble_substrate(
         wake_coalescer: Arc::new(
             pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
         ),
-        store: K8sStore::new(pool.clone(), TEST_SANDBOX_NAMESPACE.to_string()),
+        store: K8sStore::new(
+            pool.clone(),
+            TEST_SANDBOX_NAMESPACE.to_string(),
+            super::store::MaterializationMode::Fenced,
+        ),
         pod_store,
         pod_network_slots,
         pod_events: pod_reflector::PodEvents::for_test(),

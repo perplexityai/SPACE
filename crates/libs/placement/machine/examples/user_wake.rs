@@ -81,7 +81,11 @@ async fn wake(store: &PostgresPlacementStore, sandbox: SandboxId) -> Result<(), 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::PgPool::connect_lazy("postgres://localhost/space")?;
-    let store = PostgresPlacementStore::new(pool, "sandboxes".to_string());
+    let store = PostgresPlacementStore::new(
+        pool,
+        "sandboxes".to_string(),
+        pplx_space_common_core::types::PodMaterializationMode::Compatibility,
+    );
     wake(&store, SandboxId::new()).await?;
     Ok(())
 }

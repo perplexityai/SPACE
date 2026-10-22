@@ -5,6 +5,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
+use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, SandboxId};
 
 use std::sync::{
@@ -333,6 +334,51 @@ fn routable_pod(sandbox_id: SandboxId, generation: i64) -> Pod {
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[test]
+fn cancelled_materialization_cleanup_requires_the_retired_execution_identity() {
+    use pplx_space_common_core::{
+        kubernetes::SANDBOX_MATERIALIZATION_ID_ANNOTATION, types::PodMaterializationId,
+    };
+    let sandbox = SandboxId::new();
+    let token = PodMaterializationId::generate();
+    for expected in [None, Some(token)] {
+        let mut pod = routable_pod(sandbox, 3);
+        pod.metadata.name = Some("sandbox-generation-3".into());
+        if let Some(token) = expected {
+            pod.metadata.annotations.as_mut().unwrap().insert(
+                SANDBOX_MATERIALIZATION_ID_ANNOTATION.into(),
+                token.to_string(),
+            );
+        }
+        let pod = SandboxPodView::from(pod);
+        for (owner, generation, name, materialization, allowed) in [
+            (sandbox, 3, "sandbox-generation-3", expected, true),
+            (SandboxId::new(), 3, "sandbox-generation-3", expected, false),
+            (sandbox, 4, "sandbox-generation-3", expected, false),
+            (sandbox, 3, "different-name", expected, false),
+            (
+                sandbox,
+                3,
+                "sandbox-generation-3",
+                Some(PodMaterializationId::generate()),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                delete::retired_materialization_matches(
+                    &pod,
+                    owner,
+                    generation,
+                    name,
+                    materialization
+                )
+                .unwrap(),
+                allowed
+            );
+        }
     }
 }
 
@@ -1134,4 +1180,293 @@ async fn pod_worker_channel_verifies_tls_for_raw_pod_ips() {
         .expect("listener shutdown must remain bounded")
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn obsolete_materialization_cleanup_revalidates_the_current_claim()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::controllers::substrate::kubernetes::tests::{
+        insert_test_sandbox_row, substrate_with_store_and_client,
+    };
+    use pplx_space_common_core::kubernetes::SANDBOX_MATERIALIZATION_ID_ANNOTATION;
+    use tonic::codegen::http;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox, "started").await?;
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let conflict = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let count = Arc::clone(&deletes);
+    let respond_conflict = Arc::clone(&conflict);
+    let client = kube::Client::new(
+        tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            use http_body_util::BodyExt;
+            let count = Arc::clone(&count);
+            let conflict = respond_conflict.load(Ordering::SeqCst);
+            async move {
+                assert_eq!(req.method(), http::Method::DELETE);
+                let body = req.into_body().collect().await?.to_bytes();
+                let options: serde_json::Value = serde_json::from_slice(&body)?;
+                assert_eq!(options["preconditions"]["uid"], "pod-uid-1");
+                assert_eq!(options["preconditions"]["resourceVersion"], "1");
+                count.fetch_add(1, Ordering::SeqCst);
+                let code = if conflict { 409 } else { 200 };
+                let body = serde_json::json!({"kind":"Status", "apiVersion":"v1", "status":if conflict {"Failure"} else {"Success"}, "reason":if conflict {"Conflict"} else {""}, "code":code});
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                    http::Response::builder()
+                        .status(code)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(serde_json::to_vec(&body)?))?,
+                )
+            }
+        }),
+        "space",
+    );
+    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let original = substrate.store.ensure_active_execution_row(sandbox).await?;
+    sqlx::query(sql!("UPDATE sandbox_k8s_executions SET pod_name='sandbox-generation-1' WHERE sandbox_id=$1 AND active"))
+        .bind(sandbox).execute(&db.pool).await?;
+    substrate
+        .store
+        .persist_observed_pod_metadata(
+            sandbox,
+            original.generation,
+            Some("pod-uid-1"),
+            None,
+            original.materialization_id,
+        )
+        .await?;
+    let predecessor = substrate.store.ensure_active_execution_row(sandbox).await?;
+    substrate
+        .store
+        .claim_pod_materialization(sandbox, &predecessor, SandboxLifecycle::Started)
+        .await?
+        .unwrap();
+    let successor = substrate.store.ensure_active_execution_row(sandbox).await?;
+    for (expected, token, allowed, changed) in [
+        (
+            &predecessor,
+            successor.materialization_id.unwrap().to_string(),
+            false,
+            false,
+        ),
+        (
+            &successor,
+            predecessor.materialization_id.unwrap().to_string(),
+            true,
+            false,
+        ),
+        (&successor, "malformed-token".to_string(), true, false),
+        (
+            &successor,
+            predecessor.materialization_id.unwrap().to_string(),
+            true,
+            true,
+        ),
+    ] {
+        let mut pod = routable_pod(sandbox, original.generation);
+        pod.metadata.name = Some("sandbox-generation-1".into());
+        pod.metadata.resource_version = Some("1".into());
+        pod.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(SANDBOX_MATERIALIZATION_ID_ANNOTATION.into(), token);
+        conflict.store(changed, Ordering::SeqCst);
+        let count = deletes.load(Ordering::SeqCst);
+        let result = delete::delete_execution_pod(
+            &substrate.store,
+            sandbox,
+            &substrate.k8s,
+            &SandboxPodView::from(pod),
+            expected,
+        )
+        .await;
+        assert_eq!(result.is_ok(), allowed && !changed, "{result:?}");
+        if changed {
+            assert!(matches!(result, Err(SubstrateError::Unavailable { .. })));
+        }
+        assert_eq!(deletes.load(Ordering::SeqCst), count + usize::from(allowed));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_restore_checks_materialization_before_hydration()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::controllers::substrate::kubernetes::tests::{
+        insert_test_sandbox_row, substrate_with_store_client_proxy_port_and_pod,
+    };
+    use pplx_space_common_core::{
+        kubernetes::SANDBOX_MATERIALIZATION_ID_ANNOTATION, types::PodMaterializationId,
+    };
+    use tonic::codegen::http;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    for (matches, malformed) in [(true, false), (false, false), (false, true)] {
+        let sandbox = SandboxId::new();
+        let pod_name = format!("restore-{sandbox}");
+        let current = PodMaterializationId::generate();
+        let observed = if malformed {
+            "invalid-token".into()
+        } else if matches {
+            current.to_string()
+        } else {
+            PodMaterializationId::generate().to_string()
+        };
+        insert_test_sandbox_row(&db.pool, sandbox, "restoring").await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                (sandbox_id,generation,pod_name,pod_namespace,state,active,materialization_id)
+                VALUES ($1,1,$3,'space','creating',TRUE,$2)"
+        ))
+        .bind(sandbox)
+        .bind(current)
+        .bind(&pod_name)
+        .execute(&db.pool)
+        .await?;
+        let mut pod = routable_pod(sandbox, 1);
+        pod.metadata.name = Some(pod_name);
+        pod.metadata.namespace = Some("space".into());
+        pod.metadata.resource_version = Some("7".into());
+        pod.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(SANDBOX_MATERIALIZATION_ID_ANNOTATION.into(), observed);
+        pod.spec = Some(k8s_openapi::api::core::v1::PodSpec::default());
+        pod.status = Some(PodStatus {
+            phase: Some("Pending".into()),
+            ..Default::default()
+        });
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let count = deletes.clone();
+        let client = kube::Client::new(
+            tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let count = count.clone();
+                async move {
+                    use http_body_util::BodyExt;
+                    assert_eq!(request.method(), http::Method::DELETE);
+                    let body = request.into_body().collect().await?.to_bytes();
+                    let options: serde_json::Value = serde_json::from_slice(&body)?;
+                    assert_eq!(options["preconditions"]["uid"], "pod-uid-1");
+                    assert_eq!(options["preconditions"]["resourceVersion"], "7");
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(http::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(r#"{"kind":"Status","apiVersion":"v1","status":"Success","code":200}"#.as_bytes().to_vec()))?)
+                }
+            }),
+            "space",
+        );
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            db.pool.clone(),
+            client,
+            8080,
+            Some(pod),
+        );
+        let row = substrate.store.require_sandbox(sandbox).await?;
+        let result = substrate
+            .ensure_pod_exists(
+                &row,
+                None,
+                None,
+                Some("s3://example/restore?region=us-east-1"),
+                PodMaterializationOwnership::new(None, None, None),
+            )
+            .await;
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            usize::from(!matches),
+            "{result:?}"
+        );
+        if matches {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(SubstrateError::Unavailable { .. })),
+                "{result:?}"
+            );
+        }
+        let after = substrate.store.ensure_active_execution_row(sandbox).await?;
+        assert_eq!(after.materialization_id, Some(current));
+        assert_eq!(
+            after.observed_pod_uid.as_deref(),
+            matches.then_some("pod-uid-1")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn created_pod_cleanup_survives_scheduler_resource_version_change()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client;
+    use http_body_util::BodyExt;
+    use tonic::codegen::http;
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let count = deletes.clone();
+    let client = kube::Client::new(
+        tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let count = count.clone();
+            async move {
+                assert_eq!(req.method(), http::Method::DELETE);
+                let body = req.into_body().collect().await?.to_bytes();
+                let options: serde_json::Value = serde_json::from_slice(&body)?;
+                assert_eq!(options["preconditions"]["uid"], "pod-uid-1");
+                // The scheduler changed this same pod after POST returned version 1.
+                let conflict = options["preconditions"].get("resourceVersion").is_some();
+                count.fetch_add(1, Ordering::SeqCst);
+                let code = if conflict { 409 } else { 200 };
+                let body = serde_json::json!({"kind":"Status","apiVersion":"v1","status":if conflict {"Failure"} else {"Success"},"reason":if conflict {"Conflict"} else {""},"code":code});
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                    http::Response::builder()
+                        .status(code)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(serde_json::to_vec(&body)?))?,
+                )
+            }
+        }),
+        "space",
+    );
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused@127.0.0.1:1/unused")?;
+    let substrate = substrate_with_store_and_client(pool, client);
+    let mut pod = routable_pod(SandboxId::new(), 1);
+    pod.metadata.name = Some("created-pod".into());
+    pod.metadata.resource_version = Some("1".into());
+    delete::delete_created_materialization_pod(&substrate.k8s, &SandboxPodView::from(pod), None)
+        .await?;
+    assert_eq!(deletes.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_same_node_pod_cannot_supply_a_route_after_rematerialization()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::controllers::substrate::kubernetes::tests::{
+        insert_test_sandbox_row, substrate_with_inventory_caches_and_pool,
+    };
+    use pplx_space_common_core::{
+        kubernetes::SANDBOX_MATERIALIZATION_ID_ANNOTATION, types::PodMaterializationId,
+    };
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox, "started").await?;
+    let mut pod = routable_pod(sandbox, 1);
+    pod.metadata.name = Some("same-node-pod".into());
+    pod.metadata.namespace = Some("space".into());
+    pod.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+        node_name: Some("worker-a".into()),
+        ..Default::default()
+    });
+    pod.metadata.annotations.as_mut().unwrap().insert(
+        SANDBOX_MATERIALIZATION_ID_ANNOTATION.into(),
+        PodMaterializationId::generate().to_string(),
+    );
+    let pod_name = pod.metadata.name.clone().unwrap();
+    let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
+    sqlx::query(sql!("INSERT INTO sandbox_k8s_executions (sandbox_id,generation,pod_name,pod_namespace,pod_uid,pod_ip,k8s_node_name,materialization_id,state,active) VALUES ($1,1,$2,'space','successor-uid','192.0.2.20',$3,$4,'running',TRUE)"))
+        .bind(sandbox).bind(pod_name).bind(node_name).bind(PodMaterializationId::generate()).execute(&db.pool).await?;
+    let substrate = substrate_with_inventory_caches_and_pool(vec![pod], vec![], db.pool.clone());
+    assert_eq!(substrate.resolve_pod_ip(sandbox).await?, None);
+    Ok(())
 }

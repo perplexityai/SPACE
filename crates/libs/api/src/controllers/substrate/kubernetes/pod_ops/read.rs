@@ -174,6 +174,9 @@ impl KubernetesSubstrate {
             .persist_pod_node_placement_after_pod_exists(
                 PodNodePlacement {
                     sandbox_id,
+                    pod_name: pod.name(),
+                    pod_uid: pod.uid(),
+                    materialization_id: pod.materialization_id()?,
                     node_name,
                     node_uid,
                     node_id,
@@ -438,33 +441,22 @@ impl KubernetesSubstrate {
         let pod_uid = pod.uid().map(str::to_owned);
         let pod_ip = assigned_pod_ip(&pod)?;
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
-        if row.pod_uid.as_ref().map(PodUid::as_str) != pod_uid.as_deref()
-            || row.pod_ip.as_deref() != pod_ip_string.as_deref()
+        // Even an unchanged cached address is only a candidate: a successor
+        // can acquire the same name or node while this observation is in flight.
+        // The locked metadata write validates both token and Pod UID.
+        if self
+            .store
+            .persist_observed_pod_metadata(
+                sandbox_id,
+                row.generation,
+                pod_uid.as_deref(),
+                pod_ip_string.as_deref(),
+                pod.materialization_id()?,
+            )
+            .await?
+            .is_none()
         {
-            match self
-                .store
-                .persist_pod_metadata(
-                    sandbox_id,
-                    row.generation,
-                    pod_uid.as_deref(),
-                    pod_ip_string.as_deref(),
-                )
-                .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    generation = row.generation,
-                    "pod metadata write no-oped after pod lookup: the execution was \
-                     retired or replaced mid-flight"
-                ),
-                Err(err) => tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    generation = row.generation,
-                    error = %err,
-                    "failed to persist Kubernetes pod metadata after pod lookup"
-                ),
-            }
+            return Ok(None);
         }
 
         Ok(pod_ip.map(|ip| ResolvedPodInstance {

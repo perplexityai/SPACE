@@ -513,6 +513,7 @@ fn evacuation_common<'a>(
         sandbox_id: SandboxId::from_uuid(Uuid::from_u128(0x019de67463d77ef0a5888e106a878093)),
         execution_generation: 2,
         activation_attempt_id: None,
+        materialization_id: None,
         template: EVAC_TEST_TEMPLATE,
         content_hash: Some(EVAC_TEST_CONTENT_HASH),
         env,

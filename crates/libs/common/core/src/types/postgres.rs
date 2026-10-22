@@ -1,6 +1,6 @@
 //! PostgreSQL UUID codecs preserve domain identities through storage boundaries.
 
-use super::{LocalArtifactId, NodeGroupId, SandboxId, SnapshotId};
+use super::{LocalArtifactId, NodeGroupId, PodMaterializationId, SandboxId, SnapshotId};
 use uuid::Uuid;
 
 macro_rules! postgres_uuid {
@@ -26,7 +26,12 @@ macro_rules! postgres_uuid {
     )+};
 }
 
-postgres_uuid!(LocalArtifactId, NodeGroupId, SnapshotId);
+postgres_uuid!(
+    LocalArtifactId,
+    NodeGroupId,
+    PodMaterializationId,
+    SnapshotId
+);
 
 macro_rules! postgres_uuid_array {
     ($($name:ty),+ $(,)?) => {$(
@@ -38,4 +43,10 @@ macro_rules! postgres_uuid_array {
     )+};
 }
 
-postgres_uuid_array!(LocalArtifactId, NodeGroupId, SandboxId, SnapshotId);
+postgres_uuid_array!(
+    LocalArtifactId,
+    NodeGroupId,
+    PodMaterializationId,
+    SandboxId,
+    SnapshotId
+);
