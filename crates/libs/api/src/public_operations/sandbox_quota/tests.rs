@@ -349,8 +349,9 @@ async fn shared_creates_do_not_wait_for_each_other_and_refusals_take_no_lock() -
 }
 
 /// A create waiting for its quota lock gives up after
-/// [`QUOTA_LOCK_TIMEOUT`], or sooner under a shorter `statement_timeout`, as
-/// contended rather than holding its connection until the holder commits.
+/// [`QUOTA_LOCK_TIMEOUT`], or sooner under a shorter `statement_timeout` or
+/// `lock_timeout`, as contended rather than holding its connection until the
+/// holder commits.
 /// The bound covers the lock statements only: the rest of an admitted
 /// create's transaction keeps the session's own `lock_timeout`.
 #[tokio::test]
@@ -387,6 +388,17 @@ async fn a_long_quota_lock_wait_ends_contended() -> TestResult {
     let outcome = tokio::time::timeout(QUOTA_LOCK_TIMEOUT / 2, waiting.admit_new_create(quota))
         .await
         .map_err(|_| "the statement timeout did not end the wait")??;
+    assert_eq!(outcome, SandboxQuotaOutcome::Contended);
+    drop(waiting);
+
+    // A shorter bound already in force is kept, not raised.
+    let mut waiting = begin(&store, org_id, "shorter-lock-timeout").await?;
+    sqlx::query(sql!("SET LOCAL lock_timeout = '100ms'"))
+        .execute(&mut *waiting.tx)
+        .await?;
+    let outcome = tokio::time::timeout(QUOTA_LOCK_TIMEOUT / 2, waiting.admit_new_create(quota))
+        .await
+        .map_err(|_| "the shorter lock timeout was raised")??;
     assert_eq!(outcome, SandboxQuotaOutcome::Contended);
     drop(waiting);
     holder.rollback().await?;

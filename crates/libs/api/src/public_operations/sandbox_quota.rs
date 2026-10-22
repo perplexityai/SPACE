@@ -79,7 +79,7 @@ const MIN_LOCK_HEADROOM: i64 = 64;
 /// The longest a create waits for one quota lock before it answers
 /// [`SandboxQuotaOutcome::Contended`]. Set transaction-locally around the
 /// lock statements only, so the rest of the admission keeps the role's own
-/// `lock_timeout`.
+/// `lock_timeout`, and never raises a shorter one.
 const QUOTA_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The limits one native create in `org_id` is held to. Build one only when
@@ -310,21 +310,25 @@ impl PublicOperationAdmission {
     }
 }
 
-/// Bound this transaction's lock waits by `timeout`, or with `None` return
-/// them to the session default, the role's `lock_timeout`; the API sets none
-/// of its own on a session.
+/// Bound this transaction's lock waits by `timeout` unless a shorter bound
+/// is already set, or with `None` return them to the session default, the
+/// role's `lock_timeout`; the API sets none of its own on a session.
 async fn set_lock_timeout_tx(
     tx: &mut Transaction<'_, Postgres>,
     timeout: Option<Duration>,
 ) -> Result<(), sqlx::Error> {
     match timeout {
         // `set_config(..., is_local => true)` is `SET LOCAL` with a bind
-        // parameter.
+        // parameter. `0` is no bound.
         Some(timeout) => {
-            sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-                .bind(format!("{}ms", timeout.as_millis()))
-                .execute(&mut **tx)
-                .await?
+            sqlx::query(sql!(
+                "SELECT set_config('lock_timeout', $1::text, TRUE)
+                  WHERE current_setting('lock_timeout')::interval = interval '0'
+                     OR current_setting('lock_timeout')::interval > $1::text::interval"
+            ))
+            .bind(format!("{}ms", timeout.as_millis()))
+            .execute(&mut **tx)
+            .await?
         }
         None => {
             sqlx::query(sql!("SET LOCAL lock_timeout TO DEFAULT"))
@@ -363,11 +367,13 @@ struct SandboxesHeld {
 /// without one). An in-flight create whose row went terminal (a drain sweep
 /// failed it while the create ran) still counts: it can retry and succeed.
 ///
-/// One statement on purpose, which is why it reads `sandboxes` here rather
-/// than through `pplx-space-sandbox-store`: split into a row count and an
-/// operation count, two READ COMMITTED snapshots could miss a create whose
-/// row lands between them, counted by neither half. The terminal set repeats
-/// the lifecycle CAS guards' list.
+/// One statement on purpose: split into a row count and an operation count,
+/// two READ COMMITTED snapshots could miss a create whose row lands between
+/// them, counted by neither half. It lives here, beside the
+/// `public_operations` half this module owns and inside the admission
+/// transaction, rather than as a composed verb of `pplx-space-sandbox-store`,
+/// which owns `sandboxes`; moving it there has to keep it one statement. The
+/// terminal set repeats the lifecycle CAS guards' list.
 ///
 /// Cost: only a custom plan takes `idx_public_operations_state_next_attempt`
 /// alone, over the cluster's active operations; the generic plan a cached
