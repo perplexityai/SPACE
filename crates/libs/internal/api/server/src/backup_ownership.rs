@@ -33,7 +33,7 @@ pub(super) struct Caller {
     identity: Option<Result<KubernetesPodIdentity, Status>>,
 }
 impl Caller {
-    fn verified(&self) -> Result<&KubernetesPodIdentity, Status> {
+    pub(super) fn verified(&self) -> Result<&KubernetesPodIdentity, Status> {
         self.identity
             .as_ref()
             .ok_or_else(|| {
@@ -231,5 +231,12 @@ impl ClusterApiService {
             ));
         }
         Ok(())
+    }
+}
+
+pub(super) fn recovery_error(error: store::recovery::RecoveryError) -> Status {
+    match error {
+        store::recovery::RecoveryError::Refused(message) => Status::failed_precondition(message),
+        _ => Status::internal(format!("backup recovery: {error}")),
     }
 }

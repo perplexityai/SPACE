@@ -36,6 +36,7 @@ use crate::{
 mod api_key_store;
 mod api_keys;
 pub mod audit;
+mod backup_recovery;
 mod docs;
 mod identity;
 mod node_group_store;
@@ -142,6 +143,14 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/nodes/{node_id}/templates/{template_name}",
             axum::routing::delete(node_maintenance::delete_node_template),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/backup-recovery-grants",
+            get(backup_recovery::list).post(backup_recovery::approve),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/backup-recovery-grants/{grant_id}/revoke",
+            axum::routing::post(backup_recovery::revoke),
         )
         .route("/operations", get(operations::list_admin_operations))
         .route(

@@ -20,6 +20,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod backup_authority;
+pub mod recovery;
 pub mod upload_evidence;
 
 /// Reading a snapshot catalog row failed.
@@ -232,6 +233,7 @@ pub struct SnapshotRecord {
     timestamp: Timestamp,
     source_node_id: Option<NodeId>,
     source_node_uid: Option<K8sNodeUid>,
+    recovery_grant_id: Option<recovery::RecoveryGrantId>,
     label: Option<String>,
     retention_tier: Option<String>,
     vcpu: Option<i32>,
@@ -271,6 +273,10 @@ impl SnapshotRecord {
 
     pub const fn source_node_id(&self) -> Option<NodeId> {
         self.source_node_id
+    }
+
+    pub fn recovery_grant_id(&self) -> Option<recovery::RecoveryGrantId> {
+        self.recovery_grant_id
     }
 
     pub fn source_node_uid(&self) -> Option<&K8sNodeUid> {
@@ -457,6 +463,7 @@ struct SnapshotRow {
     timestamp: OffsetDateTime,
     source_node_id: Option<NodeId>,
     source_node_uid: Option<K8sNodeUid>,
+    recovery_grant_id: Option<recovery::RecoveryGrantId>,
     label: Option<String>,
     retention_tier: Option<String>,
     vcpu: Option<i32>,
@@ -527,7 +534,7 @@ pub async fn delete_snapshot_catalog(
 /// Content digest of one artifact file in a snapshot attempt, as reported by
 /// the node that uploaded it. Restore compares the bytes it pulls against this
 /// instead of trusting the object store.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotArtifactDigest {
     pub artifact: SnapshotArtifactFile,
     pub digest: Digest,
@@ -813,7 +820,7 @@ pub async fn artifact_registered_by_another_attempt(
         "SELECT EXISTS (
              SELECT 1
              FROM snapshots
-             WHERE sandbox_id = $1
+             WHERE recovery_grant_id IS NULL AND sandbox_id = $1
                AND local_artifact_id = $2
                AND id <> $3
          )"
@@ -862,7 +869,7 @@ pub async fn get(
 ) -> Result<Option<SnapshotRecord>, GetSnapshotError> {
     let row: Option<SnapshotRow> = sqlx::query_as(sql!(
         "SELECT sn.id, sn.sandbox_id, sn.type AS snapshot_kind, sn.state,
-                sn.timestamp, sn.source_node_id, sn.source_node_uid, sn.label, sn.retention_tier,
+                sn.timestamp, sn.source_node_id, sn.source_node_uid, sn.recovery_grant_id, sn.label, sn.retention_tier,
                 sn.vcpu, sn.memory_mib, sn.size_bytes, sn.template_id,
                 sn.content_hash, sn.org_id, sn.failure_reason,
                 sn.last_attempt_at, sn.local_artifact_id, sn.artifact_kind,
@@ -957,6 +964,7 @@ impl TryFrom<SnapshotRow> for SnapshotRecord {
             timestamp,
             source_node_id: row.source_node_id,
             source_node_uid: row.source_node_uid,
+            recovery_grant_id: row.recovery_grant_id,
             label: row.label,
             retention_tier: row.retention_tier,
             vcpu: row.vcpu,

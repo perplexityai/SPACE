@@ -1,5 +1,6 @@
 ---
 source: crates/libs/api/src/routes/admin/docs/tests.rs
+assertion_line: 34
 expression: paths_by_method
 ---
 {
@@ -96,6 +97,13 @@ expression: paths_by_method
   ],
   "/sandboxes/{sandbox_id}": [
     "patch"
+  ],
+  "/sandboxes/{sandbox_id}/backup-recovery-grants": [
+    "get",
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/backup-recovery-grants/{grant_id}/revoke": [
+    "post"
   ],
   "/sandboxes/{sandbox_id}:force-{action}": [
     "post"

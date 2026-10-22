@@ -15,6 +15,7 @@
   - [Troubleshooting](troubleshooting.md)
   - [Warm pools](warm-pools.md)
   - [Base snapshots](base-snapshots.md)
+  - [Retained snapshot recovery](backup-recovery.md)
   - [Internal RPC TLS](internal-rpc-tls.md)
   - [TLS interception exemptions](tls-interception-exemptions.md)
   - [Operator egress profiles](egress-profiles.md)

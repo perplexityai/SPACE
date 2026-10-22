@@ -4997,6 +4997,7 @@ dependencies = [
  "pplx-space-sandbox-store",
  "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
+ "pplx-space-snapshot-store",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
  "prost",

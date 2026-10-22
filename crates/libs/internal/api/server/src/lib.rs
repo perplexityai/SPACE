@@ -761,6 +761,31 @@ impl ClusterApiService {
         self.authorize_backup_incarnation(&mut tx, &attempt, caller)
             .await?;
 
+        let recovery_to_consume =
+            if target_state.is_ready() && attempt.recovery_grant_id().is_some() {
+                let grant = snapshot_store::recovery::for_attempt(&mut tx, snapshot_id)
+                    .await
+                    .map_err(backup_ownership::recovery_error)?
+                    .ok_or_else(|| Status::failed_precondition("recovery approval missing"))?;
+                if snapshot_store::recovery::validate_ready(
+                    &mut tx,
+                    &grant,
+                    &attempt,
+                    artifact_digests,
+                    upload_evidence,
+                    bytes_uploaded,
+                )
+                .await
+                .map_err(backup_ownership::recovery_error)?
+                {
+                    Some(grant)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         // `RETURNING` the sandbox so a READY transition can wake the
         // cohort-restore listener without a second lookup, and the node and
         // artifact identity so it can clear exactly this artifact's row from
@@ -848,6 +873,11 @@ impl ClusterApiService {
                 })?;
         }
 
+        if let Some(grant) = recovery_to_consume {
+            snapshot_store::recovery::consume(&mut tx, &grant, snapshot_id)
+                .await
+                .map_err(backup_ownership::recovery_error)?;
+        }
         let suspend_projection = if target_state.is_ready() {
             project_ready_suspend_snapshot(&mut tx, snapshot_id).await?
         } else {
@@ -1069,6 +1099,67 @@ impl ClusterApiService {
         )
         .await
         .map_err(backup_ownership::database_error)?;
+        let grant = match snapshot_store::recovery::for_attempt(&mut tx, snapshot_id)
+            .await
+            .map_err(backup_ownership::recovery_error)?
+        {
+            Some(grant) => Some(grant),
+            None => snapshot_store::recovery::for_artifact(&mut tx, sandbox_id, local_artifact_id)
+                .await
+                .map_err(backup_ownership::recovery_error)?,
+        };
+        if let Some(grant) = grant {
+            if execution_generation.map(ExecutionGeneration::get)
+                != Some(grant.execution_generation)
+            {
+                return Err(Status::failed_precondition(
+                    "recovery request does not name the approved execution",
+                ));
+            }
+            let identity = caller.verified()?;
+            self.authorize_backup_source_node(
+                &mut *tx,
+                Some(grant.uploader_node_id),
+                caller.remote_addr,
+                "recovery uploader",
+            )
+            .await?;
+            let persisted =
+                snapshot_store::recovery::register(&mut tx, &grant, snapshot, identity.node_uid())
+                    .await
+                    .map_err(backup_ownership::recovery_error)?;
+            self.authorize_backup_incarnation(&mut tx, &persisted, &caller)
+                .await?;
+            if req.fence_verdict_only {
+                tx.rollback()
+                    .await
+                    .map_err(backup_ownership::database_error)?;
+            } else {
+                tx.commit()
+                    .await
+                    .map_err(backup_ownership::database_error)?;
+            }
+            return Ok(Response::new(BeginArtifactBackupResponse {
+                local_artifact_id: local_artifact_id.to_string(),
+                backup_attempt_id: backup_attempt_id.to_string(),
+                fence_verdict_only: req.fence_verdict_only,
+            }));
+        }
+        // An explicit recovery approval reserves subsequent registrations of
+        // these bytes for its approved uploader. Historical ordinary attempts
+        // must neither block that approval nor bypass it after consumption.
+        if snapshot_store::backup_authority::has_recovery_provenance(
+            &mut tx,
+            sandbox_id,
+            local_artifact_id,
+        )
+        .await
+        .map_err(backup_ownership::database_error)?
+        {
+            return Err(Status::failed_precondition(
+                "recovery artifact requires a new valid approval",
+            ));
+        }
         snapshot = snapshot.with_source_node_id(
             prior
                 .as_ref()
