@@ -44,7 +44,10 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
-use pplx_space_common_core::types::{PodName, PodUid};
+use pplx_space_common_core::types::PodName;
+use pplx_space_common_svc::auth::node_identity::{
+    check_peer_ip, check_pod_running, check_pod_uid, single_extra_value,
+};
 use pplx_space_common_svc::sql::node_registration::registered_node;
 
 use crate::auth::{ClientService, K8sIdentity, K8sNodeIdentity};
@@ -889,67 +892,6 @@ fn validate_token_review_status(
         node_name,
         node_uid,
     })
-}
-
-fn single_extra_value<'a>(
-    extra: Option<&'a std::collections::BTreeMap<String, Vec<String>>>,
-    key: &str,
-) -> Option<&'a str> {
-    let values = extra?.get(key)?;
-    match values.as_slice() {
-        [value] if !value.is_empty() => Some(value),
-        _ => None,
-    }
-}
-
-fn check_pod_uid(pod: &Pod, expected: &PodUid) -> Result<(), Status> {
-    if pod.metadata.uid.as_deref() != Some(expected.as_str()) {
-        return Err(Status::permission_denied("pod_uid_mismatch"));
-    }
-    Ok(())
-}
-
-fn check_pod_running(pod: &Pod) -> Result<(), Status> {
-    if pod
-        .status
-        .as_ref()
-        .and_then(|status| status.phase.as_deref())
-        != Some("Running")
-    {
-        return Err(Status::permission_denied("pod_not_running"));
-    }
-    Ok(())
-}
-
-fn check_peer_ip(pod: &Pod, peer: Option<IpAddr>) -> Result<(), Status> {
-    let peer = peer
-        .map(normalize_ip)
-        .ok_or_else(|| Status::permission_denied("peer_address_missing"))?;
-    let matches = pod
-        .status
-        .as_ref()
-        .and_then(|status| status.pod_ips.as_ref())
-        .is_some_and(|ips| {
-            ips.iter().any(|ip| {
-                ip.ip
-                    .parse::<IpAddr>()
-                    .is_ok_and(|ip| normalize_ip(ip) == peer)
-            })
-        });
-    if !matches {
-        return Err(Status::permission_denied("peer_ip_mismatch"));
-    }
-    Ok(())
-}
-
-fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(ip) => ip
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(ip)),
-        ip => ip,
-    }
 }
 
 fn token_digest(token: &str) -> [u8; 32] {

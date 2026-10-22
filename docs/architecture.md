@@ -191,6 +191,28 @@ token-aware compatibility binary; pre-token binaries are no longer safe writers.
 The placement store requires an explicit creation mode and must receive the same
 policy when a controller adopts it.
 
+### Backup publisher identity
+
+Backup publisher identity is rolled out with `SPACE_BACKUP_IDENTITY_MODE`,
+initially `shadow`, which records no new verified source identity. Deploy all
+identity-aware readers before enabling `compatibility` to certify new attempts;
+rollback then requires an identity-aware binary. Pod-bound callers are checked against a live daemon
+pod before acquiring database locks; a verified attempt always requires its
+original worker incarnation, including in compatibility mode. Static Direct
+workers retain address-based admission. Static Kubernetes fallback and legacy
+execution records cannot mint historical Node UID evidence. Enable `strict`
+only after all identity writers and workers have rolled out and retained legacy
+artifacts have an operator recovery path. Verification failures use the existing
+bounded, attempt-scoped upload retries; exhaustion retains the local source.
+
+A verified retry preserves the first registration's timestamp. `last_attempt_at`
+is its liveness clock for the stuck-upload reaper and node termination gate;
+restore selection and portability continue to use the original timestamp.
+Retirement alone does not supersede a capture. Main's generation fence still
+rejects a replaced execution or a newer active/materialized execution on first
+registration. A verified prior registration can authorize an exact artifact
+retry after relocation, without changing placement or clearing quarantine.
+
 ### Lifecycle policy at activation
 
 Timeout updates use durable execution ownership rather than a lifecycle label

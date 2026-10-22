@@ -64,6 +64,7 @@ pplx-space-snapshot-store = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx", "test-hooks"] }
 hex = { workspace = true }
 insta = { workspace = true, features = ["yaml", "redactions"] }

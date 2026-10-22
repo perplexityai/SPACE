@@ -5933,6 +5933,7 @@ dependencies = [
 name = "pplx-space-internal-api-server"
 version = "0.8.0"
 dependencies = [
+ "axum",
  "futures-util",
  "hex",
  "insta",

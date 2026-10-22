@@ -6,10 +6,10 @@ use jiff::Timestamp;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactKindParseError, ArtifactOrigin, ArtifactOriginParseError,
-    ExactStorageUri, ExecutionGeneration, ExecutionGenerationParseError, LocalArtifactId, NodeId,
-    OrgId, SandboxId, SnapshotContentHash, SnapshotExecutionMetadata, SnapshotId, SnapshotKind,
-    SnapshotKindParseError, SnapshotName, SnapshotParseError, SnapshotState,
-    SnapshotStateParseError, TemplateName, TemplateParseError,
+    ExactStorageUri, ExecutionGeneration, ExecutionGenerationParseError, K8sNodeUid,
+    LocalArtifactId, NodeId, OrgId, SandboxId, SnapshotContentHash, SnapshotExecutionMetadata,
+    SnapshotId, SnapshotKind, SnapshotKindParseError, SnapshotName, SnapshotParseError,
+    SnapshotState, SnapshotStateParseError, TemplateName, TemplateParseError,
 };
 use pplx_space_common_core::types::{
     Digest, DigestParseError, SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
@@ -18,6 +18,8 @@ use sqlx::FromRow;
 use sqlx::types::Json;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+pub mod backup_authority;
 
 /// Reading a snapshot catalog row failed.
 #[derive(Debug, thiserror::Error)]
@@ -228,6 +230,7 @@ pub struct SnapshotRecord {
     state: SnapshotState,
     timestamp: Timestamp,
     source_node_id: Option<NodeId>,
+    source_node_uid: Option<K8sNodeUid>,
     label: Option<String>,
     retention_tier: Option<String>,
     vcpu: Option<i32>,
@@ -267,6 +270,10 @@ impl SnapshotRecord {
 
     pub const fn source_node_id(&self) -> Option<NodeId> {
         self.source_node_id
+    }
+
+    pub fn source_node_uid(&self) -> Option<&K8sNodeUid> {
+        self.source_node_uid.as_ref()
     }
 
     pub fn label(&self) -> Option<&str> {
@@ -448,6 +455,7 @@ struct SnapshotRow {
     state: String,
     timestamp: OffsetDateTime,
     source_node_id: Option<NodeId>,
+    source_node_uid: Option<K8sNodeUid>,
     label: Option<String>,
     retention_tier: Option<String>,
     vcpu: Option<i32>,
@@ -853,7 +861,7 @@ pub async fn get(
 ) -> Result<Option<SnapshotRecord>, GetSnapshotError> {
     let row: Option<SnapshotRow> = sqlx::query_as(sql!(
         "SELECT sn.id, sn.sandbox_id, sn.type AS snapshot_kind, sn.state,
-                sn.timestamp, sn.source_node_id, sn.label, sn.retention_tier,
+                sn.timestamp, sn.source_node_id, sn.source_node_uid, sn.label, sn.retention_tier,
                 sn.vcpu, sn.memory_mib, sn.size_bytes, sn.template_id,
                 sn.content_hash, sn.org_id, sn.failure_reason,
                 sn.last_attempt_at, sn.local_artifact_id, sn.artifact_kind,
@@ -947,6 +955,7 @@ impl TryFrom<SnapshotRow> for SnapshotRecord {
             state,
             timestamp,
             source_node_id: row.source_node_id,
+            source_node_uid: row.source_node_uid,
             label: row.label,
             retention_tier: row.retention_tier,
             vcpu: row.vcpu,

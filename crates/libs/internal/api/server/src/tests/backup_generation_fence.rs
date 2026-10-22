@@ -241,6 +241,9 @@ async fn teardown_backup_racing_a_retire_sees_the_retired_execution() -> TestRes
 
     let mut retire = pool.begin().await?;
     retire_execution(&mut *retire, sandbox_id, 4).await?;
+    let blocker: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *retire)
+        .await?;
 
     let backup_attempt_id = SnapshotId::new();
     let begin = begin_teardown_backup(
@@ -255,9 +258,9 @@ async fn teardown_backup_racing_a_retire_sees_the_retired_execution() -> TestRes
         loop {
             let waiting: i64 = sqlx::query_scalar(sql!(
                 "SELECT COUNT(*) FROM pg_stat_activity
-                  WHERE wait_event_type = 'Lock'
-                    AND query LIKE '%FROM sandbox_k8s_executions%'"
+                  WHERE $1 = ANY(pg_blocking_pids(pid))"
             ))
+            .bind(blocker)
             .fetch_one(pool)
             .await?;
             if waiting > 0 {
@@ -282,8 +285,8 @@ async fn teardown_backup_racing_a_retire_sees_the_retired_execution() -> TestRes
 
 /// A newer execution inserted while Begin is registering can't slip past the
 /// fence. The inserter holds the sandbox row `FOR UPDATE`, as every execution
-/// insert does, so the snapshot insert's foreign-key check waits on it, and
-/// the fence then reads the committed newer execution.
+/// insert does. Begin waits on that same owner, then its fence reads the
+/// committed newer execution.
 #[tokio::test(flavor = "current_thread")]
 async fn teardown_backup_racing_a_newer_execution_sees_it() -> TestResult {
     let Some(fixture) = cluster_fixture_with_max_connections(5).await? else {
@@ -310,6 +313,9 @@ async fn teardown_backup_racing_a_newer_execution_sees_it() -> TestResult {
     .execute(&mut *claim)
     .await?;
     insert_execution(&mut *claim, sandbox_id, 5, "creating", true).await?;
+    let blocker: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *claim)
+        .await?;
 
     let backup_attempt_id = SnapshotId::new();
     let begin = begin_teardown_backup(
@@ -324,9 +330,9 @@ async fn teardown_backup_racing_a_newer_execution_sees_it() -> TestResult {
         loop {
             let waiting: i64 = sqlx::query_scalar(sql!(
                 "SELECT COUNT(*) FROM pg_stat_activity
-                  WHERE wait_event_type = 'Lock'
-                    AND query LIKE '%INSERT INTO snapshots%'"
+                  WHERE $1 = ANY(pg_blocking_pids(pid))"
             ))
+            .bind(blocker)
             .fetch_one(pool)
             .await?;
             if waiting > 0 {
