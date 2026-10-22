@@ -91,6 +91,7 @@ members = [
     "crates/libs/placement/machine",
     "crates/libs/public/api",
     "crates/libs/api",
+    "crates/libs/api-route",
     "crates/libs/byte-size",
     "crates/libs/common/core",
     "crates/libs/semver",
@@ -315,6 +316,7 @@ zstd = { version = "0.14", features = ["zstdmt"] }
 
 # internal
 pplx-space-api = { path = "crates/libs/api" }
+pplx-space-api-route = { path = "crates/libs/api-route" }
 pplx-space-aws-client = { path = "crates/libs/aws/client" }
 pplx-space-s3-http-client = { path = "crates/libs/aws/s3-http-client" }
 pplx-space-bearer-token = { path = "crates/libs/bearer-token" }

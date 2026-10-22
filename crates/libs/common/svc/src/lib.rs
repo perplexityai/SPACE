@@ -33,10 +33,10 @@ pub use pplx_space_service_mutex as service_mutex;
 pub use pplx_space_valkey::redis;
 #[cfg(test)]
 mod service_mutex_handoff_tests;
+pub use pplx_space_api_route as space_api_route;
+pub use pplx_space_api_route::capability as space_api_route_capability;
+pub use pplx_space_api_route::ed25519 as space_api_route_ed25519;
 pub use pplx_space_valkey::shared_valkey;
-pub mod space_api_route;
-pub mod space_api_route_capability;
-pub mod space_api_route_ed25519;
 pub mod sql;
 pub mod template_lookup;
 pub use pplx_space_systemd_watchdog as systemd;

@@ -1,3 +1,15 @@
+//! SPACE API route identity and capabilities: the gRPC metadata vocabulary
+//! for route tokens, bridge caller policy, wait-ready purpose and
+//! route-identity rejections, the scheme-neutral route capability
+//! (`capability`), and Ed25519-signed, incarnation-bound route tokens
+//! (`ed25519`).
+//!
+//! It is its own crate so services can mint and verify route capabilities
+//! without depending on the rest of `pplx-space-common-svc`.
+
+pub mod capability;
+pub mod ed25519;
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -5,7 +17,7 @@ use pplx_space_common_core::types::{SandboxRouteIdentity, SpaceApiRouteIdentity}
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Status};
 
-pub use crate::space_api_route_capability::{
+pub use crate::capability::{
     SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY, SandboxRouteCapability, SpaceApiRouteProtocol,
     SpaceApiRouteProtocolParseError, SpaceApiRoutePurpose, SpaceApiRoutePurposeParseError,
 };
@@ -513,7 +525,7 @@ pub fn space_api_route_generation_fence_enabled() -> bool {
 }
 
 pub fn space_api_route_token_metadata(metadata: &MetadataMap) -> MetadataMap {
-    crate::space_api_route_capability::route_token_metadata(metadata)
+    crate::capability::route_token_metadata(metadata)
 }
 
 #[cfg(test)]

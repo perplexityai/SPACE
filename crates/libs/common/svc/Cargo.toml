@@ -20,19 +20,24 @@ k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
 # Exposes `sql::migration_checksums`, the accepted-checksums adapter every
 # migration runner embeds.
 migration-checksums = ["dep:pplx-space-migration-checksums"]
-# Exposes shared route and authentication test helpers to other crates.
-# Unit tests get them under `cfg(test)`; external test suites opt in through
-# a dev-dependency. Mirrors `pplx-space-metrics-emit`'s `test-capture`. Also
-# forwards `pplx-space-ecw-credential/test-support`, which exposes
+# Exposes shared authentication test helpers to other crates, and forwards to
+# `pplx-space-api-route/test-support` for the route test helpers. common-svc's
+# unit tests get its own helpers under `cfg(test)`, but not the route helpers,
+# which outside pplx-space-api-route only this feature enables.
+# External test suites opt in through a dev-dependency. Mirrors
+# `pplx-space-metrics-emit`'s `test-capture`. Also forwards
+# `pplx-space-ecw-credential/test-support`, which exposes
 # `EcwCredentialKeyring::from_current_key_for_test`; this crate's `cfg(test)`
 # does not cover that constructor, so its unit tests get it only with this
 # feature.
-test-support = ["pplx-space-ecw-credential/test-support"]
+test-support = [
+    "pplx-space-api-route/test-support",
+    "pplx-space-ecw-credential/test-support",
+]
 # Enables the test-only environment overrides (see `pplx_space_common_core::env::test_hook`).
 test-hooks = ["pplx-space-common-core/test-hooks"]
 
 [dependencies]
-aws-lc-rs = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -64,6 +69,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 
 # internal
+pplx-space-api-route = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true }

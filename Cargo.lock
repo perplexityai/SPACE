@@ -5031,6 +5031,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-api-route"
+version = "0.8.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "jiff",
+ "pplx-space-common-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tonic",
+]
+
+[[package]]
 name = "pplx-space-api-svc"
 version = "0.8.0"
 dependencies = [
@@ -5514,7 +5528,6 @@ dependencies = [
 name = "pplx-space-common-svc"
 version = "0.8.0"
 dependencies = [
- "aws-lc-rs",
  "axum",
  "base64 0.23.1",
  "bytes",
@@ -5527,6 +5540,7 @@ dependencies = [
  "log",
  "nix 0.31.3",
  "pin-project-lite",
+ "pplx-space-api-route",
  "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-common-grpc",

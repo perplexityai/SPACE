@@ -12,11 +12,9 @@ use pplx_space_common_core::types::{ClusterId, GuestPort, SandboxRouteIdentity};
 use serde::{Deserialize, Serialize};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 
-use crate::space_api_route_capability::{
-    SandboxRouteCapability, SpaceApiRouteProtocol, SpaceApiRoutePurpose,
-};
+use crate::capability::{SandboxRouteCapability, SpaceApiRouteProtocol, SpaceApiRoutePurpose};
 
-pub use crate::space_api_route_capability::SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY;
+pub use crate::capability::SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY;
 pub const SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_ENV: &str =
     "SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE";
 pub const SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV: &str =
