@@ -609,7 +609,55 @@ impl PublicOperationStore {
         payload_json: serde_json::Value,
         traceparent: Option<String>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
-        let lock_key = format!("{org_id}:{target_id}");
+        self.create_or_join_active_sandbox_operation(
+            org_id,
+            OperationKind::DeleteSandbox,
+            target_id,
+            payload_json,
+            traceparent,
+        )
+        .await
+    }
+
+    /// Create or join the one active sandbox wake for this tenant and target,
+    /// as [`Self::create_or_join_active_sandbox_delete`] does for deletes. Any
+    /// queued or running wake joins, whoever asked for it, so many commands on
+    /// one sandbox at rest share a single operation.
+    pub async fn create_or_join_active_sandbox_wake(
+        &self,
+        org_id: OrgId,
+        target_id: &str,
+        payload_json: serde_json::Value,
+        traceparent: Option<String>,
+    ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+        self.create_or_join_active_sandbox_operation(
+            org_id,
+            OperationKind::WakeSandbox,
+            target_id,
+            payload_json,
+            traceparent,
+        )
+        .await
+    }
+
+    /// The system's (actorless) operation of `kind` on a sandbox, joining one
+    /// already queued or running. The lock key includes the kind, so a delete
+    /// and a wake for one sandbox never serialize on each other here; the
+    /// dispatcher orders them.
+    async fn create_or_join_active_sandbox_operation(
+        &self,
+        org_id: OrgId,
+        kind: OperationKind,
+        target_id: &str,
+        payload_json: serde_json::Value,
+        traceparent: Option<String>,
+    ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+        // Deletes keep the lock key they always had.
+        let lock_key = if kind == OperationKind::DeleteSandbox {
+            format!("{org_id}:{target_id}")
+        } else {
+            format!("{org_id}:{target_id}:{}", kind.as_str())
+        };
         let mut tx = self.pool.begin().await?;
         sqlx::query(sql!(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
@@ -621,7 +669,7 @@ impl PublicOperationStore {
             "SELECT operation_id
                FROM public_operations
               WHERE org_id = $1
-                AND kind = 'delete_sandbox'
+                AND kind = $3
                 AND target_type = 'sandbox'
                 AND target_id = $2
                 AND state IN ('queued', 'running')
@@ -630,6 +678,7 @@ impl PublicOperationStore {
         ))
         .bind(org_id)
         .bind(target_id)
+        .bind(kind.as_str())
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(operation_id) = existing {
@@ -646,7 +695,7 @@ impl PublicOperationStore {
                 // missing actor; it keeps the snapshot-upload 409 for them.
                 actor_user_id: None,
                 api_product: ApiProduct::Native,
-                kind: OperationKind::DeleteSandbox,
+                kind,
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(target_id),
                 payload_json,
@@ -659,7 +708,7 @@ impl PublicOperationStore {
         if matches!(result, CreatePublicOperationResult::Created(_)) {
             pplx_space_metrics::operations::created(
                 ApiProduct::Native.as_str(),
-                OperationKind::DeleteSandbox.as_str(),
+                kind.as_str(),
                 OperationTargetType::Sandbox.as_str(),
             );
         }

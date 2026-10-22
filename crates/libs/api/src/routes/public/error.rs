@@ -234,6 +234,17 @@ impl PublicApiError {
         )
     }
 
+    /// A `conflict` for work that needs a running sandbox, with the
+    /// [`pplx_space_public_api::sandbox_not_running_details`].
+    pub fn sandbox_not_running(
+        sandbox_id: pplx_space_public_api::PublicSandboxId,
+        state: &pplx_space_public_api::SandboxLifecycleState,
+    ) -> Self {
+        let mut error = Self::conflict(format!("sandbox is {}, not running", state.as_str()));
+        error.details = pplx_space_public_api::sandbox_not_running_details(sandbox_id, state);
+        error
+    }
+
     pub fn failed_precondition(message: impl Into<String>) -> Self {
         Self::from_contract(
             PublicErrorCode::FailedPrecondition,
