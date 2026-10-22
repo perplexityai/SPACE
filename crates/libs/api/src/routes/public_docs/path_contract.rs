@@ -119,7 +119,7 @@ pub(super) fn insert_command_paths(
                     "400": { "description": "Invalid sandbox id, idempotency key, or command request" },
                     "401": { "description": "Authentication required" },
                     "404": { "description": "Sandbox not found" },
-                    "409": { "description": "Idempotency conflict" },
+                    "409": { "description": "Idempotency conflict, or a replayed create whose session was revoked" },
                     "413": { "description": "Request body is too large" },
                     "415": { "description": "Content-Type must be application/json" },
                     "422": { "description": "JSON body does not match CreateCommandRequest" },

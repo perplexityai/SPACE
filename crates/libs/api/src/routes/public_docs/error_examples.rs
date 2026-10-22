@@ -34,8 +34,9 @@ fn control_plane_examples(
         "401" => vec![Unauthorized],
         "403" => vec![Forbidden],
         "404" => vec![NotFound],
-        "409" if operation == CREATE_COMMAND => vec![IdempotencyConflict],
-        "409" if sandbox_mutation(operation) => vec![Conflict, IdempotencyConflict],
+        "409" if operation == CREATE_COMMAND || sandbox_mutation(operation) => {
+            vec![Conflict, IdempotencyConflict]
+        }
         "409" => vec![Conflict],
         "412" => vec![FailedPrecondition],
         "429" => vec![RateLimited],
