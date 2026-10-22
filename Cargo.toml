@@ -49,6 +49,7 @@ members = [
     "crates/libs/sandbox/store",
     "crates/libs/sandbox/teardown",
     "crates/libs/sandbox/portability",
+    "crates/libs/sandbox/auto-lifecycle-receipt",
     "crates/libs/snapshot/store",
     "crates/libs/snapshot/storage",
     "crates/libs/snapshot/retention",
@@ -397,6 +398,7 @@ pplx-space-cluster-trigger-queue = { path = "crates/libs/cluster/trigger-queue" 
 pplx-space-sandbox-portability = { path = "crates/libs/sandbox/portability" }
 pplx-space-sandbox-store = { path = "crates/libs/sandbox/store" }
 pplx-space-sandbox-teardown = { path = "crates/libs/sandbox/teardown" }
+pplx-space-auto-lifecycle-receipt = { path = "crates/libs/sandbox/auto-lifecycle-receipt" }
 pplx-space-snapshot-storage = { path = "crates/libs/snapshot/storage" }
 pplx-space-snapshot-retention = { path = "crates/libs/snapshot/retention" }
 pplx-space-snapshot-store = { path = "crates/libs/snapshot/store" }

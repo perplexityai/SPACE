@@ -1,3 +1,15 @@
+//! Auto-lifecycle delete-completion receipt contract.
+//!
+//! [`AutoLifecyclePolicyFingerprint`] is the stable identity of a normalized
+//! auto-lifecycle policy that a delete-completion receipt carries. The sandbox
+//! manager publishes receipts and the internal API consumes them; both use the
+//! fingerprint and `AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE`. The other
+//! `AUTO_LIFECYCLE_DELETE_COMPLETION_*` constants bound only the internal API.
+//!
+//! It is its own crate so that both sides can share the receipt contract
+//! without depending on `pplx-space-common-svc`. `pplx-space-common-svc`
+//! re-exports it as `types::auto_lifecycle`.
+
 use std::{fmt, str::FromStr, time::Duration};
 
 use pplx_space_common_core::types::{

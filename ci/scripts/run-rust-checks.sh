@@ -794,6 +794,24 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a common-core feature the auto-lifecycle receipt crate
+    # needs but only gets through unification with common-svc fails here.
+    echo "--- :rust: Running isolated auto-lifecycle receipt clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-auto-lifecycle-receipt \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-auto-lifecycle-receipt \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

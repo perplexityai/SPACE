@@ -12,7 +12,7 @@
 //! ```
 
 pub mod auth;
-pub mod auto_lifecycle;
+pub use pplx_space_auto_lifecycle_receipt as auto_lifecycle;
 pub mod endpoint;
 pub mod errors;
 pub mod grpc;
