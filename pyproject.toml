@@ -12,6 +12,8 @@ dependencies = [
     "python-dateutil==2.9.0.post0",
     "typing-extensions==4.16.0",
     "urllib3==2.8.0",
+    # WebSocket attach in the native process-session scenarios.
+    "websockets==17.2",
 ]
 
 [[tool.uv.index]]

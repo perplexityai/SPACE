@@ -68,7 +68,7 @@ pub(crate) async fn session_events(
         }
     };
 
-    let attached = match resolve_session_route(&state, session_id, &token).await {
+    let attached = match resolve_attach_route(&state, session_id, &token).await {
         Ok(attached) => attached,
         Err(error) => {
             pplx_space_metrics::data_plane::attach(
@@ -92,6 +92,7 @@ pub(crate) async fn session_events(
             return too_many_attached_streams_response(limit);
         }
     };
+    let sandbox_id = attached.sandbox_id;
     let stream_state = match attached.kind {
         SessionKind::Process => {
             let start_permit = match state.native_sessions.try_acquire(session_id, attached.kind) {
@@ -133,7 +134,7 @@ pub(crate) async fn session_events(
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start process event stream");
-                    return process_stream_start_http_error(&error);
+                    return process_stream_start_http_error(&error, sandbox_id);
                 }
             }
         }
@@ -350,6 +351,7 @@ impl ProcessSseState {
             code: DataPlaneErrorCode::BackendStreamError,
             message: error.to_string(),
             retryable: true,
+            details: Vec::new(),
         });
     }
 }
@@ -660,6 +662,7 @@ impl FileWatchSseState {
             code: DataPlaneErrorCode::BackendStreamError,
             message: error.to_string(),
             retryable: true,
+            details: Vec::new(),
         });
     }
 }

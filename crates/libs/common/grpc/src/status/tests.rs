@@ -234,3 +234,43 @@ fn only_a_not_found_is_marked_as_a_missing_guest_path() {
         "sandbox not found"
     )));
 }
+
+#[test]
+fn sandbox_not_running_round_trips_its_state_on_a_failed_precondition_only() {
+    let marked = mark_sandbox_not_running(Status::failed_precondition("not started"), "suspended");
+    assert_eq!(sandbox_not_running_state(&marked), Some("suspended"));
+    assert_eq!(
+        sandbox_not_running_state(&Status::failed_precondition("not started")),
+        None
+    );
+    let unavailable = mark_sandbox_not_running(Status::unavailable("gone"), "suspended");
+    assert_eq!(sandbox_not_running_state(&unavailable), None);
+}
+
+#[test]
+fn an_at_rest_session_route_round_trips_its_sandbox_and_state() {
+    use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+    let sandbox_id = SandboxId::new();
+    let marked = mark_session_route_at_rest(
+        Status::failed_precondition("no node"),
+        sandbox_id,
+        SandboxLifecycle::Paused,
+    );
+    assert_eq!(
+        session_route_at_rest(&marked),
+        Some(SessionRouteAtRest {
+            sandbox_id: Some(sandbox_id),
+            state: Some(SandboxLifecycle::Paused),
+        })
+    );
+    assert_eq!(
+        session_route_at_rest(&Status::failed_precondition("no node")),
+        None
+    );
+    let unavailable = mark_session_route_at_rest(
+        Status::unavailable("no node"),
+        sandbox_id,
+        SandboxLifecycle::Paused,
+    );
+    assert_eq!(session_route_at_rest(&unavailable), None);
+}

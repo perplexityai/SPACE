@@ -612,10 +612,13 @@ impl SandboxManagerService {
                 )
                 && !activity.is_some_and(|activity| activity.allows_implicit_wake(wake_policy))
             {
-                let refusal = Status::failed_precondition(format!(
-                    "sandbox is {}, not started",
-                    sandbox.state
-                ));
+                let refusal = pplx_space_common_grpc::mark_sandbox_not_running(
+                    Status::failed_precondition(format!(
+                        "sandbox is {}, not started",
+                        sandbox.state
+                    )),
+                    sandbox.state.as_str(),
+                );
                 return Err(match route_auth {
                     Some(route_auth) => route_auth.refuse_sandbox(&sandbox, refusal),
                     None => refusal,
@@ -742,10 +745,13 @@ impl SandboxManagerService {
                 | SandboxState::CleanupFailed
                 | SandboxState::Quarantined
                 | SandboxState::Failed => {
-                    return Err(Status::failed_precondition(format!(
-                        "sandbox is {}, cannot wake",
-                        sandbox.state
-                    )));
+                    return Err(pplx_space_common_grpc::mark_sandbox_not_running(
+                        Status::failed_precondition(format!(
+                            "sandbox is {}, cannot wake",
+                            sandbox.state
+                        )),
+                        sandbox.state.as_str(),
+                    ));
                 }
             }
         }

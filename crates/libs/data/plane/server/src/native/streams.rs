@@ -2,6 +2,10 @@
 //! WebSocket and SSE paths share.
 
 use super::*;
+use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_public_api::{
+    PublicErrorDetail, PublicSandboxId, SandboxLifecycleState, sandbox_not_running_details,
+};
 
 pub(super) async fn initial_process_stream(
     client: &mut WorkerApiClient<GrpcClientTrace<Channel>>,
@@ -134,9 +138,56 @@ pub(super) fn guest_storage_full(status: &tonic::Status) -> bool {
             == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
 }
 
-pub(super) fn process_stream_start_http_error(error: &StreamBridgeError) -> Response {
+/// The sandbox's public state and wake request when the backend refused to
+/// start work because the sandbox is not running and this attach may not
+/// wake it (see [`pplx_space_common_grpc::mark_sandbox_not_running`]).
+fn sandbox_not_running(
+    error: &StreamBridgeError,
+    sandbox_id: SandboxId,
+) -> Option<(String, Vec<PublicErrorDetail>)> {
+    let StreamBridgeError::BackendStatus(status) = error else {
+        return None;
+    };
+    let state = pplx_space_common_grpc::sandbox_not_running_state(status)?;
+    // A node-local state the cluster has no name for (cleanup) is a sandbox
+    // that will not run again.
+    let state = state
+        .parse::<SandboxLifecycle>()
+        .map_or(SandboxLifecycleState::Failed, SandboxLifecycleState::from);
+    Some((
+        format!("sandbox is {}, not running", state.as_str()),
+        sandbox_not_running_details(PublicSandboxId::from(sandbox_id), &state),
+    ))
+}
+
+pub(super) fn process_stream_start_http_error(
+    error: &StreamBridgeError,
+    sandbox_id: SandboxId,
+) -> Response {
     if let Some(response) = backend_refusal_http_error(error) {
         return response;
+    }
+    // Retrying the attach cannot start the command until the caller wakes the
+    // sandbox, so answer as createCommand does rather than as a stream that is
+    // not available yet.
+    if let Some((message, details)) = sandbox_not_running(error, sandbox_id) {
+        observe_data_plane_http_error(
+            StatusCode::CONFLICT,
+            ResponseOrigin::Node,
+            ResponseKind::BackendStatus,
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(DataPlaneHttpErrorEnvelope {
+                error: DataPlaneHttpError {
+                    code: DataPlaneHttpErrorCode::Conflict,
+                    message,
+                    retryable: false,
+                    details,
+                },
+            }),
+        )
+            .into_response();
     }
     // The sandbox's disk or quota is full: not retryable until space is freed,
     // and named as such rather than as a generic start failure.
@@ -198,7 +249,18 @@ pub(super) fn process_stream_start_http_error(error: &StreamBridgeError) -> Resp
     )
 }
 
-pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneServerFrame {
+pub(super) fn stream_start_error_frame(
+    error: &StreamBridgeError,
+    sandbox_id: SandboxId,
+) -> DataPlaneServerFrame {
+    if let Some((message, details)) = sandbox_not_running(error, sandbox_id) {
+        return DataPlaneServerFrame::Error {
+            code: DataPlaneErrorCode::BackendStreamError,
+            message,
+            retryable: false,
+            details,
+        };
+    }
     // A refusal made before anything started is retryable here as on SSE.
     if let StreamBridgeError::BackendStatus(status) = error
         && pplx_space_common_grpc::is_refused_before_start(status)
@@ -207,6 +269,7 @@ pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneSe
             code: DataPlaneErrorCode::BackendStreamError,
             message: format!("this request was refused: {}", status.message()),
             retryable: true,
+            details: Vec::new(),
         };
     }
     let retryable = matches!(
@@ -219,6 +282,7 @@ pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneSe
         code: DataPlaneErrorCode::BackendStreamError,
         message: error.to_string(),
         retryable,
+        details: Vec::new(),
     }
 }
 

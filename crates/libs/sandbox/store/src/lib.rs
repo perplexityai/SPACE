@@ -505,6 +505,30 @@ pub async fn restore_owner_active(
     .unwrap_or(false))
 }
 
+/// Whether a wake operation is queued or running for the org's sandbox, named
+/// by its operation `target_id`: observation only, it never claims the work.
+pub async fn wake_operation_active(
+    executor: impl sqlx::PgExecutor<'_>,
+    org_id: pplx_space_common_core::types::OrgId,
+    target_id: &str,
+) -> Result<bool, SandboxStoreError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM public_operations
+              WHERE org_id = $1
+                AND target_type = 'sandbox'
+                AND target_id = $2
+                AND kind = 'wake_sandbox'
+                AND state IN ('queued', 'running')
+         )"
+    ))
+    .bind(org_id)
+    .bind(target_id)
+    .fetch_one(executor)
+    .await?)
+}
+
 /// Replace desired lifecycle policy and clear its stale published observation.
 pub async fn set_auto_lifecycle_policy(
     executor: impl sqlx::PgExecutor<'_>,
