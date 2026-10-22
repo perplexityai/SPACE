@@ -100,12 +100,12 @@ pub enum BearerTokenError {
 }
 
 pub fn space_bearer_token(kind: SpaceBearerToken) -> Result<String, BearerTokenError> {
-    space_bearer_token_from_environment(kind, &pplx_space_common_core::env::ProcessEnvironment)
+    space_bearer_token_from_environment(kind, &pplx_space_env_vars::ProcessEnvironment)
 }
 
 pub(crate) fn space_bearer_token_from_environment(
     kind: SpaceBearerToken,
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> Result<String, BearerTokenError> {
     let path = env
         .var(kind.path_env())
@@ -148,12 +148,12 @@ pub(crate) fn space_bearer_token_from_environment(
 pub fn space_bearer_metadata(
     kind: SpaceBearerToken,
 ) -> Result<MetadataValue<Ascii>, BearerTokenError> {
-    space_bearer_metadata_from_environment(kind, &pplx_space_common_core::env::ProcessEnvironment)
+    space_bearer_metadata_from_environment(kind, &pplx_space_env_vars::ProcessEnvironment)
 }
 
 pub(crate) fn space_bearer_metadata_from_environment(
     kind: SpaceBearerToken,
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> Result<MetadataValue<Ascii>, BearerTokenError> {
     let token = space_bearer_token_from_environment(kind, env)?;
     Ok(format!("Bearer {token}").parse()?)
@@ -166,14 +166,14 @@ pub fn insert_space_bearer_token(
     insert_space_bearer_token_from_environment(
         metadata,
         kind,
-        &pplx_space_common_core::env::ProcessEnvironment,
+        &pplx_space_env_vars::ProcessEnvironment,
     )
 }
 
 pub(crate) fn insert_space_bearer_token_from_environment(
     metadata: &mut MetadataMap,
     kind: SpaceBearerToken,
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> Result<(), BearerTokenError> {
     metadata.insert(
         "authorization",
@@ -295,14 +295,14 @@ impl SpaceBearerInterceptor {
 
 impl tonic::service::Interceptor for SpaceBearerInterceptor {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        self.call_with_environment(request, &pplx_space_common_core::env::ProcessEnvironment)
+        self.call_with_environment(request, &pplx_space_env_vars::ProcessEnvironment)
     }
 }
 impl SpaceBearerInterceptor {
     pub(crate) fn call_with_environment(
         &mut self,
         mut request: Request<()>,
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Request<()>, Status> {
         crate::insert_space_bearer_token_from_environment(request.metadata_mut(), self.kind, env)
             .map_err(|error| {
@@ -327,15 +327,12 @@ impl SpaceBearerInterceptor {
 /// verdict. (`required_bearer_token`, by contrast, loads the static token as a
 /// service *boot* precondition and stays `INTERNAL`.)
 pub fn required_space_bearer_token(kind: crate::SpaceBearerToken) -> Result<String, Status> {
-    required_space_bearer_token_from_environment(
-        kind,
-        &pplx_space_common_core::env::ProcessEnvironment,
-    )
+    required_space_bearer_token_from_environment(kind, &pplx_space_env_vars::ProcessEnvironment)
 }
 
 pub(crate) fn required_space_bearer_token_from_environment(
     kind: crate::SpaceBearerToken,
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> Result<String, Status> {
     crate::space_bearer_token_from_environment(kind, env)
         .map_err(|error| Status::unavailable(error.to_string()))

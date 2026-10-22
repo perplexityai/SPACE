@@ -5075,7 +5075,7 @@ dependencies = [
 name = "pplx-space-bearer-token"
 version = "0.8.0"
 dependencies = [
- "pplx-space-common-core",
+ "pplx-space-env-vars",
  "pplx-space-test-env",
  "tempfile",
  "thiserror 2.0.20",
