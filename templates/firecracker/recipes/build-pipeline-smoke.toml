@@ -1,0 +1,82 @@
+# Offline derived-template recipe for the per-deploy template build smoke.
+#
+# scripts/template_recipe_build_smoke.py builds seed, then this recipe on that
+# exact seed digest, to prove a deployed cluster can still admit, build and
+# publish a derived template: Admin API -> build-manager -> build VM ->
+# release. Every step stays inside the VM and needs no network, so an outage
+# of an upstream package archive cannot fail the per-deploy signal. The real
+# code-runtime recipe, which downloads packages, runs in the smoke's
+# `code-runtime` profile on its own schedule.
+#
+# Cover each step kind the build VM executes without network access (env,
+# copy, run as root and as an unprivileged user). Package-manager and
+# Playwright steps need downloads and are covered by code-runtime.
+#
+# Usage:
+#   space-admin-cli template build build-pipeline-smoke --base seed@sha256:<digest>
+
+[metadata]
+name = "build-pipeline-smoke"
+description = "Offline derived template proving the template build pipeline"
+base = "seed"
+vcpu = 2
+memory_mib = 2048
+disk_size_mb = 4096
+
+[[steps]]
+name = "Set build smoke marker"
+type = "env"
+vars = { SPACE_BUILD_SMOKE_MARKER = "build-pipeline-smoke-v1" }
+
+[[steps]]
+name = "Copy build smoke payload"
+type = "copy"
+source = "build-pipeline-smoke/payload.txt"
+dest = "/opt/space/build-smoke/payload.txt"
+
+[[steps]]
+name = "Verify env, copy and base as root"
+type = "run"
+command = """
+set -eu
+test "$(id -u)" = 0
+test "${SPACE_BUILD_SMOKE_MARKER:-}" = build-pipeline-smoke-v1
+echo '9b54899bc93896182d5a816610f0f3eca469c0d2ffb300a50e1f72f36eb99c4a  /opt/space/build-smoke/payload.txt' | sha256sum -c -
+grep -q '^ID=ubuntu$' /etc/os-release
+printf 'root-step\\n' > /opt/space/build-smoke/root-step
+"""
+user = "root"
+
+[[steps]]
+name = "Configure user account"
+type = "run"
+command = """
+set -eu
+id -u user >/dev/null 2>&1 || useradd -m -s /bin/bash user
+mkdir -p /home/user/workspace
+chown -R user:user /home/user
+chmod 0644 /opt/space/build-smoke/payload.txt
+"""
+user = "root"
+
+[[steps]]
+name = "Verify unprivileged step"
+type = "run"
+command = """
+set -eu
+test "$(id -un)" = user
+test "${SPACE_BUILD_SMOKE_MARKER:-}" = build-pipeline-smoke-v1
+cat /opt/space/build-smoke/payload.txt > /home/user/workspace/.build-smoke
+test -s /home/user/workspace/.build-smoke
+"""
+user = "user"
+
+[[steps]]
+name = "Clean up"
+type = "run"
+command = """
+set -eu
+test -s /opt/space/build-smoke/root-step
+rm -rf /tmp/* /var/tmp/*
+"""
+user = "root"
