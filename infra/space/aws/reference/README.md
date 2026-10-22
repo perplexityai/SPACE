@@ -139,6 +139,17 @@ update the add-ons. The `general` pool doesn't follow:
 because `CreateNodegroup` only accepts the cluster's current version. Upgrade
 it after the control plane, with administrator credentials:
 `aws eks update-nodegroup-version --cluster-name space-reference --nodegroup-name general`.
+It doesn't follow its launch template either. An apply that changes the
+template, its disk size or security groups, say, leaves the running group on
+the old version, so roll it the same way, adding
+`--launch-template id=<id>,version=<version>`: the template ID is
+`launchTemplate.id` in `aws eks describe-nodegroup` for `general`, and the
+version is that template's `LatestVersionNumber` in
+`aws ec2 describe-launch-templates`. Unless you also pass the group's current
+`--kubernetes-version` and `--release-version`, that roll can upgrade its AMI
+and Kubernetes version too. EKS's documentation doesn't say how it treats
+unchanged values next to a new template version, so confirm the update's
+parameters with `aws eks describe-update`.
 
 ## The add-ons
 

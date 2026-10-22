@@ -328,7 +328,7 @@ variable "cluster_service_cidr" {
 }
 
 variable "node_instance_metadata_hop_limit" {
-  description = "IMDSv2 PUT response hop limit for EKS node group launch templates."
+  description = "IMDSv2 PUT response hop limit for EKS node group launch templates. The general, general-2, per-AZ general and cred-authority node groups, and builders when they run the EKS-managed AMI, stay on their launch-template version, so a change reaches their nodes only once they're moved onto the new one (see aws_eks_node_group.managed in the eks-cluster module)."
   type        = number
   default     = 2
 }

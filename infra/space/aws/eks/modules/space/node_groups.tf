@@ -287,9 +287,31 @@ resource "aws_eks_node_group" "general_blue_green" {
   # parked at zero, this one, general or a per-AZ group, needs it grown
   # through EKS first, and the switch, like any bound change, should be
   # planned immediately before it's applied (see the per-AZ steps below).
+  #
+  # It also stays on the launch-template version it was created or last
+  # rolled with, as module.eks's managed groups do and for the same reason:
+  # general can run pods that take longer to leave than a rolling update
+  # waits. So a parked pool can fall behind general's template, and the check
+  # after the per-AZ groups warns while it does. To switch
+  # general_serving_node_group to one that has, first empty it if it runs
+  # nodes, the way step 2 below empties an old group (cordon, drain through
+  # the eviction API, then scale to zero through EKS). Then replace it, in an
+  # apply with nothing else in it and no saved plan. Nothing in this module
+  # refuses the replacement while the group runs nodes, and EKS deletes a
+  # group with its nodes, so check that its ASG runs no instances immediately
+  # before running `terraform apply -replace='<its address>'`, quoted because
+  # the address has brackets. The apply creates it again on the template's
+  # latest version, the cluster's Kubernetes version and its newest AMI, at
+  # its configured desired size. Then plan and apply the switch.
+  #
+  # A serving pool takes a new version by moving its workload to a pool
+  # that's already on it: the steps below for the per-AZ groups, and the same
+  # declare, switch, drain and park sequence for general-2 or general,
+  # declaring the target again first if it was removed.
   lifecycle {
     ignore_changes = [
       scaling_config[0].desired_size,
+      launch_template[0].version,
     ]
   }
 }
@@ -392,11 +414,34 @@ resource "aws_eks_node_group" "general_per_az" {
     delete = "2h"
   }
 
-  # The same ownership split as general-2.
+  # The same ownership split as general-2, and the same launch-template hold.
+  # A parked per-AZ group keeps the nodes it came up with, so empty it before
+  # replacing it, as general-2's comment describes.
   lifecycle {
     ignore_changes = [
       scaling_config[0].desired_size,
+      launch_template[0].version,
     ]
+  }
+}
+
+# A warning, as for module.eks's managed groups, and with the same timing:
+# general-2 and the per-AZ groups stay on their launch-template version until
+# someone moves them.
+locals {
+  general_node_groups_behind_launch_template = {
+    for name, group in merge(
+      { for g in aws_eks_node_group.general_blue_green : "general-2" => g },
+      aws_eks_node_group.general_per_az,
+    ) : name => group.launch_template[0].version
+    if group.launch_template[0].version != tostring(module.eks.launch_templates["general"].latest_version)
+  }
+}
+
+check "general_node_groups_on_latest_launch_template" {
+  assert {
+    condition     = length(local.general_node_groups_behind_launch_template) == 0
+    error_message = "Node groups ${join(", ", [for name, version in local.general_node_groups_behind_launch_template : "${name} (version ${version})"])} run an older version of general's launch template than its latest, ${module.eks.launch_templates["general"].latest_version}, and an apply doesn't move them. The comment on aws_eks_node_group.general_blue_green in the space module describes how to move them."
   }
 }
 
