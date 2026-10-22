@@ -5,9 +5,6 @@ import json
 import time
 from urllib.parse import quote, urljoin, urlsplit
 
-from websockets.exceptions import ConnectionClosed
-from websockets.sync.client import connect
-
 from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.registry import scenario
 from space_smoke.scenarios.native_contract_command_wakes_idle_suspended_sandbox import (
@@ -20,6 +17,11 @@ MARKER = "space-smoke-process-session-wake-ok"
 def _attach(url: str, token: str, budget: float) -> tuple[list[str], list[dict[str, object]]]:
     """One WebSocket attachment: the frame types seen and any error frames.
     Stdout is decoded into the returned list, never logged."""
+    # Imported here so the registry imports without the smoke-only client:
+    # inventories such as the quarantine backlog load every scenario module.
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.client import connect
+
     stdout: list[str] = []
     frames: list[dict[str, object]] = []
     with connect(url, subprotocols=[token], open_timeout=min(30, budget)) as socket:
