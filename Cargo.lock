@@ -5968,6 +5968,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-grpc-metrics"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-metrics-emit",
+]
+
+[[package]]
 name = "pplx-space-internal-api-server"
 version = "0.8.0"
 dependencies = [
@@ -6064,6 +6071,7 @@ version = "0.8.0"
 dependencies = [
  "metrics",
  "pplx-space-common-core",
+ "pplx-space-grpc-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
  "thiserror 2.0.20",

@@ -758,6 +758,24 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a feature the gRPC metrics need but only get through
+    # unification with pplx-space-metrics fails here.
+    echo "--- :rust: Running isolated gRPC metrics clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-grpc-metrics \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-grpc-metrics \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

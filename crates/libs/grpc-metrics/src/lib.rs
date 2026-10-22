@@ -1,9 +1,16 @@
+//! gRPC client and server metrics, in their own crate so that the generic gRPC
+//! infrastructure crates can emit them without depending on
+//! `pplx-space-metrics`.
+//!
 //! The per-measurement `service` tag names the peer for client metrics and
 //! the served interface for rate-limit metrics. OTLP exports it as
 //! `service.role`, separately from process identity; native DogStatsD retains
 //! the legacy `service` tag.
 
-use crate::emit::{counter, distribution, gauge, tag};
+#[macro_use(metric_vocabulary)]
+extern crate pplx_space_metrics_emit;
+
+use pplx_space_metrics_emit::{counter, distribution, gauge, tag};
 
 /// Untagged: identity comes from the constant process tags.
 pub fn server_active_requests(depth: usize) {

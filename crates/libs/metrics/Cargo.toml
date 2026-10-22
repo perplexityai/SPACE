@@ -21,6 +21,7 @@ uuid = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 

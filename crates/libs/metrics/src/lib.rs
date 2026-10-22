@@ -24,7 +24,7 @@ pub mod data_plane;
 pub mod db;
 pub mod feature_flags;
 pub mod gateway;
-pub mod grpc;
+pub use pplx_space_grpc_metrics as grpc;
 pub mod internal_api;
 pub mod jobs;
 pub mod leader_election;
