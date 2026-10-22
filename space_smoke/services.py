@@ -91,6 +91,20 @@ class ScenarioDefinition(Protocol):
 Fixture = TypeVar("Fixture")
 SANDBOX_CREATE_ATTEMPTS = 3
 SANDBOX_CREATE_RETRY_SECONDS = 1.0
+# Smoke-owned ECW sandboxes opt into TLS interception the same way Computer
+# does. The API rejects `on` without a concrete network policy, so the key is
+# only sent when the create carries one; otherwise the template default holds.
+TLS_INTERCEPTION_METADATA_KEY = "network.tls_interception"
+
+
+def _tls_interception_metadata(
+    allow_internet_access: bool | None,
+    network: NetworkConfig | None,
+) -> dict[str, str]:
+    has_rules = network is not None and bool(network.allow_out or network.deny_out)
+    if allow_internet_access is None and not has_rules:
+        return {}
+    return {TLS_INTERCEPTION_METADATA_KEY: "on"}
 KIND_BACKEND = "kind"
 DEPLOYED_BACKEND = "deployed"
 ECW_API_SURFACE = "ecw"
@@ -731,7 +745,13 @@ class _ScenarioSandboxes:
                 sandbox = self._ecw.create(
                     template=self._template,
                     timeout=self._timeout,
-                    metadata=create_metadata,
+                    # Scenario-supplied metadata may still pin interception off.
+                    metadata={
+                        **_tls_interception_metadata(
+                            self._allow_internet_access, self._network
+                        ),
+                        **create_metadata,
+                    },
                     lifecycle=self._lifecycle,
                     allow_internet_access=self._allow_internet_access,
                     network=self._network,
