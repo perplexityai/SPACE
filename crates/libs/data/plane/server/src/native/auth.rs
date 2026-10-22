@@ -139,7 +139,11 @@ pub(crate) enum RouteResolutionError {
     Unauthenticated,
     Forbidden,
     SessionNotFound,
+    /// The sandbox has no route yet, and something is about to give it one.
     SessionNotReady,
+    /// The sandbox has no route and nothing is about to give it one: it is
+    /// at rest and no wake is queued for it.
+    SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest),
     ResolutionFailed,
     RouteStateInvalid,
 }
@@ -150,7 +154,7 @@ impl RouteResolutionError {
             Self::Unauthenticated => "unauthenticated",
             Self::Forbidden => "forbidden",
             Self::SessionNotFound => "session_not_found",
-            Self::SessionNotReady => "session_not_ready",
+            Self::SessionNotReady | Self::SessionAtRest(_) => "session_not_ready",
             Self::ResolutionFailed => "route_resolution_failed",
             Self::RouteStateInvalid => "route_state_invalid",
         }
@@ -161,7 +165,7 @@ impl RouteResolutionError {
             Self::Unauthenticated => DataPlaneErrorCode::Unauthenticated,
             Self::Forbidden => DataPlaneErrorCode::Forbidden,
             Self::SessionNotFound => DataPlaneErrorCode::SessionNotFound,
-            Self::SessionNotReady => DataPlaneErrorCode::SessionNotReady,
+            Self::SessionNotReady | Self::SessionAtRest(_) => DataPlaneErrorCode::SessionNotReady,
             Self::ResolutionFailed => DataPlaneErrorCode::RouteResolutionFailed,
             Self::RouteStateInvalid => DataPlaneErrorCode::RouteStateInvalid,
         }
@@ -171,10 +175,31 @@ impl RouteResolutionError {
         match self {
             Self::Unauthenticated | Self::Forbidden => (ResponseOrigin::Client, ResponseKind::Auth),
             Self::SessionNotFound => (ResponseOrigin::Client, ResponseKind::Validation),
-            Self::SessionNotReady => (ResponseOrigin::Cluster, ResponseKind::RouteNotReady),
+            Self::SessionNotReady | Self::SessionAtRest(_) => {
+                (ResponseOrigin::Cluster, ResponseKind::RouteNotReady)
+            }
             Self::ResolutionFailed => (ResponseOrigin::Cluster, ResponseKind::RouteResolution),
             Self::RouteStateInvalid => (ResponseOrigin::DataPlane, ResponseKind::Internal),
         }
+    }
+}
+
+/// Delay a client should wait before attaching again to a session whose
+/// sandbox is still being placed, for example by a wake.
+pub(crate) const SESSION_NOT_READY_RETRY_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// The `sandbox_not_running` details for an at-rest route, as a refusal to
+/// start a command answers them; none when the mark lost its sandbox or state.
+pub(crate) fn at_rest_details(
+    at_rest: pplx_space_common_grpc::SessionRouteAtRest,
+) -> Vec<pplx_space_public_api::PublicErrorDetail> {
+    match (at_rest.sandbox_id, at_rest.state) {
+        (Some(sandbox_id), Some(state)) => pplx_space_public_api::sandbox_not_running_details(
+            pplx_space_public_api::PublicSandboxId::from(sandbox_id),
+            &pplx_space_public_api::SandboxLifecycleState::from(state),
+        ),
+        _ => Vec::new(),
     }
 }
 
@@ -205,14 +230,33 @@ pub(crate) fn route_resolution_http_error(error: RouteResolutionError) -> Respon
             origin,
             kind,
         ),
-        RouteResolutionError::SessionNotReady => data_plane_http_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            DataPlaneHttpErrorCode::NotReady,
-            "session route is not ready",
-            true,
-            origin,
-            kind,
-        ),
+        RouteResolutionError::SessionNotReady => {
+            let mut response = data_plane_http_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                DataPlaneHttpErrorCode::NotReady,
+                "session route is not ready",
+                true,
+                origin,
+                kind,
+            );
+            insert_retry_after(&mut response, Some(SESSION_NOT_READY_RETRY_AFTER));
+            response
+        }
+        RouteResolutionError::SessionAtRest(at_rest) => {
+            observe_data_plane_http_error(StatusCode::SERVICE_UNAVAILABLE, origin, kind);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(DataPlaneHttpErrorEnvelope {
+                    error: DataPlaneHttpError {
+                        code: DataPlaneHttpErrorCode::NotReady,
+                        message: "session route is not ready".to_string(),
+                        retryable: false,
+                        details: at_rest_details(at_rest),
+                    },
+                }),
+            )
+                .into_response()
+        }
         RouteResolutionError::ResolutionFailed => data_plane_http_error(
             StatusCode::SERVICE_UNAVAILABLE,
             DataPlaneHttpErrorCode::ServiceUnavailable,
@@ -249,6 +293,7 @@ pub(crate) fn data_plane_http_error(
                 code,
                 message: message.to_string(),
                 retryable,
+                details: Vec::new(),
             },
         }),
     )

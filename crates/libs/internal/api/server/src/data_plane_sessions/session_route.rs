@@ -79,6 +79,10 @@ pub(crate) async fn resolve_session_route(
         );
         let sandbox_id = row.sandbox_id;
         let restoring = row.sandbox_lifecycle == SandboxLifecycle::Restoring;
+        let unplaced =
+            row.sandbox_active_node_id.is_none() || resolve_backend_endpoint(&row).is_none();
+        let lifecycle = row.sandbox_lifecycle;
+        let org_id = row.org_id;
         let result = async {
             refuse_restoring_route(row.sandbox_lifecycle)?;
             if matches!(
@@ -205,9 +209,18 @@ pub(crate) async fn resolve_session_route(
             })
         }
         .await;
-        let error = match result {
+        let error: Status = match result {
             Ok(response) => return Ok(response),
             Err(error) => error,
+        };
+        let error = if !ingress
+            && error.code() == tonic::Code::FailedPrecondition
+            && unplaced
+            && route_at_rest(pool, org_id, sandbox_id, lifecycle).await
+        {
+            pplx_space_common_grpc::mark_session_route_at_rest(error, sandbox_id, lifecycle)
+        } else {
+            error
         };
         let Some(owner) = activation
             .filter(|_| !activated && (restoring || activation_may_repair(ingress, &error)))
@@ -228,6 +241,36 @@ pub(crate) async fn resolve_session_route(
         }
         activated = true;
         // Re-read identity and authorization after activation; never replay bytes.
+    }
+}
+
+/// Whether nothing is about to give the session's sandbox a node: it is not
+/// heading to running and no wake is queued or running for it. A failed read
+/// answers no, which keeps the attach retryable as it always was.
+pub(super) async fn route_at_rest(
+    pool: &sqlx::PgPool,
+    org_id: OrgId,
+    sandbox_id: SandboxId,
+    lifecycle: SandboxLifecycle,
+) -> bool {
+    if matches!(
+        lifecycle,
+        SandboxLifecycle::Started
+            | SandboxLifecycle::Creating
+            | SandboxLifecycle::Starting
+            | SandboxLifecycle::Resuming
+            | SandboxLifecycle::Restoring
+            | SandboxLifecycle::Checkpointing
+    ) {
+        return false;
+    }
+    let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
+    match pplx_space_sandbox_store::wake_operation_active(pool, org_id, &target_id).await {
+        Ok(active) => !active,
+        Err(error) => {
+            tracing::warn!(%sandbox_id, %error, "could not read pending wakes for a session route");
+            false
+        }
     }
 }
 

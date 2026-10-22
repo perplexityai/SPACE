@@ -190,6 +190,13 @@ pub mod spaced {
     /// earlier attempt may still have run); hops return it as-is rather than
     /// retrying it for the caller.
     pub const REQUEST_REFUSED: &str = "request-refused";
+
+    /// [`ERROR_REASON_METADATA_KEY`] value of a FAILED_PRECONDITION refusing
+    /// guest work because the sandbox is not running and the request may not
+    /// wake it: its wake policy does not allow the request's activity, or the
+    /// sandbox is deleting or failed. Repeating the request cannot help until
+    /// the caller wakes or replaces the sandbox.
+    pub const SANDBOX_NOT_RUNNING: &str = "sandbox-not-running";
 }
 
 #[cfg(feature = "kubernetes")]

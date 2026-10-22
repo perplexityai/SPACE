@@ -30,6 +30,60 @@ pub(super) async fn resolve_session_route(
     resolve_session_route_with_cache(state, session_id, token, true).await
 }
 
+/// The attach's reading of the cluster's refusal to resolve a session route.
+pub(super) fn route_resolution_error(status: &tonic::Status) -> RouteResolutionError {
+    match status.code() {
+        tonic::Code::Unauthenticated => RouteResolutionError::Unauthenticated,
+        tonic::Code::PermissionDenied => RouteResolutionError::Forbidden,
+        tonic::Code::NotFound => RouteResolutionError::SessionNotFound,
+        tonic::Code::FailedPrecondition
+            if let Some(at_rest) = pplx_space_common_grpc::session_route_at_rest(status) =>
+        {
+            RouteResolutionError::SessionAtRest(at_rest)
+        }
+        tonic::Code::FailedPrecondition => RouteResolutionError::SessionNotReady,
+        _ => RouteResolutionError::ResolutionFailed,
+    }
+}
+
+/// How often an attach looks again for a route its sandbox does not have yet.
+const SESSION_NOT_READY_POLL: Duration = Duration::from_millis(500);
+
+/// [`resolve_session_route`] for a client attach, which waits up to the
+/// attach deadline while the session's sandbox has no route: a wake started
+/// with the session, such as the one `createCommand` starts for a sandbox at
+/// rest, places the sandbox again in about that time.
+pub(super) async fn resolve_attach_route(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    token: &str,
+) -> Result<AttachedSession, RouteResolutionError> {
+    retry_not_ready_until(tokio::time::Instant::now() + state.attach_deadline, || {
+        resolve_session_route(state, session_id, token)
+    })
+    .await
+}
+
+pub(super) async fn retry_not_ready_until<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    mut resolve: F,
+) -> Result<T, RouteResolutionError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, RouteResolutionError>>,
+{
+    loop {
+        match resolve().await {
+            Err(RouteResolutionError::SessionNotReady)
+                if tokio::time::Instant::now() + SESSION_NOT_READY_POLL < deadline =>
+            {
+                tokio::time::sleep(SESSION_NOT_READY_POLL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn resolve_session_route_with_cache(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
@@ -67,13 +121,7 @@ async fn resolve_session_route_with_cache(
             requested_transport: Some(native_requested_transport(session_id.kind()) as i32),
         })
         .await
-        .map_err(|status| match status.code() {
-            tonic::Code::Unauthenticated => RouteResolutionError::Unauthenticated,
-            tonic::Code::PermissionDenied => RouteResolutionError::Forbidden,
-            tonic::Code::NotFound => RouteResolutionError::SessionNotFound,
-            tonic::Code::FailedPrecondition => RouteResolutionError::SessionNotReady,
-            _ => RouteResolutionError::ResolutionFailed,
-        })?
+        .map_err(|status| route_resolution_error(&status))?
         .into_inner();
 
     let mut attached = attached_session_from_route_response(
@@ -717,6 +765,22 @@ pub(super) fn error_json(code: DataPlaneErrorCode) -> String {
         message: code.as_str().to_string(),
         code,
         retryable: false,
+        details: Vec::new(),
+    })
+}
+
+/// The WebSocket frame for a failed route lookup. A route that is not ready
+/// yet, as while a wake places the sandbox, is retryable here as it is on SSE.
+pub(super) fn route_resolution_error_json(error: RouteResolutionError) -> String {
+    let code = error.frame_code();
+    server_frame_json(&DataPlaneServerFrame::Error {
+        message: code.as_str().to_string(),
+        code,
+        retryable: error == RouteResolutionError::SessionNotReady,
+        details: match error {
+            RouteResolutionError::SessionAtRest(at_rest) => at_rest_details(at_rest),
+            _ => Vec::new(),
+        },
     })
 }
 

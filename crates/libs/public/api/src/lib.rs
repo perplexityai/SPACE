@@ -9,8 +9,8 @@ use pplx_space_common_core::types::SnapshotId;
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, EnvMap, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId, SimpleDuration,
-    TemplateReference,
+    AutoLifecyclePolicy, EnvMap, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId,
+    SandboxLifecycle, SimpleDuration, TemplateReference,
 };
 pub use pplx_space_common_core::types::{IdempotencyKey, ProcessId};
 use pplx_space_net_common::NetworkPolicyV1;
@@ -685,6 +685,27 @@ open_wire_enum!(SandboxLifecycleState, "sandbox lifecycle state", {
     Deleted => "deleted",
 });
 
+impl From<SandboxLifecycle> for SandboxLifecycleState {
+    /// The public state a stored lifecycle is reported as.
+    fn from(lifecycle: SandboxLifecycle) -> Self {
+        match lifecycle {
+            SandboxLifecycle::Created | SandboxLifecycle::Creating => Self::Creating,
+            SandboxLifecycle::Starting => Self::Starting,
+            SandboxLifecycle::Started => Self::Running,
+            SandboxLifecycle::Restoring => Self::Restoring,
+            SandboxLifecycle::Pausing => Self::Pausing,
+            SandboxLifecycle::Paused => Self::Paused,
+            SandboxLifecycle::Resuming => Self::Resuming,
+            SandboxLifecycle::Suspending | SandboxLifecycle::Checkpointing => Self::Suspending,
+            SandboxLifecycle::Suspended => Self::Suspended,
+            SandboxLifecycle::Stopping => Self::Stopping,
+            SandboxLifecycle::Stopped => Self::Stopped,
+            SandboxLifecycle::Deleting => Self::Deleting,
+            SandboxLifecycle::Failed | SandboxLifecycle::Quarantined => Self::Failed,
+        }
+    }
+}
+
 open_wire_enum!(SandboxFailureCode, "sandbox failure code", {
     RuntimeFailure => "runtime_failure",
 });
@@ -960,6 +981,12 @@ pub enum DataPlaneServerFrame {
         code: DataPlaneErrorCode,
         message: String,
         retryable: bool,
+        /// As on [`DataPlaneHttpError::details`]; omitted when there are none.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        details: Vec<PublicErrorDetail>,
     },
     Closed {
         reason: StreamCloseReason,
@@ -2203,6 +2230,14 @@ pub struct DataPlaneHttpError {
     pub code: DataPlaneHttpErrorCode,
     pub message: String,
     pub retryable: bool,
+    /// Bounded typed details, as on [`PublicErrorEnvelope::details`]; omitted
+    /// when there are none. A `conflict` refusing to start a command because
+    /// the sandbox is not running carries the same details as `createCommand`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub details: Vec<PublicErrorDetail>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

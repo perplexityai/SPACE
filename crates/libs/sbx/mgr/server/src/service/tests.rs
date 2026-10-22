@@ -16616,11 +16616,101 @@ pub(crate) mod service_tests {
                 let error = result.unwrap_err();
                 assert_eq!(error.code(), tonic::Code::FailedPrecondition);
                 assert_eq!(error.message(), "sandbox is paused, not started");
+                assert_eq!(
+                    pplx_space_common_grpc::sandbox_not_running_state(&error),
+                    Some("paused")
+                );
                 assert!(service.auto_lifecycle.last_wake_completed_at(&id).is_none());
             } else {
                 result.unwrap();
             }
             assert_eq!(service.lookup_sandbox(&id).unwrap().state, state);
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_access_to_a_stopped_sandbox_is_a_not_running_refusal() {
+        if !crate::service::tests::enter_route_test_process(&[]) {
+            return;
+        }
+        for (state, tagged) in [
+            (SandboxState::Stopped, true),
+            (SandboxState::Suspended, false),
+        ] {
+            let conn = crate::db::test_conn();
+            let id = SandboxId::new();
+            let mut policy = access_idle_policy(120);
+            policy
+                .wake
+                .on
+                .push(pplx_space_common_core::types::AutoLifecycleWakeSource::Access);
+            insert_test_sandbox_with_policy(&conn, &id.to_string(), SandboxState::Paused, &policy);
+            let (service, token) = route_authorized_service(conn, id);
+            {
+                // Teardown retires the route binding; only the end state differs.
+                let db = service.db_conn().unwrap();
+                crate::db::begin_suspend(&db, &id.to_string()).unwrap();
+                crate::db::complete_row_intent_cleanup(
+                    &db,
+                    &id.to_string(),
+                    CleanupCompletion::MarkSuspended,
+                    Some((LocalArtifactId::new(), "/cache/test/snapshot")),
+                )
+                .unwrap();
+                crate::db::test_fixtures::state_write_fixtures::force_state(
+                    &db,
+                    &id.to_string(),
+                    state,
+                );
+            }
+            let mut request = internal_request(SpacedReadRequest {
+                sandbox_id: id.to_string(),
+                operation: Some(pplx_space_spaced_common::proto::operations::ReadRequest {
+                    path: "/marker".to_string(),
+                    ..Default::default()
+                }),
+            });
+            insert_space_api_route_ed25519_token(request.metadata_mut(), &token).unwrap();
+            let error = service.spaced_read(request).await.err().expect("refused");
+            assert_eq!(
+                error.code(),
+                tonic::Code::FailedPrecondition,
+                "{state}: {error}"
+            );
+            assert_eq!(
+                pplx_space_common_grpc::sandbox_not_running_state(&error),
+                tagged.then_some(state.as_str()),
+                "{state}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn implicit_wake_of_a_terminal_sandbox_is_a_not_running_refusal() {
+        for state in [
+            SandboxState::Deleting,
+            SandboxState::Failed,
+            SandboxState::Quarantined,
+        ] {
+            let conn = crate::db::test_conn();
+            let id = SandboxId::new().to_string();
+            insert_test_sandbox(&conn, &id, state);
+            let service = SandboxManagerService::for_test(conn);
+            let error = service
+                .wake(internal_request(WakeRequest {
+                    sandbox_id: id.clone(),
+                    blocking: true,
+                    implicit_wake_source: crate::proto::AutoLifecycleWakeSource::Command as i32,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{state}");
+            assert_eq!(
+                pplx_space_common_grpc::sandbox_not_running_state(&error),
+                Some(state.as_str()),
+                "{state}: {error}"
+            );
         }
     }
 

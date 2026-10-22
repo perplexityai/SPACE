@@ -118,9 +118,16 @@ impl SpaceApiBridgeRouteAuthorization {
             // that is an activation precondition, not invalid credentials.
             // Mismatched dimensions above remain permission failures.
             if matches!(state, SandboxState::Suspended | SandboxState::Stopped) {
-                return Status::failed_precondition(format!(
+                let refusal = Status::failed_precondition(format!(
                     "sandbox is not running ({state}); reconnect before guest access"
                 ));
+                // Only a start returns a stopped sandbox to running; a
+                // suspended one may still be restored through a fresh route.
+                return if state == SandboxState::Stopped {
+                    pplx_space_common_grpc::mark_sandbox_not_running(refusal, state.as_str())
+                } else {
+                    refusal
+                };
             }
             Status::permission_denied(format!(
                 "{} local SPACE API route identity is incomplete",

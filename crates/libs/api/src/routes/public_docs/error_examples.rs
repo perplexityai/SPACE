@@ -111,6 +111,7 @@ fn data_plane_examples(status: &str, message: &str) -> Option<Value> {
                         code,
                         message: message.to_owned(),
                         retryable,
+                        details: Vec::new(),
                     },
                 };
                 (name, json!({"description": EXAMPLE_NOTE, "value": value}))

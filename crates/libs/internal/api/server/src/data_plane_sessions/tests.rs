@@ -220,3 +220,41 @@ async fn a_route_refresh_refuses_a_sandbox_that_started_restoring()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_route_is_at_rest_only_when_nothing_is_about_to_place_the_sandbox()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_common_core::sql;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let pool = &db.pool;
+    let sandbox_id = SandboxId::new();
+    let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
+    let org_id = OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID);
+
+    assert!(!route_at_rest(pool, org_id, sandbox_id, SandboxLifecycle::Restoring).await);
+    assert!(!route_at_rest(pool, org_id, sandbox_id, SandboxLifecycle::Started).await);
+    assert!(route_at_rest(pool, org_id, sandbox_id, SandboxLifecycle::Suspended).await);
+
+    for (state, at_rest) in [("queued", false), ("running", false), ("succeeded", true)] {
+        sqlx::query(sql!("DELETE FROM public_operations WHERE target_id = $1"))
+            .bind(&target_id)
+            .execute(pool)
+            .await?;
+        sqlx::query(sql!(
+            "INSERT INTO public_operations (operation_id, org_id, kind, target_type, target_id, state)
+             VALUES ($1, $2, 'wake_sandbox', 'sandbox', $3, $4)"
+        ))
+        .bind(uuid::Uuid::now_v7())
+        .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+        .bind(&target_id)
+        .bind(state)
+        .execute(pool)
+        .await?;
+        assert_eq!(
+            route_at_rest(pool, org_id, sandbox_id, SandboxLifecycle::Suspended).await,
+            at_rest,
+            "with a {state} wake"
+        );
+    }
+    Ok(())
+}
