@@ -14,9 +14,11 @@ fn missing_restore_context_is_not_an_sdk_recoverable_timeout() {
                 "no verified restore source; recovery requires intervention",
             ),
             (
-                SubstrateError::restore_source_pending(SandboxId::new()),
-                StatusCode::BAD_GATEWAY,
-                "Sandbox is not running",
+                SubstrateError::RestoreSourcePending {
+                    message: "local suspend is not durable; retry the same sandbox".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "local suspend is not durable; retry the same sandbox",
             ),
             (
                 SubstrateError::Timeout {
@@ -32,6 +34,8 @@ fn missing_restore_context_is_not_an_sdk_recoverable_timeout() {
             assert_eq!(mapped.message, expected_message);
             if expected_status == StatusCode::PRECONDITION_FAILED {
                 assert_eq!(mapped.retry_after(), None);
+            } else if expected_status == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(mapped.retry_after().is_some());
             }
         }
     }

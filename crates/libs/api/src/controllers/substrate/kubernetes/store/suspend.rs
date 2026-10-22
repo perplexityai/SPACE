@@ -4,6 +4,70 @@
 use super::*;
 
 impl K8sStore {
+    /// A node can release its VM before its suspend upload becomes durable.
+    /// Do not claim/join recovery or poll the dead runtime in that interval.
+    /// This is a read-only refusal: neither a failed registration nor missing
+    /// publication proves that retained bytes cannot still be re-driven.
+    pub(in crate::controllers::substrate::kubernetes) async fn ensure_local_suspend_restore_source(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<(), SubstrateError> {
+        let pending: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM sandboxes s
+                   JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
+                   JOIN node_facet_observed_status observed
+                     ON observed.node_id = s.active_node_id
+                    AND observed.facet = $2
+                    AND observed.element = s.id::TEXT
+                   LEFT JOIN snapshots sn
+                     ON sn.sandbox_id = s.id
+                    AND sn.source_node_id = observed.node_id
+                    AND sn.local_artifact_id::TEXT =
+                        observed.observed_payload -> $3::TEXT ->> 'local_artifact_id'
+                    AND sn.type = 'full'
+                    AND sn.artifact_kind = 'full'
+                    AND (sn.artifact_origin IS NULL OR sn.artifact_origin = 'suspend')
+                  WHERE s.id = $1
+                    AND s.lifecycle = 'started'
+                    AND e.state IN ('running', 'recovering', 'recovery_failed')
+                    AND observed.observed_payload -> $3::TEXT ->> 'execution_generation' = e.generation::TEXT
+                    AND observed.observed_payload -> $3::TEXT ->> 'pod_uid' = e.pod_uid
+                    AND observed.observed_payload -> $3::TEXT ->> 'local_artifact_id' IS NOT NULL
+                    AND (s.last_command_at IS NULL OR COALESCE(sn.timestamp, observed.observed_at) >= s.last_command_at)
+                    AND (s.last_access_at IS NULL OR COALESCE(sn.timestamp, observed.observed_at) >= s.last_access_at)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM snapshots ready
+                        JOIN snapshot_storage_locations location ON location.snapshot_id = ready.id
+                        WHERE ready.sandbox_id = s.id
+                          AND ready.local_artifact_id::TEXT =
+                              observed.observed_payload -> $3::TEXT ->> 'local_artifact_id'
+                          AND ready.type = 'full'
+                          AND ready.artifact_kind = 'full'
+                          AND (ready.artifact_origin IS NULL OR ready.artifact_origin = 'suspend')
+                          AND ready.state = 'ready'
+                          AND location.orphaned_at IS NULL
+                    )
+             )"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .bind(SANDBOX_LOCAL_SUSPEND_KEY)
+        .fetch_one(&self.pool)
+        .await
+        .db_context("failed to inspect local suspend durability")?;
+        if pending {
+            return Err(SubstrateError::RestoreSourcePending {
+                message: format!(
+                    "sandbox {sandbox_id} local suspend is not durable; retry the same sandbox \
+                     after snapshot publication or upload recovery"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn finish_suspended_execution(
         &self,
         sandbox_id: SandboxId,

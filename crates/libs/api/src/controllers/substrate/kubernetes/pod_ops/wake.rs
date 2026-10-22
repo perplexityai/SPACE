@@ -407,6 +407,12 @@ impl KubernetesSubstrate {
                 crate::controllers::substrate::RuntimeInternalClient,
             )> = None;
             loop {
+                // Suspend publication can arrive after recovery admission.
+                // Recheck between attempts, without cancelling a Wake RPC
+                // that may already have been accepted by the worker.
+                self.store
+                    .ensure_local_suspend_restore_source(sandbox_id)
+                    .await?;
                 let reused_selection = selected_pod_ip.is_some();
                 let mut waiting_for_pod_ip = false;
                 if selected_pod_ip.is_none() {

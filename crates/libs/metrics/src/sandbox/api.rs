@@ -315,6 +315,9 @@ pub enum ReconnectReason {
     Ok,
     NoWakeNeeded,
     RestoreInFlight,
+    /// Publication or retained-artifact recovery is a prerequisite; this does
+    /// not assert that an upload or restore is actively running.
+    RestoreSourcePending,
     /// Recovery has no verified state to materialize. Emitted with
     /// `outcome:wake_failed`; increasing the request budget cannot fix it.
     RestoreContextUnavailable,
@@ -343,6 +346,7 @@ impl ReconnectReason {
             Self::Ok => "ok",
             Self::NoWakeNeeded => "no_wake_needed",
             Self::RestoreInFlight => "restore_in_flight",
+            Self::RestoreSourcePending => "restore_source_pending",
             Self::RestoreContextUnavailable => "restore_context_unavailable",
             Self::WaitBudget => "wait_budget",
             Self::PodNeverReady => "pod_never_ready",

@@ -937,9 +937,12 @@ impl From<SubstrateError> for ControllerError {
                 ControllerError::restore_context_unavailable(message)
             }
             SubstrateError::RestoreSourcePending { message } => {
+                // Publication/re-drive is a prerequisite, not an SDK
+                // readiness timeout. Keep ECW at 503 with a retry hint instead
+                // of triggering its 502 resume-and-retry translation.
                 ControllerError::service_unavailable(message)
-                    .with_retry_after(GATEWAY_RETRY_AFTER)
-                    .with_retry_after_cause(ControllerRetryAfterCause::RestoreInFlight)
+                    .with_retry_after_header(GATEWAY_RETRY_AFTER)
+                    .with_retry_after_cause(ControllerRetryAfterCause::RestoreSourcePending)
             }
             SubstrateError::RestoreInFlight {
                 message,
