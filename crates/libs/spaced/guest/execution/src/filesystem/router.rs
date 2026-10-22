@@ -672,17 +672,20 @@ impl FilesystemHandle {
         let router = self.clone();
         let cancelled = stream_end;
         let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // Keep cancellation outside the bounded data queue: a stalled reader
+        // must neither delay cleanup nor turn a truncated response into EOF.
+        let (failure_tx, failure_rx) = tokio::sync::oneshot::channel();
         self.tasks.spawn(async move {
             tokio::pin!(incoming);
-            loop {
+            let failure = loop {
                 let message = tokio::select! {
                     biased;
-                    _ = cancelled.cancelled() => break,
-                    _ = tx.closed() => break,
+                    _ = cancelled.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
+                    _ = tx.closed() => break None,
                     message = incoming.next() => message,
                 };
                 let Some(message) = message else {
-                    break;
+                    break None;
                 };
                 let failed = message.as_ref().is_err_and(is_worker_transport_failure);
                 if failed {
@@ -694,15 +697,20 @@ impl FilesystemHandle {
                 }
                 tokio::select! {
                     biased;
-                    _ = cancelled.cancelled() => break,
-                    sent = tx.send(message) => if sent.is_err() { break; },
+                    _ = cancelled.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
+                    sent = tx.send(message) => if sent.is_err() { break None; },
                 }
                 if failed {
-                    break;
+                    break None;
                 }
+            };
+            if let Some(status) = failure {
+                let _ = failure_tx.send(status);
             }
         });
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)) as RoutedStream<T>
+        let failure = futures_util::stream::once(failure_rx)
+            .filter_map(|failure| std::future::ready(failure.ok().map(Err)));
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).chain(failure)) as RoutedStream<T>
     }
 
     /// Read through a descriptor the user's worker opened: the worker checks

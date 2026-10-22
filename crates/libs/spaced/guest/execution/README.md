@@ -144,6 +144,9 @@ and error evolution, requires a separate crate-level policy before stabilization
   observe retained ownership. Dropping a drain future keeps admission closed,
   without implicitly cancelling work. Dropping service handles or the runtime is
   not a substitute for successful drain.
+- Cancellation ends interrupted read/list streams with `Unavailable` after any
+  buffered results, including when the output queue is full. Partial output is
+  not successful completion. Graceful close still allows admitted streams to finish.
 - Cancellation wakes uploads awaiting `Open` or subsequent input. Supervised
   filesystem mutations can finish during `cancellation_grace`; stalled identity
   workers are then terminated and the outcome may be unknown. Direct execution

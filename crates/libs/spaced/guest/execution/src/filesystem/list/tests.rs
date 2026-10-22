@@ -63,3 +63,48 @@ async fn list_stream_holds_its_shared_slot_until_the_stream_is_dropped() {
     .await
     .expect("dropping the response stream must release its slot");
 }
+
+#[tokio::test]
+async fn cancelled_list_reports_failure_after_buffered_entries_without_blocking_drain() {
+    use futures_util::StreamExt;
+    let directory = tempfile::tempdir().unwrap();
+    for index in 0..64 {
+        std::fs::write(directory.path().join(format!("entry-{index}")), b"x").unwrap();
+    }
+    let slots = Arc::new(Semaphore::new(1));
+    let tasks = tokio_util::task::TaskTracker::new();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let mut stream = list_stream(
+        GuestPath::parse(directory.path().display().to_string()).unwrap(),
+        None,
+        slots.clone().try_acquire_owned().unwrap(),
+        tasks.clone(),
+        shutdown.clone(),
+    )
+    .await
+    .unwrap();
+    stream.next().await.unwrap().unwrap();
+    shutdown.cancel();
+    tasks.close();
+    tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
+        .await
+        .expect("cleanup does not wait for the reader");
+    assert_eq!(slots.available_permits(), 1);
+    let mut entries = 1;
+    loop {
+        match stream
+            .next()
+            .await
+            .expect("interrupted listing must not end successfully")
+        {
+            Ok(_) => entries += 1,
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::Unavailable);
+                assert!(!pplx_space_common_grpc::is_refused_before_start(&status));
+                break;
+            }
+        }
+    }
+    assert!(entries < 64);
+    assert!(stream.next().await.is_none());
+}
