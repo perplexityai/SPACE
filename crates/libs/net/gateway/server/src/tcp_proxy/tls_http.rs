@@ -34,6 +34,7 @@ pub(super) use error::http_reason;
 
 mod connect;
 mod credentials;
+mod dispatch;
 mod error;
 mod forward;
 mod upgrade;

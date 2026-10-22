@@ -102,8 +102,11 @@ where
     B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    pub(super) const fn is_http1(&self) -> bool {
-        matches!(self, Self::Http1(_))
+    pub(super) const fn protocol(&self) -> HttpProtocol {
+        match self {
+            Self::Http1(_) => HttpProtocol::Http1,
+            Self::Http2(_) => HttpProtocol::Http2,
+        }
     }
 
     pub(super) async fn send(
