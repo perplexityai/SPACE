@@ -101,7 +101,7 @@ async fn old_reservation_cannot_complete_a_reused_key() {
         state.records.insert(
             key.clone(),
             StoredIdempotencyRecord::Expired {
-                expired_at: Instant::now() - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1),
+                expired_at: Instant::now() - DEFAULT_RETENTION - Duration::from_secs(1),
                 in_progress_generation: None,
             },
         );
@@ -176,7 +176,7 @@ async fn capacity_pressure_reclaims_an_expired_operation_after_its_reservation_i
         else {
             panic!("reservation disappeared");
         };
-        *created_at = now - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1);
+        *created_at = now - DEFAULT_RETENTION - Duration::from_secs(1);
         state.prune(now);
         assert!(matches!(
             state.records.get(&abandoned_key),
@@ -296,7 +296,7 @@ async fn expired_reservations_cannot_begin_an_effect() {
             else {
                 panic!("reservation disappeared");
             };
-            *created_at = Instant::now() - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1);
+            *created_at = Instant::now() - DEFAULT_RETENTION - Duration::from_secs(1);
             if prune {
                 state.prune(Instant::now());
             }
@@ -329,7 +329,7 @@ async fn capacity_pressure_cannot_reuse_an_expired_operation_that_is_still_runni
         else {
             panic!("reservation disappeared");
         };
-        *created_at = now - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1);
+        *created_at = now - DEFAULT_RETENTION - Duration::from_secs(1);
         state.prune(now);
         for index in 0..(MAX_IDEMPOTENCY_RECORDS - 1) {
             state.insert(
@@ -424,4 +424,49 @@ async fn duplicate_waiters_are_bounded_and_release_slots() {
         IdempotencyLookup::Completed(Ok(IdempotencyRecord::ProcessStarted { .. }))
     ));
     assert_eq!(store.lookup_slots.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn idempotency_store_honors_its_configured_window() {
+    let window = Duration::from_secs(600);
+    let store = IdempotencyStore::with_window("test", window);
+    let key = IdempotencyKey::parse("long-window").unwrap();
+    let process_id = ProcessId::new();
+    match store.reserve_or_get(key.clone()).await.unwrap() {
+        IdempotencyLookup::Reserved(reservation) => {
+            reservation
+                .begin()
+                .unwrap()
+                .complete(Ok(IdempotencyRecord::ProcessStarted {
+                    process_id: process_id.clone(),
+                }))
+        }
+        IdempotencyLookup::Completed(_) => panic!("new key unexpectedly completed"),
+    }
+    let backdate = |by: Duration| {
+        let mut state = store.state();
+        let Some(StoredIdempotencyRecord::Completed { created_at, .. }) =
+            state.records.get_mut(&key)
+        else {
+            panic!("completed record disappeared");
+        };
+        *created_at = Instant::now() - by;
+        state.last_pruned_at = None;
+    };
+
+    backdate(DEFAULT_RETENTION + Duration::from_secs(1));
+    match store.reserve_or_get(key.clone()).await.unwrap() {
+        IdempotencyLookup::Completed(Ok(IdempotencyRecord::ProcessStarted {
+            process_id: replayed,
+        })) => assert_eq!(replayed, process_id),
+        _ => panic!("a key inside its window replays its start"),
+    }
+
+    backdate(window + Duration::from_secs(1));
+    let error = match store.reserve_or_get(key).await {
+        Ok(_) => panic!("a key past its window must not replay"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "idempotency_key expired");
 }
