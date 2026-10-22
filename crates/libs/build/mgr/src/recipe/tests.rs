@@ -470,18 +470,67 @@ fn oci_python_smoke_recipe_adapts_to_seed_overlay(oci_python_smoke_recipe: TomlR
 }
 
 #[test]
-fn bundled_firecracker_recipes_parse_and_adapt_to_proto() {
-    for (path, recipe) in bundled_recipes() {
-        let proto = recipe
-            .try_into_proto(None, &mut |_index, _source| {
-                Ok(copy::Payload::BlobSha256(
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-                ))
-            })
-            .unwrap_or_else(|err| panic!("adapt {} to proto: {err}", path.display()));
-        Recipe::try_from(proto)
-            .unwrap_or_else(|err| panic!("convert {} from proto: {err}", path.display()));
+fn bundled_firecracker_recipes_pass_check_recipe_file() {
+    for (path, _recipe) in bundled_recipes() {
+        super::check_recipe_file(&path)
+            .unwrap_or_else(|err| panic!("check {}: {err}", path.display()));
     }
+}
+
+fn check_recipe_testdata(name: &str) -> Result<super::CheckedRecipe, super::RecipeError> {
+    super::check_recipe_file(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/recipe/testdata")
+            .join(name),
+    )
+}
+
+#[test]
+fn check_recipe_file_reports_base_and_steps_in_order() {
+    let checked = check_recipe_testdata("check-recipe-file.toml").expect("recipe should check");
+
+    assert_eq!(
+        checked,
+        super::CheckedRecipe {
+            base: Some("seed".into()),
+            steps: vec![
+                super::CheckedStep::Copy {
+                    source: "files/example.txt".into(),
+                    dest: "/tmp/example.txt".into(),
+                },
+                super::CheckedStep::Other {
+                    kind: "apt-install"
+                },
+                super::CheckedStep::Run {
+                    command: "jq --version".into(),
+                    user: Some("root".into()),
+                },
+                super::CheckedStep::Run {
+                    command: "id -u".into(),
+                    user: Some("user".into()),
+                },
+            ],
+        }
+    );
+}
+
+/// A relative copy destination adapts to a build request but is rejected when the build manager
+/// validates the request, so this fails only if the check runs both stages.
+#[test]
+fn check_recipe_file_applies_build_manager_validation() {
+    let err = check_recipe_testdata("check-recipe-file-relative-copy.toml")
+        .expect_err("relative copy destination should be rejected");
+
+    assert!(
+        matches!(
+            err,
+            super::RecipeError::Invalid {
+                source: RecipeProtoError::RelativeCopyDest { index: 1 },
+                ..
+            }
+        ),
+        "{err}"
+    );
 }
 
 /// A step that interpolates `$VAR` receives the value only if that same step

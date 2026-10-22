@@ -1,0 +1,21 @@
+[metadata]
+name = "check-recipe-file"
+base = "seed"
+
+[[steps]]
+type = "copy"
+source = "files/example.txt"
+dest = "/tmp/example.txt"
+
+[[steps]]
+type = "apt-install"
+packages = ["jq"]
+
+[[steps]]
+type = "run"
+command = "jq --version"
+
+[[steps]]
+type = "run"
+command = "id -u"
+user = "user"

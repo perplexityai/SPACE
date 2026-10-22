@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 
 use oci_spec::distribution::{ParseError as OciReferenceParseError, Reference as OciReference};
@@ -31,6 +32,12 @@ pub enum RecipeError {
         path: String,
         #[source]
         source: RecipeAdapterError,
+    },
+    #[error("invalid recipe {path}: {source}")]
+    Invalid {
+        path: String,
+        #[source]
+        source: RecipeProtoError,
     },
 }
 
@@ -490,6 +497,112 @@ impl TomlRecipe {
                 .collect::<Result<_, _>>()?,
         })
     }
+}
+
+/// Stand-in blob digest for copy steps when a recipe is checked without uploading its sources.
+const CHECK_BLOB_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// A recipe file that passed [`check_recipe_file`], reduced to plain values.
+///
+/// This is a supported interface for code outside this crate that keeps its own recipes, such as
+/// downstream template repositories and their tests. Prefer it over the TOML and proto adapter
+/// types, which change with the build pipeline. Changes to this type or to
+/// [`check_recipe_file`] are API changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckedRecipe {
+    /// Base template reference as written, for template and OCI-image recipes. `None` for
+    /// scratch recipes.
+    pub base: Option<String>,
+    /// Steps in recipe order.
+    pub steps: Vec<CheckedStep>,
+}
+
+/// One step of a [`CheckedRecipe`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CheckedStep {
+    Run {
+        command: String,
+        user: Option<String>,
+    },
+    Copy {
+        /// Source path as written in the recipe.
+        source: String,
+        /// Absolute guest destination.
+        dest: String,
+    },
+    /// Any other step, named by its recipe `type`, such as `apt-install`.
+    Other { kind: &'static str },
+}
+
+/// Checks a recipe file the way a build does and returns its steps.
+///
+/// The file is parsed, adapted to the build request, and validated as the build manager validates
+/// a received request, so `Ok` means a build would accept the recipe. Copy sources are not read or
+/// uploaded; each copy step gets a stand-in payload.
+pub fn check_recipe_file(path: &Path) -> Result<CheckedRecipe, RecipeError> {
+    let display_path = path.display().to_string();
+    let content = std::fs::read_to_string(path).map_err(|source| RecipeError::Read {
+        path: display_path.clone(),
+        source,
+    })?;
+    let toml_recipe: TomlRecipe =
+        toml::from_str(&content).map_err(|source| RecipeError::Parse {
+            path: display_path.clone(),
+            source,
+        })?;
+    let base = match toml_recipe.metadata.build_from {
+        TomlBuildFrom::Template | TomlBuildFrom::OciImage => toml_recipe.metadata.base.clone(),
+        TomlBuildFrom::Scratch => None,
+    };
+    let steps = toml_recipe
+        .steps
+        .iter()
+        .map(|named| match &named.step {
+            TomlStep::SetRuntime { .. } => CheckedStep::Other {
+                kind: "set-runtime",
+            },
+            TomlStep::ClearRuntime => CheckedStep::Other {
+                kind: "clear-runtime",
+            },
+            TomlStep::Run { command, user } => CheckedStep::Run {
+                command: command.clone(),
+                user: user.clone(),
+            },
+            TomlStep::Copy { source, dest } => CheckedStep::Copy {
+                source: source.clone(),
+                dest: dest.clone(),
+            },
+            TomlStep::AptInstall { .. } => CheckedStep::Other {
+                kind: "apt-install",
+            },
+            TomlStep::PipInstall { .. } => CheckedStep::Other {
+                kind: "pip-install",
+            },
+            TomlStep::NpmInstall { .. } => CheckedStep::Other {
+                kind: "npm-install",
+            },
+            TomlStep::NpmInstallGlobal { .. } => CheckedStep::Other {
+                kind: "npm-install-global",
+            },
+            TomlStep::Env { .. } => CheckedStep::Other { kind: "env" },
+            TomlStep::PlaywrightInstall { .. } => CheckedStep::Other {
+                kind: "playwright-install",
+            },
+        })
+        .collect();
+    // Report the file as written, but only after it passes every check a build applies.
+    let proto = toml_recipe.into_proto(&display_path, None, |_index, _source| {
+        Ok(build_proto::recipe::copy::Payload::BlobSha256(
+            CHECK_BLOB_SHA256.to_string(),
+        ))
+    })?;
+    Recipe::try_from(proto).map_err(|source| RecipeError::Invalid {
+        path: display_path,
+        source,
+    })?;
+    Ok(CheckedRecipe { base, steps })
 }
 
 impl TomlNamedStep {
