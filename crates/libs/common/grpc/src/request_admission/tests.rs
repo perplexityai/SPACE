@@ -1,5 +1,6 @@
 use super::*;
 use crate::QueuedSlots;
+use pplx_space_metrics::test_capture::capture_counters_guard;
 use std::convert::Infallible;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,8 +14,11 @@ fn request(method: &str) -> http::Request<Body> {
         .expect("request")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn overload_never_enters_decoder_and_execution_retains_admission_after_cancellation() {
+    let capture = capture_counters_guard();
+    let slots = Arc::new(Semaphore::new(4));
+    let handler_slots = slots.clone();
     let entered = Arc::new(AtomicUsize::new(0));
     let execution = Arc::new(Mutex::new(None));
     let observed = entered.clone();
@@ -22,18 +26,27 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
     let inner = tower::service_fn(move |mut request: http::Request<Body>| {
         observed.fetch_add(1, Ordering::SeqCst);
         let blocked = request.uri().path().ends_with("/WriteBatch");
-        if blocked {
-            *retained.lock().expect("execution") =
-                request.extensions_mut().remove::<RequestPermit>();
-        }
+        let lifetime = if blocked {
+            let permit = RequestPermit::try_acquire_observed(
+                handler_slots.clone(),
+                4,
+                request.extensions_mut().remove(),
+                Budget::GuestFilesystem,
+            )
+            .expect("reuse transport admission");
+            let lifetime = permit.request_lifetime();
+            *retained.lock().expect("execution") = Some(permit);
+            Some(lifetime)
+        } else {
+            None
+        };
         async move {
-            if blocked {
-                std::future::pending::<()>().await;
+            if let Some(lifetime) = lifetime {
+                lifetime.observe(std::future::pending::<()>()).await;
             }
             Ok::<_, Infallible>(http::Response::new(Body::empty()))
         }
     });
-    let slots = Arc::new(Semaphore::new(4));
     let mut service = RequestAdmission::new(
         inner,
         QueuedSlots::new(slots.clone()),
@@ -41,7 +54,12 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
     )
     .with_observation(Budget::GuestFilesystem);
     let mut other_listener = service.clone();
-    let pending = service.call(request("WriteBatch"));
+    let mut pending = service.call(request("WriteBatch"));
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
     for method in ["Write", "WriteBatch", "Rename"] {
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -67,7 +85,10 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
         0,
         "execution still owns the payload"
     );
-    execution.lock().expect("execution").take();
+    let permit = execution.lock().expect("execution").take().unwrap();
+    // Supervisor and caller can observe the same cancellation; count it once.
+    permit.observe_cancellation();
+    drop(permit);
     assert_eq!(slots.available_permits(), 4);
     let response = other_listener
         .call(request("Write"))
@@ -75,6 +96,43 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
         .expect("capacity recovered");
     assert!(!response.headers().contains_key("grpc-status"));
     assert_eq!(slots.available_permits(), 4, "success releases admission");
+    let counters: Vec<_> = capture
+        .finish()
+        .into_iter()
+        .map(|event| (event.name, event.value, event.tags))
+        .collect();
+    let admission = |site: &str, outcome: &str| {
+        (
+            "spaced.guest.payload.admission".to_owned(),
+            1,
+            vec![
+                "budget:guest_filesystem".to_owned(),
+                format!("site:{site}"),
+                format!("outcome:{outcome}"),
+            ],
+        )
+    };
+    assert_eq!(
+        counters,
+        vec![
+            admission("transport", "acquired"),
+            admission("handler", "reused"),
+            admission("transport", "rejected"),
+            admission("transport", "rejected"),
+            admission("transport", "rejected"),
+            (
+                "spaced.guest.payload.cancelled_slots".into(),
+                4,
+                vec!["budget:guest_filesystem".into()]
+            ),
+            (
+                "spaced.guest.payload.cancelled_released_slots".into(),
+                4,
+                vec!["budget:guest_filesystem".into()]
+            ),
+            admission("transport", "acquired"),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -193,12 +251,13 @@ async fn queue_deadline_includes_time_before_first_poll() {
 
 #[test]
 fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
-    for (same_budget, held_weight, closed, admitted) in [
-        (true, 2, false, true),
-        (true, 1, false, false),
-        (false, 2, true, false),
-        (false, 2, false, true),
+    for (same_budget, held_weight, closed, admitted, outcome) in [
+        (true, 2, false, true, "reused"),
+        (true, 1, false, false, "rejected"),
+        (false, 2, true, false, "rejected"),
+        (false, 2, false, true, "reacquired"),
     ] {
+        let capture = capture_counters_guard();
         let slots = Arc::new(Semaphore::new(2));
         let origin = if same_budget {
             slots.clone()
@@ -236,5 +295,25 @@ fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
             "request observation must not retain admission"
         );
         drop(lifetime);
+        let counters: Vec<_> = capture
+            .finish()
+            .into_iter()
+            .map(|event| (event.name, event.value, event.tags))
+            .collect();
+        let expected: Vec<_> = ["acquired", outcome]
+            .into_iter()
+            .map(|outcome| {
+                (
+                    "spaced.guest.payload.admission".to_owned(),
+                    1,
+                    vec![
+                        "budget:guest_process".to_owned(),
+                        "site:handler".to_owned(),
+                        format!("outcome:{outcome}"),
+                    ],
+                )
+            })
+            .collect();
+        assert_eq!(counters, expected);
     }
 }
