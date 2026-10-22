@@ -284,6 +284,10 @@ impl NodeManagerService {
         let selected_environment = environment::normalize(request.get_mut())?;
         validate_sandbox_id(&request.get_ref().sandbox_id)?;
         let sandbox_id = request.get_ref().sandbox_id.clone();
+        // Ownership survives the server deadline so capture can unmount safely,
+        // but a detached capture must not start stopping a rolled-back VM.
+        let caller_cancelled = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_drop = caller_cancelled.clone().drop_guard();
         let service = self.clone();
         self.run_owned_sandbox_work(&sandbox_id, async move {
             let _vm_guard = service
@@ -321,7 +325,9 @@ impl NodeManagerService {
             service
                 .verify_snapshot_environment(req.sandbox_id.clone(), selected_environment)
                 .await?;
-            service.create_snapshot_inner(request).await
+            service
+                .create_snapshot_inner(request, caller_cancelled)
+                .await
         })
         .await
     }
@@ -329,6 +335,7 @@ impl NodeManagerService {
     async fn create_snapshot_inner(
         &self,
         request: Request<CreateSnapshotRequest>,
+        caller_cancelled: tokio_util::sync::CancellationToken,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         let req = request.get_ref();
         validate_sandbox_id(&req.sandbox_id)?;
@@ -343,7 +350,7 @@ impl NodeManagerService {
             .filter(|p| !p.is_empty())
         {
             return self
-                .create_encrypted_snapshot(&req.sandbox_id, mount_dir)
+                .create_encrypted_snapshot(&req.sandbox_id, mount_dir, caller_cancelled)
                 .await;
         }
 
@@ -446,6 +453,7 @@ impl NodeManagerService {
         &self,
         sandbox_id: &str,
         mount_dir: &str,
+        caller_cancelled: tokio_util::sync::CancellationToken,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         let typed_sandbox_id = sandbox_id
             .parse::<SandboxId>()
@@ -549,7 +557,7 @@ impl NodeManagerService {
                 // Stop the runtime to drop the mmap, then drain any remaining
                 // encsnap bind, so the volume can be sealed. Both are no-ops for
                 // a fresh capture (no restore pin).
-                stop_runtime_for_encrypted_seal(&service, &sandbox_id).await?;
+                stop_runtime_for_encrypted_seal(&service, &sandbox_id, &caller_cancelled).await?;
                 let _ = tokio::task::spawn_blocking(move || {
                     for _ in 0..MAX_ENC_SNAPSHOT_BIND_DRAIN {
                         match unmount_if_present(&jail_bind) {
@@ -1430,10 +1438,18 @@ pub(super) async fn set_firecracker_paused(
 /// while it fails server-side because the killed Firecracker is still exiting.
 /// New supervisors report drain timeouts as `Unavailable`. Keep `Internal`
 /// handling while older supervisors still report busy cgroups that way.
+/// Cancellation before the first stop retains the paused VM. Once a stop is
+/// dispatched, finish its retries even if the waiter subsequently disappears.
 async fn stop_runtime_for_encrypted_seal(
     service: &NodeManagerService,
     sandbox_id: &str,
+    caller_cancelled: &tokio_util::sync::CancellationToken,
 ) -> Result<(), Status> {
+    if caller_cancelled.is_cancelled() {
+        return Err(Status::cancelled(
+            "snapshot waiter disappeared before runtime stop; retaining paused runtime",
+        ));
+    }
     let mut attempt = 1;
     loop {
         match stop_sandbox_runtime_with_supervisor(service, sandbox_id, true, None).await {
