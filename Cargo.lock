@@ -5539,6 +5539,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-page-cache",
  "pplx-space-rustls-provider",
+ "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-systemd-watchdog",
  "pplx-space-test-env",
@@ -7020,6 +7021,15 @@ dependencies = [
  "serde",
  "sqlx",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-service-lifecycle"
+version = "0.8.0"
+dependencies = [
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

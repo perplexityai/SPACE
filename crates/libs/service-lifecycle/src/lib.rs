@@ -3,6 +3,9 @@
 //! Each daemon can override these via its own CLI flags, but the defaults
 //! sit here so the SPACE rollout shape (`terminationGracePeriodSeconds`,
 //! mutex acquire budgets, drain budgets) stays consistent across services.
+//!
+//! It is its own crate so a service can share these defaults and the drain
+//! helpers without the rest of `pplx-space-common-svc`.
 
 use std::future::IntoFuture;
 use std::sync::{

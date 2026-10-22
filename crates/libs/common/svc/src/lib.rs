@@ -24,7 +24,7 @@ pub mod federated_identity;
 pub mod http_listener;
 #[cfg(feature = "k8s")]
 pub mod kube_client;
-pub mod lifecycle;
+pub use pplx_space_service_lifecycle as lifecycle;
 pub mod local_health;
 pub use pplx_space_page_cache as page_cache;
 pub mod peer_auth;

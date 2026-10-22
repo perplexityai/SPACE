@@ -507,6 +507,24 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone, so a tokio feature the service lifecycle helpers need but
+    # only get through common-svc's broader tokio features fails here.
+    echo "--- :rust: Running isolated service lifecycle clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-service-lifecycle \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-service-lifecycle \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     # Built alone, so a libc or nix feature the Linux-only page-cache calls
     # need but only get through unification fails here.
     echo "--- :rust: Running isolated page-cache clippy"
