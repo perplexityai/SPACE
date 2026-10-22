@@ -264,7 +264,7 @@ const SESSION_ROUTE_AT_REST: &str = "session_route_at_rest";
 
 /// Mark a FAILED_PRECONDITION for a session route the sandbox has no node
 /// for as one nothing is about to give it: the sandbox is not heading to
-/// running and no wake is queued for it. The marker
+/// running, no wake is queued, and none could be queued for it. The marker
 /// names the sandbox and its state, so the answer can say how to wake it.
 /// Absence keeps the old meaning, a route that is not ready yet, so a client
 /// may wait and attach again.

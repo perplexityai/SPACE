@@ -137,7 +137,7 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
             "409": data_plane_error_response("Process session is already attached (retryable), or the sandbox is not running and this command cannot wake it (not retryable; `details` as on createCommand's conflict). Over WebSocket the same refusal is an `error` frame with code `backend_stream_error` and the same `details`: branch on `details` `reason` (`sandbox_not_running`), not on the code"),
             "429": data_plane_error_response("Attached-stream limit exceeded"),
             "500": data_plane_error_response("Session route state is invalid"),
-            "503": data_plane_error_response("Session route or backend stream is unavailable. `not_ready` is retryable, with `Retry-After`, only while something is about to give the sandbox a node: it is heading to running, or a wake is queued, such as the one a command started. Otherwise `not_ready` is not retryable and carries the `details` of createCommand's `sandbox_not_running` conflict; wake the sandbox first")
+            "503": data_plane_error_response("Session route or backend stream is unavailable. `not_ready` is retryable, with `Retry-After`, while something is about to give the sandbox a node: it is heading to running, or a wake is queued. Attaching to a sandbox at rest whose `auto_lifecycle.wake.on` allows a command wake queues one. Otherwise `not_ready` is not retryable and carries the `details` of createCommand's `sandbox_not_running` conflict; wake the sandbox first")
         }),
     );
 }
