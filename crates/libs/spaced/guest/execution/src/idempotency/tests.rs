@@ -469,4 +469,28 @@ async fn idempotency_store_honors_its_configured_window() {
     };
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(error.message(), "idempotency_key expired");
+
+    // The window governs completed keys only: a stalled original is still
+    // abandoned at the fixed in-progress limit.
+    let stalled = IdempotencyKey::parse("stalled").unwrap();
+    let IdempotencyLookup::Reserved(_reservation) =
+        store.reserve_or_get(stalled.clone()).await.unwrap()
+    else {
+        panic!("new key unexpectedly completed");
+    };
+    {
+        let mut state = store.state();
+        let Some(StoredIdempotencyRecord::InProgress { created_at, .. }) =
+            state.records.get_mut(&stalled)
+        else {
+            panic!("reservation is in progress");
+        };
+        *created_at = Instant::now() - IN_PROGRESS_LIMIT - Duration::from_secs(1);
+        state.last_pruned_at = None;
+    }
+    let error = match store.reserve_or_get(stalled).await {
+        Ok(_) => panic!("a stalled original must not hold its key for the full window"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 }

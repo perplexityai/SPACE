@@ -6,15 +6,21 @@ use std::sync::{Mutex, MutexGuard};
 
 // Retry evidence belongs to this daemon lifetime. A restart loses these records;
 // callers cannot infer exactly-once execution across that boundary.
-// Every record is kept for the store's window, so this caps the sustained
-// rate of keyed operations (process starts, file mutations) at MAX / window
-// per second. Records are small; `MAX_IDEMPOTENCY_KEY_BYTES` bounds
+// Every completed record is kept for the store's window, so this caps the
+// sustained rate of keyed operations (process starts, file mutations) at
+// MAX / window per second. Records are small; `MAX_IDEMPOTENCY_KEY_BYTES` bounds
 // their memory.
 const MAX_IDEMPOTENCY_RECORDS: usize = 16_384;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_IDEMPOTENCY_LOOKUPS: usize = 1_024;
 const IDEMPOTENCY_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const CAPACITY_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+// An operation is in progress only until it publishes its result, so this bound
+// does not follow the configurable completed-record window. It limits how long
+// a duplicate waits behind a stalled original while holding a lookup slot, and
+// when that original is treated as abandoned.
+const IN_PROGRESS_LIMIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(super) struct IdempotencyStore {
@@ -140,7 +146,7 @@ impl IdempotencyStore {
             ))
         })?;
         loop {
-            let (notify, window) = {
+            let notify = {
                 let mut state = self.state();
                 let window = state.window;
                 let now = Instant::now();
@@ -160,7 +166,7 @@ impl IdempotencyStore {
                         return Ok(IdempotencyLookup::Completed(result.clone()));
                     }
                     Some(StoredIdempotencyRecord::InProgress { created_at, notify }) => {
-                        if created_at.elapsed() > window {
+                        if created_at.elapsed() > IN_PROGRESS_LIMIT {
                             let notify = notify.clone();
                             notify.notify_waiters();
                             state.records.insert(
@@ -175,8 +181,8 @@ impl IdempotencyStore {
                         // Register under the state lock. `notify_waiters` does
                         // not retain a permit for a future waiter, so creating
                         // this only after unlocking can lose completion and
-                        // sleep until the full window.
-                        (enabled_notification(notify.clone()), window)
+                        // sleep until the full limit.
+                        enabled_notification(notify.clone())
                     }
                     Some(StoredIdempotencyRecord::Expired { .. }) => {
                         return Err(Status::failed_precondition("idempotency_key expired"));
@@ -212,7 +218,7 @@ impl IdempotencyStore {
                     }
                 }
             };
-            match tokio::time::timeout(window, notify).await {
+            match tokio::time::timeout(IN_PROGRESS_LIMIT, notify).await {
                 Ok(()) | Err(_) => {}
             }
         }
@@ -383,7 +389,7 @@ impl IdempotencyState {
                 StoredIdempotencyRecord::InProgress {
                     created_at,
                     notify: waiter,
-                } if now.duration_since(*created_at) > window => {
+                } if now.duration_since(*created_at) > IN_PROGRESS_LIMIT => {
                     notify.push(waiter.clone());
                     *record = StoredIdempotencyRecord::Expired {
                         expired_at: now,
@@ -460,14 +466,12 @@ fn enabled_notification(notify: Arc<Notify>) -> impl Future<Output = ()> + Send 
 impl IdempotencyReservation {
     pub(super) fn begin(mut self) -> Result<IdempotencyOperation, Status> {
         let claim = self.claim.as_ref().expect("reservation owns its claim");
-        let state = claim.store.state();
         let current = matches!(
-            state.records.get(&claim.key),
+            claim.store.state().records.get(&claim.key),
             Some(StoredIdempotencyRecord::InProgress { created_at, notify, .. })
                 if Arc::ptr_eq(notify, &claim.generation)
-                    && created_at.elapsed() <= state.window
+                    && created_at.elapsed() <= IN_PROGRESS_LIMIT
         );
-        drop(state);
         if !current {
             return Err(Status::failed_precondition("idempotency_key expired"));
         }
