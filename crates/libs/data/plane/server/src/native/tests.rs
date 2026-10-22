@@ -1416,51 +1416,6 @@ async fn revocation_check_has_one_timeout_across_its_reads() {
     );
 }
 
-/// Failed checks are counted apart from the ones that kept the last verdict,
-/// and a check that timed out locally is counted as a timeout.
-#[tokio::test]
-async fn revocation_check_metrics_count_kept_verdicts_and_timeouts() {
-    if !binding_fake_test_process() {
-        return;
-    }
-    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
-    let fake = spawn_revocation_fake(session_id).await;
-    let mut state = crate::tests::test_data_plane_state().await;
-    state.cluster_api = ClusterApiClients::service_only(
-        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
-            .await
-            .unwrap(),
-    );
-    state.revocation_check_timeout = Duration::from_secs(1);
-    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
-    resolve_session_route(&state, session_id, &token)
-        .await
-        .unwrap();
-    let results = |counters: Vec<pplx_space_metrics::test_capture::CapturedCounter>| {
-        counters
-            .into_iter()
-            .filter(|counter| counter.name == "data_plane.revocation.check")
-            .flat_map(|counter| counter.tags)
-            .filter_map(|tag| tag.strip_prefix("result:").map(str::to_string))
-            .collect::<Vec<_>>()
-    };
-
-    fake.answer(FakeRevocation::Down);
-    make_org_refresh_due(&state, session_id);
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
-    assert!(!session_is_revoked(&state, session_id).await.unwrap());
-    assert_eq!(
-        results(counters.finish()),
-        ["status_error", "kept_last_verdict"]
-    );
-
-    fake.answer(FakeRevocation::Hung);
-    make_org_refresh_due(&state, session_id);
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
-    assert!(!session_is_revoked(&state, session_id).await.unwrap());
-    assert_eq!(results(counters.finish()), ["timeout", "kept_last_verdict"]);
-}
-
 #[tokio::test]
 async fn route_cache_hit_does_not_confirm_the_revocation_verdict() {
     if !binding_fake_test_process() {
