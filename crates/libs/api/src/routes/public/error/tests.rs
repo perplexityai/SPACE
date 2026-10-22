@@ -252,6 +252,7 @@ fn every_constructor_matches_the_error_contract() {
         PublicApiError::idempotency_conflict("x"),
         PublicApiError::failed_precondition("x"),
         PublicApiError::rate_limited("x"),
+        PublicApiError::sandbox_quota_exceeded("x"),
         PublicApiError::capacity_unavailable("x"),
         PublicApiError::service_unavailable("x"),
         PublicApiError::lock_contention(),

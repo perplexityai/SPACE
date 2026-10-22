@@ -971,6 +971,7 @@ open_wire_enum!(PublicErrorCode, "public error code", {
     FailedPrecondition => "failed_precondition",
     CapacityUnavailable => "capacity_unavailable",
     RateLimited => "rate_limited",
+    QuotaExceeded => "quota_exceeded",
     IdempotencyConflict => "idempotency_conflict",
     OperationFailed => "operation_failed",
     ServiceUnavailable => "service_unavailable",

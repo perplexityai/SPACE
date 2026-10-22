@@ -1130,7 +1130,7 @@ fn supported_error_examples_match_envelopes_status_and_retryability() {
     use crate::routes::public::error::error_contract;
     use pplx_space_public_api::{
         DataPlaneHttpErrorEnvelope, PublicErrorCode, PublicErrorEnvelope,
-        routes::{CREATE_SANDBOX, NATIVE_V1_OPERATIONS, STREAM_SESSION_EVENTS},
+        routes::{NATIVE_V1_OPERATIONS, STREAM_SESSION_EVENTS},
     };
 
     let spec = m1_sdk_openapi_value();
@@ -1194,10 +1194,7 @@ fn supported_error_examples_match_envelopes_status_and_retryability() {
                     } else {
                         assert_eq!(expected_status.as_u16(), status);
                     }
-                    // createSandbox's 429 is the org sandbox quota, which
-                    // only a delete clears.
-                    let quota = operation == CREATE_SANDBOX && status == 429;
-                    assert_eq!(envelope.retryable, retryable && !quota);
+                    assert_eq!(envelope.retryable, retryable);
                 }
             }
         }

@@ -87,7 +87,7 @@ KNOWN_SESSION_STATES = frozenset({
 KNOWN_PROCESS_EXIT_STATUSES = frozenset({"exited", "signaled", "timed_out", "unknown"})
 KNOWN_PUBLIC_ERROR_CODES = frozenset({
     "invalid_request", "unauthorized", "forbidden", "not_found", "conflict",
-    "failed_precondition", "capacity_unavailable", "rate_limited",
+    "failed_precondition", "capacity_unavailable", "rate_limited", "quota_exceeded",
     "idempotency_conflict", "operation_failed", "service_unavailable", "internal",
 })
 MARKER = b"m1-conformance"

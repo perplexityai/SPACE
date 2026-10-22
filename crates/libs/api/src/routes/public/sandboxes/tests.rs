@@ -381,8 +381,8 @@ async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<(
         .expect("reaches the limit");
 
     let envelope = refusal(create("quota-third", org_limit(2)).await).await;
-    assert_eq!(envelope.code, PublicErrorCode::RateLimited);
-    assert!(!envelope.retryable, "only a delete clears the quota");
+    assert_eq!(envelope.code, PublicErrorCode::QuotaExceeded);
+    assert!(!envelope.retryable, "a delay does not lift the limit");
     assert!(
         envelope
             .message

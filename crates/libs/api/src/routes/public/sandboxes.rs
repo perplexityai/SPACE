@@ -502,12 +502,13 @@ async fn admit_within_sandbox_quota(
 }
 
 fn sandbox_quota_refused(refusal: SandboxQuotaRefusal) -> PublicApiError {
+    const LIFTS: &str = "it lifts once a delete completes or an in-flight create ends";
     PublicApiError::sandbox_quota_exceeded(match refusal {
-        SandboxQuotaRefusal::Org { limit } => format!(
-            "organization sandbox limit of {limit} reached; delete a sandbox to create another"
-        ),
+        SandboxQuotaRefusal::Org { limit } => {
+            format!("organization sandbox limit of {limit} reached; {LIFTS}")
+        }
         SandboxQuotaRefusal::Subject { limit } => {
-            format!("sandbox limit of {limit} per user reached; delete a sandbox to create another")
+            format!("sandbox limit of {limit} per user reached; {LIFTS}")
         }
     })
 }
