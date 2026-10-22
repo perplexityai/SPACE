@@ -607,6 +607,13 @@ impl std::fmt::Display for WaitReadyTimeoutPhase {
 pub enum SubstrateError {
     #[error("{message}")]
     Unavailable { message: String },
+    /// Suspend found no pod to suspend: the sandbox has no active execution,
+    /// or its active execution never bound a pod. Callers outside node drain
+    /// see the same 503 as [`Self::Unavailable`]. Node drain matches the type
+    /// so it can hand the sandbox to its pod-less give-up instead of retrying
+    /// a suspend that can't succeed.
+    #[error("{message}")]
+    SandboxNoPod { message: String },
     #[error("{message}")]
     Conflict { message: String },
     #[error("{message}")]
@@ -904,7 +911,7 @@ impl From<WaitReadyTimeoutPhase> for ControllerRetryAfterCause {
 impl From<SubstrateError> for ControllerError {
     fn from(err: SubstrateError) -> Self {
         match err {
-            SubstrateError::Unavailable { message } => {
+            SubstrateError::Unavailable { message } | SubstrateError::SandboxNoPod { message } => {
                 ControllerError::service_unavailable(message)
             }
             SubstrateError::Conflict { message } => {

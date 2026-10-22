@@ -164,6 +164,7 @@
 "crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 2
 "crates/libs/cluster/controller/server/src/failed_restorable_repair/store.rs" = 3
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
+"crates/libs/cluster/controller/server/src/node_drain/store/pod_less_giveup.rs" = 3
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 5
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes/quarantine_recovery/store.rs" = 1
 "crates/libs/cluster/controller/server/src/started_sandbox_repair/store.rs" = 3

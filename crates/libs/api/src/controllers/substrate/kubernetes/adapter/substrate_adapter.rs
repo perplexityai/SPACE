@@ -1255,7 +1255,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .store
             .active_execution_status(sandbox_id)
             .await?
-            .ok_or_else(|| SubstrateError::Unavailable {
+            .ok_or_else(|| SubstrateError::SandboxNoPod {
                 message: "sandbox is not assigned to a pod".to_string(),
             })?;
         let expected_generation =
@@ -1268,7 +1268,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             execution
                 .pod_uid
                 .clone()
-                .ok_or_else(|| SubstrateError::Unavailable {
+                .ok_or_else(|| SubstrateError::SandboxNoPod {
                     message: "sandbox pod has no Kubernetes UID for suspend retirement".to_string(),
                 })?;
         let suspend_claim = self

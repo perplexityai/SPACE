@@ -281,6 +281,98 @@ pub(in crate::controllers::substrate::kubernetes) fn published_generation_suspen
     )
 }
 
+/// What a node's own records say about one execution generation's local
+/// state, read through `PrepareTeardownSuspend` in observe-only mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationTeardownEvidence {
+    /// A generation-fenced local delete covers this generation or a newer
+    /// one, so nothing of it is left on the node.
+    Deleted,
+    /// The generation's suspend artifact is remotely ready, and the node
+    /// holds the sandbox as a suspended local row.
+    Durable,
+    /// A newer execution, or a generation-fenced stop or activation rollback,
+    /// owns the local runtime resources. The filesystem stays on the node.
+    Superseded,
+    /// Nothing proves the local state safe to leave: the node has no
+    /// journaled outcome, or no row for the sandbox and no delete receipt.
+    Pending,
+    /// The node refused the generation: its row is terminal in a way that
+    /// releases nothing, a quarantined sandbox say.
+    Refused,
+}
+
+/// Ask the node what its records say about `execution_generation`'s local
+/// state. Observe-only never starts a suspend. It does what any caller's poll
+/// of a journaled one does: completes or closes it, or resumes its driver
+/// when it's still running. A terminal row it refuses
+/// (a quarantined sandbox, say) comes back as
+/// [`GenerationTeardownEvidence::Refused`], so a reachable node isn't
+/// mistaken for an unreachable one.
+pub async fn observe_generation_teardown_with_node_api(
+    client: &mut NodeApiClient,
+    endpoint_addr: &str,
+    sandbox_id: SandboxId,
+    execution_generation: ExecutionGeneration,
+) -> Result<GenerationTeardownEvidence, SubstrateError> {
+    let mut client = RetryingWorkerApiClient::new(client);
+    let response = match client
+        .prepare_teardown_suspend(
+            pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendRequest {
+                sandbox_id: sandbox_id.to_string(),
+                execution_generation: execution_generation.get(),
+                action: pplx_space_sbx_mgr_client::proto::TeardownSuspendAction::ObserveOnly as i32,
+            },
+            NODE_RPC_TIMEOUT,
+        )
+        .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(error) => return failed_teardown_observation(error, endpoint_addr),
+    };
+    generation_teardown_evidence(response, endpoint_addr)
+}
+
+/// The error half of [`observe_generation_teardown_with_node_api`]. The node
+/// answers `FAILED_PRECONDITION` for a row it refuses (a quarantined sandbox,
+/// say), which is an answer from a reachable node, not a failure to reach it.
+/// It also returns that code when a generation it had just read as ready to
+/// complete stopped being ready before it completed; that race reads as a
+/// refusal for the one call, and the caller parks and asks again either way.
+pub(in crate::controllers::substrate::kubernetes) fn failed_teardown_observation(
+    error: tonic::Status,
+    endpoint_addr: &str,
+) -> Result<GenerationTeardownEvidence, SubstrateError> {
+    if error.code() == tonic::Code::FailedPrecondition {
+        return Ok(GenerationTeardownEvidence::Refused);
+    }
+    Err(SubstrateError::Unavailable {
+        message: format!("node-api teardown observation at {endpoint_addr} failed: {error}"),
+    })
+}
+
+/// The response half of [`observe_generation_teardown_with_node_api`],
+/// separate so the mapping is testable without a node.
+pub(in crate::controllers::substrate::kubernetes) fn generation_teardown_evidence(
+    response: pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendResponse,
+    endpoint_addr: &str,
+) -> Result<GenerationTeardownEvidence, SubstrateError> {
+    use pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome;
+    match TeardownSuspendOutcome::try_from(response.outcome)
+        .unwrap_or(TeardownSuspendOutcome::Unspecified)
+    {
+        TeardownSuspendOutcome::Deleted => Ok(GenerationTeardownEvidence::Deleted),
+        TeardownSuspendOutcome::Durable => Ok(GenerationTeardownEvidence::Durable),
+        TeardownSuspendOutcome::Superseded => Ok(GenerationTeardownEvidence::Superseded),
+        TeardownSuspendOutcome::Pending => Ok(GenerationTeardownEvidence::Pending),
+        TeardownSuspendOutcome::Unspecified => Err(SubstrateError::Failed {
+            message: format!(
+                "node-api at {endpoint_addr} returned an invalid teardown observation outcome"
+            ),
+        }),
+    }
+}
+
 pub(in crate::controllers::substrate::kubernetes) fn suspend_pod_deletion_confirmation(
     outcome: K8sBlockingDeleteOutcome,
     pod_name: &str,
