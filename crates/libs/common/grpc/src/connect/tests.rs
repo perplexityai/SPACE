@@ -717,6 +717,7 @@ fn is_marked(status: &tonic::Status) -> bool {
     status_chain(status).any(|error| error.is::<crate::ConnectPhaseError>())
 }
 
+#[cfg(target_os = "linux")]
 fn has_io_error(status: &tonic::Status, kind: std::io::ErrorKind) -> bool {
     status_chain(status).any(|error| {
         error

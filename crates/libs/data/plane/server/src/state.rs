@@ -2035,7 +2035,7 @@ pub(super) fn try_increment_bounded(counter: &AtomicUsize, max: usize) -> bool {
 
 pub(super) fn decrement_counter(counter: &AtomicUsize) -> usize {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             Some(value.saturating_sub(1))
         })
         .map(|previous| previous.saturating_sub(1))

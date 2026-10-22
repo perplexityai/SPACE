@@ -346,7 +346,7 @@ impl RecordingRunner {
         self.fail_on.is_some_and(|predicate| predicate(command))
             && self
                 .failures_remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

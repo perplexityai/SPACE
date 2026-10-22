@@ -682,6 +682,7 @@ async fn still_waiting_reports_are_spaced_by_the_interval() {
 
 /// A port this test owns that refuses connections: bound, so nothing else can
 /// take it, but not listening until the caller calls `listen`.
+#[cfg(target_os = "linux")]
 fn refusing_authority() -> (tokio::net::TcpSocket, crate::CredmgrEndpoint) {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
