@@ -157,16 +157,24 @@ impl SimProcessTable {
     /// already emitted is replayed, so a reconnect does not deliver stdout a
     /// second time. The data plane's backend-retry path passes the count it
     /// has delivered so far; the public SSE resume passes nothing.
+    ///
+    /// The simulator keeps every output record, so a reader never lags and
+    /// `resume_after_output_gap` is honored trivially: it is acknowledged on
+    /// `Connected` and no gap is ever reported.
     pub async fn connect(
         &self,
         sandbox_id: &str,
         process_id: &str,
         output_cursor: Option<u64>,
+        resume_after_output_gap: bool,
     ) -> Result<SimProcessEventStream, SimProcessError> {
         let process = self.get(sandbox_id, process_id).await?;
         Ok(event_stream(
             &process,
-            ConnectMode::Connect { output_cursor },
+            ConnectMode::Connect {
+                output_cursor,
+                resume_after_output_gap,
+            },
         ))
     }
 
@@ -261,7 +269,7 @@ enum ConnectMode {
     /// Reattach: `Connected`, then the journal from `output_cursor`; `None`
     /// is the live tail, which replays nothing, and a cursor past the output
     /// fails.
-    Connect { output_cursor: Option<u64> },
+    Connect { output_cursor: Option<u64>, resume_after_output_gap: bool },
 }
 
 fn event_stream(process: &SimProcess, mode: ConnectMode) -> SimProcessEventStream {
@@ -282,11 +290,12 @@ fn event_stream(process: &SimProcess, mode: ConnectMode) -> SimProcessEventStrea
             }
             (started, 0)
         }
-        ConnectMode::Connect { output_cursor } => {
+        ConnectMode::Connect { output_cursor, resume_after_output_gap } => {
             // Nothing is evicted, so the stream starts at the cursor.
             let connected =
                 sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {
                     output_cursor,
+                    resume_after_output_gap,
                 });
             if output_cursor.is_some_and(|cursor| cursor > tail) {
                 return Box::pin(tokio_stream::iter(vec![

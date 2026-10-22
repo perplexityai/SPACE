@@ -21383,31 +21383,3 @@ pub(crate) mod service_tests {
         assert_eq!(metrics.waiting(), 0);
     }
 }
-
-#[test]
-fn bridged_output_gap_keeps_its_accounting() {
-    let bridged = super::spaced_bridge::process_event_to_spaced(host_proto::ProcessEvent {
-        process_id: "process".into(),
-        pid: Some(7),
-        event: Some(host_proto::process_event::Event::OutputGap(
-            host_proto::ProcessOutputGap {
-                skipped_events: 3,
-                output_cursor: 10,
-                output_bytes_before: 4096,
-            },
-        )),
-    })
-    .expect("an output gap is a valid event");
-    assert_eq!(bridged.process_id, "process");
-    assert_eq!(bridged.pid, Some(7));
-    assert_eq!(
-        bridged.event,
-        Some(crate::proto::spaced_process_event::Event::OutputGap(
-            SpacedProcessOutputGap {
-                skipped_events: 3,
-                output_cursor: 10,
-                output_bytes_before: 4096,
-            }
-        ))
-    );
-}

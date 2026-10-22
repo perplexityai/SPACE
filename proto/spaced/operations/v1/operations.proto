@@ -317,6 +317,11 @@ message ProcessConnected {
   // `resume_from_oldest_retained` moved the start past evicted output.
   // Unset by older guests.
   optional uint64 output_cursor = 1;
+  // Set when the request asked for resume_after_output_gap and this guest
+  // honors it. A guest that predates the field ignores the request and keeps
+  // failing a lagged reader; spaced-host then refuses the opted-in stream with
+  // a guest-capability-unsupported status.
+  bool resume_after_output_gap = 2;
 }
 message ProcessOutput { bytes data = 1; }
 message ProcessOutputGap {
