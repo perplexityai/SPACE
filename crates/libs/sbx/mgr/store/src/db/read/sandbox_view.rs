@@ -2,10 +2,10 @@
 //! when the whole row would not decode or when there is no row at all.
 //!
 //! A view names its sandbox and reads nothing until an accessor is called.
-//! Each accessor is one call to its old reader, preserving that reader's
-//! statement and transaction sequence, missing-row rule and strictness; the
-//! one exception is `delete_receipts().execution_covers`, which owns the
-//! statement the old reader now calls. Most accessors read only the columns
+//! Accessors preserve their readers' statement and transaction sequences,
+//! missing-row rules and strictness. `erase_safety` reads both the sandbox
+//! and its quarantine episode; `delete_receipts().execution_covers` owns the
+//! statement its reader calls. Most accessors read only the columns
 //! or child rows they answer from, so a malformed column elsewhere does not
 //! fail them. `restore_scope().reclaim_attempt_is_current` decodes the whole
 //! row strictly before it reads the scope, and the teardown `status` and
@@ -20,7 +20,7 @@
 
 use pplx_space_common_core::types::{
     ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
-    SandboxId, SandboxRuntimeLabel, TransferScopeId,
+    SandboxId, SandboxQuarantineReasonCode, SandboxRuntimeLabel, TransferScopeId,
 };
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
 use rusqlite::params;
@@ -110,6 +110,39 @@ impl SandboxView<'_> {
     /// parsed, so a state this binary does not know is still returned.
     pub fn current_state_label(&self) -> Result<Option<String>> {
         crate::db::current_state_label(self.conn, self.id)
+    }
+
+    /// Whether deleting the row would erase pending or retained suspend state.
+    /// Hold the caller's transaction through cleanup admission.
+    pub fn erase_safety(&self) -> Result<Option<(SandboxState, crate::db::SandboxEraseSafety)>> {
+        use crate::db::SandboxEraseSafety;
+
+        let Some(row) = crate::db::get_sandbox(self.conn, self.id)? else {
+            return Ok(None);
+        };
+        let safety = if row.state == SandboxState::Quarantined
+            && match crate::db::current_quarantine_reason_wire_value(self.conn, self.id)?
+                .as_deref()
+                .map(str::parse::<SandboxQuarantineReasonCode>)
+                .transpose()
+            {
+                // Diagnostic messages vary by failing step. Missing or newer
+                // episode vocabulary cannot prove that the retained bytes
+                // are expendable either.
+                Ok(Some(SandboxQuarantineReasonCode::SuspendSnapshotPublicationFailed))
+                | Ok(None)
+                | Err(_) => true,
+                Ok(Some(_)) => false,
+            } {
+            SandboxEraseSafety::RetainedFilesystemOnlyCopy
+        } else {
+            crate::db::sandbox_erase_safety(
+                row.state,
+                row.cleanup_completion,
+                row.failure_reason.as_deref(),
+            )
+        };
+        Ok(Some((row.state, safety)))
     }
 
     /// The route's execution generation, `None` without a row or without a

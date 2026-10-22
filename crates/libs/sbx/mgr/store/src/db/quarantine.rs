@@ -529,31 +529,32 @@ pub fn mark_quarantined(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn current_quarantine_reason_wire_value(conn: &Connection, id: &str) -> Result<Option<String>> {
-    let raw = conn
-        .query_row(
-            "SELECT reason_code FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
-            params![id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    raw.map(|raw| {
-        let value = raw.trim();
-        if value.is_empty() {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                0,
-                Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "quarantine reason code is blank",
-                )),
-            ));
-        }
-        Ok(value.to_string())
-    })
-    .transpose()
-    .map_err(Error::from)
+db_private_outside_tests! {
+    fn current_quarantine_reason_wire_value(conn: &Connection, id: &str) -> Result<Option<String>> {
+        let raw = conn
+            .query_row(
+                "SELECT reason_code FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        raw.map(|raw| {
+            let value = raw.trim();
+            if value.is_empty() {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "quarantine reason code is blank",
+                    )),
+                ));
+            }
+            Ok(value.to_string())
+        })
+        .transpose()
+        .map_err(Error::from)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
