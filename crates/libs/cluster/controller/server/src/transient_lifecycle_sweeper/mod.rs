@@ -53,6 +53,22 @@
 //!   `persist_pod_metadata` write) and the row then converges; no such pod
 //!   defers the row, still `restoring`, until something hydrates it or the
 //!   VM retires into the revert path below.
+//! - **alive + `creating`, owner gone, never routable** — a create whose API
+//!   process died after its pod was placed, before its execution became
+//!   routable (`running` with a pod IP), leaves the VM running and the row
+//!   `creating`. The candidate select never
+//!   lists a `creating` row whose active execution holds an
+//!   activation-attempt lease that hasn't been expired for a full age window:
+//!   until then the request may still be running and finalize the row
+//!   itself. Once it has, the row fails and retires like a dead one rather
+//!   than converging: the client that asked for it usually never got its id,
+//!   and nothing records what else the request asked for. The fail CAS
+//!   re-checks that the execution is still unroutable.
+//! - **alive + `creating`, otherwise** — defer. A crashed create whose
+//!   execution became routable still holds its attempt, so the node's
+//!   activation-completion receipt moves it to `started`. A `creating` row
+//!   whose execution holds no attempt (never assigned, or already released)
+//!   has nothing to show its owner is gone.
 //! - **alive + anything else** — defer; a later slice may converge those.
 //! - **`restoring` (dormant / dead / missing) with a ready durable
 //!   snapshot** — revert to `suspended` and retire the leftover execution;
@@ -746,41 +762,50 @@ impl ReconcilerConfig {
     /// Read config from env vars. Helm renders these under
     /// `clusterController.reconcilers.transientLifecycleSweeper.*`.
     pub fn from_env() -> Self {
+        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    }
+
+    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+        let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {
-            enabled: env_config::truthy_default(
-                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED",
-                default.enabled,
-            ),
-            tick: env_config::duration_secs(
-                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS",
-                default.tick,
-            ),
-            default_age: std::env::var("SPACE_TRANSIENT_LIFECYCLE_SWEEPER_DEFAULT_AGE_SECS")
+            enabled: config
+                .truthy_default("SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED", default.enabled),
+            tick: config.duration_secs("SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS", default.tick),
+            default_age: env
+                .var("SPACE_TRANSIENT_LIFECYCLE_SWEEPER_DEFAULT_AGE_SECS")
                 .ok()
                 .and_then(|raw| raw.parse::<u64>().ok())
                 .and_then(|n| PositiveDuration::new(Duration::from_secs(n)))
                 .unwrap_or(default.default_age),
-            creating_age: default.creating_age,
+            // Unset keeps the default age, as before this knob existed, so a
+            // deployment that ages `creating` out on the default keeps doing
+            // so. A deployment whose default is effectively "never" opts in
+            // here.
+            creating_age: env_lifecycle_age(
+                env,
+                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_CREATING_AGE_SECS",
+            ),
             starting_age: default.starting_age,
             pausing_age: default.pausing_age,
             resuming_age: default.resuming_age,
             suspending_age: env_lifecycle_age(
+                env,
                 "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_SUSPENDING_AGE_SECS",
             ),
             restoring_age: env_lifecycle_age(
+                env,
                 "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_AGE_SECS",
             ),
             stopping_age: default.stopping_age,
             checkpointing_age: env_lifecycle_age(
+                env,
                 "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_CHECKPOINTING_AGE_SECS",
             ),
             probe_timeout: default.probe_timeout,
             // Ships enabled and retires failed rows, so a malformed value must
             // disable it rather than leave it running.
-            failed_cleanup_enabled: env_config::destructive_gate(
-                "SPACE_FAILED_SANDBOX_CLEANUP_ENABLED",
-            ),
+            failed_cleanup_enabled: config.destructive_gate("SPACE_FAILED_SANDBOX_CLEANUP_ENABLED"),
             failed_cleanup_batch_size: default.failed_cleanup_batch_size,
             command_ready_pending_enabled: false,
             command_ready_pending_age: default.command_ready_pending_age,
@@ -833,11 +858,11 @@ impl ReconcilerConfig {
 /// positive integer -> [`LifecycleAge::Override`]; unset or unparseable ->
 /// [`LifecycleAge::UseDefault`] (so a typo doesn't silently disable a
 /// lifecycle).
-fn env_lifecycle_age(var: &str) -> LifecycleAge {
-    match std::env::var(var)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-    {
+fn env_lifecycle_age(
+    env: &dyn pplx_space_common_core::env::Environment,
+    var: &str,
+) -> LifecycleAge {
+    match env.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
         Some(0) => LifecycleAge::Disabled,
         Some(n) => PositiveDuration::new(Duration::from_secs(n))
             .map(LifecycleAge::Override)
@@ -863,9 +888,45 @@ pub struct FailedCleanupCandidate {
     /// `k8s_node_name` from the active execution row; `None` when the pod
     /// never reached a node.
     pub node_name: Option<String>,
+    /// Whether the execution's first activation (for a cold create, the
+    /// create) finished, and if not whether its owner is gone.
+    pub first_activation: FirstActivation,
     /// What the listing observed of that execution, so the retire can refuse
     /// if the sandbox moved on before the probe and the retire ran.
     pub pod_fence: RetireFence,
+}
+
+/// What the failed-cleanup listing saw of an execution's first activation
+/// (for a cold create, the create itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstActivation {
+    /// It finished (the execution reached `running`), or the execution holds no
+    /// attempt. The row may be repaired to `started` when its node reports
+    /// the VM started.
+    Finished,
+    /// It never reached `running` and still holds an activation attempt (the
+    /// route's or a later one) whose lease hasn't expired: its owner may still be
+    /// working. Never repaired to `started` (nothing routable to reach it at), and
+    /// not retired while the VM is alive; deferred until the lease expires.
+    /// An attempt with no expiry counts as live, as in the sweep's owner
+    /// check; no writer produces one.
+    InFlight,
+    /// As `InFlight`, but the lease has expired. The row is `failed`, so the
+    /// create can't finish even if its owner is still working. Retired even
+    /// with its VM alive, never repaired to `started`.
+    Abandoned,
+}
+
+impl FirstActivation {
+    /// From the listing's `first_activation_unfinished` and
+    /// `first_activation_abandoned` columns.
+    pub(crate) fn from_columns(unfinished: bool, abandoned: bool) -> Self {
+        match (unfinished, abandoned) {
+            (_, true) => Self::Abandoned,
+            (true, false) => Self::InFlight,
+            (false, false) => Self::Finished,
+        }
+    }
 }
 
 /// A preserved `started` row whose `command_ready_pending` marker has stuck,
@@ -881,6 +942,22 @@ pub struct CommandReadyPendingCandidate {
     /// pod, and a create that finally converged between probe and retire looks
     /// identical to one that never will.
     pub pod_fence: RetireFence,
+}
+
+/// What the fail CAS re-checks beyond the candidate select's guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailGuard {
+    /// Only the candidate select's guards.
+    Aged,
+    /// Also that the row's active execution still isn't routable. The sweep
+    /// fails an alive abandoned create only if it never became routable; one
+    /// that did is left to its node's activation-completion receipt, so a pod
+    /// IP committed between the select and the CAS (a read of the pod records
+    /// one) makes the CAS claim nothing. The pod-IP write doesn't take the
+    /// sandbox row lock, so one that lands after the CAS, before the retire,
+    /// isn't caught: the retire's pod fence checks the pod's identity, not its
+    /// IP.
+    NeverRoutable,
 }
 
 /// DB-side surface the sweeper depends on. Implementations:
@@ -986,14 +1063,15 @@ pub trait SweepSink: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<Option<RevertedToSuspended>, sqlx::Error>> + Send;
 
     /// CAS one provably-unrecoverable row from `lifecycle` to `'failed'`,
-    /// with the same evacuation-exemption guards as the candidate select.
-    /// Returns whether this call claimed the row; cleanup runs only on
-    /// claimed rows.
+    /// with the same evacuation-exemption guards as the candidate select,
+    /// plus whatever `guard` adds. Returns whether this call claimed the row;
+    /// cleanup runs only on claimed rows.
     fn fail_aged_candidate(
         &self,
         sandbox_id: SandboxId,
         lifecycle: SandboxLifecycle,
         age: PositiveDuration,
+        guard: FailGuard,
     ) -> impl std::future::Future<Output = Result<Option<String>, sqlx::Error>> + Send;
 
     /// Undo a fail this sweep just made, when the retire it was supposed to
@@ -1142,6 +1220,14 @@ pub trait SweepSink: Send + Sync + 'static {
         &self,
         batch_size: i64,
     ) -> impl std::future::Future<Output = Result<Vec<FailedCleanupCandidate>, sqlx::Error>> + Send;
+
+    /// Re-read a failed-cleanup candidate's first activation, as the listing
+    /// classifies it. `None` when the sandbox is no longer `failed` with an
+    /// active execution.
+    fn first_activation(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> impl std::future::Future<Output = Result<Option<FirstActivation>, sqlx::Error>> + Send;
 
     /// Rotate the cleanup candidate before attempting deletion so repeated
     /// failures do not monopolize every tick.
@@ -1774,8 +1860,8 @@ impl<S: SweepSink> Reconciler<S> {
     }
 
     /// The old age-out behavior, now reached only for rows the probe proved
-    /// gone from their node with nothing recoverable: CAS to `failed` and
-    /// retire the execution.
+    /// gone from their node with nothing recoverable, or for an alive
+    /// abandoned create: CAS to `failed` and retire the execution.
     async fn fail_candidate(
         &self,
         candidate: &SweepCandidate,
@@ -1785,6 +1871,15 @@ impl<S: SweepSink> Reconciler<S> {
     ) {
         let sandbox_id = candidate.sandbox_id;
         let lifecycle_label = candidate.lifecycle.to_string();
+        // `decide` fails an alive create only if it never became routable;
+        // the CAS re-checks that, as it re-checks the owner.
+        let guard = if candidate.lifecycle == SandboxLifecycle::Creating
+            && verdict == ProbeVerdict::AliveOnNode
+        {
+            FailGuard::NeverRoutable
+        } else {
+            FailGuard::Aged
+        };
         // Ask before committing, as the revert and reap paths do. `failed` is
         // the hardest of the three to walk back — nothing does — so learning
         // the fence was lost afterwards is how a sandbox that finished pausing
@@ -1821,7 +1916,7 @@ impl<S: SweepSink> Reconciler<S> {
 
         let write_token = match self
             .sink
-            .fail_aged_candidate(sandbox_id, candidate.lifecycle, age)
+            .fail_aged_candidate(sandbox_id, candidate.lifecycle, age, guard)
             .await
         {
             Ok(claimed) => claimed,
@@ -2511,7 +2606,44 @@ impl<S: SweepSink> Reconciler<S> {
                 continue;
             }
 
-            if verdict == ProbeVerdict::AliveOnNode
+            // A first activation that never finished is retired even with its
+            // VM alive once its owner is gone: the sweep fails such a create
+            // on purpose, and repairing it to `started` would hand out a
+            // sandbox its create request never returned, with no pod IP to
+            // reach it at. One whose owner may still be working is never
+            // repaired either; with its VM alive it defers below.
+            let retire_alive_create = candidate.first_activation == FirstActivation::Abandoned
+                && verdict == ProbeVerdict::AliveOnNode;
+            // The listing's facts predate the probe, and an execution that
+            // reached `running` since (the pod-metadata write records the pod IP
+            // and `running` together) is routable, so re-read them before
+            // retiring a live VM. Anything that moved waits for the next tick's
+            // listing.
+            if retire_alive_create {
+                match self.sink.first_activation(sandbox_id).await {
+                    Ok(Some(FirstActivation::Abandoned)) => {}
+                    Ok(now) => {
+                        tracing::debug!(
+                            sandbox_id = %sandbox_id,
+                            first_activation = ?now,
+                            "transient_lifecycle_sweeper: failed create moved since the listing; \
+                             not retiring its live VM this tick"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %error,
+                            "transient_lifecycle_sweeper: could not re-read a failed create's \
+                             first activation; not retiring its live VM this tick"
+                        );
+                        continue;
+                    }
+                }
+            }
+            if candidate.first_activation == FirstActivation::Finished
+                && verdict == ProbeVerdict::AliveOnNode
                 && observation.node_status == Some(SandboxLifecycle::Started)
             {
                 self.repair_failed_active_candidate(sandbox_id, observation, report)
@@ -2519,7 +2651,7 @@ impl<S: SweepSink> Reconciler<S> {
                 continue;
             }
 
-            if !verdict.permits_failed_retire() {
+            if !retire_alive_create && !verdict.permits_failed_retire() {
                 let defer_reason = failed_cleanup_defer_reason(observation);
                 OutcomeEvent::failed_cleanup(FailedCleanupOutcome::Deferred, verdict.as_str())
                     .reason(defer_reason)

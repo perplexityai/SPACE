@@ -17,7 +17,8 @@ use super::probe::SweepCandidate;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProbeVerdict {
     /// The node reports the Firecracker VM alive. The row is stale, not the
-    /// sandbox — destruction is forbidden.
+    /// sandbox — destruction is forbidden, except for a `creating` row whose
+    /// create was abandoned, which [`decide`] fails and retires.
     AliveOnNode,
     /// The node knows the sandbox, the VM is not running, and a
     /// current-instance local artifact pointer exists. The node may hold the
@@ -149,8 +150,9 @@ pub enum SweepAction {
     /// lifecycle's "ready snapshot" is a stale prior-cycle copy.
     RevertToSuspended,
     /// The old age-out behavior — CAS to `failed` and retire the execution.
-    /// Reached only when the probe proved the sandbox gone from its node and
-    /// no durable snapshot exists.
+    /// Reached when the probe proved the sandbox gone from its node and no
+    /// durable snapshot exists, or for an alive `creating` row whose create
+    /// was abandoned (see [`decide`]).
     FailAndRetire,
     /// No provably-safe action this tick; the row rolls to the next tick.
     Defer { reason: DeferReason },
@@ -159,7 +161,10 @@ pub enum SweepAction {
 /// Why a candidate was deferred, for the `sweep_deferred` event's `reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferReason {
-    /// The VM is alive in a lifecycle the sweep does not converge yet.
+    /// The VM is alive in a lifecycle the sweep does not converge yet, or
+    /// the row is `creating` and either nothing shows its create was
+    /// abandoned or its execution is routable, so its node's receipt
+    /// finishes it.
     AliveNotConvergeable,
     /// The VM is alive and the row is `restoring`, but no routable backing
     /// pod exists (DB unroutable and the substrate found no live matching
@@ -245,6 +250,28 @@ pub fn decide(candidate: &SweepCandidate, verdict: ProbeVerdict) -> SweepAction 
                 // before asserting it.
                 SweepAction::HydrateThenConverge { target }
             }
+        }
+        // A create whose owner is gone after its VM came up, and which never
+        // became routable: the candidate select never lists a `creating` row
+        // whose activation lease is live or recently expired, and
+        // `activation_abandoned` says this one's expired a full window ago.
+        // It fails rather than converges. The request that would have
+        // returned the sandbox died: a synchronous create's client never got
+        // the id and usually retries into a second sandbox, and nothing
+        // records what else the request asked for (file-change tracking, say)
+        // for a converge to honor. There is no earlier snapshot to protect,
+        // and the retire keeps node-local state.
+        //
+        // A routable one defers instead. Its node's activation-completion
+        // receipt moves it to `started` on the attempt it still holds, and
+        // failing it first would only race that receipt and failed cleanup's
+        // repair. The fail CAS re-checks routability (`FailGuard`).
+        ProbeVerdict::AliveOnNode
+            if candidate.lifecycle == SandboxLifecycle::Creating
+                && candidate.activation_abandoned
+                && !candidate.routable_execution =>
+        {
+            SweepAction::FailAndRetire
         }
         ProbeVerdict::AliveOnNode => SweepAction::Defer {
             reason: DeferReason::AliveNotConvergeable,

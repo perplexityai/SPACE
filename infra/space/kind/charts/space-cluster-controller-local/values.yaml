@@ -184,10 +184,11 @@ reconcilers:
   #   the unrestorable-restoring phase, which fails a markerless `restoring`
   #   row with no source node, snapshot or upload in flight once its
   #   placement is 300 s old.
-  # - Every other transient lifecycle is effectively off. creating, starting,
-  #   pausing, resuming and stopping have no per-lifecycle knob and take the
-  #   default age, so the default is a year; suspending and checkpointing
-  #   take `0`, which disables them.
+  # - Every other transient lifecycle is effectively off. starting, pausing,
+  #   resuming and stopping have no per-lifecycle knob, and creating's
+  #   (`..._CREATING_AGE_SECS`) is unset here, so they take the default age,
+  #   which is a year; suspending and checkpointing take `0`, which disables
+  #   them.
   # - Failed-sandbox cleanup (retrying the teardown of `failed` rows that
   #   still hold an active execution) ships on; rendered explicitly.
   # At these ages a row a scenario legitimately holds mid-transition is never

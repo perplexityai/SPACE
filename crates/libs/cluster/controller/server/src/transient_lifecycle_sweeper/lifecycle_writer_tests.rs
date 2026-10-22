@@ -11,8 +11,9 @@
 //! in `tests.rs` are not repeated here: the fail CAS's age (`r1`) and
 //! substrate scope (`r4`), the marked-`restoring` exemption (`r6`), the
 //! current-cycle snapshot exemption (`r7`), the restore lease and the
-//! converge age (`r10`, `r13`) and the revert's snapshot window (`r11`,
-//! `r15`).
+//! converge age (`r10`, `r13`), the revert's snapshot window (`r11`,
+//! `r15`), and the `creating` fail CAS's activation-owner check
+//! (`tests/crashed_create.rs`).
 //!
 //! The sink runs over the direct substrate, which labels its rows
 //! `managed_by = 'space'` and needs no node or Kubernetes API for these
@@ -45,21 +46,21 @@ use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::{SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
+use super::{FailGuard, SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{
     ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_sandbox, insert_snapshot,
     kubernetes_substrate, pin_local_artifact, pod_name, pod_uid, single_backend_pool,
     wait_until_blocked,
 };
 
-fn age() -> PositiveDuration {
+pub(super) fn age() -> PositiveDuration {
     PositiveDuration::new(Duration::from_secs(60)).expect("non-zero")
 }
 
 // Direct is only a placeholder: it supplies `managed_by`, and only the converge
 // CAS and the failed-active repair CAS would decide differently for a
 // Kubernetes label (see the module doc).
-fn direct_sink(pool: &PgPool) -> SubstrateSweepSink {
+pub(super) fn direct_sink(pool: &PgPool) -> SubstrateSweepSink {
     SubstrateSweepSink::new(
         pool.clone(),
         Arc::new(Substrate::from_direct(DirectSubstrate::new(pool.clone()))),
@@ -237,7 +238,7 @@ async fn fail_cas_claims_only_the_lifecycle_it_was_listed_under() -> TestResult 
             insert_row(pool, sandbox_id, &Row::bare(stored)).await?;
 
             let claimed = sink
-                .fail_aged_candidate(sandbox_id, listed, age())
+                .fail_aged_candidate(sandbox_id, listed, age(), FailGuard::Aged)
                 .await?
                 .is_some();
 
@@ -307,7 +308,7 @@ async fn fail_cas_clears_the_moved_columns_and_spares_a_published_evacuation() -
         }
 
         let claimed = sink
-            .fail_aged_candidate(sandbox_id, listed, age())
+            .fail_aged_candidate(sandbox_id, listed, age(), FailGuard::Aged)
             .await?
             .is_some();
 
@@ -332,7 +333,12 @@ async fn fail_undo_reverts_only_its_own_failed_write() -> TestResult {
         let sandbox_id = SandboxId::new();
         insert_row(pool, sandbox_id, &Row::bare("pausing")).await?;
         let token = sink
-            .fail_aged_candidate(sandbox_id, SandboxLifecycle::Pausing, age())
+            .fail_aged_candidate(
+                sandbox_id,
+                SandboxLifecycle::Pausing,
+                age(),
+                FailGuard::Aged,
+            )
             .await?
             .expect("the accepting fail CAS claims");
         relabel_keeping_write_token(pool, sandbox_id, stored).await?;
@@ -356,7 +362,12 @@ async fn fail_undo_reverts_only_its_own_failed_write() -> TestResult {
     let sandbox_id = SandboxId::new();
     insert_row(pool, sandbox_id, &Row::bare("pausing")).await?;
     let token = sink
-        .fail_aged_candidate(sandbox_id, SandboxLifecycle::Pausing, age())
+        .fail_aged_candidate(
+            sandbox_id,
+            SandboxLifecycle::Pausing,
+            age(),
+            FailGuard::Aged,
+        )
         .await?
         .expect("the accepting fail CAS claims");
     rewrite_lifecycle(pool, sandbox_id, "started").await?;
@@ -425,7 +436,12 @@ async fn fail_cas_waiting_on_a_row_lock_decides_on_the_committed_row() -> TestRe
         let (sweep_pool, sweep_pid) = single_backend_pool(&db).await?;
         let sweep = tokio::spawn(async move {
             direct_sink(&sweep_pool)
-                .fail_aged_candidate(sandbox_id, SandboxLifecycle::Restoring, age())
+                .fail_aged_candidate(
+                    sandbox_id,
+                    SandboxLifecycle::Restoring,
+                    age(),
+                    FailGuard::Aged,
+                )
                 .await
         });
         bounded(wait_until_blocked(pool, sweep_pid, writer_pid)).await?;

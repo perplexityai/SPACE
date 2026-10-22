@@ -27,6 +27,7 @@ fn candidate(
         fork_restore: false,
         node_name: Some("node-a".to_string()),
         routable_execution: true,
+        activation_abandoned: false,
         pod_fence: RetireFence::NoExecution,
     }
 }
@@ -39,6 +40,78 @@ fn unroutable_candidate(
     SweepCandidate {
         routable_execution: false,
         ..candidate(lifecycle, ready_snapshot, evacuation_restore_target)
+    }
+}
+
+/// A crashed create whose VM came up is failed and retired once its
+/// activation is abandoned, but only if its execution never became routable.
+/// A routable one defers to its node's activation-completion receipt, and so
+/// does any alive create without an abandoned activation. Neither is ever
+/// converged or hydrated.
+#[test]
+fn an_alive_abandoned_create_fails_only_if_it_never_became_routable() {
+    for (activation_abandoned, routable_execution, expected) in [
+        (true, false, SweepAction::FailAndRetire),
+        (
+            true,
+            true,
+            SweepAction::Defer {
+                reason: DeferReason::AliveNotConvergeable,
+            },
+        ),
+        (
+            false,
+            false,
+            SweepAction::Defer {
+                reason: DeferReason::AliveNotConvergeable,
+            },
+        ),
+        (
+            false,
+            true,
+            SweepAction::Defer {
+                reason: DeferReason::AliveNotConvergeable,
+            },
+        ),
+    ] {
+        let create = SweepCandidate {
+            activation_abandoned,
+            routable_execution,
+            ..candidate(SandboxLifecycle::Creating, false, None)
+        };
+        assert_eq!(
+            decide(&create, ProbeVerdict::AliveOnNode),
+            expected,
+            "abandoned {activation_abandoned}, routable {routable_execution}"
+        );
+    }
+}
+
+/// An abandoned activation fails an alive, never-routable row only when it's
+/// `creating`. Every other lifecycle keeps its own alive-row decision:
+/// `restoring` hydrates and converges to its wake target and the rest defer.
+#[test]
+fn an_abandoned_activation_fails_only_an_alive_create() {
+    for lifecycle in super::super::SWEEPABLE_LIFECYCLES.iter().copied() {
+        let candidate = SweepCandidate {
+            activation_abandoned: true,
+            routable_execution: false,
+            ..candidate(lifecycle, false, None)
+        };
+        let expected = match lifecycle {
+            SandboxLifecycle::Creating => SweepAction::FailAndRetire,
+            SandboxLifecycle::Restoring => SweepAction::HydrateThenConverge {
+                target: SandboxLifecycle::Started,
+            },
+            _ => SweepAction::Defer {
+                reason: DeferReason::AliveNotConvergeable,
+            },
+        };
+        assert_eq!(
+            decide(&candidate, ProbeVerdict::AliveOnNode),
+            expected,
+            "lifecycle {lifecycle}"
+        );
     }
 }
 
