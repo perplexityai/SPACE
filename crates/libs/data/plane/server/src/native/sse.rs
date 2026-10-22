@@ -459,7 +459,13 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             }
                         }
                         let mut output_seq = state.backend_output_cursor.unwrap_or_default();
-                        let batch = process_event_frames(event, &mut output_seq);
+                        let batch = match process_event_frames(event, &mut output_seq) {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                state.finish_with_error(error);
+                                return state.pending.pop_front();
+                            }
+                        };
                         if batch
                             .frames
                             .iter()

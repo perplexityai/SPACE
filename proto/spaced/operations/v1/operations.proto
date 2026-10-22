@@ -229,6 +229,11 @@ message ConnectProcessRequest {
   // number of stdout/stderr events already durably captured so output emitted
   // while a client was disconnected is replayed from the guest journal.
   optional uint64 output_cursor = 3;
+  // When output this stream has not delivered was evicted, emit
+  // ProcessOutputGap and continue at the oldest retained event instead of
+  // failing with RESOURCE_EXHAUSTED. A caller that polls at its own pace can
+  // then report the loss and keep reading.
+  optional bool resume_after_output_gap = 4;
 }
 message ListProcessesRequest {}
 message ProcessInfo {
@@ -273,11 +278,29 @@ message ProcessEvent {
     ProcessOutput stdout = 5;
     ProcessOutput stderr = 6;
     ProcessExit exit = 7;
+    // Sent only to a ConnectProcess caller that set resume_after_output_gap.
+    ProcessOutputGap output_gap = 8;
   }
 }
 message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
-message ProcessConnected {}
+message ProcessConnected {
+  // Set when the request asked for resume_after_output_gap and this guest
+  // honors it. A guest that predates the field ignores the request and keeps
+  // failing a lagged reader; spaced-host then refuses the opted-in stream with
+  // a guest-capability-unsupported status.
+  bool resume_after_output_gap = 1;
+}
 message ProcessOutput { bytes data = 1; }
+message ProcessOutputGap {
+  // Output events evicted before this stream delivered them.
+  uint64 skipped_events = 1;
+  // The output_cursor of the next output event this stream delivers.
+  uint64 output_cursor = 2;
+  // Total stdout and stderr data bytes the process emitted before
+  // output_cursor. A caller that counted the bytes it received from cursor 0
+  // subtracts that count to learn how many bytes it missed.
+  uint64 output_bytes_before = 3;
+}
 message ProcessExit {
   oneof outcome {
     ProcessExited exited = 1;

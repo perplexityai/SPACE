@@ -566,7 +566,7 @@ pub(crate) async fn bridge_process_session(
                                     ));
                                 }
                             }
-                            let batch = process_event_frames(event, &mut output_seq);
+                            let batch = process_event_frames(event, &mut output_seq)?;
                             if batch.frames.iter().any(|frame| {
                                 matches!(frame, DataPlaneServerFrame::ProcessExited { .. })
                             }) {

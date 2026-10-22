@@ -73,7 +73,9 @@ fn connected_process_event(process_id: &ProcessId) -> SpacedProcessEvent {
         process_id: process_id.to_string(),
         pid: Some(123),
         event: Some(spaced_ops::process_event::Event::Connected(
-            spaced_ops::ProcessConnected {},
+            spaced_ops::ProcessConnected {
+                resume_after_output_gap: false,
+            },
         )),
     }
 }
@@ -895,24 +897,41 @@ fn process_start_reopen_backoff_is_bounded() {
 async fn process_start_stream_rejects_output_from_a_different_process() {
     let process_id = ProcessId::new();
     let changed_process_id = ProcessId::new();
-    let initial = tokio_stream::iter(vec![
-        Ok(started_process_event(&process_id)),
-        Ok(stdout_process_event(&changed_process_id, b"wrong process")),
-        Ok(exited_process_event(&process_id)),
-    ]);
+    // ECW never asks to continue past lost output, so a gap is also data loss.
+    let unrequested_gap = SpacedProcessEvent {
+        process_id: process_id.to_string(),
+        pid: Some(123),
+        event: Some(spaced_ops::process_event::Event::OutputGap(
+            spaced_ops::ProcessOutputGap {
+                skipped_events: 1,
+                output_cursor: 1,
+                output_bytes_before: 4,
+            },
+        )),
+    };
+    for lost in [
+        stdout_process_event(&changed_process_id, b"wrong process"),
+        unrequested_gap,
+    ] {
+        let initial = tokio_stream::iter(vec![
+            Ok(started_process_event(&process_id)),
+            Ok(lost),
+            Ok(exited_process_event(&process_id)),
+        ]);
 
-    let events = Box::pin(resumable_process_start_stream(initial, false, |_| async {
-        unreachable!("the stream should fail before reopening")
-    }))
-    .collect::<Vec<_>>()
-    .await;
+        let events = Box::pin(resumable_process_start_stream(initial, false, |_| async {
+            unreachable!("the stream should fail before reopening")
+        }))
+        .collect::<Vec<_>>()
+        .await;
 
-    assert_eq!(events.len(), 2);
-    events[0].as_ref().expect("first event should succeed");
-    assert_eq!(
-        events[1].as_ref().unwrap_err().code(),
-        tonic::Code::DataLoss
-    );
+        assert_eq!(events.len(), 2);
+        events[0].as_ref().expect("first event should succeed");
+        assert_eq!(
+            events[1].as_ref().unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+    }
 }
 
 #[tokio::test]

@@ -288,7 +288,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Commands::Connect { process_id } => {
             let mut stream = client
-                .connect_process_stream_with_cursor(process_id, None, None)
+                .connect_process_stream_with_cursor(process_id, None, None, false)
                 .await?;
             while let Some(event) = stream.message().await? {
                 print_process_event(event).await?;
@@ -382,6 +382,10 @@ async fn print_process_event(
         Some(Event::Stderr(output)) => {
             return write_output(&mut tokio::io::stderr(), &output.data).await;
         }
+        Some(Event::OutputGap(gap)) => format!(
+            "output_gap process_id={} skipped_events={} output_cursor={} output_bytes_before={}\n",
+            event.process_id, gap.skipped_events, gap.output_cursor, gap.output_bytes_before
+        ),
         Some(Event::Exit(exit)) => {
             use pplx_space_spaced_host_client::proto::process_exit::Outcome;
             match exit.outcome {

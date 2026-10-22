@@ -427,7 +427,7 @@ impl ProcessLaunch {
         ));
         claim.publish(Arc::clone(&record));
 
-        let cursor = record.journal.cursor(Some(0));
+        let cursor = record.journal.cursor(Some(0), None);
         let mut output_tasks = VecDeque::new();
         if let Some(reader) = pty_reader {
             output_tasks.push_back(spawn_process_output_reader(
@@ -1028,7 +1028,11 @@ impl ProcessEventJournal {
             .completed_at
     }
 
-    fn cursor(self: &Arc<Self>, requested: Option<u64>) -> ProcessJournalCursor {
+    fn cursor(
+        self: &Arc<Self>,
+        requested: Option<u64>,
+        gap_resume: Option<OutputGapResume>,
+    ) -> ProcessJournalCursor {
         let mut state = self
             .state
             .lock()
@@ -1052,6 +1056,7 @@ impl ProcessEventJournal {
             changed: self.subscribe(),
             next_sequence,
             primary,
+            gap_resume,
         }
     }
 
@@ -1086,7 +1091,7 @@ impl ProcessEventJournal {
     }
 
     fn try_append_output(&self, event: ProcessEvent) -> Option<ProcessEvent> {
-        let output_bytes = match event.event.as_ref() {
+        let (output_bytes, data_bytes) = match event.event.as_ref() {
             Some(
                 pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Stdout(
                     output,
@@ -1096,11 +1101,12 @@ impl ProcessEventJournal {
                 pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Stderr(
                     output,
                 ),
-            ) => {
+            ) => (
                 output.data.capacity()
                     + event.process_id.capacity()
-                    + std::mem::size_of::<SequencedProcessEvent>()
-            }
+                    + std::mem::size_of::<SequencedProcessEvent>(),
+                output.data.len() as u64,
+            ),
             _ => unreachable!("process journal only retains output events"),
         };
         if output_bytes > PROCESS_OUTPUT_RETENTION_BYTES {
@@ -1109,6 +1115,8 @@ impl ProcessEventJournal {
                     .state
                     .lock()
                     .expect("process output journal lock poisoned");
+                let cleared: u64 = state.output.iter().map(|event| event.data_bytes).sum();
+                state.dropped_output_bytes += cleared + data_bytes;
                 state.output.clear();
                 state.retained_bytes = 0;
                 state.guaranteed_bytes = 0;
@@ -1159,6 +1167,7 @@ impl ProcessEventJournal {
                         }
                         Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
                             state.first_sequence = state.next_sequence + 1;
+                            state.dropped_output_bytes += data_bytes;
                             break None;
                         }
                     }
@@ -1178,6 +1187,7 @@ impl ProcessEventJournal {
                 sequence,
                 event,
                 output_bytes,
+                data_bytes,
                 guaranteed_bytes,
                 _shared_output_slot: shared_output_slot,
             });
@@ -1188,18 +1198,20 @@ impl ProcessEventJournal {
     }
 
     fn complete(&self, exit: ProcessEvent) {
-        let next_sequence = {
+        let (next_sequence, output_bytes) = {
             let mut state = self
                 .state
                 .lock()
                 .expect("process output journal lock poisoned");
             state.exit = Some(exit.clone());
             state.completed_at = Some(Instant::now());
-            state.next_sequence
+            let retained: u64 = state.output.iter().map(|event| event.data_bytes).sum();
+            (state.next_sequence, state.dropped_output_bytes + retained)
         };
         self.changed.send_replace(ProcessJournalChange::Exit {
             event: exit,
             next_sequence,
+            output_bytes,
         });
     }
 
@@ -1209,7 +1221,10 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned");
         if cursor < state.first_sequence {
-            return ProcessJournalRead::Lagged;
+            return ProcessJournalRead::Lagged {
+                resume_sequence: state.first_sequence,
+                output_bytes_before: state.dropped_output_bytes,
+            };
         }
         if cursor < state.next_sequence {
             let offset = (cursor - state.first_sequence) as usize;
@@ -1238,6 +1253,9 @@ struct ProcessJournalState {
     next_sequence: u64,
     retained_bytes: usize,
     guaranteed_bytes: usize,
+    /// Data bytes of every output event below `first_sequence`: evicted, or
+    /// dropped on arrival.
+    dropped_output_bytes: u64,
     exit: Option<ProcessEvent>,
     completed_at: Option<Instant>,
 }
@@ -1246,6 +1264,7 @@ struct SequencedProcessEvent {
     sequence: u64,
     event: ProcessEvent,
     output_bytes: usize,
+    data_bytes: u64,
     guaranteed_bytes: usize,
     _shared_output_slot: Option<OwnedSemaphorePermit>,
 }
@@ -1264,6 +1283,7 @@ fn evict_oldest_process_output(state: &mut ProcessJournalState) {
         .expect("retained byte count requires a process output event");
     state.retained_bytes -= removed.output_bytes;
     state.guaranteed_bytes -= removed.guaranteed_bytes;
+    state.dropped_output_bytes += removed.data_bytes;
     state.first_sequence = removed.sequence + 1;
 }
 
@@ -1273,6 +1293,8 @@ enum ProcessJournalChange {
     Exit {
         event: ProcessEvent,
         next_sequence: u64,
+        /// Stdout and stderr data bytes in every output event, retained or not.
+        output_bytes: u64,
     },
 }
 
@@ -1280,7 +1302,10 @@ enum ProcessJournalRead {
     Event(ProcessEvent),
     Exit(ProcessEvent),
     Pending,
-    Lagged,
+    Lagged {
+        resume_sequence: u64,
+        output_bytes_before: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1303,6 +1328,56 @@ struct ProcessJournalCursor {
     changed: watch::Receiver<ProcessJournalChange>,
     next_sequence: u64,
     primary: Option<Arc<AtomicU64>>,
+    /// Set when the reader asked to continue past evicted output.
+    gap_resume: Option<OutputGapResume>,
+}
+
+/// What a resumed reader's `ProcessOutputGap` event is addressed with.
+struct OutputGapResume {
+    process_id: String,
+    pid: Option<u32>,
+}
+
+impl ProcessJournalCursor {
+    fn advance_to(&mut self, next_sequence: u64) {
+        self.next_sequence = next_sequence;
+        if let Some(primary) = &self.primary {
+            primary.store(next_sequence, Ordering::Release);
+            if let Some(journal) = self.journal.upgrade() {
+                journal.consumed.send_replace(());
+            }
+        }
+    }
+
+    /// Moves an opted-in reader past output the journal no longer holds.
+    fn skip_output_gap(
+        &mut self,
+        resume_sequence: u64,
+        output_bytes_before: u64,
+    ) -> Option<ProcessEvent> {
+        let resume = self.gap_resume.as_ref()?;
+        let gap = process_output_gap_event(
+            resume,
+            resume_sequence - self.next_sequence,
+            resume_sequence,
+            output_bytes_before,
+        );
+        self.advance_to(resume_sequence);
+        Some(gap)
+    }
+
+    /// After the record is gone, everything unread before the exit is a gap.
+    fn skip_evicted_output(&mut self) -> Option<ProcessEvent> {
+        let (next_sequence, output_bytes) = match &*self.changed.borrow() {
+            ProcessJournalChange::Exit {
+                next_sequence,
+                output_bytes,
+                ..
+            } if self.next_sequence < *next_sequence => (*next_sequence, *output_bytes),
+            _ => return None,
+        };
+        self.skip_output_gap(next_sequence, output_bytes)
+    }
 }
 
 impl Drop for ProcessJournalCursor {
@@ -1407,7 +1482,12 @@ impl ProcessRegistry {
         Some(record)
     }
 
-    fn replay(&self, process_id: &ProcessId, output_cursor: Option<u64>) -> Option<ProcessReplay> {
+    fn replay(
+        &self,
+        process_id: &ProcessId,
+        output_cursor: Option<u64>,
+        resume_after_output_gap: bool,
+    ) -> Option<ProcessReplay> {
         let record = self.get_record(process_id)?;
         if output_cursor.is_none()
             && let Some(exit) = record.journal.exit()
@@ -1419,7 +1499,13 @@ impl ProcessRegistry {
         }
         Some(ProcessReplay::Running {
             started: record.started.clone(),
-            cursor: record.journal.cursor(output_cursor),
+            cursor: record.journal.cursor(
+                output_cursor,
+                resume_after_output_gap.then(|| OutputGapResume {
+                    process_id: record.started.process_id.clone(),
+                    pid: record.started.pid,
+                }),
+            ),
         })
     }
 
@@ -1524,27 +1610,35 @@ fn process_event_stream_with_prefix(
             let current = cursor.as_mut()?;
             let result = loop {
                 let Some(journal) = current.journal.upgrade() else {
+                    if let Some(gap) = current.skip_evicted_output() {
+                        return Some((Ok(gap), (prefix, cursor)));
+                    }
                     break evicted_process_journal_result(current);
                 };
                 let read = journal.read(current.next_sequence);
                 drop(journal);
                 match read {
                     ProcessJournalRead::Event(event) => {
-                        current.next_sequence += 1;
-                        if let Some(primary) = &current.primary {
-                            primary.store(current.next_sequence, Ordering::Release);
-                            if let Some(journal) = current.journal.upgrade() {
-                                journal.consumed.send_replace(());
-                            }
-                        }
+                        current.advance_to(current.next_sequence + 1);
                         return Some((Ok(event), (prefix, cursor)));
                     }
                     ProcessJournalRead::Exit(exit) => break Ok(exit),
-                    ProcessJournalRead::Lagged => {
-                        break Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE));
+                    ProcessJournalRead::Lagged {
+                        resume_sequence,
+                        output_bytes_before,
+                    } => {
+                        let Some(gap) =
+                            current.skip_output_gap(resume_sequence, output_bytes_before)
+                        else {
+                            break Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE));
+                        };
+                        return Some((Ok(gap), (prefix, cursor)));
                     }
                     ProcessJournalRead::Pending => {
                         if current.changed.changed().await.is_err() {
+                            if let Some(gap) = current.skip_evicted_output() {
+                                return Some((Ok(gap), (prefix, cursor)));
+                            }
                             break evicted_process_journal_result(current);
                         }
                     }
@@ -1555,11 +1649,32 @@ fn process_event_stream_with_prefix(
     ))
 }
 
+fn process_output_gap_event(
+    resume: &OutputGapResume,
+    skipped_events: u64,
+    output_cursor: u64,
+    output_bytes_before: u64,
+) -> ProcessEvent {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        ProcessOutputGap, process_event::Event,
+    };
+    ProcessEvent {
+        process_id: resume.process_id.clone(),
+        pid: resume.pid,
+        event: Some(Event::OutputGap(ProcessOutputGap {
+            skipped_events,
+            output_cursor,
+            output_bytes_before,
+        })),
+    }
+}
+
 fn evicted_process_journal_result(cursor: &ProcessJournalCursor) -> Result<ProcessEvent, Status> {
     match cursor.changed.borrow().clone() {
         ProcessJournalChange::Exit {
             event,
             next_sequence,
+            ..
         } if cursor.next_sequence >= next_sequence => Ok(event),
         ProcessJournalChange::Exit { .. } => {
             Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE))
@@ -1585,13 +1700,19 @@ fn process_started_event(process_id: &ProcessId, pid: Option<u32>) -> Result<Pro
     })
 }
 
-fn process_connected_event(process_id: &ProcessId, pid: Option<u32>) -> ProcessEvent {
+fn process_connected_event(
+    process_id: &ProcessId,
+    pid: Option<u32>,
+    resume_after_output_gap: bool,
+) -> ProcessEvent {
     ProcessEvent {
         process_id: process_id.as_str().to_string(),
         pid,
         event: Some(
             pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Connected(
-                pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {},
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {
+                    resume_after_output_gap,
+                },
             ),
         ),
     }
@@ -2066,7 +2187,7 @@ impl Process for ExecutionService {
                 let replay = self
                     .inner
                     .processes
-                    .replay(&process_id, Some(0))
+                    .replay(&process_id, Some(0), false)
                     .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
                 return Ok(Response::new(
                     replay_process_event_stream(replay) as Self::StartStream
@@ -2185,6 +2306,7 @@ impl Process for ExecutionService {
         )?;
         let request = request.into_inner();
         let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
+        let resume_after_output_gap = request.resume_after_output_gap.unwrap_or(false);
         // Validate the field for wire compatibility, but do not turn it into a
         // total stream-lifetime deadline here. ECW and native callers own
         // their outer stream budgets; enforcing the same value again in the
@@ -2193,7 +2315,7 @@ impl Process for ExecutionService {
         let replay = self
             .inner
             .processes
-            .replay(&process_id, request.output_cursor)
+            .replay(&process_id, request.output_cursor, resume_after_output_gap)
             .ok_or_else(|| Status::not_found("process not found"))?;
         let pid = match &replay {
             ProcessReplay::Running { started, .. } | ProcessReplay::Completed { started, .. } => {
@@ -2202,7 +2324,11 @@ impl Process for ExecutionService {
         };
         let stream = match replay {
             ProcessReplay::Running { cursor, .. } => process_event_stream_with_prefix(
-                vec![process_connected_event(&process_id, pid)],
+                vec![process_connected_event(
+                    &process_id,
+                    pid,
+                    resume_after_output_gap,
+                )],
                 Some(cursor),
             ),
             replay @ ProcessReplay::Completed { .. } => replay_process_event_stream(replay),

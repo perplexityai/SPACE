@@ -406,6 +406,7 @@ pub(super) async fn process_connect(
             process_id,
             timeout,
             output_cursor: None,
+            resume_after_output_gap: None,
         }),
     };
     let route_state = state.clone();

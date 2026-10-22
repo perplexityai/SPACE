@@ -20,14 +20,18 @@ fn uds_per_sandbox_limit_requires_metadata() {
 
 #[test]
 fn guest_capability_unsupported_status_round_trips_through_metadata() {
-    let capability = GuestCapability::InteractiveProcessControl;
-    let status =
-        guest_capability_unsupported_status(capability, format!("{capability} is unsupported"));
+    for capability in [
+        GuestCapability::InteractiveProcessControl,
+        GuestCapability::ProcessOutputGapResume,
+    ] {
+        let status =
+            guest_capability_unsupported_status(capability, format!("{capability} is unsupported"));
 
-    assert_eq!(
-        GuestCapabilityUnsupported::from_status(&status),
-        Some(GuestCapabilityUnsupported { capability })
-    );
+        assert_eq!(
+            GuestCapabilityUnsupported::from_status(&status),
+            Some(GuestCapabilityUnsupported { capability })
+        );
+    }
 }
 
 #[test]

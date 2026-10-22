@@ -223,6 +223,7 @@ impl SandboxManagerService {
                 operation.process_id.clone(),
                 proto_duration_to_std(operation.timeout),
                 operation.output_cursor,
+                operation.resume_after_output_gap.unwrap_or(false),
             )
             .await?;
         // A reconnected foreground stream is the same liveness signal as the
