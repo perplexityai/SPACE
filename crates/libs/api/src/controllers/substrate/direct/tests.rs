@@ -2912,6 +2912,7 @@ impl DirectCreateFixture {
                 &self.postgres.pool,
                 &self.actor,
                 request,
+                crate::controllers::sandbox::RequestAutoLifecycleOrigin::Explicit,
                 pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
                 crate::controllers::sandbox::FederatedSandboxCreateContext::new(None, None),
             )

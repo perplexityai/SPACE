@@ -781,6 +781,37 @@ fn record_reconnect_substrate_error(
     );
 }
 
+/// Where a create request's auto-lifecycle policy came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAutoLifecycleOrigin {
+    /// The caller chose the policy (native API).
+    Explicit,
+    /// The ECW boundary synthesized an access-idle policy from the request timeout,
+    /// whether or not the caller expressed any lifecycle intent.
+    SynthesizedDefault,
+}
+
+/// Resolve a new sandbox's auto-lifecycle policy from the optional request policy,
+/// its origin, and the template default.
+///
+/// An explicit request policy always wins. A synthesized one yields to a template
+/// default ECW doesn't manage (see [`crate::e2b::is_ecw_managed`]), such as a
+/// CommandIdle default whose idle clock command submission resets: replacing it would
+/// silently downgrade the sandbox to access-driven idle.
+fn resolve_create_auto_lifecycle(
+    request: Option<&AutoLifecyclePolicy>,
+    origin: RequestAutoLifecycleOrigin,
+    template_default: &AutoLifecyclePolicy,
+) -> Result<AutoLifecyclePolicy, ControllerError> {
+    let prefer_template_default = origin == RequestAutoLifecycleOrigin::SynthesizedDefault
+        && !crate::e2b::is_ecw_managed(template_default);
+    let policy = match request {
+        Some(policy) if !prefer_template_default => policy,
+        _ => template_default,
+    };
+    create_auto_lifecycle_policy(Some(policy.clone()))
+}
+
 fn resolve_activation_options(
     request: Option<&SandboxActivationRequest>,
     default_blocking: bool,

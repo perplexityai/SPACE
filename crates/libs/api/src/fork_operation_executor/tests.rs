@@ -70,6 +70,15 @@ fn create_request_applies_timeout_to_disabled_source_lifecycle_policy() {
 }
 
 #[test]
+fn create_request_keeps_a_non_ecw_source_lifecycle_policy() {
+    let mut config = target_config();
+    config.auto_lifecycle = crate::test_support::command_idle_suspend_policy(600);
+    let request = create_request(&config, ForkSandboxLifetimeSeconds::try_from(42).unwrap());
+
+    assert_eq!(request.auto_lifecycle, Some(config.auto_lifecycle));
+}
+
+#[test]
 fn persisted_sandbox_result_contains_only_minting_inputs() {
     let sandbox_id = SandboxId::new();
     let result = sandbox_result(

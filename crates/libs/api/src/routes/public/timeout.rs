@@ -127,6 +127,12 @@ pub(super) async fn set_timeout(
         AccessIdleTimeoutOutcome::Applied => {
             Some(conservative_deadline(observed_at, timeout_secs)?)
         }
+        // The expected-policy check already pinned an access-idle policy.
+        AccessIdleTimeoutOutcome::Unmanaged => {
+            return Err(PublicApiError::failed_precondition(
+                "unsupported idle timeout policy",
+            ));
+        }
     };
     let response = SetSandboxTimeoutResponse {
         sandbox_id,

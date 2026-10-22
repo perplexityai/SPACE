@@ -2782,6 +2782,87 @@ fn e2b_timeout_update_preserves_e2b_pause_resume_flags() {
 }
 
 #[test]
+fn ecw_manages_only_the_policies_it_synthesizes() {
+    use crate::test_support::command_idle_suspend_policy;
+
+    assert!(crate::e2b::is_ecw_managed(&AutoLifecyclePolicy::disabled()));
+    assert!(crate::e2b::is_ecw_managed(
+        &crate::e2b::auto_lifecycle_policy(300, true, true)
+    ));
+    // A native access-idle rule longer than ECW's `u32` timeout is still that shape.
+    assert!(crate::e2b::is_ecw_managed(&crate::e2b::access_idle_policy(
+        u64::from(u32::MAX) + 1,
+        false,
+        false
+    )));
+    // Periodic client `/timeout` heartbeats must leave a CommandIdle template default alone.
+    assert!(!crate::e2b::is_ecw_managed(&command_idle_suspend_policy(
+        600
+    )));
+    // So must ECW create and timeout when an access-idle rule shares the policy with one
+    // ECW can't express.
+    let mut mixed = crate::e2b::auto_lifecycle_policy(300, true, false);
+    let command_idle = command_idle_suspend_policy(600);
+    mixed.condition_sets.extend(command_idle.condition_sets);
+    mixed.stages.extend(command_idle.stages);
+    assert!(!crate::e2b::is_ecw_managed(&mixed));
+}
+
+#[test]
+fn end_at_fallback_uses_the_earliest_stage_of_a_non_e2b_policy() {
+    let policy = crate::test_support::command_idle_suspend_policy(600);
+
+    assert_eq!(
+        super::translate::end_at_fallback_timeout_secs(Some(&policy), &policy),
+        600
+    );
+    assert_eq!(
+        super::translate::end_at_fallback_timeout_secs(None, &AutoLifecyclePolicy::disabled()),
+        ECW_RESPONSE_DEFAULT_TIMEOUT_SECS
+    );
+    let mut mixed = e2b_auto_lifecycle_policy(900, true, false);
+    let command_idle = crate::test_support::command_idle_suspend_policy(600);
+    mixed.condition_sets.extend(command_idle.condition_sets);
+    mixed.stages.extend(command_idle.stages);
+    assert_eq!(
+        super::translate::end_at_fallback_timeout_secs(None, &mixed),
+        600
+    );
+    assert_eq!(
+        super::translate::end_at_fallback_timeout_secs(
+            None,
+            &e2b_auto_lifecycle_policy(45, false, false)
+        ),
+        45
+    );
+}
+
+#[test]
+fn connect_timeout_extends_only_an_access_idle_deadline() {
+    use super::lifecycle::connect_can_extend_access_deadline;
+
+    assert!(connect_can_extend_access_deadline(
+        &e2b_auto_lifecycle_policy(300, false, false)
+    ));
+    assert!(!connect_can_extend_access_deadline(
+        &crate::test_support::command_idle_suspend_policy(600)
+    ));
+    assert!(connect_can_extend_access_deadline(
+        &AutoLifecyclePolicy::disabled()
+    ));
+}
+
+#[test]
+fn e2b_resume_lifecycle_options_preserve_command_idle_policy() {
+    let policy = crate::test_support::command_idle_suspend_policy(600);
+
+    assert_eq!(
+        e2b_policy_for_resume_update(&policy, Some(300), Some(true)),
+        None
+    );
+}
+
+#[test]
 fn e2b_runtime_unreachable_touch_is_not_a_delivery() {
     assert_eq!(
         classify_touch(Some(AutoLifecycleTouchOutcome::RuntimeUnreachable)),
