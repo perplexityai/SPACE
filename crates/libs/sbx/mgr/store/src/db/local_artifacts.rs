@@ -501,6 +501,16 @@ fn insert_local_artifact_at(
     Ok(())
 }
 
+db_private_outside_tests! {
+    fn local_artifact_backup_completed(conn: &Connection, id: LocalArtifactId) -> Result<bool> {
+        conn.query_row(
+            sql!("SELECT EXISTS(SELECT 1 FROM local_artifacts
+                  WHERE local_artifact_id = ?1 AND backup_completed_at IS NOT NULL)"),
+            [id.to_string()], |row| row.get(0),
+        )
+    }
+}
+
 /// Mark the artifact's remote backup as durably completed. Written by
 /// the snapshot-upload worker right after `finalize_artifact_backup`
 /// returns `ready` from the cluster API. The reaper gates eviction
