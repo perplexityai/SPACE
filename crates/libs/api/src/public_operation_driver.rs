@@ -320,29 +320,21 @@ where
                 let max_age_seconds = deadline
                     .expect("deadline is configured when it is exceeded")
                     .as_secs();
-                // A requeue that carries the error it stands for (as an
-                // exhausted retry budget records it) names the cause: its
-                // code, and its fields beside the deadline's evidence.
                 let terminal_error_code = result
                     .terminal_error_code
                     .unwrap_or(PublicErrorCode::OperationFailed);
-                let mut terminal_error_json = serde_json::json!({
-                    "operation_id": operation_id.to_string(),
-                    "kind": kind.as_str(),
-                    "reason": "operation_deadline_exceeded",
-                    "max_age_seconds": max_age_seconds,
-                    "last_requeue_reason": last_requeue_reason,
-                    "last_progress_message": last_progress_message,
-                    "attempts": attempts,
-                });
-                if let (Some(evidence), Some(serde_json::Value::Object(cause))) = (
-                    terminal_error_json.as_object_mut(),
+                let terminal_error_json = with_carried_error(
+                    serde_json::json!({
+                        "operation_id": operation_id.to_string(),
+                        "kind": kind.as_str(),
+                        "reason": "operation_deadline_exceeded",
+                        "max_age_seconds": max_age_seconds,
+                        "last_requeue_reason": last_requeue_reason,
+                        "last_progress_message": last_progress_message,
+                        "attempts": attempts,
+                    }),
                     result.terminal_error_json,
-                ) {
-                    for (field, value) in cause {
-                        evidence.entry(field).or_insert(value);
-                    }
-                }
+                );
                 let updated = store
                     .fail_claimed_operation(FailClaimedPublicOperation {
                         claim_token,
@@ -388,7 +380,7 @@ where
                 let terminal_error_code = result
                     .terminal_error_code
                     .unwrap_or(PublicErrorCode::Internal);
-                let mut terminal_error_json = result.terminal_error_json.unwrap_or_else(|| {
+                let mut terminal_error_json = with_carried_error(
                     serde_json::json!({
                         "operation_id": operation_id.to_string(),
                         "kind": kind.as_str(),
@@ -396,8 +388,9 @@ where
                         "retry_reason": retry_reason,
                         "attempts": attempts,
                         "max_retry_attempts": config.max_retry_attempts.max(1),
-                    })
-                });
+                    }),
+                    result.terminal_error_json,
+                );
                 // Deferred retries give their attempts back, so the window,
                 // not the attempt count, is what ran out, whichever error
                 // the operation fails with.
@@ -507,6 +500,24 @@ where
     Ok(report)
 }
 
+/// The error envelope of a requeue the driver fails: its own `evidence`, with
+/// any fields of the error the requeue `carried` that the evidence lacks. The
+/// carried code replaces the driver's own; see
+/// [`PublicOperationExecutionResult`].
+fn with_carried_error(
+    mut evidence: serde_json::Value,
+    carried: Option<serde_json::Value>,
+) -> serde_json::Value {
+    if let (Some(evidence), Some(serde_json::Value::Object(cause))) =
+        (evidence.as_object_mut(), carried)
+    {
+        for (field, value) in cause {
+            evidence.entry(field).or_insert(value);
+        }
+    }
+    evidence
+}
+
 /// How often a running execution renews its claim: a third of
 /// `claim_stale_after`, so two renewals can be lost before it goes stale.
 pub fn claim_renewal_interval(claim_stale_after: Duration) -> Duration {
@@ -519,7 +530,8 @@ pub fn claim_renewal_interval(claim_stale_after: Duration) -> Duration {
 /// minute, so the longest delay is `hint` plus 60 s. An operation first
 /// claimed moments ago is retried within seconds; one first claimed eight
 /// minutes or more ago, however long it has been deferring, is retried about
-/// once a minute.
+/// once a minute. A native delete waiting on a snapshot upload spaces its
+/// workflow progress the same way.
 pub fn deferred_retry_delay(
     operation_id: OperationId,
     deferred_for: Duration,

@@ -163,7 +163,14 @@ pub struct PublicOperationExecutionResult {
     pub state: OperationState,
     pub progress_message: String,
     pub result_json: Option<serde_json::Value>,
+    /// The error code of a failed result. A requeue may carry one too: the
+    /// error it stands for, recorded if the driver fails the operation instead
+    /// of requeueing it (its deadline, deferral window, or retry budget). The
+    /// carried code replaces the driver's own.
     pub terminal_error_code: Option<PublicErrorCode>,
+    /// The error envelope of a failed result. A requeue's carried envelope is
+    /// merged under the driver's own evidence: the driver keeps its fields and
+    /// adds the carried ones it lacks.
     pub terminal_error_json: Option<serde_json::Value>,
     pub retry_after: Option<Duration>,
     pub requeue_reason: PublicOperationRequeueReason,
