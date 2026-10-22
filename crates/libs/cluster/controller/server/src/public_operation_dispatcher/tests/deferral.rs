@@ -4,6 +4,7 @@
 
 use super::*;
 use pplx_space_api::retry_deferral::defer_retry_wait;
+use pplx_space_common_core::types::{SandboxId, SnapshotId};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A wake behind a lingering prior-generation pod: until `fence_cleared`,
@@ -418,48 +419,31 @@ fn retry_deferral_switch_reads_from_env() {
 
 const UPLOAD_CONFLICT_MESSAGE: &str = "sandbox has a suspend-snapshot upload in flight; retry the DELETE after the snapshot finalizes";
 
-/// A native delete queued against a suspended sandbox whose suspend snapshot
-/// is still uploading, with the native executor that runs it. Returns the
-/// operation, the sandbox and the uploading snapshot.
+/// A native delete queued against a suspended sandbox whose snapshot is still
+/// uploading. Returns the operation, the sandbox and the uploading snapshot.
 async fn native_delete_behind_an_upload(
     pool: &PgPool,
     store: &PublicOperationStore,
-) -> TestResult<(OperationId, Uuid, Uuid, NativePublicOperationExecutor)> {
-    let org_id = seed_org(pool).await?;
-    let user_id = seed_user(pool, OrgId::from_uuid(org_id)).await?;
-    let sandbox_id = PublicSandboxId::new();
-    sqlx::query(sql!(
-        "INSERT INTO sandboxes (
-             id, user_id, org_id, managed_by, lifecycle, placement,
-             network_policy_generation
-         ) VALUES ($1, $2, $3, 'space', 'suspended', 'on_node', 1)"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(user_id)
-    .bind(org_id)
-    .execute(pool)
-    .await?;
-    let snapshot_id = Uuid::now_v7();
-    sqlx::query(sql!(
-        "INSERT INTO snapshots (id, sandbox_id, type, state)
-         VALUES ($1, $2, 'full', 'creating')"
-    ))
-    .bind(snapshot_id)
-    .bind(sandbox_id.as_uuid())
-    .execute(pool)
-    .await?;
-    let target_id = sandbox_id.to_string();
+) -> TestResult<(OperationId, SandboxId, SnapshotId)> {
+    let org_id = OrgId::from_uuid(seed_org(pool).await?);
+    let user_id = UserId::from_uuid(seed_user(pool, org_id).await?);
+    let sandbox_id =
+        pplx_space_db_test_fixtures::insert_suspended_sandbox(pool, org_id, user_id).await?;
+    let snapshot_id =
+        pplx_space_db_test_fixtures::insert_uploading_snapshot(pool, sandbox_id, 0, None).await?;
+    let public_sandbox_id = PublicSandboxId::from(sandbox_id);
+    let target_id = public_sandbox_id.to_string();
     let operation_id = match store
         .create_operation(pplx_space_api::public_operations::CreatePublicOperation {
-            org_id: OrgId::from_uuid(org_id),
-            actor_user_id: Some(UserId::from_uuid(user_id)),
+            org_id,
+            actor_user_id: Some(user_id),
             api_product: ApiProduct::Native,
             kind: OperationKind::DeleteSandbox,
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&target_id),
             payload_json:
                 pplx_space_api::public_sandbox_operations::SandboxLifecycleOperationPayload {
-                    sandbox_id,
+                    sandbox_id: public_sandbox_id,
                     action: pplx_space_public_api::SandboxLifecycleAction::Delete,
                     rollback: None,
                 }
@@ -472,74 +456,63 @@ async fn native_delete_behind_an_upload(
         pplx_space_api::public_operations::CreatePublicOperationResult::Created(id) => id,
         other => return Err(format!("expected a created delete, got {other:?}").into()),
     };
-    // Direct stands in for the substrate: the sandbox has no runtime to tear down.
-    let substrate = Substrate::from_direct(
-        pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
-    );
-    let executor = NativePublicOperationExecutor::with_cluster_admission(
-        pool.clone(),
-        substrate.clone(),
-        ClusterSandboxAdmission::with_config(
-            substrate,
-            ClusterSandboxAdmissionConfig {
-                enabled: false,
-                refill_rps: 6.0,
-                burst: 60.0,
-                redis_url: None,
-            },
-            FeatureFlagClient::disabled(),
-        ),
-        test_route_ed25519_authority(),
-        pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
-            .grant_audience,
-        None,
-        EgressProfiles::default(),
-    );
-    Ok((operation_id, sandbox_id.as_uuid(), snapshot_id, executor))
+    Ok((operation_id, sandbox_id, snapshot_id))
 }
 
-/// A native delete behind a suspend-snapshot upload waits as a deferred
-/// retry: no attempt is spent, so it outlasts the one-attempt budget, and the
-/// spacing grows with the wait. It succeeds once the upload finalizes.
+/// A native delete behind a snapshot upload waits as workflow progress, with
+/// retry deferral on or off: no attempt is spent, so it outlasts the
+/// one-attempt budget, and the spacing grows with the wait. It succeeds once
+/// the upload finalizes.
 #[tokio::test]
 async fn a_native_delete_waits_out_an_upload_without_spending_attempts() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
     };
     let store = PublicOperationStore::new(db.pool.clone());
-    let (operation_id, sandbox_id, snapshot_id, executor) =
-        native_delete_behind_an_upload(&db.pool, &store).await?;
-    let config = deferral_config();
+    let executor = direct_native_executor(&db.pool, false, None, EgressProfiles::default());
 
-    for age_secs in (0..=300).step_by(60) {
-        age_and_make_due(&db.pool, operation_id, age_secs).await?;
-        let report = tick(&config, &store, &executor).await?;
-        assert_eq!(report.retried, 1, "waiting at age {age_secs}s");
-        let (state, attempts, delay_secs, _) = operation_row(&db.pool, operation_id).await?;
-        assert_eq!(state, "queued");
-        assert_eq!(attempts, 0, "waiting for the upload spends no attempt");
-        // The 3 s hint plus an equal-jittered eighth of the time waiting.
-        let ceiling = (age_secs as f64 / 8.0).min(60.0);
-        assert!(
-            (3.0 + ceiling / 2.0 - 0.5..=3.0 + ceiling + 0.5).contains(&delay_secs),
-            "age {age_secs}s: delay {delay_secs}s"
-        );
+    for retry_deferral_enabled in [true, false] {
+        let (operation_id, sandbox_id, snapshot_id) =
+            native_delete_behind_an_upload(&db.pool, &store).await?;
+        let config = ReconcilerConfig {
+            retry_deferral_enabled,
+            ..deferral_config()
+        };
+        for age_secs in (0..=300).step_by(60) {
+            let at = format!("deferral={retry_deferral_enabled}, age {age_secs}s");
+            age_and_make_due(&db.pool, operation_id, age_secs).await?;
+            let report = tick(&config, &store, &executor).await?;
+            assert_eq!(report.retried, 1, "{at}");
+            let (state, attempts, delay_secs, _) = operation_row(&db.pool, operation_id).await?;
+            assert_eq!(state, "queued", "{at}");
+            assert_eq!(
+                attempts, 0,
+                "{at}: waiting for the upload spends no attempt"
+            );
+            // The 3 s floor plus an equal-jittered eighth of the time waiting.
+            let ceiling = (age_secs as f64 / 8.0).min(60.0);
+            assert!(
+                (3.0 + ceiling / 2.0 - 0.5..=3.0 + ceiling + 0.5).contains(&delay_secs),
+                "{at}: delay {delay_secs}s"
+            );
+        }
+
+        sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+            .bind(snapshot_id)
+            .execute(&db.pool)
+            .await?;
+        age_and_make_due(&db.pool, operation_id, 330).await?;
+        assert_eq!(tick(&config, &store, &executor).await?.succeeded, 1);
+        let (state, attempts, _, _) = operation_row(&db.pool, operation_id).await?;
+        // Only the claim that succeeded is counted.
+        assert_eq!((state.as_str(), attempts), ("succeeded", 1));
+        let remaining: i64 =
+            sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(remaining, 0);
     }
-
-    sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
-        .bind(snapshot_id)
-        .execute(&db.pool)
-        .await?;
-    age_and_make_due(&db.pool, operation_id, 330).await?;
-    assert_eq!(tick(&config, &store, &executor).await?.succeeded, 1);
-    let (state, attempts, _, _) = operation_row(&db.pool, operation_id).await?;
-    // Only the claim that succeeded is counted.
-    assert_eq!((state.as_str(), attempts), ("succeeded", 1));
-    let remaining: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
-        .bind(sandbox_id)
-        .fetch_one(&db.pool)
-        .await?;
-    assert_eq!(remaining, 0);
     Ok(())
 }
 
@@ -553,7 +526,8 @@ async fn a_native_delete_at_its_deadline_names_the_upload() -> TestResult {
         return Ok(());
     };
     let store = PublicOperationStore::new(db.pool.clone());
-    let (operation_id, _, _, executor) = native_delete_behind_an_upload(&db.pool, &store).await?;
+    let (operation_id, _, _) = native_delete_behind_an_upload(&db.pool, &store).await?;
+    let executor = direct_native_executor(&db.pool, false, None, EgressProfiles::default());
     let config = deferral_config();
     let max_age = config
         .m1_max_age
@@ -582,6 +556,6 @@ async fn a_native_delete_at_its_deadline_names_the_upload() -> TestResult {
     let error = error.expect("a failed operation carries its error envelope");
     assert_eq!(error["message"], UPLOAD_CONFLICT_MESSAGE);
     assert_eq!(error["reason"], "operation_deadline_exceeded");
-    assert_eq!(error["last_requeue_reason"], "retry_deferred");
+    assert_eq!(error["last_requeue_reason"], "workflow_progress");
     Ok(())
 }

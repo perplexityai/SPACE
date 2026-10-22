@@ -56,15 +56,38 @@ enum ControllerErrorKind {
     /// which blames the sandbox fleet for a Postgres lock race and puts the
     /// wrong `origin` on the response metrics.
     LockContention,
-    /// A DELETE refused because a suspend's snapshot upload is still in
-    /// flight. Carried so the native delete executor can wait for the upload
-    /// to finalize instead of failing the operation.
-    SuspendUploadInFlight(SuspendUploadCheck),
+    /// A DELETE refused because a snapshot upload is still in flight.
+    /// Carried so the native delete executor can wait for the upload to
+    /// finalize instead of failing the operation.
+    SnapshotUploadInFlight(SnapshotUploadInFlight),
 }
 
-/// Which delete check found a suspend-snapshot upload in flight.
+/// The in-flight snapshot upload a delete check refused a DELETE for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SuspendUploadCheck {
+pub(crate) struct SnapshotUploadInFlight {
+    pub(crate) check: SnapshotUploadCheck,
+    /// Whole seconds, which keeps `ControllerError` small.
+    idle_secs: u32,
+}
+
+impl SnapshotUploadInFlight {
+    pub(crate) fn new(check: SnapshotUploadCheck, idle_for: Duration) -> Self {
+        Self {
+            check,
+            idle_secs: u32::try_from(idle_for.as_secs()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// How long the stalest blocking upload has gone without activity, as
+    /// [`crate::reconcile_queue::in_flight_snapshot_upload_idle_for`] reports it.
+    pub(crate) fn idle_for(self) -> Duration {
+        Duration::from_secs(u64::from(self.idle_secs))
+    }
+}
+
+/// Which delete check found a snapshot upload in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotUploadCheck {
     /// The pre-flight check, before any runtime teardown.
     Preflight,
     /// The locked check at finalize, after the runtime was torn down.
@@ -306,20 +329,20 @@ impl ControllerError {
         matches!(self.kind, ControllerErrorKind::SandboxAlreadyExists)
     }
 
-    pub(crate) fn suspend_upload_in_flight(
-        check: SuspendUploadCheck,
+    pub(crate) fn snapshot_upload_in_flight(
+        upload: SnapshotUploadInFlight,
         message: impl Into<String>,
     ) -> Self {
         let mut error = Self::conflict(message);
-        error.kind = ControllerErrorKind::SuspendUploadInFlight(check);
+        error.kind = ControllerErrorKind::SnapshotUploadInFlight(upload);
         error
     }
 
-    /// The check that refused this DELETE for an in-flight suspend-snapshot
-    /// upload, if that is what it is.
-    pub(crate) const fn suspend_upload_in_flight_check(&self) -> Option<SuspendUploadCheck> {
+    /// The in-flight snapshot upload this DELETE was refused for, if that is
+    /// what it is.
+    pub(crate) const fn snapshot_upload_in_flight_details(&self) -> Option<SnapshotUploadInFlight> {
         match self.kind {
-            ControllerErrorKind::SuspendUploadInFlight(check) => Some(check),
+            ControllerErrorKind::SnapshotUploadInFlight(upload) => Some(upload),
             _ => None,
         }
     }

@@ -333,22 +333,32 @@ mod delete {
         Ok(())
     }
 
-    /// An ECW DELETE that lands while a native delete waits on a
-    /// suspend-snapshot upload joins that delete instead of answering the
-    /// upload's 409, and is accepted while the delete waits.
+    /// An ECW DELETE that lands while a native delete waits on a snapshot
+    /// upload joins that delete instead of answering the upload's 409, and is
+    /// accepted while the delete waits. The native delete is driven through
+    /// the real executor, which requeues it behind the upload.
     #[tokio::test]
     async fn ecw_delete_joins_a_native_delete_waiting_on_an_upload() -> TestResult {
-        use crate::public_operations::{
-            ApiProduct, CreatePublicOperation, ReleaseClaimedPublicOperation,
+        use crate::controllers::sandbox::SandboxController;
+        use crate::controllers::substrate::{Substrate, direct::DirectSubstrate};
+        use crate::public_operation_driver::{
+            OperationExecutionConfig, OperationExecutor, drive_claimed_operation,
         };
+        use crate::public_operations::{ApiProduct, CreatePublicOperation};
+        use crate::public_sandbox_operations::SandboxLifecycleOperationExecutor;
         use pplx_space_common_core::types::UserId;
-        use pplx_space_db_test_fixtures::SEED_USER_ID;
+        use pplx_space_db_test_fixtures::{
+            SEED_USER_ID, insert_suspended_sandbox, insert_uploading_snapshot,
+        };
         use pplx_space_public_api::OperationTargetType;
 
         let db = pg_test_db().await?;
         let store = PublicOperationStore::new(db.pool.clone());
         let org_id = OrgId::from_uuid(SEED_ORG_ID);
-        let sandbox_id = PublicSandboxId::new();
+        let user_id = UserId::from_uuid(SEED_USER_ID);
+        let sandbox = insert_suspended_sandbox(&db.pool, org_id, user_id).await?;
+        insert_uploading_snapshot(&db.pool, sandbox, 0, None).await?;
+        let sandbox_id = PublicSandboxId::from(sandbox);
         let target_id = sandbox_id.to_string();
         let payload = SandboxLifecycleOperationPayload {
             sandbox_id,
@@ -359,7 +369,7 @@ mod delete {
         let native = match store
             .create_operation(CreatePublicOperation {
                 org_id,
-                actor_user_id: Some(UserId::from_uuid(SEED_USER_ID)),
+                actor_user_id: Some(user_id),
                 api_product: ApiProduct::Native,
                 kind: OperationKind::DeleteSandbox,
                 target_type: Some(OperationTargetType::Sandbox),
@@ -373,27 +383,33 @@ mod delete {
             CreatePublicOperationResult::Created(id) => id,
             other => return Err(format!("native delete was not admitted: {other:?}").into()),
         };
-        // The dispatcher ran it once and requeued it behind the upload.
-        let claimed = store
+        let mut claimed = store
             .claim_operations(ClaimPublicOperations {
                 limit: 1,
                 claim_stale_after: Duration::from_secs(60),
                 claimable_kinds: &[OperationKind::DeleteSandbox],
             })
             .await?;
-        assert!(
-            store
-                .release_claimed_operation(ReleaseClaimedPublicOperation {
-                    claim_token: claimed.claim_token,
-                    operation_id: native,
-                    progress_message:
-                        "waiting for the suspend-snapshot upload to finalize before deleting"
-                            .to_string(),
-                    retry_after: Duration::from_secs(3),
-                    count_attempt: false,
-                })
-                .await?
+        let operation = claimed
+            .operations
+            .pop()
+            .ok_or("the native delete is claimable")?;
+        let executor = SandboxLifecycleOperationExecutor::new(
+            db.pool.clone(),
+            SandboxController::new(Substrate::from_direct(DirectSubstrate::new(
+                db.pool.clone(),
+            ))),
         );
+        let report = drive_claimed_operation(
+            store.clone(),
+            claimed.claim_token,
+            OperationExecutionConfig::default(),
+            operation.clone(),
+            OperationExecutor::Dispatcher,
+            async move { executor.execute(&operation).await.into() },
+        )
+        .await?;
+        assert_eq!(report.retried, 1, "the native delete waits on the upload");
 
         let joined = store
             .create_or_join_active_sandbox_delete(org_id, &target_id, payload, None)

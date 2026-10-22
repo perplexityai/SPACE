@@ -786,7 +786,7 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
 
 /// The delete pre-flight's `55P03` is retryable, not an unrecoverable delete.
 ///
-/// `any_creating_snapshot_for_sandbox` is the first database statement
+/// `in_flight_snapshot_upload_idle_for` is the first database statement
 /// `delete_control_plane` runs, and it is a plain `SELECT` on `snapshots` — so
 /// under the role-level `lock_timeout` it aborts with `55P03` whenever DDL
 /// holds `ACCESS EXCLUSIVE` on that table. It answered a flat 500, telling the

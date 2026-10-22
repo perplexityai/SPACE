@@ -32,6 +32,40 @@ fn single_claim_config() -> ReconcilerConfig {
     }
 }
 
+/// The native executor over a Direct substrate, which is only a placeholder:
+/// the tests that build it never reach a node. With `admission_enabled`, the
+/// cluster admission gate sees zero eligible nodes, as it would from a synced,
+/// empty Kubernetes node cache.
+fn direct_native_executor(
+    pool: &PgPool,
+    admission_enabled: bool,
+    tls_interception_exemptions: Option<TlsInterceptionExemptions>,
+    egress_profiles: EgressProfiles,
+) -> NativePublicOperationExecutor {
+    let substrate = Substrate::from_direct(
+        pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
+    );
+    NativePublicOperationExecutor::with_cluster_admission(
+        pool.clone(),
+        substrate.clone(),
+        ClusterSandboxAdmission::with_config(
+            substrate,
+            ClusterSandboxAdmissionConfig {
+                enabled: admission_enabled,
+                refill_rps: 6.0,
+                burst: 60.0,
+                redis_url: None,
+            },
+            FeatureFlagClient::disabled(),
+        ),
+        test_route_ed25519_authority(),
+        pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
+            .grant_audience,
+        tls_interception_exemptions,
+        egress_profiles,
+    )
+}
+
 #[test]
 fn config_defaults_enabled() {
     let config = ReconcilerConfig::default();
@@ -752,30 +786,8 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
         claim_generation: 1,
         traceparent: None,
     };
-    // Direct is only a placeholder: admission sees zero eligible nodes, as it would
-    // from a synced, empty Kubernetes node cache, and rejects before any create.
-    let substrate = Substrate::from_direct(
-        pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-    );
-    let executor = NativePublicOperationExecutor::with_cluster_admission(
-        db.pool.clone(),
-        substrate.clone(),
-        ClusterSandboxAdmission::with_config(
-            substrate,
-            ClusterSandboxAdmissionConfig {
-                enabled: true,
-                refill_rps: 6.0,
-                burst: 60.0,
-                redis_url: None,
-            },
-            FeatureFlagClient::disabled(),
-        ),
-        test_route_ed25519_authority(),
-        pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
-            .grant_audience,
-        None,
-        EgressProfiles::default(),
-    );
+    // Admission sees zero eligible nodes and rejects before any create.
+    let executor = direct_native_executor(&db.pool, true, None, EgressProfiles::default());
 
     let result = executor.execute("claim-token", operation).await;
 
@@ -866,26 +878,9 @@ async fn native_executor_persists_operator_policy_on_update_and_template_reset()
         .bind(if configured { vec!["sensor"] } else { vec![] })
         .execute(&db.pool)
         .await?;
-        // Direct is only a placeholder here: this test never reaches the substrate.
-        let substrate = Substrate::from_direct(
-            pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-        );
-        let executor = NativePublicOperationExecutor::with_cluster_admission(
-            db.pool.clone(),
-            substrate.clone(),
-            ClusterSandboxAdmission::with_config(
-                substrate,
-                ClusterSandboxAdmissionConfig {
-                    enabled: false,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
-                FeatureFlagClient::disabled(),
-            ),
-            test_route_ed25519_authority(),
-            pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
-                .grant_audience,
+        let executor = direct_native_executor(
+            &db.pool,
+            false,
             configured.then(|| exemptions.clone()),
             profiles.clone(),
         );
