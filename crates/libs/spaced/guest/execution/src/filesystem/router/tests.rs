@@ -345,6 +345,40 @@ async fn reset_routes_release_admission_on_removal_or_expiry() {
     stop_worker(proxy, server).await;
 }
 
+#[tokio::test]
+async fn worker_watches_end_quietly_on_close_or_cancellation() {
+    for cancel in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let router = identity_router();
+        let (_channel, proxy, server) = connected_worker(&router).await;
+        let mut stream = router
+            .watch(Request::new(WatchRequest {
+                path: directory.path().display().to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        if cancel {
+            router.shutdown.cancel();
+        } else {
+            router.lifecycle.close();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("watch retires without drain")
+                .is_none(),
+            "watch retirement is normal completion on either backend"
+        );
+        tokio::time::timeout(Duration::from_secs(5), router.drain())
+            .await
+            .unwrap();
+        assert!(router.tasks.is_empty());
+        stop_worker(proxy, server).await;
+    }
+}
+
 #[test]
 fn dropping_watch_stream_outside_runtime_does_not_panic() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -369,7 +403,7 @@ fn dropping_watch_stream_outside_runtime_does_not_panic() {
             router.forward_stream(
                 tokio_stream::pending::<Result<(), Status>>(),
                 worker,
-                router.shutdown.clone(),
+                StreamEnd::Watch(router.lifecycle.closed()),
             ),
             router.worker_pool().expect("worker backend").clone(),
             user,
@@ -1060,7 +1094,7 @@ async fn drain_settles_stream_failure_before_the_caller_polls_it() {
     let mut stream = router.forward_stream(
         futures_util::stream::iter([Err::<(), _>(Status::unavailable("worker connection lost"))]),
         worker,
-        router.shutdown.clone(),
+        StreamEnd::ReadOrList(router.shutdown.clone()),
     );
     tokio::time::timeout(Duration::from_secs(5), router.drain())
         .await
@@ -1099,7 +1133,7 @@ async fn cancelled_worker_streams_report_failure_after_partial_results() {
                             path: file.display().to_string(),
                             ..Default::default()
                         },
-                        router.shutdown.clone(),
+                        StreamEnd::ReadOrList(router.shutdown.clone()),
                         FilesystemClient::read,
                     )
                     .await
@@ -1169,7 +1203,11 @@ async fn cancelled_relay_reports_failure_with_empty_or_full_output_queue() {
                     std::future::pending().await
                 }
             }));
-        let mut stream = router.forward_stream(incoming, worker, router.shutdown.clone());
+        let mut stream = router.forward_stream(
+            incoming,
+            worker,
+            StreamEnd::ReadOrList(router.shutdown.clone()),
+        );
         if full {
             tokio::time::timeout(Duration::from_secs(5), waiting)
                 .await

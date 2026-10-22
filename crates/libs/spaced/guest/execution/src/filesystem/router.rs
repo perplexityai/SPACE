@@ -645,7 +645,7 @@ impl FilesystemHandle {
         &self,
         user: Option<String>,
         request: R,
-        stream_end: CancellationToken,
+        stream_end: StreamEnd,
         call: impl AsyncFnOnce(
             &mut FilesystemClient<tonic::transport::Channel>,
             R,
@@ -667,10 +667,9 @@ impl FilesystemHandle {
         &self,
         incoming: impl Stream<Item = Result<T, Status>> + Send + 'static,
         worker: super::worker::WorkerClient,
-        stream_end: CancellationToken,
+        stream_end: StreamEnd,
     ) -> RoutedStream<T> {
         let router = self.clone();
-        let cancelled = stream_end;
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         // Keep cancellation outside the bounded data queue: a stalled reader
         // must neither delay cleanup nor turn a truncated response into EOF.
@@ -680,7 +679,7 @@ impl FilesystemHandle {
             let failure = loop {
                 let message = tokio::select! {
                     biased;
-                    _ = cancelled.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
+                    failure = stream_end.wait() => break failure,
                     _ = tx.closed() => break None,
                     message = incoming.next() => message,
                 };
@@ -697,7 +696,7 @@ impl FilesystemHandle {
                 }
                 tokio::select! {
                     biased;
-                    _ = cancelled.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
+                    failure = stream_end.wait() => break failure,
                     sent = tx.send(message) => if sent.is_err() { break None; },
                 }
                 if failed {
@@ -1052,6 +1051,30 @@ fn is_worker_transport_failure(status: &Status) -> bool {
     )
 }
 
+// Read/list cancellation truncates a finite result. Passive watches have no
+// natural completion and retire quietly during shutdown on both backends.
+#[cfg(target_os = "linux")]
+enum StreamEnd {
+    ReadOrList(CancellationToken),
+    Watch(CancellationToken),
+}
+
+#[cfg(target_os = "linux")]
+impl StreamEnd {
+    async fn wait(&self) -> Option<Status> {
+        match self {
+            Self::ReadOrList(cancelled) => {
+                cancelled.cancelled().await;
+                Some(Status::unavailable("filesystem stream cancelled"))
+            }
+            Self::Watch(closed) => {
+                closed.cancelled().await;
+                None
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 type RoutedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -1133,7 +1156,7 @@ impl Filesystem for FilesystemHandle {
                 self.stream(
                     request.user.take(),
                     request,
-                    self.shutdown.clone(),
+                    StreamEnd::ReadOrList(self.shutdown.clone()),
                     FilesystemClient::list,
                 )
                 .await
@@ -1163,8 +1186,13 @@ impl Filesystem for FilesystemHandle {
                 {
                     return Ok(Response::new(stream));
                 }
-                self.stream(user, request, self.shutdown.clone(), FilesystemClient::read)
-                    .await
+                self.stream(
+                    user,
+                    request,
+                    StreamEnd::ReadOrList(self.shutdown.clone()),
+                    FilesystemClient::read,
+                )
+                .await
             }
         }
     }
@@ -1330,7 +1358,7 @@ impl Filesystem for FilesystemHandle {
                 self.stream(
                     request.user.take(),
                     request,
-                    self.lifecycle.closed(),
+                    StreamEnd::Watch(self.lifecycle.closed()),
                     FilesystemClient::watch,
                 )
                 .await
