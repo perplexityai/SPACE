@@ -18,7 +18,7 @@ pub use pplx_space_migration_checksums as migration_checksums;
 pub use pplx_space_node_registration_store as node_registration;
 pub use pplx_space_sandbox_quarantine_store as sandbox_quarantine;
 pub mod sandbox_residency;
-pub mod sandbox_routability;
+pub use pplx_space_sandbox_routability as sandbox_routability;
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 

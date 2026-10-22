@@ -5599,6 +5599,7 @@ dependencies = [
  "pplx-space-request-id",
  "pplx-space-rustls-provider",
  "pplx-space-sandbox-quarantine-store",
+ "pplx-space-sandbox-routability",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-state-reconciliation",
@@ -7020,6 +7021,10 @@ dependencies = [
 
 [[package]]
 name = "pplx-space-sandbox-quarantine-store"
+version = "0.8.0"
+
+[[package]]
+name = "pplx-space-sandbox-routability"
 version = "0.8.0"
 
 [[package]]

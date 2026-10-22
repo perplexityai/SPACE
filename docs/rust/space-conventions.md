@@ -180,7 +180,7 @@ The statement stays syntactically whole, as the store rules require: new code
 writes whole statements with bound values, not fragments around the value.
 The started- and failed-restorable repair `row_state_guards` helpers and the
 shared `routable_execution_or_non_k8s` routability fragment
-(`crates/libs/common/svc/src/sql/sandbox_routability.rs`) take their
+(`crates/libs/sandbox/routability/src/lib.rs`) take their
 placeholder as an argument only because they are existing fragments; they are
 not a pattern for new code. Read a `managed_by` column back as `SubstrateKind`
 rather than comparing strings. Where one bad row must not fail the batch, read

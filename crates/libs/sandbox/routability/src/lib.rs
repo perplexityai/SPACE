@@ -18,6 +18,8 @@
 //!   heals the row.
 //!
 //! Centralising the fragment makes "routable" one question with one answer.
+//! It is its own crate, with no dependencies, so a crate that composes the
+//! fragment need not depend on `pplx-space-common-svc` for it.
 
 /// Returns a self-contained `EXISTS(...)` SQL fragment evaluating to TRUE iff
 /// the sandbox row aliased as `sandbox_alias` has an active
