@@ -363,9 +363,13 @@ async fn service_with_stop(
 async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
     for code in [tonic::Code::Internal, tonic::Code::Unavailable] {
         let (service, id, _socket, server) = service_with_stop(code, 2).await;
-        super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
-            .await
-            .expect("stop succeeds once the runtime finishes exiting");
+        super::stop_runtime_for_encrypted_seal(
+            &service,
+            &id.to_string(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("stop succeeds once the runtime finishes exiting");
         crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
     }
 }
@@ -375,9 +379,13 @@ async fn encrypted_seal_stop_gives_up_after_the_attempt_cap() {
     let (service, id, _socket, server) =
         service_with_stop(tonic::Code::Internal, super::ENC_CAPTURE_STOP_ATTEMPTS).await;
 
-    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
-        .await
-        .unwrap_err();
+    let error = super::stop_runtime_for_encrypted_seal(
+        &service,
+        &id.to_string(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Internal);
 
     crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
@@ -388,9 +396,13 @@ async fn encrypted_seal_stop_does_not_retry_other_failures() {
     let (service, id, _socket, server) =
         service_with_stop(tonic::Code::FailedPrecondition, 1).await;
 
-    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
-        .await
-        .unwrap_err();
+    let error = super::stop_runtime_for_encrypted_seal(
+        &service,
+        &id.to_string(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 
     crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
@@ -730,4 +742,81 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+#[tokio::test]
+async fn cancelled_capture_retains_runtime_but_an_admitted_stop_finishes() {
+    use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    for (cancel_before_stop, cancel_during_stop, expected_stops) in
+        [(true, false, 0), (false, true, 2), (false, false, 1)]
+    {
+        let caller_cancelled = CancellationToken::new();
+        let cancel_on_drop = caller_cancelled.clone().drop_guard();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let observed = stops.clone();
+        let cancel = caller_cancelled.clone();
+        let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+        service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
+            stop_runtime: Some(Arc::new(move |_| {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                if cancel_during_stop && attempt == 0 {
+                    cancel.cancel();
+                    return Err(tonic::Status::unavailable("runtime is still exiting"));
+                }
+                Ok(Default::default())
+            })),
+            ..Default::default()
+        });
+        let id = super::SandboxId::new().to_string();
+        let fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            None,
+        );
+        service.pool.bind_execution(&id, fence).unwrap();
+        let (started, capture_started) = tokio::sync::oneshot::channel();
+        let (finish, finish_capture) = tokio::sync::oneshot::channel();
+        let (completed, capture_completed) = tokio::sync::oneshot::channel();
+        let tracker = tokio_util::task::TaskTracker::new();
+        let capture = tracker.spawn(async move {
+            super::run_detached(
+                tokio_util::task::TaskTracker::new(),
+                "test-capture",
+                async move {
+                    started.send(()).unwrap();
+                    finish_capture.await.unwrap();
+                    // Capture has completed and unmounted its jail bind.
+                    let result =
+                        super::stop_runtime_for_encrypted_seal(&service, &id, &caller_cancelled)
+                            .await;
+                    completed.send(result).unwrap();
+                },
+            )
+            .await
+            .unwrap();
+        });
+        capture_started.await.unwrap();
+        if cancel_before_stop {
+            // A server deadline drops the waiter while capture still owns cleanup.
+            drop(cancel_on_drop);
+            capture.abort();
+        }
+        finish.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), capture_completed)
+            .await
+            .unwrap()
+            .unwrap();
+        if cancel_before_stop {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Cancelled);
+        } else {
+            result.unwrap();
+            capture.await.unwrap();
+        }
+        assert_eq!(stops.load(Ordering::SeqCst), expected_stops);
+    }
 }
