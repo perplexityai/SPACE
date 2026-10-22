@@ -6,8 +6,8 @@
 //! supersedes any activation and writes `stopping` over every state the generic
 //! guards do not refuse, a `stopping` row included. Delete admission writes
 //! `deleting` the same way, over a `deleting` row too, unless the row's suspend
-//! state has not reached the cluster. The expected outcomes are written out
-//! here, not derived from that writer.
+//! state has not reached the cluster or its quarantine retains the only copy.
+//! The expected outcomes are written out here, not derived from that writer.
 //!
 //! The Stop RPC admits only a sandbox whose runtime is live: it resolves its
 //! target with `running_only`, which selects nothing unless the sandbox's
@@ -22,7 +22,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_core::types::{
+    SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+};
 use pplx_space_common_svc::PeerIdentity;
 use tonic::Request;
 
@@ -92,7 +94,7 @@ enum Admission {
     /// Firecracker process, so the Stop RPC's runtime gate selects nothing.
     AdmittedOnlyDirectly,
     /// Refused: Stop with `Unavailable` and this message, Delete (`None`)
-    /// because the row's suspend state has not reached the cluster.
+    /// because suspend publication is pending or quarantine retains the only copy.
     Refused(Option<&'static str>),
 }
 
@@ -148,10 +150,10 @@ fn delete_admission(state: SandboxState) -> Admission {
         | SandboxState::Restoring
         | SandboxState::CleanupRequired
         | SandboxState::CleanupFailed
-        | SandboxState::Quarantined
         | SandboxState::Failed => Admission::Admitted,
-        // Its suspend state has not reached the cluster yet.
-        SandboxState::Suspending => Admission::Refused(None),
+        // Its suspend state has not reached the cluster yet, or a missing
+        // quarantine episode cannot prove that the retained files are expendable.
+        SandboxState::Suspending | SandboxState::Quarantined => Admission::Refused(None),
     }
 }
 
@@ -208,6 +210,9 @@ impl Cleanup {
                 Self::Delete,
                 Err(CleanupAdmissionError::SuspendPublicationPending { state: found, .. }),
             ) => found == state,
+            (Self::Delete, Err(CleanupAdmissionError::RetainedFilesystemOnlyCopy { .. })) => {
+                state == SandboxState::Quarantined
+            }
             (Self::Delete, Err(_)) | (Self::Stop | Self::Delete, Ok(_)) => false,
         }
     }
@@ -226,14 +231,50 @@ impl Cleanup {
 /// checks that.
 async fn sweep_every_source_state(cleanup: Cleanup) {
     for persist_intent in [true, false] {
-        for state in SandboxState::all() {
+        let cases = SandboxState::all().into_iter().flat_map(|state| {
+            let reasons = if state == SandboxState::Quarantined {
+                vec![
+                    None,
+                    Some(SandboxQuarantineReasonCode::SuspendSnapshotPublicationFailed),
+                    Some(SandboxQuarantineReasonCode::PauseFailed),
+                ]
+            } else {
+                vec![None]
+            };
+            reasons.into_iter().map(move |reason| (state, reason))
+        });
+        for (state, reason) in cases {
+            let expected = match (cleanup, reason) {
+                (Cleanup::Delete, Some(SandboxQuarantineReasonCode::PauseFailed)) => {
+                    Admission::Admitted
+                }
+                _ => cleanup.admission(state),
+            };
             let case = format!(
-                "{cleanup:?} of {state} ({:?}), persist intent {persist_intent}",
-                cleanup.admission(state)
+                "{cleanup:?} of {state}, reason {reason:?} ({expected:?}), \
+                 persist intent {persist_intent}"
             );
             let conn = crate::db::test_conn();
-            let sandbox_id = insert_row(&conn, state);
+            let sandbox_id = insert_row(
+                &conn,
+                if reason.is_some() {
+                    SandboxState::Started
+                } else {
+                    state
+                },
+            );
             let id = sandbox_id.to_string();
+            if let Some(reason) = reason {
+                crate::db::mark_quarantined(
+                    &conn,
+                    &id,
+                    SandboxQuarantineSource::SbxManager,
+                    reason,
+                    "synthetic lifecycle failure",
+                    SandboxQuarantineNextAction::RequiresOperatorAttention,
+                )
+                .unwrap();
+            }
             let scratch = tempfile::tempdir().unwrap();
             let service = isolated_service(conn, scratch.path());
             // The service's own background tasks exit on cancellation; once
@@ -268,7 +309,7 @@ async fn sweep_every_source_state(cleanup: Cleanup) {
 
             {
                 let db = service.db_conn().unwrap();
-                if let Admission::Refused(message) = cleanup.admission(state) {
+                if let Admission::Refused(message) = expected {
                     assert!(
                         cleanup.refused(state, message, result),
                         "{case}: expected a refusal"
