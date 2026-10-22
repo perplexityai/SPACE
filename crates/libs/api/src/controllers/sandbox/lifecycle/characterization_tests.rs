@@ -13,7 +13,7 @@
 //! which only Kubernetes reaches.
 
 use axum::http::StatusCode;
-use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId};
+use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId, UserId};
 use pplx_space_db_test_fixtures::pg_test_db_with_max_connections;
 use pplx_space_metrics::sandbox::api::{SandboxApiMetricIdentity, WakeCompletionAction};
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
@@ -1126,6 +1126,97 @@ async fn untracked_runtime_actions_without_placement_are_unavailable() -> TestRe
             StatusCode::SERVICE_UNAVAILABLE,
             "{action:?}: {error}"
         );
+    }
+    Ok(())
+}
+
+/// The wake a command queues (a native wake with no actor) runs through the
+/// lifecycle executor like a `:wake`, but only while the sandbox's wake
+/// policy, read when it executes, still lets a command wake it: allowed, it
+/// wakes the paused resident; cleared since, it fails as a conflict and
+/// leaves the sandbox paused. A caller's `:wake` is not policy-gated.
+#[tokio::test(flavor = "current_thread")]
+async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> TestResult {
+    use crate::public_operations::{ApiProduct, ClaimedPublicOperation};
+    use crate::public_sandbox_operations::{
+        SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload,
+    };
+    use pplx_space_public_api::{
+        OperationId, OperationKind, OperationState, PublicErrorCode, PublicSandboxId,
+        SandboxLifecycleAction,
+    };
+
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let (worker, node_id) = start_sim_worker(pool).await?;
+    let executor = SandboxLifecycleOperationExecutor::new(pool.clone(), direct_controller(pool));
+
+    let caller: UserId = "00000000-0000-0000-0000-000000000010".parse()?;
+    for (actor, allowed, wakes) in [
+        (None, true, true),
+        (None, false, false),
+        (Some(caller), false, true),
+    ] {
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, "paused", "space").await?;
+        // Places it with an access-wake policy.
+        place_on_node(pool, sandbox_id, node_id).await?;
+        insert_resident(worker.state(), sandbox_id, "paused").await?;
+        if !allowed {
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET auto_lifecycle_json = '{}'::JSONB WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .execute(pool)
+            .await?;
+        }
+        let operation = ClaimedPublicOperation {
+            id: OperationId::new(),
+            org_id: "00000000-0000-0000-0000-000000000001".parse()?,
+            actor_user_id: actor,
+            api_product: ApiProduct::Native,
+            kind: OperationKind::WakeSandbox,
+            target_type: None,
+            target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
+            payload: SandboxLifecycleOperationPayload {
+                sandbox_id: PublicSandboxId::from(sandbox_id),
+                action: SandboxLifecycleAction::Wake,
+                rollback: None,
+            }
+            .into_json(),
+            attempts: 1,
+            claim_generation: 1,
+            traceparent: None,
+        };
+
+        let result = executor.execute(&operation).await;
+
+        let resident = worker.state().get(&sandbox_id.to_string()).await?.status;
+        if wakes {
+            assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+            assert_eq!(resident, "running");
+            assert_eq!(
+                row(pool, sandbox_id).await?,
+                Some(Row::new("started", "on_node"))
+            );
+        } else {
+            assert_eq!(result.state, OperationState::Failed, "{result:?}");
+            assert_eq!(result.terminal_error_code, Some(PublicErrorCode::Conflict));
+            // Refused by the executor before any node call: a sandbox with no
+            // node to ask (a suspended Kubernetes one) has no other check.
+            assert_eq!(
+                result.progress_message, "sandbox wake policy no longer allows this wake",
+                "{result:?}"
+            );
+            assert_eq!(resident, "paused");
+            assert_eq!(
+                row(pool, sandbox_id).await?,
+                Some(Row::new("paused", "on_node"))
+            );
+        }
     }
     Ok(())
 }

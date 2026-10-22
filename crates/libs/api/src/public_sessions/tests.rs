@@ -939,6 +939,7 @@ async fn command_session_persists_the_requested_guest_user() -> TestResult {
             public_sandbox_id,
             request(guest_user.clone()),
             IdempotencyKey::parse(key)?,
+            || Ok(()),
         )
         .await
         .expect("command session is created");
@@ -1015,6 +1016,7 @@ async fn command_session_runs_under_sandbox_org_for_cross_org_caller() -> TestRe
         public_sandbox_id,
         request,
         key,
+        || Ok(()),
     )
     .await
     .expect("admin command session is created for a cross-org sandbox");

@@ -92,6 +92,25 @@ impl PublicSessionStore {
         &self,
         input: CreatePublicSession<'_>,
     ) -> Result<PublicSession, PublicSessionStoreError> {
+        match self
+            .create_session_admitted(input, || Ok::<(), std::convert::Infallible>(()))
+            .await?
+        {
+            Ok(session) => Ok(session),
+            Err(never) => match never {},
+        }
+    }
+
+    /// [`Self::create_session`], refusing a new session when `admit` does.
+    ///
+    /// `admit` runs only after the idempotency lookup misses, so a retry of a
+    /// request that already created its session replays it even if the state
+    /// `admit` judges has changed since.
+    pub async fn create_session_admitted<E>(
+        &self,
+        input: CreatePublicSession<'_>,
+        admit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<PublicSession, E>, PublicSessionStoreError> {
         let fingerprint = request_fingerprint(input.fingerprint_payload)?;
         let mut tx = self.pool.begin().await?;
 
@@ -117,7 +136,11 @@ impl PublicSessionStore {
                 row,
                 Some(token),
                 self.data_plane_base_url.as_str(),
-            );
+            )
+            .map(Ok);
+        }
+        if let Err(refusal) = admit() {
+            return Ok(Err(refusal));
         }
         let session_id = DataPlaneSessionId::new_for_kind(input.kind);
         let scope = input.kind.connect_scope();
@@ -215,6 +238,7 @@ impl PublicSessionStore {
         );
 
         PublicSessionRow::try_into_public(row, Some(token), self.data_plane_base_url.as_str())
+            .map(Ok)
     }
 
     pub async fn fetch_session(
