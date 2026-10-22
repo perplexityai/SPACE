@@ -747,8 +747,8 @@ enum FakeRevocation {
 const FAKE_SLOW_ANSWER: Duration = Duration::from_millis(300);
 /// The check timeout for [`FakeRevocation::SlowOrgThenHungSession`], and how
 /// long its org read takes.
-const SPLIT_CHECK_TIMEOUT: Duration = Duration::from_millis(1_000);
-const SPLIT_CHECK_ORG_READ: Duration = Duration::from_millis(800);
+const SPLIT_CHECK_TIMEOUT: Duration = Duration::from_millis(2_000);
+const SPLIT_CHECK_ORG_READ: Duration = Duration::from_millis(1_200);
 
 /// A fake cluster API and worker for one running process. The test sets how
 /// revocation checks are answered and sends stdout chunks down the open
@@ -773,6 +773,23 @@ impl RevocationFake {
     fn failed_answers(&self) -> usize {
         self.failed_answers.load(Ordering::SeqCst)
     }
+}
+
+/// Make the session's org due for a refresh, so its next check reads the
+/// cluster API however soon the last read answered.
+fn make_org_refresh_due(state: &DataPlaneState, session_id: DataPlaneSessionId) {
+    let org_id = state
+        .revocation_cache
+        .entries
+        .get(&session_id.to_string())
+        .unwrap()
+        .org_id;
+    state
+        .revocation_cache
+        .orgs
+        .get_mut(&org_id)
+        .unwrap()
+        .refresh_after = tokio::time::Instant::now();
 }
 
 const FAKE_CLUSTER_API_OUTAGE: &str = "connection refused: 192.0.2.10:9443";
@@ -1374,7 +1391,6 @@ async fn revocation_check_has_one_timeout_across_its_reads() {
             .await
             .unwrap(),
     );
-    state.revocation_check_interval = Duration::from_millis(1);
     state.revocation_check_timeout = SPLIT_CHECK_TIMEOUT;
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
     resolve_session_route(&state, session_id, &token)
@@ -1382,6 +1398,7 @@ async fn revocation_check_has_one_timeout_across_its_reads() {
         .unwrap();
 
     fake.answer(FakeRevocation::SlowOrgThenHungSession);
+    make_org_refresh_due(&state, session_id);
     let started = tokio::time::Instant::now();
     let error = session_is_revoked(&state, session_id)
         .await
@@ -1414,8 +1431,7 @@ async fn revocation_check_metrics_count_kept_verdicts_and_timeouts() {
             .await
             .unwrap(),
     );
-    state.revocation_check_interval = Duration::from_millis(1);
-    state.revocation_check_timeout = Duration::from_millis(100);
+    state.revocation_check_timeout = Duration::from_secs(1);
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
     resolve_session_route(&state, session_id, &token)
         .await
@@ -1430,6 +1446,7 @@ async fn revocation_check_metrics_count_kept_verdicts_and_timeouts() {
     };
 
     fake.answer(FakeRevocation::Down);
+    make_org_refresh_due(&state, session_id);
     let counters = pplx_space_metrics::test_capture::capture_counters_guard();
     assert!(!session_is_revoked(&state, session_id).await.unwrap());
     assert_eq!(
@@ -1438,6 +1455,7 @@ async fn revocation_check_metrics_count_kept_verdicts_and_timeouts() {
     );
 
     fake.answer(FakeRevocation::Hung);
+    make_org_refresh_due(&state, session_id);
     let counters = pplx_space_metrics::test_capture::capture_counters_guard();
     assert!(!session_is_revoked(&state, session_id).await.unwrap());
     assert_eq!(results(counters.finish()), ["timeout", "kept_last_verdict"]);
