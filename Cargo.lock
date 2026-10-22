@@ -5438,6 +5438,7 @@ dependencies = [
  "pplx-space-execution-spec",
  "pplx-space-guest-process",
  "pplx-space-k8s-ids",
+ "pplx-space-linux-ids",
  "pplx-space-net-common",
  "pplx-space-semver",
  "pplx-space-sql-locator",
@@ -6138,6 +6139,14 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-linux-ids"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

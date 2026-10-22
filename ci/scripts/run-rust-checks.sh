@@ -1019,6 +1019,25 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a serde feature the Linux host and vsock identifier
+    # crate needs but only gets through unification with common-core fails
+    # here. serde is its only feature, so --all-features is serde alone.
+    echo "--- :rust: Running isolated Linux identifier clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-linux-ids \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-linux-ids \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {
