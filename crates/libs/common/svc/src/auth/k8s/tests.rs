@@ -1111,13 +1111,13 @@ async fn concurrent_cache_inserts_at_capacity_do_not_panic() {
 
 #[test]
 fn validate_token_review_status_accepts_confirmed_audience() {
-    let username = validate_token_review_status(
+    let identity = validate_token_review_status(
         Some(accepted_token_review_status("space-node-api")),
         "space-node-api",
     )
     .unwrap();
 
-    assert_eq!(username.username, "system:serviceaccount:space:space-api");
+    assert_eq!(identity.username, "system:serviceaccount:space:space-api");
 }
 
 #[test]

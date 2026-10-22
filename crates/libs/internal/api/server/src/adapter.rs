@@ -90,6 +90,7 @@ impl ClusterApiService {
         use pplx_space_common_svc::auth::{
             AuthenticatedNodeIdentity, NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
         };
+        use pplx_space_metrics::auth::{TemplateNodeBinding, template_node_binding};
 
         let Some(caller) = request.extensions().get::<NodeApiAuthenticatedCaller>() else {
             return Ok(TemplateReadScope::Unscoped);
@@ -99,15 +100,29 @@ impl ClusterApiService {
         }
         match caller.node_identity() {
             AuthenticatedNodeIdentity::Kubernetes(Some(node)) => {
-                return self
+                let scope = self
                     .template_releases_store
                     .node_scope_for_identity(node)
                     .await
                     .map_err(|err| {
                         Status::internal(format!("resolve caller node identity: {err}"))
-                    });
+                    })?;
+                if matches!(&scope, TemplateReadScope::NodeScoped { node_ids } if node_ids.is_empty())
+                {
+                    template_node_binding(TemplateNodeBinding::NoInventoryMatch);
+                    tracing::warn!(node_name = %node.name(), node_uid = %node.uid(),
+                        "template catalog node identity has no live inventory match; private templates are unavailable");
+                } else {
+                    template_node_binding(TemplateNodeBinding::Bound);
+                }
+                return Ok(scope);
             }
             AuthenticatedNodeIdentity::Kubernetes(None) => {
+                template_node_binding(TemplateNodeBinding::Unbound);
+                tracing::warn!(
+                    peer_addr = ?request.remote_addr(),
+                    "template catalog caller lacks usable pod/node claims; check projected tokens and Kubernetes 1.32+ node metadata; private templates are unavailable"
+                );
                 return Ok(TemplateReadScope::NodeScoped {
                     node_ids: Vec::new(),
                 });

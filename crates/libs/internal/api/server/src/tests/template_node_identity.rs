@@ -2,7 +2,10 @@ use super::*;
 use crate::proto::{cluster_api_client::ClusterApiClient, cluster_api_server::ClusterApiServer};
 use pplx_space_common_svc::auth::{
     NodeApiAuthConfig, NodeApiAuthLayer, NodeRole,
-    test_support::{projected_token, serve_token_reviews, service_account_status},
+    test_support::{
+        pod_bound_service_account_status, projected_token, serve_token_reviews,
+        service_account_status,
+    },
 };
 use std::sync::{
     Arc,
@@ -62,34 +65,22 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
                 .iter()
                 .position(|token| Some(token) == spec.token.as_ref())
                 .unwrap();
-            let mut status =
-                service_account_status("space-cluster-api", "system:serviceaccount:space:workers");
-            if index != 2 {
+            let username = "system:serviceaccount:space:workers";
+            if index == 2 {
+                service_account_status("space-cluster-api", username)
+            } else {
                 let uid = if index == 0 {
-                    node_uid.clone()
+                    node_uid.as_str()
                 } else {
-                    Uuid::now_v7().to_string()
+                    "stale-node-uid"
                 };
-                status.user.as_mut().unwrap().extra = Some(
-                    [
-                        (
-                            "authentication.kubernetes.io/pod-name".into(),
-                            vec!["template-manager-test".into()],
-                        ),
-                        (
-                            "authentication.kubernetes.io/pod-uid".into(),
-                            vec![Uuid::now_v7().to_string()],
-                        ),
-                        (
-                            "authentication.kubernetes.io/node-name".into(),
-                            vec!["catalog-worker".into()],
-                        ),
-                        ("authentication.kubernetes.io/node-uid".into(), vec![uid]),
-                    ]
-                    .into(),
-                );
+                pod_bound_service_account_status(
+                    "space-cluster-api",
+                    username,
+                    "catalog-worker",
+                    uid,
+                )
             }
-            status
         },
         tokio_util::sync::CancellationToken::new(),
     )));
@@ -141,18 +132,13 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
                 request
                     .metadata_mut()
                     .insert("authorization", format!("Bearer {token}").parse()?);
-                let result = client.find_template_release_by_hash(request).await;
-                assert_eq!(
-                    result.map(|_| true).or_else(|error| {
-                        if error.code() == Code::NotFound {
-                            Ok(false)
-                        } else {
-                            Err(error)
-                        }
-                    })?,
-                    expected,
-                    "{template}"
-                );
+                let actual = client
+                    .find_template_release_by_hash(request)
+                    .await
+                    .map(|_| Code::Ok)
+                    .unwrap_or_else(|status| status.code());
+                let expected = if expected { Code::Ok } else { Code::NotFound };
+                assert_eq!(actual, expected, "{template}");
             }
         }
     }

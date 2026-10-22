@@ -38,6 +38,35 @@ pub fn service_account_status(audience: &str, username: &str) -> TokenReviewStat
     }
 }
 
+pub fn pod_bound_service_account_status(
+    audience: &str,
+    username: &str,
+    node_name: &str,
+    node_uid: &str,
+) -> TokenReviewStatus {
+    let mut status = service_account_status(audience, username);
+    status
+        .user
+        .as_mut()
+        .expect("service_account_status supplies UserInfo")
+        .extra = Some(
+        [
+            ("pod-name", "test-pod"),
+            ("pod-uid", "test-pod-uid"),
+            ("node-name", node_name),
+            ("node-uid", node_uid),
+        ]
+        .map(|(key, value)| {
+            (
+                format!("authentication.kubernetes.io/{key}"),
+                vec![value.into()],
+            )
+        })
+        .into(),
+    );
+    status
+}
+
 pub fn projected_token(service_account: &str) -> String {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let expiry = jiff::Timestamp::now().as_second() + 600;

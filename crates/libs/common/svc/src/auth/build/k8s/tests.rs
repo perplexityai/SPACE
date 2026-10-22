@@ -3,7 +3,10 @@ use super::super::{
     tenant_publication_requires_grant,
 };
 use super::*;
-use crate::auth::test_support::{TokenReviewStatus, service_account_status, token_review_service};
+use crate::auth::test_support::{
+    TokenReviewStatus, pod_bound_service_account_status, service_account_status,
+    token_review_service,
+};
 use kube::client::{Body, ClientBuilder};
 use std::sync::{
     Arc,
@@ -400,29 +403,7 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
 }
 
 fn bound_publisher_status(audience: &str, username: &str) -> TokenReviewStatus {
-    let mut status = service_account_status(audience, username);
-    status.user.as_mut().unwrap().extra = Some(
-        [
-            (
-                "authentication.kubernetes.io/pod-name".into(),
-                vec!["builder-pod".into()],
-            ),
-            (
-                "authentication.kubernetes.io/pod-uid".into(),
-                vec!["builder-pod-uid".into()],
-            ),
-            (
-                "authentication.kubernetes.io/node-name".into(),
-                vec!["builder-node".into()],
-            ),
-            (
-                "authentication.kubernetes.io/node-uid".into(),
-                vec!["builder-node-uid".into()],
-            ),
-        ]
-        .into(),
-    );
-    status
+    pod_bound_service_account_status(audience, username, "builder-node", "builder-node-uid")
 }
 
 #[tokio::test]
