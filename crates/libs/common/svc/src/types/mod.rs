@@ -18,7 +18,7 @@ pub mod errors;
 pub mod grpc;
 pub mod http;
 pub mod k8s;
-pub mod reconcile;
+pub use pplx_space_state_reconciliation as reconcile;
 pub mod sockets;
 
 pub use auth::*;

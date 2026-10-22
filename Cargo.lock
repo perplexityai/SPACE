@@ -5589,6 +5589,7 @@ dependencies = [
  "pplx-space-rustls-provider",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
+ "pplx-space-state-reconciliation",
  "pplx-space-systemd-watchdog",
  "pplx-space-test-env",
  "pplx-space-tokio-runtime",
@@ -7588,6 +7589,15 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-sbx-mgr-client",
  "tokio",
+]
+
+[[package]]
+name = "pplx-space-state-reconciliation"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "sqlx",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
