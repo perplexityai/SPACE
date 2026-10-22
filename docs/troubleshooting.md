@@ -80,7 +80,7 @@ This prints sandbox listings and the saved creation/deletion operations, sandbox
 | HTTP stream succeeds but output is incomplete | Check for `process_exited`, its exit result, and any `error` or `resync_required` frame. A closed connection is not proof of successful execution. |
 | Reconnect reports `resync_required` | Missed output is not replayed. Inspect the saved event transcript and query the process only if it is still running. Rerun only if repeating the command's effects is safe. |
 | Command exits nonzero | Read stderr and the exit result from the saved event transcript. Check that the executable and working directory exist inside the sandbox, not just on the host. |
-| Single-process GET returns `not_found` | This endpoint inspects a running or recently exited process, not historical command results. It returns `not_found` before attachment and from 15 minutes after exit. |
+| Single-process GET returns `not_found` | This endpoint inspects a running or recently exited process, not historical command results. It returns `not_found` before attachment and once the sandbox no longer keeps the exit: 15 minutes after exit, sooner once many newer processes start, and right after exit on a sandbox from an older template. |
 
 Inspect a running process with `GET /v1/sandboxes/{sandbox_id}/processes/{process_id}`. An empty process list is expected after a command exits; use the saved event transcript to check its result. Keep a failed transcript for diagnosis, but review it for secrets before sharing it.
 

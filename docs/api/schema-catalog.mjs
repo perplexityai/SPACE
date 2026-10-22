@@ -30,7 +30,7 @@ export const modelGroups = [
       ['DataPlaneAttachInfo', 'Attachment credentials', 'Attachment destinations, credential transports and token expiry; validate the destination before sending the session token.'],
       ['PublicProcess', 'Process', 'Metadata for a running process, or a recently exited one with its exit.'],
       ['PublicProcessPage', 'Process list', 'A page of running processes and its continuation cursor.'],
-      ['ProcessState', 'Process state', 'Set to exited once a process has ended and absent while it runs; tolerate unknown future values.'],
+      ['ProcessState', 'Process state', 'exited once a process has ended. Test for exited: a running process omits it today and may report running later; tolerate unknown future values.'],
       ['ProcessSignalRequest', 'Signal request', 'The Unix signal number to send to a process.'],
       ['ProcessMutationResponse', 'Process action result', 'Acknowledges a runtime action, not proof of process exit.'],
       ['SessionState', 'Session state', 'Attachment-session state; use the event stream to determine command success.'],

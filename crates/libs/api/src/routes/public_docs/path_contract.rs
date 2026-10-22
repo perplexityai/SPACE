@@ -352,7 +352,7 @@ pub(super) fn insert_process_paths(paths: &mut Map<String, Value>) {
         GET_PROCESS,
         json!({
                 "summary": "Get a process",
-                "description": "Returns metadata for a running process, or for one that exited within the last 15 minutes with `state` `exited` and its exit. After that window, or once many newer processes have finished, it is `not_found`. Environment variables are never returned. Collect output from the command's event stream.",
+                "description": "Returns metadata for a running process, or for a recently exited one with `state` `exited` and its exit. Test for `state` `exited`: a running process omits `state` today and may report `running` later. A sandbox keeps an exited process for up to 15 minutes, less once many newer processes start; then it is `not_found`. A sandbox from an older template returns `not_found` as soon as the process exits. Environment variables are never returned. Collect output from the command's event stream.",
                 "responses": {
                     "200": {
                         "description": "Process metadata",
