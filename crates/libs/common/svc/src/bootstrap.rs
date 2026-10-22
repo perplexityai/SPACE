@@ -1,17 +1,12 @@
-use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use axum::extract::MatchedPath;
-use http::{HeaderMap, Method, Request as HttpRequest, Response as HttpResponse};
+use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse};
 use tonic::Status;
-use tower_http::classify::{
-    GrpcCode, GrpcErrorsAsFailures, GrpcFailureClass, ServerErrorsAsFailures,
-    ServerErrorsFailureClass, SharedClassifier,
-};
+use tower_http::classify::{GrpcCode, GrpcErrorsAsFailures, GrpcFailureClass, SharedClassifier};
 use tower_http::trace::{
-    DefaultOnBodyChunk, DefaultOnEos, DefaultOnRequest, GrpcMakeClassifier, MakeSpan, OnEos,
-    OnFailure, OnResponse, TraceLayer,
+    DefaultOnBodyChunk, DefaultOnRequest, GrpcMakeClassifier, MakeSpan, OnEos, OnFailure,
+    OnResponse, TraceLayer,
 };
 use uuid::Uuid;
 
@@ -27,11 +22,14 @@ pub use pplx_space_unix_socket_bind::{
 
 mod grpc_request_params;
 mod grpc_trace;
-mod http_trace;
 
 pub use grpc_request_params::*;
 pub use grpc_trace::*;
-pub use http_trace::*;
+pub use pplx_space_http_server::{
+    DefaultHttpSpanMetadata, HttpServerMakeSpan, HttpServerOnFailure, HttpServerOnResponse,
+    HttpServerTraceLayer, HttpSpanMetadata, REDACTED_HTTP_PATH_VALUE, TraceparentResponseLayer,
+    http_trace_layer, is_probe_request,
+};
 pub use pplx_space_service_lifecycle::shutdown::*;
 
 pub const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);

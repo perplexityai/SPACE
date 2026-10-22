@@ -21,7 +21,7 @@ pub use pplx_space_dependency_drain as dependency_drain;
 pub mod disk_admission;
 pub use pplx_space_ecw_credential as ecw_credential;
 pub use pplx_space_federated_identity as federated_identity;
-pub mod http_listener;
+pub use pplx_space_http_server::http_listener;
 #[cfg(feature = "k8s")]
 pub use pplx_space_kube_client as kube_client;
 pub use pplx_space_service_lifecycle as lifecycle;

@@ -5602,6 +5602,7 @@ dependencies = [
  "pplx-space-ecw-credential",
  "pplx-space-federated-grant-store",
  "pplx-space-federated-identity",
+ "pplx-space-http-server",
  "pplx-space-ingress-admission",
  "pplx-space-k8s-node-id",
  "pplx-space-kube-client",
@@ -6074,6 +6075,20 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-http-server"
+version = "0.8.0"
+dependencies = [
+ "axum",
+ "http 1.5.0",
+ "pplx-space-observability",
+ "pplx-space-request-id",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
 ]
 
 [[package]]

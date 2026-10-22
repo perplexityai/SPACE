@@ -150,6 +150,7 @@ members = [
     "crates/libs/rpc-contracts",
     "crates/libs/btrfs",
     "crates/libs/db-identity",
+    "crates/libs/http-server",
     "crates/libs/cluster/controller/server",
     "crates/libs/cluster/pool",
     "crates/libs/cluster/reconciler",
@@ -425,6 +426,7 @@ pplx-space-pii = { path = "crates/libs/pii" }
 pplx-space-rpc-contracts = { path = "crates/libs/rpc-contracts" }
 pplx-space-btrfs = { path = "crates/libs/btrfs" }
 pplx-space-db-identity = { path = "crates/libs/db-identity" }
+pplx-space-http-server = { path = "crates/libs/http-server" }
 pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
 pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }

@@ -1,7 +1,16 @@
 //! The HTTP server trace layer: span naming and redaction, probe filtering, and the traceparent
 //! response header.
 
-use super::*;
+use std::borrow::Cow;
+use std::time::Duration;
+
+use axum::extract::MatchedPath;
+use http::{HeaderMap, Method, Request as HttpRequest, Response as HttpResponse};
+use pplx_space_request_id::request_id_from_headers;
+use tower_http::classify::{ServerErrorsAsFailures, ServerErrorsFailureClass, SharedClassifier};
+use tower_http::trace::{
+    DefaultOnBodyChunk, DefaultOnEos, DefaultOnRequest, MakeSpan, OnFailure, OnResponse, TraceLayer,
+};
 
 pub const REDACTED_HTTP_PATH_VALUE: &str = "[REDACTED]";
 

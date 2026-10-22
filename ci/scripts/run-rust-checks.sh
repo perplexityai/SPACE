@@ -1228,6 +1228,24 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a dependency the HTTP server crate needs but only gets
+    # through unification with common-svc fails here.
+    echo "--- :rust: Running isolated HTTP server clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-http-server \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-http-server \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {
