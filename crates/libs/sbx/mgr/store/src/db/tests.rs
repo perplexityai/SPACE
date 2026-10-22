@@ -1130,6 +1130,73 @@ fn suspend_publication_protects_live_and_retry_owned_suspend() {
 }
 
 #[test]
+fn suspend_quarantine_erase_safety_uses_the_episode_not_the_diagnostic() {
+    for diagnostic in [
+        SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
+        "snapshot capture response was lost",
+        "encrypted snapshot volume is busy",
+        "artifact backup handoff failed",
+    ] {
+        let conn = test_conn();
+        let id = SandboxId::new();
+        let label = SandboxRuntimeLabel::from_sandbox_id(id);
+        insert_test_sandbox(
+            &conn,
+            TestSandboxInsert::new(id.to_string(), label.to_string(), SandboxState::Suspending),
+        );
+        assert!(mark_suspending_quarantined(&conn, &id.to_string(), diagnostic).unwrap());
+
+        assert_eq!(
+            read::sandbox_view(&conn, &id.to_string())
+                .erase_safety()
+                .unwrap(),
+            Some((
+                SandboxState::Quarantined,
+                SandboxEraseSafety::RetainedFilesystemOnlyCopy
+            )),
+            "a suspend quarantine must retain its filesystem regardless of diagnostic: {diagnostic}",
+        );
+    }
+
+    for (reason, expected) in [
+        (
+            Some(SandboxQuarantineReasonCode::PauseFailed.as_str()),
+            SandboxEraseSafety::Safe,
+        ),
+        (None, SandboxEraseSafety::RetainedFilesystemOnlyCopy),
+        (
+            Some("future_quarantine_reason"),
+            SandboxEraseSafety::RetainedFilesystemOnlyCopy,
+        ),
+    ] {
+        let conn = test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(
+            &conn,
+            TestSandboxInsert::new(&id, "reason01", SandboxState::Suspending),
+        );
+        assert!(mark_suspending_quarantined(&conn, &id, "step-specific failure").unwrap());
+        match reason {
+            Some(reason) => conn.execute(
+                "UPDATE sandbox_quarantine_state SET reason_code = ?1 WHERE sandbox_id = ?2",
+                params![reason, id],
+            ),
+            None => conn.execute(
+                "DELETE FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
+                [&id],
+            ),
+        }
+        .unwrap();
+
+        assert_eq!(
+            read::sandbox_view(&conn, &id).erase_safety().unwrap(),
+            Some((SandboxState::Quarantined, expected)),
+            "quarantine metadata {reason:?}",
+        );
+    }
+}
+
+#[test]
 fn cleanup_episode_recovery_fence_requires_artifact_and_generation_together() {
     let conn = test_conn();
     let sandbox_id = SandboxId::new();
