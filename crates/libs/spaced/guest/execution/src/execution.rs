@@ -42,6 +42,7 @@ pub struct ExecutionServiceConfig {
     pub native_upload_idle_timeout: Duration,
     /// Guest memory used to size retained process output; None uses the fallback budget.
     pub guest_memory_bytes: Option<u64>,
+    /// How long completed processes and keyed starts are kept for callers.
     pub process_retention: ProcessRetention,
 }
 
@@ -49,14 +50,15 @@ pub struct ExecutionServiceConfig {
 /// needs. A restart loses both.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessRetention {
-    /// How long a completed process's exit stays replayable. When every record slot is held, the record that completed
-    /// first is evicted to admit a new start.
+    /// How long a completed process's exit stays replayable. When every record
+    /// slot is held, the record that completed first is evicted to admit a new start.
     pub completed: Duration,
     /// How long completed output and environment remain retained, bounded by
     /// `completed`. Retained bytes still consume the shared output budget.
     pub output: Duration,
-    /// How long a keyed start is remembered. The key store's fixed capacity
-    /// divided by this window bounds the sustained rate of keyed starts.
+    /// How long a completed keyed start is remembered. The key store's fixed
+    /// capacity divided by this window bounds the sustained rate of keyed starts.
+    /// In-progress starts keep their fixed 60-second bound.
     pub idempotency: Duration,
 }
 

@@ -2212,7 +2212,6 @@ async fn graceful_drain_waits_for_an_admitted_start_without_killing_it() {
 
 #[tokio::test]
 async fn completed_process_replay_follows_configured_retention() {
-    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{process_event::Event, process_exit};
     use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
     use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
         ConnectProcessRequest, process_exit,
