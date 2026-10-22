@@ -47,6 +47,12 @@ and error evolution, requires a separate crate-level policy before stabilization
   executable during construction: an unreadable or invalid `/proc/self/exe`
   intentionally fails startup before readiness, rather than deferring that
   failure to the first filesystem request.
+- `ExecutionServiceConfig::process_retention` sets how long a completed process
+  stays replayable and how long a keyed start is remembered; both default to 60
+  seconds and are lost on restart. An embedder whose callers poll at their own
+  pace can retain completed processes longer. At capacity, the record that
+  completed first is evicted. A long idempotency window lowers the sustained
+  keyed-start rate the fixed key store admits.
 - Linux identity workers require the daemon's privilege to install the requested
   OS account's groups and IDs; an unprivileged worker host is unsupported. Direct mode
   runs filesystem syscalls with the daemon's credentials; its `user` selects path
