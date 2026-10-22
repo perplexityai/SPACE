@@ -1077,3 +1077,124 @@ async fn drain_settles_stream_failure_before_the_caller_polls_it() {
         "reading a buffered error after drain cannot dispatch cleanup"
     );
 }
+
+#[tokio::test]
+async fn cancelled_worker_streams_report_failure_after_partial_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("file");
+    std::fs::write(&file, vec![b'x'; 1024 * 1024]).unwrap();
+    for index in 0..64 {
+        std::fs::write(directory.path().join(format!("entry-{index}")), b"x").unwrap();
+    }
+    for read in [false, true] {
+        let router = identity_router();
+        let (_channel, proxy, server) = connected_worker(&router).await;
+        // Exercise the worker RPC relay even on hosts supporting descriptor reads.
+        let mut stream: RoutedStream<()> = if read {
+            Box::pin(
+                router
+                    .stream(
+                        None,
+                        ReadRequest {
+                            path: file.display().to_string(),
+                            ..Default::default()
+                        },
+                        router.shutdown.clone(),
+                        FilesystemClient::read,
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .map(|item| item.map(|_| ())),
+            )
+        } else {
+            Box::pin(
+                router
+                    .list_info(Request::new(ListRequest {
+                        path: directory.path().display().to_string(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .map(|item| item.map(|_| ())),
+            )
+        };
+        stream.next().await.unwrap().unwrap();
+        router.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), router.drain())
+            .await
+            .expect("shutdown settles with the reader stalled");
+        loop {
+            match stream
+                .next()
+                .await
+                .expect("partial worker result must not end successfully")
+            {
+                Ok(()) => {}
+                Err(status) => {
+                    assert_eq!(status.code(), tonic::Code::Unavailable);
+                    assert!(!pplx_space_common_grpc::is_refused_before_start(&status));
+                    break;
+                }
+            }
+        }
+        assert!(stream.next().await.is_none());
+        assert!(router.tasks.is_empty());
+        stop_worker(proxy, server).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_relay_reports_failure_with_empty_or_full_output_queue() {
+    for full in [false, true] {
+        let router = identity_router();
+        let pool = router.worker_pool().unwrap();
+        pool.insert_test_client(
+            current_user(),
+            Endpoint::from_static("http://[::]:50051").connect_lazy(),
+        )
+        .await
+        .unwrap();
+        let worker = pool.client_for(current_user()).await.unwrap();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        // Polling the second message means one is queued and the next send
+        // will be backpressured. The empty case waits on the worker instead.
+        let incoming =
+            futures_util::stream::iter([Ok(())]).chain(futures_util::stream::once(async move {
+                ready.send(()).unwrap();
+                if full {
+                    Ok(())
+                } else {
+                    std::future::pending().await
+                }
+            }));
+        let mut stream = router.forward_stream(incoming, worker, router.shutdown.clone());
+        if full {
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            stream.next().await.unwrap().unwrap();
+        }
+        router.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), router.drain())
+            .await
+            .unwrap();
+        loop {
+            match stream
+                .next()
+                .await
+                .expect("cancellation must not become EOF")
+            {
+                Ok(()) => {}
+                Err(status) => {
+                    assert_eq!(status.code(), tonic::Code::Unavailable);
+                    break;
+                }
+            }
+        }
+        assert!(stream.next().await.is_none());
+    }
+}
