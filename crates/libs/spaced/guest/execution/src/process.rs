@@ -523,6 +523,7 @@ impl ExecutionService {
             pplx_space_common_grpc::QueuedSlots::new(self.inner.process_payload_slots.clone()),
             process_limits::PAYLOAD_METHODS,
         )
+        .with_observation(pplx_space_metrics::payload::Budget::GuestProcess)
     }
 }
 
@@ -535,12 +536,14 @@ async fn resolve_process_account(
     let admission = crate::payload::acquire(
         &slots,
         pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
+        pplx_space_metrics::payload::Budget::GuestProcess,
         ingress,
     )?;
     // NSS may block on external account providers. Keep the existing Start
     // admission with the physical lookup even if its requesting future drops.
-    tasks
-        .spawn_blocking(move || resolve().map(|account| (account, admission)))
+    admission
+        .request_lifetime()
+        .observe(tasks.spawn_blocking(move || resolve().map(|account| (account, admission))))
         .await
         .map_err(|error| Status::internal(format!("guest account lookup task failed: {error}")))?
 }
@@ -2441,6 +2444,7 @@ impl Process for ExecutionService {
             }
         };
         let operation = reservation.begin()?;
+        let request_lifetime = _start_admission.request_lifetime();
         let launch = ProcessLaunch {
             command,
             prepared_pty,
@@ -2487,7 +2491,8 @@ impl Process for ExecutionService {
         });
         drop(start_gate);
 
-        let (pid, started, cursor) = started_rx
+        let (pid, started, cursor) = request_lifetime
+            .observe(started_rx)
             .await
             .map_err(|_| Status::internal("process start ended without a result"))??;
         tracing::debug!(
@@ -2622,6 +2627,7 @@ impl Process for ExecutionService {
             &mut request,
             &self.inner.process_payload_slots,
             1,
+            pplx_space_metrics::payload::Budget::GuestProcess,
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let mut request = request.into_inner();
