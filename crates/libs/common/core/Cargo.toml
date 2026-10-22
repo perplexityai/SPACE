@@ -28,6 +28,7 @@ pplx-space-guest-process = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
+pplx-space-network-roles = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 rusqlite = { workspace = true, optional = true }
@@ -65,6 +66,7 @@ serde = [
     "pplx-space-accounts/serde",
     "pplx-space-execution-spec/serde",
     "pplx-space-linux-ids/serde",
+    "pplx-space-network-roles/serde",
 ]
 sqlx = [
     "dep:sqlx",

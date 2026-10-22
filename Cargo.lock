@@ -5440,6 +5440,7 @@ dependencies = [
  "pplx-space-k8s-ids",
  "pplx-space-linux-ids",
  "pplx-space-net-common",
+ "pplx-space-network-roles",
  "pplx-space-semver",
  "pplx-space-sql-locator",
  "rusqlite",
@@ -6358,6 +6359,14 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-network-roles"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
