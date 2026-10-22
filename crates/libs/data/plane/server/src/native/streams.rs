@@ -91,6 +91,48 @@ pub(super) async fn open_native_process_stream(
     .await
 }
 
+/// Asks the worker whether it already runs the process this session would
+/// start, under the session's derived process id. `None` when the guest
+/// reports no such process; any other failure, including running past the
+/// attach deadline, is an error.
+pub(super) async fn probe_session_process(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    attached: &mut AttachedSession,
+) -> Result<Option<ProcessId>, StreamBridgeError> {
+    let process_id = process_id_for_session(session_id);
+    let probe = native_route_call(state, attached, |route| {
+        let process_id = process_id.clone();
+        async move {
+            let channel = state
+                .backend_channels
+                .channel(&route.backend_endpoint, session_id)
+                .await?;
+            let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
+            connect_process_stream(
+                &mut client,
+                &route.sandbox_id,
+                &process_id,
+                None,
+                route.space_api_route_token.as_ref(),
+            )
+            .await
+        }
+    });
+    match tokio::time::timeout(state.attach_deadline, probe).await {
+        Ok(Ok(_stream)) => Ok(Some(process_id)),
+        Ok(Err(StreamBridgeError::BackendStatus(status)))
+            if status.code() == tonic::Code::NotFound =>
+        {
+            Ok(None)
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(StreamBridgeError::BackendStatus(
+            tonic::Status::deadline_exceeded("process probe deadline exceeded"),
+        )),
+    }
+}
+
 /// A backend refusal made before this request did anything (an admission
 /// limit, or the sandbox shutting down): retryable, with the backend's retry
 /// hint. It says nothing about an earlier attempt or an already running
