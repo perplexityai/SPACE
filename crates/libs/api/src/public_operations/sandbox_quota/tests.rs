@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{IdempotencyKey, OrgId, SandboxId, UserId};
@@ -7,7 +7,7 @@ use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicSandboxId, RequestFingerprint,
 };
 use pplx_space_test_env::TestResult;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use super::*;
 use crate::public_operations::{
@@ -80,6 +80,11 @@ async fn the_org_limit_counts_every_owner_and_a_subject_limit_its_own() -> TestR
     let store = PublicOperationStore::new(pool.clone());
     // In flight past its row insert, so already counted by its row.
     record_create(&store, org_id, local, materialized).await?;
+    // In flight while its row is terminal (a drain sweep failed it): it can
+    // still retry and succeed, so it counts.
+    let abandoned = SandboxId::new();
+    seed_sandbox(pool, abandoned, local, org_id, "failed").await?;
+    record_create(&store, org_id, local, abandoned).await?;
     // In flight before their row inserts.
     record_create(&store, org_id, local, SandboxId::new()).await?;
     record_create(&store, org_id, subject_a, SandboxId::new()).await?;
@@ -94,32 +99,25 @@ async fn the_org_limit_counts_every_owner_and_a_subject_limit_its_own() -> TestR
         .await?;
     }
 
-    // The org holds four live rows and two creates; subject A one of each.
+    // The org holds four live rows and three creates; subject A one of each.
     let subject = |user_id, limit| Some(SubjectSandboxQuota { user_id, limit });
     for (quota, expected) in [
         (
-            SandboxQuota {
-                org_limit: Some(6),
-                subject: None,
-            },
-            SandboxQuotaOutcome::Refuse(SandboxQuotaRefusal::Org { limit: 6 }),
+            org_quota(org_id, 7),
+            SandboxQuotaOutcome::Refuse(SandboxQuotaRefusal::Org { limit: 7 }),
         ),
+        (org_quota(org_id, 8), SandboxQuotaOutcome::Admit),
         (
             SandboxQuota {
+                org_id,
                 org_limit: Some(7),
-                subject: None,
-            },
-            SandboxQuotaOutcome::Admit,
-        ),
-        (
-            SandboxQuota {
-                org_limit: Some(6),
                 subject: subject(new_subject, 10),
             },
-            SandboxQuotaOutcome::Refuse(SandboxQuotaRefusal::Org { limit: 6 }),
+            SandboxQuotaOutcome::Refuse(SandboxQuotaRefusal::Org { limit: 7 }),
         ),
         (
             SandboxQuota {
+                org_id,
                 org_limit: None,
                 subject: subject(subject_a, 2),
             },
@@ -127,13 +125,15 @@ async fn the_org_limit_counts_every_owner_and_a_subject_limit_its_own() -> TestR
         ),
         (
             SandboxQuota {
-                org_limit: Some(7),
+                org_id,
+                org_limit: Some(8),
                 subject: subject(subject_a, 3),
             },
             SandboxQuotaOutcome::Admit,
         ),
         (
             SandboxQuota {
+                org_id,
                 org_limit: None,
                 subject: subject(new_subject, 1),
             },
@@ -142,7 +142,7 @@ async fn the_org_limit_counts_every_owner_and_a_subject_limit_its_own() -> TestR
     ] {
         let mut admission = begin(&store, org_id, "count").await?;
         assert_eq!(
-            quota_outcome(&mut admission, org_id, quota).await?,
+            admission.admit_new_create(quota).await?,
             expected,
             "{quota:?}"
         );
@@ -168,6 +168,7 @@ async fn an_exclusive_create_waits_for_a_racing_create_and_counts_it() -> TestRe
                 actor_id.as_uuid(),
                 SUBJECT_LOCK_SEED,
                 SandboxQuota {
+                    org_id,
                     org_limit: None,
                     subject: Some(SubjectSandboxQuota {
                         user_id: actor_id,
@@ -180,10 +181,7 @@ async fn an_exclusive_create_waits_for_a_racing_create_and_counts_it() -> TestRe
             (
                 org_id.as_uuid(),
                 ORG_LOCK_SEED,
-                SandboxQuota {
-                    org_limit: Some(1),
-                    subject: None,
-                },
+                org_quota(org_id, 1),
                 SandboxQuotaRefusal::Org { limit: 1 },
             )
         };
@@ -198,12 +196,12 @@ async fn an_exclusive_create_waits_for_a_racing_create_and_counts_it() -> TestRe
         .await?;
 
         let mut waiting = begin(&store, org_id, "exclusive-waiting").await?;
-        let plan = planned(&mut waiting, org_id, quota).await?;
+        let plan = planned(&mut waiting, quota).await?;
         let waiting = tokio::spawn(async move {
-            let outcome = waiting.enforce_sandbox_quota(org_id, plan).await;
+            let outcome = waiting.enforce_sandbox_quota(plan).await;
             waiting.finish().await.map(|()| outcome)
         });
-        assert_waits(&waiting).await;
+        wait_until_blocked_by(&mut racing).await?;
 
         racing.commit().await?;
         assert_eq!(
@@ -227,28 +225,25 @@ async fn a_near_limit_create_waits_for_in_flight_shared_creates() -> TestResult 
     let org_id = seed_org(&db.pool).await?;
     let actor_id = seed_user(&db.pool, org_id, None).await?;
     let store = PublicOperationStore::new(db.pool.clone());
-    let quota = SandboxQuota {
-        org_limit: Some(1000),
-        subject: None,
-    };
+    let quota = org_quota(org_id, 1000);
     seed_sandboxes(&db.pool, org_id, actor_id, 799).await?;
 
     // Well under the limit: admitted under the shared lock, not yet recorded.
     let mut shared = begin(&store, org_id, "shared-in-flight").await?;
     assert_eq!(
-        quota_outcome(&mut shared, org_id, quota).await?,
+        shared.admit_new_create(quota).await?,
         SandboxQuotaOutcome::Admit
     );
     // Others fill the org to one under its limit.
     seed_sandboxes(&db.pool, org_id, actor_id, 200).await?;
 
     let mut near = begin(&store, org_id, "near-limit").await?;
-    let plan = planned(&mut near, org_id, quota).await?;
+    let plan = planned(&mut near, quota).await?;
     let near = tokio::spawn(async move {
-        let outcome = near.enforce_sandbox_quota(org_id, plan).await;
+        let outcome = near.enforce_sandbox_quota(plan).await;
         near.finish().await.map(|()| outcome)
     });
-    assert_waits(&near).await;
+    wait_until_blocked_by(&mut shared.tx).await?;
 
     let target_id = PublicSandboxId::new().to_string();
     let key = IdempotencyKey::parse("shared-in-flight")?;
@@ -279,14 +274,11 @@ async fn a_shared_count_that_moved_near_the_limit_is_contended() -> TestResult {
     let org_id = seed_org(&db.pool).await?;
     let actor_id = seed_user(&db.pool, org_id, None).await?;
     let store = PublicOperationStore::new(db.pool.clone());
-    let quota = SandboxQuota {
-        org_limit: Some(1000),
-        subject: None,
-    };
+    let quota = org_quota(org_id, 1000);
     seed_sandboxes(&db.pool, org_id, actor_id, 799).await?;
 
     let mut shared = begin(&store, org_id, "planned-shared").await?;
-    let plan = planned(&mut shared, org_id, quota).await?;
+    let plan = planned(&mut shared, quota).await?;
 
     let mut racing = db.pool.begin().await?;
     lock_tx(
@@ -306,10 +298,10 @@ async fn a_shared_count_that_moved_near_the_limit_is_contended() -> TestResult {
     .await?;
 
     let shared = tokio::spawn(async move {
-        let outcome = shared.enforce_sandbox_quota(org_id, plan).await;
+        let outcome = shared.enforce_sandbox_quota(plan).await;
         shared.finish().await.map(|()| outcome)
     });
-    assert_waits(&shared).await;
+    wait_until_blocked_by(&mut racing).await?;
     racing.commit().await?;
     assert_eq!(shared.await???, SandboxQuotaOutcome::Contended);
     Ok(())
@@ -337,14 +329,11 @@ async fn shared_creates_do_not_wait_for_each_other_and_refusals_take_no_lock() -
     ] {
         let mut holder = db.pool.begin().await?;
         lock_tx(&mut holder, org_id.as_uuid(), ORG_LOCK_SEED, held_mode).await?;
-        let quota = SandboxQuota {
-            org_limit: Some(limit),
-            subject: None,
-        };
+        let quota = org_quota(org_id, limit);
         let check = async {
             let mut admission = begin(&store, org_id, "no-wait").await?;
-            let outcome = match admission.plan_sandbox_quota(org_id, quota).await? {
-                Ok(plan) => Ok(admission.enforce_sandbox_quota(org_id, plan).await?),
+            let outcome = match admission.plan_sandbox_quota(quota).await? {
+                Ok(plan) => Ok(admission.enforce_sandbox_quota(plan).await?),
                 Err(refusal) => Err(refusal),
             };
             admission.finish().await?;
@@ -359,35 +348,105 @@ async fn shared_creates_do_not_wait_for_each_other_and_refusals_take_no_lock() -
     Ok(())
 }
 
-async fn quota_outcome(
-    admission: &mut PublicOperationAdmission,
-    org_id: OrgId,
-    quota: SandboxQuota,
-) -> Result<SandboxQuotaOutcome, PublicOperationStoreError> {
-    Ok(match admission.plan_sandbox_quota(org_id, quota).await? {
-        Ok(plan) => admission.enforce_sandbox_quota(org_id, plan).await?,
-        Err(refusal) => SandboxQuotaOutcome::Refuse(refusal),
-    })
+/// A create waiting for its quota lock gives up after
+/// [`QUOTA_LOCK_TIMEOUT`], or sooner under a shorter `statement_timeout`, as
+/// contended rather than holding its connection until the holder commits.
+/// The bound covers the lock statements only: the rest of an admitted
+/// create's transaction keeps the session's own `lock_timeout`.
+#[tokio::test]
+async fn a_long_quota_lock_wait_ends_contended() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(3).await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let quota = org_quota(org_id, 1);
+
+    let mut holder = db.pool.begin().await?;
+    lock_tx(
+        &mut holder,
+        org_id.as_uuid(),
+        ORG_LOCK_SEED,
+        LockMode::Exclusive,
+    )
+    .await?;
+
+    let mut waiting = begin(&store, org_id, "lock-timeout").await?;
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(3 * QUOTA_LOCK_TIMEOUT, waiting.admit_new_create(quota))
+        .await
+        .map_err(|_| "the lock wait was not bounded")??;
+    assert_eq!(outcome, SandboxQuotaOutcome::Contended);
+    assert!(started.elapsed() >= QUOTA_LOCK_TIMEOUT);
+    drop(waiting);
+
+    let mut waiting = begin(&store, org_id, "statement-timeout").await?;
+    sqlx::query(sql!("SET LOCAL statement_timeout = '100ms'"))
+        .execute(&mut *waiting.tx)
+        .await?;
+    let outcome = tokio::time::timeout(QUOTA_LOCK_TIMEOUT / 2, waiting.admit_new_create(quota))
+        .await
+        .map_err(|_| "the statement timeout did not end the wait")??;
+    assert_eq!(outcome, SandboxQuotaOutcome::Contended);
+    drop(waiting);
+    holder.rollback().await?;
+
+    let mut admitted = begin(&store, org_id, "admitted").await?;
+    let show = sql!("SHOW lock_timeout");
+    let session_default: String = sqlx::query_scalar(show)
+        .fetch_one(&mut *admitted.tx)
+        .await?;
+    assert_eq!(
+        admitted.admit_new_create(quota).await?,
+        SandboxQuotaOutcome::Admit
+    );
+    let after: String = sqlx::query_scalar(show)
+        .fetch_one(&mut *admitted.tx)
+        .await?;
+    assert_eq!(after, session_default);
+    Ok(())
+}
+
+fn org_quota(org_id: OrgId, limit: u32) -> SandboxQuota {
+    SandboxQuota {
+        org_id,
+        org_limit: Some(limit),
+        subject: None,
+    }
 }
 
 async fn planned(
     admission: &mut PublicOperationAdmission,
-    org_id: OrgId,
     quota: SandboxQuota,
 ) -> TestResult<SandboxQuotaPlan> {
     admission
-        .plan_sandbox_quota(org_id, quota)
+        .plan_sandbox_quota(quota)
         .await?
         .map_err(|refusal| format!("refused at the lock-free count: {refusal:?}").into())
 }
 
-/// Give a spawned check time to block, and fail if it did not.
-async fn assert_waits<T>(task: &tokio::task::JoinHandle<T>) {
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        !task.is_finished(),
-        "the create must wait for the racing create to commit"
-    );
+/// Wait until some backend is blocked on a lock `holder` holds: proof that
+/// the create under test queued behind it.
+async fn wait_until_blocked_by(holder: &mut PgConnection) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let blocked: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND pg_backend_pid() = ANY(pg_blocking_pids(pid))
+             )"
+        ))
+        .fetch_one(&mut *holder)
+        .await?;
+        if blocked {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("the create never waited for the holder's lock".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn begin(

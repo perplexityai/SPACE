@@ -6,9 +6,14 @@
 //! is its entry in `SPACE_NATIVE_ORG_SANDBOX_LIMIT_OVERRIDES` if it has one,
 //! else `SPACE_NATIVE_ORG_SANDBOX_LIMIT`. `SPACE_NATIVE_SUBJECT_SANDBOX_LIMIT`
 //! additionally limits each federated-identity subject. Malformed values fail
-//! startup rather than silently leaving a caller uncapped.
+//! startup rather than silently leaving a caller uncapped: a non-integer or
+//! negative limit, `0` for the default or per-user limit (an override of `0`
+//! is allowed and refuses every native create of that org), and overrides
+//! that are not a JSON object of organization ids, or that repeat one.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use pplx_space_common_core::types::{OrgId, UserId};
@@ -21,9 +26,9 @@ const SUBJECT_LIMIT_ENV: &str = "SPACE_NATIVE_SUBJECT_SANDBOX_LIMIT";
 
 #[derive(Clone, Debug, Default)]
 pub struct NativeSandboxLimits {
-    default_limit: Option<u32>,
+    default_limit: Option<NonZeroU32>,
     overrides: Arc<BTreeMap<OrgId, u32>>,
-    subject_limit: Option<u32>,
+    subject_limit: Option<NonZeroU32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -40,11 +45,18 @@ pub enum NativeSandboxLimitsConfigError {
 
 impl NativeSandboxLimits {
     pub fn from_env() -> Result<Self, NativeSandboxLimitsConfigError> {
-        Self::parse(
+        let limits = Self::parse(
             env_var(DEFAULT_LIMIT_ENV)?.as_deref(),
             env_var(OVERRIDES_ENV)?.as_deref(),
             env_var(SUBJECT_LIMIT_ENV)?.as_deref(),
-        )
+        )?;
+        tracing::info!(
+            default_org_limit = ?limits.default_limit,
+            org_overrides = limits.overrides.len(),
+            subject_limit = ?limits.subject_limit,
+            "native create sandbox limits configured"
+        );
+        Ok(limits)
     }
 
     fn parse(
@@ -59,13 +71,13 @@ impl NativeSandboxLimits {
         let overrides = overrides
             .map(str::trim)
             .filter(|raw| !raw.is_empty())
-            .map(serde_json::from_str)
+            .map(serde_json::from_str::<Overrides>)
             .transpose()
             .map_err(NativeSandboxLimitsConfigError::Overrides)?
             .unwrap_or_default();
         Ok(Self {
             default_limit,
-            overrides: Arc::new(overrides),
+            overrides: Arc::new(overrides.0),
             subject_limit,
         })
     }
@@ -79,10 +91,14 @@ impl NativeSandboxLimits {
         federated_subject: Option<UserId>,
     ) -> Option<SandboxQuota> {
         let quota = SandboxQuota {
+            org_id,
             org_limit: self.limit_for(org_id),
             subject: federated_subject
                 .zip(self.subject_limit)
-                .map(|(user_id, limit)| SubjectSandboxQuota { user_id, limit }),
+                .map(|(user_id, limit)| SubjectSandboxQuota {
+                    user_id,
+                    limit: limit.get(),
+                }),
         };
         (quota.org_limit.is_some() || quota.subject.is_some()).then_some(quota)
     }
@@ -90,11 +106,50 @@ impl NativeSandboxLimits {
     /// The most sandboxes `org_id` may hold, counting creates still in
     /// flight, or `None` when the org is uncapped.
     fn limit_for(&self, org_id: OrgId) -> Option<u32> {
-        self.overrides.get(&org_id).copied().or(self.default_limit)
+        self.overrides
+            .get(&org_id)
+            .copied()
+            .or(self.default_limit.map(NonZeroU32::get))
     }
 }
 
-fn parse_limit(raw: Option<&str>) -> Result<Option<u32>, std::num::ParseIntError> {
+/// `SPACE_NATIVE_ORG_SANDBOX_LIMIT_OVERRIDES`: a map deserialized by hand so
+/// that a repeated organization id fails instead of keeping the last value.
+#[derive(Default)]
+struct Overrides(BTreeMap<OrgId, u32>);
+
+impl<'de> serde::Deserialize<'de> for Overrides {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Overrides;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object mapping organization ids to sandbox limits")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Overrides, A::Error> {
+                let mut overrides = BTreeMap::new();
+                while let Some((org_id, limit)) = map.next_entry::<OrgId, u32>()? {
+                    if overrides.insert(org_id, limit).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "organization {org_id} is listed more than once"
+                        )));
+                    }
+                }
+                Ok(Overrides(overrides))
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+fn parse_limit(raw: Option<&str>) -> Result<Option<NonZeroU32>, std::num::ParseIntError> {
     raw.map(str::trim)
         .filter(|raw| !raw.is_empty())
         .map(str::parse)

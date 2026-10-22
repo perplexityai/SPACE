@@ -79,7 +79,7 @@ mod responses;
 pub(crate) use responses::ResponseAdmissionError;
 mod sandbox_quota;
 pub use sandbox_quota::{
-    SandboxQuota, SandboxQuotaOutcome, SandboxQuotaPlan, SandboxQuotaRefusal, SubjectSandboxQuota,
+    SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal, SubjectSandboxQuota,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

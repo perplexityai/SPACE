@@ -164,3 +164,39 @@ pub fn dispatcher_slots(in_flight: usize, capacity: usize) {
 pub fn retry_wait_deferred(site: &str) {
     counter("operations.retry_wait_deferred", 1, &[tag("site", site)]);
 }
+
+metric_vocabulary!(
+    /// How a native create's live-sandbox limits answered it: the `outcome`
+    /// tag on `operations.sandbox_quota`.
+    SandboxQuotaOutcome {
+        Admit => "admit",
+        /// The organization's limit refused it.
+        RefuseOrg => "refuse_org",
+        /// The caller's per-user limit refused it.
+        RefuseSubject => "refuse_subject",
+        /// Its count moved into the headroom while it waited for the lock, or
+        /// the lock wait timed out; it answered a retryable 503.
+        Contended => "contended",
+    }
+);
+
+metric_vocabulary!(
+    /// The strongest quota lock a checked create took: the `lock_mode` tag on
+    /// `operations.sandbox_quota`.
+    SandboxQuotaLockMode {
+        /// Refused at the lock-free count, before taking any lock.
+        None => "none",
+        Shared => "shared",
+        Exclusive => "exclusive",
+    }
+);
+
+/// A genuinely new native create checked against its live-sandbox limits.
+/// Creates without a limit, replays and key conflicts are not recorded.
+pub fn sandbox_quota(outcome: SandboxQuotaOutcome, lock_mode: SandboxQuotaLockMode) {
+    counter(
+        "operations.sandbox_quota",
+        1,
+        &[tag("outcome", outcome), tag("lock_mode", lock_mode)],
+    );
+}

@@ -5,18 +5,17 @@
 //! sandbox of the org whoever owns it, and, for a federated-identity caller,
 //! to a per-subject limit that counts the subject's own. "Live" excludes the
 //! terminal set the lifecycle guards use (`failed`, `quarantined`, `deleted`,
-//! `cleanup_required`); queued or running native creates that have no row
-//! yet count too. A create targets its public sandbox id, the row's id with
-//! the public prefix, so one past its row insert is counted once.
+//! `cleanup_required`); queued or running native creates without a live row
+//! count too. A create targets its public sandbox id, the row's id with the
+//! public prefix, so one past its row insert is counted once.
 //!
 //! # Concurrency
 //!
 //! Each limit has an advisory transaction lock: per org for the org limit,
-//! per subject for the subject limit. [`PublicOperationAdmission::plan_sandbox_quota`]
-//! counts without a lock and picks a lock mode for each limit;
-//! [`PublicOperationAdmission::enforce_sandbox_quota`] takes the locks in that
-//! mode and counts again before the caller records the create in the same
-//! transaction.
+//! per subject for the subject limit. [`PublicOperationAdmission::admit_new_create`]
+//! counts without a lock and picks a lock mode for each limit, then takes the
+//! locks in that mode and counts again before the caller records the create
+//! in the same transaction.
 //!
 //! * Well under a limit (below `limit - 2 * headroom`, see [`headroom`]) a
 //!   create takes the lock shared, so such creates do not wait for one
@@ -28,14 +27,19 @@
 //! Every create holds its lock from its count through its commit, and the
 //! count is a new statement after the lock is granted, so under READ
 //! COMMITTED it sees every create that held the lock before it. An exclusive
-//! holder therefore sees all creates that could still commit, and never
-//! admits past the limit. Creates holding the lock shared at the same time do
-//! not see one another; each counted under `limit - headroom`, so together
-//! they exceed the limit only when more than `headroom` of them hold it at
-//! once, and by at most that excess. Each holder is an open transaction on
-//! some API replica, so the excess is below the API's total database
-//! connections across all replicas less the headroom. A limit of
-//! `2 * MIN_LOCK_HEADROOM` or less is always checked exclusively and is exact.
+//! holder therefore sees all native creates that could still commit, and
+//! admits none past the limit. That holds only among native creates on
+//! replicas running this check with the same limits: ECW, fork and admin
+//! creates, the failed-sandbox repair that returns a `failed` row to
+//! `suspended`, and a replica without this check take no quota lock, so the
+//! count sees their sandboxes only once committed. Creates holding the lock
+//! shared at the same time do not see one another; each counted under
+//! `limit - headroom`, so together they exceed the limit only when more than
+//! `headroom` of them hold it at once, and by at most that excess. Each
+//! holder is an open transaction on some API replica, so the excess is below
+//! the API's total database connections across all replicas less the
+//! headroom. A limit of `2 * MIN_LOCK_HEADROOM` or less is always checked
+//! exclusively and is exact.
 //!
 //! A shared count that lands between `limit - headroom` and `limit` (the
 //! count grew while the create waited for the lock) cannot be upgraded to
@@ -43,16 +47,28 @@
 //! create is answered [`SandboxQuotaOutcome::Contended`] and the caller
 //! retries; the retry counts near the limit and takes the lock exclusively.
 //!
+//! Each lock wait is bounded by [`QUOTA_LOCK_TIMEOUT`]. Near a limit creates
+//! queue on the exclusive lock, each holding its pooled connection while it
+//! waits; past the bound the wait ends as [`SandboxQuotaOutcome::Contended`]
+//! too, so a burst at one org parks connections for at most that long.
+//!
 //! Locks are taken subject first, then org, after the idempotency-key lock,
 //! on every create, so they cannot deadlock. Deletes take none; one landing
 //! concurrently only lowers a count.
 
+use std::time::Duration;
+
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_common_svc::sql::contention;
+use pplx_space_metrics::operations as metrics;
 use pplx_space_public_api::OperationKind;
 use sqlx::{Postgres, Transaction};
 
-use super::{ApiProduct, PublicOperationAdmission, PublicOperationStoreError};
+use super::{
+    ApiProduct, ObservePublicOperationIdempotency, PublicOperationAdmission,
+    PublicOperationStoreError,
+};
 
 /// Stable namespace for the per-org quota lock.
 const ORG_LOCK_SEED: i64 = 0x6f72_675f_7162;
@@ -60,11 +76,17 @@ const ORG_LOCK_SEED: i64 = 0x6f72_675f_7162;
 const SUBJECT_LOCK_SEED: i64 = 0x7375_625f_7162;
 /// The smallest headroom; see [`headroom`].
 const MIN_LOCK_HEADROOM: i64 = 64;
+/// The longest a create waits for one quota lock before it answers
+/// [`SandboxQuotaOutcome::Contended`]. Set transaction-locally around the
+/// lock statements only, so the rest of the admission keeps the role's own
+/// `lock_timeout`.
+const QUOTA_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The limits a native create is held to. Build one only when at least one
-/// is set.
+/// The limits one native create in `org_id` is held to. Build one only when
+/// at least one is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SandboxQuota {
+    pub org_id: OrgId,
     /// The org's limit over every live sandbox it holds.
     pub org_limit: Option<u32>,
     /// A federated-identity caller's own limit.
@@ -88,11 +110,12 @@ pub enum SandboxQuotaRefusal {
 pub enum SandboxQuotaOutcome {
     Admit,
     Refuse(SandboxQuotaRefusal),
-    /// The count moved while the create waited for its lock; retry.
+    /// The count moved while the create waited for its lock, or the wait
+    /// timed out; retry.
     Contended,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum LockMode {
     Shared,
     Exclusive,
@@ -100,13 +123,27 @@ enum LockMode {
 
 /// The lock mode each limit of one create takes, from a lock-free count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SandboxQuotaPlan {
+struct SandboxQuotaPlan {
+    org_id: OrgId,
     org: Option<(u32, LockMode)>,
     subject: Option<(UserId, u32, LockMode)>,
 }
 
-/// The margin below a limit within which creates are serialized: a tenth of
-/// the limit, never less than [`MIN_LOCK_HEADROOM`].
+impl SandboxQuotaPlan {
+    fn strongest_mode(&self) -> metrics::SandboxQuotaLockMode {
+        let org = self.org.map(|(_, mode)| mode);
+        let subject = self.subject.map(|(_, _, mode)| mode);
+        match org.max(subject) {
+            Some(LockMode::Exclusive) => metrics::SandboxQuotaLockMode::Exclusive,
+            Some(LockMode::Shared) => metrics::SandboxQuotaLockMode::Shared,
+            None => metrics::SandboxQuotaLockMode::None,
+        }
+    }
+}
+
+/// The margin below a limit within which a create taking the lock shared is
+/// not admitted: a tenth of the limit, never less than [`MIN_LOCK_HEADROOM`].
+/// Creates are serialized within twice this of the limit.
 fn headroom(limit: u32) -> i64 {
     (i64::from(limit) / 10).max(MIN_LOCK_HEADROOM)
 }
@@ -142,18 +179,56 @@ enum Verdict {
 }
 
 impl PublicOperationAdmission {
-    /// Count the caller's sandboxes without a lock. A create at or over a
-    /// limit is refused here, before the caller does any other work in the
-    /// transaction (an admission-time warm-pool claim); otherwise the plan
-    /// says how [`Self::enforce_sandbox_quota`] locks. Call only for a
-    /// genuinely new create: a replay or a key conflict is not counted.
-    pub(crate) async fn plan_sandbox_quota(
+    /// Hold a genuinely new create to `quota`. A replay or a key conflict is
+    /// not counted and is answered [`SandboxQuotaOutcome::Admit`], so the
+    /// admission answers it as before. Call before any other work in the
+    /// transaction (an admission-time warm-pool claim), so a refused create,
+    /// or one waiting for its lock, holds no slot. On `Admit` the transaction
+    /// holds the quota locks until it ends; record the create in it next.
+    /// Otherwise drop it.
+    pub(crate) async fn admit_new_create(
         &mut self,
-        org_id: OrgId,
+        quota: SandboxQuota,
+    ) -> Result<SandboxQuotaOutcome, PublicOperationStoreError> {
+        if !matches!(
+            self.observation(),
+            ObservePublicOperationIdempotency::Missing
+        ) {
+            return Ok(SandboxQuotaOutcome::Admit);
+        }
+        let (outcome, lock_mode) = match self.plan_sandbox_quota(quota).await? {
+            Err(refusal) => (
+                SandboxQuotaOutcome::Refuse(refusal),
+                metrics::SandboxQuotaLockMode::None,
+            ),
+            Ok(plan) => (
+                self.enforce_sandbox_quota(plan).await?,
+                plan.strongest_mode(),
+            ),
+        };
+        let label = match outcome {
+            SandboxQuotaOutcome::Admit => metrics::SandboxQuotaOutcome::Admit,
+            SandboxQuotaOutcome::Refuse(SandboxQuotaRefusal::Org { .. }) => {
+                metrics::SandboxQuotaOutcome::RefuseOrg
+            }
+            SandboxQuotaOutcome::Refuse(SandboxQuotaRefusal::Subject { .. }) => {
+                metrics::SandboxQuotaOutcome::RefuseSubject
+            }
+            SandboxQuotaOutcome::Contended => metrics::SandboxQuotaOutcome::Contended,
+        };
+        metrics::sandbox_quota(label, lock_mode);
+        Ok(outcome)
+    }
+
+    /// Count the caller's sandboxes without a lock: a create at or over a
+    /// limit is refused here; otherwise the plan says how
+    /// [`Self::enforce_sandbox_quota`] locks.
+    async fn plan_sandbox_quota(
+        &mut self,
         quota: SandboxQuota,
     ) -> Result<Result<SandboxQuotaPlan, SandboxQuotaRefusal>, PublicOperationStoreError> {
         let subject_id = quota.subject.map(|subject| subject.user_id);
-        let held = sandboxes_held_tx(&mut self.tx, org_id, subject_id).await?;
+        let held = sandboxes_held_tx(&mut self.tx, quota.org_id, subject_id).await?;
         let org = match quota.org_limit {
             None => None,
             Some(limit) => match plan_limit(held.org, limit) {
@@ -168,25 +243,48 @@ impl PublicOperationAdmission {
                 Err(()) => return Ok(Err(SandboxQuotaRefusal::Subject { limit })),
             },
         };
-        Ok(Ok(SandboxQuotaPlan { org, subject }))
+        Ok(Ok(SandboxQuotaPlan {
+            org_id: quota.org_id,
+            org,
+            subject,
+        }))
     }
 
     /// Take the plan's locks, held until the transaction ends, and count
-    /// again. Record the create in this transaction only on
-    /// [`SandboxQuotaOutcome::Admit`].
-    pub(crate) async fn enforce_sandbox_quota(
+    /// again. A lock wait that ends in `lock_timeout` or `statement_timeout`
+    /// is [`SandboxQuotaOutcome::Contended`] and leaves the transaction
+    /// aborted.
+    async fn enforce_sandbox_quota(
         &mut self,
-        org_id: OrgId,
         plan: SandboxQuotaPlan,
     ) -> Result<SandboxQuotaOutcome, PublicOperationStoreError> {
-        if let Some((user_id, _, mode)) = plan.subject {
-            lock_tx(&mut self.tx, user_id.as_uuid(), SUBJECT_LOCK_SEED, mode).await?;
+        let locks = [
+            plan.subject
+                .map(|(user_id, _, mode)| (user_id.as_uuid(), SUBJECT_LOCK_SEED, mode)),
+            plan.org
+                .map(|(_, mode)| (plan.org_id.as_uuid(), ORG_LOCK_SEED, mode)),
+        ];
+        set_lock_timeout_tx(&mut self.tx, Some(QUOTA_LOCK_TIMEOUT)).await?;
+        for (id, seed, mode) in locks.into_iter().flatten() {
+            match lock_tx(&mut self.tx, id, seed, mode).await {
+                Ok(()) => {}
+                Err(error)
+                    if contention::is_lock_contention(&error)
+                        || contention::is_query_canceled(&error) =>
+                {
+                    tracing::warn!(
+                        error = %error,
+                        org_id = %plan.org_id,
+                        "native create gave up waiting for its sandbox quota lock; retryable"
+                    );
+                    return Ok(SandboxQuotaOutcome::Contended);
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        if let Some((_, mode)) = plan.org {
-            lock_tx(&mut self.tx, org_id.as_uuid(), ORG_LOCK_SEED, mode).await?;
-        }
+        set_lock_timeout_tx(&mut self.tx, None).await?;
         let subject_id = plan.subject.map(|(user_id, _, _)| user_id);
-        let held = sandboxes_held_tx(&mut self.tx, org_id, subject_id).await?;
+        let held = sandboxes_held_tx(&mut self.tx, plan.org_id, subject_id).await?;
         let org = plan.org.map(|(limit, mode)| {
             (
                 enforce_limit(held.org, limit, mode),
@@ -212,6 +310,31 @@ impl PublicOperationAdmission {
     }
 }
 
+/// Bound this transaction's lock waits by `timeout`, or with `None` return
+/// them to the session default, the role's `lock_timeout`; the API sets none
+/// of its own on a session.
+async fn set_lock_timeout_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    timeout: Option<Duration>,
+) -> Result<(), sqlx::Error> {
+    match timeout {
+        // `set_config(..., is_local => true)` is `SET LOCAL` with a bind
+        // parameter.
+        Some(timeout) => {
+            sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
+                .bind(format!("{}ms", timeout.as_millis()))
+                .execute(&mut **tx)
+                .await?
+        }
+        None => {
+            sqlx::query(sql!("SET LOCAL lock_timeout TO DEFAULT"))
+                .execute(&mut **tx)
+                .await?
+        }
+    };
+    Ok(())
+}
+
 async fn lock_tx(
     tx: &mut Transaction<'_, Postgres>,
     id: uuid::Uuid,
@@ -235,8 +358,16 @@ struct SandboxesHeld {
     subject: i64,
 }
 
-/// The org's live sandboxes plus its in-flight native creates without a row,
-/// and the share of those `subject_id` owns or requested (zero without one).
+/// The org's live sandboxes plus its in-flight native creates without a
+/// live row, and the share of those `subject_id` owns or requested (zero
+/// without one). An in-flight create whose row went terminal (a drain sweep
+/// failed it while the create ran) still counts: it can retry and succeed.
+///
+/// One statement on purpose, which is why it reads `sandboxes` here rather
+/// than through `pplx-space-sandbox-store`: split into a row count and an
+/// operation count, two READ COMMITTED snapshots could miss a create whose
+/// row lands between them, counted by neither half. The terminal set repeats
+/// the lifecycle CAS guards' list.
 ///
 /// Cost: only a custom plan takes `idx_public_operations_state_next_attempt`
 /// alone, over the cluster's active operations; the generic plan a cached
@@ -269,6 +400,7 @@ async fn sandboxes_held_tx(
                          FROM sandboxes s
                         WHERE s.org_id = $1
                           AND $5 || s.id::text = op.target_id
+                          AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
                    )
            ) held"
     ))

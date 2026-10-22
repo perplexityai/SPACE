@@ -30,6 +30,16 @@ fn an_org_override_takes_precedence_over_the_default() {
     assert_eq!(quota.limit_for(other), Some(100));
 }
 
+/// An override of zero is an explicit choice for one org: it refuses every
+/// native create of that org.
+#[test]
+fn an_org_override_of_zero_is_kept() {
+    let blocked = OrgId::new();
+    let overrides = format!(r#"{{"{blocked}": 0}}"#);
+    let quota = NativeSandboxLimits::parse(Some("100"), Some(&overrides), None).unwrap();
+    assert_eq!(quota.limit_for(blocked), Some(0));
+}
+
 #[test]
 fn only_a_federated_caller_has_a_subject_limit() {
     let org = OrgId::new();
@@ -39,6 +49,7 @@ fn only_a_federated_caller_has_a_subject_limit() {
     assert_eq!(
         subject_only.for_create(org, Some(subject)),
         Some(SandboxQuota {
+            org_id: org,
             org_limit: None,
             subject: Some(SubjectSandboxQuota {
                 user_id: subject,
@@ -51,6 +62,7 @@ fn only_a_federated_caller_has_a_subject_limit() {
     assert_eq!(
         both.for_create(org, None),
         Some(SandboxQuota {
+            org_id: org,
             org_limit: Some(100),
             subject: None,
         })
@@ -75,6 +87,17 @@ fn malformed_configuration_is_rejected() {
         ),
         (None, Some("[3]"), None),
         (None, None, Some("five")),
+        (None, None, Some("-5")),
+        // Zero is not "no limit": unset means that.
+        (Some("0"), None, None),
+        (None, None, Some("0")),
+        (
+            None,
+            Some(
+                r#"{"0190d5a4-2b4e-7c3e-8f00-000000000001": 3, "0190d5a4-2b4e-7c3e-8f00-000000000001": 5}"#,
+            ),
+            None,
+        ),
     ] {
         assert!(
             NativeSandboxLimits::parse(default_limit, overrides, subject_limit).is_err(),

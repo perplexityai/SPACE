@@ -318,7 +318,7 @@ pub(crate) async fn create_native_sandbox_operation(
                     // Before the claim, so a refused create never takes a
                     // slot and one waiting for its quota lock holds none.
                     if let Some(quota) = sandbox_quota {
-                        admit_within_sandbox_quota(&mut admission, org_id, quota).await?;
+                        admit_within_sandbox_quota(&mut admission, quota).await?;
                     }
                     match controller
                         .claim_admission_pool_slot(admission.transaction(), template_release_id)
@@ -473,28 +473,19 @@ async fn create_unclaimed_operation(
     let mut admission = store
         .begin_operation_admission(input.org_id, ApiProduct::Native, idempotency)
         .await?;
-    if matches!(
-        admission.observation(),
-        ObservePublicOperationIdempotency::Missing
-    ) {
-        admit_within_sandbox_quota(&mut admission, input.org_id, quota).await?;
-    }
+    admit_within_sandbox_quota(&mut admission, quota).await?;
     Ok(admission.create(input).await?)
 }
 
 /// Hold a genuinely new create to `quota` in its admission transaction,
-/// which then holds the quota locks until it commits. Record the create
-/// through `admission` next; an error drops it, rolling the transaction back.
+/// which then holds the quota locks until it commits; a replay or key
+/// conflict passes. Record the create through `admission` next; an error
+/// drops it, rolling the transaction back.
 async fn admit_within_sandbox_quota(
     admission: &mut PublicOperationAdmission,
-    org_id: OrgId,
     quota: SandboxQuota,
 ) -> Result<(), PublicApiError> {
-    let plan = admission
-        .plan_sandbox_quota(org_id, quota)
-        .await?
-        .map_err(sandbox_quota_refused)?;
-    match admission.enforce_sandbox_quota(org_id, plan).await? {
+    match admission.admit_new_create(quota).await? {
         SandboxQuotaOutcome::Admit => Ok(()),
         SandboxQuotaOutcome::Refuse(refusal) => Err(sandbox_quota_refused(refusal)),
         SandboxQuotaOutcome::Contended => Err(PublicApiError::lock_contention()),
