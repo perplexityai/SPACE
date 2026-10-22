@@ -19,6 +19,15 @@ networkPolicy:
   receiverPeers: []
   queryPeers: []
   additionalEgress: []
+# Cross-namespace scrape of the optional space-infra-metrics release. Leave
+# namespace empty and Prometheus scrapes nothing extra, so a cluster without
+# that release gets no failing targets.
+scrape:
+  infraMetrics:
+    namespace: ""
+    kubeStateMetrics: false
+    processExporter: false
+
 collector:
   # false runs only the backend, fed by an external Collector labelled
   # app=collector in this namespace (the space-observability gateway).

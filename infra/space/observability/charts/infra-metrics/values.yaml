@@ -1,0 +1,67 @@
+# Both sources are off by default. They replace Datadog Agent integrations
+# rather than any OTLP producer, so a cluster that keeps the Agent needs
+# neither, and a cluster that drops it loses these metrics without them.
+profile: shared
+
+# Kubernetes object state: namespaces, workloads, pod phases. Replaces the
+# Agent's kubernetes_state integration. Needs cluster-wide read on the object
+# kinds it exports and nothing else.
+kubeStateMetrics:
+  enabled: false
+  # Exported groups. Narrow this rather than widening: every group is a
+  # cluster-wide read and a cardinality source.
+  resources:
+    - namespaces
+    - nodes
+    - pods
+    - deployments
+    - daemonsets
+    - statefulsets
+  requests: {cpu: 10m, memory: 64Mi}
+  limits: {cpu: 100m, memory: 192Mi}
+
+# Per-process CPU and memory. Replaces the Agent's Live Processes product,
+# which is the only source of proc.* metrics today.
+#
+# This requires hostPID: the exporter reads /proc for every process on the
+# node, so it can see command lines cluster-wide. That is a real privilege
+# escalation beyond the other releases here. Enable it deliberately, per
+# cluster, and keep processNames narrow: a broad matcher turns command-line
+# arguments into metric labels.
+processExporter:
+  enabled: false
+  # Acknowledge the hostPID grant explicitly. The chart refuses to render
+  # without it, so no values file enables this by accident.
+  acknowledgeHostPid: false
+  # Matchers. `exe` matches the executable's basename; `comm` would not,
+  # because Linux truncates comm to 15 characters and every SPACE service
+  # name is longer than that -- `space-spaced-host-svc` appears as
+  # `space-spaced-ho` and a comm matcher silently matches nothing.
+  #
+  # `name` templates the metric's groupname from the executable, never from
+  # the command line, so no argument value becomes a metric label.
+  processNames:
+    - name: "{{.ExeBase}}"
+      exe:
+        - firecracker
+        - space-spaced-host-svc
+        - space-netgtw-svc
+  requests: {cpu: 10m, memory: 32Mi}
+  limits: {cpu: 100m, memory: 128Mi}
+
+scheduling:
+  nodeSelector: {}
+  tolerations: []
+
+networkPolicy:
+  enabled: true
+  # The namespace running Prometheus. Scrape ingress is allowed from here and
+  # nowhere else; an empty list means nothing may scrape these exporters.
+  scrapePeers: []
+  additionalEgress: []
+
+# Pinned multi-platform digests; versions verified 2026-10-06.
+images:
+  kubeStateMetrics: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.14.0@sha256:37d841299325c23b56e5951176ce8ef317d537447c0f1b2d2437dddbb1f51165
+  # latest resolved to v0.8.7 (revision e52ab0a1, built 2025-04-21).
+  processExporter: ncabatoff/process-exporter:0.8.7@sha256:bc2363ff7e05ada1b2a694f06c43dc824dc26cd6e487b5d36b66b1a40df4e842

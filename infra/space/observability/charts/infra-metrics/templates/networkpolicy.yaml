@@ -1,0 +1,37 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: infra-metrics
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- if .Values.networkPolicy.scrapePeers }}
+    # Scrape only. These exporters serve metrics and nothing else.
+    - from:
+{{ toYaml .Values.networkPolicy.scrapePeers | indent 8 }}
+      ports:
+        {{- if .Values.kubeStateMetrics.enabled }}
+        - {protocol: TCP, port: 8080}
+        {{- end }}
+        {{- if .Values.processExporter.enabled }}
+        - {protocol: TCP, port: 9256}
+        {{- end }}
+    {{- end }}
+  egress:
+{{ include "common.dnsEgress" . | indent 4 }}
+    {{- if .Values.kubeStateMetrics.enabled }}
+    # kube-state-metrics watches the API server; process-exporter needs no
+    # egress at all and gets none beyond DNS.
+    - to:
+        - ipBlock: {cidr: 0.0.0.0/0}
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 6443}
+    {{- end }}
+    {{- with .Values.networkPolicy.additionalEgress }}
+{{ toYaml . | indent 4 }}
+    {{- end }}
+{{- end }}

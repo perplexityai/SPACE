@@ -1,0 +1,22 @@
+# Copy to an operator-owned values file. Both sources are off; enable only
+# what this cluster actually loses by removing the Datadog Agent.
+profile: shared
+kubeStateMetrics:
+  enabled: false
+processExporter:
+  enabled: false
+  # Reading every process on the node. Confirm the grant deliberately.
+  # The namespace must also permit hostPID: both the restricted and
+  # baseline Pod Security standards reject it, so a restricted namespace
+  # will refuse this DaemonSet.
+  acknowledgeHostPid: false
+  # Required. Match on `exe`, not `comm`: Linux truncates comm to 15
+  # characters, so a longer executable name silently matches nothing.
+  processNames: []
+scheduling:
+  nodeSelector: {}
+  tolerations: [] # process-exporter is a DaemonSet; add every taint it must tolerate.
+networkPolicy:
+  enabled: true
+  scrapePeers: [] # Required: the namespace running Prometheus, and nothing else.
+  additionalEgress: []

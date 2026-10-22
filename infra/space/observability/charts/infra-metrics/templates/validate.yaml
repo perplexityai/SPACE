@@ -1,0 +1,15 @@
+{{- include "common.profileGuard" . }}
+{{- if not (or .Values.kubeStateMetrics.enabled .Values.processExporter.enabled) }}
+{{- fail "enable kubeStateMetrics, processExporter, or both: this release installs nothing otherwise" }}
+{{- end }}
+{{- if and .Values.processExporter.enabled (not .Values.processExporter.acknowledgeHostPid) }}
+{{- fail "processExporter needs hostPID to read every process on the node; set processExporter.acknowledgeHostPid=true to confirm that grant" }}
+{{- end }}
+{{- if and .Values.processExporter.enabled (not .Values.processExporter.processNames) }}
+{{- fail "processExporter.processNames must list the executables to export; an empty matcher exports every process on the node" }}
+{{- end }}
+{{- if eq .Values.profile "shared" }}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.scrapePeers) }}
+{{- fail "networkPolicy.scrapePeers must name the Prometheus namespace explicitly on a shared cluster" }}
+{{- end }}
+{{- end }}

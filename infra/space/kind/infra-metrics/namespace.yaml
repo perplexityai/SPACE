@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: space-infra-metrics
+  labels:
+    space-local-owner: infra-metrics
+    # privileged, not restricted: process-exporter sets hostPID to read every
+    # process on the node, which both the restricted and baseline Pod Security
+    # standards forbid. kube-state-metrics alone would run under restricted, so
+    # a cluster that enables only that source should tighten this label.
+    pod-security.kubernetes.io/enforce: privileged

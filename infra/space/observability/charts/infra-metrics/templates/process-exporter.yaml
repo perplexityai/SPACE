@@ -1,0 +1,77 @@
+{{- if .Values.processExporter.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: process-exporter-config
+  namespace: {{ .Release.Namespace }}
+data:
+  config.yml: |
+    process_names:
+{{ toYaml .Values.processExporter.processNames | indent 6 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: process-exporter
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: process-exporter}
+  ports:
+    - {name: metrics, port: 9256, targetPort: 9256, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: process-exporter
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    matchLabels: {app: process-exporter}
+  template:
+    metadata:
+      labels:
+{{ include "common.podLabels" (dict "app" "process-exporter" "profile" .Values.profile "owner" "infra-metrics") | indent 8 }}
+    spec:
+      # Reading per-process CPU and memory means reading every process on the
+      # node, which is what the Datadog process agent does today. hostPID is
+      # the whole reason this is a separate release from the metrics backend.
+      hostPID: true
+{{ include "common.scheduling" .Values.scheduling | indent 6 }}
+      containers:
+        - name: process-exporter
+          image: {{ .Values.images.processExporter | quote }}
+          args:
+            - --procfs=/host/proc
+            - --config.path=/etc/process-exporter/config.yml
+          ports:
+            - {name: metrics, containerPort: 9256}
+          volumeMounts:
+            - {name: proc, mountPath: /host/proc, readOnly: true}
+            - {name: config, mountPath: /etc/process-exporter, readOnly: true}
+          resources:
+            requests: {{ toYaml .Values.processExporter.requests | nindent 14 }}
+            limits: {{ toYaml .Values.processExporter.limits | nindent 14 }}
+          securityContext:
+            # Per-process metrics require reading /proc entries that belong to
+            # other users: resolving /proc/<pid>/exe for a root-owned process
+            # is what the exe matchers need. As nonroot with no capabilities
+            # the exporter still scrapes, but reports partial errors and
+            # matches nothing -- it cannot see what the processes are. This is
+            # the same privilege the Datadog process agent holds today.
+            #
+            # Everything else stays locked down: read-only root filesystem, no
+            # privilege escalation, and only the one capability needed.
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [SYS_PTRACE]
+      volumes:
+        - name: proc
+          hostPath: {path: /proc, type: Directory}
+        - name: config
+          configMap: {name: process-exporter-config}
+{{- end }}
