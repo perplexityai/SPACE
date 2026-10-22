@@ -234,7 +234,7 @@ class ProcessSandbox(CommandSandbox, Protocol):
 
     @property
     def reports_exited_processes(self) -> bool:
-        """Whether `get_process` reports a recently exited process, with its exit."""
+        """Whether the smoke requires `get_process` to report a recently exited process."""
         ...
 
     def start_background(self, command: str, *, timeout: int = 60) -> ProcessHandle: ...

@@ -1298,7 +1298,7 @@ class CommandSandboxFixture:
 
     @property
     def reports_exited_processes(self) -> bool:
-        """Whether `get_process` reports a recently exited process, with its exit."""
+        """Whether the smoke requires `get_process` to report a recently exited process."""
 
         return self._process_sandbox().reports_exited_processes
 

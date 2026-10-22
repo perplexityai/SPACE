@@ -93,6 +93,7 @@ SANDBOX_CREATE_ATTEMPTS = 3
 SANDBOX_CREATE_RETRY_SECONDS = 1.0
 KIND_BACKEND = "kind"
 DEPLOYED_BACKEND = "deployed"
+REQUIRE_EXIT_RETENTION_ENV = "SPACE_SMOKE_REQUIRE_EXIT_RETENTION"
 ECW_API_SURFACE = "ecw"
 NATIVE_API_SURFACE = "native"
 # Set by the suite runner on the scenarios it launches once its own bootstrap
@@ -529,6 +530,9 @@ class SmokeServices:
                         ready_timeout_seconds=float(
                             values.get("SPACE_READY_TIMEOUT_SECS", "180")
                         ),
+                        reports_exited_processes=_require_exit_retention(
+                            values, backend
+                        ),
                     )
                 ),
                 api_surface=api_surface,
@@ -630,6 +634,17 @@ class SmokeServices:
             owns_api_key=supplied_key is None,
             template_override=template_override,
         )
+
+
+def _require_exit_retention(values: Mapping[str, str], backend: str) -> bool:
+    """Kind builds its templates from this tree; deployed templates may predate it."""
+
+    override = values.get(REQUIRE_EXIT_RETENTION_ENV)
+    if not override:
+        return backend == KIND_BACKEND
+    if override not in {"0", "1"}:
+        raise SmokeConfigurationError(f"{REQUIRE_EXIT_RETENTION_ENV} must be '1' or '0'")
+    return override == "1"
 
 
 def repair_orphaned_kind_faults(environment: Mapping[str, str]) -> bool:
