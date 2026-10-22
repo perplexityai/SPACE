@@ -57,10 +57,8 @@ pub enum PublicSessionStoreError {
     MissingIdempotencyOperation,
     #[error("session idempotency operation has no target session")]
     MissingIdempotencyTarget,
-    #[error("session was revoked or ended")]
-    SessionRevoked,
-    #[error("session has expired")]
-    SessionExpired,
+    #[error("session was revoked or has ended")]
+    SessionEnded,
     #[error("database error: {0}")]
     Sql(#[from] sqlx::Error),
 }
@@ -112,25 +110,17 @@ impl PublicSessionStore {
             let session_id = fetch_operation_target_session(&mut tx, operation_id)
                 .await?
                 .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
-            let token = refresh_attach_token_tx(&mut tx, session_id).await?;
-            let Some(row) =
-                fetch_session_tx(&mut tx, input.org_id, input.sandbox_id, session_id).await?
-            else {
-                return Err(
-                    if session_expired_tx(&mut tx, input.org_id, input.sandbox_id, session_id)
-                        .await?
-                    {
-                        PublicSessionStoreError::SessionExpired
-                    } else {
-                        PublicSessionStoreError::MissingIdempotencyTarget
-                    },
-                );
+            // A replay must not hand out a token for a session that is revoked,
+            // expired or gone. The create wrote the session, operation and key
+            // record together under the key's lock, so a missing row was swept
+            // by retention after it ended. An expired row means the API host's
+            // clock ran behind the database's, which set the key's expiry.
+            let Some(token) = refresh_attach_token_tx(&mut tx, session_id).await? else {
+                return Err(PublicSessionStoreError::SessionEnded);
             };
-            // The refresh skips a session that has ended, which still exists
-            // after a revoke or close; a replay must not hand out a token for it.
-            let Some(token) = token else {
-                return Err(PublicSessionStoreError::SessionRevoked);
-            };
+            let row = fetch_session_tx(&mut tx, input.org_id, input.sandbox_id, session_id)
+                .await?
+                .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
             tx.commit().await?;
             return PublicSessionRow::try_into_public(
                 row,
@@ -599,9 +589,9 @@ async fn fetch_operation_target_session(
         .transpose()
 }
 
-/// Mint a token for a replayed session, or `None` when the session was revoked
-/// or has ended. The row lock this takes orders the replay against a concurrent
-/// revoke.
+/// Mint a token for a replayed session, or `None` when the session was revoked,
+/// has expired or no longer exists. The row lock this takes orders the replay
+/// against a concurrent revoke.
 async fn refresh_attach_token_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: DataPlaneSessionId,
@@ -617,7 +607,7 @@ async fn refresh_attach_token_tx(
              updated_at = NOW()
          WHERE session_id = $1
            AND revocation_status = 'active'
-           AND state NOT IN ('closing', 'closed', 'revoked', 'failed')"
+           AND (expires_at IS NULL OR expires_at > NOW())"
     ))
     .bind(&session_id_string)
     .bind(token.hash.as_str())
@@ -626,30 +616,6 @@ async fn refresh_attach_token_tx(
     .execute(&mut **tx)
     .await?;
     Ok((refreshed.rows_affected() > 0).then_some(token))
-}
-
-async fn session_expired_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    org_id: OrgId,
-    sandbox_id: PublicSandboxId,
-    session_id: DataPlaneSessionId,
-) -> Result<bool, sqlx::Error> {
-    let session_id_string = session_id.to_string();
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-             SELECT 1
-             FROM data_plane_sessions
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND session_id = $3
-               AND expires_at <= NOW()
-         )"
-    ))
-    .bind(org_id)
-    .bind(sandbox_id.as_uuid())
-    .bind(&session_id_string)
-    .fetch_one(&mut **tx)
-    .await
 }
 
 async fn fetch_session_tx(

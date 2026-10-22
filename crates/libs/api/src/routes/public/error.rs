@@ -183,6 +183,16 @@ impl PublicApiError {
         error
     }
 
+    /// A `conflict` that names why it was refused in a `reason` detail.
+    pub fn conflict_with_reason(message: impl Into<String>, reason: &str) -> Self {
+        let mut error = Self::conflict(message);
+        error.details.push(PublicErrorDetail {
+            key: pplx_space_public_api::CONFLICT_REASON_DETAIL_KEY.to_string(),
+            value: reason.to_string(),
+        });
+        error
+    }
+
     pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
         self.retry_after = Some(retry_after);
         self
@@ -373,25 +383,11 @@ impl From<crate::public_sessions::PublicSessionStoreError> for PublicApiError {
                     "idempotency key was already used with a different request",
                 )
             }
-            crate::public_sessions::PublicSessionStoreError::SessionRevoked => {
-                let mut error = Self::conflict(
-                    "session was revoked or ended; create a new session with a new idempotency key",
-                );
-                error.details.push(PublicErrorDetail {
-                    key: pplx_space_public_api::CONFLICT_REASON_DETAIL_KEY.to_string(),
-                    value: pplx_space_public_api::CONFLICT_REASON_SESSION_REVOKED.to_string(),
-                });
-                error
-            }
-            crate::public_sessions::PublicSessionStoreError::SessionExpired => {
-                let mut error = Self::conflict(
-                    "session has expired; create a new session with a new idempotency key",
-                );
-                error.details.push(PublicErrorDetail {
-                    key: pplx_space_public_api::CONFLICT_REASON_DETAIL_KEY.to_string(),
-                    value: pplx_space_public_api::CONFLICT_REASON_SESSION_EXPIRED.to_string(),
-                });
-                error
+            crate::public_sessions::PublicSessionStoreError::SessionEnded => {
+                Self::conflict_with_reason(
+                    "session was revoked or has ended; create a new session with a new idempotency key",
+                    pplx_space_public_api::CONFLICT_REASON_SESSION_ENDED,
+                )
             }
             crate::public_sessions::PublicSessionStoreError::Sql(error) => Self::from(error),
             other => {

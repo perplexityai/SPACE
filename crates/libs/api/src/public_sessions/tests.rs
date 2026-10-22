@@ -1178,6 +1178,15 @@ async fn stored_token_hash(
     .await
 }
 
+async fn session_count(pool: &PgPool, sandbox_id: PublicSandboxId) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT COUNT(*) FROM data_plane_sessions WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .fetch_one(pool)
+    .await
+}
+
 #[tokio::test]
 async fn replay_of_a_revoked_session_is_refused_without_a_token() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -1201,46 +1210,48 @@ async fn replay_of_a_revoked_session_is_refused_without_a_token() -> TestResult 
         .await
         .expect_err("a revoked session's replay must not mint a token");
     assert!(
-        matches!(replay, PublicSessionStoreError::SessionRevoked),
+        matches!(replay, PublicSessionStoreError::SessionEnded),
         "{replay:?}"
     );
     assert_eq!(stored_token_hash(&db.pool, first.id).await?, None);
     Ok(())
 }
 
+/// The guard reads `revocation_status`, not `state`: a session whose
+/// revocation has started is refused while its state is still `pending`.
 #[tokio::test]
-async fn replay_of_an_ended_session_is_refused() -> TestResult {
+async fn replay_is_refused_once_revocation_starts_while_still_pending() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    for state in ["closing", "closed", "revoked", "failed"] {
-        let create = ReplayableCreate::seed(&db.pool, &format!("{state}-session-replay")).await?;
+    for status in ["revoking", "revoked"] {
+        let create = ReplayableCreate::seed(&db.pool, &format!("{status}-status-replay")).await?;
         let first = create.create().await?;
         let first_hash = hash_token(&first.attach.as_ref().expect("attach token").token);
         sqlx::query(sql!(
-            "UPDATE data_plane_sessions SET state = $2 WHERE session_id = $1"
+            "UPDATE data_plane_sessions SET revocation_status = $2 WHERE session_id = $1"
         ))
         .bind(first.id.to_string())
-        .bind(state)
+        .bind(status)
         .execute(&db.pool)
         .await?;
 
-        let replay = create.create().await.expect_err(state);
+        let replay = create.create().await.expect_err(status);
         assert!(
-            matches!(replay, PublicSessionStoreError::SessionRevoked),
-            "{state}: {replay:?}"
+            matches!(replay, PublicSessionStoreError::SessionEnded),
+            "{status}: {replay:?}"
         );
         assert_eq!(
             stored_token_hash(&db.pool, first.id).await?,
             Some(first_hash),
-            "{state}"
+            "{status}"
         );
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn replay_of_an_expired_session_is_refused_as_expired() -> TestResult {
+async fn replay_of_an_expired_session_is_refused() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -1261,12 +1272,50 @@ async fn replay_of_an_expired_session_is_refused_as_expired() -> TestResult {
         .await
         .expect_err("an expired session's replay must be refused");
     assert!(
-        matches!(replay, PublicSessionStoreError::SessionExpired),
+        matches!(replay, PublicSessionStoreError::SessionEnded),
         "{replay:?}"
     );
     assert_eq!(
         stored_token_hash(&db.pool, first.id).await?,
         Some(first_hash)
     );
+    Ok(())
+}
+
+/// Retention deletes an ended session's row long before its idempotency key
+/// expires. The replay is still refused, and does not run the create again.
+#[tokio::test]
+async fn replay_of_a_revoked_session_is_refused_after_its_row_is_swept() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let create = ReplayableCreate::seed(&db.pool, "swept-session-replay").await?;
+    let first = create.create().await?;
+    create
+        .store
+        .revoke_session(RevokePublicSession {
+            org_id: create.org_id,
+            sandbox_id: create.sandbox_id,
+            session_id: first.id,
+            reason: "user_requested",
+        })
+        .await?
+        .expect("session should be revoked");
+    sqlx::query(sql!(
+        "DELETE FROM data_plane_sessions WHERE session_id = $1"
+    ))
+    .bind(first.id.to_string())
+    .execute(&db.pool)
+    .await?;
+
+    let replay = create
+        .create()
+        .await
+        .expect_err("a swept session's replay must be refused");
+    assert!(
+        matches!(replay, PublicSessionStoreError::SessionEnded),
+        "{replay:?}"
+    );
+    assert_eq!(session_count(&db.pool, create.sandbox_id).await?, 0);
     Ok(())
 }
