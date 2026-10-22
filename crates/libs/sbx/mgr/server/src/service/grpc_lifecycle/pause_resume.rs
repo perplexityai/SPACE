@@ -70,6 +70,7 @@ pub(super) async fn prepare_guest_for_pause(
 pub(super) enum PauseReconciliationOutcome {
     Paused,
     Running,
+    NotStarted,
     Unknown(String),
 }
 
@@ -79,9 +80,7 @@ pub(super) fn pause_reconciliation_outcome(
     match observation.state() {
         Some(FirecrackerVmState::Paused) => PauseReconciliationOutcome::Paused,
         Some(FirecrackerVmState::Running) => PauseReconciliationOutcome::Running,
-        Some(FirecrackerVmState::NotStarted) => {
-            PauseReconciliationOutcome::Unknown("Firecracker reported NotStarted".to_string())
-        }
+        Some(FirecrackerVmState::NotStarted) => PauseReconciliationOutcome::NotStarted,
         None => PauseReconciliationOutcome::Unknown(
             observation
                 .unobservable_reason()
@@ -114,8 +113,9 @@ async fn reconcile_state_after_unconfirmed_pause(
 
 /// Pause the VM of a `pausing` row, reconciling unconfirmed responses against
 /// the observed VM state. Returns `paused` for the caller to complete, or the
-/// state the row was left in: `started` after a rollback, or `quarantined`
-/// when the VM state stays unknown. `Err` is the rejection when the rollback
+/// state the row was left in: `started` after a rollback, `pausing` while
+/// observations are unavailable, or `quarantined` after affirmative runtime loss.
+/// Periodic lifecycle recovery retries `pausing`. `Err` is the rejection when the rollback
 /// or the quarantine finds that another operation moved the row out of
 /// `pausing`; that operation owns the row.
 #[expect(
@@ -167,6 +167,13 @@ pub(super) async fn pause_with_reconciliation(
                         };
                     }
                     PauseReconciliationOutcome::Running => {}
+                    PauseReconciliationOutcome::NotStarted => {
+                        return quarantine_failed_pause(
+                            db,
+                            &sandbox_id_string,
+                            &format!("{reason}; Firecracker reported NotStarted"),
+                        );
+                    }
                     PauseReconciliationOutcome::Unknown(detail) => {
                         last_reason = Some(format!("{reason}; {detail}"));
                     }
@@ -195,12 +202,35 @@ pub(super) async fn pause_with_reconciliation(
     }
 
     let reason = last_reason.unwrap_or_else(|| reason_context.to_string());
+    tracing::warn!(sandbox_id = %sandbox_id, reason,
+        "pause outcome remains unobservable; periodic recovery will retry");
+    let found = crate::node_state_sync::connection_or_signal_failure(db)
+        .ok()
+        .and_then(|db| {
+            crate::db::read::sandbox(&db, &sandbox_id_string)
+                .ok()
+                .flatten()
+        })
+        .map(|row| row.state);
+    if let Some(found) = found
+        && found != SandboxState::Pausing
+    {
+        return Err(StateWriteRejected::FromState { found });
+    }
+    Ok(SandboxState::Pausing)
+}
+
+fn quarantine_failed_pause(
+    db: &crate::db::SharedConnection,
+    sandbox_id_string: &str,
+    reason: &str,
+) -> Result<SandboxState, StateWriteRejected> {
     if !mark_quarantined_best_effort(
         db,
-        &sandbox_id_string,
+        sandbox_id_string,
         SandboxState::Pausing,
         SandboxQuarantineReasonCode::PauseFailed,
-        &reason,
+        reason,
     ) {
         // The quarantine compare-and-set refuses a row that left `pausing`,
         // which is how a Stop that killed the VM mid-pause surfaces here. It
@@ -212,7 +242,7 @@ pub(super) async fn pause_with_reconciliation(
         let found = crate::node_state_sync::connection_or_signal_failure(db)
             .ok()
             .and_then(|db| {
-                crate::db::read::sandbox(&db, &sandbox_id_string)
+                crate::db::read::sandbox(&db, sandbox_id_string)
                     .ok()
                     .flatten()
             })
@@ -330,6 +360,12 @@ impl SandboxManagerService {
         }
         let pause_state =
             pause_state.map_err(|rejected| rejected.into_status("reconcile unconfirmed pause"))?;
+        if pause_state == SandboxState::Pausing {
+            mark_sandbox_dirty(&self.db, &sandbox.id);
+            return Err(Status::unavailable(
+                "pause outcome is pending; runtime observation will retry",
+            ));
+        }
         if pause_state != SandboxState::Paused {
             return Err(Status::internal(format!(
                 "pause failed; sandbox reconciled to {pause_state}"

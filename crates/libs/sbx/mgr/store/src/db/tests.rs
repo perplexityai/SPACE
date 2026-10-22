@@ -190,6 +190,7 @@ fn periodic_recovery_bounds_discovery_and_advances_past_retained_or_malformed_ro
     .unwrap();
     let mut expected = Vec::new();
     for state in [
+        SandboxState::Pausing,
         SandboxState::Paused,
         SandboxState::Resuming,
         SandboxState::Checkpointing,

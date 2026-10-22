@@ -445,6 +445,10 @@ impl SandboxManagerService {
                     "fc_pause_failed",
                     reason.clone(),
                 );
+                if pause_state == SandboxState::Pausing {
+                    mark_sandbox_dirty(&self.db, &sandbox.id);
+                    return Err(Status::unavailable(reason));
+                }
                 // A refusal is unreachable under suspend's fence and locks; it answers `Internal`.
                 return Err(Status::internal(reason));
             }

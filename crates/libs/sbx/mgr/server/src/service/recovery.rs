@@ -454,6 +454,17 @@ impl SandboxManagerService {
                 Output = crate::runtime_reconciliation::FirecrackerVmStateObservation,
             >,
     {
+        // Pause and suspend admission serialize on the artifact lock. Do not
+        // take the wake lock: a blocking wake can hold it while waiting for
+        // this transient row to settle. Recovery only observes runtime state.
+        let artifact = self.auto_lifecycle.artifact_lock(&row.id);
+        let Ok(_artifact) = artifact.try_lock() else {
+            return Ok(crate::db::StartupRecoveryRecord {
+                id: row.id,
+                previous_state: row.state,
+                outcome: crate::db::StartupRecoveryOutcome::Deferred,
+            });
+        };
         if !row.has_runtime_fields() {
             return self
                 .quarantine_interrupted_pause(row, "sandbox row has no retained runtime identity")
@@ -475,13 +486,24 @@ impl SandboxManagerService {
                     .await;
             }
             Err(error) => {
-                return self
-                    .quarantine_interrupted_pause(row, &error.to_string())
-                    .await;
+                tracing::warn!(sandbox_id = %row.id, %error,
+                    "interrupted pause remains unobservable; periodic recovery will retry");
+                return Ok(crate::db::StartupRecoveryRecord {
+                    id: row.id,
+                    previous_state: row.state,
+                    outcome: crate::db::StartupRecoveryOutcome::Deferred,
+                });
             }
         };
         let changed = {
             let db = self.startup_recovery_db()?;
+            if !crate::db::startup_resident_witness_current(&db, &row)? {
+                return Ok(crate::db::StartupRecoveryRecord {
+                    id: row.id,
+                    previous_state: row.state,
+                    outcome: crate::db::StartupRecoveryOutcome::Deferred,
+                });
+            }
             crate::db::recover_interrupted_pause_state(&db, &row.id, target)?
         };
         if changed {
@@ -527,6 +549,13 @@ impl SandboxManagerService {
         );
         let changed = {
             let db = self.startup_recovery_db()?;
+            if !crate::db::startup_resident_witness_current(&db, &row)? {
+                return Ok(crate::db::StartupRecoveryRecord {
+                    id: row.id,
+                    previous_state: row.state,
+                    outcome: crate::db::StartupRecoveryOutcome::Deferred,
+                });
+            }
             crate::db::mark_quarantined_from_state(
                 &db,
                 &row.id,

@@ -1094,7 +1094,7 @@ fn pause_reconciliation_maps_firecracker_observations() {
                 FirecrackerVmState::NotStarted,
             )
         ),
-        super::PauseReconciliationOutcome::Unknown("Firecracker reported NotStarted".to_string())
+        super::PauseReconciliationOutcome::NotStarted
     );
     assert_eq!(
         pause_reconciliation_outcome(
@@ -1104,26 +1104,6 @@ fn pause_reconciliation_maps_firecracker_observations() {
         ),
         super::PauseReconciliationOutcome::Unknown("probe failed".to_string())
     );
-}
-
-#[test]
-fn pause_reconciliation_does_not_guess_unknown_state() {
-    for observation in [
-        crate::runtime_reconciliation::FirecrackerVmStateObservation::Unobservable(
-            "probe failed".to_string(),
-        ),
-        crate::runtime_reconciliation::FirecrackerVmStateObservation::Observed(
-            FirecrackerVmState::NotStarted,
-        ),
-    ] {
-        assert!(
-            matches!(
-                pause_reconciliation_outcome(&observation),
-                super::PauseReconciliationOutcome::Unknown(_)
-            ),
-            "unknown pause outcomes must remain retryable with evidence"
-        );
-    }
 }
 
 #[tokio::test]

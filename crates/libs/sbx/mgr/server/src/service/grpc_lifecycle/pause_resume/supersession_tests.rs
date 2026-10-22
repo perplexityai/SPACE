@@ -45,18 +45,20 @@ enum Exit {
     /// Every node pause attempt fails with the VM running:
     /// `pause_with_reconciliation` rolls back, best effort.
     VmStaysRunning,
-    /// Every node pause attempt fails and the VM state cannot be read, as
-    /// when a Stop killed the VM: `pause_with_reconciliation` quarantines.
+    /// Every node pause attempt and runtime observation is unavailable.
     VmUnobservable,
+    /// Firecracker affirmatively reports no resident runtime.
+    VmNotStarted,
 }
 
-const EXITS: [Exit; 6] = [
+const EXITS: [Exit; 7] = [
     Exit::PreparationFails,
     Exit::NodeUnreachable,
     Exit::NodeConfirms,
     Exit::RetryPreparationFails,
     Exit::VmStaysRunning,
     Exit::VmUnobservable,
+    Exit::VmNotStarted,
 ];
 
 impl Exit {
@@ -67,7 +69,8 @@ impl Exit {
             Self::PreparationFails
             | Self::NodeUnreachable
             | Self::NodeConfirms
-            | Self::VmUnobservable => 1,
+            | Self::VmUnobservable
+            | Self::VmNotStarted => 1,
             Self::RetryPreparationFails => 2,
             Self::VmStaysRunning => 3,
         }
@@ -79,7 +82,8 @@ impl Exit {
             Self::NodeUnreachable
             | Self::NodeConfirms
             | Self::VmStaysRunning
-            | Self::VmUnobservable => false,
+            | Self::VmUnobservable
+            | Self::VmNotStarted => false,
         }
     }
 
@@ -108,21 +112,28 @@ impl Exit {
                     )
                     .serve(),
             ),
-            Self::VmUnobservable => Some(
-                FakeNodeManager::default()
-                    .unary("PauseSandbox", |_: PauseSandboxRequest| {
-                        Err::<PauseSandboxResponse, _>(Status::unavailable("test pause failed"))
-                    })
-                    .unary(
-                        "GetFirecrackerVmState",
-                        |_: GetFirecrackerVmStateRequest| {
-                            Err::<GetFirecrackerVmStateResponse, _>(Status::unavailable(
-                                "test VM state unavailable",
-                            ))
-                        },
-                    )
-                    .serve(),
-            ),
+            Self::VmUnobservable | Self::VmNotStarted => {
+                let not_started = matches!(self, Self::VmNotStarted);
+                Some(
+                    FakeNodeManager::default()
+                        .unary("PauseSandbox", |_: PauseSandboxRequest| {
+                            Err::<PauseSandboxResponse, _>(Status::unavailable("test pause failed"))
+                        })
+                        .unary(
+                            "GetFirecrackerVmState",
+                            move |_: GetFirecrackerVmStateRequest| {
+                                if not_started {
+                                    Ok(GetFirecrackerVmStateResponse {
+                                        state: WireFirecrackerVmState::NotStarted as i32,
+                                    })
+                                } else {
+                                    Err(Status::unavailable("test VM state unavailable"))
+                                }
+                            },
+                        )
+                        .serve(),
+                )
+            }
         }
     }
 
@@ -132,9 +143,10 @@ impl Exit {
             Self::PreparationFails => "roll back failed pause preparation",
             Self::NodeUnreachable => "roll back pause after node-manager connect failure",
             Self::NodeConfirms => "complete pause",
-            Self::RetryPreparationFails | Self::VmStaysRunning | Self::VmUnobservable => {
-                "reconcile unconfirmed pause"
-            }
+            Self::RetryPreparationFails
+            | Self::VmStaysRunning
+            | Self::VmUnobservable
+            | Self::VmNotStarted => "reconcile unconfirmed pause",
         }
     }
 }
@@ -170,6 +182,8 @@ enum Expected {
     RolledBack(&'static str),
     /// `Internal` reporting the quarantine, with the row `quarantined`.
     Quarantined,
+    /// `Unavailable`, with the row retained in `pausing` for observation.
+    Pending,
     /// `Aborted` with this message, with every row as the interleaving left
     /// it.
     Rejected(String),
@@ -221,14 +235,15 @@ fn expected(exit: Exit, found: SandboxState) -> Expected {
             Exit::RetryPreparationFails | Exit::VmStaysRunning => {
                 Expected::RolledBack("pause failed; sandbox reconciled to started")
             }
-            Exit::VmUnobservable => Expected::Quarantined,
+            Exit::VmUnobservable => Expected::Pending,
+            Exit::VmNotStarted => Expected::Quarantined,
         };
     }
     match exit {
         // The quarantine's compare-and-set reports only that it refused;
         // pause re-reads the row and reports the state it found, including a
         // quarantine another writer made.
-        Exit::VmUnobservable => match found {
+        Exit::VmUnobservable | Exit::VmNotStarted => match found {
             SandboxState::Creating
             | SandboxState::Created
             | SandboxState::Starting
@@ -371,6 +386,25 @@ fn assert_outcome(
                 status.message(),
                 "pause failed; sandbox reconciled to quarantined",
                 "{case}"
+            );
+        }
+        Expected::Pending => {
+            assert_eq!(state, SandboxState::Pausing, "{case}");
+            assert_eq!(
+                result.expect_err(case).code(),
+                tonic::Code::Unavailable,
+                "{case}"
+            );
+            assert!(
+                crate::db::current_quarantine_reason_wire_value(db, id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                crate::db::get_sandbox(db, id)
+                    .unwrap()
+                    .unwrap()
+                    .has_runtime_fields()
             );
         }
         Expected::Rejected(message) => {

@@ -14917,86 +14917,157 @@ pub(crate) mod service_tests {
         }
     }
 
-    #[tokio::test]
-    async fn startup_recovery_heals_definitive_pause_and_quarantines_ambiguity() {
-        use crate::runtime_reconciliation::FirecrackerVmStateObservation;
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_pause_recovers_definitive_state_and_defers_unavailable_evidence() {
+        use crate::runtime_reconciliation::FirecrackerVmStateObservation as Observation;
+        use FirecrackerVmState::{NotStarted, Paused, Running};
 
-        for (observed, expected) in [
-            (FirecrackerVmState::Running, SandboxState::Started),
-            (FirecrackerVmState::Paused, SandboxState::Paused),
+        for (observations, expected) in [
+            (vec![Some(Running); 2], SandboxState::Started),
+            (vec![Some(Paused); 2], SandboxState::Paused),
+            (vec![Some(NotStarted)], SandboxState::Quarantined),
+            (vec![None; 3], SandboxState::Pausing),
+            (
+                vec![Some(Running), Some(Paused), Some(Running)],
+                SandboxState::Pausing,
+            ),
         ] {
             let conn = crate::db::test_conn();
-            let sandbox_id = SandboxId::new().to_string();
-            insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Pausing);
+            let id = SandboxId::new().to_string();
+            insert_test_sandbox_with_runtime(&conn, &id, SandboxState::Pausing);
             let service = SandboxManagerService::for_test(conn);
-            let row = service.lookup_sandbox(&sandbox_id).unwrap();
-            let probe_count = Arc::new(AtomicUsize::new(0));
-
+            let mut observations = observations.into_iter();
             let record = service
-                .recover_interrupted_pause_with_probe(row, {
-                    let probe_count = Arc::clone(&probe_count);
-                    move |_| {
-                        probe_count.fetch_add(1, Ordering::Relaxed);
-                        async move { FirecrackerVmStateObservation::Observed(observed) }
-                    }
+                .recover_interrupted_pause_with_probe(service.lookup_sandbox(&id).unwrap(), |_| {
+                    let observation = match observations.next().expect("bounded probes") {
+                        Some(state) => Observation::Observed(state),
+                        None => Observation::Unobservable("node-manager unavailable".into()),
+                    };
+                    async { observation }
                 })
                 .await
                 .unwrap();
-
-            assert_eq!(probe_count.load(Ordering::Relaxed), 2);
             assert_eq!(
                 record.outcome,
-                crate::db::StartupRecoveryOutcome::State(expected)
+                if expected == SandboxState::Pausing {
+                    crate::db::StartupRecoveryOutcome::Deferred
+                } else {
+                    crate::db::StartupRecoveryOutcome::State(expected)
+                },
             );
-            let db = service.db.lock().expect("mutex poisoned");
-            let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
-            assert_eq!(row.state, expected);
-            assert!(crate::db::sandbox_has_runtime_fields(&row));
+            assert_eq!(service.lookup_sandbox(&id).unwrap().state, expected);
+            let reason =
+                crate::db::current_quarantine_reason_wire_value(&service.db.lock().unwrap(), &id)
+                    .unwrap();
+            assert_eq!(
+                reason.as_deref(),
+                (expected == SandboxState::Quarantined)
+                    .then_some(SandboxQuarantineReasonCode::PauseFailed.as_str())
+            );
+            if expected == SandboxState::Pausing {
+                let recovered = service
+                    .recover_interrupted_pause_with_probe(
+                        service.lookup_sandbox(&id).unwrap(),
+                        |_| async { Observation::Observed(Paused) },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    recovered.outcome,
+                    crate::db::StartupRecoveryOutcome::State(SandboxState::Paused)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_pause_recovery_yields_to_admission_but_not_a_waiting_wake() {
+        use crate::node_manager_transport::fake::FakeNodeManager;
+        use pplx_space_node_mgr_client::proto::{
+            GetFirecrackerVmStateRequest, GetFirecrackerVmStateResponse,
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let node = FakeNodeManager::default()
+            .unary("GetFirecrackerVmState", {
+                let calls = Arc::clone(&calls);
+                move |_: GetFirecrackerVmStateRequest| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(GetFirecrackerVmStateResponse {
+                        state: pplx_space_node_mgr_client::proto::FirecrackerVmState::Paused as i32,
+                    })
+                }
+            })
+            .serve();
+        let scratch = tempfile::tempdir().unwrap();
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox_with_runtime(&conn, &id, SandboxState::Pausing);
+        let mut options = SandboxManagerServiceOptions::for_test_in(scratch.path());
+        options.node_manager = node.connector();
+        let service = SandboxManagerService::new_with_options(conn, options);
+        let wake = service.auto_lifecycle.wake_lock(&id);
+        let _wake = wake.lock().await;
+        let artifact = service.auto_lifecycle.artifact_lock(&id);
+        let admitted = artifact.lock().await;
+        let shutdown = CancellationToken::new();
+
+        service
+            .recover_periodic_resident_operations(
+                vec![service.lookup_sandbox(&id).unwrap()],
+                &shutdown,
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            SandboxState::Pausing
+        );
+        drop(admitted);
+
+        service
+            .recover_periodic_resident_operations(
+                vec![service.lookup_sandbox(&id).unwrap()],
+                &shutdown,
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            SandboxState::Paused
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_pause_recovery_rechecks_identity_before_settlement() {
+        use crate::runtime_reconciliation::FirecrackerVmStateObservation as Observation;
+        for observed in [FirecrackerVmState::Paused, FirecrackerVmState::NotStarted] {
+            let conn = crate::db::test_conn();
+            let id = SandboxId::new().to_string();
+            insert_test_sandbox_with_runtime(&conn, &id, SandboxState::Pausing);
+            let service = SandboxManagerService::for_test(conn);
+            let record = service
+                .recover_interrupted_pause_with_probe(service.lookup_sandbox(&id).unwrap(), |_| {
+                    service
+                        .db
+                        .lock()
+                        .unwrap()
+                        .execute("UPDATE sandboxes SET pid = 123 WHERE id = ?1", [&id])
+                        .unwrap();
+                    async move { Observation::Observed(observed) }
+                })
+                .await
+                .unwrap();
+            assert_eq!(record.outcome, crate::db::StartupRecoveryOutcome::Deferred);
+            let row = service.lookup_sandbox(&id).unwrap();
+            assert_eq!(row.state, SandboxState::Pausing);
+            assert_eq!(row.pid, Some(123));
             assert!(
-                crate::db::current_quarantine_reason_wire_value(&db, &sandbox_id)
+                crate::db::current_quarantine_reason_wire_value(&service.db.lock().unwrap(), &id,)
                     .unwrap()
                     .is_none()
             );
         }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Pausing);
-        let service = SandboxManagerService::for_test(conn);
-        let row = service.lookup_sandbox(&sandbox_id).unwrap();
-        let observations = Arc::new(Mutex::new(
-            [
-                FirecrackerVmState::Running,
-                FirecrackerVmState::Paused,
-                FirecrackerVmState::Running,
-            ]
-            .into_iter(),
-        ));
-
-        let record = service
-            .recover_interrupted_pause_with_probe(row, {
-                let observations = Arc::clone(&observations);
-                move |_| {
-                    let observed = observations.lock().unwrap().next().unwrap();
-                    async move { FirecrackerVmStateObservation::Observed(observed) }
-                }
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            record.outcome,
-            crate::db::StartupRecoveryOutcome::State(SandboxState::Quarantined)
-        );
-        let db = service.db.lock().expect("mutex poisoned");
-        let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
-        assert_eq!(row.state, SandboxState::Quarantined);
-        assert_eq!(
-            crate::db::current_quarantine_reason_wire_value(&db, &sandbox_id)
-                .unwrap()
-                .as_deref(),
-            Some(SandboxQuarantineReasonCode::PauseFailed.as_str()),
-        );
     }
 
     #[tokio::test]
