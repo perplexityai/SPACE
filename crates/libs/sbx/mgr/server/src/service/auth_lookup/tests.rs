@@ -98,3 +98,35 @@ fn connection_failure_rolls_back_only_the_admitted_resume() {
         );
     }
 }
+
+/// Readiness waiters keep polling a `FailedPrecondition` that says "not
+/// started"; a quarantined row must not say it, while a transient one still does.
+#[tokio::test]
+async fn started_lookup_does_not_ask_waiters_to_keep_polling_a_quarantined_row() {
+    for (state, keeps_polling) in [("quarantined", false), ("restoring", true)] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        conn.execute(
+            pplx_space_common_core::sql!(
+                "INSERT INTO sandboxes (id,uuid8,state,template,user,runtime,created_at,updated_at)
+                 VALUES (?1,'lookup01',?2,'seed','deploy','fc','1','1')"
+            ),
+            rusqlite::params![id, state],
+        )
+        .unwrap();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            super::super::SandboxManagerServiceOptions::for_test(),
+        );
+        let Err(error) = service.lookup_started_sandbox(&id) else {
+            panic!("{state}: a row that is not started passed the started lookup");
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{state}");
+        assert_eq!(
+            error.message().contains("not started"),
+            keeps_polling,
+            "{state}: {}",
+            error.message()
+        );
+    }
+}
