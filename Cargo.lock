@@ -5535,6 +5535,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-dependency-drain",
  "pplx-space-federated-identity",
+ "pplx-space-kube-client",
  "pplx-space-metrics",
  "pplx-space-migration-checksums",
  "pplx-space-observability",
@@ -6007,6 +6008,26 @@ dependencies = [
  "serde",
  "sqlx",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-kube-client"
+version = "0.8.0"
+dependencies = [
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "k8s-openapi",
+ "kube",
+ "pin-project-lite",
+ "pplx-space-observability",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

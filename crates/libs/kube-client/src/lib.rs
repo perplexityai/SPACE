@@ -1,3 +1,10 @@
+//! Kubernetes API clients for SPACE services, with `kubernetes.client`
+//! tracing spans, and a shared reflector driver.
+//!
+//! It is its own crate so a service can build a traced Kubernetes client
+//! without the rest of `pplx-space-common-svc`, which re-exports it as
+//! `kube_client` behind its `k8s` feature.
+
 mod reflector;
 pub use reflector::spawn_reflector;
 

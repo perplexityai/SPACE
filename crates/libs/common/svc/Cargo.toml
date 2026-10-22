@@ -16,7 +16,7 @@ otel = ["pplx-space-observability/otel"]
 datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
-k8s = ["dep:k8s-openapi", "dep:kube"]
+k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
 # Exposes `sql::migration_checksums`, the accepted-checksums adapter every
 # migration runner embeds.
 migration-checksums = ["dep:pplx-space-migration-checksums"]
@@ -67,6 +67,7 @@ pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
 pplx-space-federated-identity = { workspace = true }
+pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-migration-checksums = { workspace = true, optional = true }
 pplx-space-observability = { workspace = true }

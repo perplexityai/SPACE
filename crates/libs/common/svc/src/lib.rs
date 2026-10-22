@@ -23,7 +23,7 @@ pub mod ecw_credential;
 pub use pplx_space_federated_identity as federated_identity;
 pub mod http_listener;
 #[cfg(feature = "k8s")]
-pub mod kube_client;
+pub use pplx_space_kube_client as kube_client;
 pub use pplx_space_service_lifecycle as lifecycle;
 pub mod local_health;
 pub use pplx_space_page_cache as page_cache;
