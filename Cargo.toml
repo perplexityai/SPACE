@@ -129,6 +129,7 @@ members = [
     "crates/libs/kube-client",
     "crates/libs/cluster-id",
     "crates/libs/federated-identity",
+    "crates/libs/request-id",
     "crates/libs/cluster/controller/server",
     "crates/libs/cluster/pool",
     "crates/libs/cluster/reconciler",
@@ -388,6 +389,7 @@ pplx-space-k8s-ids = { path = "crates/libs/k8s-ids" }
 pplx-space-kube-client = { path = "crates/libs/kube-client" }
 pplx-space-cluster-id = { path = "crates/libs/cluster-id" }
 pplx-space-federated-identity = { path = "crates/libs/federated-identity" }
+pplx-space-request-id = { path = "crates/libs/request-id" }
 pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
 pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }

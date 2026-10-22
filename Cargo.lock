@@ -5553,6 +5553,7 @@ dependencies = [
  "pplx-space-migration-checksums",
  "pplx-space-observability",
  "pplx-space-page-cache",
+ "pplx-space-request-id",
  "pplx-space-rustls-provider",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
@@ -6818,6 +6819,13 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-request-id"
+version = "0.8.0"
+dependencies = [
+ "http 1.5.0",
 ]
 
 [[package]]
