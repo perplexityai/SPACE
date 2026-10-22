@@ -570,7 +570,7 @@ impl FilesystemHandle {
             #[cfg(target_os = "linux")]
             ledger_evidence: Arc::new(Mutex::new(HashMap::new())),
             cancellation_grace,
-            native_upload_idle_timeout: std::time::Duration::from_secs(30),
+            native_upload_idle_timeout: crate::execution::DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT,
         })
     }
 

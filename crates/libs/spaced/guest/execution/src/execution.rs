@@ -2,6 +2,8 @@
 use super::*;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{WriteRequest, WriteResponse};
 
+pub(crate) const DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Configuration for process execution and the filesystem backend.
 ///
 /// # Defaults
@@ -25,7 +27,8 @@ pub struct ExecutionServiceConfig {
     /// Maximum wait for each native upload message, including the initial `Open`.
     /// Defaults to 30 seconds. Applies only to native `write_file`; the gRPC
     /// stream retains its existing transport behavior. Does not bound cleanup,
-    /// execution backpressure or the total upload duration.
+    /// execution backpressure or the total upload duration. Zero gives pending
+    /// input no grace period; it does not disable the timeout.
     pub native_upload_idle_timeout: Duration,
     /// Guest memory used to size retained process output; None uses the fallback budget.
     pub guest_memory_bytes: Option<u64>,
@@ -43,7 +46,7 @@ impl Default for ExecutionServiceConfig {
                 FilesystemExecutionMode::Direct
             },
             cancellation_grace: filesystem::router::DEFAULT_CANCELLATION_GRACE,
-            native_upload_idle_timeout: Duration::from_secs(30),
+            native_upload_idle_timeout: DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT,
             guest_memory_bytes: None,
             worker_executable: None,
             identity_policy: if cfg!(target_os = "linux") {

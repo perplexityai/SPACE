@@ -93,6 +93,8 @@ execution metadata.
   semantics as gRPC. Borrowed streams and streams without `Unpin` are supported.
   Each native wait for input, including `Open`, has a 30-second idle timeout,
   configurable through `ExecutionServiceConfig::native_upload_idle_timeout`.
+  Zero gives pending input no grace period; it does not disable the timeout.
+  Config struct literals must supply this field or use `..Default::default()`.
   Expiry returns `DeadlineExceeded` and cancels the upload. Execution backpressure
   is not input idle time; gRPC retains its existing transport behavior. Callers
   can additionally bound total upload duration with `tokio::time::timeout`.

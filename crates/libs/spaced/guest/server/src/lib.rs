@@ -368,10 +368,10 @@ impl SpacedGuestService {
                 default_working_dir: config.default_working_dir.clone(),
                 filesystem_execution: config.filesystem_execution,
                 cancellation_grace: config.cancellation_grace,
-                native_upload_idle_timeout: Duration::from_secs(30),
                 guest_memory_bytes: meta::guest_mem_total_bytes(),
                 worker_executable,
                 identity_policy: pplx_space_spaced_guest_execution::IdentityPolicy::Guest,
+                ..Default::default()
             },
             guest_cgroups.map(|cgroups| Arc::clone(&cgroups.placement)),
         )?;
