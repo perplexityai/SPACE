@@ -19,6 +19,7 @@ pub(super) fn connect_process_request(
         timeout: timeout.map(proto_duration),
         output_cursor,
         resume_from_oldest_retained,
+        resume_after_output_gap: None,
     }
 }
 

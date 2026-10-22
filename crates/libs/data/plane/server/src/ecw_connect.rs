@@ -276,7 +276,9 @@ pub(super) fn process_event_to_connect_message(
             Some(connect_process_output("stderr", &stderr.data))
         }
         Some(spaced_process_event::Event::Exit(exit)) => Some(connect_process_exit(exit.outcome)),
-        None => None,
+        // ECW reconnects never set `resume_after_output_gap`, so a gap cannot
+        // arrive here; a lagged ECW reader still fails.
+        Some(spaced_process_event::Event::OutputGap(_)) | None => None,
     }
 }
 

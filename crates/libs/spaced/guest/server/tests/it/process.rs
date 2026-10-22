@@ -192,6 +192,7 @@ async fn bridge_guest_process_stalled_stream_does_not_block_reconnect_exit() {
             timeout: None,
             output_cursor: None,
             resume_from_oldest_retained: false,
+            resume_after_output_gap: None,
         }))
         .await
         .expect("connect response")
@@ -246,6 +247,7 @@ async fn bridge_guest_process_connect_replays_from_output_cursor() {
             timeout: None,
             output_cursor: Some(0),
             resume_from_oldest_retained: true,
+            resume_after_output_gap: None,
         }))
         .await
         .expect("connect response")
@@ -560,6 +562,7 @@ async fn bridge_guest_process_start_replays_output_while_cursorless_connect_retu
                     timeout: None,
                     output_cursor: None,
                     resume_from_oldest_retained: false,
+                    resume_after_output_gap: None,
                 })
                 .await
                 .expect("connect exited process")
@@ -715,6 +718,7 @@ async fn bridge_guest_process_connect_and_signal_validation_work() {
                 timeout: None,
                 output_cursor: None,
                 resume_from_oldest_retained: false,
+                resume_after_output_gap: None,
             })
             .await
             .expect("connect process")
@@ -815,6 +819,7 @@ async fn bridge_guest_process_connect_unknown_returns_not_found() {
             timeout: None,
             output_cursor: None,
             resume_from_oldest_retained: false,
+            resume_after_output_gap: None,
         })
         .await
         .expect_err("missing process rejected");

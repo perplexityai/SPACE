@@ -88,6 +88,32 @@ async fn resolve_process_account(
         .map_err(|error| Status::internal(format!("guest account lookup task failed: {error}")))?
 }
 
+/// What a resumed reader's `ProcessOutputGap` event is addressed with.
+struct OutputGapResume {
+    process_id: String,
+    pid: Option<u32>,
+}
+
+fn process_output_gap_event(
+    resume: &OutputGapResume,
+    skipped_events: u64,
+    output_cursor: u64,
+    output_bytes_before: u64,
+) -> ProcessEvent {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        ProcessOutputGap, process_event::Event,
+    };
+    ProcessEvent {
+        process_id: resume.process_id.clone(),
+        pid: resume.pid,
+        event: Some(Event::OutputGap(ProcessOutputGap {
+            skipped_events,
+            output_cursor,
+            output_bytes_before,
+        })),
+    }
+}
+
 enum ProcessExitOutcome {
     Exited(i32),
     Signaled(i32),
@@ -352,7 +378,7 @@ impl Process for ExecutionService {
                 let replay = self
                     .inner
                     .processes
-                    .replay(&process_id, Some(0), false)
+                    .replay(&process_id, Some(0), false, false)
                     .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
                 return Ok(Response::new(
                     replay_process_event_stream(replay) as Self::StartStream
@@ -487,6 +513,7 @@ impl Process for ExecutionService {
                 &process_id,
                 request.output_cursor,
                 request.resume_from_oldest_retained,
+                request.resume_after_output_gap.unwrap_or(false),
             )
             .ok_or_else(|| Status::not_found("process not found"))?;
         let pid = match &replay {
