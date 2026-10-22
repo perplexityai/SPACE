@@ -77,8 +77,10 @@ impl ClusterApiService {
     /// pull path omits it, so it cannot authorize anything. A node-scoped
     /// caller (every TokenReview identity, and the static token once
     /// TokenReview is configured) is instead bound to registered nodes. Pod-bound
-    /// tokens use the reviewed node name and UID; static-token callers use the
-    /// remote address. A caller with no matching registered node resolves
+    /// tokens with complete claims use the reviewed node name and UID. Missing
+    /// claims and static-token callers retain the registered-address binding;
+    /// malformed claims or a mismatched UID never fall back. A caller with no
+    /// matching registered node resolves
     /// generic templates only. A request that reached the handler without the
     /// auth layer (tests, local simulators) is unscoped, matching how the
     /// other narrow authorities treat a missing extension.
@@ -99,7 +101,7 @@ impl ClusterApiService {
             return Ok(TemplateReadScope::Unscoped);
         }
         match caller.node_identity() {
-            AuthenticatedNodeIdentity::Kubernetes(Some(node)) => {
+            AuthenticatedNodeIdentity::Kubernetes(node) => {
                 let scope = self
                     .template_releases_store
                     .node_scope_for_identity(node)
@@ -117,15 +119,18 @@ impl ClusterApiService {
                 }
                 return Ok(scope);
             }
-            AuthenticatedNodeIdentity::Kubernetes(None) => {
+            AuthenticatedNodeIdentity::MalformedKubernetesClaims => {
                 template_node_binding(TemplateNodeBinding::Unbound);
                 tracing::warn!(
                     peer_addr = ?request.remote_addr(),
-                    "template catalog caller lacks usable pod/node claims; check projected tokens and Kubernetes 1.32+ node metadata; private templates are unavailable"
+                    "template catalog caller has malformed pod/node claims; private templates are unavailable"
                 );
                 return Ok(TemplateReadScope::NodeScoped {
                     node_ids: Vec::new(),
                 });
+            }
+            AuthenticatedNodeIdentity::MissingKubernetesClaims => {
+                template_node_binding(TemplateNodeBinding::AddressFallback);
             }
             AuthenticatedNodeIdentity::RemoteAddress => {}
         }

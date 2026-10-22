@@ -15,7 +15,8 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   grant-bound template publication; match both against live builder inventory.
 - A new RPC that acts for a node identifies it as the registered node whose
   address equals the caller's remote IP (except publication above and template
-  catalog reads, which bind reviewed pod tokens to live node name/UID), never by a
+  catalog reads, which use reviewed node name/UID when supplied and retain
+  address matching for missing claims), never by a
   request field alone; one that names a node uses `authenticated_origin_node_id`. Existing exception:
   `TouchArtifactBackup` binds no node.
 - ClusterApi never creates a node registration. `nodes` and `node_k8s` rows

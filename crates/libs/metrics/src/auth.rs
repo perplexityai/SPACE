@@ -63,7 +63,9 @@ pub fn token_review_cache(result: &str) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemplateNodeBinding {
     Bound,
-    /// Missing, malformed, or ambiguous pod/node claims.
+    /// Missing pod/node metadata uses registered-address matching.
+    AddressFallback,
+    /// Malformed or ambiguous supplied claims.
     Unbound,
     NoInventoryMatch,
 }
@@ -72,6 +74,7 @@ impl TemplateNodeBinding {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bound => "bound",
+            Self::AddressFallback => "address_fallback",
             Self::Unbound => "unbound",
             Self::NoInventoryMatch => "no_inventory_match",
         }
@@ -85,7 +88,8 @@ impl std::fmt::Display for TemplateNodeBinding {
 }
 
 /// One Kubernetes template-catalog read, including reads using cached TokenReview.
-/// `unbound` and `no_inventory_match` restrict the caller to generic templates.
+/// `address_fallback` retains the legacy address scope; `unbound` and
+/// `no_inventory_match` restrict the caller to generic templates.
 pub fn template_node_binding(result: TemplateNodeBinding) {
     counter(
         "auth.template_node_binding",

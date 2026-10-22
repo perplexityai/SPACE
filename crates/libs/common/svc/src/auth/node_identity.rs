@@ -10,8 +10,11 @@ pub struct AuthenticatedKubernetesNode {
 pub enum AuthenticatedNodeIdentity {
     /// Static-token callers retain the registered transport-address binding.
     RemoteAddress,
-    /// An absent pod binding must not fall back to the pod's transport address.
-    Kubernetes(Option<AuthenticatedKubernetesNode>),
+    Kubernetes(AuthenticatedKubernetesNode),
+    /// Incomplete metadata retains the legacy registered-address binding.
+    MissingKubernetesClaims,
+    /// Invalid supplied claims must not trigger an address fallback.
+    MalformedKubernetesClaims,
 }
 
 impl AuthenticatedKubernetesNode {
@@ -35,21 +38,54 @@ impl AuthenticatedKubernetesNode {
     pub(super) fn from_reviewed_user_info(
         user: &k8s_openapi::api::authentication::v1::UserInfo,
     ) -> Option<Self> {
-        use pplx_space_common_core::types::{PodName, PodUid};
-        let extra = user.extra.as_ref()?;
-        let claim = |key| match extra.get(key).map(Vec::as_slice) {
-            Some([value]) if !value.is_empty() => Some(value.as_str()),
-            _ => None,
+        match AuthenticatedNodeIdentity::from_reviewed_user_info(user) {
+            AuthenticatedNodeIdentity::Kubernetes(node) => Some(node),
+            AuthenticatedNodeIdentity::RemoteAddress
+            | AuthenticatedNodeIdentity::MissingKubernetesClaims
+            | AuthenticatedNodeIdentity::MalformedKubernetesClaims => None,
+        }
+    }
+}
+
+impl AuthenticatedNodeIdentity {
+    /// Classify reviewed claims without confusing absent metadata with invalid
+    /// supplied values. Validate every present claim before selecting fallback.
+    #[cfg(feature = "k8s")]
+    pub(super) fn from_reviewed_user_info(
+        user: &k8s_openapi::api::authentication::v1::UserInfo,
+    ) -> Self {
+        use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, PodName, PodUid};
+        let claim = |key| match user.extra.as_ref().and_then(|extra| extra.get(key)) {
+            None => Some(None),
+            Some(values) => match values.as_slice() {
+                [value] => Some(Some(value.as_str())),
+                _ => None,
+            },
         };
-        PodName::parse(claim("authentication.kubernetes.io/pod-name")?).ok()?;
-        PodUid::parse(claim("authentication.kubernetes.io/pod-uid")?).ok()?;
-        Some(Self {
-            name: claim("authentication.kubernetes.io/node-name")?
-                .parse()
-                .ok()?,
-            uid: claim("authentication.kubernetes.io/node-uid")?
-                .parse()
-                .ok()?,
-        })
+        let parse = || {
+            let pod_name = claim("authentication.kubernetes.io/pod-name")?
+                .map(PodName::parse)
+                .transpose()
+                .ok()?;
+            let pod_uid = claim("authentication.kubernetes.io/pod-uid")?
+                .map(PodUid::parse)
+                .transpose()
+                .ok()?;
+            let name = claim("authentication.kubernetes.io/node-name")?
+                .map(str::parse::<K8sNodeName>)
+                .transpose()
+                .ok()?;
+            let uid = claim("authentication.kubernetes.io/node-uid")?
+                .map(str::parse::<K8sNodeUid>)
+                .transpose()
+                .ok()?;
+            Some(match (pod_name, pod_uid, name, uid) {
+                (Some(_), Some(_), Some(name), Some(uid)) => {
+                    Self::Kubernetes(AuthenticatedKubernetesNode { name, uid })
+                }
+                _ => Self::MissingKubernetesClaims,
+            })
+        };
+        parse().unwrap_or(Self::MalformedKubernetesClaims)
     }
 }

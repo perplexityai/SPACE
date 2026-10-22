@@ -416,7 +416,7 @@ impl NodeApiAuthenticatedCaller {
         data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
     ) -> Self {
         Self {
-            node_identity: AuthenticatedNodeIdentity::Kubernetes(None),
+            node_identity: AuthenticatedNodeIdentity::MissingKubernetesClaims,
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,

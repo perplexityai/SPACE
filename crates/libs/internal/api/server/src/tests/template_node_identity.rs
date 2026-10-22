@@ -50,7 +50,16 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
         .await?;
     }
 
-    let tokens = ["bound", "stale", "unbound"].map(projected_token);
+    let tokens = [
+        "bound",
+        "stale",
+        "unbound",
+        "missing-node",
+        "missing-uid",
+        "malformed",
+        "missing-and-malformed",
+    ]
+    .map(projected_token);
     let reviewed_tokens = tokens.clone();
     let reviews = Arc::new(AtomicUsize::new(0));
     let review_count = reviews.clone();
@@ -74,12 +83,37 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
                 } else {
                     "stale-node-uid"
                 };
-                pod_bound_service_account_status(
+                let mut status = pod_bound_service_account_status(
                     "space-cluster-api",
                     username,
                     "catalog-worker",
                     uid,
-                )
+                );
+                let extra = status.user.as_mut().unwrap().extra.as_mut().unwrap();
+                match index {
+                    3 => {
+                        extra.remove("authentication.kubernetes.io/node-name");
+                        extra.remove("authentication.kubernetes.io/node-uid");
+                    }
+                    4 => {
+                        extra.remove("authentication.kubernetes.io/node-uid");
+                    }
+                    5 => {
+                        extra.insert(
+                            "authentication.kubernetes.io/node-uid".into(),
+                            vec![uid.into(), uid.into()],
+                        );
+                    }
+                    6 => {
+                        extra.remove("authentication.kubernetes.io/node-uid");
+                        extra.insert(
+                            "authentication.kubernetes.io/pod-name".into(),
+                            vec!["invalid/name".into()],
+                        );
+                    }
+                    _ => {}
+                }
+                status
             }
         },
         tokio_util::sync::CancellationToken::new(),
@@ -115,7 +149,11 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
     for (token, expected) in [
         (tokens[0].as_str(), [true, false]),
         (tokens[1].as_str(), [false, false]),
-        (tokens[2].as_str(), [false, false]),
+        (tokens[2].as_str(), [false, true]),
+        (tokens[3].as_str(), [false, true]),
+        (tokens[4].as_str(), [false, true]),
+        (tokens[5].as_str(), [false, false]),
+        (tokens[6].as_str(), [false, false]),
         ("synthetic-static-token", [false, true]),
     ] {
         for _ in 0..2 {
@@ -144,7 +182,7 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
     }
     assert_eq!(
         reviews.load(Ordering::SeqCst),
-        3,
+        tokens.len(),
         "each projected token is reviewed once"
     );
     drop(server);
