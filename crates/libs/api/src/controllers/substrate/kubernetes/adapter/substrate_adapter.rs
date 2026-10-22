@@ -286,6 +286,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             sandbox_id: sandbox_uuid,
             execution_generation: execution.generation,
             activation_attempt_id: execution.bootstrap_route_activation_id(),
+            materialization_id: execution.materialization_id,
             template: request.template_ref.template.as_str(),
             content_hash: request.template_ref.content_hash,
             env: request.env,
@@ -412,11 +413,12 @@ impl SubstrateAdapter for KubernetesSubstrate {
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
         match self
             .store
-            .persist_pod_metadata(
+            .persist_observed_pod_metadata(
                 sandbox_uuid,
                 execution.generation,
                 pod_uid.as_deref(),
                 pod_ip_string.as_deref(),
+                pod.materialization_id()?,
             )
             .await
         {
@@ -2640,7 +2642,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
         request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
     ) -> Result<(), ControllerError> {
-        pool::persist_pooled_execution_claim(tx, request, claim).await
+        pool::persist_pooled_execution_claim(tx, request, claim, self.store.materialization_mode())
+            .await
     }
 
     async fn rollback_pooled_execution_claim(

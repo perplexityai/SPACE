@@ -2779,5 +2779,71 @@ fn non_empty_bounded(
     Ok(())
 }
 
+/// Creation policy shared by execution writers. Both modes must enforce any
+/// token already recorded; Compatibility is a rollout mode, not a bypass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PodMaterializationMode {
+    Compatibility,
+    Fenced,
+}
+
+impl PodMaterializationMode {
+    pub fn initial_token(self) -> Option<PodMaterializationId> {
+        match self {
+            Self::Compatibility => None,
+            Self::Fenced => Some(PodMaterializationId::generate()),
+        }
+    }
+}
+
+/// Identity of one authorized pod materialization, reused across create retries.
+/// A new same-generation pod receives a new identity after its predecessor is gone.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct PodMaterializationId(Uuid);
+
+impl PodMaterializationId {
+    pub fn generate() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for PodMaterializationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for PodMaterializationId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for PodMaterializationId {
+    type Error = uuid::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::from_str(&value)
+    }
+}
+
+impl From<PodMaterializationId> for String {
+    fn from(value: PodMaterializationId) -> Self {
+        value.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests;

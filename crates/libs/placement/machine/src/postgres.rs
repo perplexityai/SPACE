@@ -11,7 +11,8 @@ use std::time::Duration;
 use jiff::Timestamp;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeId, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
+    ExecutionGeneration, NodeId, PodMaterializationMode, SandboxId, SandboxLifecycle,
+    SandboxLifecycleParseError,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -166,11 +167,21 @@ type ClaimedRow = (i64, i32, Option<Uuid>, String);
 pub struct PostgresPlacementStore {
     pool: PgPool,
     namespace: String,
+    materialization_mode: PodMaterializationMode,
 }
 
 impl PostgresPlacementStore {
-    pub fn new(pool: PgPool, namespace: String) -> Self {
-        Self { pool, namespace }
+    /// Callers must use the same rollout mode as all other execution writers.
+    pub fn new(
+        pool: PgPool,
+        namespace: String,
+        materialization_mode: PodMaterializationMode,
+    ) -> Self {
+        Self {
+            pool,
+            namespace,
+            materialization_mode,
+        }
     }
 
     /// Ensure an active execution row exists and return its generation — the
@@ -204,9 +215,9 @@ impl PostgresPlacementStore {
                 let pod_name = format!("space-sbx-{}-g{}", sandbox.as_uuid().simple(), generation);
                 let inserted = sqlx::query_scalar::<_, i64>(sql!(
                     "INSERT INTO sandbox_k8s_executions (
-                         sandbox_id, generation, pod_name, pod_namespace, state, active
+                         sandbox_id, generation, pod_name, pod_namespace, state, active, materialization_id
                      )
-                     VALUES ($1, $2, $3, $4, 'creating', TRUE)
+                     VALUES ($1, $2, $3, $4, 'creating', TRUE, $5)
                      ON CONFLICT DO NOTHING
                      RETURNING generation"
                 ))
@@ -214,6 +225,7 @@ impl PostgresPlacementStore {
                 .bind(generation)
                 .bind(&pod_name)
                 .bind(&self.namespace)
+                .bind(self.materialization_mode.initial_token())
                 .fetch_optional(&mut **tx)
                 .await?;
                 match inserted {

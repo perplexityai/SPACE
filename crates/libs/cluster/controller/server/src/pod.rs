@@ -35,6 +35,7 @@ pub fn build_pool_pod(
                 pod_name: &slot.pod_name,
                 sandbox_id: slot.reserved_sandbox_id,
                 execution_generation: 1,
+                materialization_id: None,
                 // A pool slot is one control-plane activation attempt: its ID
                 // remains stable across Create/Wake retries and a replacement
                 // slot receives a distinct ID.

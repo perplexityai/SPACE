@@ -173,6 +173,24 @@ activation listeners share its shutdown signal and drain budget. Draining is
 best-effort within the deployment termination grace; existing activation leases
 provide recovery if the process exits before completion.
 
+### Kubernetes materialization ownership
+
+Each new fenced execution carries a pod materialization token. Create retries
+reuse it; replacement after confirmed pod absence rotates it. Observations must
+match both that token and the recorded Pod UID before publishing an address or
+node incarnation. The separate `pod_materialized_at` record survives replacement
+and retirement so backup admission can detect a genuinely newer execution.
+
+`SPACE_POD_MATERIALIZATION_MODE=compatibility` is the initial rollout setting.
+Apply the additive schema and deploy token-aware writers everywhere before
+selecting `fenced`. Compatibility writers leave new pool-bound execution Node
+UIDs unknown while old writers may move their placement. Historical generations
+remain legacy until turnover; inventory never supplies historical proof. Both
+modes enforce tokens already issued. After activation, rollback requires a
+token-aware compatibility binary; pre-token binaries are no longer safe writers.
+The placement store requires an explicit creation mode and must receive the same
+policy when a controller adopts it.
+
 ### Lifecycle policy at activation
 
 Timeout updates use durable execution ownership rather than a lifecycle label

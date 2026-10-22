@@ -473,11 +473,14 @@ pub struct SandboxPoolPodMetadata {
     pub disk_io_limits: crate::types::DiskIoLimits,
 }
 
+pub const SANDBOX_MATERIALIZATION_ID_ANNOTATION: &str = "space.pplx.net/materialization-id";
+
 pub struct SandboxPodCommon<'a> {
     pub pod_name: &'a str,
     pub sandbox_id: crate::types::SandboxId,
     pub execution_generation: i64,
     pub activation_attempt_id: Option<crate::types::SandboxActivationAttemptId>,
+    pub materialization_id: Option<crate::types::PodMaterializationId>,
     pub template: &'a str,
     pub content_hash: Option<&'a str>,
     pub env: &'a BTreeMap<String, String>,
@@ -817,6 +820,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
         sandbox_id,
         execution_generation,
         activation_attempt_id,
+        materialization_id,
         template,
         content_hash,
         env,
@@ -875,6 +879,12 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
         SANDBOX_EXECUTION_GENERATION_ANNOTATION.to_string(),
         execution_generation.to_string(),
     );
+    if let Some(materialization_id) = materialization_id {
+        annotations.insert(
+            SANDBOX_MATERIALIZATION_ID_ANNOTATION.to_string(),
+            materialization_id.to_string(),
+        );
+    }
     if let Some(activation_attempt_id) = activation_attempt_id {
         annotations.insert(
             SANDBOX_ACTIVATION_ATTEMPT_ID_ANNOTATION.to_string(),

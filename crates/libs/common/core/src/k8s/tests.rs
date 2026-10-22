@@ -519,6 +519,7 @@ fn test_common<'a>(
         sandbox_id,
         execution_generation,
         activation_attempt_id: None,
+        materialization_id: None,
         template: "seed",
         content_hash: Some(TEST_CONTENT_HASH),
         env,
@@ -878,8 +879,10 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let activation_attempt_id = crate::types::SandboxActivationAttemptId::from_uuid(
         Uuid::from_u128(0x019f80000000700080000000000000aa),
     );
+    let materialization_id = "019f8000-0000-7000-8000-0000000000ab".parse().unwrap();
     let common = |pod_name, sandbox_id, execution_generation| SandboxPodCommon {
         activation_attempt_id: Some(activation_attempt_id),
+        materialization_id: Some(materialization_id),
         ..test_common(pod_name, sandbox_id, execution_generation, &env)
     };
 
@@ -1150,6 +1153,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         1,
     );
     pooled_common.activation_attempt_id = None;
+    pooled_common.materialization_id = None;
     let pooled = build_sandbox_pod(
         &config,
         SandboxPodRequest::Pooled {
@@ -2272,6 +2276,7 @@ fn node_group_placement_renders_boundary_affinity_and_dedicated_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                materialization_id: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2360,6 +2365,7 @@ fn shared_only_node_group_placement_renders_no_dedicated_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                materialization_id: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2418,6 +2424,7 @@ fn node_group_placement_and_drain_cohort_are_anded_in_one_term() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                materialization_id: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2479,6 +2486,7 @@ fn pooled_pod_renders_node_group_placement() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                materialization_id: None,
             },
             pool: SandboxPoolPodMetadata {
                 slot_id: TEST_POOL_SLOT_ID,
@@ -2550,6 +2558,7 @@ fn local_only_restore_keeps_direct_node_assignment_under_placement() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 4,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
@@ -2627,6 +2636,7 @@ fn dedicated_org_mismatch_renders_an_unsatisfiable_boundary() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 12,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
@@ -2684,6 +2694,7 @@ fn placement_boundary_survives_with_every_soft_bias_disabled() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 13,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: None,
                 env: &env,
@@ -2730,6 +2741,7 @@ fn soft_pinned_restore_suppresses_the_dedicated_preference() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 14,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
@@ -2806,6 +2818,7 @@ fn pooled_pod_never_renders_dedicated_toleration_or_preference() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                materialization_id: None,
             },
             pool: SandboxPoolPodMetadata {
                 slot_id: TEST_POOL_SLOT_ID,
@@ -2873,6 +2886,7 @@ fn dedicated_rendering_requires_matching_runtime_org() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                materialization_id: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2935,6 +2949,7 @@ fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                materialization_id: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3024,6 +3039,7 @@ fn dedicated_preference_is_gated_on_node_services_readiness() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 9,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
@@ -3077,6 +3093,7 @@ fn dedicated_preference_is_ungated_when_readiness_bias_is_off() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 10,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
@@ -3126,6 +3143,7 @@ fn all_shared_placement_for_another_org_fails_closed() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 17,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
@@ -3191,6 +3209,7 @@ fn org_less_placement_on_an_org_owned_pod_fails_closed() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 18,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
@@ -3247,6 +3266,7 @@ fn placement_for_a_different_template_fails_closed() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 18,
                 activation_attempt_id: None,
+                materialization_id: None,
                 // Not the template the placement was resolved for.
                 template: "acme-secret",
                 content_hash: Some(TEST_CONTENT_HASH),
@@ -3310,6 +3330,7 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
                 sandbox_id: TEST_SANDBOX_ID,
                 execution_generation: 19,
                 activation_attempt_id: None,
+                materialization_id: None,
                 template: "seed",
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,

@@ -107,6 +107,7 @@ pub struct ProtectedTemplateRelease {
 /// value. Row-locked at read time; see [`crate::WarmPoolStore::bind_source`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClaimedSlotBindSource {
+    pub k8s_node_uid: Option<pplx_space_common_core::types::K8sNodeUid>,
     pub pod_name: String,
     pub pod_namespace: String,
     pub pod_uid: Option<String>,

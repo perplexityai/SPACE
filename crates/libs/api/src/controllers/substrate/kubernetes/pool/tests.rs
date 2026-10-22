@@ -363,89 +363,114 @@ fn pool_eligibility_skips_requests_requiring_immediate_runtime_work() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_claim_and_bind_pool_slot() -> TestResult {
-    let db = pg_test_db().await?;
-    let slot = insert_ready_pool_slot(&db.pool).await?;
-    let actor = ActorRef::new(slot.user_id, slot.org_id, Email::parse("pool@example.com")?);
-    let env = BTreeMap::new();
-    let auto_lifecycle = AutoLifecyclePolicy::disabled();
-    let template_network_policy = NetworkPolicyV1::deny_all();
-    let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+    use super::super::store::MaterializationMode;
+    for mode in [
+        MaterializationMode::Compatibility,
+        MaterializationMode::Fenced,
+    ] {
+        let db = pg_test_db().await?;
+        let slot = insert_ready_pool_slot(&db.pool).await?;
+        sqlx::query(sql!(
+            "UPDATE kubernetes_pool_slots SET k8s_node_uid='node-uid' WHERE reserved_sandbox_id=$1"
+        ))
+        .bind(slot.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        let actor = ActorRef::new(slot.user_id, slot.org_id, Email::parse("pool@example.com")?);
+        let env = BTreeMap::new();
+        let auto_lifecycle = AutoLifecyclePolicy::disabled();
+        let template_network_policy = NetworkPolicyV1::deny_all();
+        let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
 
-    let claim = claim_pooled_execution(&db.pool, &request, "space").await?;
-    assert_eq!(
-        claim.pool_shape,
-        Some(PooledExecutionPoolShape::new(4, 2048, Default::default()))
-    );
-    let claim = claim.claim.expect("ready pool slot should be claimed");
+        let claim = claim_pooled_execution(&db.pool, &request, "space").await?;
+        assert_eq!(
+            claim.pool_shape,
+            Some(PooledExecutionPoolShape::new(4, 2048, Default::default()))
+        );
+        let claim = claim.claim.expect("ready pool slot should be claimed");
 
-    assert_eq!(claim.sandbox_id, slot.sandbox_id);
-    assert_eq!(claim.content_hash, slot.content_hash);
-    assert_eq!(claim.pod_name, "space-sbx-pooled-g1");
-    assert_eq!(claim.execution_generation, 1);
-    assert_eq!(claim.pod_ip, "10.90.0.11");
-    assert_eq!(claim.vcpu, Some(4));
-    assert_eq!(claim.memory_mib, Some(2048));
-    assert_eq!(claim.active_node_id, Some(slot.node_id));
-    let expected_slot_id = claim
-        .pool_slot_id
-        .expect("Kubernetes pooled claim should carry its slot id");
+        assert_eq!(claim.sandbox_id, slot.sandbox_id);
+        assert_eq!(claim.content_hash, slot.content_hash);
+        assert_eq!(claim.pod_name, "space-sbx-pooled-g1");
+        assert_eq!(claim.execution_generation, 1);
+        assert_eq!(claim.pod_ip, "10.90.0.11");
+        assert_eq!(claim.vcpu, Some(4));
+        assert_eq!(claim.memory_mib, Some(2048));
+        assert_eq!(claim.active_node_id, Some(slot.node_id));
+        let expected_slot_id = claim
+            .pool_slot_id
+            .expect("Kubernetes pooled claim should carry its slot id");
 
-    let mut tx = db.pool.begin().await?;
-    insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
-    persist_pooled_execution_claim(&mut tx, &request, &claim).await?;
-    tx.commit().await?;
+        let mut tx = db.pool.begin().await?;
+        insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
+        persist_pooled_execution_claim(&mut tx, &request, &claim, mode).await?;
+        tx.commit().await?;
 
-    let (state, claim_id): (String, Option<Uuid>) = sqlx::query_as(sql!(
-        "SELECT state, claim_id
+        let (state, claim_id): (String, Option<Uuid>) = sqlx::query_as(sql!(
+            "SELECT state, claim_id
          FROM kubernetes_pool_slots
          WHERE reserved_sandbox_id = $1"
-    ))
-    .bind(slot.sandbox_id)
-    .fetch_one(&db.pool)
-    .await?;
-    assert_eq!(state, "bound");
-    assert_eq!(claim_id, Some(claim.claim_id));
+        ))
+        .bind(slot.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(state, "bound");
+        assert_eq!(claim_id, Some(claim.claim_id));
 
-    let (
-        generation,
-        pod_name,
-        pod_namespace,
-        pod_uid,
-        pod_ip,
-        k8s_node_name,
-        state,
-        active,
-        route_activation_id,
-    ): PooledExecutionRow = sqlx::query_as(sql!(
-        "SELECT generation, pod_name, pod_namespace, pod_uid, host(pod_ip),
+        let (
+            generation,
+            pod_name,
+            pod_namespace,
+            pod_uid,
+            pod_ip,
+            k8s_node_name,
+            state,
+            active,
+            route_activation_id,
+        ): PooledExecutionRow = sqlx::query_as(sql!(
+            "SELECT generation, pod_name, pod_namespace, pod_uid, host(pod_ip),
                 k8s_node_name, state, active, route_activation_id
          FROM sandbox_k8s_executions
          WHERE sandbox_id = $1"
-    ))
-    .bind(slot.sandbox_id)
-    .fetch_one(&db.pool)
-    .await?;
-    assert_eq!(generation, 1);
-    assert_eq!(pod_name, "space-sbx-pooled-g1");
-    assert_eq!(pod_namespace, "space");
-    assert_eq!(pod_uid.as_deref(), Some("pod-uid"));
-    assert_eq!(pod_ip.as_deref(), Some("10.90.0.11"));
-    assert_eq!(k8s_node_name.as_deref(), Some("pool-node-1"));
-    assert_eq!(state, "running");
-    assert!(active);
-    assert_eq!(route_activation_id, Some(expected_slot_id));
-    assert_ne!(route_activation_id, Some(claim.claim_id));
-    let materialized: bool = sqlx::query_scalar(sql!(
+        ))
+        .bind(slot.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(generation, 1);
+        assert_eq!(pod_name, "space-sbx-pooled-g1");
+        assert_eq!(pod_namespace, "space");
+        assert_eq!(pod_uid.as_deref(), Some("pod-uid"));
+        assert_eq!(pod_ip.as_deref(), Some("10.90.0.11"));
+        assert_eq!(k8s_node_name.as_deref(), Some("pool-node-1"));
+        assert_eq!(state, "running");
+        assert!(active);
+        assert_eq!(route_activation_id, Some(expected_slot_id));
+        assert_ne!(route_activation_id, Some(claim.claim_id));
+        let materialized: bool = sqlx::query_scalar(sql!(
         "SELECT pod_materialized_at IS NOT NULL FROM sandbox_k8s_executions WHERE sandbox_id = $1"
     ))
     .bind(slot.sandbox_id)
     .fetch_one(&db.pool)
     .await?;
-    assert!(
-        materialized,
-        "an execution born with its slot's pod records that it materialized one"
-    );
+        assert!(
+            materialized,
+            "an execution born with its slot's pod records that it materialized one"
+        );
 
+        let uid: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1"
+        ))
+        .bind(slot.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            uid.as_deref(),
+            match mode {
+                MaterializationMode::Compatibility => None,
+                MaterializationMode::Fenced => Some("node-uid"),
+            }
+        );
+    }
     Ok(())
 }
 
@@ -664,7 +689,13 @@ async fn postgres_claim_blank_pool_slot_pod_uid_as_absent() -> TestResult {
 
     let mut tx = db.pool.begin().await?;
     insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
-    persist_pooled_execution_claim(&mut tx, &request, &claim).await?;
+    persist_pooled_execution_claim(
+        &mut tx,
+        &request,
+        &claim,
+        super::super::store::MaterializationMode::Fenced,
+    )
+    .await?;
     tx.commit().await?;
 
     let execution_pod_uid: Option<String> = sqlx::query_scalar(sql!(
@@ -760,7 +791,11 @@ async fn postgres_invalidate_claimed_pool_slot_keeps_slot_unclaimable() -> TestR
 async fn upsert_pool_config_uses_store_namespace() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
 
     let config = upsert_pool_config(
         &store,
@@ -801,7 +836,11 @@ async fn upsert_pool_config_uses_store_namespace() -> TestResult {
 async fn upsert_pool_config_rejects_encryptable_configs() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let request = |enabled| ClusterPoolConfigRequest {
         template_name: "seed".to_string(),
         content_hash: Some(slot.content_hash.clone()),
@@ -844,7 +883,11 @@ async fn upsert_pool_config_rejects_encryptable_configs() -> TestResult {
 async fn upsert_pool_config_preserves_and_explicitly_resets_disk_capacity() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let request = |disk_mib, reset_disk_to_template_default| ClusterPoolConfigRequest {
         template_name: "seed".to_string(),
         content_hash: Some(slot.content_hash.clone()),
@@ -892,7 +935,11 @@ async fn disable_pool_config_preserves_autoscaler_ownership() -> TestResult {
     // arrange
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     let config_id: Uuid = sqlx::query_scalar(sql!(
         "UPDATE kubernetes_pool_configs
          SET managed_by = 'autoscaler'
@@ -924,7 +971,11 @@ async fn upsert_pool_config_takes_manual_ownership_from_autoscaler() -> TestResu
     // arrange
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+    );
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs
          SET managed_by = 'autoscaler'
@@ -1033,7 +1084,13 @@ async fn postgres_admitted_claim_adopts_and_binds_the_exact_slot() -> TestResult
 
     let mut tx = db.pool.begin().await?;
     insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
-    persist_pooled_execution_claim(&mut tx, &request, &claim).await?;
+    persist_pooled_execution_claim(
+        &mut tx,
+        &request,
+        &claim,
+        super::super::store::MaterializationMode::Fenced,
+    )
+    .await?;
     tx.commit().await?;
 
     assert_eq!(
