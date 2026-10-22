@@ -67,7 +67,7 @@ templateCache:
 
 # template-manager drains for 25 s, then exits while holding its service mutex
 # if work is still running (crates/libs/template/mgr/src/run.rs); the shared
-# lifecycle default grace (crates/libs/common/svc/src/lifecycle.rs).
+# lifecycle default grace (crates/libs/service-lifecycle/src/lib.rs).
 terminationGracePeriodSeconds: 60
 
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).
