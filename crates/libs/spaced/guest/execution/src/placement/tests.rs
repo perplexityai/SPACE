@@ -1,6 +1,13 @@
 #[test]
 fn placement_hook_owns_the_descriptor_until_spawn() {
     use super::ExecutionCgroups;
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            clippy::single_element_loop,
+            reason = "Filesystem workers are Linux-only; other platforms exercise one hook"
+        )
+    )]
     for (filesystem, place) in [
         (
             false,

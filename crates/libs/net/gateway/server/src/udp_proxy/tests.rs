@@ -380,7 +380,7 @@ async fn pending_replay_rechecks_ca_readiness_before_each_datagram() {
         let remaining = Arc::new(AtomicUsize::new(usize::MAX));
         let gate = remaining.clone();
         let state = GatewayNetworkState::pending_policy().with_traffic_gate(Arc::new(move || {
-            gate.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            gate.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
         }));
         let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

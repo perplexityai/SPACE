@@ -10,6 +10,6 @@
 # (root Cargo.toml `[workspace.package]`): the pin says "the toolchain we all
 # run"; the floor says "the minimum we compile on." Bump this pin deliberately
 # (and keep it >= the floor) rather than tracking `stable` and inheriting drift.
-channel = "1.98.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 targets = ["aarch64-unknown-linux-musl"]

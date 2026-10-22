@@ -35,7 +35,7 @@ pub(super) fn current_thread_cpu_us() -> u64 {
 
 impl StreamPullTiming {
     pub(super) fn add(counter: &std::sync::atomic::AtomicU64, value: u64) {
-        match counter.fetch_update(
+        match counter.try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |current| Some(current.saturating_add(value)),
