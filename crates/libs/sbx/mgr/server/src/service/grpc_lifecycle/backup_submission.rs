@@ -143,32 +143,6 @@ impl SandboxManagerService {
 }
 
 impl SandboxManagerService {
-    pub(in crate::service) fn require_node_local_backup_handoff(
-        &self,
-        sandbox_id: &str,
-        local_artifact_id: LocalArtifactId,
-        result: Result<SubmitSuspendSnapshotOutcome, Status>,
-    ) -> Result<(), Status> {
-        match result {
-            Ok(SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. }) => {
-                tracing::info!(
-                    sandbox_id,
-                    local_artifact_id = %local_artifact_id,
-                    job_id = %job_id,
-                    "persisted suspend artifact backup before runtime teardown",
-                );
-                Ok(())
-            }
-            Ok(SubmitSuspendSnapshotOutcome::NoUploadConfig) => Ok(()),
-            Err(status) => {
-                let reason =
-                    format!("persist suspend artifact backup before runtime teardown: {status}");
-                self.record_suspend_snapshot_publication_failure_after_begin(sandbox_id, &reason);
-                Err(status)
-            }
-        }
-    }
-
     /// Resolve the org-level S3 override for this sandbox. Returns one
     /// of three classifications:
     ///
@@ -528,22 +502,22 @@ impl SandboxManagerService {
 
     /// Hand a node-local suspend's capture to a durable upload, registered
     /// under the sandbox's Kubernetes execution (see
-    /// [`node_local_registration_generation`]). Any failure, a refusal of a
-    /// superseded execution included, is a backup-fence failure, which rolls
-    /// the suspend back and disarms auto-lifecycle.
-    pub(super) async fn enqueue_node_local_suspend_backup(
+    /// [`node_local_registration_generation`]). The durable cleanup intent owns
+    /// retries, including a refused handoff; publication must never roll back.
+    pub(in crate::service) async fn enqueue_node_local_suspend_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
         local_artifact_id: LocalArtifactId,
         snapshot_dir: &str,
-        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+        format: Option<pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat>,
     ) -> Result<SubmitSuspendSnapshotOutcome, Status> {
-        self.enqueue_suspend_artifact_backup(
+        self.enqueue_suspend_artifact_backup_with_handoff(
             sandbox,
             local_artifact_id,
             snapshot_dir,
             format,
             node_local_registration_generation(sandbox),
+            ArtifactBackupHandoff::TeardownFence,
         )
         .await
         .map_err(|error| artifact_backup_fence_status(error.to_string()))
@@ -556,6 +530,26 @@ impl SandboxManagerService {
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
         registration_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
+        self.enqueue_suspend_artifact_backup_with_handoff(
+            sandbox,
+            local_artifact_id,
+            snapshot_dir,
+            Some(format),
+            registration_generation,
+            ArtifactBackupHandoff::TeardownFence,
+        )
+        .await
+    }
+
+    async fn enqueue_suspend_artifact_backup_with_handoff(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        local_artifact_id: LocalArtifactId,
+        snapshot_dir: &str,
+        format: Option<pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat>,
+        registration_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        handoff: ArtifactBackupHandoff,
     ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {
             OrgSnapshotConfigResolution::Resolved(config) => Some(config),
@@ -570,6 +564,14 @@ impl SandboxManagerService {
                 None
             }
         };
+        let format = match format {
+            Some(format) => format,
+            None if request_override.is_none() && self.snapshot_upload_config.is_none() => {
+                return Ok(SubmitSuspendSnapshotOutcome::NoUploadConfig);
+            }
+            None => reupload_format_from_sidecar(snapshot_dir)
+                .map_err(|error| ArtifactBackupSubmissionError::from(error.to_string()))?,
+        };
         self.submit_artifact_backup(
             sandbox,
             ArtifactBackupSubmission {
@@ -581,7 +583,7 @@ impl SandboxManagerService {
                 snapshot_dir,
                 request_override: request_override.as_ref(),
                 format,
-                handoff: ArtifactBackupHandoff::TeardownFence,
+                handoff,
                 execution_generation: registration_generation,
             },
         )
