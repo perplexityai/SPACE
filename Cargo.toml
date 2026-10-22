@@ -47,6 +47,7 @@ members = [
     "crates/libs/bearer-token",
     "crates/libs/tokio-runtime",
     "crates/libs/sandbox/store",
+    "crates/libs/sandbox/quarantine-store",
     "crates/libs/sandbox/teardown",
     "crates/libs/sandbox/portability",
     "crates/libs/sandbox/auto-lifecycle-receipt",
@@ -418,6 +419,7 @@ pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }
 pplx-space-cluster-trigger-queue = { path = "crates/libs/cluster/trigger-queue" }
 pplx-space-sandbox-portability = { path = "crates/libs/sandbox/portability" }
+pplx-space-sandbox-quarantine-store = { path = "crates/libs/sandbox/quarantine-store" }
 pplx-space-sandbox-store = { path = "crates/libs/sandbox/store" }
 pplx-space-sandbox-teardown = { path = "crates/libs/sandbox/teardown" }
 pplx-space-auto-lifecycle-receipt = { path = "crates/libs/sandbox/auto-lifecycle-receipt" }

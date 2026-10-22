@@ -88,6 +88,7 @@ pplx-space-page-cache = { workspace = true }
 pplx-space-postgres-contention = { workspace = true }
 pplx-space-request-id = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }
+pplx-space-sandbox-quarantine-store = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }

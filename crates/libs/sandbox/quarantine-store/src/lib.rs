@@ -1,4 +1,14 @@
 //! Shared SQL fragments for recording sandbox quarantine entries.
+//!
+//! These are the column lists and the conflict assignments for the
+//! control-plane Postgres `sandbox_quarantine_state` and
+//! `sandbox_quarantine_history` tables, which the cluster controller's
+//! orphaned-sandbox sweep and the internal API's published-state writer splice
+//! into their statements. Other writers of those tables still write their SQL
+//! inline, and sbx-mgr's SQLite tables of the same names belong to
+//! `pplx-space-sbx-mgr-store`, not here. The fragments sit in their own crate,
+//! outside `pplx-space-common-svc`, until store functions for these tables
+//! replace them.
 
 pub fn quarantine_state_insert_columns() -> &'static str {
     "sandbox_id,

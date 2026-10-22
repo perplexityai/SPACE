@@ -1093,6 +1093,25 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a feature the sandbox quarantine store needs from a
+    # future dependency but only gets through unification with common-svc
+    # fails here.
+    echo "--- :rust: Running isolated sandbox quarantine store clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-sandbox-quarantine-store \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-sandbox-quarantine-store \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

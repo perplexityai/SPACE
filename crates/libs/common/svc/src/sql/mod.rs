@@ -16,7 +16,7 @@ pub mod identity;
 #[cfg(feature = "migration-checksums")]
 pub use pplx_space_migration_checksums as migration_checksums;
 pub use pplx_space_node_registration_store as node_registration;
-pub mod sandbox_quarantine;
+pub use pplx_space_sandbox_quarantine_store as sandbox_quarantine;
 pub mod sandbox_residency;
 pub mod sandbox_routability;
 
