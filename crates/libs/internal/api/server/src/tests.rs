@@ -1,3 +1,5 @@
+#[cfg(feature = "kubernetes")]
+mod backup_identity;
 mod prefetch_catalog;
 mod reconcile_claim_origins;
 mod substrate_scope;
@@ -6417,9 +6419,12 @@ async fn finalize_unknown_snapshot_returns_not_found() -> TestResult {
 /// Helper to heartbeat a backup attempt through `TouchArtifactBackup`.
 async fn touch(service: &ClusterApiService, snapshot_id: SnapshotId) -> Result<(), tonic::Status> {
     service
-        .touch_artifact_backup(Request::new(TouchArtifactBackupRequest {
-            backup_attempt_id: snapshot_id.to_string(),
-        }))
+        .touch_artifact_backup(request_from_node(
+            TouchArtifactBackupRequest {
+                backup_attempt_id: snapshot_id.to_string(),
+            },
+            TEST_WORKER_IP,
+        ))
         .await
         .map(|_| ())
 }
