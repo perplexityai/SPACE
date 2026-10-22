@@ -216,7 +216,14 @@ pub(crate) async fn resolve_session_route(
             Err(error) => error,
         };
         let at_rest = if !ingress && error.code() == tonic::Code::FailedPrecondition && unplaced {
-            route_at_rest(pool, org_id, sandbox_id).await
+            match route_at_rest(pool, org_id, sandbox_id).await {
+                Some(lifecycle)
+                    if !implicit_wake_queued(activation, sandbox_id, deadline).await =>
+                {
+                    Some(lifecycle)
+                }
+                _ => None,
+            }
         } else {
             None
         };
@@ -322,6 +329,32 @@ pub(super) async fn hold_route_for_activation(
         Err(error) => {
             tracing::warn!(%sandbox_id, %error, "could not read pending activations for a session route");
             Ok(())
+        }
+    }
+}
+
+/// Ask the lifecycle owner to queue, or join, the wake a session on an
+/// at-rest sandbox waits for. Only its definite "nothing can wake it" lets the
+/// route be answered as at rest; no owner, an owner from before this request,
+/// or one that cannot be reached is unknown, and leaves it retryable.
+pub(super) async fn implicit_wake_queued(
+    activation: Option<&dyn crate::ingress_activation::IngressActivation>,
+    sandbox_id: SandboxId,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let Some(activation) = activation else {
+        return true;
+    };
+    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match activation.queue_implicit_wake(sandbox_id, budget).await {
+        Ok(keep_waiting) => keep_waiting,
+        Err(error) if error.code() == tonic::Code::Unimplemented => {
+            tracing::debug!(%sandbox_id, %error, "lifecycle owner cannot queue a session's wake");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%sandbox_id, %error, "could not queue the wake a session waits for");
+            true
         }
     }
 }

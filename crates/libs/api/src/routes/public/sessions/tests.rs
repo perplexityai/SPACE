@@ -846,4 +846,47 @@ mod not_running {
         }
         Ok(())
     }
+
+    #[tokio::test]
+    async fn an_attach_on_a_sandbox_at_rest_queues_the_wake_its_policy_allows() -> TestDbResult<()>
+    {
+        let fixture = fixture().await?;
+        for (lifecycle, wake_on, queued) in [
+            ("suspended", &["access"][..], true),
+            ("paused", &["command"], true),
+            ("suspended", &[], false),
+            ("stopped", &["command"], false),
+            // Running or heading there since the resolver looked: no wake,
+            // but the attach keeps waiting.
+            ("started", &["access"], true),
+            ("restoring", &[], true),
+        ] {
+            let sandbox_id = sandbox(&fixture, lifecycle, wake_on).await?;
+            let stored =
+                crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                    .await?
+                    .expect("seeded sandbox");
+            for _ in 0..2 {
+                assert_eq!(
+                    queue_command_wake(&fixture.db.pool, &stored)
+                        .await
+                        .map_err(|e| format!("{e:?}"))?,
+                    queued,
+                    "{lifecycle} {wake_on:?}"
+                );
+            }
+            let woken = queued && !matches!(lifecycle, "started" | "restoring");
+            let expected = if woken {
+                vec![(None, "native".to_string())]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                wakes(&fixture, sandbox_id).await?,
+                expected,
+                "{lifecycle} {wake_on:?}"
+            );
+        }
+        Ok(())
+    }
 }

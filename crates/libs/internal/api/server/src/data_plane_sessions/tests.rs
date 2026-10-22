@@ -368,3 +368,40 @@ async fn a_wake_finishing_after_the_route_row_was_read_leaves_the_route_retryabl
     assert_eq!(route_at_rest(pool, row.org_id, row.sandbox_id).await, None);
     Ok(())
 }
+
+#[tokio::test]
+async fn only_a_definite_no_from_the_lifecycle_owner_leaves_a_route_at_rest() {
+    struct Owner(Result<bool, tonic::Code>);
+    #[tonic::async_trait]
+    impl crate::ingress_activation::IngressActivation for Owner {
+        async fn prepare(&self, _: SandboxId, _: std::time::Duration) -> Result<(), Status> {
+            Ok(())
+        }
+        async fn queue_implicit_wake(
+            &self,
+            _: SandboxId,
+            _: std::time::Duration,
+        ) -> Result<bool, Status> {
+            self.0
+                .map_err(|code| Status::new(code, "synthetic owner failure"))
+        }
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let sandbox_id = SandboxId::new();
+    // Unknown is not "nothing can wake it": the attach stays retryable.
+    assert!(implicit_wake_queued(None, sandbox_id, deadline).await);
+    for (answer, queued) in [
+        (Ok(true), true),
+        (Ok(false), false),
+        (Err(tonic::Code::Unavailable), true),
+        // An API from before the request.
+        (Err(tonic::Code::Unimplemented), true),
+    ] {
+        let owner = Owner(answer);
+        assert_eq!(
+            implicit_wake_queued(Some(&owner), sandbox_id, deadline).await,
+            queued,
+            "{answer:?}"
+        );
+    }
+}

@@ -21,6 +21,9 @@ struct Backend {
 }
 #[tonic::async_trait]
 impl AccessBackend for Backend {
+    async fn queue_command_wake(&self, _: SandboxId) -> Result<bool, Status> {
+        Ok(false)
+    }
     async fn observe(&self, _: SandboxId) -> Result<Observation, Status> {
         Ok(*self.state.lock().unwrap())
     }

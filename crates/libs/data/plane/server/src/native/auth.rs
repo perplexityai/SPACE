@@ -135,7 +135,7 @@ pub(crate) enum RouteResolutionError {
     /// The sandbox has no route yet, and something is about to give it one.
     SessionNotReady,
     /// The sandbox has no route and nothing is about to give it one: it is
-    /// at rest and no wake is queued for it.
+    /// at rest, no wake is queued for it, and none could be queued.
     SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest),
     ResolutionFailed,
     RouteStateInvalid,

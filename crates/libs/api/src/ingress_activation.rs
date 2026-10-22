@@ -7,7 +7,8 @@ use pplx_space_common_svc::{
 use pplx_space_node_api_client::{
     activation::IngressActivation,
     proto::{
-        PrepareIngressRequest, PrepareIngressResponse,
+        PrepareIngressRequest, PrepareIngressResponse, QueueImplicitWakeRequest,
+        QueueImplicitWakeResponse,
         ingress_activation_api_server::{IngressActivationApi, IngressActivationApiServer},
     },
 };
@@ -49,6 +50,25 @@ impl IngressActivationApi for ActivationService {
         let _waiter = IngressPreparationPermit::acquire(Some(id))?;
         self.activation.prepare(id, budget).await?;
         Ok(Response::new(PrepareIngressResponse {}))
+    }
+
+    async fn queue_implicit_wake(
+        &self,
+        request: Request<QueueImplicitWakeRequest>,
+    ) -> Result<Response<QueueImplicitWakeResponse>, Status> {
+        if self.shutdown.is_cancelled() {
+            return Err(Status::unavailable("activation API is draining"));
+        }
+        let id = request
+            .into_inner()
+            .sandbox_id
+            .parse::<SandboxId>()
+            .map_err(|_| Status::invalid_argument("sandbox_id must be a UUID"))?;
+        let queued = self
+            .activation
+            .queue_implicit_wake(id, preparation_timeout())
+            .await?;
+        Ok(Response::new(QueueImplicitWakeResponse { queued }))
     }
 }
 

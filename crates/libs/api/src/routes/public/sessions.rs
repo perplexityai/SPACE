@@ -145,7 +145,7 @@ pub async fn create_process_session(
     )
     .await?;
     if admission == CommandAdmission::AdmitAndWake {
-        enqueue_command_wake(&state, org.id, sandbox_id).await?;
+        enqueue_command_wake(&state.pool, org.id, sandbox_id).await?;
     }
 
     Ok((StatusCode::CREATED, Json(session)))
@@ -180,7 +180,7 @@ pub async fn create_command(
     )
     .await?;
     if admission == CommandAdmission::AdmitAndWake {
-        enqueue_command_wake(&state, org.id, sandbox_id).await?;
+        enqueue_command_wake(&state.pool, org.id, sandbox_id).await?;
     }
 
     // Streaming is negotiated after the create, so validation, owner scope,
@@ -282,7 +282,7 @@ fn sandbox_lifecycle(sandbox: &Sandbox) -> Result<SandboxLifecycle, PublicApiErr
 /// Called for a replayed session too, so a retry heals a wake that failed to
 /// queue after its session was created.
 async fn enqueue_command_wake(
-    state: &AppState,
+    pool: &sqlx::PgPool,
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
 ) -> Result<(), PublicApiError> {
@@ -292,7 +292,7 @@ async fn enqueue_command_wake(
         rollback: None,
     }
     .into_json();
-    PublicOperationStore::new(state.pool.clone())
+    PublicOperationStore::new(pool.clone())
         .create_or_join_active_sandbox_wake(
             org_id,
             &sandbox_id.to_string(),
@@ -301,6 +301,27 @@ async fn enqueue_command_wake(
         )
         .await?;
     Ok(())
+}
+
+/// Queue, or join, the wake an existing session on `sandbox` waits for, when
+/// the sandbox is at rest and its wake policy lets a command wake it, as for
+/// a new one. For the session route resolver, whose attach found the sandbox
+/// with no node: answers whether the attach should keep waiting. A sandbox
+/// that is running or heading there again since the resolver looked needs no
+/// wake and keeps waiting too; only one nothing can wake answers no.
+pub(crate) async fn queue_command_wake(
+    pool: &sqlx::PgPool,
+    sandbox: &Sandbox,
+) -> Result<bool, PublicApiError> {
+    let lifecycle = sandbox_lifecycle(sandbox)?;
+    match command_admission(lifecycle, &sandbox.auto_lifecycle.0) {
+        CommandAdmission::Admit => Ok(true),
+        CommandAdmission::Refuse => Ok(false),
+        CommandAdmission::AdmitAndWake => {
+            enqueue_command_wake(pool, sandbox.org_id, PublicSandboxId::from(sandbox.id)).await?;
+            Ok(true)
+        }
+    }
 }
 
 /// Create a command (one-shot process) data-plane session for `sandbox_id`,

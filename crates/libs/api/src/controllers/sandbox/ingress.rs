@@ -37,6 +37,9 @@ trait AccessBackend: Send + Sync {
     /// Read-only probe: no wake, recovery, or lifecycle reconciliation.
     async fn reachable(&self, id: SandboxId) -> Result<bool, Status>;
     async fn access(&self, id: SandboxId) -> Result<AccessOutcome, Status>;
+    /// Queue, or join, the system wake a session on the sandbox waits for,
+    /// when it is at rest and its wake policy lets a command wake it.
+    async fn queue_command_wake(&self, id: SandboxId) -> Result<bool, Status>;
 }
 
 /// Detached request waiters cannot create unbounded accepted activation tasks.
@@ -98,6 +101,19 @@ pub(crate) fn ingress_activation(
 
 #[tonic::async_trait]
 impl AccessBackend for StoredAccess {
+    async fn queue_command_wake(&self, id: SandboxId) -> Result<bool, Status> {
+        let Some(sandbox) = fetch_sandbox(&self.pool, id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        crate::routes::public::sessions::queue_command_wake(&self.pool, &sandbox)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!("could not queue the command wake: {error:?}"))
+            })
+    }
     async fn observe(&self, id: SandboxId) -> Result<Observation, Status> {
         let sandbox = fetch_sandbox(&self.pool, id)
             .await
@@ -226,6 +242,13 @@ fn validate_access(lifecycle: SandboxLifecycle, access_wake: bool) -> Result<(),
 
 #[tonic::async_trait]
 impl IngressActivation for Activator {
+    async fn queue_implicit_wake(&self, id: SandboxId, _timeout: Duration) -> Result<bool, Status> {
+        if self.owners.shutdown.is_cancelled() {
+            return Err(Status::unavailable("ingress activation is shutting down"));
+        }
+        self.backend.queue_command_wake(id).await
+    }
+
     async fn prepare(&self, id: SandboxId, timeout: Duration) -> Result<(), Status> {
         let work = async {
             if self.owners.shutdown.is_cancelled() {
