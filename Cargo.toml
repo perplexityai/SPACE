@@ -142,6 +142,7 @@ members = [
     "crates/libs/execution-spec",
     "crates/libs/linux-ids",
     "crates/libs/network-roles",
+    "crates/libs/auto-lifecycle",
     "crates/libs/cluster/controller/server",
     "crates/libs/cluster/pool",
     "crates/libs/cluster/reconciler",
@@ -411,6 +412,7 @@ pplx-space-request-id = { path = "crates/libs/request-id" }
 pplx-space-execution-spec = { path = "crates/libs/execution-spec" }
 pplx-space-linux-ids = { path = "crates/libs/linux-ids" }
 pplx-space-network-roles = { path = "crates/libs/network-roles" }
+pplx-space-auto-lifecycle = { path = "crates/libs/auto-lifecycle" }
 pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
 pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }

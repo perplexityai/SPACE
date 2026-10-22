@@ -6,7 +6,7 @@ use super::{
 use std::collections::BTreeMap;
 
 #[cfg(feature = "serde")]
-use crate::types::parse_simple_duration_secs;
+use pplx_space_durations::parse_simple_duration_secs;
 
 #[test]
 fn disabled_policy_is_empty() {

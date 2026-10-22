@@ -1074,6 +1074,25 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a serde feature the auto-lifecycle policy crate needs but
+    # only gets through unification with common-core fails here. serde is its
+    # only feature, so --all-features also covers serde alone.
+    echo "--- :rust: Running isolated auto-lifecycle policy clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-auto-lifecycle \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-auto-lifecycle \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

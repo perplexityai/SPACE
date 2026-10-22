@@ -17,6 +17,7 @@ k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl"] }
 pplx-space-accounts = { workspace = true }
+pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
@@ -67,6 +68,7 @@ serde = [
     "pplx-space-execution-spec/serde",
     "pplx-space-linux-ids/serde",
     "pplx-space-network-roles/serde",
+    "pplx-space-auto-lifecycle/serde",
 ]
 sqlx = [
     "dep:sqlx",
