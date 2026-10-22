@@ -82,6 +82,7 @@ pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-migration-checksums = { workspace = true, optional = true }
+pplx-space-node-registration-store = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-page-cache = { workspace = true }
 pplx-space-postgres-contention = { workspace = true }

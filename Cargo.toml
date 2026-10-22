@@ -76,6 +76,7 @@ members = [
     "crates/libs/node/mgr/client",
     "crates/libs/node/mgr/protocol",
     "crates/libs/node/mgr/server",
+    "crates/libs/node/registration-store",
     "crates/libs/node/runtime/core",
     "crates/libs/node/runtime/manager/client",
     "crates/libs/node/runtime/manager/server",
@@ -377,6 +378,7 @@ pplx-space-node-api-sim = { path = "crates/libs/node/api/sim" }
 pplx-space-node-mgr = { path = "crates/libs/node/mgr/server" }
 pplx-space-node-mgr-client = { path = "crates/libs/node/mgr/client" }
 pplx-space-node-mgr-protocol = { path = "crates/libs/node/mgr/protocol" }
+pplx-space-node-registration-store = { path = "crates/libs/node/registration-store" }
 pplx-space-node-runtime-core = { path = "crates/libs/node/runtime/core" }
 pplx-space-node-runtime-manager = { path = "crates/libs/node/runtime/manager/server" }
 pplx-space-node-runtime-manager-client = { path = "crates/libs/node/runtime/manager/client" }

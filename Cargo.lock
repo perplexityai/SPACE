@@ -5565,6 +5565,7 @@ dependencies = [
  "pplx-space-kube-client",
  "pplx-space-metrics",
  "pplx-space-migration-checksums",
+ "pplx-space-node-registration-store",
  "pplx-space-observability",
  "pplx-space-page-cache",
  "pplx-space-postgres-contention",
@@ -6637,6 +6638,16 @@ dependencies = [
  "clap",
  "pplx-space-common-svc",
  "pplx-space-node-mgr",
+]
+
+[[package]]
+name = "pplx-space-node-registration-store"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-sql-locator",
+ "sqlx",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

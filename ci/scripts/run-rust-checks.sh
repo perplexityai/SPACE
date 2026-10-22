@@ -902,6 +902,33 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a sqlx or common-core feature the node registration
+    # store needs but only gets through unification with common-svc fails here.
+    echo "--- :rust: Running isolated node registration store clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-node-registration-store \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-node-registration-store \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+    # Library alone, so a sqlx feature that a future dev-dependency (such as
+    # the database test fixtures) would unify into --all-targets fails here.
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-node-registration-store \
+        --no-default-features \
+        --lib \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {
