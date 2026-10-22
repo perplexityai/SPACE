@@ -152,7 +152,7 @@ impl JsonLogContext {
             service: service_name.to_string(),
             environment: logging::environment(),
             version: logging::version(),
-            cluster_id: pplx_space_common_core::types::process_cluster_id()
+            cluster_id: pplx_space_cluster_id::process_cluster_id()
                 .map(|id| id.as_str().to_string()),
             sandbox_id: context.sandbox_id,
             boot_type: context.boot_type,

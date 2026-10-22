@@ -6684,6 +6684,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "pplx-space-cluster-id",
  "pplx-space-common-core",
  "serde_json",
  "thiserror 2.0.20",

@@ -3,7 +3,7 @@ mod datadog;
 #[cfg(feature = "otlp-metrics")]
 mod otlp;
 
-use pplx_space_common_core::types::process_cluster_id;
+use pplx_space_cluster_id::process_cluster_id;
 
 use crate::{ObservabilityError, identity::Identity, selection::Selection};
 
@@ -266,7 +266,7 @@ pub(super) fn shutdown_metrics() {
 }
 
 pub(super) fn constant_tags_from_env(identity: &Identity) -> Vec<String> {
-    // Read the shared process-global cluster id (single owner in common-core,
+    // Read the shared process-global cluster id (single owner in cluster-id,
     // also consumed by the sandbox-event stream), so metrics and events never
     // disagree about cluster identity. A malformed value is already dropped +
     // logged once at that single owner, so it never reaches this tag.
