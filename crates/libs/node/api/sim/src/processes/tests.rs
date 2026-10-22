@@ -45,7 +45,7 @@ async fn connect_replays_the_journal_from_the_cursor_only() {
         .unwrap();
 
     // Everything already delivered: nothing to replay.
-    let at_tail = collect(table.connect("sbx", &process_id, Some(1)).await.unwrap()).await;
+    let at_tail = collect(table.connect("sbx", &process_id, Some(1), false).await.unwrap()).await;
     assert_eq!(
         at_tail[0],
         sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {
@@ -60,17 +60,46 @@ async fn connect_replays_the_journal_from_the_cursor_only() {
     ));
 
     // Nothing delivered yet: replay from sequence 0.
-    let from_start = collect(table.connect("sbx", &process_id, Some(0)).await.unwrap()).await;
+    let from_start = collect(
+        table
+            .connect("sbx", &process_id, Some(0), false)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(stdout_count(&from_start), 1);
 
+    // The simulator never lags, so it acknowledges a gap-resume request and
+    // replays the same output.
+    let resumed = collect(
+        table
+            .connect("sbx", &process_id, Some(0), true)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        resumed[0],
+        sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {
+            resume_after_output_gap: true,
+        })
+    );
+    assert_eq!(stdout_count(&resumed), 1);
+
     // No cursor: live tail, no replay.
-    let live = collect(table.connect("sbx", &process_id, None).await.unwrap()).await;
+    let live = collect(
+        table
+            .connect("sbx", &process_id, None, false)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(stdout_count(&live), 0);
 
     // A cursor past the tail fails, as the guest's does, instead of
     // skipping the output before it.
     let beyond: Vec<_> = table
-        .connect("sbx", &process_id, Some(2))
+        .connect("sbx", &process_id, Some(2), false)
         .await
         .unwrap()
         .collect()
@@ -120,7 +149,7 @@ async fn terminating_a_sandbox_ends_its_processes_and_forgets_them() {
     );
     assert!(table.list("sbx-a", false, None).await.is_empty());
     assert!(matches!(
-        table.connect("sbx-a", &process_id, None).await,
+        table.connect("sbx-a", &process_id, None, false).await,
         Err(SimProcessError::NotFound { .. })
     ));
     assert_eq!(
@@ -161,7 +190,13 @@ async fn background_start_ends_after_started_and_keeps_the_process() {
     // Connecting later still replays from the cursor and follows the exit.
     let process_id = running[0].process_id.clone();
     table.kill("sbx", &process_id).await.unwrap();
-    let events = collect(table.connect("sbx", &process_id, Some(0)).await.unwrap()).await;
+    let events = collect(
+        table
+            .connect("sbx", &process_id, Some(0), false)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(stdout_count(&events), 1);
     assert!(matches!(
         events.last(),
@@ -197,7 +232,13 @@ async fn signaling_an_exited_process_is_not_found() {
         Err(SimProcessError::NotFound { .. })
     ));
     // Connect still works for an exited process: it replays the exit.
-    let events = collect(table.connect("sbx", &process_id, None).await.unwrap()).await;
+    let events = collect(
+        table
+            .connect("sbx", &process_id, None, false)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(matches!(
         events.last(),
         Some(sbx::spaced_process_event::Event::Exit(_))

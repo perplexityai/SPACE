@@ -380,7 +380,7 @@ impl ProcessEventJournal {
     }
 
     pub(super) fn complete(&self, exit: ProcessEvent) {
-        let next_sequence = {
+        let (next_sequence, output_bytes) = {
             let mut state = self
                 .state
                 .lock()
@@ -388,11 +388,13 @@ impl ProcessEventJournal {
             state.exit = Some(exit.clone());
             state.completed_at = Some(tokio::time::Instant::now());
             state.ended_at = Some(SystemTime::now());
-            state.next_sequence
+            let retained: u64 = state.output.iter().map(|event| event.data_bytes).sum();
+            (state.next_sequence, state.dropped_output_bytes + retained)
         };
         self.changed.send_replace(ProcessJournalChange::Exit {
             event: exit,
             next_sequence,
+            output_bytes,
         });
     }
 
@@ -483,6 +485,8 @@ pub(super) enum ProcessJournalChange {
     Exit {
         event: ProcessEvent,
         next_sequence: u64,
+        /// Stdout and stderr data bytes in every output event, retained or not.
+        output_bytes: u64,
     },
 }
 
@@ -569,19 +573,16 @@ pub(super) fn process_event_stream_with_prefix(
             let current = cursor.as_mut()?;
             let result = loop {
                 let Some(journal) = current.journal.upgrade() else {
+                    if let Some(gap) = current.skip_evicted_output() {
+                        return Some((Ok(gap), (prefix, cursor)));
+                    }
                     break evicted_process_journal_result(current);
                 };
                 let read = journal.read(current.next_sequence);
                 drop(journal);
                 match read {
                     ProcessJournalRead::Event(event) => {
-                        current.next_sequence += 1;
-                        if let Some(primary) = &current.primary {
-                            primary.store(current.next_sequence, Ordering::Release);
-                            if let Some(journal) = current.journal.upgrade() {
-                                journal.consumed.send_replace(());
-                            }
-                        }
+                        current.advance_to(current.next_sequence + 1);
                         return Some((Ok(event), (prefix, cursor)));
                     }
                     ProcessJournalRead::Exit(exit) => break Ok(exit),
@@ -589,21 +590,19 @@ pub(super) fn process_event_stream_with_prefix(
                         first_sequence,
                         output_bytes_before,
                     } => {
-                        let Some(resume) = &current.gap_resume else {
+                        let Some(gap) =
+                            current.skip_output_gap(first_sequence, output_bytes_before)
+                        else {
                             break Err(process_output_lagged_status(Some(first_sequence)));
                         };
-                        let gap = process_output_gap_event(
-                            resume,
-                            first_sequence - current.next_sequence,
-                            first_sequence,
-                            output_bytes_before,
-                        );
-                        current.next_sequence = first_sequence;
                         return Some((Ok(gap), (prefix, cursor)));
                     }
                     ProcessJournalRead::Ahead => break Err(process_output_cursor_ahead_status()),
                     ProcessJournalRead::Pending => {
                         if current.changed.changed().await.is_err() {
+                            if let Some(gap) = current.skip_evicted_output() {
+                                return Some((Ok(gap), (prefix, cursor)));
+                            }
                             break evicted_process_journal_result(current);
                         }
                     }
@@ -654,6 +653,7 @@ pub(super) fn evicted_process_journal_result(
         ProcessJournalChange::Exit {
             event,
             next_sequence,
+            ..
         } if cursor.next_sequence >= next_sequence => Ok(event),
         ProcessJournalChange::Exit { .. } => Err(process_output_lagged_status(None)),
         ProcessJournalChange::OutputChanged => Err(Status::resource_exhausted(
@@ -684,6 +684,7 @@ pub(super) fn process_connected_event(
     process_id: &ProcessId,
     pid: Option<u32>,
     output_cursor: Option<u64>,
+    resume_after_output_gap: bool,
 ) -> ProcessEvent {
     ProcessEvent {
         process_id: process_id.as_str().to_string(),
@@ -692,6 +693,7 @@ pub(super) fn process_connected_event(
             pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Connected(
                 pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {
                     output_cursor,
+                    resume_after_output_gap,
                 },
             ),
         ),

@@ -719,6 +719,7 @@ pub(super) fn process_event_to_spaced(
         }),
         HostEvent::Connected(connected) => SpacedEvent::Connected(SpacedProcessConnected {
             output_cursor: connected.output_cursor,
+            resume_after_output_gap: connected.resume_after_output_gap,
         }),
         HostEvent::Stdout(output) => SpacedEvent::Stdout(SpacedProcessOutput { data: output.data }),
         HostEvent::Stderr(output) => SpacedEvent::Stderr(SpacedProcessOutput { data: output.data }),

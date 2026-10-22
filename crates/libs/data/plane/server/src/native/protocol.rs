@@ -114,8 +114,11 @@ pub(crate) struct ProcessFrameBatch {
     pub(crate) output_bytes: u64,
 }
 
-pub(crate) fn process_event_frames(event: ProcessEvent, output_seq: &mut u64) -> ProcessFrameBatch {
-    match event.event {
+pub(crate) fn process_event_frames(
+    event: ProcessEvent,
+    output_seq: &mut u64,
+) -> Result<ProcessFrameBatch, StreamBridgeError> {
+    Ok(match event.event {
         Some(spaced_process_event::Event::Started(_))
         | Some(spaced_process_event::Event::Connected(_)) => ProcessFrameBatch {
             frames: vec![DataPlaneServerFrame::ProcessStarted {
@@ -154,13 +157,18 @@ pub(crate) fn process_event_frames(event: ProcessEvent, output_seq: &mut u64) ->
             }],
             output_bytes: 0,
         },
-        // Native reconnects do not yet set `resume_after_output_gap`, so a gap
-        // cannot arrive here; a lagged native reader still fails.
-        Some(spaced_process_event::Event::OutputGap(_)) | None => ProcessFrameBatch {
+        // Native connects do not set `resume_after_output_gap`, so a gap means
+        // output was lost without the stream asking to continue past it.
+        Some(spaced_process_event::Event::OutputGap(_)) => {
+            return Err(StreamBridgeError::BackendStatus(tonic::Status::data_loss(
+                "backend reported an output gap this stream did not request",
+            )));
+        }
+        None => ProcessFrameBatch {
             frames: Vec::new(),
             output_bytes: 0,
         },
-    }
+    })
 }
 
 pub(crate) fn record_process_output_bytes(kind: &str, batch: &ProcessFrameBatch) {

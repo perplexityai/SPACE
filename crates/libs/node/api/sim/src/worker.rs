@@ -1463,6 +1463,7 @@ impl WorkerApi for SimWorkerApiService {
                 &req.sandbox_id,
                 &operation.process_id,
                 operation.output_cursor,
+                operation.resume_after_output_gap.unwrap_or(false),
             )
             .await?;
         Ok(Response::new(stream))

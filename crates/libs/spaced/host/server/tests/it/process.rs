@@ -242,6 +242,34 @@ async fn process_connect_and_kill_relay_to_guest_bridge() {
     );
     assert!(events.message().await.unwrap().is_none());
 
+    // A guest that ignores the opt-in would silently keep failing lagged
+    // readers, so the host refuses it; one that acknowledges it streams.
+    let error = client
+        .connect_process_stream_with_cursor("proc-1".into(), None, Some(0), true)
+        .await
+        .expect_err("an older guest cannot resume after an output gap");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&error)
+            .map(|unsupported| unsupported.capability),
+        Some(pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume)
+    );
+    let mut events = client
+        .connect_process_stream_with_cursor("proc-2".into(), None, Some(0), true)
+        .await
+        .expect("a current guest acknowledges the opt-in");
+    assert_eq!(
+        events.message().await.unwrap().unwrap().event,
+        Some(
+            pplx_space_spaced_host_client::proto::process_event::Event::Connected(
+                pplx_space_spaced_host_client::proto::ProcessConnected {
+                    resume_after_output_gap: true,
+                }
+            )
+        )
+    );
+    assert!(events.message().await.unwrap().is_none());
+
     client
         .send_input("proc-1".into(), b"hello stdin\n".to_vec())
         .await
