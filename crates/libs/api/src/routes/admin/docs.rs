@@ -364,7 +364,185 @@ fn admin_openapi_value() -> Value {
     insert_admin_sandbox_create_paths(paths);
     insert_identity_profile_paths(paths);
     insert_audit_event_paths(paths);
+    insert_backup_recovery_paths(paths);
     spec
+}
+
+fn insert_backup_recovery_paths(paths: &mut Map<String, Value>) {
+    paths.insert("/sandboxes/{sandbox_id}/backup-recovery-grants".to_owned(), json!({
+  "get": {
+  "parameters": [
+    {
+      "name": "sandbox_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+        "type": "string"
+      }
+    }
+  ],
+    "summary": "List the newest 100 recovery approvals and their outcomes",
+    "responses": {
+      "200": {
+        "description": "Recovery approvals"
+      }
+    }
+  },
+  "post": {
+  "parameters": [
+    {
+      "name": "sandbox_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+        "type": "string"
+      }
+    }
+  ],
+    "summary": "Approve one validated retained full suspend artifact",
+    "description": "Requires managing-organization admin authentication and the recovery rollout flag. Records exact logical file proofs, stable metadata digest, capture time, execution generation, and current uploader incarnation. Expires within 24 hours. Does not enqueue, seal, clear quarantine, or wake.",
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "required": [
+              "local_artifact_id",
+              "execution_generation",
+              "uploader_node_id",
+              "uploader_node_uid",
+              "captured_at",
+              "capture_evidence",
+              "expires_at",
+              "reason",
+              "manifest"
+            ],
+            "properties": {
+              "local_artifact_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "execution_generation": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "uploader_node_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "uploader_node_uid": {
+                "type": "string"
+              },
+              "captured_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "capture_evidence": {
+                "description": "Capture time must fall within the approved execution lifetime.",
+                "oneOf": [
+                  {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["kind", "reference"],
+                    "properties": {
+                      "kind": { "type": "string", "enum": ["recorded_capture"] },
+                      "reference": { "type": "string", "minLength": 1, "maxLength": 2048 }
+                    }
+                  },
+                  {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["kind", "explanation"],
+                    "properties": {
+                      "kind": { "type": "string", "enum": ["operator_attests_no_newer_state"] },
+                      "explanation": { "type": "string", "minLength": 1, "maxLength": 2048 }
+                    }
+                  }
+                ]
+              },
+              "expires_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 2048
+              },
+              "manifest": {
+                "type": "object",
+                "description": "Requires validation {sealed_full_suspend: true, evidence_reference}, captured execution, vcpu, memory_mib, template_id, optional content_hash, metadata_binding_digest, and exact logical VM artifacts (artifact, digest, size_bytes). Generated btrfs-send sources are not supported."
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "200": {
+        "description": "Approval identity"
+      },
+      "409": {
+        "description": "State or approval conflict"
+      },
+      "503": {
+        "description": "Recovery issuance disabled"
+      }
+    }
+  }
+}));
+    paths.insert(
+        "/sandboxes/{sandbox_id}/backup-recovery-grants/{grant_id}/revoke".to_owned(),
+        json!({
+          "post": {
+            "summary": "Revoke an unconsumed recovery approval",
+            "parameters": [
+              {
+                "name": "sandbox_id",
+                "in": "path",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "grant_id",
+                "in": "path",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            ],
+            "requestBody": {
+              "required": true,
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "reason"
+                    ],
+                    "properties": {
+                      "reason": {
+                        "type": "string",
+                        "maxLength": 2048
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "responses": {
+              "200": {
+                "description": "Revoked"
+              },
+              "409": {
+                "description": "Absent, already revoked, or consumed"
+              }
+            }
+          }
+        }),
+    );
 }
 
 fn insert_api_key_paths(paths: &mut Map<String, Value>) {

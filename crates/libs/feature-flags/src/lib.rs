@@ -171,6 +171,11 @@ pub use provider::{
     AttributeValue, Attributes, FeatureFlagProvider, ProviderState, UnavailableProvider, Unresolved,
 };
 
+/// Issuance is off until every backup reader enforces recovery provenance.
+/// Turning it off prevents new approvals; existing approvals remain enforced.
+pub const BACKUP_RECOVERY_GRANTS_ENABLED: BoolFlag =
+    BoolFlag::new("space-backup-recovery-grants-enabled", false);
+
 /// Boolean flag acting as a dynamic cluster-wide kill-switch for the
 /// Redis-backed sandbox activation rate limiter. Layered under the static
 /// `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` env master by [`policy`].

@@ -31,7 +31,7 @@ pub async fn prior_registration(
     artifact: LocalArtifactId,
 ) -> Result<Option<Registration>, sqlx::Error> {
     sqlx::query_as(sql!("SELECT id,source_node_id,source_node_uid FROM snapshots
-        WHERE sandbox_id=$1 AND local_artifact_id=$2 AND source_node_id IS NOT NULL AND source_node_uid IS NOT NULL
+        WHERE recovery_grant_id IS NULL AND sandbox_id=$1 AND local_artifact_id=$2 AND source_node_id IS NOT NULL AND source_node_uid IS NOT NULL
         ORDER BY timestamp,id LIMIT 1"))
         .bind(sandbox).bind(artifact).fetch_optional(conn).await
 }
@@ -132,4 +132,14 @@ pub async fn touch(
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// Grant-backed bytes never become ordinary retry authority after expiry/consumption.
+pub async fn has_recovery_provenance(
+    conn: &mut sqlx::PgConnection,
+    sandbox: SandboxId,
+    artifact: LocalArtifactId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM snapshots WHERE sandbox_id=$1 AND local_artifact_id=$2 AND recovery_grant_id IS NOT NULL) OR EXISTS(SELECT 1 FROM backup_recovery_grants WHERE sandbox_id=$1 AND local_artifact_id=$2)"))
+        .bind(sandbox).bind(artifact).fetch_one(conn).await
 }

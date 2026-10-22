@@ -277,8 +277,324 @@ async fn verified_backup_rpcs_preserve_retry_authority_and_reject_replacement(
     client
         .finalize_artifact_backup(authenticated(finalize(), &token))
         .await?;
+    exercise_recovery(&mut client, &pool, &token, node).await?;
     drop(client);
     drop(rpc);
     drop(api);
+    Ok(())
+}
+
+async fn exercise_recovery(
+    client: &mut ClusterApiClient<tonic::transport::Channel>,
+    pool: &sqlx::PgPool,
+    token: &str,
+    node: NodeId,
+) -> TestResult {
+    use pplx_space_common_core::types::{K8sNodeUid, SnapshotArtifact as File};
+    use snapshot_store::recovery::{
+        self, ApproveRecovery, CaptureTimeEvidence, RecoveryGrantId, RecoveryManifest,
+        SealedValidation,
+    };
+    let actor = UserId::from_uuid(SEEDED_USER_ID);
+    let uid: K8sNodeUid = "node-original".parse()?;
+    for scenario in [
+        "ready",
+        "prior-registration",
+        "expired",
+        "revoked",
+        "wrong-proof",
+        "wrong-object",
+        "changed-state",
+        "newer-materialized",
+        "abandoned-newer",
+        "race-revoke",
+    ] {
+        let sandbox = seed_unplaced_sandbox(pool).await?;
+        let artifact = LocalArtifactId::new();
+        sqlx::query(sql!("UPDATE sandboxes SET lifecycle='quarantined',current_local_artifact_id=$2,current_local_artifact_kind='full',current_local_artifact_origin='suspend' WHERE id=$1")).bind(sandbox).bind(artifact).execute(pool).await?;
+        sqlx::query(sql!("INSERT INTO sandbox_k8s_executions(sandbox_id,generation,pod_name,pod_namespace,state,active,created_at,terminated_at)
+            VALUES($1,1,'retained-' || $1::text,'space','retired',false,NOW()-INTERVAL '2 hours',NOW()-INTERVAL '1 hour')")).bind(sandbox).execute(pool).await?;
+        if scenario == "abandoned-newer" {
+            sqlx::query(sql!("INSERT INTO sandbox_k8s_executions(sandbox_id,generation,pod_name,pod_namespace,state,active) VALUES($1,2,'abandoned-pod','space','failed',false)")).bind(sandbox).execute(pool).await?;
+        }
+        let manifest = RecoveryManifest {
+            validation: SealedValidation {
+                sealed_full_suspend: true,
+                evidence_reference: "synthetic validation of sealed fixture".into(),
+            },
+            execution: snapshot_execution_metadata(Some(&test_snapshot_execution()))?,
+            metadata_binding_digest: format!("sha256:{}", "33".repeat(32)).parse()?,
+            vcpu: 2,
+            memory_mib: 1024,
+            template_id: "synthetic-template".parse()?,
+            content_hash: None,
+            artifacts: [File::Rootfs, File::Memory, File::VmState]
+                .into_iter()
+                .map(|artifact| snapshot_store::SnapshotArtifactDigest {
+                    artifact,
+                    digest: format!("sha256:{}", "22".repeat(32)).parse().unwrap(),
+                    size_bytes: 32,
+                })
+                .collect(),
+        };
+        let id = RecoveryGrantId::new();
+        let capture_evidence = CaptureTimeEvidence::RecordedCapture {
+            reference: "synthetic durable capture record".into(),
+        };
+        let (captured_at, expires_at): (OffsetDateTime, OffsetDateTime) = sqlx::query_as(sql!(
+            "SELECT NOW()-INTERVAL '90 minutes',NOW()+INTERVAL '1 hour'"
+        ))
+        .fetch_one(pool)
+        .await?;
+        if scenario == "prior-registration" {
+            // A failed upload from the old incarnation must not prevent an
+            // explicit approval for the currently authenticated uploader.
+            sqlx::query(sql!("INSERT INTO snapshots(id,sandbox_id,type,state,timestamp,source_node_id,source_node_uid,local_artifact_id,artifact_kind,artifact_origin,generation)
+                VALUES($1,$2,'full','failed',$3,$4,'prior-incarnation',$5,'full','suspend',1)"))
+                .bind(SnapshotId::new()).bind(sandbox).bind(captured_at).bind(node).bind(artifact).execute(pool).await?;
+        }
+        let mut tx = pool.begin().await?;
+        recovery::approve(
+            &mut tx,
+            ApproveRecovery {
+                id,
+                sandbox_id: sandbox,
+                artifact_id: artifact,
+                generation: ExecutionGeneration::new(1)?,
+                uploader_node_id: node,
+                uploader_node_uid: &uid,
+                captured_at,
+                capture_evidence: &capture_evidence,
+                expires_at,
+                actor,
+                reason: "validate retained fixture",
+                manifest: &manifest,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        if scenario == "ready" {
+            // The SQL constraints protect audit consistency even from a caller
+            // that bypasses the typed approval route.
+            for mutation in [
+                "UPDATE backup_recovery_grants SET expires_at=approved_at+INTERVAL '25 hours' WHERE id=$1",
+                "UPDATE backup_recovery_grants SET revoked_at=NOW() WHERE id=$1",
+                "UPDATE backup_recovery_grants SET consumed_attempt_id=space_uuid_v7() WHERE id=$1",
+                "UPDATE backup_recovery_grants SET active_attempt_id=id,consumed_attempt_id=id,revoked_at=NOW(),revoked_by=approved_by,revoke_reason='conflict' WHERE id=$1",
+            ] {
+                let mut constraint_tx = pool.begin().await?;
+                let error = sqlx::query(sqlx::AssertSqlSafe(sql!(mutation)))
+                    .bind(id)
+                    .execute(&mut *constraint_tx)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error
+                        .as_database_error()
+                        .and_then(|error| error.code())
+                        .as_deref(),
+                    Some("23514")
+                );
+                constraint_tx.rollback().await?;
+            }
+        }
+        let attempt = SnapshotId::new();
+        let begin = |attempt: SnapshotId| BeginArtifactBackupRequest {
+            sandbox_id: sandbox.to_string(),
+            local_artifact_id: artifact.to_string(),
+            backup_attempt_id: attempt.to_string(),
+            storage_uri: test_storage_uri(sandbox, attempt),
+            artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32,
+            artifact_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend as i32,
+            execution: Some(test_snapshot_execution()),
+            execution_generation: Some(1),
+            ..Default::default()
+        };
+        client
+            .begin_artifact_backup(authenticated(begin(attempt), token))
+            .await?;
+        assert_eq!(
+            client
+                .begin_artifact_backup(authenticated(begin(SnapshotId::new()), token))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition,
+            "one active attempt: {scenario}"
+        );
+        let captured: bool = sqlx::query_scalar(sql!(
+            "SELECT timestamp=$2 AND last_attempt_at>timestamp FROM snapshots WHERE id=$1"
+        ))
+        .bind(attempt)
+        .bind(captured_at)
+        .fetch_one(pool)
+        .await?;
+        assert!(captured, "grant must preserve capture time");
+        let finalize = |attempt: SnapshotId| {
+            let uri = pplx_space_common_core::types::StorageUri::parse(&test_storage_uri(
+                sandbox, attempt,
+            ))
+            .unwrap();
+            let mut artifact_digests: Vec<_> = manifest
+                .artifacts
+                .iter()
+                .map(|file| crate::proto::SnapshotArtifactDigest {
+                    artifact: file.artifact.file_name().into(),
+                    digest: file.digest.to_string(),
+                    size_bytes: file.size_bytes,
+                    upload_evidence: Some(crate::proto::SnapshotUploadEvidence {
+                        object_key: format!("{}/{}", uri.key_prefix, file.artifact.file_name()),
+                        wire_size_bytes: 16,
+                        etag: Some("synthetic-object".into()),
+                        version_id: None,
+                        metadata_binding_digest: None,
+                    }),
+                })
+                .collect();
+            artifact_digests.push(crate::proto::SnapshotArtifactDigest {
+                artifact: "metadata.json".into(),
+                digest: format!("sha256:{}", "44".repeat(32)),
+                size_bytes: 5,
+                upload_evidence: Some(crate::proto::SnapshotUploadEvidence {
+                    object_key: format!("{}/metadata.json", uri.key_prefix),
+                    wire_size_bytes: 5,
+                    etag: Some("synthetic-metadata".into()),
+                    version_id: None,
+                    metadata_binding_digest: Some(manifest.metadata_binding_digest.to_string()),
+                }),
+            });
+            FinalizeArtifactBackupRequest {
+                backup_attempt_id: attempt.to_string(),
+                target_state: SuspendSnapshotTerminalState::Ready as i32,
+                bytes_uploaded: 48,
+                artifact_digests,
+                failure_reason: None,
+            }
+        };
+        match scenario {
+            "expired" => {
+                sqlx::query(sql!("UPDATE backup_recovery_grants SET approved_at=NOW()-INTERVAL '1 hour',expires_at=NOW()-INTERVAL '1 minute' WHERE id=$1")).bind(id).execute(pool).await?;
+            }
+            "revoked" => {
+                let mut tx = pool.begin().await?;
+                assert!(recovery::revoke(&mut tx, sandbox, id, actor, "synthetic revoke").await?);
+                tx.commit().await?;
+            }
+            "changed-state" => {
+                sqlx::query(sql!("UPDATE sandboxes SET lifecycle='failed' WHERE id=$1"))
+                    .bind(sandbox)
+                    .execute(pool)
+                    .await?;
+            }
+            "newer-materialized" => {
+                sqlx::query(sql!("INSERT INTO sandbox_k8s_executions(sandbox_id,generation,pod_name,pod_namespace,state,active,pod_materialized_at) VALUES($1,2,'newer-pod','space','retired',false,NOW())")).bind(sandbox).execute(pool).await?;
+            }
+            _ => (),
+        }
+        let mut request = finalize(attempt);
+        if scenario == "wrong-proof" {
+            request.artifact_digests[0].digest = format!("sha256:{}", "55".repeat(32));
+        }
+        if scenario == "wrong-object" {
+            request.artifact_digests[0]
+                .upload_evidence
+                .as_mut()
+                .unwrap()
+                .object_key = "other-attempt/rootfs".into();
+        }
+        if scenario == "race-revoke" {
+            let mut gate = pool.begin().await?;
+            sqlx::query(sql!("SELECT id FROM sandboxes WHERE id=$1 FOR UPDATE"))
+                .bind(sandbox)
+                .execute(&mut *gate)
+                .await?;
+            let mut writer = client.clone();
+            let token = token.to_owned();
+            let ready = tokio::spawn(async move {
+                writer
+                    .finalize_artifact_backup(authenticated(request, &token))
+                    .await
+            });
+            let revoke_pool = pool.clone();
+            let revoke = tokio::spawn(async move {
+                let mut tx = revoke_pool.begin().await?;
+                let revoked =
+                    recovery::revoke(&mut tx, sandbox, id, actor, "concurrent revoke").await?;
+                tx.commit().await?;
+                Ok::<_, recovery::RecoveryError>(revoked)
+            });
+            gate.commit().await?;
+            let ready = ready.await?;
+            let revoked = revoke.await??;
+            assert_ne!(
+                ready.is_ok(),
+                revoked,
+                "exactly one Ready/revoke transition may win"
+            );
+            let outcome:(bool,bool,bool)=sqlx::query_as(sql!("SELECT s.state='ready',g.consumed_attempt_id IS NOT DISTINCT FROM s.id,g.revoked_at IS NOT NULL FROM snapshots s JOIN backup_recovery_grants g ON s.recovery_grant_id=g.id WHERE s.id=$1")).bind(attempt).fetch_one(pool).await?;
+            assert_eq!(outcome.0, outcome.1);
+            assert_ne!(outcome.0, outcome.2);
+            continue;
+        }
+        let result = client
+            .finalize_artifact_backup(authenticated(request, token))
+            .await;
+        if matches!(scenario, "ready" | "abandoned-newer" | "prior-registration") {
+            result?;
+            client
+                .begin_artifact_backup(authenticated(begin(attempt), token))
+                .await?;
+            let mut altered = begin(attempt);
+            altered.storage_uri = altered.storage_uri.replace("test-bucket", "other-bucket");
+            assert_eq!(
+                client
+                    .begin_artifact_backup(authenticated(altered, token))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition
+            );
+            client
+                .finalize_artifact_backup(authenticated(finalize(attempt), token))
+                .await?;
+            assert_eq!(
+                client
+                    .begin_artifact_backup(authenticated(begin(SnapshotId::new()), token))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition,
+                "consumed grant cannot confer ordinary retry authority"
+            );
+            let row:(String,bool)=sqlx::query_as(sql!("SELECT s.lifecycle,g.consumed_attempt_id=$2 FROM sandboxes s JOIN backup_recovery_grants g ON g.sandbox_id=s.id WHERE g.id=$1")).bind(id).bind(attempt).fetch_one(pool).await?;
+            assert_eq!(row, ("quarantined".into(), true));
+        } else {
+            assert_eq!(
+                result.unwrap_err().code(),
+                Code::FailedPrecondition,
+                "{scenario}"
+            );
+            let state: String = sqlx::query_scalar(sql!("SELECT state FROM snapshots WHERE id=$1"))
+                .bind(attempt)
+                .fetch_one(pool)
+                .await?;
+            assert_eq!(state, "creating", "failed validation must roll back Ready");
+            let mut failed = finalize(attempt);
+            failed.target_state = SuspendSnapshotTerminalState::Failed as i32;
+            failed.artifact_digests.clear();
+            client
+                .finalize_artifact_backup(authenticated(failed, token))
+                .await?;
+            if scenario == "wrong-proof" {
+                let retry = SnapshotId::new();
+                client
+                    .begin_artifact_backup(authenticated(begin(retry), token))
+                    .await?;
+                client
+                    .finalize_artifact_backup(authenticated(finalize(retry), token))
+                    .await?;
+            }
+        }
+    }
     Ok(())
 }
