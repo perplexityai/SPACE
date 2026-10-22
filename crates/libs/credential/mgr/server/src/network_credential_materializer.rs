@@ -21,11 +21,11 @@ pub use provider_dispatcher::CredentialProviderDispatcher;
 
 /// Resolves and materializes the references bound by one network policy.
 #[derive(Clone)]
-pub struct CredentialInjectionBundleMaterializer {
+pub struct NetworkCredentialMaterializer {
     providers: CredentialProviderDispatcher,
 }
 
-impl CredentialInjectionBundleMaterializer {
+impl NetworkCredentialMaterializer {
     pub fn new(provider_dispatcher: CredentialProviderDispatcher) -> Self {
         Self {
             providers: provider_dispatcher,
@@ -36,7 +36,7 @@ impl CredentialInjectionBundleMaterializer {
         &self,
         organization_id: Uuid,
         references: Vec<NetworkCredentialMaterialization>,
-    ) -> Result<Vec<ResolvedNetworkCredential>, BundleMaterializationError> {
+    ) -> Result<Vec<ResolvedNetworkCredential>, NetworkCredentialMaterializationError> {
         let resolved = try_join_all(references.iter().map(|reference| async {
             match materialize_network_credential(reference, organization_id, &self.providers).await
             {
@@ -50,12 +50,14 @@ impl CredentialInjectionBundleMaterializer {
     }
 }
 
-fn network_credential_is_permanently_unavailable(error: &BundleMaterializationError) -> bool {
+fn network_credential_is_permanently_unavailable(
+    error: &NetworkCredentialMaterializationError,
+) -> bool {
     match error {
-        BundleMaterializationError::Provider(ResolutionError::ProviderUnavailable)
-        | BundleMaterializationError::InvalidRules(_) => false,
-        BundleMaterializationError::Provider(_)
-        | BundleMaterializationError::InvalidResolvedCredential(_) => true,
+        NetworkCredentialMaterializationError::Provider(ResolutionError::ProviderUnavailable)
+        | NetworkCredentialMaterializationError::InvalidRules(_) => false,
+        NetworkCredentialMaterializationError::Provider(_)
+        | NetworkCredentialMaterializationError::InvalidResolvedCredential(_) => true,
     }
 }
 
@@ -77,7 +79,7 @@ impl std::fmt::Debug for NetworkCredentialMaterialization {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum BundleMaterializationError {
+pub enum NetworkCredentialMaterializationError {
     #[error("stored credential references are invalid: {0}")]
     InvalidRules(&'static str),
     #[error("resolved credential cannot be injected: {0}")]
@@ -110,16 +112,18 @@ async fn materialize_network_credential(
     input: &NetworkCredentialMaterialization,
     organization_id: Uuid,
     providers: &CredentialProviderDispatcher,
-) -> Result<ResolvedNetworkCredential, BundleMaterializationError> {
+) -> Result<ResolvedNetworkCredential, NetworkCredentialMaterializationError> {
     let value = providers
         .resolve_for_destinations(organization_id, &input.reference, &input.destinations)
         .await?;
     let mut bytes = value.as_bytes().to_vec();
     if bytes.is_empty() || !bytes.iter().copied().all(is_valid_header_value_byte) {
         bytes.zeroize();
-        return Err(BundleMaterializationError::InvalidResolvedCredential(
-            "resolved credential is not a valid HTTP header value",
-        ));
+        return Err(
+            NetworkCredentialMaterializationError::InvalidResolvedCredential(
+                "resolved credential is not a valid HTTP header value",
+            ),
+        );
     }
     Ok(ResolvedNetworkCredential {
         credential_reference_id: input.reference_id.to_string(),

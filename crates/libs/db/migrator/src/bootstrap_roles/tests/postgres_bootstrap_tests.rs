@@ -265,7 +265,7 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
         .fetch_one(&mut user)
         .await?;
     assert!(role_has_table_privilege(&fixture, USER_ROLE, "sandboxes", "INSERT").await?);
-    let fence_error = sqlx::query(sql!("SELECT COUNT(*) FROM user_credentials"))
+    let fence_error = sqlx::query(sql!("SELECT COUNT(*) FROM org_master_keys"))
         .fetch_one(&mut user)
         .await
         .expect_err("space_user must not read credential tables");
@@ -311,7 +311,7 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
         .fetch_one(&mut ro)
         .await?;
     assert!(!role_has_table_privilege(&fixture, RO_ROLE, "sandboxes", "INSERT").await?);
-    let ro_fence_error = sqlx::query(sql!("SELECT COUNT(*) FROM user_credentials"))
+    let ro_fence_error = sqlx::query(sql!("SELECT COUNT(*) FROM org_master_keys"))
         .fetch_one(&mut ro)
         .await
         .expect_err("space_ro must not read credential tables");
@@ -320,10 +320,10 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
     // space_creds reads and writes everything, credential tables
     // included.
     let mut creds = fixture.connect_as(CREDS_ROLE).await?;
-    sqlx::query(sql!("SELECT COUNT(*) FROM user_credentials"))
+    sqlx::query(sql!("SELECT COUNT(*) FROM org_master_keys"))
         .fetch_one(&mut creds)
         .await?;
-    assert!(role_has_table_privilege(&fixture, CREDS_ROLE, "user_credentials", "INSERT").await?);
+    assert!(role_has_table_privilege(&fixture, CREDS_ROLE, "org_master_keys", "INSERT").await?);
     assert!(role_has_table_privilege(&fixture, CREDS_ROLE, "sandboxes", "UPDATE").await?);
 
     // space_migrator can run DDL on pre-existing and new tables, and

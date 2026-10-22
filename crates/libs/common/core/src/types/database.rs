@@ -16,8 +16,8 @@ pub enum DatabaseIdentity {
     /// Holds no grants on the credential-fenced tables.
     SpaceUser,
     /// Login reserved for narrowly scoped credential-table access
-    /// (`user_credentials`, `org_credentials`, `org_master_keys`,
-    /// `snapshot_storage_location_encrypted_fields`).
+    /// (`org_master_keys`, `snapshot_storage_location_encrypted_fields`, and
+    /// the rest of `CREDENTIAL_TABLES` in the migrator's role bootstrap).
     SpaceCreds,
 }
 
