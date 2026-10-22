@@ -43,7 +43,6 @@ libc = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
 pin-project-lite = { workspace = true }
-redis = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -77,6 +76,7 @@ pplx-space-service-mutex = { workspace = true }
 pplx-space-systemd-watchdog = { workspace = true }
 pplx-space-tokio-runtime = { workspace = true }
 pplx-space-unix-socket-path = { workspace = true }
+pplx-space-valkey = { workspace = true }
 
 [dev-dependencies]
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }

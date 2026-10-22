@@ -5545,8 +5545,8 @@ dependencies = [
  "pplx-space-test-env",
  "pplx-space-tokio-runtime",
  "pplx-space-unix-socket-path",
+ "pplx-space-valkey",
  "rand 0.10.2",
- "redis",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -7549,6 +7549,14 @@ dependencies = [
 name = "pplx-space-unix-socket-path"
 version = "0.8.0"
 dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-valkey"
+version = "0.8.0"
+dependencies = [
+ "redis",
  "thiserror 2.0.20",
 ]
 

@@ -29,11 +29,11 @@ pub mod local_health;
 pub use pplx_space_page_cache as page_cache;
 pub mod peer_auth;
 pub mod rate_limiter;
-pub mod redis;
 pub use pplx_space_service_mutex as service_mutex;
+pub use pplx_space_valkey::redis;
 #[cfg(test)]
 mod service_mutex_handoff_tests;
-pub mod shared_valkey;
+pub use pplx_space_valkey::shared_valkey;
 pub mod space_api_route;
 pub mod space_api_route_capability;
 pub mod space_api_route_ed25519;
