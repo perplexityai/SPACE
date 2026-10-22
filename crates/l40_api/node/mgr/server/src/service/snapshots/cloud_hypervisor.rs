@@ -123,7 +123,12 @@ impl NodeManagerService {
                     let sandbox_id = id.to_string();
                     // Stop even after a partial capture. Closing the VMM and its
                     // mount namespace is required before the volume can be sealed.
-                    let stopped = stop_runtime_for_encrypted_seal(&service, &sandbox_id).await;
+                    let stopped = stop_runtime_for_encrypted_seal(
+                        &service,
+                        &sandbox_id,
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
                     let root = pplx_space_node_runtime_core::control::isolation_root(
                         RuntimeKind::CloudHypervisor,
                         &sandbox_id,

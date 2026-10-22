@@ -422,9 +422,13 @@ async fn encrypted_seal_stop_does_not_retry_other_failures() {
     let (service, id, _socket, server) =
         service_with_stop(tonic::Code::FailedPrecondition, 1).await;
 
-    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
-        .await
-        .unwrap_err();
+    let error = super::stop_runtime_for_encrypted_seal(
+        &service,
+        &id.to_string(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 
     crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
@@ -882,5 +886,100 @@ async fn instance_restore_accepts_only_internal_snapshots() {
             tonic::Code::InvalidArgument,
             "{name}: {error}"
         );
+    }
+}
+
+#[tokio::test]
+async fn dropping_snapshot_handler_skips_queued_capture_and_preserves_running_vm() {
+    use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
+    use crate::service::tests::service_tests::{
+        allocate_test_lease, bind_test_execution, root_request,
+    };
+    use std::future::{Future, poll_fn};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::Poll;
+    use std::time::Duration;
+
+    for running_capture in [true, false] {
+        let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+        let id = super::SandboxId::new().to_string();
+        let fence = bind_test_execution(&service, &id);
+        allocate_test_lease(&service, &id);
+        let captures = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        service.encrypted_capture_io = Some(Arc::new({
+            let (captures, started, finish) = (captures.clone(), started.clone(), finish.clone());
+            move || {
+                let (captures, started, finish) =
+                    (captures.clone(), started.clone(), finish.clone());
+                Box::pin(async move {
+                    captures.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    if running_capture {
+                        finish.notified().await;
+                    }
+                    Ok(())
+                })
+            }
+        }));
+        service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
+            stop_runtime: Some(Arc::new({
+                let stops = stops.clone();
+                move |_| {
+                    stops.fetch_add(1, Ordering::SeqCst);
+                    // Refuse before any host bind-drain work, even if cancellation regresses.
+                    Err(tonic::Status::failed_precondition(
+                        "unexpected runtime stop",
+                    ))
+                }
+            })),
+            ..Default::default()
+        });
+        let queued = if running_capture {
+            None
+        } else {
+            Some(service.lock_sandbox_vm_cgroup_launch(&id).await)
+        };
+        let request = root_request(crate::proto::CaptureVmStateRequest {
+            sandbox_id: id.clone(),
+            execution_fence: Some(fence),
+            artifacts: crate::snapshot_request::tests::artifacts(
+                "/vmstate".into(),
+                "/memory".into(),
+            ),
+            storage: Some(crate::proto::VmStateStorage {
+                encrypted_volume_mount: Some(snapshot_volume(&id)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut handler = Box::pin(service.capture_vm_state(request));
+        poll_fn(|cx| {
+            assert!(handler.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        if running_capture {
+            tokio::time::timeout(Duration::from_secs(5), started.notified())
+                .await
+                .unwrap();
+        }
+        drop(handler);
+        drop(queued);
+        finish.notify_one();
+        service.device_op_tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), service.device_op_tasks.wait())
+            .await
+            .unwrap();
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            usize::from(running_capture)
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
     }
 }
