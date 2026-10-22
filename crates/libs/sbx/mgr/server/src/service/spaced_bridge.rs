@@ -712,6 +712,11 @@ pub(super) fn process_event_to_spaced(
         HostEvent::Connected(_) => SpacedEvent::Connected(SpacedProcessConnected {}),
         HostEvent::Stdout(output) => SpacedEvent::Stdout(SpacedProcessOutput { data: output.data }),
         HostEvent::Stderr(output) => SpacedEvent::Stderr(SpacedProcessOutput { data: output.data }),
+        HostEvent::OutputGap(gap) => SpacedEvent::OutputGap(SpacedProcessOutputGap {
+            skipped_events: gap.skipped_events,
+            output_cursor: gap.output_cursor,
+            output_bytes_before: gap.output_bytes_before,
+        }),
         HostEvent::Exit(exit) => {
             let host_outcome = exit.outcome.ok_or_else(|| {
                 Status::internal("spaced host returned exit event without outcome")

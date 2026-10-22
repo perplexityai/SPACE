@@ -17,6 +17,7 @@ pub(super) fn connect_process_request(
         process_id: process_id.as_str().to_string(),
         timeout: timeout.map(proto_duration),
         output_cursor,
+        resume_after_output_gap: None,
     }
 }
 

@@ -271,6 +271,7 @@ pub(crate) async fn connect_process_stream(
                 process_id: process_id.to_string(),
                 timeout: None,
                 output_cursor,
+                resume_after_output_gap: None,
             }),
         },
         route_token,
