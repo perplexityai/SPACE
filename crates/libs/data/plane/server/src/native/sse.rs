@@ -931,12 +931,15 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
 
 /// Whether a process stream frame carries an SSE id: only one that moves the
 /// client's position does. That is output, and `resync_required`, which
-/// acknowledges a gap, so a resume from it continues past the gap without
-/// reporting it again; a gap moves the position, so it never repeats at one.
-/// Every other frame (`process_started`, `process_exited`, a backend
-/// reconnect's, `error`, `closed`) leaves the client's last id unchanged, so
-/// resumes and reconnects against an idle process spend no frames of the
-/// [`ProcessEventId`] at its position.
+/// acknowledges a gap. After evicted output the stream keeps its position, at
+/// the oldest output retained, so a resume from that id continues past the
+/// gap without reporting it again. After a restart from the start of the
+/// output (a cursor past it, a foreign id) or a move to the live tail, the
+/// ids carry no position, and a resume from them replays behind
+/// `resync_required`. Every other frame (`process_started`, `process_exited`,
+/// a backend reconnect's, `error`, `closed`) leaves the client's last id
+/// unchanged, so resumes and reconnects against an idle process spend no
+/// frames of the [`ProcessEventId`] at its position.
 fn process_frame_has_event_id(frame: &DataPlaneServerFrame) -> bool {
     process_frame_advances_backend_cursor(frame)
         || matches!(frame, DataPlaneServerFrame::ResyncRequired { .. })
