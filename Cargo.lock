@@ -5522,7 +5522,6 @@ dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
  "http-body 1.1.0",
- "insta",
  "jiff",
  "k8s-openapi",
  "kube",
@@ -5723,7 +5722,6 @@ name = "pplx-space-credmgr-client"
 version = "0.8.0"
 dependencies = [
  "anyhow",
- "hyper-util",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
@@ -5738,7 +5736,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
- "tower",
  "uuid",
  "zeroize",
 ]
@@ -6136,7 +6133,6 @@ dependencies = [
 name = "pplx-space-net-gateway-client"
 version = "0.8.0"
 dependencies = [
- "hyper-util",
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
@@ -6147,7 +6143,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tonic",
- "tower",
 ]
 
 [[package]]

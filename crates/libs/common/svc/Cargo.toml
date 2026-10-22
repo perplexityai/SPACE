@@ -78,7 +78,6 @@ pplx-space-tokio-runtime = { workspace = true }
 pplx-space-unix-socket-path = { workspace = true }
 
 [dev-dependencies]
-insta = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 nix = { workspace = true, features = ["signal"] }
 tonic-prost = { workspace = true }
