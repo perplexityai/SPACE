@@ -218,7 +218,6 @@ impl ExecutionService {
                 self.inner.filesystem.drain(),
                 self.inner.process_tasks.wait()
             );
-            self.inner.lifecycle.mark_drained();
         };
         if tokio::time::timeout(timeout, settle).await.is_err() {
             self.cancel();

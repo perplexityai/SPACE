@@ -10,7 +10,6 @@ use tonic::Status;
 enum Phase {
     Running,
     Closing,
-    Drained,
 }
 
 struct Inner {
@@ -71,14 +70,6 @@ impl Lifecycle {
 
     pub(crate) async fn wait(&self) {
         self.0.operations.wait().await;
-    }
-
-    pub(crate) fn mark_drained(&self) {
-        *self
-            .0
-            .phase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Phase::Drained;
     }
 }
 
