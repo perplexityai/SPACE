@@ -216,7 +216,7 @@ impl<F: Fn(Uri) -> Endpoint> Feed<F> {
             self.set_fallback(false).await?;
         }
 
-        pplx_space_metrics::grpc::client_lb_endpoints(self.service, next.len());
+        pplx_space_grpc_metrics::client_lb_endpoints(self.service, next.len());
         pplx_space_observability::with_peer_service!(tracing::info!(
             peer.service = self.service,
             endpoints = next.len(),
@@ -246,7 +246,7 @@ impl<F: Fn(Uri) -> Endpoint> Feed<F> {
         } else {
             None
         };
-        pplx_space_metrics::grpc::client_lb_fallback(self.service, active);
+        pplx_space_grpc_metrics::client_lb_fallback(self.service, active);
         Ok(())
     }
 
@@ -261,7 +261,7 @@ impl<F: Fn(Uri) -> Endpoint> Feed<F> {
         self.send(Change::Insert(EndpointKey::Fallback, endpoint))
             .await?;
         self.fallback_expires_at = Some(Instant::now() + max_age);
-        pplx_space_metrics::grpc::client_connection_rotation(self.service, "rotated");
+        pplx_space_grpc_metrics::client_connection_rotation(self.service, "rotated");
         pplx_space_observability::with_peer_service!(tracing::debug!(
             peer.service = self.service,
             "retired aged gRPC Service fallback connection"
