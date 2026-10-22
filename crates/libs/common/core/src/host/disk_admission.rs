@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::host::btrfs::{BtrfsError, FilesystemUsage, read_filesystem_usage};
@@ -171,9 +172,23 @@ struct CachedMeasurement {
     measurement: CacheDiskMeasurement,
 }
 
+/// What a failed probe does to the last good measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheDiskRefreshFailure {
+    /// Keep it until [`DEFAULT_MEASUREMENT_TTL`] expires. Use when every
+    /// allocation since that measurement is still charged as a reservation.
+    KeepLastGood,
+    /// Drop it, closing admission until a later probe succeeds. Use when space
+    /// was consumed without a reservation the caller can keep charged.
+    Invalidate,
+}
+
 #[derive(Debug, Default)]
 pub struct CacheDiskAdmissionMonitor {
     last_good: Mutex<Option<CachedMeasurement>>,
+    /// Successful publications so far. Refreshes are serialized, so a success
+    /// published after a caller's own refresh returned was probed after it.
+    successful_refreshes: AtomicU64,
     refresh_lock: Mutex<()>,
 }
 
@@ -210,12 +225,22 @@ impl CacheDiskAdmissionMonitor {
         evaluate_cache_disk_measurement(config, cached.measurement, pending_reservation_bytes)
     }
 
-    pub fn refresh(&self) -> Result<CacheDiskMeasurement, CacheDiskProbeError> {
-        self.refresh_with(read_cache_disk_measurement)
+    pub fn refresh(
+        &self,
+        on_failure: CacheDiskRefreshFailure,
+    ) -> Result<CacheDiskMeasurement, CacheDiskProbeError> {
+        self.refresh_with(on_failure, read_cache_disk_measurement)
     }
 
-    fn refresh_with(
+    /// Number of successful refreshes published so far. Read it after a failed
+    /// refresh returns; any larger value comes from a probe that started later.
+    pub fn successful_refreshes(&self) -> u64 {
+        self.successful_refreshes.load(Ordering::Acquire)
+    }
+
+    pub fn refresh_with(
         &self,
+        on_failure: CacheDiskRefreshFailure,
         probe: impl FnOnce() -> Result<CacheDiskMeasurement, CacheDiskProbeError>,
     ) -> Result<CacheDiskMeasurement, CacheDiskProbeError> {
         // The blocking job owns this lock, including when its async waiter is
@@ -225,12 +250,19 @@ impl CacheDiskAdmissionMonitor {
         let measured_at = Instant::now();
         let result = probe();
         let mut last_good = self.last_good.lock().unwrap_or_else(|e| e.into_inner());
-        *last_good = result.as_ref().ok().map(|measurement| CachedMeasurement {
-            measured_at,
-            measurement: *measurement,
-        });
-        // A failed post-allocation refresh must invalidate earlier free space
-        // before the caller releases its reservation. The periodic owner retries.
+        match (&result, on_failure) {
+            (Ok(measurement), _) => {
+                *last_good = Some(CachedMeasurement {
+                    measured_at,
+                    measurement: *measurement,
+                });
+                // Advance while publication is locked so a reader that sees the
+                // new generation evaluates this measurement or a newer one.
+                self.successful_refreshes.fetch_add(1, Ordering::AcqRel);
+            }
+            (Err(_), CacheDiskRefreshFailure::KeepLastGood) => {}
+            (Err(_), CacheDiskRefreshFailure::Invalidate) => *last_good = None,
+        }
         result
     }
 

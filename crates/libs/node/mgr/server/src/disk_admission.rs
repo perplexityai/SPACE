@@ -1,9 +1,10 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use pplx_space_common_core::host::disk_admission::{
     CacheDiskAdmissionConfig, CacheDiskAdmissionDecision, CacheDiskAdmissionReason,
-    CacheDiskAdmissionState as CoreCacheDiskAdmissionState,
+    CacheDiskAdmissionState as CoreCacheDiskAdmissionState, CacheDiskMeasurement,
+    CacheDiskProbeError, CacheDiskRefreshFailure, read_cache_disk_measurement,
 };
 use pplx_space_common_svc::disk_admission::CacheDiskAdmissionHandle;
 use tokio_util::sync::CancellationToken;
@@ -29,21 +30,52 @@ impl DiskAllocationOperation {
     }
 }
 
-#[derive(Clone, Debug)]
+type CacheDiskProbe =
+    Arc<dyn Fn() -> Result<CacheDiskMeasurement, CacheDiskProbeError> + Send + Sync>;
+
+/// A completed allocation's reservation, kept charged after its follow-up
+/// probe failed. It is released once a refresh newer than that failure
+/// succeeds, because only then does the measurement include the allocation.
+struct DeferredRelease {
+    successful_refreshes_at_failure: u64,
+    _reservation: DiskAdmissionReservation,
+}
+
+#[derive(Clone)]
 pub struct DiskAdmission {
     handle: CacheDiskAdmissionHandle,
     pending_reservation_bytes: Arc<AtomicU64>,
     unknown_reservations: Arc<AtomicU64>,
+    // Bounded by allocations completed while probes keep failing; once the
+    // last good measurement exceeds its TTL, admission closes.
+    deferred_releases: Arc<Mutex<Vec<DeferredRelease>>>,
+    probe: CacheDiskProbe,
+}
+
+impl std::fmt::Debug for DiskAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskAdmission")
+            .field("handle", &self.handle)
+            .field("pending_reservation_bytes", &self.pending_reservation_bytes)
+            .field("unknown_reservations", &self.unknown_reservations)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DiskAdmission {
     pub async fn new(config: CacheDiskAdmissionConfig) -> Self {
+        Self::with_probe(config, Arc::new(read_cache_disk_measurement)).await
+    }
+
+    async fn with_probe(config: CacheDiskAdmissionConfig, probe: CacheDiskProbe) -> Self {
         let (handle, initial_refresh) =
             CacheDiskAdmissionHandle::with_initial_refresh(config).await;
         let admission = Self {
             handle,
             pending_reservation_bytes: Arc::new(AtomicU64::new(0)),
             unknown_reservations: Arc::new(AtomicU64::new(0)),
+            deferred_releases: Arc::new(Mutex::new(Vec::new())),
+            probe,
         };
         if config.enabled {
             if let Err(error) = initial_refresh {
@@ -74,6 +106,7 @@ impl DiskAdmission {
         // Observe the hold before sampling bytes: recovery publishes the known
         // charge before releasing its hold. The reverse order can miss both.
         let unknown = self.unknown_reservations.load(Ordering::Acquire);
+        self.settle_deferred_releases();
         let mut decision = self.handle.evaluate(self.pending_reservation_bytes());
         if unknown != 0 {
             decision.state = CoreCacheDiskAdmissionState::Unavailable;
@@ -96,15 +129,30 @@ impl DiskAdmission {
         }
     }
 
+    /// Releases deferred reservations once a newer refresh has succeeded. The
+    /// cached measurement read afterwards is at least that new, so it already
+    /// reflects their allocations.
+    fn settle_deferred_releases(&self) {
+        let successful_refreshes = self.handle.successful_refreshes();
+        self.deferred_releases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|deferred| deferred.successful_refreshes_at_failure >= successful_refreshes);
+    }
+
     fn emit_metrics(&self) {
         let decision = self.decision();
         pplx_space_common_svc::disk_admission::emit_cache_disk_admission_metrics(&decision);
     }
 
-    async fn refresh_once_result(&self) -> Result<(), String> {
-        let result =
-            pplx_space_common_svc::disk_admission::refresh_cache_disk_admission_once(&self.handle)
-                .await;
+    async fn refresh_once_result(&self, on_failure: CacheDiskRefreshFailure) -> Result<(), String> {
+        let probe = Arc::clone(&self.probe);
+        let result = pplx_space_common_svc::disk_admission::refresh_cache_disk_admission_once_with(
+            &self.handle,
+            on_failure,
+            move || probe(),
+        )
+        .await;
         self.emit_metrics();
         result
     }
@@ -204,13 +252,42 @@ impl DiskAdmission {
             .max(configured_bytes)
     }
 
+    /// Releases a completed allocation's reservation against a measurement
+    /// that includes it. If that probe fails, the reservation stays charged
+    /// until a later probe succeeds instead of closing admission for everyone.
     pub async fn release_after_success(&self, reservation: DiskAdmissionReservation) {
-        self.refresh_after_external_allocation().await;
-        reservation.release();
+        if !self.config().enabled {
+            reservation.release();
+            return;
+        }
+        let Err(error) = self
+            .refresh_once_result(CacheDiskRefreshFailure::KeepLastGood)
+            .await
+        else {
+            reservation.release();
+            return;
+        };
+        tracing::warn!(
+            %error,
+            "fresh disk measurement failed after allocation; keeping its reservation until a later measurement"
+        );
+        let successful_refreshes_at_failure = self.handle.successful_refreshes();
+        self.deferred_releases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(DeferredRelease {
+                successful_refreshes_at_failure,
+                _reservation: reservation,
+            });
     }
 
+    /// Refreshes after space was consumed without a reservation to keep
+    /// charged. A failed probe invalidates the last good measurement.
     pub async fn refresh_after_external_allocation(&self) {
-        if let Err(error) = self.refresh_once_result().await {
+        if let Err(error) = self
+            .refresh_once_result(CacheDiskRefreshFailure::Invalidate)
+            .await
+        {
             tracing::warn!(%error, "fresh disk measurement failed after external allocation");
         }
     }
@@ -278,3 +355,6 @@ impl Drop for DiskAdmissionReservation {
         self.release_inner();
     }
 }
+
+#[cfg(test)]
+mod tests;
