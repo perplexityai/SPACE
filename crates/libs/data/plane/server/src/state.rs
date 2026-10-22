@@ -1406,7 +1406,8 @@ impl IntoResponse for ProxyError {
                         origin,
                         kind,
                     ),
-                    RouteResolutionError::SessionNotReady => (
+                    RouteResolutionError::SessionNotReady
+                    | RouteResolutionError::SessionAtRest(_) => (
                         StatusCode::SERVICE_UNAVAILABLE,
                         DataPlaneHttpErrorCode::NotReady,
                         "session route is not ready",
@@ -1451,6 +1452,7 @@ impl IntoResponse for ProxyError {
                 code,
                 message: message.to_string(),
                 retryable,
+                details: Vec::new(),
             }),
         )
             .into_response()

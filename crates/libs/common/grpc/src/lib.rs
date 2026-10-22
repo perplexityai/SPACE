@@ -90,12 +90,13 @@ pub use server::{GrpcServer, grpc_server_builder};
 pub use status::{
     DESIRED_STATE_APPLY_TERMINAL_METADATA, GuestCapability, GuestCapabilityUnsupported,
     GuestServiceUnavailable, RETRY_AFTER_MS_METADATA, RateLimited, SandboxServiceRouteNotReady,
-    UdsPerSandboxLimitExceeded, guest_capability_unsupported_status, guest_service_connect_status,
-    is_desired_state_apply_terminal, is_guest_path_not_found, is_refused_before_start,
-    is_terminal_guest_process_error, mark_desired_state_apply_terminal, mark_guest_path_not_found,
-    mark_guest_process_error, rate_limited_status, refused_before_start, retry_after,
-    sandbox_service_route_not_ready_status, uds_per_sandbox_limit_exceeded_status,
-    with_retry_after,
+    SessionRouteAtRest, UdsPerSandboxLimitExceeded, guest_capability_unsupported_status,
+    guest_service_connect_status, is_desired_state_apply_terminal, is_guest_path_not_found,
+    is_refused_before_start, is_terminal_guest_process_error, mark_desired_state_apply_terminal,
+    mark_guest_path_not_found, mark_guest_process_error, mark_sandbox_not_running,
+    mark_session_route_at_rest, rate_limited_status, refused_before_start, retry_after,
+    sandbox_not_running_state, sandbox_service_route_not_ready_status, session_route_at_rest,
+    uds_per_sandbox_limit_exceeded_status, with_retry_after,
 };
 pub use trace::{
     CLIENT_SERVICE_METADATA_KEY, ExpectedGrpcStatus, GrpcClientTrace, current_service_name,

@@ -136,7 +136,7 @@ pub(super) async fn authenticate_native_socket(
         },
     };
 
-    let attached = match resolve_session_route(state, session_id, &token).await {
+    let attached = match resolve_attach_route(state, session_id, &token).await {
         Ok(attached) => attached,
         Err(error) => {
             pplx_space_metrics::data_plane::attach(
@@ -144,7 +144,7 @@ pub(super) async fn authenticate_native_socket(
                 error.metric_label(),
             );
             let _ = socket
-                .send(Message::Text(error_json(error.frame_code()).into()))
+                .send(Message::Text(route_resolution_error_json(error).into()))
                 .await;
             let _ = socket.close().await;
             return None;
@@ -359,6 +359,7 @@ pub(crate) async fn close_with_error(
                 message: code.as_str().to_string(),
                 code,
                 retryable,
+                details: Vec::new(),
             })
             .into(),
         ))
@@ -465,6 +466,7 @@ pub(crate) async fn bridge_process_session(
 ) -> Result<BridgeEnd, StreamBridgeError> {
     let shutdown_token = state.stream_shutdown_token.child_token();
     let (mut sink, mut source) = socket.split();
+    let sandbox_id = attached.sandbox_id;
     let open = open_native_process_stream(&state, session_id, &mut attached, None);
     // The deadline can pass while the backend stream is still opening.
     let opened = tokio::select! {
@@ -490,6 +492,7 @@ pub(crate) async fn bridge_process_session(
                     code: DataPlaneErrorCode::SessionNotReady,
                     message: "too many client frames before the session was ready".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await;
@@ -501,7 +504,8 @@ pub(crate) async fn bridge_process_session(
     let mut stream = match initial {
         Ok((_client, initial)) => initial,
         Err(error) => {
-            let _ = send_server_frame(&mut sink, &stream_start_error_frame(&error)).await;
+            let _ =
+                send_server_frame(&mut sink, &stream_start_error_frame(&error, sandbox_id)).await;
             let _ = sink.close().await;
             return Err(error);
         }
@@ -662,6 +666,7 @@ pub(crate) async fn bridge_process_session(
                                     code: DataPlaneErrorCode::BackendStreamError,
                                     message: status.message().to_string(),
                                     retryable: backend_stream_status_retryable(&status),
+                                    details: Vec::new(),
                                 },
                             )
                             .await;
@@ -764,6 +769,7 @@ pub(crate) async fn bridge_process_session(
                                     code: DataPlaneErrorCode::BinaryClientFramesNotSupported,
                                     message: "binary client frames are not supported".to_string(),
                                     retryable: false,
+                                    details: Vec::new(),
                                 },
                             )
                             .await
@@ -814,7 +820,11 @@ pub(crate) async fn bridge_file_watch_session(
     let (_client, mut stream) = match opened {
         Ok(opened) => opened,
         Err(error) => {
-            let _ = send_server_frame(&mut sink, &stream_start_error_frame(&error)).await;
+            let _ = send_server_frame(
+                &mut sink,
+                &stream_start_error_frame(&error, attached.sandbox_id),
+            )
+            .await;
             let _ = sink.close().await;
             return Err(error);
         }
@@ -930,6 +940,7 @@ pub(crate) async fn bridge_file_watch_session(
                                     code: DataPlaneErrorCode::BackendStreamError,
                                     message: status.message().to_string(),
                                     retryable: backend_stream_status_retryable(&status),
+                                    details: Vec::new(),
                                 },
                             )
                             .await;
@@ -962,6 +973,7 @@ pub(crate) async fn bridge_file_watch_session(
                                     code: DataPlaneErrorCode::BinaryClientFramesNotSupported,
                                     message: "binary client frames are not supported".to_string(),
                                     retryable: false,
+                                    details: Vec::new(),
                                 },
                             )
                             .await
@@ -1013,6 +1025,7 @@ where
                     code: DataPlaneErrorCode::AlreadyAttached,
                     message: "session is already attached".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
@@ -1027,6 +1040,7 @@ where
                         code: DataPlaneErrorCode::ProcessNotStarted,
                         message: "process has not started yet".to_string(),
                         retryable: true,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1064,6 +1078,7 @@ where
                         code: DataPlaneErrorCode::ProcessNotStarted,
                         message: "process has not started yet".to_string(),
                         retryable: true,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1077,6 +1092,7 @@ where
                         code: DataPlaneErrorCode::InvalidResize,
                         message: "terminal resize rows and cols must be non-zero".to_string(),
                         retryable: false,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1110,6 +1126,7 @@ where
                             code: DataPlaneErrorCode::ResizeNotSupported,
                             message: status.message().to_string(),
                             retryable: false,
+                            details: Vec::new(),
                         },
                     )
                     .await
@@ -1127,6 +1144,7 @@ where
                         code: DataPlaneErrorCode::ProcessNotStarted,
                         message: "process has not started yet".to_string(),
                         retryable: true,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1159,6 +1177,7 @@ where
                         code: DataPlaneErrorCode::ProcessNotStarted,
                         message: "process has not started yet".to_string(),
                         retryable: true,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1219,6 +1238,7 @@ where
                     code: DataPlaneErrorCode::AlreadyAttached,
                     message: "session is already attached".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
@@ -1233,6 +1253,7 @@ where
                     message: "interactive stdin is not supported by this backend stream"
                         .to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
@@ -1246,6 +1267,7 @@ where
                     code: DataPlaneErrorCode::InputNotSupported,
                     message: "process control is not supported by this backend stream".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
@@ -1265,6 +1287,7 @@ where
                     code: DataPlaneErrorCode::ResizeNotSupported,
                     message: "terminal resize is not supported by this backend stream".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
