@@ -504,10 +504,25 @@ pub fn complete_leased_job(
     worker_id: &str,
     bytes: i64,
 ) -> rusqlite::Result<bool> {
+    complete_leased_job_with_result(conn, job_id, worker_id, None, bytes, None)
+}
+
+pub fn complete_leased_job_with_result(
+    conn: &Connection,
+    job_id: &JobId,
+    worker_id: &str,
+    expected_attempt: Option<i32>,
+    bytes: i64,
+    payload: Option<&str>,
+) -> rusqlite::Result<bool> {
     let rows = conn.execute(
         "UPDATE jobs
          SET status = 'completed',
              bytes_processed = ?3,
+             payload = CASE WHEN json_valid(payload) AND json_type(payload) = 'object' THEN
+                 CASE WHEN ?4 IS NULL THEN json_remove(payload, '$.completion_result')
+                 ELSE json_set(payload, '$.completion_result', json_object('version', 1, 'attempt', attempts, 'value', json(?4))) END
+                 ELSE payload END,
              error = NULL,
              error_kind = NULL,
              failure_reason = NULL,
@@ -517,8 +532,9 @@ pub fn complete_leased_job(
              heartbeat_at = NULL
          WHERE job_id = ?1
            AND lease_owner = ?2
-           AND status = 'running'",
-        params![job_id, worker_id, bytes],
+           AND status = 'running'
+           AND (?5 IS NULL OR attempts = ?5)",
+        params![job_id, worker_id, bytes, payload, expected_attempt],
     )?;
     Ok(rows > 0)
 }
@@ -626,13 +642,26 @@ pub fn complete_job_attempt(
     expected_attempts: i32,
     bytes: i64,
 ) -> rusqlite::Result<bool> {
+    complete_job_attempt_with_result(conn, job_id, expected_attempts, bytes, None)
+}
+
+pub fn complete_job_attempt_with_result(
+    conn: &Connection,
+    job_id: &JobId,
+    expected_attempts: i32,
+    bytes: i64,
+    payload: Option<&str>,
+) -> rusqlite::Result<bool> {
     let changed = conn.execute(
         "UPDATE jobs
-         SET status = 'completed', bytes_processed = ?2,
+         SET status = 'completed', bytes_processed = ?2, payload = CASE WHEN json_valid(payload) AND json_type(payload) = 'object' THEN
+                 CASE WHEN ?4 IS NULL THEN json_remove(payload, '$.completion_result')
+                 ELSE json_set(payload, '$.completion_result', json_object('version', 1, 'attempt', attempts, 'value', json(?4))) END
+                 ELSE payload END,
              error = NULL, error_kind = NULL, failure_reason = NULL,
              completed_at = datetime('now')
          WHERE job_id = ?1 AND status = 'running' AND attempts = ?3",
-        params![job_id, bytes, expected_attempts],
+        params![job_id, bytes, expected_attempts, payload],
     )?;
     Ok(changed == 1)
 }

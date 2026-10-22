@@ -1259,3 +1259,41 @@ fn absent_volume_manager_socket() -> std::path::PathBuf {
         .join(format!("space-sbx-mgr-test-{}", uuid::Uuid::now_v7()))
         .join("absent-volume-manager.sock")
 }
+
+#[test]
+fn transfer_evidence_reaches_finalization_without_inventing_legacy_proofs() {
+    let proof = pplx_space_volmgr_client::proto::LogicalArtifactDigest {
+        artifact: pplx_space_volmgr_client::proto::SnapshotArtifact::Memory as i32,
+        digest: format!("sha256:{}", "11".repeat(32)),
+        size_bytes: 100,
+        object_key: "synthetic/attempt/memfile".into(),
+        wire_size_bytes: 40,
+        etag: Some("synthetic-etag".into()),
+        version_id: None,
+        metadata_binding_digest: None,
+    };
+    let mut observation = ArtifactTransferObservation {
+        proofs: vec![proof],
+        bytes: 100,
+        queue_duration_ms: None,
+        transfer_duration_ms: None,
+    };
+    let forwarded = transfer_digests(&[observation.clone()]);
+    assert_eq!(forwarded[0].artifact, "memfile");
+    assert_eq!(forwarded[0].size_bytes, 100);
+    assert_eq!(
+        forwarded[0]
+            .upload_evidence
+            .as_ref()
+            .unwrap()
+            .wire_size_bytes,
+        40
+    );
+    observation.proofs.push(observation.proofs[0].clone());
+    assert!(
+        transfer_digests(&[observation.clone()]).is_empty(),
+        "ambiguous roles are not proof"
+    );
+    observation.proofs.clear();
+    assert!(transfer_digests(&[observation]).is_empty());
+}

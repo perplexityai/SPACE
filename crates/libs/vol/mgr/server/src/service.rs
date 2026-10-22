@@ -643,6 +643,35 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         "cancelled" => TransferJobStatus::Cancelled,
         _ => TransferJobStatus::Unspecified,
     };
+    let logical_artifact_digests = if status == TransferJobStatus::Completed {
+        #[derive(serde::Deserialize)]
+        struct Proofs {
+            logical_artifact_digests: Vec<crate::executor::logical_digest::LogicalArtifactDigest>,
+        }
+        let proofs = pplx_space_common_jobs::completion_result::<Proofs>(&job)
+            .map(|result| result.logical_artifact_digests)
+            .unwrap_or_default();
+        proofs
+            .into_iter()
+            .map(
+                |proof| pplx_space_volmgr_client::proto::LogicalArtifactDigest {
+                    artifact: pplx_space_volmgr_client::snapshot_artifact_to_proto(proof.artifact)
+                        as i32,
+                    digest: proof.digest.to_string(),
+                    size_bytes: proof.size_bytes,
+                    object_key: proof.object_key,
+                    wire_size_bytes: proof.wire_size_bytes,
+                    etag: proof.etag,
+                    version_id: proof.version_id,
+                    metadata_binding_digest: proof
+                        .metadata_binding_digest
+                        .map(|digest| digest.to_string()),
+                },
+            )
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(TransferJob {
         job_id: job.job_id.to_string(),
         status: transfer_job_status_code(status),
@@ -657,6 +686,7 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         completed_at: job.completed_at,
         transfer_scope_id,
         attempts: u32::try_from(job.attempts).unwrap_or_default(),
+        logical_artifact_digests,
     })
 }
 

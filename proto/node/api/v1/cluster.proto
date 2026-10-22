@@ -1121,6 +1121,16 @@ message SnapshotArtifactDigest {
   string digest = 2;
   // Size in bytes of the same bytes the digest covers.
   uint64 size_bytes = 3;
+  // Optional identity of the verified uploaded object; absent on older workers.
+  optional SnapshotUploadEvidence upload_evidence = 4;
+}
+
+message SnapshotUploadEvidence {
+  string object_key = 1;
+  uint64 wire_size_bytes = 2;
+  optional string etag = 3;
+  optional string version_id = 4;
+  optional string metadata_binding_digest = 5;
 }
 
 message FinalizeArtifactBackupResponse {}

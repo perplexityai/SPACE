@@ -1720,3 +1720,35 @@ fn classify_artifact_retry_rejects_divergent_wrap_on_pull() {
         .is_some()
     );
 }
+
+#[test]
+fn completed_transfer_status_survives_unreadable_optional_proofs() {
+    let attempt = persisted_job("completed", &sample_artifact()).attempts;
+    let known = serde_json::json!({"completion_result":{"version":1,"attempt":attempt,"value":{"logical_artifact_digests":[{
+        "artifact":"memory", "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size_bytes":7,
+        "object_key":"synthetic/attempt/memfile","wire_size_bytes":7,"etag":"synthetic-etag","version_id":null
+    }]}}});
+    let mut stale = known.clone();
+    stale["completion_result"]["attempt"] = (attempt - 1).into();
+    let mut future = known.clone();
+    future["completion_result"]["version"] = 2.into();
+    for (payload, proofs) in [
+        (known.to_string(), 1),
+        ("{}".into(), 0),
+        (known.to_string().replace("memory", "future_artifact"), 0),
+        (stale.to_string(), 0),
+        (future.to_string(), 0),
+        ("{malformed".into(), 0),
+    ] {
+        let mut job = persisted_job("completed", &sample_artifact());
+        job.payload = payload;
+        job.bytes_processed = 7;
+        let response = job_to_proto(job).expect("optional proofs cannot hide durable completion");
+        assert_eq!(
+            response.status,
+            transfer_job_status_code(TransferJobStatus::Completed)
+        );
+        assert_eq!(response.bytes_transferred, 7);
+        assert_eq!(response.logical_artifact_digests.len(), proofs);
+    }
+}

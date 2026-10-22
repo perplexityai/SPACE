@@ -20,6 +20,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod backup_authority;
+pub mod upload_evidence;
 
 /// Reading a snapshot catalog row failed.
 #[derive(Debug, thiserror::Error)]

@@ -534,3 +534,73 @@ fn count_failed_jobs_by_dedup_key_counts_one_failure_kind_of_one_key() {
         0
     );
 }
+#[test]
+fn completion_evidence_is_atomic_and_fenced() {
+    for leased in [false, true] {
+        let conn = mem_conn();
+        let id = fixture_job_id("content-proof");
+        insert_job(
+            &conn,
+            InsertJob {
+                job_id: &id,
+                kind: "push",
+                payload: "{\"source\":\"owned\"}",
+                subject_id: None,
+                dedup_key: None,
+                max_attempts: 3,
+                traceparent: None,
+                priority: JobPriority::default(),
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='running',attempts=2,lease_owner='current' WHERE job_id=?1",
+            [id],
+        )
+        .unwrap();
+        let complete = |owner, attempt, payload| {
+            if leased {
+                complete_leased_job_with_result(&conn, &id, owner, Some(attempt), 14, Some(payload))
+            } else {
+                complete_job_attempt_with_result(&conn, &id, attempt, 14, Some(payload))
+            }
+        };
+        assert!(!complete("previous", 1, "wrong-proof").unwrap());
+        assert!(!complete("current", 1, "stale-attempt-proof").unwrap());
+        let unchanged = get_job(&conn, &id).unwrap().unwrap();
+        assert_eq!(unchanged.status, "running");
+        assert_eq!(unchanged.payload, "{\"source\":\"owned\"}");
+        conn.execute(
+            "UPDATE jobs SET payload=json_set(payload,'$.updated_during_upload',1) WHERE job_id=?1",
+            [id],
+        )
+        .unwrap();
+        assert!(
+            complete(
+                "current",
+                2,
+                "{\"source\":\"owned\",\"proof\":\"verified\"}"
+            )
+            .unwrap()
+        );
+        let completed = get_job(&conn, &id).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.bytes_processed, 14);
+        assert!(completed.payload.contains("verified"));
+        let payload: serde_json::Value = serde_json::from_str(&completed.payload).unwrap();
+        assert_eq!(payload["updated_during_upload"], 1);
+        assert_eq!(payload["source"], "owned");
+        assert_eq!(
+            crate::completion_result::<serde_json::Value>(&completed).unwrap()["proof"],
+            "verified"
+        );
+        let mut old_retry = completed.clone();
+        old_retry.attempts += 1;
+        assert!(crate::completion_result::<serde_json::Value>(&old_retry).is_none());
+        assert!(!complete("current", 2, "replacement-proof").unwrap());
+        assert_eq!(
+            get_job(&conn, &id).unwrap().unwrap().payload,
+            completed.payload
+        );
+    }
+}

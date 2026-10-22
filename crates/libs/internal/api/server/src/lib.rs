@@ -517,6 +517,43 @@ fn parse_artifact_digests(
         .collect()
 }
 
+struct BackupFinalization<'a> {
+    snapshot_id: SnapshotId,
+    target_state: SnapshotState,
+    bytes_uploaded: i64,
+    failure_reason: Option<&'a str>,
+    artifact_digests: &'a [snapshot_store::SnapshotArtifactDigest],
+    upload_evidence: &'a [snapshot_store::upload_evidence::ArtifactUploadEvidence],
+    caller: &'a backup_ownership::Caller,
+}
+
+fn parse_upload_evidence(
+    digests: &[crate::proto::SnapshotArtifactDigest],
+) -> Vec<snapshot_store::upload_evidence::ArtifactUploadEvidence> {
+    digests
+        .iter()
+        .filter_map(|entry| {
+            let evidence = entry.upload_evidence.as_ref()?;
+            if evidence.object_key.is_empty() {
+                return None;
+            }
+            Some(snapshot_store::upload_evidence::ArtifactUploadEvidence {
+                artifact: entry.artifact.parse().ok()?,
+                object_key: evidence.object_key.clone(),
+                wire_size_bytes: evidence.wire_size_bytes,
+                etag: evidence.etag.clone(),
+                version_id: evidence.version_id.clone(),
+                metadata_binding_digest: evidence
+                    .metadata_binding_digest
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .ok()?,
+            })
+        })
+        .collect()
+}
+
 fn snapshot_insert_status(error: snapshot_store::InsertSnapshotError) -> Status {
     match error {
         snapshot_store::InsertSnapshotError::IdentityConflict { .. }
@@ -678,15 +715,16 @@ impl ClusterApiService {
     ///
     /// Only the attempt's source node may close it; the check precedes the
     /// transaction so a refused caller writes nothing.
-    async fn finalize_backup_attempt(
-        &self,
-        snapshot_id: SnapshotId,
-        target_state: SnapshotState,
-        bytes_uploaded: i64,
-        failure_reason: Option<&str>,
-        artifact_digests: &[snapshot_store::SnapshotArtifactDigest],
-        caller: &backup_ownership::Caller,
-    ) -> Result<(), Status> {
+    async fn finalize_backup_attempt(&self, input: BackupFinalization<'_>) -> Result<(), Status> {
+        let BackupFinalization {
+            snapshot_id,
+            target_state,
+            bytes_uploaded,
+            failure_reason,
+            artifact_digests,
+            upload_evidence,
+            caller,
+        } = input;
         let attempt = self
             .registered_backup_attempt(snapshot_id)
             .await?
@@ -796,6 +834,17 @@ impl ClusterApiService {
                     snapshot_store::RecordArtifactDigestsError::Database(_) => {
                         Status::internal(format!("record artifact digests: {error}"))
                     }
+                })?;
+        }
+
+        if target_state.is_ready() {
+            snapshot_store::upload_evidence::record(&mut tx, snapshot_id, upload_evidence)
+                .await
+                .map_err(|error| match error {
+                    snapshot_store::RecordArtifactDigestsError::Database(_) => {
+                        Status::internal(format!("upload evidence: {error}"))
+                    }
+                    _ => Status::failed_precondition(format!("upload evidence: {error}")),
                 })?;
         }
 
@@ -1116,14 +1165,15 @@ impl ClusterApiService {
             }
         };
         let artifact_digests = parse_artifact_digests(&req.artifact_digests)?;
-        self.finalize_backup_attempt(
-            SnapshotId::from_uuid(backup_attempt_id.as_uuid()),
+        self.finalize_backup_attempt(BackupFinalization {
+            snapshot_id: SnapshotId::from_uuid(backup_attempt_id.as_uuid()),
             target_state,
-            req.bytes_uploaded,
-            req.failure_reason.as_deref(),
-            &artifact_digests,
-            &caller,
-        )
+            bytes_uploaded: req.bytes_uploaded,
+            failure_reason: req.failure_reason.as_deref(),
+            artifact_digests: &artifact_digests,
+            upload_evidence: &parse_upload_evidence(&req.artifact_digests),
+            caller: &caller,
+        })
         .await?;
         Ok(Response::new(FinalizeArtifactBackupResponse {}))
     }
@@ -1425,6 +1475,7 @@ impl ClusterApiService {
                 artifact: digest.artifact.file_name().to_string(),
                 digest: digest.digest.to_string(),
                 size_bytes: digest.size_bytes,
+                upload_evidence: None,
             })
             .collect())
     }

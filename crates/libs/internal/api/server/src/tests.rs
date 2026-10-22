@@ -7306,11 +7306,13 @@ async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult
 fn test_artifact_digests() -> Vec<crate::proto::SnapshotArtifactDigest> {
     vec![
         crate::proto::SnapshotArtifactDigest {
+            upload_evidence: None,
             artifact: "memfile".to_string(),
             digest: format!("sha256:{}", "22".repeat(32)),
             size_bytes: 1 << 30,
         },
         crate::proto::SnapshotArtifactDigest {
+            upload_evidence: None,
             artifact: "binfile".to_string(),
             digest: format!("sha256:{}", "11".repeat(32)),
             size_bytes: 4096,
@@ -7357,8 +7359,32 @@ async fn finalize_to_ready_publishes_artifact_digests_to_restore_lookups() -> Te
         pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
     )
     .await?;
-    finalize_ready_with_digests(&fixture.service, backup_attempt_id, test_artifact_digests())
-        .await?;
+    let mut uploaded = test_artifact_digests();
+    uploaded[0].upload_evidence = Some(crate::proto::SnapshotUploadEvidence {
+        object_key: format!("synthetic/{sandbox_id}/{backup_attempt_id}/memfile"),
+        wire_size_bytes: 123,
+        etag: Some("synthetic-etag".into()),
+        version_id: None,
+        metadata_binding_digest: None,
+    });
+    finalize_ready_with_digests(&fixture.service, backup_attempt_id, uploaded.clone()).await?;
+    let evidence =
+        snapshot_store::upload_evidence::get(&fixture.service.pool, backup_attempt_id).await?;
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].etag.as_deref(), Some("synthetic-etag"));
+    finalize_ready_with_digests(&fixture.service, backup_attempt_id, uploaded.clone()).await?;
+    uploaded[0].upload_evidence.as_mut().unwrap().etag = Some("changed-object".into());
+    assert_eq!(
+        finalize_ready_with_digests(&fixture.service, backup_attempt_id, uploaded)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        snapshot_store::upload_evidence::get(&fixture.service.pool, backup_attempt_id).await?,
+        evidence
+    );
 
     let mut expected = test_artifact_digests();
     expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
