@@ -660,6 +660,17 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a common-core serde feature the federated identity
+    # policy needs but only gets through unification fails here.
+    echo "--- :rust: Running isolated federated identity clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-federated-identity \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

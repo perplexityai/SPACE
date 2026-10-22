@@ -5534,6 +5534,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-db-test-fixtures",
  "pplx-space-dependency-drain",
+ "pplx-space-federated-identity",
  "pplx-space-metrics",
  "pplx-space-migration-checksums",
  "pplx-space-observability",
@@ -5926,6 +5927,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-federated-identity"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
