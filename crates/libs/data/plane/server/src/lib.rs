@@ -503,14 +503,6 @@ const DATA_PLANE_TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 const DATA_PLANE_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// How many unanswered keepalive probes drop the connection.
 const DATA_PLANE_TCP_KEEPALIVE_RETRIES: u32 = 3;
-/// How long an accepted connection may go without its peer acknowledging data
-/// sent to it, or, on Linux 5.11 and later, keep a zero receive window while
-/// answering window probes, before it is dropped. This is the longest a client
-/// may stop reading a stream with output pending. It is minutes, not seconds,
-/// so a client or proxy that pauses reading under backpressure keeps its
-/// stream.
-#[cfg(target_os = "linux")]
-const DATA_PLANE_TCP_USER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 type DataPlaneListener = axum::serve::TapIo<
     pplx_space_common_svc::http_listener::NodelayListener,
@@ -521,12 +513,15 @@ type DataPlaneListener = axum::serve::TapIo<
 /// detection set, on every route this listener serves, ECW's included.
 ///
 /// Keepalive probes a connection that carries nothing for 30 seconds and drops
-/// it after about a minute of silence. A stream that sends regularly, such as
-/// SSE with its 15-second keep-alive comments, is never idle, so it is
-/// `TCP_USER_TIMEOUT` that drops it when its peer stops acknowledging, after 5
-/// minutes. Either way a connection that dies silently releases its stream,
-/// and the node's per-sandbox permit behind it. Both detect the immediate TCP
-/// peer, which is often a proxy rather than the end client.
+/// it after about a minute of silence, so an idle connection that dies
+/// silently releases its stream, and the node's per-sandbox permit behind it.
+/// It detects the immediate TCP peer, which is often a proxy rather than the
+/// end client. It never closes a connection whose peer still answers, so it
+/// sets no limit on how long a client may stop reading. A stream that sends
+/// regularly, such as SSE with its 15-second keep-alive comments, is never
+/// idle, so a dead peer on it waits out the kernel's retransmission timeout.
+/// No `TCP_USER_TIMEOUT` is set: this listener serves ECW routes too, and on
+/// Linux that option would also decide when keepalive gives up.
 fn data_plane_listener(listener: tokio::net::TcpListener) -> DataPlaneListener {
     fn set_dead_peer_detection(tcp: &mut tokio::net::TcpStream) {
         let socket = socket2::SockRef::from(&*tcp);
@@ -536,10 +531,6 @@ fn data_plane_listener(listener: tokio::net::TcpListener) -> DataPlaneListener {
             .with_retries(DATA_PLANE_TCP_KEEPALIVE_RETRIES);
         if let Err(error) = socket.set_tcp_keepalive(&keepalive) {
             tracing::debug!(%error, "failed to set TCP keepalive on an accepted connection");
-        }
-        #[cfg(target_os = "linux")]
-        if let Err(error) = socket.set_tcp_user_timeout(Some(DATA_PLANE_TCP_USER_TIMEOUT)) {
-            tracing::debug!(%error, "failed to set TCP_USER_TIMEOUT on an accepted connection");
         }
     }
     axum::serve::ListenerExt::tap_io(

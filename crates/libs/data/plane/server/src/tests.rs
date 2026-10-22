@@ -894,11 +894,10 @@ async fn accepted_connections_detect_dead_peers() {
         socket.tcp_keepalive_retries().unwrap(),
         DATA_PLANE_TCP_KEEPALIVE_RETRIES
     );
+    // A user timeout would cap how long a client may stop reading, ECW's
+    // included, and on Linux would decide when keepalive gives up.
     #[cfg(target_os = "linux")]
-    assert_eq!(
-        socket.tcp_user_timeout().unwrap(),
-        Some(DATA_PLANE_TCP_USER_TIMEOUT)
-    );
+    assert_eq!(socket.tcp_user_timeout().unwrap(), None);
 }
 
 pub(crate) async fn test_data_plane_state() -> DataPlaneState {

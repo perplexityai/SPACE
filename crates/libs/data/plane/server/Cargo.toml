@@ -38,7 +38,7 @@ rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-socket2 = { workspace = true, features = ["all"] }
+socket2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["formatting"] }
@@ -64,6 +64,8 @@ pplx-space-sbx-mgr-client = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
+# The socket option getters the listener test reads.
+socket2 = { workspace = true, features = ["all"] }
 pplx-space-test-env = { workspace = true }
 aws-lc-rs = { workspace = true }
 insta = { workspace = true }
