@@ -5559,6 +5559,7 @@ dependencies = [
  "pplx-space-dependency-drain",
  "pplx-space-ecw-credential",
  "pplx-space-federated-identity",
+ "pplx-space-k8s-node-id",
  "pplx-space-kube-client",
  "pplx-space-metrics",
  "pplx-space-migration-checksums",
@@ -6055,6 +6056,14 @@ dependencies = [
  "serde",
  "sqlx",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-k8s-node-id"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "uuid",
 ]
 
 [[package]]

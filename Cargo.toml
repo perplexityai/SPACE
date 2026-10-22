@@ -71,6 +71,7 @@ members = [
     "crates/libs/node/api/server",
     "crates/libs/node/ctl/server",
     "crates/libs/node/ctl/client",
+    "crates/libs/node/k8s-node-id",
     "crates/libs/node/api/sim",
     "crates/libs/node/mgr/client",
     "crates/libs/node/mgr/protocol",
@@ -367,6 +368,7 @@ pplx-space-node-api-client = { path = "crates/libs/node/api/client" }
 pplx-space-node-ctl-client = { path = "crates/libs/node/ctl/client" }
 pplx-space-node-api-server = { path = "crates/libs/node/api/server" }
 pplx-space-node-ctl-server = { path = "crates/libs/node/ctl/server" }
+pplx-space-k8s-node-id = { path = "crates/libs/node/k8s-node-id" }
 pplx-space-node-api-sim = { path = "crates/libs/node/api/sim" }
 pplx-space-node-mgr = { path = "crates/libs/node/mgr/server" }
 pplx-space-node-mgr-client = { path = "crates/libs/node/mgr/client" }
