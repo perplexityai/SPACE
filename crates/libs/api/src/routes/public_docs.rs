@@ -53,7 +53,7 @@ pub(crate) async fn llms_txt() -> impl IntoResponse {
 
 fn public_openapi_value() -> Value {
     const MAX_IDEMPOTENCY_KEY_BYTES: usize =
-        pplx_space_common_core::types::MAX_IDEMPOTENCY_KEY_BYTES;
+        pplx_space_public_api::limits::MAX_IDEMPOTENCY_KEY_BYTES;
     let idempotency_key_parameter = json!({
         "name": "Idempotency-Key",
         "in": "header",
@@ -63,7 +63,8 @@ fn public_openapi_value() -> Value {
             "minLength": 1,
             "maxLength": MAX_IDEMPOTENCY_KEY_BYTES,
             MAX_UTF8_BYTES_EXTENSION: MAX_IDEMPOTENCY_KEY_BYTES,
-            "pattern": "^[^\\u0000]+$"
+            "pattern": "^[\\t -~]+$",
+            "description": format!("1 to {MAX_IDEMPOTENCY_KEY_BYTES} printable ASCII characters, spaces or tabs.")
         }
     });
     let data_plane_events_path =
@@ -85,7 +86,7 @@ fn public_openapi_value() -> Value {
         "info": {
             "title": "SPACE API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "### Errors and retries\n\n- Keep `x-request-id` for troubleshooting. Management errors use `PublicErrorEnvelope`, with a stable `code` and a `retryable` flag; SSE admission errors use the nested `DataPlaneHttpErrorEnvelope`.\n- Follow the returned `retryable` flag, subject to the duplicate-work precautions below. If no valid envelope is available, HTTP 429 and 5xx may be transient, but do not blindly retry mutations with ambiguous outcomes.\n- Wait for `Retry-After` when present (whole seconds). Otherwise, start with a one-second delay and double it with jitter. Stop after five attempts.\n\n### Avoid duplicate work\n\nOnly endpoints declaring a required `Idempotency-Key` deduplicate mutations. Retry those with the same method, path, body, and key. Within 24 hours, this returns the original result. A different body returns `idempotency_conflict`; a new or expired key can start another operation. Process kill and signal do not use this mechanism: inspect ambiguous outcomes before repeating them, because a repeat can apply the action again.\n\n### Error codes\n\n- Management errors that are not retryable: `invalid_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` and `idempotency_conflict` (409), `failed_precondition` (412).\n- Usually retryable management errors: `rate_limited` (429), `capacity_unavailable` and `service_unavailable` (503), `internal` (500). Always check the returned `retryable` flag. Data-plane mappings differ; see each response's envelope.\n- Unsupported methods (405), oversized bodies (413), wrong content types (415), and invalid request schemas (422) use `invalid_request` with `retryable: false`. Other unhandled management 5xx errors use `internal`.\n- A file route's `not_found` lists `{\"key\": \"resource\", \"value\": \"path\"}` in `details` when the sandbox is yours and the path does not exist. Without that detail, treat it as the sandbox not being found: a missing sandbox and one you cannot access answer alike."
+            "description": "### Errors and retries\n\n- Keep `x-request-id` for troubleshooting. Management errors use `PublicErrorEnvelope`, with a stable `code` and a `retryable` flag; SSE admission errors use the nested `DataPlaneHttpErrorEnvelope`.\n- Follow the returned `retryable` flag, subject to the duplicate-work precautions below. If no valid envelope is available, HTTP 429 and 5xx may be transient, but do not blindly retry mutations with ambiguous outcomes.\n- Wait for `Retry-After` when present (whole seconds). Otherwise, start with a one-second delay and double it with jitter. Stop after five attempts.\n\n### Avoid duplicate work\n\nOnly endpoints declaring a required `Idempotency-Key` deduplicate mutations. Retry those with the same method, path, body, and key. Within 24 hours, this returns the original result. A different body returns `idempotency_conflict`; a new or expired key can start another operation. Process kill and signal do not use this mechanism: inspect ambiguous outcomes before repeating them, because a repeat can apply the action again.\n\n### Error codes\n\n- Management errors that are not retryable: `invalid_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` and `idempotency_conflict` (409), `failed_precondition` (412).\n- Usually retryable management errors: `rate_limited` (429), `capacity_unavailable` and `service_unavailable` (503), `internal` (500). Always check the returned `retryable` flag. Data-plane mappings differ; see each response's envelope.\n- Unsupported methods (405), oversized bodies (413), wrong content types (415), and invalid request schemas (422) use `invalid_request` with `retryable: false`. Other unhandled management 5xx errors use `internal`.\n- A file route's `not_found` lists `{\"key\": \"resource\", \"value\": \"path\"}` in `details` when the sandbox is yours and the path does not exist. Without that detail, treat it as the sandbox not being found: a missing sandbox and one you cannot access answer alike.\n- A sandbox create or update that exceeds a documented input limit returns `invalid_request` listing `{\"key\": \"field\", \"value\": \"<field>\"}` in `details`, such as `metadata` or `resources.vcpu`."
         },
         "servers": [
             { "url": "/v1" },

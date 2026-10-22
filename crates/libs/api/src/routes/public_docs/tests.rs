@@ -148,7 +148,7 @@ fn public_openapi_stub_is_public_only() {
                 "name": "limit",
                 "in": "query",
                 "required": false,
-                "description": "Maximum number of sandboxes. Omitted or zero uses the server default of 100; values above 1000 are capped at 1000.",
+                "description": "Maximum number of sandboxes. Omitted or zero uses the server default of 100; values above 1000 are capped at 1000. A page also ends early once its sandboxes reach 8 MiB of JSON; follow `next_cursor` until it is null.",
                 "schema": { "type": "integer", "minimum": 0, "maximum": 65535 }
             }
         ])

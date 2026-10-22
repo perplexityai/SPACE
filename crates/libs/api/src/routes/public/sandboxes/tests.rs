@@ -1208,6 +1208,7 @@ fn public_sandbox_row(created_at: OffsetDateTime, id: SandboxId) -> PublicSandbo
         auto_lifecycle: SqlJson(AutoLifecyclePolicy::disabled()),
         created_at,
         updated_at: created_at,
+        has_next: false,
     }
 }
 
@@ -1590,4 +1591,232 @@ mod admission_pool_claim {
         assert_eq!(admission_outcomes(&counters), vec!["outcome:miss"]);
         Ok(())
     }
+}
+
+async fn error_envelope(
+    error: PublicApiError,
+) -> (
+    axum::http::StatusCode,
+    pplx_space_public_api::PublicErrorEnvelope,
+) {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let response = error.into_response();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn field_detail(field: &str) -> Vec<pplx_space_public_api::PublicErrorDetail> {
+    vec![pplx_space_public_api::PublicErrorDetail {
+        key: pplx_space_public_api::limits::INVALID_FIELD_DETAIL_KEY.to_string(),
+        value: field.to_string(),
+    }]
+}
+
+/// Create and update reject out-of-limit fields with a non-retryable
+/// `invalid_request` that names the field, before anything is admitted.
+#[tokio::test]
+async fn create_and_update_name_the_field_outside_its_limit() {
+    use pplx_space_public_api::{PublicErrorCode, PublicSandboxMetadataValue};
+
+    let mut big_metadata = create_request_with_auto_lifecycle(None);
+    big_metadata.metadata = (0..65)
+        .map(|index| (format!("k{index}"), PublicSandboxMetadataValue::Bool(true)))
+        .collect();
+    let mut nul_name = create_request_with_auto_lifecycle(None);
+    nul_name.name = Some("a\0b".into());
+    let mut wrapping_vcpu = create_request_with_auto_lifecycle(None);
+    wrapping_vcpu.resources = Some(SandboxResources {
+        vcpu: Some(3_000_000_000),
+        memory_mib: None,
+        disk_mib: None,
+    });
+    for (request, field) in [
+        (big_metadata, "metadata"),
+        (nul_name, "name"),
+        (wrapping_vcpu, "resources.vcpu"),
+    ] {
+        let (status, envelope) =
+            error_envelope(prepare_native_create_request(request).unwrap_err()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{field}");
+        assert_eq!(envelope.code, PublicErrorCode::InvalidRequest, "{field}");
+        assert!(!envelope.retryable, "{field}");
+        assert_eq!(envelope.details, field_detail(field));
+    }
+
+    let update = UpdateSandboxRequest {
+        metadata: None,
+        resources: Some(SandboxResources {
+            vcpu: None,
+            memory_mib: Some(16),
+            disk_mib: None,
+        }),
+        network_policy: None,
+        auto_lifecycle: None,
+    };
+    let (status, envelope) = error_envelope(validate_update_request(&update).unwrap_err()).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(envelope.details, field_detail("resources.memory_mib"));
+}
+
+#[tokio::test]
+async fn idempotency_key_distinguishes_missing_from_invalid() {
+    use axum::http::HeaderValue;
+
+    let with_key = |value: HeaderValue| {
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY_HEADER, value);
+        headers
+    };
+    let max = "k".repeat(pplx_space_public_api::limits::MAX_IDEMPOTENCY_KEY_BYTES);
+    assert_eq!(
+        idempotency_key(&with_key(HeaderValue::from_str(&max).unwrap()))
+            .unwrap()
+            .as_str(),
+        max
+    );
+
+    for accepted in ["two words", "tab\tseparated"] {
+        assert_eq!(
+            idempotency_key(&with_key(HeaderValue::from_static(accepted)))
+                .unwrap()
+                .as_str(),
+            accepted
+        );
+    }
+
+    let cases = [
+        (HeaderMap::new(), "Idempotency-Key header is required"),
+        (
+            with_key(HeaderValue::from_str(&format!("{max}k")).unwrap()),
+            "Idempotency-Key exceeds 1024 bytes",
+        ),
+        (
+            with_key(HeaderValue::from_bytes("clé".as_bytes()).unwrap()),
+            "Idempotency-Key must contain only printable ASCII characters, spaces and tabs",
+        ),
+        (
+            with_key(HeaderValue::from_static("")),
+            "Idempotency-Key must not be empty",
+        ),
+    ];
+    for (headers, message) in cases {
+        let (status, envelope) = error_envelope(idempotency_key(&headers).unwrap_err()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{message}");
+        assert_eq!(envelope.message, message);
+    }
+}
+
+#[test]
+fn sandboxes_page_continues_after_a_budget_cut() {
+    let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let last_id = SandboxId::new();
+    let rows = |has_next| {
+        vec![
+            public_sandbox_row(created_at, SandboxId::new()),
+            PublicSandboxRow {
+                has_next,
+                ..public_sandbox_row(created_at - time::Duration::seconds(1), last_id)
+            },
+        ]
+    };
+
+    let cut = sandboxes_page(rows(true), 100).unwrap();
+    assert_eq!(cut.data.len(), 2);
+    let cursor = cut.next_cursor.expect("a cut page continues");
+    assert_eq!(
+        parse_sandbox_cursor(&decode_cursor(CursorKind::Sandbox, cursor.as_str()).unwrap())
+            .unwrap(),
+        (created_at - time::Duration::seconds(1), last_id)
+    );
+    assert!(
+        sandboxes_page(rows(false), 100)
+            .unwrap()
+            .next_cursor
+            .is_none()
+    );
+}
+
+/// Inserts a sandbox directly, as one stored before the input limits could
+/// be, with a single metadata string of `metadata_bytes` bytes.
+async fn insert_legacy_sandbox(
+    pool: &PgPool,
+    created_at: OffsetDateTime,
+    metadata_bytes: usize,
+) -> TestDbResult<SandboxId> {
+    let id = SandboxId::new();
+    let metadata = serde_json::json!({ "legacy": "m".repeat(metadata_bytes) });
+    sqlx::query(pplx_space_common_core::sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, lifecycle, created_at, metadata,
+             network_policy_override_json, network_policy_generation
+         ) VALUES ($1, $2, $3, 'stopped', $4, $5, $6, 1)"
+    ))
+    .bind(id)
+    .bind(SEED_USER_ID)
+    .bind(SEED_ORG_ID)
+    .bind(created_at)
+    .bind(SqlJson(metadata))
+    .bind(SqlJson(&pplx_space_net_common::NetworkPolicyV1::default()))
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Rows stored before the metadata limits still page within the byte
+/// budget: Postgres returns no more than the budget (or one oversized row),
+/// and following the cursor visits every row once.
+#[tokio::test]
+async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
+    const MIB: usize = 1024 * 1024;
+    let db = pg_test_db().await?;
+    let org_id = OrgId::from_uuid(SEED_ORG_ID);
+    let newest = OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+    // Newest first: one row over the whole budget, twelve 1 MiB rows, then
+    // three small ones.
+    let sizes = std::iter::once(9 * MIB)
+        .chain(std::iter::repeat_n(MIB, 12))
+        .chain(std::iter::repeat_n(16, 3));
+    let mut expected = Vec::new();
+    for (offset, size) in sizes.enumerate() {
+        let created_at = newest - time::Duration::seconds(offset as i64);
+        expected.push(insert_legacy_sandbox(&db.pool, created_at, size).await?);
+    }
+
+    let mut pages = Vec::new();
+    let mut cursor = None;
+    loop {
+        let rows =
+            fetch_sandboxes_page(&db.pool, org_id, None, cursor, MAX_SANDBOX_LIST_LIMIT).await?;
+        let metadata_bytes = rows
+            .iter()
+            .map(|row| serde_json::to_vec(&row.metadata.0).unwrap().len())
+            .sum::<usize>();
+        if rows.len() > 1 {
+            assert!(
+                metadata_bytes <= MAX_SANDBOX_LIST_PAGE_BYTES as usize,
+                "{metadata_bytes}"
+            );
+        }
+        let ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let page = sandboxes_page(rows, MAX_SANDBOX_LIST_LIMIT).unwrap();
+        pages.push(ids);
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(
+            parse_sandbox_cursor(&decode_cursor(CursorKind::Sandbox, next.as_str()).unwrap())
+                .unwrap(),
+        );
+    }
+
+    // The oversized row comes back alone; 1 MiB rows fit seven to a page.
+    assert_eq!(
+        pages.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![1, 7, 8]
+    );
+    assert_eq!(pages.concat(), expected);
+    Ok(())
 }

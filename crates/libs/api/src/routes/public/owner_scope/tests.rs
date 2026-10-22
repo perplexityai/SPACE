@@ -1097,3 +1097,27 @@ async fn a_sandbox_outside_the_callers_scope_is_answered_as_an_unknown_one() -> 
     }
     Ok(())
 }
+
+#[test]
+fn federated_idempotency_key_is_checked_before_it_is_hashed() {
+    let subject_id = UserId::from_uuid(SEED_USER_ID);
+    let with_key = |key: String| {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_str(&key).unwrap());
+        headers
+    };
+    let max = pplx_space_public_api::limits::MAX_IDEMPOTENCY_KEY_BYTES;
+
+    let mut accepted = with_key("k".repeat(max));
+    namespace_idempotency_key(&mut accepted, subject_id).unwrap();
+    assert!(
+        accepted["idempotency-key"]
+            .to_str()
+            .unwrap()
+            .starts_with("native-owner-")
+    );
+
+    let mut rejected = with_key("k".repeat(max + 1));
+    assert!(namespace_idempotency_key(&mut rejected, subject_id).is_err());
+    assert_eq!(rejected["idempotency-key"].len(), max + 1, "left unhashed");
+}

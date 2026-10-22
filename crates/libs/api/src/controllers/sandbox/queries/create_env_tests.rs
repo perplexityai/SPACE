@@ -19,3 +19,14 @@ fn sanitize_create_env_keeps_valid_entries_and_drops_invalid_entries() {
     assert!(!sanitized.contains_key("BAD-NAME"));
     assert!(!sanitized.contains_key("BAD_VALUE"));
 }
+
+#[test]
+fn stored_resource_rejects_values_past_the_integer_column() {
+    assert_eq!(stored_resource(None, "vcpu").unwrap(), None);
+    assert_eq!(
+        stored_resource(Some(i32::MAX as u32), "vcpu").unwrap(),
+        Some(i32::MAX)
+    );
+    let error = stored_resource(Some(3_000_000_000), "vcpu").unwrap_err();
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+}
