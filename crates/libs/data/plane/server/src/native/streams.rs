@@ -3,11 +3,22 @@
 
 use super::*;
 
+/// Whether the attach that may start a process can write its input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProcessInput {
+    /// A WebSocket attach forwards stdin frames to the process.
+    Writable,
+    /// An SSE stream carries no input, so a requested stdin starts at EOF
+    /// instead of as a pipe that nothing can write to or close.
+    Closed,
+}
+
 pub(super) async fn initial_process_stream(
     client: &mut WorkerApiClient<GrpcClientTrace<Channel>>,
     attached: &AttachedSession,
     session_id: DataPlaneSessionId,
     output_cursor: Option<u64>,
+    input: ProcessInput,
 ) -> Result<tonic::Streaming<ProcessEvent>, StreamBridgeError> {
     if let Some(process_id) = attached.backend_process_id.as_ref() {
         return connect_process_stream(
@@ -20,7 +31,10 @@ pub(super) async fn initial_process_stream(
         .await;
     }
 
-    let start = process_start_request(attached, session_id)?;
+    let mut start = process_start_request(attached, session_id)?;
+    if input == ProcessInput::Closed {
+        start.stdin = false;
+    }
     let started = start_process_stream(
         client,
         &attached.sandbox_id,
@@ -56,6 +70,7 @@ pub(super) async fn open_native_process_stream(
     session_id: DataPlaneSessionId,
     attached: &mut AttachedSession,
     output_cursor: Option<u64>,
+    input: ProcessInput,
 ) -> Result<
     (
         WorkerApiClient<GrpcClientTrace<Channel>>,
@@ -69,7 +84,8 @@ pub(super) async fn open_native_process_stream(
             .channel(&route.backend_endpoint, session_id)
             .await?;
         let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-        let stream = initial_process_stream(&mut client, &route, session_id, output_cursor).await?;
+        let stream =
+            initial_process_stream(&mut client, &route, session_id, output_cursor, input).await?;
         Ok((client, stream))
     })
     .await

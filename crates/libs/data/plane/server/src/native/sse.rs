@@ -82,24 +82,6 @@ pub(crate) async fn session_events(
     if state.drain_started.is_cancelled() {
         return native_draining_response(session_id.kind().as_str());
     }
-    // Refused only when this attach would start the process, which would then
-    // wait on input this stream cannot deliver and outlive the request. A
-    // process already bound to the session (started over WebSocket, or before
-    // this check existed) reconnects as usual: reading its output starts
-    // nothing.
-    if attached.kind == SessionKind::Process
-        && attached.backend_process_id.is_none()
-        && process_session_needs_input(&attached)
-    {
-        return data_plane_http_error(
-            StatusCode::BAD_REQUEST,
-            DataPlaneHttpErrorCode::InvalidRequest,
-            "events stream cannot send input; attach a stdin or pty process session over WebSocket",
-            false,
-            ResponseOrigin::Client,
-            ResponseKind::Validation,
-        );
-    }
     let stream_permit = match state.attached_streams.try_acquire_attached(&attached) {
         Ok(permit) => permit,
         Err(limit) => {
@@ -128,6 +110,45 @@ pub(crate) async fn session_events(
                         ResponseKind::Admission,
                     );
                 }
+            };
+            // Refused only when this attach would start a pty process, whose
+            // input this stream can neither deliver nor close, so it would
+            // wait and outlive the request. A process already bound to the
+            // session reconnects as usual: reading its output starts nothing.
+            // The cached route can predate a binding just made elsewhere, so
+            // an unbound one is read again before refusing.
+            let attached = if attached.backend_process_id.is_none()
+                && process_session_needs_pty(&attached)
+            {
+                let current =
+                    match resolve_session_route_with_cache(&state, session_id, &token, false).await
+                    {
+                        Ok(current) => current,
+                        Err(error) => {
+                            pplx_space_metrics::data_plane::attach(
+                                session_id.kind().as_str(),
+                                error.metric_label(),
+                            );
+                            return route_resolution_http_error(error);
+                        }
+                    };
+                if current.backend_process_id.is_none() {
+                    pplx_space_metrics::data_plane::attach(
+                        session_id.kind().as_str(),
+                        "input_unsupported",
+                    );
+                    return data_plane_http_error(
+                        StatusCode::BAD_REQUEST,
+                        DataPlaneHttpErrorCode::InvalidRequest,
+                        "events stream cannot send input; attach a pty process session over WebSocket",
+                        false,
+                        ResponseOrigin::Client,
+                        ResponseKind::Validation,
+                    );
+                }
+                current
+            } else {
+                attached
             };
             let stream_shutdown_token = state.stream_shutdown_token.clone();
             let opened = before_stream_deadline(
@@ -310,6 +331,7 @@ impl ProcessSseState {
             session_id,
             &mut attached,
             replay.backend_output_cursor,
+            ProcessInput::Closed,
         )
         .await?;
         let mut pending = VecDeque::new();
