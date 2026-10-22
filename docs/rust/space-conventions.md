@@ -41,7 +41,8 @@ including `aws_lc_rs` for rustls and rcgen, `tls-aws-lc` for tonic, and
 `verify-aws` for x509-parser.
 
 Services install the process-wide rustls provider through
-`pplx_space_common_svc::install_default_rustls_crypto_provider`; downstream
+`pplx_space_rustls_provider::install_default_rustls_crypto_provider`
+(re-exported from `pplx-space-common-svc`); downstream
 crates must not attempt to install a competing provider. A transitive dependency
 that offers no provider choice may retain ring temporarily, but record that
 constraint rather than adding SPACE-owned ring usage around it. Changing the

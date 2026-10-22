@@ -23,8 +23,9 @@ For every wire-boundary parameter, ask: what does this value *mean*? If the answ
 
 Before defining a new type, check:
 
-- `crates/libs/common/core/src/types/` — `SandboxId`, `GuestPath`, `IdempotencyKey`, `ProcessUserName`, `TemplateName`, `MemorySize`, …
-- `crates/libs/common/svc/src/types/`
+- `crates/libs/common/core/src/types/` — `SandboxId`, `GuestPath`, `IdempotencyKey`, `ProcessUserName`, `TemplateName`, …
+- the value-type crates `common-core` re-exports — `pplx-space-byte-size` (`MemorySize`, `DiskSize`), `pplx-space-semver`, `pplx-space-durations`, `pplx-space-content-digest`, `pplx-space-cpu-arch`, `pplx-space-k8s-ids`, `pplx-space-cluster-id`
+- `crates/libs/common/svc/src/types/` (`UnixSocketPath` lives in `pplx-space-unix-socket-path`)
 
 Reuse the existing noun. `pplx-space-common-svc` re-exports `pplx-space-common-core` as `core::*`, so one import covers both.
 

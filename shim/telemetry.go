@@ -195,7 +195,7 @@ func shimServiceName() string {
 
 // maxClusterIDBytes mirrors Rust's `MAX_CLUSTER_ID_BYTES` (one RFC-1123 label).
 // The shim can't import Rust constants, so keep this in sync with
-// `ClusterId` in crates/libs/common/core/src/types/cluster.rs.
+// `ClusterId` in crates/libs/cluster-id/src/lib.rs.
 const maxClusterIDBytes = 63
 
 // isValidClusterID reports whether s is a single lowercase RFC-1123 label
