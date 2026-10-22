@@ -4,13 +4,14 @@
 # up.sh). A restart interrupts whatever else is using the stack — another
 # session's smoke run, say — so these cases pin, against the real up.sh:
 #
-#   1. A changed listed setting restarts Tilt.
+#   1. A changed listed setting restarts Tilt, the Rust build included.
 #   2. Nothing else does: not a refreshed AWS_SESSION_TOKEN with exchange
 #      storage credentials (nothing reads it then), not a knob only up.sh reads
 #      (SPACE_KIND_MIN_FREE_GIB), and not a setting set explicitly to its
 #      default. With static storage credentials the AWS variables count.
-#   3. A run whose settings up.sh or the bring-up would refuse (an invalid
-#      storage mode, parallelism or timeout) leaves the running Tilt running:
+#   3. A run whose settings up.sh, the bring-up or the Rust build would refuse
+#      (an invalid storage mode, Rust build, parallelism or timeout, or the
+#      release build with another profile) leaves the running Tilt running:
 #      the refusal comes before the stop, not after it.
 #   4. So does a reused cluster whose nodes' vendor copies differ from the host
 #      vendor tree, including when they differ only from the tree this run
@@ -191,6 +192,7 @@ up_case() {
 # 1: a listed setting changed.
 up_case datadog-mode restart "" "SPACE_KIND_DATADOG_MODE=fakeintake"
 up_case storage-mode restart "" "SPACE_KIND_STORAGE_CREDENTIALS=static"
+up_case rust-build restart "" "SPACE_KIND_RUST_BUILD=release"
 
 # 2: nothing else does.
 up_case session-token reuse \
@@ -206,6 +208,12 @@ up_case static-session-token restart \
 up_case invalid-storage-mode refuse "" "SPACE_KIND_STORAGE_CREDENTIALS=bogus"
 up_case invalid-parallelism refuse "" "SPACE_TILT_MAX_PARALLEL_UPDATES=many"
 up_case invalid-timeout refuse "" "SPACE_BOOTSTRAP_TIMEOUT=30m SPACE_KIND_TELEMETRY_MODE=otel"
+up_case invalid-rust-build refuse "" "SPACE_KIND_RUST_BUILD=bogus"
+grep -q "SPACE_KIND_RUST_BUILD must be test-hooks or release" "$work/invalid-rust-build.out" \
+    || fail "invalid-rust-build: the refusal must be lib/rust-build.sh's" "$(cat "$work/invalid-rust-build.out")"
+up_case release-other-profile refuse "" "SPACE_KIND_RUST_BUILD=release SPACE_KIND_RUST_PROFILE=dev-release"
+grep -q "SPACE_KIND_RUST_BUILD=release builds the release profile" "$work/release-other-profile.out" \
+    || fail "release-other-profile: the refusal must be build-rust-artifacts.sh's" "$(cat "$work/release-other-profile.out")"
 
 # 4: so does a reused cluster whose nodes' vendor copies differ.
 vendor_case() {
@@ -226,6 +234,6 @@ up_case vendor-copy-matches restart "" "SPACE_KIND_DATADOG_MODE=fakeintake"
 rm -f "$work/cluster"
 
 if [ "$status" -eq 0 ]; then
-    echo "ok: up.sh restarts Tilt only for a changed setting Tilt reads, and refuses invalid settings and a reused cluster's drifted vendor copies before stopping it"
+    echo "ok: up.sh restarts Tilt only for a changed setting Tilt reads, and refuses invalid settings, the release build with another profile and a reused cluster's drifted vendor copies before stopping it"
 fi
 exit "$status"

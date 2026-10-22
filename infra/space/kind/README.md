@@ -37,11 +37,12 @@ whose update failed. It restarts Tilt when Tilt was started with other values of
 the settings Tilt reads from its environment once, at start: the list is
 `TILT_SETTINGS` in `up.sh` (the telemetry, Datadog and storage credentials
 modes, the prune and parallel-update switches, `SPACE_LOOP_DEVICE_TARGET`,
-`SPACE_SEED_OUTPUT_DIR` and the Rust build mode), each compared with its
-default, plus the optional AWS credentials when storage credentials are
-`static`. Nothing else restarts it, so a refreshed AWS session token in the
-default mode keeps the running Tilt. Before stopping it, `up.sh` checks its own
-refusals (the timeout, storage mode and parallelism, and the cluster's mounts,
+`SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile, and
+`SPACE_KIND_RUST_BUILD`), each compared with its default, plus the optional
+AWS credentials when storage credentials are `static`. Nothing else restarts
+it, so a refreshed AWS session token in the default mode keeps the running
+Tilt. Before stopping it, `up.sh` checks its own refusals (the timeout, storage
+mode, Rust build and profile, and parallelism, and the cluster's mounts,
 node image, layout, Postgres data and nodes' vendor copies, after staging the
 vendor tree as the bring-up does); a refusal at Tiltfile load is not
 pre-checked. Tilt's log

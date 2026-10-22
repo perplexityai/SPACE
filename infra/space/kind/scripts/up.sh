@@ -15,12 +15,12 @@
 # Tilt is restarted only when it serves a deleted cluster or another checkout,
 # or was started with other values of the settings listed in TILT_SETTINGS
 # below, since Tilt reads those once, at start. Before a running Tilt is
-# stopped, this run's own refusals are checked: the timeout, storage mode and
-# parallelism, and the cluster's mounts, node image, layout, data and the
-# nodes' vendor copies, against the vendor tree this run stages
-# (assert_restartable); the Tiltfile's load-time refusals are not, and would
-# leave no watcher. Tilt keeps running afterwards and redeploys whatever
-# changes in the checkout; teardown.sh stops it.
+# stopped, this run's own refusals are checked: the timeout, storage mode,
+# Rust build and profile, and parallelism, and the cluster's mounts, node
+# image, layout, data and the nodes' vendor copies, against the vendor tree
+# this run stages (assert_restartable); the Tiltfile's load-time refusals are
+# not, and would leave no watcher. Tilt keeps running afterwards and redeploys
+# whatever changes in the checkout; teardown.sh stops it.
 #
 # Usage:
 #   bash infra/space/kind/scripts/up.sh
@@ -34,7 +34,8 @@
 #                            included) and node publication (default: 1800)
 #   SPACE_KIND_DATADOG_MODE, SPACE_KIND_TELEMETRY_MODE, SPACE_KIND_OBSERVABILITY,
 #   SPACE_KIND_OBSERVABILITY_CONFIG, SPACE_KIND_STORAGE_CREDENTIALS,
-#   SPACE_LOOP_DEVICE_TARGET, SPACE_KIND_PRUNE_SUPERSEDED_IMAGES,
+#   SPACE_KIND_RUST_BUILD, SPACE_LOOP_DEVICE_TARGET,
+#   SPACE_KIND_PRUNE_SUPERSEDED_IMAGES,
 #   SPACE_TILT_PRUNE_HOST_IMAGES, SPACE_TILT_MAX_PARALLEL_UPDATES,
 #   SPACE_SEED_OUTPUT_DIR    see infra/space/kind/README.md
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
@@ -115,6 +116,7 @@ KIND_STACK_DETACH=0
 # the cluster itself.
 TILT_SETTINGS=(
   SPACE_KIND_STORAGE_CREDENTIALS=exchange
+  SPACE_KIND_RUST_BUILD=test-hooks
   SPACE_KIND_OBSERVABILITY_CONFIG=
   SPACE_TILT_MAX_PARALLEL_UPDATES=8
   SPACE_LOOP_DEVICE_TARGET=
@@ -179,6 +181,12 @@ tilt_settings_differ() {
 # stopping it first.
 assert_restartable() {
   space_kind_storage_credentials >/dev/null || exit 1
+  local rust_build
+  rust_build="$(space_kind_rust_build)" || exit 1
+  # build-rust-artifacts.sh's refusal, which the restarted Tilt would reach
+  # only after this one had been stopped.
+  [[ "$rust_build" != release || "${SPACE_KIND_RUST_PROFILE:-release}" == release ]] \
+    || die "SPACE_KIND_RUST_BUILD=release builds the release profile; unset SPACE_KIND_RUST_PROFILE (got '$SPACE_KIND_RUST_PROFILE')"
   [[ "${SPACE_TILT_MAX_PARALLEL_UPDATES:-8}" =~ ^[1-9][0-9]*$ ]] \
     || die "SPACE_TILT_MAX_PARALLEL_UPDATES must be a positive integer"
   kind_stack_assert_cluster_mounts
@@ -219,6 +227,7 @@ cat <<MSG
   Tilt UI:    http://localhost:10350 (log: $tilt_log)
   Datadog:    $DATADOG_MODE
   Telemetry:  $TELEMETRY_MODE
+  Rust build: $(space_kind_rust_build)
   Login:      root@local
 
   Smoke:      bash scripts/tests/smoke-kind-e2e.sh
