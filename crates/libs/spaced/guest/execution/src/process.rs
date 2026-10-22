@@ -37,11 +37,11 @@ const PROCESS_RECORD_LIMIT: usize = 128;
 // output is released `COMPLETED_PROCESS_OUTPUT_RETENTION` after the exit, so
 // finished processes do not hold the shared output budget. The record limit
 // above still bounds what is retained.
-const COMPLETED_PROCESS_RETENTION: Duration = Duration::from_secs(15 * 60);
+pub(super) const COMPLETED_PROCESS_RETENTION: Duration = Duration::from_secs(15 * 60);
 // How long a completed record keeps its output. A retried start replays it,
 // so this is at least the start's idempotency window. A reconnect that resumes
 // from an output cursor also replays it; after this it reads the lagged error.
-const COMPLETED_PROCESS_OUTPUT_RETENTION: Duration = IDEMPOTENCY_RECORD_TTL;
+pub(super) const COMPLETED_PROCESS_OUTPUT_RETENTION: Duration = IDEMPOTENCY_RECORD_TTL;
 // One process retains at most a quarter of the smallest total.
 const PROCESS_OUTPUT_RETENTION_BYTES: usize = PROCESS_OUTPUT_RETENTION_MIN_BYTES / 4;
 
@@ -563,6 +563,7 @@ pub(super) struct ProcessRegistry {
     /// output can be due before the deadline it is sleeping until.
     reaper_wake: Arc<Notify>,
     output_budget: ProcessOutputBudget,
+    retention: ProcessRetention,
 }
 
 /// A process id in use: by an admitted start that has not published its
@@ -689,12 +690,12 @@ impl ProcessRecord {
 impl Default for ProcessRegistry {
     /// The budget of a guest of unknown size: the full 64 MiB.
     fn default() -> Self {
-        Self::new(ProcessOutputBudget::for_guest_memory(None))
+        Self::new(ProcessOutputBudget::for_guest_memory(None), ProcessRetention::default())
     }
 }
 
 impl ProcessRegistry {
-    pub(super) fn new(output_budget: ProcessOutputBudget) -> Self {
+    pub(super) fn new(output_budget: ProcessOutputBudget, retention: ProcessRetention) -> Self {
         Self {
             records: Arc::new(DashMap::new()),
             record_slots: Arc::new(Semaphore::new(PROCESS_RECORD_LIMIT)),
@@ -702,6 +703,7 @@ impl ProcessRegistry {
             reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reaper_wake: Arc::new(Notify::new()),
             output_budget,
+            retention,
         }
     }
 }
@@ -1172,27 +1174,27 @@ impl ProcessEventJournal {
             .is_some()
     }
 
-    fn is_expired(&self) -> bool {
+    fn is_expired(&self, retention: Duration) -> bool {
         self.state
             .lock()
             .expect("process output journal lock poisoned")
             .completed_at
-            .is_some_and(|completed_at| completed_at.elapsed() > COMPLETED_PROCESS_RETENTION)
+            .is_some_and(|completed_at| completed_at.elapsed() > retention)
     }
 
     /// Drops the retained output of a process that completed more than
-    /// `COMPLETED_PROCESS_OUTPUT_RETENTION` ago, keeping its exit, and says
+    /// the configured output window ago, keeping its exit, and says
     /// whether this call released it. A reconnect without a cursor needs just
     /// the start and the exit; one that resumes from a cursor reads the lagged
     /// error from then on.
-    fn release_output_if_due(&self) -> bool {
+    fn release_output_if_due(&self, retention: Duration) -> bool {
         let mut state = self
             .state
             .lock()
             .expect("process output journal lock poisoned");
         if state.output_released
             || !state.completed_at.is_some_and(|completed_at| {
-                completed_at.elapsed() > COMPLETED_PROCESS_OUTPUT_RETENTION
+                completed_at.elapsed() > retention
             })
         {
             return false;
@@ -1207,15 +1209,15 @@ impl ProcessEventJournal {
 
     /// When the reaper next has work for this record: releasing its output,
     /// then ending its retention (just after each, as both are strictly past).
-    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+    fn next_deadline(&self, retention: ProcessRetention) -> Option<tokio::time::Instant> {
         let state = self
             .state
             .lock()
             .expect("process output journal lock poisoned");
         let retained_for = if state.output_released {
-            COMPLETED_PROCESS_RETENTION
+            retention.completed
         } else {
-            COMPLETED_PROCESS_OUTPUT_RETENTION
+            retention.output.min(retention.completed)
         };
         state
             .completed_at
@@ -1638,7 +1640,7 @@ impl ProcessRegistry {
             .records
             .get(process_id)
             .and_then(|entry| entry.record().cloned())?;
-        if record.journal.is_expired() {
+        if record.journal.is_expired(self.retention.completed) {
             self.records.remove(process_id);
             return None;
         }
@@ -1722,10 +1724,10 @@ impl ProcessRegistry {
             let Some(record) = entry.record() else {
                 return true;
             };
-            if record.journal.release_output_if_due() {
+            if record.journal.release_output_if_due(self.retention.output) {
                 record.release_env();
             }
-            !record.journal.is_expired()
+            !record.journal.is_expired(self.retention.completed)
         });
     }
 
@@ -1734,7 +1736,7 @@ impl ProcessRegistry {
     fn next_expiry(&self) -> Option<tokio::time::Instant> {
         self.records
             .iter()
-            .filter_map(|entry| entry.record()?.journal.next_deadline())
+            .filter_map(|entry| entry.record()?.journal.next_deadline(self.retention))
             .min()
     }
 
@@ -1748,7 +1750,7 @@ impl ProcessRegistry {
             .filter(|entry| process_id.is_none_or(|process_id| entry.key().as_str() == process_id))
             .filter_map(|entry| {
                 let record = entry.record()?;
-                if record.journal.is_expired() {
+                if record.journal.is_expired(self.retention.completed) {
                     expired.push(entry.key().clone());
                     return None;
                 }
