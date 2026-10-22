@@ -283,7 +283,13 @@ message ProcessEvent {
   }
 }
 message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
-message ProcessConnected {}
+message ProcessConnected {
+  // Set when the request asked for resume_after_output_gap and this guest
+  // honors it. A guest that predates the field ignores the request and keeps
+  // failing a lagged reader; spaced-host then refuses the opted-in stream with
+  // a guest-capability-unsupported status.
+  bool resume_after_output_gap = 1;
+}
 message ProcessOutput { bytes data = 1; }
 message ProcessOutputGap {
   // Output events evicted before this stream delivered them.

@@ -163,9 +163,12 @@ impl<R> ResumableProcessStartState<R> {
                 self.output_cursor = self.output_cursor.saturating_add(1);
                 self.reopens_without_progress = 0;
             }
-            Some(spaced_ops::process_event::Event::OutputGap(gap)) => {
-                self.ensure_bound_process(event)?;
-                self.output_cursor = gap.output_cursor;
+            // ECW connects do not set `resume_after_output_gap`, so a gap means
+            // output was lost without the stream asking to continue past it.
+            Some(spaced_ops::process_event::Event::OutputGap(_)) => {
+                return Err(tonic::Status::data_loss(
+                    "backend reported an output gap this stream did not request",
+                ));
             }
             Some(spaced_ops::process_event::Event::Exit(_)) => {
                 self.ensure_bound_process(event)?;

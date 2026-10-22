@@ -43,7 +43,9 @@ fn process_events_encode_connect_wire_shape() {
             process_id: "proc-1".to_string(),
             pid: None,
             event: Some(spaced_process_event::Event::Connected(
-                SpacedProcessConnected {},
+                SpacedProcessConnected {
+                    resume_after_output_gap: false,
+                },
             )),
         },
         true,

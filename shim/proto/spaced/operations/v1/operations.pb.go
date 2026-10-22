@@ -3416,9 +3416,14 @@ func (x *ProcessStarted) GetStartTime() *timestamppb.Timestamp {
 }
 
 type ProcessConnected struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Set when the request asked for resume_after_output_gap and this guest
+	// honors it. A guest that predates the field ignores the request and keeps
+	// failing a lagged reader; spaced-host then refuses the opted-in stream with
+	// a guest-capability-unsupported status.
+	ResumeAfterOutputGap bool `protobuf:"varint,1,opt,name=resume_after_output_gap,json=resumeAfterOutputGap,proto3" json:"resume_after_output_gap,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ProcessConnected) Reset() {
@@ -3449,6 +3454,13 @@ func (x *ProcessConnected) ProtoReflect() protoreflect.Message {
 // Deprecated: Use ProcessConnected.ProtoReflect.Descriptor instead.
 func (*ProcessConnected) Descriptor() ([]byte, []int) {
 	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{53}
+}
+
+func (x *ProcessConnected) GetResumeAfterOutputGap() bool {
+	if x != nil {
+		return x.ResumeAfterOutputGap
+	}
+	return false
 }
 
 type ProcessOutput struct {
@@ -4314,8 +4326,9 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x0eProcessStarted\x12>\n" +
 	"\n" +
 	"start_time\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampH\x00R\tstartTime\x88\x01\x01B\r\n" +
-	"\v_start_time\"\x12\n" +
-	"\x10ProcessConnected\"#\n" +
+	"\v_start_time\"I\n" +
+	"\x10ProcessConnected\x125\n" +
+	"\x17resume_after_output_gap\x18\x01 \x01(\bR\x14resumeAfterOutputGap\"#\n" +
 	"\rProcessOutput\x12\x12\n" +
 	"\x04data\x18\x01 \x01(\fR\x04data\"\x8e\x01\n" +
 	"\x10ProcessOutputGap\x12%\n" +

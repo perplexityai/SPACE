@@ -943,36 +943,63 @@ async fn completed_cursor_keeps_terminal_event_without_retaining_journal() {
 
 #[tokio::test]
 async fn evicted_cursor_reports_lag_before_terminal_event() {
-    let journal = Arc::new(ProcessEventJournal::new(output_slots()));
-    let process_id = ProcessId::new();
-    journal.append_output(process_stdout_event(
-        &process_id,
-        Some(1),
-        b"unread".to_vec(),
-    ));
-    let exit = process_stdout_event(&process_id, Some(1), b"terminal".to_vec());
-    let cursor = ProcessJournalCursor {
-        journal: Arc::downgrade(&journal),
-        changed: journal.subscribe(),
-        next_sequence: 0,
-        primary: None,
-        gap_resume: None,
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        ProcessOutputGap, process_event::Event,
     };
-    journal.complete(exit);
-    drop(journal);
 
-    let events = process_event_stream_with_prefix(Vec::new(), Some(cursor))
-        .collect::<Vec<_>>()
-        .await;
+    for resume_after_output_gap in [false, true] {
+        let journal = Arc::new(ProcessEventJournal::new(output_slots()));
+        let process_id = ProcessId::new();
+        journal.append_output(process_stdout_event(
+            &process_id,
+            Some(1),
+            b"unread".to_vec(),
+        ));
+        let exit = process_stdout_event(&process_id, Some(1), b"terminal".to_vec());
+        let cursor = ProcessJournalCursor {
+            journal: Arc::downgrade(&journal),
+            changed: journal.subscribe(),
+            next_sequence: 0,
+            primary: None,
+            gap_resume: resume_after_output_gap.then(|| OutputGapResume {
+                process_id: process_id.as_str().to_string(),
+                pid: Some(1),
+            }),
+        };
+        journal.complete(exit.clone());
+        drop(journal);
 
-    assert_eq!(events.len(), 1);
-    assert_eq!(
-        events[0]
-            .as_ref()
-            .expect_err("lagged replay must fail")
-            .code(),
-        tonic::Code::ResourceExhausted
-    );
+        let events = process_event_stream_with_prefix(Vec::new(), Some(cursor))
+            .collect::<Vec<_>>()
+            .await;
+
+        if !resume_after_output_gap {
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0]
+                    .as_ref()
+                    .expect_err("lagged replay must fail")
+                    .code(),
+                tonic::Code::ResourceExhausted
+            );
+            continue;
+        }
+        // The record is gone, so everything unread before the exit is a gap.
+        let events = events
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("a resumed reader does not fail");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event,
+            Some(Event::OutputGap(ProcessOutputGap {
+                skipped_events: 1,
+                output_cursor: 1,
+                output_bytes_before: b"unread".len() as u64,
+            }))
+        );
+        assert_eq!(events[1], exit);
+    }
 }
 
 #[tokio::test]
@@ -1574,9 +1601,11 @@ async fn connect_resumes_after_an_output_gap_only_when_asked() {
     };
 
     let mut resumed = connect(true).await.expect("connect").into_inner();
-    let (mut bytes_before, mut received, mut exited) = (None, 0_u64, false);
+    let (mut acknowledged, mut bytes_before, mut received, mut exited) =
+        (false, None, 0_u64, false);
     while let Some(event) = resumed.next().await {
         match event.expect("a resumed reader does not fail").event {
+            Some(Event::Connected(connected)) => acknowledged = connected.resume_after_output_gap,
             Some(Event::OutputGap(gap)) => {
                 assert_eq!(bytes_before, None, "one gap for one eviction run");
                 assert_eq!(received, 0);
@@ -1587,6 +1616,7 @@ async fn connect_resumes_after_an_output_gap_only_when_asked() {
             _ => {}
         }
     }
+    assert!(acknowledged, "spaced-host relies on the acknowledgement");
     let bytes_before = bytes_before.expect("the reader was told about the gap");
     assert!(bytes_before > 0);
     assert_eq!(bytes_before + received, noise as u64 + 4);
@@ -1595,9 +1625,16 @@ async fn connect_resumes_after_an_output_gap_only_when_asked() {
     let mut legacy = connect(false).await.expect("connect").into_inner();
     let mut error = None;
     while let Some(event) = legacy.next().await {
-        if let Err(status) = event {
-            error = Some(status);
-            break;
+        match event {
+            Ok(event) => {
+                if let Some(Event::Connected(connected)) = event.event {
+                    assert!(!connected.resume_after_output_gap);
+                }
+            }
+            Err(status) => {
+                error = Some(status);
+                break;
+            }
         }
     }
     let error = error.expect("a reader that did not opt in still fails");
