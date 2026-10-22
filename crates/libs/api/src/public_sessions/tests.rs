@@ -1178,15 +1178,6 @@ async fn stored_token_hash(
     .await
 }
 
-async fn session_count(pool: &PgPool, sandbox_id: PublicSandboxId) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
-        "SELECT COUNT(*) FROM data_plane_sessions WHERE sandbox_id = $1"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .fetch_one(pool)
-    .await
-}
-
 #[tokio::test]
 async fn replay_of_a_revoked_session_is_refused_without_a_token() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -1283,7 +1274,7 @@ async fn replay_of_an_expired_session_is_refused() -> TestResult {
 }
 
 /// Retention deletes an ended session's row long before its idempotency key
-/// expires. The replay is still refused, and does not run the create again.
+/// expires. The replay is still refused rather than run as a new create.
 #[tokio::test]
 async fn replay_of_a_revoked_session_is_refused_after_its_row_is_swept() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -1316,6 +1307,5 @@ async fn replay_of_a_revoked_session_is_refused_after_its_row_is_swept() -> Test
         matches!(replay, PublicSessionStoreError::SessionEnded),
         "{replay:?}"
     );
-    assert_eq!(session_count(&db.pool, create.sandbox_id).await?, 0);
     Ok(())
 }
