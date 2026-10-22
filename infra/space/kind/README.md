@@ -1541,7 +1541,7 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | runtime-manager | space-rtmgr + SPACE_RUNTIME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/vendor` and `/space/bin` read-only, `/space/cache` HostToContainer | lists runtimes and kernels, and installs the catalog's: downloads them from the compiled sources over the pod network into its private `/space/cache/.rtmgr-staging`, then asks node-manager over its socket to publish them (`crates/libs/node/runtime/manager/server`); the account writes nothing else in the cache or the store |
 | volume-manager | space-volmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); the account `docs/installation.md` describes: node-manager's btrfs send-lease RPCs authorize it and credential-manager serves it on the volume socket |
 | credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
-| template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because its template-release reads are scoped by source address (below) |
+| template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, pod network; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); template-release reads bind the reviewed token's node name/UID |
 | sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs |
 | node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
 | node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800; its ServiceAccount's API credentials (TokenReview only) and projected node-api and, on builders, build-manager tokens | reviews callers' tokens; the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager through the node-local `space-builder-build-manager` Service and sleeps 5 s in preStop (below) |
@@ -1558,13 +1558,14 @@ The check reads neither the credential nor the transport: it applies alike to
 the static token and to TokenReview-authenticated projected tokens, and internal
 RPC TLS, being server-auth only, does not change it. So node-ctl and
 sandbox-manager run in the node's network namespace. template-manager makes no
-node-bound call, but under TokenReview authentication its template-release reads
-are scoped to the node whose registered address is the caller's source address
-(`template_read_scope`, `crates/libs/internal/api/server/src/adapter.rs`), and
-nothing maps a pod IP to its node. From the pod network an org's private
-templates do not resolve: sandbox creates from them and private-base builds
-fail, which a pod-network trial confirmed, so template-manager runs on the host
-network too. build-manager's only source-scoped read checks for an existing
+node-bound call. Its template-release reads use the reviewed token's node name
+and UID to match live inventory (`template_read_scope`,
+`crates/libs/internal/api/server/src/adapter.rs`), so it runs on the pod network.
+This makes `local.ecw_template_build_from_oci_boots` and
+`local.private_template_build_isolation` exercise private-template resolution
+when the caller's pod IP differs from the registered node IP. Missing claims
+retain address matching; malformed claims and unmatched complete bindings do
+not fall back. build-manager's only source-scoped read checks for an existing
 upload, and an org-private base is resolved by template-manager, so it runs on
 the pod network; node-api reaches it through the node-local
 `space-builder-build-manager` Service, named as its TLS leaf.
