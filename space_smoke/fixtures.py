@@ -1296,6 +1296,12 @@ class CommandSandboxFixture:
     def kill_process(self, process_id: str) -> bool:
         return self._process_sandbox().kill_process(process_id)
 
+    @property
+    def reports_exited_processes(self) -> bool:
+        """Whether `get_process` reports a recently exited process, with its exit."""
+
+        return self._process_sandbox().reports_exited_processes
+
     def wait_until_process_stopped(
         self, process_id: str
     ) -> tuple[tuple[ProcessInfo, ...], ProcessInfo | None]:

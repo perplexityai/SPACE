@@ -6998,6 +6998,9 @@ class EcwConfig:
 
 
 class _SdkSandbox:
+    # E2B selects processes from its running-only list.
+    reports_exited_processes = False
+
     def __init__(self, sandbox: Any, config: EcwConfig) -> None:
         self._sandbox = sandbox
         self._config = config

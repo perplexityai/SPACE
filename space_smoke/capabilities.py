@@ -232,6 +232,11 @@ class ProcessInfo:
 class ProcessSandbox(CommandSandbox, Protocol):
     """Protocol-neutral background process control used by the shared smoke."""
 
+    @property
+    def reports_exited_processes(self) -> bool:
+        """Whether `get_process` reports a recently exited process, with its exit."""
+        ...
+
     def start_background(self, command: str, *, timeout: int = 60) -> ProcessHandle: ...
 
     def list_processes(self) -> tuple[ProcessInfo, ...]: ...

@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, replace
-from typing import BinaryIO, cast
+from typing import BinaryIO, ClassVar, cast
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -607,6 +607,8 @@ class NativeSandboxFactory:
 class _NativeSandbox:
     _factory: NativeSandboxFactory
     sandbox_id: str
+    # `getProcess` keeps a recently exited process, with its exit.
+    reports_exited_processes: ClassVar[bool] = True
 
     def get_info(self) -> SandboxInfo:
         response = self._factory._json_request(

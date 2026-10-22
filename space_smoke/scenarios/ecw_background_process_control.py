@@ -93,11 +93,15 @@ def background_process_control(test: smoke.CommandSandboxFixture) -> None:
             observed_get_process_id=None if final is None else final.process_id,
         )
         # The native API keeps reporting a recently exited process, with its exit.
-        if final is not None:
+        if test.reports_exited_processes:
             test.verify(
-                final.exit_status == "signaled" and final.signal == 9,
-                "killed background command did not report SIGKILL",
-                observed_process_id=final.process_id,
-                observed_exit_status=final.exit_status,
-                observed_signal=final.signal,
+                final is not None
+                and final.state == "exited"
+                and final.exit_status == "signaled"
+                and final.signal == 9,
+                "killed background command did not report its SIGKILL exit",
+                observed_process_id=None if final is None else final.process_id,
+                observed_state=None if final is None else final.state,
+                observed_exit_status=None if final is None else final.exit_status,
+                observed_signal=None if final is None else final.signal,
             )

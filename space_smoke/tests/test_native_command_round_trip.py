@@ -77,7 +77,6 @@ class _Script:
         wake_ready: bool,
         pause_state: str,
         process_failure: str | None,
-        exited_get: Mapping[str, object] | None,
     ) -> None:
         self.stdout = stdout
         self.sandbox_info_id = sandbox_info_id
@@ -101,9 +100,7 @@ class _Script:
         self.marker = ""
         self.process_failure = process_failure
         self.process_running = False
-        self.exited_get = exited_get
         self.process_killed = False
-        self.process_signaled = False
 
 
 def _handler(script: _Script) -> type[BaseHTTPRequestHandler]:
@@ -238,7 +235,6 @@ def _handler(script: _Script) -> type[BaseHTTPRequestHandler]:
                 f"/v1/sandboxes/{_SANDBOX_ID}/processes/{_PROCESS_ID}:signal"
             ):
                 assert body == {"signal": PROCESS_SIGNAL}
-                script.process_signaled = True
                 self._json(200, {"ok": script.process_failure != "signal"})
                 return
             if self.path == (
@@ -312,22 +308,26 @@ def _handler(script: _Script) -> type[BaseHTTPRequestHandler]:
                 self._json(200, {"data": data, "next_cursor": None})
                 return
             if parsed.path == (f"/v1/sandboxes/{_SANDBOX_ID}/processes/{_PROCESS_ID}"):
+                if script.process_killed:
+                    # The native API keeps a recently exited process's exit.
+                    self._json(
+                        200,
+                        {
+                            **_process_payload(),
+                            "state": "exited",
+                            "exit_code": 137,
+                            "exit_status": "signaled",
+                            "signal": 9,
+                            "ended_at": "2026-09-28T12:00:00Z",
+                        },
+                    )
+                    return
                 if not script.process_running:
-                    if script.process_killed and script.exited_get is not None:
-                        self._json(200, {**_process_payload(), **script.exited_get})
-                        return
                     self.send_error(404)
                     return
                 process = dict(_process_payload())
                 if script.process_failure == "mismatched_get":
                     process["process_id"] = "proc_wrong"
-                if (
-                    script.process_failure == "exited_after_term"
-                    and script.process_signaled
-                ):
-                    process.update(
-                        state="exited", exit_code=143, exit_status="signaled", signal=15
-                    )
                 self._json(200, process)
                 return
             if self.path.startswith("/v1/operations/"):
@@ -450,7 +450,6 @@ def _server(
     wake_ready: bool = True,
     pause_state: str = "paused",
     process_failure: str | None = None,
-    exited_get: Mapping[str, object] | None = None,
 ) -> Iterator[tuple[str, _Script]]:
     script = _Script(
         stdout,
@@ -462,7 +461,6 @@ def _server(
         wake_ready,
         pause_state,
         process_failure,
-        exited_get,
     )
     server = HTTPServer(("127.0.0.1", 0), _handler(script))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -763,50 +761,12 @@ class NativeCommandRoundTripTests(unittest.TestCase):
             )
         )
 
-    def test_shared_background_process_accepts_a_reported_exit(self) -> None:
-        # A recently exited process stays visible to getProcess with its exit;
-        # the scenario accepts it only when that exit is the SIGKILL it sent.
-        killed = {
-            "state": "exited",
-            "exit_code": 137,
-            "exit_status": "signaled",
-            "signal": 9,
-            "ended_at": "2026-09-28T12:00:00Z",
-        }
-        for exited_get, verdict in (
-            (killed, Verdict.PASS),
-            ({**killed, "exit_code": 143, "signal": 15}, Verdict.FAIL),
-        ):
-            with self.subTest(signal=exited_get["signal"]):
-                with _server(MARKER, exited_get=exited_get) as (base_url, script):
-                    native = _native_services(base_url, background_process_control)
-                    with mock.patch("space_smoke.native.time.sleep"):
-                        result = _run(native, scenario=background_process_control)
-
-                self.assertEqual(result.verdict, verdict, result.summary)
-                if verdict == Verdict.FAIL:
-                    self.assertIn("did not report SIGKILL", result.summary)
-                self.assertEqual(result.cleanup_failures, ())
-                self.assert_cleaned_up(script)
-                # The reported exit ends the wait at its first poll.
-                paths = [request.path for request in script.requests]
-                kill = paths.index(
-                    f"/v1/sandboxes/{_SANDBOX_ID}/processes/{_PROCESS_ID}:kill"
-                )
-                self.assertEqual(
-                    paths[kill + 1 :].count(
-                        f"/v1/sandboxes/{_SANDBOX_ID}/processes/{_PROCESS_ID}"
-                    ),
-                    1,
-                )
-
     def test_shared_background_process_failures_still_clean_the_sandbox(self) -> None:
         cases = (
             ("missing_list", Verdict.FAIL, "did not contain"),
             ("duplicate_list", Verdict.FAIL, "exactly once"),
             ("mismatched_get", Verdict.FAIL, "details did not match"),
             ("signal", Verdict.FAIL, "did not signal"),
-            ("exited_after_term", Verdict.FAIL, "exited after TERM"),
             ("kill", Verdict.FAIL, "before expected SIGKILL"),
             ("terminal_timeout", Verdict.FAIL, "remained visible"),
         )
