@@ -5435,6 +5435,7 @@ dependencies = [
  "pplx-space-cpu-arch",
  "pplx-space-durations",
  "pplx-space-env-vars",
+ "pplx-space-execution-spec",
  "pplx-space-guest-process",
  "pplx-space-k8s-ids",
  "pplx-space-net-common",
@@ -5966,6 +5967,19 @@ dependencies = [
  "thiserror 2.0.20",
  "tonic",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "pplx-space-execution-spec"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-byte-size",
+ "pplx-space-content-digest",
+ "pplx-space-cpu-arch",
+ "pplx-space-k8s-ids",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

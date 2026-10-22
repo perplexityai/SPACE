@@ -17,7 +17,7 @@
 //! # Examples
 //!
 //! ```rust
-//! # use pplx_space_common_core::types::HostCpu;
+//! # use pplx_space_execution_spec::HostCpu;
 //! let cpuinfo = "processor\t: 0\n\
 //!                vendor_id\t: GenuineIntel\n\
 //!                cpu family\t: 6\n\
@@ -40,7 +40,7 @@ use super::{LabelValue, LabelValueParseError};
 /// value.
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::HostCpu;
+/// # use pplx_space_execution_spec::HostCpu;
 /// assert!(HostCpu::parse("").is_err());
 /// assert!(HostCpu::parse("Intel(R) Xeon(R)").is_err());
 /// ```
@@ -65,7 +65,7 @@ pub enum HostCpuParseError {
 /// out, so equal identities aren't proof of compatibility either.
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::HostCpu;
+/// # use pplx_space_execution_spec::HostCpu;
 /// let cpu = HostCpu::parse("genuineintel-6-85-4").unwrap();
 /// assert_eq!(cpu.to_string(), "genuineintel-6-85-4");
 /// ```
@@ -102,7 +102,7 @@ impl HostCpu {
     /// rather than as a guess.
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::HostCpu;
+    /// # use pplx_space_execution_spec::HostCpu;
     /// let cpuinfo = "processor\t: 0\n\
     ///                CPU implementer\t: 0x41\n\
     ///                CPU architecture: 8\n\
@@ -233,7 +233,7 @@ pub enum HostCpuCompatibilityParseError {
 /// each allowed direction is listed.
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::{HostCpu, HostCpuCompatibility};
+/// # use pplx_space_execution_spec::{HostCpu, HostCpuCompatibility};
 /// let compat =
 ///     HostCpuCompatibility::parse("genuineintel-6-85-4=>genuineintel-6-85-7").unwrap();
 /// let skylake = HostCpu::parse("genuineintel-6-85-4").unwrap();
