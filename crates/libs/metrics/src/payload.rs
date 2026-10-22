@@ -7,7 +7,9 @@
 //! permit-loss signal. The daemon's permit-handoff regression guards that contract.
 //! `reused` means a matching permit; `reacquired` means a supplied permit could
 //! not satisfy the requested budget/weight. `rejected` counts capacity refusals
-//! only, including transport queue expiry, not invalid input or closed service.
+//! only, including transport queue expiry and closed admission semaphores. It
+//! excludes invalid input and lifecycle closure refusals: those checks do not
+//! attempt payload admission. Service closure does not close the semaphores.
 //!
 //! Under the same `spaced.guest.payload` prefix, `cancelled_slots` counts weighted
 //! slots still owned when cancellation is observed. `cancelled_released_slots`
