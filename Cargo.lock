@@ -5566,6 +5566,7 @@ dependencies = [
  "pplx-space-migration-checksums",
  "pplx-space-observability",
  "pplx-space-page-cache",
+ "pplx-space-postgres-contention",
  "pplx-space-request-id",
  "pplx-space-rustls-provider",
  "pplx-space-service-lifecycle",
@@ -6836,6 +6837,16 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-placement",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-postgres-contention"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

@@ -16,6 +16,12 @@
 //! `55P03`, and that omission is invisible until the role-level bound is
 //! enabled — before then, a lock wait ends in `57014` (statement timeout)
 //! or not at all.
+//!
+//! It is its own crate because it depends only on SQLx's error types, so a
+//! crate that classifies these errors does not need `pplx-space-common-svc`,
+//! which re-exports it as `sql::contention`. It is a classification helper,
+//! not a storage layer: it owns no table and runs no statement, so the store
+//! boundary rules do not apply to it.
 
 /// True when `error` is `55P03` (`lock_not_available`): a lock wait
 /// exceeded `lock_timeout`, or a `NOWAIT` acquisition found the lock held.

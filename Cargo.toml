@@ -90,6 +90,7 @@ members = [
     "crates/libs/build/mgr/server",
     "crates/libs/object-store",
     "crates/libs/page-cache",
+    "crates/libs/postgres-contention",
     "crates/libs/placement/executor",
     "crates/libs/placement/machine",
     "crates/libs/public/api",
@@ -382,6 +383,7 @@ pplx-space-node-runtime-supervisor = { path = "crates/libs/node/runtime/supervis
 pplx-space-net-common = { path = "crates/libs/net/common" }
 pplx-space-object-store = { path = "crates/libs/object-store" }
 pplx-space-page-cache = { path = "crates/libs/page-cache" }
+pplx-space-postgres-contention = { path = "crates/libs/postgres-contention" }
 pplx-space-public-api = { path = "crates/libs/public/api" }
 pplx-space-metrics = { path = "crates/libs/metrics" }
 pplx-space-metrics-emit = { path = "crates/libs/metrics-emit" }

@@ -856,6 +856,33 @@ run_clippy_checks() {
         --lib \
         -- \
         -D warnings
+
+    # Built alone, so the contention classifier and its tests lint without
+    # common-svc, with no features and with all of them.
+    echo "--- :rust: Running isolated Postgres contention clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-postgres-contention \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-postgres-contention \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+    # The library alone: --all-targets unifies the test fixtures' sqlx features
+    # into it, so a sqlx feature the library needs but does not enable fails here.
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-postgres-contention \
+        --no-default-features \
+        --lib \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

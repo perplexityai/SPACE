@@ -1,6 +1,6 @@
 use super::{is_lock_contention, is_lock_not_available};
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{raise_sqlstate, try_pg_test_db};
+use pplx_space_sql_locator::sql;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
