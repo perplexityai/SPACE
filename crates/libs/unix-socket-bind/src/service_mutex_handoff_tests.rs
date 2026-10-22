@@ -6,7 +6,7 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
-use crate::service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
 
 fn mutex_path(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("service.mutex")
@@ -21,7 +21,7 @@ fn mutex_path(dir: &tempfile::TempDir) -> PathBuf {
 /// established connections keep working on the unlinked inode.
 #[tokio::test]
 async fn handoff_moves_new_connections_and_preserves_established_ones() {
-    use crate::bootstrap::{UnixSocketOptions, bind_unix_socket};
+    use crate::{UnixSocketOptions, bind_unix_socket};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 

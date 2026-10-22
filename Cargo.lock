@@ -5577,6 +5577,7 @@ dependencies = [
  "pplx-space-test-env",
  "pplx-space-tokio-runtime",
  "pplx-space-uds-peer-auth",
+ "pplx-space-unix-socket-bind",
  "pplx-space-unix-socket-path",
  "pplx-space-valkey",
  "rand 0.10.2",
@@ -7707,6 +7708,21 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-unix-socket-bind"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
+ "pplx-space-service-mutex",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -1,9 +1,7 @@
-//! Tests for binding node-local Unix sockets.
-
 use super::*;
 
 #[test]
-pub(super) fn unix_socket_staging_path_preserves_the_published_path_budget() {
+fn unix_socket_staging_path_preserves_the_published_path_budget() {
     let socket_path = Path::new(
         "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sock",
     );
@@ -20,7 +18,7 @@ pub(super) fn unix_socket_staging_path_preserves_the_published_path_budget() {
 }
 
 #[test]
-pub(super) fn concurrent_unix_socket_replacements_use_distinct_staging_paths() {
+fn concurrent_unix_socket_replacements_use_distinct_staging_paths() {
     let socket_path = Path::new("/tmp/handoff.sock");
 
     let first = unix_socket_staging_path_for_attempt(socket_path, Uuid::from_u128(0), 0).unwrap();
@@ -33,7 +31,7 @@ pub(super) fn concurrent_unix_socket_replacements_use_distinct_staging_paths() {
 }
 
 #[test]
-pub(super) fn compact_unix_socket_staging_keeps_a_minimum_nonce_budget() {
+fn compact_unix_socket_staging_keeps_a_minimum_nonce_budget() {
     let socket_path = Path::new("/tmp/1234567890");
 
     let staging_path =
@@ -48,7 +46,7 @@ pub(super) fn compact_unix_socket_staging_keeps_a_minimum_nonce_budget() {
 }
 
 #[test]
-pub(super) fn compact_unix_socket_staging_attempts_do_not_repeat() {
+fn compact_unix_socket_staging_attempts_do_not_repeat() {
     let socket_path = Path::new("/tmp/s");
     let seed = Uuid::from_u128(0);
     let paths = (0..64)
@@ -59,7 +57,7 @@ pub(super) fn compact_unix_socket_staging_attempts_do_not_repeat() {
 }
 
 #[test]
-pub(super) fn unix_socket_replacement_does_not_unlink_another_binders_staging_path() {
+fn unix_socket_replacement_does_not_unlink_another_binders_staging_path() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
@@ -87,7 +85,7 @@ pub(super) fn unix_socket_replacement_does_not_unlink_another_binders_staging_pa
 }
 
 #[test]
-pub(super) fn unix_socket_rebind_never_removes_published_path() {
+fn unix_socket_rebind_never_removes_published_path() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()

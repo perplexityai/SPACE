@@ -1,13 +1,9 @@
 use std::borrow::Cow;
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::extract::MatchedPath;
 use http::{HeaderMap, Method, Request as HttpRequest, Response as HttpResponse};
-use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tower_http::classify::{
@@ -24,18 +20,21 @@ pub use pplx_space_common_grpc::{
     CLIENT_SERVICE_METADATA_KEY, GrpcClientTrace, current_service_name, set_current_service_name,
     trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+pub use pplx_space_unix_socket_bind::{
+    ApplyUnixSocketPermissionsError, BindUnixSocketError, SocketGroup, UnixGroupLookupError,
+    UnixSocketOptions, UnixSocketStagingPathError, apply_unix_socket_permissions, bind_unix_socket,
+    unix_group_exists,
+};
 
 mod grpc_request_params;
 mod grpc_trace;
 mod http_trace;
 mod shutdown;
-mod unix_socket;
 
 pub use grpc_request_params::*;
 pub use grpc_trace::*;
 pub use http_trace::*;
 pub use shutdown::*;
-pub use unix_socket::*;
 
 pub const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const GRPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);

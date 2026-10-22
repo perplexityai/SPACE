@@ -2,11 +2,6 @@ use super::*;
 use http::HeaderValue;
 use tower_http::classify::{ClassifiedResponse, ClassifyResponse};
 
-mod unix_socket;
-
-#[allow(unused_imports)]
-use unix_socket::*;
-
 #[test]
 fn parse_grpc_path_splits_tonic_style_path() {
     assert_eq!(

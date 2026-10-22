@@ -929,6 +929,32 @@ run_clippy_checks() {
         --lib \
         -- \
         -D warnings
+
+    # Built alone, so a tokio, nix or uuid feature the Unix socket binding
+    # needs but only gets through common-svc's broader features fails here.
+    echo "--- :rust: Running isolated Unix socket binding clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-unix-socket-bind \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-unix-socket-bind \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+    # The library alone, so the tests' tokio and nix features do not unify in.
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-unix-socket-bind \
+        --no-default-features \
+        --lib \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

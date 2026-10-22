@@ -65,6 +65,7 @@ members = [
     "crates/libs/sqlite",
     "crates/libs/unix-socket-path",
     "crates/libs/uds-peer-auth",
+    "crates/libs/unix-socket-bind",
     "crates/libs/valkey",
     "crates/libs/systemd-watchdog",
     "crates/libs/node/api/client",
@@ -438,6 +439,7 @@ pplx-space-template-publisher = { path = "crates/libs/template/publish" }
 pplx-space-test-env = { path = "crates/libs/test-env" }
 pplx-space-unix-socket-path = { path = "crates/libs/unix-socket-path" }
 pplx-space-uds-peer-auth = { path = "crates/libs/uds-peer-auth" }
+pplx-space-unix-socket-bind = { path = "crates/libs/unix-socket-bind" }
 pplx-space-valkey = { path = "crates/libs/valkey" }
 pplx-space-tokio-runtime = { path = "crates/libs/tokio-runtime" }
 [profile.release]
