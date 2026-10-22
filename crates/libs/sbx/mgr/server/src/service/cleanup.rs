@@ -2173,6 +2173,113 @@ impl SandboxManagerService {
         .await
     }
 
+    async fn ensure_suspend_backup_before_cleanup(
+        &self,
+        sandbox_id: &str,
+        published: Option<&(LocalArtifactId, String)>,
+        job_id: Option<&pplx_space_common_core::types::JobId>,
+    ) -> Result<Option<CleanupOutcome>, Status> {
+        let (row, artifact) = {
+            let db = self.db_conn()?;
+            let row = crate::db::read::sandbox(&db, sandbox_id)
+                .map_err(|error| {
+                    Status::unavailable(format!("read suspend backup owner: {error}"))
+                })?
+                .ok_or_else(|| Status::aborted("suspend cleanup row disappeared"))?;
+            let artifact = match published {
+                Some(artifact) => Some(artifact.clone()),
+                None => match row.current_local_artifact_id {
+                    Some(id) => crate::db::read::local_artifact(
+                        &db,
+                        crate::db::read::LocalArtifactKey::Id(id),
+                    )
+                    .map_err(|error| {
+                        Status::unavailable(format!("read suspend cleanup artifact: {error}"))
+                    })?
+                    .map(|artifact| (artifact.local_artifact_id, artifact.local_path)),
+                    None => None,
+                },
+            };
+            let Some((id, _)) = artifact.as_ref() else {
+                return Ok(None);
+            };
+            if let Some(status) = crate::db::read::sandbox_view(&db, sandbox_id)
+                .teardown()
+                .status()
+                .map_err(|error| {
+                    Status::unavailable(format!("read teardown backup ownership: {error}"))
+                })?
+                && let Some(operation) = status.operation.as_ref()
+                && operation.status.is_active()
+            {
+                return if status.backup_completed
+                    && status
+                        .artifact
+                        .as_ref()
+                        .is_some_and(|artifact| artifact.local_artifact_id == *id)
+                {
+                    Ok(None)
+                } else {
+                    Err(Status::unavailable(
+                        "teardown suspend backup is not remotely durable",
+                    ))
+                };
+            }
+
+            if crate::db::read::local_artifact_backup_completed(&db, *id).map_err(|error| {
+                Status::unavailable(format!("read suspend backup completion: {error}"))
+            })? {
+                return Ok(None);
+            }
+            (row, artifact)
+        };
+        if let Some((id, path)) = artifact
+            && let Err(error) = self
+                .enqueue_node_local_suspend_backup(&row, id, &path, None)
+                .await
+        {
+            if !error.refuses_artifact() {
+                if let Some(job_id) = job_id {
+                    let job = crate::db::read::cleanup_job(&*self.db_conn()?, job_id).map_err(
+                        |error| {
+                            Status::unavailable(format!("read suspend handoff retry age: {error}"))
+                        },
+                    )?;
+                    if let Some(job) = job
+                        && let Ok(created) = job.created_at.parse::<jiff::Timestamp>()
+                        && jiff::Timestamp::now()
+                            .as_second()
+                            .saturating_sub(created.as_second())
+                            >= 300
+                    {
+                        tracing::error!(sandbox_id, %job_id, attempts = job.attempts, %error,
+                                "suspend backup handoff pending for over five minutes; artifact retained for retry");
+                    }
+                }
+                return Err(super::grpc_lifecycle::artifact_backup_fence_status(
+                    error.to_string(),
+                ));
+            }
+            let reason = format!("suspend artifact backup permanently refused: {error}");
+            let applied = crate::db::quarantine_refused_suspend_backup(
+                &*self.db_conn()?,
+                &row,
+                id,
+                &reason,
+                job_id,
+            )
+            .map_err(|error| {
+                Status::unavailable(format!("record refused suspend backup: {error}"))
+            })?;
+            return Ok(Some(if applied {
+                CleanupOutcome::Quarantined(reason)
+            } else {
+                CleanupOutcome::Superseded
+            }));
+        }
+        Ok(None)
+    }
+
     pub(super) async fn execute_cleanup_attempt(
         &self,
         request: SynchronousCleanupRequest<'_>,
@@ -2377,6 +2484,16 @@ impl SandboxManagerService {
 
             if completion == CleanupCompletion::DeletePoolClone {
                 admit_prepared_clone_disposal_attempt(&self.db, sandbox_id, job_id)?;
+            }
+            // Activation compensation restores its entry artifact; it must not
+            // register that older artifact as a capture by the current execution.
+            if completion == CleanupCompletion::MarkSuspended
+                && cleanup_id.is_none()
+                && let Some(outcome) = self.ensure_suspend_backup_before_cleanup(
+                    sandbox_id, published_artifact.as_ref(), job_id,
+                ).await?
+            {
+                return Ok(outcome);
             }
             let dispatch_target = prepare_dispatch().await?;
 

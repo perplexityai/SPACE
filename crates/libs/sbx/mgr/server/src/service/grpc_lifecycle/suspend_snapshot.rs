@@ -1115,30 +1115,17 @@ impl SandboxManagerService {
                 .await?;
             }
 
-            // Node-local auto-suspend must hand the exact published artifact to a
-            // durable owner before runtime cleanup releases its rootfs. A missing
-            // upload destination is an intentional local-only configuration; when
-            // a destination exists, failure to persist the worker intent leaves
-            // the runtime intact and makes this suspend retryable.
-            let upload_queue_started_at = std::time::Instant::now();
             if durability == SuspendDurability::NodeLocal {
-                let enqueue_result = self
-                    .enqueue_node_local_suspend_backup(
-                        &sandbox,
-                        local_artifact_id,
-                        &snapshot_dir_string,
-                        published_format,
-                    )
-                    .await;
-                self.require_node_local_backup_handoff(&sandbox.id, local_artifact_id, enqueue_result)?;
+                let upload_started_at = std::time::Instant::now();
+                self.prepare_node_local_suspend_cleanup(
+                    &sandbox, local_artifact_id, &snapshot_dir_string,
+                    published_format, &verdicts,
+                ).await?;
+                pplx_space_metrics::snapshot::create_step(
+                    create_kind, create_codec, sandbox.volume_encryption,
+                    "upload_queue", upload_started_at,
+                );
             }
-            pplx_space_metrics::snapshot::create_step(
-                create_kind,
-                create_codec,
-                sandbox.volume_encryption,
-                "upload_queue",
-                upload_queue_started_at,
-            );
 
             let cleanup_started_at = std::time::Instant::now();
             self.ensure_teardown_suspend_owner_for_durability(&sandbox.id, durability)?;
@@ -1203,6 +1190,65 @@ impl SandboxManagerService {
             }
         }
         result
+    }
+
+    /// Called under the suspend's artifact and cleanup fences. A live plaintext
+    /// VM remains wakeable and monitored when backup registration is unavailable.
+    /// With no runtime, durable cleanup intent owns the handoff retry instead.
+    pub(super) async fn prepare_node_local_suspend_cleanup(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        artifact: LocalArtifactId,
+        path: &str,
+        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
+    ) -> Result<(), Status> {
+        if !sandbox.volume_encryption
+            && (self.sandbox_runtime_live)(&sandbox.id)
+            && let Err(error) = self
+                .enqueue_node_local_suspend_backup(sandbox, artifact, path, Some(format))
+                .await
+            && (self.sandbox_runtime_live)(&sandbox.id)
+        {
+            let canonical = crate::service::suspend_snapshot_publication::validate_recoverable_suspend_snapshot_dir(
+                std::path::Path::new(path),
+                Some(sandbox.id.parse().map_err(|error| {
+                    Status::internal(format!("invalid suspend sandbox identity: {error}"))
+                })?),
+                verdicts,
+            )
+            .map_err(|error| {
+                Status::unavailable(format!("verify published suspend rollback: {error}"))
+            })?;
+            if canonical.local_artifact_id != artifact {
+                return Err(Status::aborted("published suspend artifact changed"));
+            }
+            let applied = crate::db::rollback_published_suspend_to_paused(
+                &*self.db_conn()?,
+                sandbox,
+                artifact,
+                path,
+            )
+            .map_err(|error| {
+                Status::unavailable(format!("retain published suspend on rollback: {error}"))
+            })?;
+            if !applied {
+                return Err(Status::aborted("published suspend rollback superseded"));
+            }
+            mark_sandbox_dirty(&self.db, &sandbox.id);
+            return Err(artifact_backup_fence_status(error.to_string()));
+        }
+        crate::db::pin_suspended_artifact_for_cleanup(
+            &*self.db_conn()?,
+            &sandbox.id,
+            artifact,
+            path,
+        )
+        .map_err(|error| {
+            Status::unavailable(format!(
+                "published suspend artifact awaits its cleanup owner: {error}"
+            ))
+        })
     }
 
     pub(super) async fn finalize_suspended_runtime(

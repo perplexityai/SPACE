@@ -77,74 +77,215 @@ fn node_local_suspend_registers_under_its_kubernetes_execution() {
     assert_eq!(super::super::node_local_registration_generation(&row), None);
 }
 
-/// The node-local suspend path end to end, up to the runtime it keeps: the
-/// upload it persists carries the sandbox's Kubernetes execution generation,
-/// the cluster's refusal of that generation comes back as a backup-fence
-/// failure, and that failure rolls the suspend back to `paused` with the
-/// runtime still resident.
+/// A superseded capture preserves the live plaintext rollback; after runtime
+/// loss the same explicit refusal is terminal, without a rediscoverable intent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
+async fn node_local_suspend_of_a_superseded_execution_retains_its_published_artifact() {
     with_cluster_api(RETIRING, async || {
+        use crate::db::{CleanupCompletion, cleanup_jobs::CleanupOutcome};
+        use crate::service::cleanup::SynchronousCleanupRequest;
         use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
-        let mut fields = runtime_fields(generation(GENERATION), 7);
-        fields.space_api_route_identity.substrate_kind =
-            Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
-        crate::db::update_runtime_fields(&conn, sandbox_id.parse().unwrap(), fields).unwrap();
-        let service = service_with_runtime_probe(conn, true);
-        let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
-        let snapshot_root = tempfile::tempdir().unwrap();
-        let local_artifact_id = LocalArtifactId::new();
-        let snapshot_dir = snapshot_root.path().join("snapshot");
-        crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
-            &snapshot_dir,
-            &sandbox_id,
-            local_artifact_id,
-            b"node-local-capture",
-        );
-
-        let refused = service
-            .enqueue_node_local_suspend_backup(
-                &sandbox,
-                local_artifact_id,
-                snapshot_dir.to_str().unwrap(),
-                SuspendSnapshotFormat::Full,
-            )
-            .await
-            .expect_err("the cluster refuses a superseded execution's capture");
-        assert!(
-            refused
-                .metadata()
-                .contains_key(super::super::AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA),
-            "a refusal must disarm auto-lifecycle: {refused:?}"
-        );
-        let payload: String = service
-            .db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT payload FROM jobs WHERE kind = ?1 AND subject_id = ?2",
-                crate::db::fixture::params![
-                    crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-                    sandbox_id
-                ],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let payload: crate::snapshot_upload::SnapshotUploadJobs =
-            serde_json::from_str(&payload).unwrap();
-        assert_eq!(payload.execution_generation, Some(generation(GENERATION)));
-
-        service
-            .require_node_local_backup_handoff(&sandbox_id, local_artifact_id, Err(refused))
-            .expect_err("a refused handoff must stop before runtime finalization");
-        let row = service.lookup_sandbox(&sandbox_id).unwrap();
-        assert_eq!(row.state, SandboxState::Paused);
-        assert_eq!(row.pid, Some(std::process::id()));
-        drain(&service).await;
+        for live in [true, false] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
+            let mut fields = runtime_fields(generation(GENERATION), 7);
+            fields.space_api_route_identity.substrate_kind =
+                Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+            crate::db::update_runtime_fields(&conn, sandbox_id.parse().unwrap(), fields).unwrap();
+            let service = service_with_runtime_probe(conn, live);
+            let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+            let snapshot_root = tempfile::tempdir().unwrap();
+            let artifact = LocalArtifactId::new();
+            let path = snapshot_root.path().join("snapshot");
+            crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+                &path,
+                &sandbox_id,
+                artifact,
+                b"node-local-capture",
+            );
+            let prepared = service
+                .prepare_node_local_suspend_cleanup(
+                    &sandbox,
+                    artifact,
+                    path.to_str().unwrap(),
+                    SuspendSnapshotFormat::Full,
+                    &crate::retained_source::RetainedSourceVerdicts::default(),
+                )
+                .await;
+            if live {
+                let refused =
+                    prepared.expect_err("a live VM remains available after refused handoff");
+                assert!(refused.metadata().contains_key(
+                    super::super::AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA
+                ));
+            } else {
+                prepared.unwrap();
+                let outcome = service
+                    .run_cleanup_to_completion_with_node_dispatch_and_admission(
+                        SynchronousCleanupRequest {
+                            sandbox_id: &sandbox_id,
+                            uuid8: sandbox.uuid8.as_str(),
+                            keep_filesystem: true,
+                            context: "refused suspend backup",
+                            completion: CleanupCompletion::MarkSuspended,
+                            published_artifact: None,
+                            immediate_kill: true,
+                            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                        },
+                        None,
+                        None,
+                        || async { Ok(()) },
+                        |_| async { panic!("a refused artifact must never dispatch cleanup") },
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(outcome, CleanupOutcome::Quarantined(_)));
+                assert!(
+                    service
+                        .recover_requested_cleanup_targets_for_ids(vec![
+                            sandbox_id.parse().unwrap()
+                        ])
+                        .is_empty()
+                );
+            }
+            let payload: String = service
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM jobs WHERE kind = ?1 AND subject_id = ?2",
+                    crate::db::fixture::params![
+                        crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                        sandbox_id
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let payload: crate::snapshot_upload::SnapshotUploadJobs =
+                serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload.execution_generation, Some(generation(GENERATION)));
+            let row = service.lookup_sandbox(&sandbox_id).unwrap();
+            assert_eq!(
+                row.state,
+                if live {
+                    SandboxState::Paused
+                } else {
+                    SandboxState::Quarantined
+                }
+            );
+            assert_eq!(row.current_local_artifact_id, Some(artifact));
+            assert_eq!(row.cleanup_completion, None);
+            assert!(path.exists());
+            if live {
+                assert_eq!(row.pid, Some(std::process::id()));
+            }
+            drain(&service).await;
+        }
     })
+    .await;
+}
+
+/// The transfer handles survive a manager restart. A later control-plane
+/// outage must not introduce a second handoff gate after monitoring is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persisted_suspend_handoff_releases_runtime_during_control_plane_outage() {
+    with_cluster_api(
+        RetiringClusterApi {
+            unavailable: true,
+            ..RETIRING
+        },
+        async || {
+            use crate::db::{CleanupCompletion, cleanup_jobs::CleanupOutcome};
+            use crate::service::cleanup::SynchronousCleanupRequest;
+            for rollback in [false, true] {
+                let conn = crate::db::test_conn();
+                let id = SandboxId::new();
+                crate::service::tests::service_tests::insert_test_sandbox(
+                    &conn,
+                    &id.to_string(),
+                    SandboxState::Suspending,
+                );
+                let mut fields =
+                    crate::service::tests::service_tests::runtime_fields(generation(GENERATION), 7);
+                fields.space_api_route_identity.substrate_kind =
+                    Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+                crate::db::update_runtime_fields(&conn, id, fields).unwrap();
+                let artifact = LocalArtifactId::new();
+                let scratch = tempfile::tempdir().unwrap();
+                let path = scratch.path().join("snapshot");
+                crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+                    &path,
+                    &id.to_string(),
+                    artifact,
+                    b"restorable-capture",
+                );
+                let row = crate::db::get_sandbox(&conn, &id.to_string())
+                    .unwrap()
+                    .unwrap();
+                crate::db::pin_suspended_artifact_for_cleanup(
+                    &conn,
+                    &id.to_string(),
+                    artifact,
+                    path.to_str().unwrap(),
+                )
+                .unwrap();
+                let cleanup_id = if rollback {
+                    crate::db::complete_row_intent_cleanup(
+                        &conn, &id.to_string(), CleanupCompletion::MarkSuspended, None,
+                    ).unwrap();
+                    let episode = crate::db::begin_activation(
+                        &conn, &id.to_string(), SandboxState::Suspended,
+                        crate::db::ActivationKind::Restore, Some(generation(GENERATION)), None,
+                    ).unwrap().unwrap();
+                    crate::db::request_cleanup_episode(
+                        &conn, &id.to_string(), episode.id,
+                        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+                        "restore interrupted",
+                    ).unwrap();
+                    Some(episode.id)
+                } else {
+                    None
+                };
+                let mut payload = bound_upload_payload(artifact);
+                payload.meta.local_artifact_id = Some(artifact);
+                payload.meta.sandbox_id = id.to_string();
+                payload.job_ids = if rollback { vec![] } else { vec![JobId::new()] };
+                insert_upload_job(
+                    &conn,
+                    &id.to_string(),
+                    artifact,
+                    &serde_json::to_string(&payload).unwrap(),
+                );
+                let service = service_with_runtime_probe(conn, true);
+                let outcome = service
+                    .run_cleanup_to_completion_with_node_dispatch_and_admission(
+                        SynchronousCleanupRequest {
+                            sandbox_id: &id.to_string(),
+                            uuid8: row.uuid8.as_str(),
+                            keep_filesystem: true,
+                            context: "persisted suspend handoff",
+                            completion: CleanupCompletion::MarkSuspended,
+                            published_artifact: None,
+                            immediate_kill: true,
+                            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                        },
+                        None,
+                        cleanup_id,
+                        || async { Ok(()) },
+                        |_| async { Ok(()) },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome, CleanupOutcome::Applied);
+                assert_eq!(
+                    service.lookup_sandbox(&id.to_string()).unwrap().state,
+                    SandboxState::Suspended
+                );
+                drain(&service).await;
+            }
+        },
+    )
     .await;
 }
 
