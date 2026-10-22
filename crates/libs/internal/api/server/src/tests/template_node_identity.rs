@@ -156,7 +156,7 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
         (tokens[6].as_str(), [false, false]),
         ("synthetic-static-token", [false, true]),
     ] {
-        for _ in 0..2 {
+        for require_scope in [false, true] {
             for ((template, hash), expected) in
                 [("placed-template", &hash), ("peer-template", &peer_hash)]
                     .into_iter()
@@ -170,9 +170,16 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
                 request
                     .metadata_mut()
                     .insert("authorization", format!("Bearer {token}").parse()?);
-                let actual = client
-                    .find_template_release_by_hash(request)
-                    .await
+                let scope = pplx_space_common_svc::template_lookup::TemplateLookupScope::Cluster;
+                if require_scope {
+                    scope.request_authorization(&mut request);
+                }
+
+                let response = client.find_template_release_by_hash(request).await;
+                if require_scope && let Ok(response) = &response {
+                    scope.require_authorization(response)?;
+                }
+                let actual = response
                     .map(|_| Code::Ok)
                     .unwrap_or_else(|status| status.code());
                 let expected = if expected { Code::Ok } else { Code::NotFound };
