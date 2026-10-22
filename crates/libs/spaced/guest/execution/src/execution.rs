@@ -21,6 +21,7 @@ pub struct ExecutionServiceConfig {
     pub cancellation_grace: Duration,
     /// Guest memory used to size retained process output; None uses the fallback budget.
     pub guest_memory_bytes: Option<u64>,
+    /// How long completed processes and keyed starts are kept for callers.
     pub process_retention: ProcessRetention,
 }
 
@@ -30,10 +31,14 @@ pub struct ExecutionServiceConfig {
 pub struct ProcessRetention {
     /// How long a completed process's exit and retained output stay
     /// replayable. When every record slot is held, the record that completed
-    /// first is evicted to admit a new start.
+    /// first is evicted to admit a new start. Retained output keeps its share
+    /// of the output budget until then, so a longer window leaves less shared
+    /// budget to running processes.
     pub completed: Duration,
-    /// How long a keyed start is remembered. The key store's fixed capacity
-    /// divided by this window bounds the sustained rate of keyed starts.
+    /// How long a completed keyed start is remembered. The key store's fixed
+    /// capacity divided by this window bounds the sustained rate of keyed
+    /// starts. A start still in progress is not affected: its duplicates wait
+    /// at most 60 seconds for it.
     pub idempotency: Duration,
 }
 

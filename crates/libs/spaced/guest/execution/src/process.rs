@@ -1942,8 +1942,9 @@ impl Process for ExecutionService {
         // session, which is what a timed-out start leaves behind. Every later
         // step can fail or stall for such a retry of a still-running process:
         // the account lookup or PTY setup hits the descriptor limit,
-        // `reserve_or_get` fails an idempotency key past its window, and `reserve` reports exhaustion when every
-        // record slot holds a running process. Answering here also keeps the
+        // `reserve_or_get` fails an idempotency key past its window, and
+        // `reserve` reports exhaustion when every record slot holds a running
+        // process. Answering here also keeps the
         // outcome independent of the idempotency record's lifetime. Payload
         // admission in front of this handler, here and in spaced-host, still
         // applies: it runs before the request is decoded, so while every start
