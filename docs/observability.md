@@ -1108,7 +1108,9 @@ reconnect failed and no connection was usable.
 These still warn and count as before:
 
 - `reserved DNS upstream connection failed` for any failed connection,
-  including a failed reconnect;
+  including a failed reconnect. It carries `connect_ms`, the time from the
+  dial starting to the failure, and `established_before`, false until a
+  connection to that upstream has succeeded in this gateway process;
 - `reserved DNS upstream request failed` for every error Hickory receives,
   including a failed reconnect and `Busy` from an open connection at its
   request limit;
@@ -1118,6 +1120,14 @@ These still warn and count as before:
   `gateway.reserved_dns.request.duration_ms`, both with `reason` `transport`,
   for lookups that fail with `NoConnections`; Hickory reports exhausted `Busy`
   as `NoConnections` too, so this path does not produce `resolver_busy`.
+
+`reserved DNS upstream first connection established` logs at info once per
+upstream per gateway process, with `connect_ms`. Its timestamp minus
+`connect_ms` is when the gateway first dialed that upstream. Compared with the
+node agent's per-pod egress isolation events, it shows whether the gateway
+started DNS work while the pod's egress was still blocked. A failure with
+`established_before=false` and `connect_ms` near the attempt timeout is a dial
+that never got a SYN-ACK.
 
 `gateway.reserved_dns.upstream_busy.lookup_in_flight` samples only `Busy` that
 reaches Hickory, not sends on closed connections. A send that races the
