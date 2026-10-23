@@ -1,4 +1,5 @@
 pub mod auto_lifecycle;
+pub(crate) mod placement_fence;
 pub mod sandbox;
 pub mod substrate;
 pub mod template;

@@ -268,6 +268,8 @@ mod delete {
             sandbox_id,
             action: PublicSandboxLifecycleAction::Delete,
             rollback: None,
+            create_rollback_fence: None,
+            create_rollback_teardown_issued: false,
         }
         .into_json();
         match store
@@ -364,6 +366,8 @@ mod delete {
             sandbox_id,
             action: PublicSandboxLifecycleAction::Delete,
             rollback: None,
+            create_rollback_fence: None,
+            create_rollback_teardown_issued: false,
         }
         .into_json();
         let native = match store

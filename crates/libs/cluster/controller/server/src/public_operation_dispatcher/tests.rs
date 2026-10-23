@@ -638,6 +638,72 @@ async fn tick_does_not_exhaust_workflow_progress_requeues() -> TestResult {
     Ok(())
 }
 
+/// Create compensation has no deadline, so its retry budget is the only thing
+/// that ends it. The property: a compensation that keeps asking to be requeued
+/// for workflow progress or backpressure still reaches a terminal state,
+/// rather than requeueing forever with its row in `deleting`. A fresh one is
+/// requeued and charged the attempt; one at its last attempt fails.
+#[tokio::test]
+async fn compensation_requeues_always_spend_the_retry_budget() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let config = single_claim_config();
+    let budget = config.max_retry_attempts * 16;
+    for reason in [
+        PublicOperationRequeueReason::WorkflowProgress,
+        PublicOperationRequeueReason::ActivationBackpressure,
+    ] {
+        for prior_attempts in [0, budget - 1] {
+            let operation_id = create_queued_operation(
+                &store,
+                OrgId::from_uuid(org_id),
+                ApiProduct::Native,
+                OperationKind::CompensateCreateSandbox,
+                // One target per case: the dispatcher runs a target's
+                // operations in order, so an earlier case still queued would
+                // hold this one back.
+                &format!("sbx_compensation_requeue_{reason:?}_{prior_attempts}"),
+            )
+            .await?;
+            sqlx::query(sql!(
+                "UPDATE public_operations SET attempts = $2 WHERE operation_id = $1"
+            ))
+            .bind(operation_id.as_uuid())
+            .bind(prior_attempts)
+            .execute(&db.pool)
+            .await?;
+            let executor = FixedExecutor::requeue(
+                &[OperationKind::CompensateCreateSandbox],
+                reason,
+                "compensation asked to be requeued",
+            );
+
+            tick(&config, &store, &executor).await?;
+
+            let (state, attempts): (String, i32) = sqlx::query_as(sql!(
+                "SELECT state, attempts FROM public_operations WHERE operation_id = $1"
+            ))
+            .bind(operation_id.as_uuid())
+            .fetch_one(&db.pool)
+            .await?;
+            if prior_attempts == 0 {
+                assert_eq!(state, OperationState::Queued.as_str(), "{reason:?}");
+                assert_eq!(attempts, 1, "{reason:?}: the requeue is charged");
+            } else {
+                assert_eq!(
+                    state,
+                    OperationState::Failed.as_str(),
+                    "{reason:?}: the last attempt ends the compensation"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn expired_native_m1_requeues_fail_with_evidence() -> TestResult {
     for (reason, message, m1_max_age, expected_duration) in [
@@ -1307,7 +1373,10 @@ struct AlwaysRetryExecutor;
 #[async_trait::async_trait]
 impl PublicOperationExecutor for AlwaysRetryExecutor {
     fn supported_kinds(&self) -> &'static [OperationKind] {
-        &[OperationKind::WakeSandbox]
+        &[
+            OperationKind::WakeSandbox,
+            OperationKind::CompensateCreateSandbox,
+        ]
     }
 
     async fn execute(
@@ -1482,6 +1551,139 @@ fn test_route_ed25519_authority() -> Arc<SpaceApiRouteEd25519Authority> {
         );
         env.set(SPACE_API_ROUTE_ED25519_ISSUER_ENV, "cluster-api");
         Arc::new(SpaceApiRouteEd25519Authority::load_required_from_environment(&env).unwrap())
+    }
+}
+
+/// Internal create-compensation gets a **larger** retry budget — and still a
+/// finite one.
+///
+/// Two halves, because the property is a middle and each half rules out one
+/// failure:
+///
+/// * `tick_fails_operation_after_retry_budget` shows an ordinary operation fails
+///   terminally at the ordinary cap; this test shows a create-compensation one
+///   does not, at the same cap. What marks it as internal cleanup is the
+///   operation kind, `CompensateCreateSandbox`; the product is `native` exactly
+///   as in production. It is the only owner of a `managed_by = 'space'` teardown
+///   — the transient-lifecycle sweeper answers `AliveOnNode` with `Defer` and
+///   `orphaned_sandboxes` scans `managed_by = 'k8s'` only — so giving up early
+///   strands a live guest.
+/// * `tick_still_exhausts_internal_cleanup_eventually` shows the budget is finite.
+///   An exemption would be unbounded in two ways: every cycle writes `Claimed` +
+///   `Requeued` rows into `public_operation_events` that are never collected
+///   (`gc_expired` takes terminal states only; the events table is cascade-only),
+///   and the operation stays permanently the oldest row under the claim query's
+///   `ORDER BY requested_at ASC … LIMIT`, so it crowds out user work.
+///
+/// Same executor, product and config as the paired test — the operation kind is
+/// the only variable.
+#[tokio::test]
+async fn tick_gives_internal_cleanup_a_larger_retry_budget() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id =
+        create_internal_cleanup_operation(&store, org_id, "sbx_cleanup_budget").await?;
+    // Budget of 1 fails a user-facing operation on the first attempt; internal
+    // cleanup multiplies it, so this attempt is still well inside its budget.
+    let config = single_claim_config();
+
+    let report = tick(&config, &store, &AlwaysRetryExecutor).await?;
+
+    assert_eq!(
+        report,
+        TickReport {
+            claimed: 1,
+            retried: 1,
+            ..TickReport::default()
+        },
+        "internal cleanup must requeue where a user-facing product would fail"
+    );
+    let operation = store
+        .fetch_operation(OrgId::from_uuid(org_id), operation_id)
+        .await?
+        .expect("operation remains visible");
+    assert_eq!(operation.state, OperationState::Queued);
+    Ok(())
+}
+
+/// The other half: the larger budget is still a budget.
+#[tokio::test]
+async fn tick_still_exhausts_internal_cleanup_eventually() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id =
+        create_internal_cleanup_operation(&store, org_id, "sbx_cleanup_exhausted").await?;
+    // Zero base budget drives the multiplied budget to zero too, which is the
+    // cheapest way to reach exhaustion without running the real multiplier's worth
+    // of ticks. If the product were exempt rather than multiplied, this would
+    // requeue forever and the assertion below would fail.
+    let config = ReconcilerConfig {
+        max_retry_attempts: 0,
+        ..single_claim_config()
+    };
+
+    let report = tick(&config, &store, &AlwaysRetryExecutor).await?;
+
+    assert_eq!(
+        report,
+        TickReport {
+            claimed: 1,
+            failed: 1,
+            ..TickReport::default()
+        },
+        "an exempt product would never reach a terminal state; a multiplied one must"
+    );
+    let operation = store
+        .fetch_operation(OrgId::from_uuid(org_id), operation_id)
+        .await?
+        .expect("operation remains visible");
+    assert_eq!(operation.state, OperationState::Failed);
+    Ok(())
+}
+
+async fn create_internal_cleanup_operation(
+    store: &PublicOperationStore,
+    org_id: uuid::Uuid,
+    target: &str,
+) -> TestResult<pplx_space_public_api::OperationId> {
+    let payload_json =
+        pplx_space_api::public_sandbox_operations::SandboxLifecycleOperationPayload {
+            sandbox_id: pplx_space_public_api::PublicSandboxId::new(),
+            action: pplx_space_public_api::SandboxLifecycleAction::Delete,
+            rollback: None,
+            create_rollback_teardown_issued: false,
+            create_rollback_fence: Some(
+                pplx_space_api::controllers::substrate::CreateRollbackExecutionFence::Direct {
+                    node_id: pplx_space_common_core::types::NodeId::new(),
+                    route_identity: None,
+                },
+            ),
+        }
+        .into_json();
+    match store
+        .create_operation(pplx_space_api::public_operations::CreatePublicOperation {
+            org_id: OrgId::from_uuid(org_id),
+            actor_user_id: None,
+            // `native`, matching production: compensation is identified by its
+            // kind, not by a dedicated `api_product`.
+            api_product: pplx_space_api::public_operations::ApiProduct::Native,
+            kind: OperationKind::CompensateCreateSandbox,
+            target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
+            target_id: Some(target),
+            payload_json,
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?
+    {
+        pplx_space_api::public_operations::CreatePublicOperationResult::Created(id) => Ok(id),
+        other => panic!("expected created operation, got {other:?}"),
     }
 }
 

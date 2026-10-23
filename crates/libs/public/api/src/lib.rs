@@ -205,6 +205,30 @@ macro_rules! wire_enum_open_schema {
         closed_wire_enum_impls!($name, $label, {$($variant => $wire),+});
         extensible_string_schema!($name, $label, Self::KNOWN_VALUES);
     };
+    // Variants after `internal` parse and serialize like the rest but are left
+    // out of the published schema: the schema is an extensible string, so a
+    // client already accepts a value it doesn't list, and an internal value
+    // doesn't change the public contract.
+    ($name:ident, $label:literal, {$($variant:ident => $wire:literal),+ $(,)?},
+     internal {$($internal:ident => $internal_wire:literal),+ $(,)?}) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        pub enum $name {
+            $($variant,)+
+            $($internal),+
+        }
+
+        closed_wire_enum_impls!(
+            $name, $label, {$($variant => $wire,)+ $($internal => $internal_wire),+}
+        );
+
+        impl $name {
+            /// [`Self::KNOWN_VALUES`] without the internal ones; what the
+            /// schema publishes.
+            pub const PUBLIC_VALUES: &'static [&'static str] = &[$($wire),+];
+        }
+
+        extensible_string_schema!($name, $label, Self::PUBLIC_VALUES);
+    };
 }
 
 macro_rules! closed_wire_enum_impls {
@@ -589,6 +613,11 @@ wire_enum_open_schema!(OperationKind, "operation kind", {
     RollbackSandbox => "rollback_sandbox",
     DeleteTemplate => "delete_template",
     CreateSession => "create_session",
+}, internal {
+    // The durable teardown a failed create queues for the sandbox it already
+    // started. A kind of its own so a controller that predates it never claims
+    // one: claims select by kind.
+    CompensateCreateSandbox => "compensate_create_sandbox",
 });
 
 open_wire_enum!(OperationTargetType, "operation target type", {

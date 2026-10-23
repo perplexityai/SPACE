@@ -25,7 +25,9 @@
 use pplx_space_common_core::types::{NodeId, SubstrateKind};
 
 use pplx_space_common_core::sql;
+use pplx_space_common_svc::sql::node_placement_fence::lock_node_for_phase_write;
 use sqlx::PgPool;
+use std::time::Duration;
 
 use super::{OrphanCandidate, OrphanedNodesSink};
 
@@ -46,6 +48,14 @@ impl NodeDbStore {
         Self { pool }
     }
 }
+
+/// How long the orphan DELETE waits for the `nodes` row lock before giving up.
+///
+/// Bounded for the same reason the drain reconcilers bound theirs: the scan
+/// iterates candidates sequentially, so an unbounded wait on one contended row
+/// stalls every node behind it. A timeout costs this node one tick, and the next
+/// scan re-lists it.
+const ORPHAN_DELETE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl OrphanedNodesSink for NodeDbStore {
     async fn list_candidates(
@@ -116,6 +126,26 @@ impl OrphanedNodesSink for NodeDbStore {
         node_id: NodeId,
         expected_uid: Option<String>,
     ) -> Result<bool, sqlx::Error> {
+        // **The `FOR UPDATE` preamble is required by the placement fence, not by
+        // this reconciler's own logic**, and it was added when that fence landed.
+        // This is a hard `DELETE FROM nodes`, which takes `FOR UPDATE` on the row
+        // — a mode the placement writers' `FOR KEY SHARE` conflicts with. Before
+        // the fence those writers took no lock on `nodes`, so this statement could
+        // never block on one; now it can, and a blocked statement's `NOT EXISTS`
+        // over *`sandboxes`* is evaluated on the pre-wait snapshot (the READ
+        // COMMITTED rule `node_placement_fence::lock_node_for_phase_write`
+        // documents). Taking the lock in a prior statement is what gives the
+        // guarded DELETE a snapshot that includes whatever committed while it
+        // waited.
+        //
+        // This one is worse than the same shape in `drained_node_terminator`, and
+        // that is why it is fixed rather than merely noted: the candidate here has
+        // `drain_phase IS NULL`, so the fence returns `Open` and the placement
+        // *commits*. The guest is live. Deleting the `nodes` row underneath it
+        // leaves a running sandbox pointing at a row that no longer exists —
+        // exactly what the `NOT EXISTS` guard was written to refuse.
+        let mut tx = self.pool.begin().await?;
+        lock_node_for_phase_write(&mut tx, node_id.as_uuid(), ORPHAN_DELETE_LOCK_TIMEOUT).await?;
         // The COALESCE-to-'' shape lets a NULL stored UID compare equal to
         // a NULL expected UID without `IS NOT DISTINCT FROM` (which would
         // require a different bind-parameter shape under sqlx). A NULL on
@@ -144,8 +174,9 @@ impl OrphanedNodesSink for NodeDbStore {
         .bind(node_id)
         .bind(expected_uid)
         .bind(SubstrateKind::Kubernetes)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }

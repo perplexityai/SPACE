@@ -55,6 +55,8 @@ use pplx_space_common_core::types::NodeId;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pplx_space_metrics::placement_fence as placement_fence_metrics;
+
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
@@ -207,6 +209,13 @@ pub struct TickReport {
     pub lookup_errors: usize,
     /// DB DELETE errors. Same shape as `lookup_errors`.
     pub delete_errors: usize,
+    /// Candidates whose DELETE gave up waiting for the `nodes` row lock and
+    /// deferred to the next tick. Separate from [`Self::delete_errors`] because
+    /// nothing failed: a conflicting nodes-row writer held the row. Placement
+    /// fences, registration/heartbeat, and inventory upserts can all be that
+    /// holder. A sustained nonzero value means the reap is contending with one
+    /// of those writers, not that either operation is broken.
+    pub contention_defers: usize,
 }
 
 pub struct Reconciler<S: OrphanedNodesSink, L: InstanceLookup> {
@@ -313,6 +322,25 @@ impl<S: OrphanedNodesSink, L: InstanceLookup> Reconciler<S, L> {
                         "orphaned_nodes: DELETE refused (uid changed, drain started, or sandbox pinned)"
                     );
                     report.skipped_drift += 1;
+                }
+                Err(err)
+                    if pplx_space_common_svc::sql::node_placement_fence::is_lock_timeout(&err) =>
+                {
+                    // The DELETE's bounded `nodes`-row lock wait fired, not a
+                    // database problem: a conflicting nodes-row writer holds the
+                    // row (placement fence, registration/heartbeat, inventory,
+                    // etc.). Debug rather than warn, and *not* counted as a delete
+                    // error — nothing failed to delete, and a node whose row is
+                    // held by a long writer would otherwise emit one WARN per tick
+                    // indefinitely, reading identically to an outage. The next
+                    // tick re-lists the candidate.
+                    tracing::debug!(
+                        node_id = %candidate.node_id,
+                        k8s_node_name = %candidate.k8s_node_name,
+                        "orphaned_nodes: DELETE deferred; nodes row contended"
+                    );
+                    placement_fence_metrics::termination_contention_deferral();
+                    report.contention_defers += 1;
                 }
                 Err(err) => {
                     tracing::warn!(

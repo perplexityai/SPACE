@@ -789,6 +789,21 @@ impl PublicOperationStore {
         complete_claimed_operation(&self.pool, input).await
     }
 
+    /// Renew the claim `claim_token` holds on `operation`, or report it lost.
+    ///
+    /// **Never waits on the operation's row lock.** The driver awaits this
+    /// with the execution suspended, and the execution can itself hold that
+    /// lock in an open transaction: a payload write (`update_claimed_payload_in_transaction`)
+    /// or a create compensation's teardown record. A blocking `UPDATE` would
+    /// wait on a transaction that can't progress until this returns. So a row
+    /// locked by anyone counts as still owned for this tick, as long as a plain
+    /// read (which takes no lock) still shows the claim; a claim another
+    /// claimant took is seen as lost on the next tick. A skipped tick doesn't
+    /// extend the lease, so a row held across ticks long enough for
+    /// `claimed_at` to go stale can be reclaimed once it's released; the
+    /// operation is re-driven, and the attempt that lost it records nothing.
+    /// The lock taken is the `FOR NO KEY UPDATE` a plain `UPDATE` takes, so a
+    /// foreign-key check against the row doesn't make a tick skip.
     pub async fn renew_claimed_operation(
         &self,
         claim_token: &str,
@@ -797,10 +812,15 @@ impl PublicOperationStore {
         let updated = sqlx::query(sql!(
             "UPDATE public_operations
              SET claimed_at = NOW(), updated_at = NOW()
-             WHERE operation_id = $1
-               AND claim_token = $2
-               AND claim_generation = $3
-               AND state = $4"
+             WHERE operation_id = (
+                 SELECT operation_id
+                   FROM public_operations
+                  WHERE operation_id = $1
+                    AND claim_token = $2
+                    AND claim_generation = $3
+                    AND state = $4
+                  FOR NO KEY UPDATE SKIP LOCKED
+             )"
         ))
         .bind(operation.id.as_uuid())
         .bind(claim_token)
@@ -809,7 +829,25 @@ impl PublicOperationStore {
         .execute(&self.pool)
         .await?
         .rows_affected();
-        Ok(updated == 1)
+        if updated == 1 {
+            return Ok(true);
+        }
+        Ok(sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM public_operations
+                  WHERE operation_id = $1
+                    AND claim_token = $2
+                    AND claim_generation = $3
+                    AND state = $4
+             )"
+        ))
+        .bind(operation.id.as_uuid())
+        .bind(claim_token)
+        .bind(operation.claim_generation)
+        .bind(OperationState::Running.as_str())
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn fail_claimed_operation(
@@ -953,11 +991,42 @@ pub enum ObservePublicOperationIdempotency {
     },
 }
 
+/// Record on a claimed create-compensation operation that its node teardown
+/// has run, so a later attempt only verifies it. Guarded by the claim: an
+/// attempt whose claim went stale records nothing and gets `false`. Runs in the
+/// caller's transaction, so it can be atomic with the write that makes the
+/// marker true.
+pub(crate) async fn mark_create_rollback_teardown_issued_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: OperationId,
+    claim_token: &str,
+    claim_generation: i64,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(sql!(
+        "UPDATE public_operations
+            SET payload_json = jsonb_set(
+                    payload_json, '{create_rollback_teardown_issued}', 'true'::jsonb
+                ),
+                updated_at = NOW()
+          WHERE operation_id = $1
+            AND claim_token = $2
+            AND claim_generation = $3
+            AND state = 'running'"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(claim_generation)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
 /// Claim an operation this transaction just created, as
 /// [`PublicOperationStore::claim_operations`] would: `running`, one attempt,
 /// a fresh claim token and generation, and a `claimed` event. Committed with
 /// the create, so no other claimant ever sees the operation queued.
-async fn claim_created_operation_tx(
+pub(crate) async fn claim_created_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: OperationId,
 ) -> Result<(String, ClaimedPublicOperation), PublicOperationStoreError> {
