@@ -127,7 +127,7 @@ where
 
                     retry_index += 1;
                     self.cache_after_status(client, reconnect);
-                    pplx_space_metrics::grpc::client_retry(
+                    pplx_space_grpc_metrics::client_retry(
                         self.service_name,
                         command,
                         "rpc",
@@ -202,7 +202,7 @@ where
                     }
 
                     *retry_index += 1;
-                    pplx_space_metrics::grpc::client_retry(
+                    pplx_space_grpc_metrics::client_retry(
                         self.service_name,
                         command,
                         "connect",
@@ -241,7 +241,7 @@ where
                     }
 
                     *retry_index += 1;
-                    pplx_space_metrics::grpc::client_retry(
+                    pplx_space_grpc_metrics::client_retry(
                         self.service_name,
                         command,
                         "connect",

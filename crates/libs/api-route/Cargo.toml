@@ -1,0 +1,29 @@
+[package]
+name = "pplx-space-api-route"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes the fixed Ed25519 test signing key and the environment-injected
+# authority loaders to other crates' test suites.
+test-support = []
+
+[dependencies]
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+jiff = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true, features = ["serde"] }

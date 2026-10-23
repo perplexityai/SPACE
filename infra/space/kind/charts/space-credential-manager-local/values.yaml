@@ -13,7 +13,7 @@ node: {}
 
 # The agent drains for the shared 25 s lifecycle default, then releases its
 # service mutex (crates/libs/credential/mgr/server/src/run.rs,
-# crates/libs/common/svc/src/lifecycle.rs).
+# crates/libs/service-lifecycle/src/lib.rs).
 terminationGracePeriodSeconds: 60
 
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).

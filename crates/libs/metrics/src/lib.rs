@@ -1,44 +1,9 @@
+// `metric_vocabulary!` is invoked unqualified throughout this crate; the
+// macro prelude makes it resolve in every module without a `use`.
+#[macro_use(metric_vocabulary)]
+extern crate pplx_space_metrics_emit;
+
 mod emit;
-
-/// Declare a bounded metric-tag vocabulary: the enum, its canonical `as_str`,
-/// and a `Display` that agrees with it.
-///
-/// Every tag value SPACE emits has to come from a closed set — an unbounded
-/// tag is a cardinality incident — and the three pieces have to agree, so they
-/// are generated together rather than written three times per enum.
-///
-/// Doc comments are forwarded, on the enum and on each variant, because what a
-/// tag value *means* is the part an operator reading the metrics catalog needs
-/// and the part a hand-written copy tends to omit.
-///
-/// Textually scoped from the crate root, so it is available to every module
-/// declared below without a `use`.
-macro_rules! metric_vocabulary {
-    (
-        $(#[$enum_meta:meta])*
-        $name:ident { $($(#[$variant_meta:meta])* $variant:ident => $value:literal),+ $(,)? }
-    ) => {
-        $(#[$enum_meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum $name {
-            $($(#[$variant_meta])* $variant),+
-        }
-
-        impl $name {
-            pub const fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $value),+
-                }
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(self.as_str())
-            }
-        }
-    };
-}
 
 #[cfg(any(test, feature = "test-capture"))]
 pub mod test_capture {
@@ -59,7 +24,7 @@ pub mod data_plane;
 pub mod db;
 pub mod feature_flags;
 pub mod gateway;
-pub mod grpc;
+pub use pplx_space_grpc_metrics as grpc;
 pub mod internal_api;
 pub mod jobs;
 pub mod leader_election;

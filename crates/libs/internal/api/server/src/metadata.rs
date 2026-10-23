@@ -249,6 +249,7 @@ pub(super) fn proto_facet(value: ReconcileFacet) -> ProtoReconcileFacet {
         ReconcileFacet::SandboxDesiredState => ProtoReconcileFacet::SandboxDesiredState,
         ReconcileFacet::TemplateDesiredState => ProtoReconcileFacet::TemplateDesiredState,
         ReconcileFacet::NodeStatus => ProtoReconcileFacet::NodeStatus,
+        ReconcileFacet::RuntimeProvisioning => ProtoReconcileFacet::RuntimeProvisioning,
     }
 }
 
@@ -296,8 +297,8 @@ pub(super) fn facet_element_to_proto(
         | ReconcileFacet::TemplateDesiredState => {
             Ok(facet_ref::Element::Template(element.to_string()))
         }
-        ReconcileFacet::NodeStatus => Err(Status::internal(
-            "queued node-status facet must not have an element",
+        ReconcileFacet::NodeStatus | ReconcileFacet::RuntimeProvisioning => Err(Status::internal(
+            "queued whole-node facet must not have an element",
         )),
     }
 }
@@ -313,6 +314,7 @@ pub(super) fn proto_facet_ref_to_storage(value: FacetRef) -> Result<QueuedFacetR
         ProtoReconcileFacet::SandboxDesiredState => FACET_SANDBOX_DESIRED_STATE,
         ProtoReconcileFacet::TemplateDesiredState => FACET_TEMPLATE_DESIRED_STATE,
         ProtoReconcileFacet::NodeStatus => FACET_NODE_STATUS,
+        ProtoReconcileFacet::RuntimeProvisioning => FACET_RUNTIME_PROVISIONING,
         ProtoReconcileFacet::Unspecified => {
             return Err(Status::invalid_argument("facet is required"));
         }
@@ -332,9 +334,9 @@ pub(super) fn proto_facet_ref_to_storage(value: FacetRef) -> Result<QueuedFacetR
             | FACET_TEMPLATE_DESIRED_STATE,
             Some(facet_ref::Element::Template(template)),
         ) => Some(template),
-        (FACET_NODE_STATUS, Some(_)) => {
+        (FACET_NODE_STATUS | FACET_RUNTIME_PROVISIONING, Some(_)) => {
             return Err(Status::invalid_argument(
-                "node-status facet does not accept an element",
+                "whole-node facet does not accept an element",
             ));
         }
         (facet, Some(_)) => {

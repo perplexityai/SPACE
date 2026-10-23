@@ -16,24 +16,31 @@ otel = ["pplx-space-observability/otel"]
 datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
-k8s = ["dep:k8s-openapi", "dep:kube"]
+k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
 # Exposes `sql::migration_checksums`, the accepted-checksums adapter every
 # migration runner embeds.
 migration-checksums = ["dep:pplx-space-migration-checksums"]
-# Exposes shared route and authentication test helpers to other crates.
-# Unit tests get them under `cfg(test)`; external test suites opt in through
-# a dev-dependency. Mirrors `pplx-space-metrics`'s `test-capture`.
-test-support = []
+# Exposes shared authentication test helpers to other crates, and forwards to
+# `pplx-space-api-route/test-support` for the route test helpers. common-svc's
+# unit tests get its own helpers under `cfg(test)`, but not the route helpers,
+# which outside pplx-space-api-route only this feature enables.
+# External test suites opt in through a dev-dependency. Mirrors
+# `pplx-space-metrics-emit`'s `test-capture`. Also forwards
+# `pplx-space-ecw-credential/test-support`, which exposes
+# `EcwCredentialKeyring::from_current_key_for_test`; this crate's `cfg(test)`
+# does not cover that constructor, so its unit tests get it only with this
+# feature.
+test-support = [
+    "pplx-space-api-route/test-support",
+    "pplx-space-ecw-credential/test-support",
+]
 # Enables the test-only environment overrides (see `pplx_space_common_core::env::test_hook`).
 test-hooks = ["pplx-space-common-core/test-hooks"]
 
 [dependencies]
-aws-lc-rs = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-hmac = { workspace = true }
-hex = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 jiff = { workspace = true }
@@ -43,7 +50,6 @@ libc = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
 pin-project-lite = { workspace = true }
-redis = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -63,22 +69,41 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 
 # internal
+pplx-space-api-route = { workspace = true }
+pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
+pplx-space-ecw-credential = { workspace = true }
+pplx-space-federated-grant-store = { workspace = true }
+pplx-space-federated-identity = { workspace = true }
+pplx-space-grpc-rate-limiter = { workspace = true }
+pplx-space-http-server = { workspace = true }
+pplx-space-ingress-admission = { workspace = true }
+pplx-space-k8s-node-id = { workspace = true }
+pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-migration-checksums = { workspace = true, optional = true }
+pplx-space-node-registration-store = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-page-cache = { workspace = true }
+pplx-space-postgres-contention = { workspace = true }
+pplx-space-request-id = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }
+pplx-space-sandbox-quarantine-store = { workspace = true }
+pplx-space-sandbox-routability = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }
 pplx-space-systemd-watchdog = { workspace = true }
 pplx-space-tokio-runtime = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
 pplx-space-unix-socket-path = { workspace = true }
+pplx-space-valkey = { workspace = true }
 
 [dev-dependencies]
-insta = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 nix = { workspace = true, features = ["signal"] }
 tonic-prost = { workspace = true }

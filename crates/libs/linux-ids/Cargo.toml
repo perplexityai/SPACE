@@ -1,0 +1,19 @@
+[package]
+name = "pplx-space-linux-ids"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"], optional = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

@@ -11,7 +11,7 @@ publish.workspace = true
 workspace = true
 
 [features]
-test-capture = []
+test-capture = ["pplx-space-metrics-emit/test-capture"]
 
 [dependencies]
 metrics = { workspace = true }
@@ -21,9 +21,14 @@ uuid = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-grpc-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 
 [dev-dependencies]
+# Unit tests here assert on captured values, so they need the capture the
+# emit crate builds only with `test-capture`.
+pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [[example]]

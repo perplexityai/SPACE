@@ -489,11 +489,16 @@ fn facet_ref_from_args(facet: &str, element: Option<String>) -> Result<FacetRef>
             ReconcileFacet::TemplateDesiredState,
             element.map(facet_ref::Element::Template),
         ),
-        "node-status" => {
+        "node-status" | "runtime-provisioning" => {
             if element.is_some() {
-                anyhow::bail!("node-status facet does not accept an element");
+                anyhow::bail!("{facet} facet does not accept an element");
             }
-            (ReconcileFacet::NodeStatus, None)
+            let facet = if facet == "node-status" {
+                ReconcileFacet::NodeStatus
+            } else {
+                ReconcileFacet::RuntimeProvisioning
+            };
+            (facet, None)
         }
         _ => anyhow::bail!("unknown facet {facet:?}"),
     };

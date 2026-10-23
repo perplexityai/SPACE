@@ -26,8 +26,10 @@ Read only the references that match the task:
 
 - Parse raw strings, numbers, UUIDs, proto fields, and JSON once at the wire
   boundary. Pass validated domain types through the interior call graph.
-- Reuse nouns from `pplx-space-common-core` and `pplx-space-common-svc` before
-  creating a local parallel type. Extend a shared noun instead of forking it.
+- Reuse a noun from the crate that owns it before creating a local parallel
+  type, and extend it there instead of forking it. Put a new shared type in the
+  crate that owns the concept or a new single-responsibility crate, never in
+  `pplx-space-common-core` or `pplx-space-common-svc`.
 - Model closed vocabularies as exhaustive enums. Implement `as_str`, `Display`,
   and `FromStr`; put predicates on the enum; match variants rather than string
   literals. The types reference defines the complete pattern.

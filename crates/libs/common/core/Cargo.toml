@@ -16,14 +16,24 @@ base64 = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl"] }
+pplx-space-accounts = { workspace = true }
+pplx-space-auto-lifecycle = { workspace = true }
+pplx-space-btrfs = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
+pplx-space-db-identity = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
+pplx-space-guest-process = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
+pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
+pplx-space-network-roles = { workspace = true }
+pplx-space-pii = { workspace = true }
+pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 rusqlite = { workspace = true, optional = true }
@@ -57,9 +67,20 @@ serde = [
     "pplx-space-cpu-arch/serde",
     "pplx-space-k8s-ids/serde",
     "pplx-space-cluster-id/serde",
+    "pplx-space-guest-process/serde",
+    "pplx-space-accounts/serde",
+    "pplx-space-execution-spec/serde",
+    "pplx-space-linux-ids/serde",
+    "pplx-space-network-roles/serde",
+    "pplx-space-auto-lifecycle/serde",
 ]
-sqlx = ["dep:sqlx", "pplx-space-semver/sqlx", "pplx-space-k8s-ids/sqlx"]
-rusqlite = ["dep:rusqlite"]
+sqlx = [
+    "dep:sqlx",
+    "pplx-space-semver/sqlx",
+    "pplx-space-k8s-ids/sqlx",
+    "pplx-space-accounts/sqlx",
+]
+rusqlite = ["dep:rusqlite", "pplx-space-accounts/rusqlite"]
 # Compiles in the test-only environment overrides (see `env::test_hook`). Only
 # kind and smoke images and test builds enable it; release binaries cannot read
 # these variables, so they are not part of the public configuration surface.

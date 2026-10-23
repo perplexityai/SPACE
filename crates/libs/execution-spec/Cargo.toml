@@ -1,0 +1,33 @@
+[package]
+name = "pplx-space-execution-spec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pplx-space-byte-size = { workspace = true }
+pplx-space-content-digest = { workspace = true }
+pplx-space-cpu-arch = { workspace = true }
+pplx-space-k8s-ids = { workspace = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = []
+serde = [
+    "dep:serde",
+    "dep:serde_json",
+    "pplx-space-byte-size/serde",
+    "pplx-space-content-digest/serde",
+    "pplx-space-cpu-arch/serde",
+]

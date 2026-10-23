@@ -88,7 +88,7 @@ SPACE_VOLUME_MANAGER_GROUPS="space-sbxclients space-cache-rw space-volcredclient
 # needs its own socket group so it can hand that group to its socket, and
 # node-manager's client group so it can ask node-manager to publish installs.
 SPACE_RUNTIME_MANAGER_GROUPS="space-rtmgrclients space-nodeclients"
-SPACE_NODECTL_GROUPS="space-nodeclients space-sbxclients space-tmplclients space-nodectlclients"
+SPACE_NODECTL_GROUPS="space-nodeclients space-sbxclients space-tmplclients space-nodectlclients space-rtmgrclients"
 SPACE_NODEAPI_WORKER_GROUPS="space-nodeclients space-sbxclients space-tmplclients space-nodectlclients"
 SPACE_NODEAPI_BUILDER_GROUPS="$SPACE_NODEAPI_WORKER_GROUPS space-buildclients"
 SPACE_NODEAPI_CLUSTER_GROUPS="space-sbxclients space-tmplclients"

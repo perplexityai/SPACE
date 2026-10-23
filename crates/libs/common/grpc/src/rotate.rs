@@ -270,7 +270,7 @@ impl Shared {
                 // response completes.
                 state.channel = channel;
                 state.expires_at = Instant::now() + subsequent_age(max_age);
-                pplx_space_metrics::grpc::client_connection_rotation(self.service_name, "rotated");
+                pplx_space_grpc_metrics::client_connection_rotation(self.service_name, "rotated");
                 pplx_space_observability::with_peer_service!(tracing::debug!(
                     peer.service = self.service_name,
                     "retired aged gRPC connection"
@@ -280,7 +280,7 @@ impl Shared {
                 // The old connection is still serving, so a failed dial is a
                 // deferred rotation and not a request-path failure.
                 state.expires_at = Instant::now() + ROTATION_RETRY_DELAY;
-                pplx_space_metrics::grpc::client_connection_rotation(
+                pplx_space_grpc_metrics::client_connection_rotation(
                     self.service_name,
                     "dial_failed",
                 );

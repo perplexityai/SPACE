@@ -56,7 +56,7 @@ fn start_sampler(counter: &InFlightRequestsCounter) {
 async fn sample_forever(counter: InFlightRequestsCounter) {
     counter
         .run_emitter(SAMPLE_INTERVAL, |depth| async move {
-            pplx_space_metrics::grpc::server_active_requests(depth);
+            pplx_space_grpc_metrics::server_active_requests(depth);
         })
         .await;
 }
