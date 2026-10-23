@@ -12,6 +12,13 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+#[cfg(test)]
+pub(super) type EncryptedCaptureIo = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Status>> + Send>>
+        + Send
+        + Sync,
+>;
+
 const BTRFS_SNAPSHOTS_DIR_NAME: &str = "snapshots";
 
 fn prepare_btrfs_snapshot_source(instance_dir: &Path) -> Result<(), Status> {
@@ -284,6 +291,10 @@ impl NodeManagerService {
         let selected_environment = environment::normalize(request.get_mut())?;
         validate_sandbox_id(&request.get_ref().sandbox_id)?;
         let sandbox_id = request.get_ref().sandbox_id.clone();
+        // Ownership survives the server deadline so capture can unmount safely,
+        // but a detached capture must not start stopping a rolled-back VM.
+        let caller_cancelled = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_drop = caller_cancelled.clone().drop_guard();
         let service = self.clone();
         self.run_owned_sandbox_work(&sandbox_id, async move {
             let _vm_guard = service
@@ -321,7 +332,9 @@ impl NodeManagerService {
             service
                 .verify_snapshot_environment(req.sandbox_id.clone(), selected_environment)
                 .await?;
-            service.create_snapshot_inner(request).await
+            service
+                .create_snapshot_inner(request, caller_cancelled)
+                .await
         })
         .await
     }
@@ -329,6 +342,7 @@ impl NodeManagerService {
     async fn create_snapshot_inner(
         &self,
         request: Request<CreateSnapshotRequest>,
+        caller_cancelled: tokio_util::sync::CancellationToken,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         let req = request.get_ref();
         validate_sandbox_id(&req.sandbox_id)?;
@@ -343,7 +357,7 @@ impl NodeManagerService {
             .filter(|p| !p.is_empty())
         {
             return self
-                .create_encrypted_snapshot(&req.sandbox_id, mount_dir)
+                .create_encrypted_snapshot(&req.sandbox_id, mount_dir, caller_cancelled)
                 .await;
         }
 
@@ -446,6 +460,7 @@ impl NodeManagerService {
         &self,
         sandbox_id: &str,
         mount_dir: &str,
+        caller_cancelled: tokio_util::sync::CancellationToken,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         let typed_sandbox_id = sandbox_id
             .parse::<SandboxId>()
@@ -453,14 +468,11 @@ impl NodeManagerService {
         super::trusted_paths::validate_snapshot_volume(sandbox_id, mount_dir)?;
         let jail_root = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root");
         let jail_bind = format!("{jail_root}/{ENC_SNAPSHOT_JAIL_SUBDIR}");
-        let api_socket = format!("{jail_root}/firecracker.sock");
         let lease = self
             .pool
             .get(sandbox_id)
             .map_err(slot_store_status)?
             .ok_or_else(|| Status::unavailable("snapshot lease is no longer active"))?;
-        let fc_snapshot_path = format!("/{ENC_SNAPSHOT_JAIL_SUBDIR}/{ENC_SNAPSHOT_VMSTATE_NAME}");
-        let fc_mem_file_path = format!("/{ENC_SNAPSHOT_JAIL_SUBDIR}/{ENC_SNAPSHOT_MEMORY_NAME}");
 
         // Serialize the whole capture per-sandbox on the SAME device-stack lock
         // prepare/release/cleanup take: the capture mutates the stable
@@ -494,52 +506,14 @@ impl NodeManagerService {
             let mount_dir = mount_dir.to_string();
             async move {
                 let _guard = guard;
-                let bind = {
-                    tokio::task::spawn_blocking(move || -> Result<(), Status> {
-                        let (volume, target) = pin_encrypted_snapshot_bind(
-                            Path::new(&mount_dir),
-                            Path::new(&jail_root),
-                            super::trusted_paths::reown,
-                        )?;
-                        super::trusted_paths::bind_pinned_files(&volume, &target)
-                    })
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("encrypted-snapshot bind task failed: {e}"))
-                    })?
-                };
-                let create_result = match bind {
-                    // On a re-suspend, `memory` is the correctly-sized image
-                    // loaded by Firecracker. Firecracker 1.15 merges dirty
-                    // pages into that existing file, so capture work scales
-                    // with the dirty set while the result remains standalone.
-                    // The first diff after a cold boot is standalone by the
-                    // Firecracker contract and starts from an empty volume.
-                    Ok(()) => crate::fc_api::FcApiClient::new(api_socket)
-                        .create_snapshot(&fc_snapshot_path, &fc_mem_file_path)
-                        .await
-                        .map_err(|e| {
-                            Status::internal(format!("create encrypted snapshot failed: {e}"))
-                        }),
-                    Err(error) => Err(error),
-                };
-                // ALWAYS unmount the bind, so the caller can seal the volume
-                // whatever happened above; idempotent if the bind never formed.
-                {
-                    let jail_bind = jail_bind.clone();
-                    let sandbox_id = sandbox_id.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Err(e) = unmount_if_present(&jail_bind) {
-                            tracing::warn!(
-                                sandbox_id = %sandbox_id,
-                                %e,
-                                "failed to unmount encrypted-snapshot jail bind"
-                            );
-                        }
-                    })
-                    .await;
+                if caller_cancelled.is_cancelled() {
+                    return Err(Status::cancelled(
+                        "snapshot waiter disappeared before capture; skipping queued capture",
+                    ));
                 }
-                create_result?;
+                service
+                    .write_encrypted_snapshot_files(&sandbox_id, &mount_dir)
+                    .await?;
                 service.adopt_validated_lease(&sandbox_id, &lease)?;
 
                 // A restored sandbox's Firecracker holds the snapshot volume's
@@ -549,7 +523,7 @@ impl NodeManagerService {
                 // Stop the runtime to drop the mmap, then drain any remaining
                 // encsnap bind, so the volume can be sealed. Both are no-ops for
                 // a fresh capture (no restore pin).
-                stop_runtime_for_encrypted_seal(&service, &sandbox_id).await?;
+                stop_runtime_for_encrypted_seal(&service, &sandbox_id, &caller_cancelled).await?;
                 let _ = tokio::task::spawn_blocking(move || {
                     for _ in 0..MAX_ENC_SNAPSHOT_BIND_DRAIN {
                         match unmount_if_present(&jail_bind) {
@@ -583,6 +557,66 @@ impl NodeManagerService {
             "encrypted snapshot written (vmstate+memory compressed+encrypted at t0)"
         );
         Ok(Response::new(CreateSnapshotResponse {}))
+    }
+
+    async fn write_encrypted_snapshot_files(
+        &self,
+        sandbox_id: &str,
+        mount_dir: &str,
+    ) -> Result<(), Status> {
+        #[cfg(test)]
+        if let Some(capture) = &self.encrypted_capture_io {
+            return capture().await;
+        }
+        let sandbox_id = sandbox_id.to_owned();
+        let mount_dir = mount_dir.to_owned();
+        let jail_root = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root");
+        let jail_bind = format!("{jail_root}/{ENC_SNAPSHOT_JAIL_SUBDIR}");
+        let api_socket = format!("{jail_root}/firecracker.sock");
+        let fc_snapshot_path = format!("/{ENC_SNAPSHOT_JAIL_SUBDIR}/{ENC_SNAPSHOT_VMSTATE_NAME}");
+        let fc_mem_file_path = format!("/{ENC_SNAPSHOT_JAIL_SUBDIR}/{ENC_SNAPSHOT_MEMORY_NAME}");
+        let bind = {
+            tokio::task::spawn_blocking(move || -> Result<(), Status> {
+                let (volume, target) = pin_encrypted_snapshot_bind(
+                    Path::new(&mount_dir),
+                    Path::new(&jail_root),
+                    super::trusted_paths::reown,
+                )?;
+                super::trusted_paths::bind_pinned_files(&volume, &target)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("encrypted-snapshot bind task failed: {e}")))?
+        };
+        let create_result = match bind {
+            // On a re-suspend, `memory` is the correctly-sized image
+            // loaded by Firecracker. Firecracker 1.15 merges dirty
+            // pages into that existing file, so capture work scales
+            // with the dirty set while the result remains standalone.
+            // The first diff after a cold boot is standalone by the
+            // Firecracker contract and starts from an empty volume.
+            Ok(()) => crate::fc_api::FcApiClient::new(api_socket)
+                .create_snapshot(&fc_snapshot_path, &fc_mem_file_path)
+                .await
+                .map_err(|e| Status::internal(format!("create encrypted snapshot failed: {e}"))),
+            Err(error) => Err(error),
+        };
+        // ALWAYS unmount the bind, so the caller can seal the volume
+        // whatever happened above; idempotent if the bind never formed.
+        {
+            let jail_bind = jail_bind.clone();
+            let sandbox_id = sandbox_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = unmount_if_present(&jail_bind) {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        %e,
+                        "failed to unmount encrypted-snapshot jail bind"
+                    );
+                }
+            })
+            .await;
+        }
+        create_result
     }
 
     pub(super) async fn load_snapshot(
@@ -1430,10 +1464,18 @@ pub(super) async fn set_firecracker_paused(
 /// while it fails server-side because the killed Firecracker is still exiting.
 /// New supervisors report drain timeouts as `Unavailable`. Keep `Internal`
 /// handling while older supervisors still report busy cgroups that way.
+/// Cancellation before the first stop retains the paused VM. Once a stop is
+/// dispatched, finish its retries even if the waiter subsequently disappears.
 async fn stop_runtime_for_encrypted_seal(
     service: &NodeManagerService,
     sandbox_id: &str,
+    caller_cancelled: &tokio_util::sync::CancellationToken,
 ) -> Result<(), Status> {
+    if caller_cancelled.is_cancelled() {
+        return Err(Status::cancelled(
+            "snapshot waiter disappeared before runtime stop; retaining paused runtime",
+        ));
+    }
     let mut attempt = 1;
     loop {
         match stop_sandbox_runtime_with_supervisor(service, sandbox_id, true, None).await {

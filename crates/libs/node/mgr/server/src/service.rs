@@ -226,6 +226,8 @@ pub struct NodeManagerService {
     cleanup_operations: cleanup_inspect::CleanupOperationRegistry,
     orphan_inventory: orphan_inventory::OrphanInventory,
     snapshot_inventory: snapshot_inventory::SnapshotInventory,
+    #[cfg(test)]
+    encrypted_capture_io: Option<snapshots::EncryptedCaptureIo>,
 }
 
 type SandboxCgroupGateLock = std::sync::Arc<tokio::sync::RwLock<()>>;
@@ -417,6 +419,8 @@ impl NodeManagerService {
             cleanup_operations: cleanup_inspect::CleanupOperationRegistry::new(task_tracker),
             orphan_inventory: orphan_inventory::OrphanInventory::default(),
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
+            #[cfg(test)]
+            encrypted_capture_io: None,
         })
     }
 

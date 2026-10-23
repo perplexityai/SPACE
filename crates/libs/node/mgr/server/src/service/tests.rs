@@ -712,6 +712,7 @@ pub(super) mod service_tests {
             cleanup_operations: CleanupOperationRegistry::default(),
             orphan_inventory: orphan_inventory::OrphanInventory::default(),
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
+            encrypted_capture_io: None,
         }
     }
 
