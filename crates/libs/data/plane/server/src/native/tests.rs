@@ -418,14 +418,51 @@ enum FakeBind {
     NotFound,
 }
 
+/// How the fake worker answers a connect to the session's process.
+#[derive(Clone, Copy)]
+enum FakeProcess {
+    Running,
+    /// The guest has no such process.
+    Missing,
+    /// The node has no such sandbox.
+    SandboxMissing,
+    Unreachable,
+}
+
+/// The process session a fake cluster API serves.
+struct FakeSession {
+    /// The session's stored `CreateProcessRequest`.
+    adapter_state: &'static str,
+    /// Whether each route lookup, in order, reports the process as bound to
+    /// the session; the last answer repeats.
+    bound: &'static [bool],
+    /// Whether the worker reports the process's exit after its first event.
+    exits: bool,
+    bind: FakeBind,
+    process: FakeProcess,
+}
+
 /// A fake cluster API and worker for one native process session. Each bind
 /// waits for a `release` permit before answering, so a test can hold the
-/// binding open while it watches what the client receives.
+/// binding open while it watches what the client receives. Every call, and
+/// the `stdin` flag of every start, is recorded.
 struct BindingFake {
     endpoint: String,
     release: Arc<tokio::sync::Semaphore>,
     bind_started: Arc<tokio::sync::Notify>,
     bound_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+    started_stdin: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl BindingFake {
+    fn called(&self, method: &str) -> bool {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.ends_with(method))
+    }
 }
 
 async fn spawn_binding_fake(
@@ -433,14 +470,35 @@ async fn spawn_binding_fake(
     exits: bool,
     bind: FakeBind,
 ) -> BindingFake {
+    spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: r#"{"command":["true"]}"#,
+            bound: &[false],
+            exits,
+            bind,
+            process: FakeProcess::Running,
+        },
+    )
+    .await
+}
+
+async fn spawn_session_fake(session_id: DataPlaneSessionId, session: FakeSession) -> BindingFake {
     use prost::Message as _;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let mut route = crate::tests::route_response_with_token(session_id, None);
-    route.backend.as_mut().unwrap().endpoint = endpoint.clone();
-    route.adapter_state_json = r#"{"command":["true"]}"#.to_string();
-    let route = route.encode_to_vec();
     let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+    let routes: Vec<_> = session
+        .bound
+        .iter()
+        .map(|&bound| {
+            let mut route = crate::tests::route_response_with_token(session_id, None);
+            route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+            route.adapter_state_json = session.adapter_state.to_string();
+            route.backend_process_id = bound.then(|| process_id.clone());
+            route.encode_to_vec()
+        })
+        .collect();
     let event = |event| {
         let mut framed = vec![0];
         let encoded = ProcessEvent {
@@ -453,11 +511,8 @@ async fn spawn_binding_fake(
         framed.extend(encoded);
         bytes::Bytes::from(framed)
     };
-    let mut events = vec![event(spaced_process_event::Event::Started(
-        pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
-    ))];
-    if exits {
-        events.push(event(spaced_process_event::Event::Exit(
+    let exit = session.exits.then(|| {
+        event(spaced_process_event::Event::Exit(
             pplx_space_sbx_mgr_client::proto::SpacedProcessExit {
                 outcome: Some(
                     pplx_space_sbx_mgr_client::proto::spaced_process_exit::Outcome::Exited(
@@ -465,30 +520,55 @@ async fn spawn_binding_fake(
                     ),
                 ),
             },
-        )));
-    }
-    let release = Arc::new(tokio::sync::Semaphore::new(0));
-    let bind_started = Arc::new(tokio::sync::Notify::new());
-    let bound_process_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        ))
+    });
+    let started_events: Vec<_> = std::iter::once(event(spaced_process_event::Event::Started(
+        pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
+    )))
+    .chain(exit.clone())
+    .collect();
+    let connected_events: Vec<_> = std::iter::once(event(spaced_process_event::Event::Connected(
+        pplx_space_sbx_mgr_client::proto::SpacedProcessConnected {},
+    )))
+    .chain(exit)
+    .collect();
+    let bind = session.bind;
+    let process = session.process;
+    let route_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fake = BindingFake {
         endpoint,
-        release: Arc::clone(&release),
-        bind_started: Arc::clone(&bind_started),
-        bound_process_ids: Arc::clone(&bound_process_ids),
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+        bind_started: Arc::new(tokio::sync::Notify::new()),
+        bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        started_stdin: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
+    let release = Arc::clone(&fake.release);
+    let bind_started = Arc::clone(&fake.bind_started);
+    let bound_process_ids = Arc::clone(&fake.bound_process_ids);
+    let calls = Arc::clone(&fake.calls);
+    let started_stdin = Arc::clone(&fake.started_stdin);
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
-        let route = route.clone();
-        let events = events.clone();
+        let routes = routes.clone();
+        let started_events = started_events.clone();
+        let connected_events = connected_events.clone();
+        let route_lookups = Arc::clone(&route_lookups);
         let release = Arc::clone(&release);
         let bind_started = Arc::clone(&bind_started);
         let bound_process_ids = Arc::clone(&bound_process_ids);
+        let calls = Arc::clone(&calls);
+        let started_stdin = Arc::clone(&started_stdin);
         async move {
             let path = request.uri().path().to_string();
+            calls.lock().unwrap().push(path.clone());
             if path.ends_with("/Check") {
                 return crate::tests::grpc_test_response(vec![8, 1]);
             }
             if path.ends_with("/ResolveDataPlaneSessionRoute") {
-                return crate::tests::grpc_test_response(route);
+                let lookup = route_lookups.fetch_add(1, Ordering::SeqCst);
+                return crate::tests::grpc_test_response(
+                    routes[lookup.min(routes.len() - 1)].clone(),
+                );
             }
             if path.ends_with("/BindDataPlaneSessionProcess") {
                 let body = request.into_body().collect().await.unwrap().to_bytes();
@@ -504,10 +584,34 @@ async fn spawn_binding_fake(
                     }
                 };
             }
-            assert!(
-                path.ends_with("/SpacedStartProcess"),
-                "unexpected call {path}"
-            );
+            let events = if path.ends_with("/SpacedStartProcess") {
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let start = SpacedStartProcessRequest::decode(&body[5..]).unwrap();
+                started_stdin
+                    .lock()
+                    .unwrap()
+                    .push(start.operation.unwrap().stdin);
+                started_events
+            } else if path.ends_with("/SpacedConnectProcess") {
+                match process {
+                    FakeProcess::Running => connected_events,
+                    FakeProcess::Missing => {
+                        return pplx_space_common_grpc::mark_guest_process_error(
+                            tonic::Status::not_found("process not found"),
+                        )
+                        .into_http::<Body>();
+                    }
+                    FakeProcess::SandboxMissing => {
+                        return tonic::Status::not_found("sandbox not found").into_http::<Body>();
+                    }
+                    FakeProcess::Unreachable => {
+                        return tonic::Status::unavailable("worker unreachable")
+                            .into_http::<Body>();
+                    }
+                }
+            } else {
+                panic!("unexpected call {path}");
+            };
             let frames = futures_util::stream::iter(
                 events
                     .into_iter()
@@ -539,12 +643,7 @@ fn binding_fake_test_process() -> bool {
     ])
 }
 
-/// Opens the session's event stream and forwards its body text, chunk by
-/// chunk, until the body ends.
-async fn open_process_events(
-    fake: &BindingFake,
-    session_id: DataPlaneSessionId,
-) -> (DataPlaneState, tokio::sync::mpsc::UnboundedReceiver<String>) {
+async fn binding_fake_state(fake: &BindingFake) -> DataPlaneState {
     let mut state = crate::tests::test_data_plane_state().await;
     state.cluster_api = ClusterApiClients::service_only(
         pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
@@ -552,16 +651,34 @@ async fn open_process_events(
             .unwrap(),
     );
     state.revocation_check_interval = Duration::from_secs(3600);
+    state
+}
+
+async fn get_session_events(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    last_event_id: Option<&str>,
+) -> Response {
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
-    let response = tower::ServiceExt::oneshot(
-        router(state.clone()),
-        Request::get(format!("/v1/sessions/{session_id}/events"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    let mut request = Request::get(format!("/v1/sessions/{session_id}/events"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(last_event_id) = last_event_id {
+        request = request.header("last-event-id", last_event_id);
+    }
+    tower::ServiceExt::oneshot(router(state.clone()), request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// Opens the session's event stream and forwards its body text, chunk by
+/// chunk, until the body ends.
+async fn open_process_events(
+    fake: &BindingFake,
+    session_id: DataPlaneSessionId,
+    last_event_id: Option<&str>,
+) -> (DataPlaneState, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    let state = binding_fake_state(fake).await;
+    let response = get_session_events(&state, session_id, last_event_id).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
     let (chunk_tx, chunks) = tokio::sync::mpsc::unbounded_channel();
@@ -607,7 +724,7 @@ async fn process_start_reaches_the_client_before_its_binding_commits() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_binding_fake(session_id, false, FakeBind::Succeeds).await;
-    let (state, mut chunks) = open_process_events(&fake, session_id).await;
+    let (state, mut chunks) = open_process_events(&fake, session_id, None).await;
     let mut seen = String::new();
 
     // The bind is still held open, yet the start already reached the client.
@@ -642,7 +759,7 @@ async fn process_exit_is_reported_only_after_its_binding_commits() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_binding_fake(session_id, true, FakeBind::Succeeds).await;
-    let (_state, mut chunks) = open_process_events(&fake, session_id).await;
+    let (_state, mut chunks) = open_process_events(&fake, session_id, None).await;
     let mut seen = String::new();
 
     read_until(&mut chunks, &mut seen, "process_started").await;
@@ -674,7 +791,7 @@ async fn failed_binding_ends_the_process_stream_with_a_retryable_error() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_binding_fake(session_id, false, FakeBind::NotFound).await;
-    let (state, mut chunks) = open_process_events(&fake, session_id).await;
+    let (state, mut chunks) = open_process_events(&fake, session_id, None).await;
     let mut seen = String::new();
 
     read_until(&mut chunks, &mut seen, "process_started").await;
@@ -696,7 +813,7 @@ async fn binding_survives_a_client_that_disconnects_mid_bind() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_binding_fake(session_id, false, FakeBind::Succeeds).await;
-    let (state, mut chunks) = open_process_events(&fake, session_id).await;
+    let (state, mut chunks) = open_process_events(&fake, session_id, None).await;
     let mut seen = String::new();
 
     read_until(&mut chunks, &mut seen, "process_started").await;
@@ -720,6 +837,283 @@ async fn binding_survives_a_client_that_disconnects_mid_bind() {
     .await
     .expect("the binding completed after the client left");
     assert_eq!(fake.bound_process_ids.lock().unwrap().len(), 1);
+}
+
+const PTY_SESSION: &str = r#"{"command":["sh"],"pty":{"rows":24,"cols":80}}"#;
+
+async fn error_body(response: Response) -> serde_json::Value {
+    use http_body_util::BodyExt;
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// Server-sent events carry no input and cannot close a pty's, so an events
+/// attach that would start a pty process is refused once the worker reports
+/// that the session has no process. Nothing is started.
+#[tokio::test]
+async fn events_stream_refuses_to_start_pty_process_sessions() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: PTY_SESSION,
+            bound: &[false],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::Missing,
+        },
+    )
+    .await;
+    let state = binding_fake_state(&fake).await;
+    let response = get_session_events(&state, session_id, None).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = error_body(response).await;
+    assert_eq!(body["error"]["code"], "invalid_request", "{body}");
+    assert_eq!(body["error"]["retryable"], false, "{body}");
+    assert!(fake.called("/SpacedConnectProcess"), "the worker was asked");
+    assert!(!fake.called("/SpacedStartProcess"), "nothing was started");
+}
+
+/// A WebSocket start reports the process before its binding commits. While
+/// the route still says unbound, the worker's running process is resumed
+/// rather than refused, through the one connect that also asked whether it
+/// runs, and this stream commits the binding.
+#[tokio::test]
+async fn events_stream_resumes_a_running_pty_process_before_its_binding_commits() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: PTY_SESSION,
+            bound: &[false],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::Running,
+        },
+    )
+    .await;
+    let (_state, mut chunks) = open_process_events(&fake, session_id, None).await;
+    let mut seen = String::new();
+
+    fake.release.add_permits(1);
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    let calls = fake.calls.lock().unwrap();
+    let connects = calls
+        .iter()
+        .filter(|path| path.ends_with("/SpacedConnectProcess"))
+        .count();
+    assert_eq!(connects, 1, "the stream is the first connect: {calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|path| path.ends_with("/SpacedStartProcess")),
+        "nothing was started"
+    );
+    assert_eq!(
+        *fake.bound_process_ids.lock().unwrap(),
+        vec![pplx_space_public_api::process_id_for_session(session_id).to_string()],
+        "the resumed process was bound"
+    );
+}
+
+/// A `NotFound` from the node, such as for a missing sandbox, is not the
+/// guest saying it has no process, so the attach keeps the answer a start
+/// gets rather than the pty refusal.
+#[tokio::test]
+async fn events_stream_does_not_refuse_a_pty_session_whose_sandbox_is_missing() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: PTY_SESSION,
+            bound: &[false],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::SandboxMissing,
+        },
+    )
+    .await;
+    let state = binding_fake_state(&fake).await;
+    let response = get_session_events(&state, session_id, None).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = error_body(response).await;
+    assert_eq!(body["error"]["code"], "stream_unavailable", "{body}");
+    assert_eq!(body["error"]["retryable"], true, "{body}");
+    assert!(!fake.called("/SpacedStartProcess"), "nothing was started");
+}
+
+/// When the worker cannot say whether the session's process exists, the
+/// attach is answered as retryable rather than refused.
+#[tokio::test]
+async fn events_stream_answers_a_failed_process_connect_as_retryable() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: PTY_SESSION,
+            bound: &[false],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::Unreachable,
+        },
+    )
+    .await;
+    let state = binding_fake_state(&fake).await;
+    let response = get_session_events(&state, session_id, None).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = error_body(response).await;
+    assert_eq!(body["error"]["retryable"], true, "{body}");
+    assert!(!fake.called("/SpacedStartProcess"), "nothing was started");
+}
+
+/// A `stdin` process started over server-sent events gets stdin at EOF, so a
+/// command that reads it finishes instead of waiting on input nobody sends.
+#[tokio::test]
+async fn events_stream_starts_stdin_process_sessions_with_stdin_at_eof() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: r#"{"command":["cat"],"stdin":true}"#,
+            bound: &[false],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::Running,
+        },
+    )
+    .await;
+    let (_state, mut chunks) = open_process_events(&fake, session_id, None).await;
+    let mut seen = String::new();
+
+    read_until(&mut chunks, &mut seen, "process_started").await;
+    fake.release.add_permits(1);
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    assert_eq!(
+        *fake.started_stdin.lock().unwrap(),
+        vec![false],
+        "started once, without a stdin pipe"
+    );
+}
+
+/// A pty process already bound to the session is only read from, so an events
+/// reconnect still resumes it.
+#[tokio::test]
+async fn events_stream_resumes_started_pty_process_sessions() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: PTY_SESSION,
+            bound: &[true],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::Running,
+        },
+    )
+    .await;
+    let (_state, mut chunks) = open_process_events(&fake, session_id, Some("3")).await;
+    let mut seen = String::new();
+
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    assert!(seen.contains("resync_required"), "{seen}");
+    assert!(fake.called("/SpacedConnectProcess"));
+    assert!(!fake.called("/SpacedStartProcess"), "nothing was started");
+}
+
+/// The cached route can predate a binding another attach just made. An
+/// unbound pty route is read again, and a process bound in the meantime is
+/// resumed through its binding, which is not written again.
+#[tokio::test]
+async fn events_stream_rereads_an_unbound_pty_route_before_refusing() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: PTY_SESSION,
+            bound: &[false, true],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::Running,
+        },
+    )
+    .await;
+    let (_state, mut chunks) = open_process_events(&fake, session_id, None).await;
+    let mut seen = String::new();
+
+    fake.release.add_permits(1);
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    let calls = fake.calls.lock().unwrap();
+    let connects = calls
+        .iter()
+        .filter(|path| path.ends_with("/SpacedConnectProcess"))
+        .count();
+    assert_eq!(connects, 1, "resumed from the re-read route: {calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|path| path.ends_with("/SpacedStartProcess")),
+        "nothing was started"
+    );
+    assert!(
+        fake.bound_process_ids.lock().unwrap().is_empty(),
+        "already bound"
+    );
+}
+
+/// While another attach on this replica holds the session, as a start does
+/// until its binding commits, a pty attach gets the retryable conflict rather
+/// than the refusal.
+#[tokio::test]
+async fn events_stream_answers_a_held_pty_session_with_a_retryable_conflict() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_session_fake(
+        session_id,
+        FakeSession {
+            adapter_state: PTY_SESSION,
+            bound: &[false],
+            exits: true,
+            bind: FakeBind::Succeeds,
+            process: FakeProcess::Missing,
+        },
+    )
+    .await;
+    let state = binding_fake_state(&fake).await;
+    let _held = state
+        .native_sessions
+        .try_acquire(session_id, SessionKind::Process)
+        .unwrap();
+    let response = get_session_events(&state, session_id, None).await;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = error_body(response).await;
+    assert_eq!(body["error"]["retryable"], true, "{body}");
 }
 
 /// How a fake cluster API answers revocation checks.
