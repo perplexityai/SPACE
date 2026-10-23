@@ -136,8 +136,9 @@ and error evolution, requires a separate crate-level policy before stabilization
   and owned filesystem workers have been reaped. Passive watches are retired
   during drain. A caller must continue polling or drop its admitted futures and
   consume or drop its read/list/process output streams; otherwise graceful drain
-  can wait for their input or backpressure. Do not try to finish a process with a
-  new `send_input` call after closure: it will be refused along with other calls.
+  can wait for their input or backpressure. Send required input, close stdin and
+  send any signals before closing admission: `send_input`, `close_stdin` and
+  `send_signal` are all refused afterward.
 - Expiry requests cancellation and returns `IncompleteExecutionDrain`. It bounds
   waiting, not OS completion, and does not prove that effects have stopped. Keep
   the Tokio runtime alive and call drain again; concurrent and repeated drains
@@ -147,19 +148,24 @@ and error evolution, requires a separate crate-level policy before stabilization
 - Cancellation ends interrupted read/list streams with `Unavailable` after any
   buffered results, including when the output queue is full. Partial output is
   not successful completion. Graceful close allows admitted reads and lists to
-  finish. Worker watches retire quietly at close; Direct watches retire quietly
-  during drain or cancellation.
-- Cancellation wakes uploads awaiting `Open` or subsequent input. Supervised
-  filesystem mutations can finish during `cancellation_grace`; stalled identity
-  workers are then terminated and the outcome may be unknown. Direct execution
-  waits for outstanding I/O, which may outlast any deadline. Already-admitted
-  same-key retries can still wait for the owner or the retry retention deadline;
+  finish. Worker watches retire with recoverable `Unavailable` at close or
+  cancellation, so downstream SSE/WebSocket consumers can reconnect. Direct
+  watches retire quietly during drain or cancellation. A read/list/relay producer
+  that exits without reporting completion ends its stream with `Internal`.
+- Cancellation wakes uploads awaiting `Open` or subsequent input. Request
+  cancellation gives supervised filesystem mutations `cancellation_grace` before
+  terminating stalled identity workers. Service/parent cancellation, including
+  drain-deadline expiry, can terminate workers immediately without that grace;
+  outcomes may be unknown. Direct execution waits for outstanding I/O, which may
+  outlast any deadline. Already-admitted same-key retries can still wait for the
+  owner or the retry retention deadline;
   closure does not directly wake them. Cancellation does not undo effects or make
   a fresh-key retry safe. Successful drain implies neither flush nor persistence.
 - The daemon still cancels its own token before draining and retains its overall
-  shutdown deadline. Active requests, wire schemas, identity policy and process
-  exit semantics are unchanged. Admission-only close is for hosts that choose a
-  graceful wait before requesting cancellation.
+  shutdown deadline. Wire schemas, identity policy and process exit semantics are
+  unchanged; interrupted streams now report failure instead of successful EOF.
+  Admission-only close is for hosts that choose a graceful wait before requesting
+  cancellation.
 - Linux PTY descriptors are created with close-on-exec atomically. Other Unix
   targets serialize PTY allocation and workload spawning through a private lock;
   unrelated spawners do not participate in that coordination.

@@ -645,7 +645,7 @@ impl FilesystemHandle {
         &self,
         user: Option<String>,
         request: R,
-        stream_end: StreamEnd,
+        stream_end: CancellationToken,
         call: impl AsyncFnOnce(
             &mut FilesystemClient<tonic::transport::Channel>,
             R,
@@ -667,19 +667,19 @@ impl FilesystemHandle {
         &self,
         incoming: impl Stream<Item = Result<T, Status>> + Send + 'static,
         worker: super::worker::WorkerClient,
-        stream_end: StreamEnd,
+        stream_end: CancellationToken,
     ) -> RoutedStream<T> {
         let router = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         // Keep cancellation outside the bounded data queue: a stalled reader
         // must neither delay cleanup nor turn a truncated response into EOF.
-        let (failure_tx, failure_rx) = tokio::sync::oneshot::channel();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         self.tasks.spawn(async move {
             tokio::pin!(incoming);
             let failure = loop {
                 let message = tokio::select! {
                     biased;
-                    failure = stream_end.wait() => break failure,
+                    _ = stream_end.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
                     _ = tx.closed() => break None,
                     message = incoming.next() => message,
                 };
@@ -696,20 +696,19 @@ impl FilesystemHandle {
                 }
                 tokio::select! {
                     biased;
-                    failure = stream_end.wait() => break failure,
+                    _ = stream_end.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
                     sent = tx.send(message) => if sent.is_err() { break None; },
                 }
                 if failed {
                     break None;
                 }
             };
-            if let Some(status) = failure {
-                let _ = failure_tx.send(status);
-            }
+            let _ = completion_tx.send(failure.map_or(Ok(()), Err));
         });
-        let failure = futures_util::stream::once(failure_rx)
-            .filter_map(|failure| std::future::ready(failure.ok().map(Err)));
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).chain(failure)) as RoutedStream<T>
+        Box::pin(super::terminal::with_completion(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+            completion_rx,
+        )) as RoutedStream<T>
     }
 
     /// Read through a descriptor the user's worker opened: the worker checks
@@ -1051,30 +1050,6 @@ fn is_worker_transport_failure(status: &Status) -> bool {
     )
 }
 
-// Read/list cancellation truncates a finite result. Passive watches have no
-// natural completion and retire quietly during shutdown on both backends.
-#[cfg(target_os = "linux")]
-enum StreamEnd {
-    ReadOrList(CancellationToken),
-    Watch(CancellationToken),
-}
-
-#[cfg(target_os = "linux")]
-impl StreamEnd {
-    async fn wait(&self) -> Option<Status> {
-        match self {
-            Self::ReadOrList(cancelled) => {
-                cancelled.cancelled().await;
-                Some(Status::unavailable("filesystem stream cancelled"))
-            }
-            Self::Watch(closed) => {
-                closed.cancelled().await;
-                None
-            }
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 type RoutedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -1156,7 +1131,7 @@ impl Filesystem for FilesystemHandle {
                 self.stream(
                     request.user.take(),
                     request,
-                    StreamEnd::ReadOrList(self.shutdown.clone()),
+                    self.shutdown.clone(),
                     FilesystemClient::list,
                 )
                 .await
@@ -1186,13 +1161,8 @@ impl Filesystem for FilesystemHandle {
                 {
                     return Ok(Response::new(stream));
                 }
-                self.stream(
-                    user,
-                    request,
-                    StreamEnd::ReadOrList(self.shutdown.clone()),
-                    FilesystemClient::read,
-                )
-                .await
+                self.stream(user, request, self.shutdown.clone(), FilesystemClient::read)
+                    .await
             }
         }
     }
@@ -1358,7 +1328,7 @@ impl Filesystem for FilesystemHandle {
                 self.stream(
                     request.user.take(),
                     request,
-                    StreamEnd::Watch(self.lifecycle.closed()),
+                    self.lifecycle.closed(),
                     FilesystemClient::watch,
                 )
                 .await

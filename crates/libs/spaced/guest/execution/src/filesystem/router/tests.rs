@@ -346,8 +346,8 @@ async fn reset_routes_release_admission_on_removal_or_expiry() {
 }
 
 #[tokio::test]
-async fn worker_watches_end_quietly_on_close_or_cancellation() {
-    for cancel in [false, true] {
+async fn worker_watches_report_recoverable_closure() {
+    for mode in 0..3 {
         let directory = tempfile::tempdir().unwrap();
         let router = identity_router();
         let (_channel, proxy, server) = connected_worker(&router).await;
@@ -359,18 +359,23 @@ async fn worker_watches_end_quietly_on_close_or_cancellation() {
             .await
             .unwrap()
             .into_inner();
-        if cancel {
-            router.shutdown.cancel();
-        } else {
+        if mode != 1 {
             router.lifecycle.close();
         }
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), stream.next())
-                .await
-                .expect("watch retires without drain")
-                .is_none(),
-            "watch retirement is normal completion on either backend"
-        );
+        if mode != 0 {
+            router.shutdown.cancel();
+        }
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("watch retires without drain");
+        // SSE and WebSocket consumers reconnect on Unavailable; successful
+        // EOF instead closes their sessions permanently.
+        let status = terminal
+            .expect("closure must remain recoverable")
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(!pplx_space_common_grpc::is_refused_before_start(&status));
+        assert!(stream.next().await.is_none());
         tokio::time::timeout(Duration::from_secs(5), router.drain())
             .await
             .unwrap();
@@ -403,7 +408,7 @@ fn dropping_watch_stream_outside_runtime_does_not_panic() {
             router.forward_stream(
                 tokio_stream::pending::<Result<(), Status>>(),
                 worker,
-                StreamEnd::Watch(router.lifecycle.closed()),
+                router.lifecycle.closed(),
             ),
             router.worker_pool().expect("worker backend").clone(),
             user,
@@ -1094,7 +1099,7 @@ async fn drain_settles_stream_failure_before_the_caller_polls_it() {
     let mut stream = router.forward_stream(
         futures_util::stream::iter([Err::<(), _>(Status::unavailable("worker connection lost"))]),
         worker,
-        StreamEnd::ReadOrList(router.shutdown.clone()),
+        router.shutdown.clone(),
     );
     tokio::time::timeout(Duration::from_secs(5), router.drain())
         .await
@@ -1133,7 +1138,7 @@ async fn cancelled_worker_streams_report_failure_after_partial_results() {
                             path: file.display().to_string(),
                             ..Default::default()
                         },
-                        StreamEnd::ReadOrList(router.shutdown.clone()),
+                        router.shutdown.clone(),
                         FilesystemClient::read,
                     )
                     .await
@@ -1203,11 +1208,7 @@ async fn cancelled_relay_reports_failure_with_empty_or_full_output_queue() {
                     std::future::pending().await
                 }
             }));
-        let mut stream = router.forward_stream(
-            incoming,
-            worker,
-            StreamEnd::ReadOrList(router.shutdown.clone()),
-        );
+        let mut stream = router.forward_stream(incoming, worker, router.shutdown.clone());
         if full {
             tokio::time::timeout(Duration::from_secs(5), waiting)
                 .await
@@ -1235,4 +1236,36 @@ async fn cancelled_relay_reports_failure_with_empty_or_full_output_queue() {
         }
         assert!(stream.next().await.is_none());
     }
+}
+
+#[tokio::test]
+async fn worker_relay_panic_reports_failure_after_buffered_output() {
+    let router = identity_router();
+    let pool = router.worker_pool().unwrap();
+    pool.insert_test_client(
+        current_user(),
+        Endpoint::from_static("http://[::]:50051").connect_lazy(),
+    )
+    .await
+    .unwrap();
+    let worker = pool.client_for(current_user()).await.unwrap();
+    let incoming = futures_util::stream::iter([Ok(())]).chain(futures_util::stream::once(async {
+        panic!("injected relay producer failure");
+    }));
+    let mut stream = router.forward_stream(incoming, worker, router.shutdown.clone());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream.next().await.unwrap().unwrap();
+        let status = stream
+            .next()
+            .await
+            .expect("panic must not become EOF")
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(!pplx_space_common_grpc::is_refused_before_start(&status));
+        assert!(stream.next().await.is_none());
+        router.drain().await;
+    })
+    .await
+    .unwrap();
+    assert!(router.tasks.is_empty());
 }

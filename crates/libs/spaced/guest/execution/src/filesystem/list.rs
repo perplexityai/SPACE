@@ -48,7 +48,7 @@ pub(super) async fn list_stream(
     let mut directories_enqueued = 1_usize;
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     // A separate terminal status cannot be lost behind a full entry queue.
-    let (failure_tx, failure_rx) = tokio::sync::oneshot::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     tasks.spawn(async move {
         let _stream_slot = stream_slot;
         let result: Result<(), Status> = async {
@@ -89,17 +89,12 @@ pub(super) async fn list_stream(
             }
             Ok(())
         }.await;
-        if let Err(status) = result {
-            let _ = failure_tx.send(status);
-        }
+        let _ = completion_tx.send(result);
     });
-    let failure = futures_util::stream::once(failure_rx)
-        .filter_map(|failure| std::future::ready(failure.ok().map(Err)));
-    Ok(Box::pin(
-        tokio_stream::wrappers::ReceiverStream::new(rx)
-            .map(Ok)
-            .chain(failure),
-    ) as GuestFileInfoStream)
+    Ok(Box::pin(super::terminal::with_completion(
+        tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok),
+        completion_rx,
+    )) as GuestFileInfoStream)
 }
 
 #[cfg(test)]
