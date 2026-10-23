@@ -24,6 +24,9 @@ mod concurrency;
 
 #[derive(Default)]
 struct FakeSink {
+    checkpoint: Mutex<DiscoveryCheckpoint>,
+    fail_checkpoint_load: Mutex<bool>,
+    fail_checkpoint_save: Mutex<bool>,
     /// Stateful protocol oracle for concurrent workflows. SQL transitions are
     /// covered by the Postgres lifecycle tests below.
     enforce_protocol: bool,
@@ -31,6 +34,8 @@ struct FakeSink {
     backend_returns: Mutex<Vec<SnapshotId>>,
     candidates: Mutex<Vec<PruneCandidate>>,
     candidate_page_size: Option<usize>,
+    /// A sparse raw page whose query consumes the discovery allowance.
+    empty_page_through: Option<SnapshotId>,
     claimed: Mutex<Vec<PruneCandidate>>,
     fail_candidate_scan: Mutex<bool>,
     fail_claimed_scan: Mutex<bool>,
@@ -117,6 +122,32 @@ impl FakeSink {
 }
 
 impl RetentionSink for Arc<FakeSink> {
+    async fn load_discovery_checkpoint(&self) -> Result<DiscoveryCheckpoint, sqlx::Error> {
+        if *self.fail_checkpoint_load.lock().unwrap() {
+            return Err(sqlx::Error::PoolClosed);
+        }
+        Ok(*self.checkpoint.lock().unwrap())
+    }
+
+    async fn save_discovery_checkpoint(
+        &self,
+        revision: i64,
+        after: Option<SnapshotId>,
+    ) -> Result<bool, sqlx::Error> {
+        if *self.fail_checkpoint_save.lock().unwrap() {
+            return Err(sqlx::Error::PoolClosed);
+        }
+        let mut checkpoint = self.checkpoint.lock().unwrap();
+        if checkpoint.revision != revision {
+            return Ok(false);
+        }
+        *checkpoint = DiscoveryCheckpoint {
+            after,
+            revision: revision + 1,
+        };
+        Ok(true)
+    }
+
     async fn list_candidates(
         &self,
         keep_n: i64,
@@ -126,6 +157,16 @@ impl RetentionSink for Arc<FakeSink> {
     ) -> Result<CandidatePage, sqlx::Error> {
         if *self.fail_candidate_scan.lock().unwrap() {
             return Err(sqlx::Error::PoolClosed);
+        }
+        if let Some(through) = self.empty_page_through
+            && after.is_none_or(|after| after < through)
+        {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            return Ok(CandidatePage {
+                candidates: Vec::new(),
+                scanned_through: Some(through),
+                exhausted: false,
+            });
         }
         self.last_keep_n.lock().unwrap().replace(keep_n);
         self.last_min_age.lock().unwrap().replace(min_age);
@@ -1101,9 +1142,12 @@ async fn t11_unsupported_scheme_candidate_skipped() {
     assert!(sink.prune_calls().is_empty());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn t12_max_per_tick_caps_processing() {
-    let sink = FakeSink::new();
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn t12_budget_cursor_survives_restart_and_wraps() {
+    let sink = Arc::new(FakeSink {
+        empty_page_through: Some(SnapshotId::from_uuid(Uuid::from_u128(1))),
+        ..FakeSink::default()
+    });
     let backend = FakeBackend::new();
     let rows: Vec<PruneCandidate> = (0..5)
         .map(|i| candidate(&fixture_uri(&i.to_string()), false))
@@ -1116,6 +1160,13 @@ async fn t12_max_per_tick_caps_processing() {
     }
     sink.set_candidates(rows);
     let mut r = Reconciler::new(config(2), sink.clone(), registry_with(backend.clone()));
+    assert_eq!(
+        r.tick().await.scanned,
+        0,
+        "sparse discovery consumes its time allowance"
+    );
+    drop(r);
+    let mut r = Reconciler::new(config(2), sink.clone(), registry_with(backend.clone()));
     let report = r.tick().await;
     // The tick fetches `2 * max_per_tick` rows (here 4 of the 5 staged),
     // prunes up to `max_per_tick` (2), and rate-limits the rest of what it
@@ -1123,6 +1174,8 @@ async fn t12_max_per_tick_caps_processing() {
     // up next tick.
     assert_eq!(report.pruned, 2);
     assert_eq!(report.rate_limited, 2);
+    drop(r);
+    let mut r = Reconciler::new(config(2), sink.clone(), registry_with(backend.clone()));
     // Increasing the budget must continue past the first two rows, even
     // though this fixture retains finalized rows in its candidate list.
     r.set_work_limits(NonZeroU32::new(3).unwrap(), NonZeroU32::new(2).unwrap());
@@ -1133,6 +1186,77 @@ async fn t12_max_per_tick_caps_processing() {
         calls.iter().collect::<std::collections::HashSet<_>>().len(),
         5
     );
+    // The completed pass must wrap, including across another restart.
+    drop(r);
+    let mut r = Reconciler::new(config(2), sink.clone(), registry_with(backend));
+    assert_eq!(r.tick().await.scanned, 0, "wrap revisits the sparse prefix");
+    assert_eq!(r.tick().await.pruned, 2);
+    assert_eq!(&sink.prune_calls()[5..], &calls[..2]);
+}
+
+#[tokio::test]
+async fn checkpoint_errors_retry_saved_progress_without_blocking_recovery() {
+    for fail_load in [true, false] {
+        let sink = FakeSink::new();
+        let backend = FakeBackend::new();
+        let rows: Vec<_> = (0..4)
+            .map(|i| candidate(&fixture_uri(&format!("checkpoint-{i}")), false))
+            .collect();
+        sink.set_candidates(rows.clone());
+        *sink.checkpoint.lock().unwrap() = DiscoveryCheckpoint {
+            after: Some(rows[0].snapshot_id),
+            revision: 1,
+        };
+        *sink.fail_checkpoint_load.lock().unwrap() = fail_load;
+        *sink.fail_checkpoint_save.lock().unwrap() = !fail_load;
+        let mut r = Reconciler::new(config(1), sink.clone(), registry_with(backend.clone()));
+        assert_eq!(r.tick().await.checkpoint_errors, 1);
+        assert_eq!(
+            sink.checkpoint.lock().unwrap().after,
+            Some(rows[0].snapshot_id)
+        );
+        if fail_load {
+            assert!(sink.claim_calls().is_empty());
+            sink.set_claimed(vec![rows[0].clone()]);
+            r.set_work_limits(NonZeroU32::new(2).unwrap(), NonZeroU32::MIN);
+            assert_eq!(
+                r.tick().await.resumed,
+                1,
+                "checkpoint errors cannot stop recovery"
+            );
+        }
+        *sink.fail_checkpoint_load.lock().unwrap() = false;
+        *sink.fail_checkpoint_save.lock().unwrap() = false;
+        // Continuing the same instance must reload after a failed save too.
+        r.set_work_limits(NonZeroU32::MIN, NonZeroU32::MIN);
+        sink.set_claimed(Vec::new());
+        assert_eq!(r.tick().await.pruned, 1);
+        assert_eq!(sink.claim_calls().last(), Some(&rows[1].snapshot_id));
+    }
+}
+
+#[tokio::test]
+async fn dry_run_does_not_consume_the_live_checkpoint() {
+    let sink = FakeSink::new();
+    let rows: Vec<_> = (0..3)
+        .map(|i| candidate(&fixture_uri(&format!("dry-checkpoint-{i}")), false))
+        .collect();
+    sink.set_candidates(rows.clone());
+    let checkpoint = DiscoveryCheckpoint {
+        after: Some(rows[0].snapshot_id),
+        revision: 7,
+    };
+    *sink.checkpoint.lock().unwrap() = checkpoint;
+    *sink.fail_checkpoint_load.lock().unwrap() = true;
+    *sink.fail_checkpoint_save.lock().unwrap() = true;
+    let mut policy = config(1);
+    policy.dry_run = true;
+    let mut r = Reconciler::new(policy, sink.clone(), registry_with(FakeBackend::new()));
+    let report = r.tick().await;
+    assert_eq!(report.would_prune, 1);
+    assert_eq!(report.checkpoint_errors, 0);
+    assert_eq!(*sink.checkpoint.lock().unwrap(), checkpoint);
+    assert!(sink.claim_calls().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1198,6 +1322,45 @@ mod postgres {
     };
 
     use pplx_space_test_env::TestResult;
+
+    #[tokio::test]
+    async fn discovery_checkpoint_is_durable_and_rejects_stale_writes_across_wrap() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let store = SnapshotRetentionDbStore::new(db.pool.clone());
+        let initial = store.load_discovery_checkpoint().await?;
+        assert_eq!(initial.after, None);
+        // The cursor remains valid even when the referenced snapshot is absent.
+        let after = Some(SnapshotId::from_uuid(Uuid::now_v7()));
+        assert!(
+            store
+                .save_discovery_checkpoint(initial.revision, after)
+                .await?
+        );
+        drop(store);
+        let replacement = SnapshotRetentionDbStore::new(db.pool.clone());
+        let resumed = replacement.load_discovery_checkpoint().await?;
+        assert_eq!(resumed.after, after);
+        assert!(
+            !replacement
+                .save_discovery_checkpoint(initial.revision, None)
+                .await?
+        );
+        assert!(
+            replacement
+                .save_discovery_checkpoint(resumed.revision, None)
+                .await?
+        );
+        // A stale writer cannot resurrect the previous pass after wraparound.
+        assert!(
+            !replacement
+                .save_discovery_checkpoint(resumed.revision, after)
+                .await?
+        );
+        assert_eq!(replacement.load_discovery_checkpoint().await?.after, None);
+        Ok(())
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn discovery_candidate_cap_keeps_siblings_outside_the_raw_page() -> TestResult {

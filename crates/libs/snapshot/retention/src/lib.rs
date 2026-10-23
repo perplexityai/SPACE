@@ -82,6 +82,13 @@
 //! contracts. The hosting application owns environment parsing, interval
 //! scheduling, singleton authority, and shutdown. SPACE currently hosts it in
 //! `space-cluster-controller`; API servers do not start background loops.
+//!
+//! Fresh discovery checkpoints its position after a completed live tick. A
+//! replacement resumes there; interrupted ticks may replay work, never skip it.
+//! Reaching the end checkpoints `None`, so older rows are revisited next tick.
+//! Dry runs neither load nor write the live checkpoint. Claims remain a separate
+//! durable recovery queue. The host must still enforce singleton authority;
+//! checkpoint revisions only prevent stale writers from overwriting progress.
 
 use pplx_space_common_core::types::SnapshotId;
 
@@ -201,6 +208,20 @@ pub struct CandidatePage {
 
 /// Postgres-side surface. Production impl: [`SnapshotRetentionDbStore`].
 pub trait RetentionSink: Send + Sync + 'static {
+    /// Load the database-scoped fresh-discovery checkpoint. Failure must not
+    /// be treated as an empty checkpoint and overwrite previously saved progress.
+    fn load_discovery_checkpoint(
+        &self,
+    ) -> impl std::future::Future<Output = Result<DiscoveryCheckpoint, sqlx::Error>> + Send;
+
+    /// Save only if the revision still matches; false means another writer won.
+    /// The cursor is advisory and must not reference a snapshot by foreign key.
+    fn save_discovery_checkpoint(
+        &self,
+        expected_revision: i64,
+        after: Option<SnapshotId>,
+    ) -> impl std::future::Future<Output = Result<bool, sqlx::Error>> + Send;
+
     /// Discover a bounded raw page and return at most `limit` eligible rows.
     /// Claimed rows are absent; an empty candidate page can still make progress.
     fn list_candidates(
@@ -258,6 +279,12 @@ pub enum ClaimOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimedScanEpoch {
     pub through: SnapshotId,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryCheckpoint {
+    pub after: Option<SnapshotId>,
+    pub revision: i64,
 }
 
 /// Outcome of [`RetentionSink::finalize_prune`].
@@ -321,6 +348,8 @@ pub struct TickReport {
     /// blob is already cleared, so the next tick re-lists (idempotent) and
     /// retries the delete. Transient.
     pub db_errors: usize,
+    /// Failed checkpoint reads/writes or conflicting checkpoint writers.
+    pub checkpoint_errors: usize,
     /// Finalize calls refused because the row was not `deleting`.
     pub finalize_protocol_errors: usize,
     /// Refused claims or rows already gone at finalize.
@@ -360,6 +389,7 @@ impl TickReport {
             backend_errors,
             claim_errors,
             db_errors,
+            checkpoint_errors,
             finalize_protocol_errors,
             drift_skips,
             resumed,
@@ -381,6 +411,7 @@ impl TickReport {
         self.backend_errors += backend_errors;
         self.claim_errors += claim_errors;
         self.db_errors += db_errors;
+        self.checkpoint_errors += checkpoint_errors;
         self.finalize_protocol_errors += finalize_protocol_errors;
         self.drift_skips += drift_skips;
         self.resumed += resumed;
@@ -397,6 +428,8 @@ pub struct Reconciler<S: RetentionSink> {
     registry: StorageBackendRegistry,
     /// Cursor for fresh candidates only.
     scan_after: Option<SnapshotId>,
+    /// None until a successful load, and after a failed/contended save.
+    checkpoint_revision: Option<i64>,
     /// Independent cursor for claimed recovery.
     claimed_scan_after: Option<SnapshotId>,
     /// Fixed upper bound for the current recovery epoch. New higher-id claims
@@ -426,6 +459,7 @@ impl<S: RetentionSink> Reconciler<S> {
             sink: Arc::new(sink),
             registry,
             scan_after: None,
+            checkpoint_revision: None,
             claimed_scan_after: None,
             claimed_scan_through: None,
             recovery_gets_extra: true,
@@ -627,6 +661,19 @@ impl<S: RetentionSink> Reconciler<S> {
         if budget == 0 {
             return;
         }
+        if !self.policy.dry_run && self.checkpoint_revision.is_none() {
+            match self.sink.load_discovery_checkpoint().await {
+                Ok(checkpoint) => {
+                    self.scan_after = checkpoint.after;
+                    self.checkpoint_revision = Some(checkpoint.revision);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "retention checkpoint load failed; deferring fresh discovery");
+                    report.checkpoint_errors += 1;
+                    return;
+                }
+            }
+        }
         // Empty keeper pages must not cost an entire controller interval. Bound
         // discovery independently of destructive work: at most 10M raw rows and
         // five seconds of page starts per tick. An in-flight query still obeys
@@ -692,6 +739,23 @@ impl<S: RetentionSink> Reconciler<S> {
         if successful_scan {
             sweeper_metrics::candidates_scanned(report.scanned as u64);
             sweeper_metrics::rate_limited(report.rate_limited as u64);
+            if let Some(revision) = self.checkpoint_revision {
+                match self
+                    .sink
+                    .save_discovery_checkpoint(revision, self.scan_after)
+                    .await
+                {
+                    Ok(true) => self.checkpoint_revision = Some(revision + 1),
+                    result => {
+                        tracing::warn!(
+                            ?result,
+                            "retention checkpoint save failed or conflicted; reloading next tick"
+                        );
+                        self.checkpoint_revision = None;
+                        report.checkpoint_errors += 1;
+                    }
+                }
+            }
         }
     }
 

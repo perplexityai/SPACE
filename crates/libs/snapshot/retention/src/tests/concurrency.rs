@@ -298,3 +298,67 @@ async fn failures_do_not_cancel_siblings_and_claims_finish_forward() {
         "finish-forward never reclaims or unclaims"
     );
 }
+
+#[tokio::test]
+async fn interrupted_tick_keeps_checkpoint_and_replacement_recovers_claims() {
+    let sink = Arc::new(FakeSink {
+        enforce_protocol: true,
+        ..FakeSink::default()
+    });
+    let rows: Vec<_> = (0..3)
+        .map(|i| candidate(&fixture_uri(&format!("interrupted-{i}")), false))
+        .collect();
+    let saved = DiscoveryCheckpoint {
+        after: Some(rows[0].snapshot_id),
+        revision: 1,
+    };
+    *sink.checkpoint.lock().unwrap() = saved;
+    sink.set_candidates(rows[1..].to_vec());
+    let fake = FakeBackend::new();
+    let mut gates = HashMap::new();
+    let mut releases = Vec::new();
+    for row in &rows[1..] {
+        let (tx, rx) = oneshot::channel();
+        gates.insert(row.snapshot_id, rx);
+        releases.push(tx);
+    }
+    let backend = Arc::new(GatedBackend {
+        sink: sink.clone(),
+        backend: fake.clone(),
+        routes: rows
+            .iter()
+            .map(|r| (candidate_route(r).to_owned(), r.snapshot_id))
+            .collect(),
+        gates: Mutex::new(gates),
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    });
+    let mut registry = StorageBackendRegistry::new();
+    registry.register(backend.clone());
+    let mut policy = config(2);
+    policy.max_concurrent_deletes = NonZeroU32::new(2).unwrap();
+    let mut r = Reconciler::new(policy, sink.clone(), registry);
+    let mut tick = Box::pin(tokio::task::unconstrained(r.tick()));
+    assert!(poll_until_stalled(tick.as_mut()).is_pending());
+    assert_eq!(sink.claim_calls().len(), 2);
+    assert_eq!(*sink.checkpoint.lock().unwrap(), saved);
+    drop(tick);
+    drop(r);
+    drop(releases);
+    let mut registry = StorageBackendRegistry::new();
+    registry.register(Arc::new(GatedBackend {
+        sink: sink.clone(),
+        backend: fake,
+        routes: backend.routes.clone(),
+        gates: Mutex::default(),
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    }));
+    let mut replacement = Reconciler::new(config(2), sink.clone(), registry);
+    assert_eq!(
+        replacement.tick().await.resumed + replacement.tick().await.resumed,
+        2
+    );
+    assert!(sink.claimed.lock().unwrap().is_empty());
+    assert_eq!(sink.claim_calls().len(), 2, "recovery must not reclaim");
+}
