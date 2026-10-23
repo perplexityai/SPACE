@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    native::{ProcessReplayState, first_frame_attach_token_from_recv},
-    runtime_route::sweep_expired_ecw_routes,
-};
+use crate::{native::first_frame_attach_token_from_recv, runtime_route::sweep_expired_ecw_routes};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
 use pplx_space_common_core::{
@@ -3785,47 +3782,29 @@ async fn first_frame_attach_token_times_out_at_deadline() {
     assert_eq!(result, Err(DataPlaneErrorCode::AttachDeadlineExceeded));
 }
 
-#[test]
-fn process_sse_resume_emits_resync_at_next_event_id() {
-    let session_id = DataPlaneSessionId::Process(Default::default());
-    let replay = ProcessReplayState::load(session_id, Some(41));
-
-    assert_eq!(replay.event_seq, 42);
-    assert_eq!(replay.backend_output_cursor, None);
-    assert_eq!(replay.pending.len(), 1);
-
-    let fresh = ProcessReplayState::load(session_id, None);
-    assert_eq!(fresh.event_seq, 0);
-    assert!(fresh.pending.is_empty());
-}
-
-/// The public reconnection contract, shared by process and file-watch
-/// sessions: `Last-Event-ID` resumes the live stream at `last + 1` behind a
-/// `resync_required(cursor_replay_unavailable)` frame; no cursor, no frame.
-/// Missed output is never replayed, so the backend cursor stays unset.
+/// The file-watch reconnection contract: `Last-Event-ID` resumes the live
+/// stream at `last + 1` behind a `resync_required(cursor_replay_unavailable)`
+/// frame; no cursor, no frame.
 #[test]
 fn last_event_id_resume_is_a_cursor_replay_unavailable_resync() {
-    for kind in ["process", "file_watch"] {
-        assert_eq!(resume_resync_frame(kind, None), None, "{kind}");
-        assert_eq!(
-            resume_resync_frame(kind, Some(41)),
-            Some((
-                42,
-                DataPlaneServerFrame::ResyncRequired {
-                    reason: DataPlaneResyncReason::CursorReplayUnavailable,
-                },
-            )),
-            "{kind}"
-        );
-        // The largest cursor the request boundary admits still gets a fresh id.
-        assert_eq!(
-            resume_resync_frame(kind, Some(MAX_LAST_EVENT_ID)).map(|(seq, _)| seq),
-            Some(MAX_LAST_EVENT_ID + 1),
-            "{kind}"
-        );
-    }
+    let kind = "file_watch";
+    assert_eq!(resume_resync_frame(kind, None), None);
     assert_eq!(
-        resume_resync_frame("process", Some(0)).map(|(seq, _)| seq),
+        resume_resync_frame(kind, Some(41)),
+        Some((
+            42,
+            DataPlaneServerFrame::ResyncRequired {
+                reason: DataPlaneResyncReason::CursorReplayUnavailable,
+            },
+        ))
+    );
+    // The largest cursor the request boundary admits still gets a fresh id.
+    assert_eq!(
+        resume_resync_frame(kind, Some(MAX_LAST_EVENT_ID)).map(|(seq, _)| seq),
+        Some(MAX_LAST_EVENT_ID + 1)
+    );
+    assert_eq!(
+        resume_resync_frame(kind, Some(0)).map(|(seq, _)| seq),
         Some(1)
     );
 }

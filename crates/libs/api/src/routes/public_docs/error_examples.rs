@@ -39,6 +39,7 @@ fn control_plane_examples(
         }
         "409" => vec![Conflict],
         "412" => vec![FailedPrecondition],
+        "429" if operation == CREATE_SANDBOX => vec![QuotaExceeded],
         "429" => vec![RateLimited],
         "500" => vec![Internal],
         "503" if sandbox_mutation(operation) => vec![CapacityUnavailable, ServiceUnavailable],

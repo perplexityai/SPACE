@@ -89,8 +89,8 @@ const PROCESS_OUTPUT_GUARANTEED_BYTES: usize =
 const PROCESS_OUTPUT_SHARED_BYTES: usize =
     PROCESS_OUTPUT_RETENTION_MAX_BYTES - PROCESS_RECORD_LIMIT * PROCESS_OUTPUT_GUARANTEED_BYTES;
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
-const PROCESS_OUTPUT_LAGGED_MESSAGE: &str =
-    "process output stream fell behind retained output buffer";
+const PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE: &str =
+    "process output cursor is past the output the process has written";
 const PROCESS_CAPACITY_MESSAGE: &str = "too many retained processes";
 // A start phase slower than this is logged with every phase's duration once
 // the spawn returns, so a slow start names its cause. The account lookup
@@ -443,7 +443,7 @@ impl ProcessLaunch {
         ));
         claim.publish(Arc::clone(&record));
 
-        let cursor = record.journal.cursor(Some(0));
+        let cursor = record.journal.cursor(Some(0), false);
         let mut output_tasks = VecDeque::new();
         if let Some(reader) = pty_reader {
             output_tasks.push_back(spawn_process_output_reader(
@@ -1237,12 +1237,25 @@ impl ProcessEventJournal {
             .completed_at
     }
 
-    fn cursor(self: &Arc<Self>, requested: Option<u64>) -> ProcessJournalCursor {
+    /// A reader from `requested`, or from the live tail when `None`. With
+    /// `from_oldest_retained`, a cursor before the oldest retained output
+    /// starts there instead of lagging. That start is chosen under the lock
+    /// that also claims the primary reader's place, so no output written
+    /// meanwhile can evict it.
+    fn cursor(
+        self: &Arc<Self>,
+        requested: Option<u64>,
+        from_oldest_retained: bool,
+    ) -> ProcessJournalCursor {
         let mut state = self
             .state
             .lock()
             .expect("process output journal lock poisoned");
-        let next_sequence = requested.unwrap_or(state.next_sequence);
+        let next_sequence = match requested {
+            Some(cursor) if from_oldest_retained => cursor.max(state.first_sequence),
+            Some(cursor) => cursor,
+            None => state.next_sequence,
+        };
         // Only one reader controls the producer. Observers cannot stall an
         // existing consumer; after disconnect a new attachment can take over.
         let primary = if !state.backpressure_disabled
@@ -1419,7 +1432,15 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned");
         if cursor < state.first_sequence {
-            return ProcessJournalRead::Lagged;
+            return ProcessJournalRead::Lagged {
+                first_sequence: state.first_sequence,
+            };
+        }
+        // A cursor only ever advances over output it has read, so one past the
+        // end came from a caller, not from this journal: waiting for output to
+        // reach it would skip everything written before it.
+        if cursor > state.next_sequence {
+            return ProcessJournalRead::Ahead;
         }
         if cursor < state.next_sequence {
             let offset = (cursor - state.first_sequence) as usize;
@@ -1493,7 +1514,8 @@ enum ProcessJournalRead {
     Event(ProcessEvent),
     Exit(ProcessEvent),
     Pending,
-    Lagged,
+    Lagged { first_sequence: u64 },
+    Ahead,
 }
 
 #[derive(Clone, Copy)]
@@ -1620,7 +1642,12 @@ impl ProcessRegistry {
         Some(record)
     }
 
-    fn replay(&self, process_id: &ProcessId, output_cursor: Option<u64>) -> Option<ProcessReplay> {
+    fn replay(
+        &self,
+        process_id: &ProcessId,
+        output_cursor: Option<u64>,
+        from_oldest_retained: bool,
+    ) -> Option<ProcessReplay> {
         let record = self.get_record(process_id)?;
         if output_cursor.is_none()
             && let Some(exit) = record.journal.exit()
@@ -1632,7 +1659,7 @@ impl ProcessRegistry {
         }
         Some(ProcessReplay::Running {
             started: record.started.clone(),
-            cursor: record.journal.cursor(output_cursor),
+            cursor: record.journal.cursor(output_cursor, from_oldest_retained),
         })
     }
 
@@ -1781,9 +1808,10 @@ fn process_event_stream_with_prefix(
                         return Some((Ok(event), (prefix, cursor)));
                     }
                     ProcessJournalRead::Exit(exit) => break Ok(exit),
-                    ProcessJournalRead::Lagged => {
-                        break Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE));
+                    ProcessJournalRead::Lagged { first_sequence } => {
+                        break Err(process_output_lagged_status(Some(first_sequence)));
                     }
+                    ProcessJournalRead::Ahead => break Err(process_output_cursor_ahead_status()),
                     ProcessJournalRead::Pending => {
                         if current.changed.changed().await.is_err() {
                             break evicted_process_journal_result(current);
@@ -1796,15 +1824,46 @@ fn process_event_stream_with_prefix(
     ))
 }
 
+fn process_output_cursor_ahead_status() -> Status {
+    let mut status = Status::out_of_range(PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE);
+    status.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+        ),
+    );
+    status
+}
+
+/// The status that ends a stream whose cursor is before the oldest retained
+/// output, naming where that output starts, `first_sequence`, so the caller
+/// can continue from there. `None` once the journal itself is gone.
+fn process_output_lagged_status(first_sequence: Option<u64>) -> Status {
+    let mut status =
+        Status::resource_exhausted(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE);
+    let metadata = status.metadata_mut();
+    metadata.insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+        ),
+    );
+    if let Some(first_sequence) = first_sequence {
+        metadata.insert(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            tonic::metadata::MetadataValue::from(first_sequence),
+        );
+    }
+    status
+}
+
 fn evicted_process_journal_result(cursor: &ProcessJournalCursor) -> Result<ProcessEvent, Status> {
     match cursor.changed.borrow().clone() {
         ProcessJournalChange::Exit {
             event,
             next_sequence,
         } if cursor.next_sequence >= next_sequence => Ok(event),
-        ProcessJournalChange::Exit { .. } => {
-            Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE))
-        }
+        ProcessJournalChange::Exit { .. } => Err(process_output_lagged_status(None)),
         ProcessJournalChange::OutputChanged => Err(Status::resource_exhausted(
             "process replay state was evicted",
         )),
@@ -1826,13 +1885,19 @@ fn process_started_event(process_id: &ProcessId, pid: Option<u32>) -> Result<Pro
     })
 }
 
-fn process_connected_event(process_id: &ProcessId, pid: Option<u32>) -> ProcessEvent {
+fn process_connected_event(
+    process_id: &ProcessId,
+    pid: Option<u32>,
+    output_cursor: Option<u64>,
+) -> ProcessEvent {
     ProcessEvent {
         process_id: process_id.as_str().to_string(),
         pid,
         event: Some(
             pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Connected(
-                pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {},
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {
+                    output_cursor,
+                },
             ),
         ),
     }
@@ -2307,7 +2372,7 @@ impl Process for ExecutionService {
                 let replay = self
                     .inner
                     .processes
-                    .replay(&process_id, Some(0))
+                    .replay(&process_id, Some(0), false)
                     .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
                 return Ok(Response::new(
                     replay_process_event_stream(replay) as Self::StartStream
@@ -2436,7 +2501,11 @@ impl Process for ExecutionService {
         let replay = self
             .inner
             .processes
-            .replay(&process_id, request.output_cursor)
+            .replay(
+                &process_id,
+                request.output_cursor,
+                request.resume_from_oldest_retained,
+            )
             .ok_or_else(|| Status::not_found("process not found"))?;
         let pid = match &replay {
             ProcessReplay::Running { started, .. } | ProcessReplay::Completed { started, .. } => {
@@ -2444,10 +2513,13 @@ impl Process for ExecutionService {
             }
         };
         let stream = match replay {
-            ProcessReplay::Running { cursor, .. } => process_event_stream_with_prefix(
-                vec![process_connected_event(&process_id, pid)],
-                Some(cursor),
-            ),
+            ProcessReplay::Running { cursor, .. } => {
+                let output_cursor = request.output_cursor.map(|_| cursor.next_sequence);
+                process_event_stream_with_prefix(
+                    vec![process_connected_event(&process_id, pid, output_cursor)],
+                    Some(cursor),
+                )
+            }
             replay @ ProcessReplay::Completed { .. } => replay_process_event_stream(replay),
         };
         tracing::debug!(

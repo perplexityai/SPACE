@@ -9,8 +9,11 @@
 //!
 //! Reconnects follow the guest's journal contract (`ConnectProcessRequest`):
 //! output records carry a sequence starting at `0`; a connect with an
-//! `output_cursor` replays every record at or after that sequence, and a
-//! connect without one follows the live tail and replays nothing. The
+//! `output_cursor` replays every record at or after that sequence, a cursor
+//! past the output ends the stream with the guest's tagged `OUT_OF_RANGE`,
+//! and a connect without one follows the live tail and replays nothing. The
+//! simulator retains all output, so it never reports a cursor as evicted, and
+//! `ProcessConnected` reports that the stream starts at the cursor. The
 //! process table is per sandbox and is dropped with the sandbox. An exited
 //! process stays listable with its exit, as the guest retains one, until then.
 
@@ -256,7 +259,8 @@ enum ConnectMode {
     /// background start ends after `Started`, like production's stream.
     Start { background: bool },
     /// Reattach: `Connected`, then the journal from `output_cursor`; `None`
-    /// is the live tail, which replays nothing.
+    /// is the live tail, which replays nothing, and a cursor past the output
+    /// fails.
     Connect { output_cursor: Option<u64> },
 }
 
@@ -278,10 +282,20 @@ fn event_stream(process: &SimProcess, mode: ConnectMode) -> SimProcessEventStrea
             }
             (started, 0)
         }
-        ConnectMode::Connect { output_cursor } => (
-            sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {}),
-            output_cursor.unwrap_or(tail).min(tail),
-        ),
+        ConnectMode::Connect { output_cursor } => {
+            // Nothing is evicted, so the stream starts at the cursor.
+            let connected =
+                sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {
+                    output_cursor,
+                });
+            if output_cursor.is_some_and(|cursor| cursor > tail) {
+                return Box::pin(tokio_stream::iter(vec![
+                    Ok(event(&process_id, Some(pid), connected)),
+                    Err(cursor_ahead_status()),
+                ]));
+            }
+            (connected, output_cursor.unwrap_or(tail))
+        }
     };
     let mut initial = vec![Ok(event(&process_id, Some(pid), first))];
     initial.extend(
@@ -311,6 +325,19 @@ fn event_stream(process: &SimProcess, mode: ConnectMode) -> SimProcessEventStrea
             ))
         });
     Box::pin(tokio_stream::iter(initial).chain(exit))
+}
+
+/// The guest's status for a connect whose cursor is past the output.
+fn cursor_ahead_status() -> Status {
+    let mut status =
+        Status::out_of_range("process output cursor is past the output the process has written");
+    status.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+        ),
+    );
+    status
 }
 
 fn event(

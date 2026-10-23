@@ -335,7 +335,7 @@ async fn losing_start_response_preserves_output_supervision_and_idempotency() {
             let mut changed = record.journal.subscribe();
             while record.journal.tail_cursor() < 2
                 || (completed && !record.journal.is_completed())
-                || (evicted && !matches!(record.journal.read(0), ProcessJournalRead::Lagged))
+                || (evicted && !matches!(record.journal.read(0), ProcessJournalRead::Lagged { .. }))
             {
                 changed.changed().await.unwrap();
             }
@@ -369,7 +369,10 @@ async fn losing_start_response_preserves_output_supervision_and_idempotency() {
                         Err(error) => {
                             assert!(evicted);
                             assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-                            assert_eq!(error.message(), PROCESS_OUTPUT_LAGGED_MESSAGE);
+                            assert_eq!(
+                                error.message(),
+                                pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE
+                            );
                             lagged = true;
                             assert!(replay.next().await.is_none());
                             break;
@@ -521,7 +524,7 @@ async fn process_journal_reports_lag_when_local_ring_evicts_output() {
             ));
         }
         assert!(
-            matches!(journal.read(0), ProcessJournalRead::Lagged),
+            matches!(journal.read(0), ProcessJournalRead::Lagged { .. }),
             "retention must charge tiny event overhead as well as payloads"
         );
         assert!(matches!(
@@ -545,7 +548,7 @@ async fn attached_output_backpressures_and_disconnect_releases_the_producer() {
             shared_bytes,
         ))));
         let process_id = ProcessId::new();
-        let cursor = journal.cursor(Some(0));
+        let cursor = journal.cursor(Some(0), false);
         let event = process_stdout_event(&process_id, Some(1), vec![b'a'; 8192]);
         while journal.try_append_output(event.clone()).is_none() {}
         let tail = journal.tail_cursor();
@@ -646,7 +649,8 @@ async fn fallback_drain_bounds_inherited_writer_despite_consuming_reader() {
     let id = ProcessId::new();
     let pid = std::process::id();
     let journal = Arc::new(ProcessEventJournal::new(output_slots()));
-    let mut stream = process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0))));
+    let mut stream =
+        process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0), false)));
     let event = process_stdout_event(&id, Some(pid), vec![0; 8192]);
     while journal.try_append_output(event.clone()).is_none() {}
     let (blocked, mut pending) = tokio::sync::mpsc::channel(1);
@@ -804,7 +808,7 @@ fn process_journal_drops_oversized_chunk_without_panicking() {
         vec![0; PROCESS_OUTPUT_RETENTION_BYTES + 1],
     ));
 
-    assert!(matches!(journal.read(0), ProcessJournalRead::Lagged));
+    assert!(matches!(journal.read(0), ProcessJournalRead::Lagged { .. }));
 }
 
 #[test]
@@ -823,7 +827,7 @@ fn output_pressure_is_isolated_to_one_process() {
     ));
     noisy.append_output(process_stdout_event(&noisy_id, Some(1), vec![1]));
 
-    assert!(matches!(noisy.read(0), ProcessJournalRead::Lagged));
+    assert!(matches!(noisy.read(0), ProcessJournalRead::Lagged { .. }));
     assert!(matches!(quiet.read(0), ProcessJournalRead::Event(_)));
 }
 
@@ -902,6 +906,138 @@ async fn evicted_cursor_reports_lag_before_terminal_event() {
             .code(),
         tonic::Code::ResourceExhausted
     );
+}
+
+/// A cursor past the written output fails at once, whether the process is
+/// still running or has exited, rather than waiting for output to reach it and
+/// skipping everything written before. The end of the output stays valid.
+#[tokio::test]
+async fn cursor_past_the_output_fails_instead_of_waiting() {
+    for completed in [false, true] {
+        let journal = Arc::new(ProcessEventJournal::new(output_slots()));
+        let process_id = ProcessId::new();
+        journal.append_output(process_stdout_event(
+            &process_id,
+            Some(1),
+            b"written".to_vec(),
+        ));
+        let exit = process_stdout_event(&process_id, Some(1), b"terminal".to_vec());
+        if completed {
+            journal.complete(exit.clone());
+        }
+
+        let mut ahead =
+            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(5), false)));
+        let error = tokio::time::timeout(Duration::from_secs(1), ahead.next())
+            .await
+            .expect("a cursor past the output must not wait")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::OutOfRange,
+            "completed: {completed}"
+        );
+        assert_eq!(
+            error
+                .metadata()
+                .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+        );
+        assert!(ahead.next().await.is_none());
+
+        let mut at_end =
+            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(1), false)));
+        let next = tokio::time::timeout(Duration::from_millis(100), at_end.next()).await;
+        if completed {
+            assert_eq!(next.unwrap().unwrap().unwrap(), exit);
+        } else {
+            assert!(next.is_err(), "the end of a running process's output waits");
+        }
+    }
+}
+
+/// A cursor before the oldest retained output fails with a status that says
+/// so and where that output starts, so the caller can continue from there
+/// instead of jumping to the live tail.
+#[tokio::test]
+async fn lagged_cursor_reports_the_oldest_retained_output() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+
+    let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(0))));
+    let process_id = ProcessId::new();
+    journal.append_output(process_stdout_event(
+        &process_id,
+        Some(1),
+        vec![0; PROCESS_OUTPUT_RETENTION_BYTES],
+    ));
+    journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
+
+    let mut lagged =
+        process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0), false)));
+    let error = lagged.next().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    let metadata = |key| {
+        error
+            .metadata()
+            .get(key)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        metadata(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY).as_deref(),
+        Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED)
+    );
+    let first_sequence: u64 =
+        metadata(pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+            .expect("the oldest retained output")
+            .parse()
+            .unwrap();
+    assert_eq!(first_sequence, 1);
+    assert!(lagged.next().await.is_none());
+
+    let mut retained = process_event_stream_with_prefix(
+        Vec::new(),
+        Some(journal.cursor(Some(first_sequence), false)),
+    );
+    let event = retained.next().await.unwrap().unwrap();
+    assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
+}
+
+/// A lagged cursor that asks for the oldest retained output starts there,
+/// and holds it: the start is chosen under the lock that makes the reader
+/// primary, so output written before it reads anything waits for it instead
+/// of evicting that output, and the reader cannot lag again.
+#[tokio::test]
+async fn lagged_cursor_from_oldest_retained_starts_there_and_holds_it() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+
+    let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(0))));
+    let process_id = ProcessId::new();
+    journal.append_output(process_stdout_event(
+        &process_id,
+        Some(1),
+        vec![0; PROCESS_OUTPUT_RETENTION_BYTES],
+    ));
+    journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
+
+    let cursor = journal.cursor(Some(0), true);
+    assert_eq!(
+        cursor.next_sequence, 1,
+        "starts at the oldest retained output"
+    );
+    let more = process_stdout_event(&process_id, Some(1), vec![0; 8192]);
+    let waited = (0..2 * PROCESS_OUTPUT_RETENTION_BYTES / 8192)
+        .any(|_| journal.try_append_output(more.clone()).is_some());
+    assert!(
+        waited,
+        "later output waits for the reader instead of evicting"
+    );
+
+    let mut retained = process_event_stream_with_prefix(Vec::new(), Some(cursor));
+    let event = retained.next().await.unwrap().unwrap();
+    assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
 }
 
 #[tokio::test]

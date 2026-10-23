@@ -46,10 +46,13 @@ async fn connect_replays_the_journal_from_the_cursor_only() {
 
     // Everything already delivered: nothing to replay.
     let at_tail = collect(table.connect("sbx", &process_id, Some(1)).await.unwrap()).await;
-    assert!(matches!(
+    assert_eq!(
         at_tail[0],
-        sbx::spaced_process_event::Event::Connected(_)
-    ));
+        sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {
+            output_cursor: Some(1)
+        }),
+        "reports where it starts"
+    );
     assert_eq!(stdout_count(&at_tail), 0);
     assert!(matches!(
         at_tail.last(),
@@ -64,9 +67,28 @@ async fn connect_replays_the_journal_from_the_cursor_only() {
     let live = collect(table.connect("sbx", &process_id, None).await.unwrap()).await;
     assert_eq!(stdout_count(&live), 0);
 
-    // A cursor past the tail is clamped rather than panicking.
-    let beyond = collect(table.connect("sbx", &process_id, Some(99)).await.unwrap()).await;
-    assert_eq!(stdout_count(&beyond), 0);
+    // A cursor past the tail fails, as the guest's does, instead of
+    // skipping the output before it.
+    let beyond: Vec<_> = table
+        .connect("sbx", &process_id, Some(2))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert_eq!(beyond.len(), 2);
+    assert!(matches!(
+        beyond[0].as_ref().unwrap().event,
+        Some(sbx::spaced_process_event::Event::Connected(_))
+    ));
+    let error = beyond[1].as_ref().unwrap_err();
+    assert_eq!(error.code(), tonic::Code::OutOfRange);
+    assert_eq!(
+        error
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok()),
+        Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+    );
 }
 
 /// Every execution-teardown path (stop, kill, delete, cleanup) ends the

@@ -230,7 +230,24 @@ message ConnectProcessRequest {
   // follows the live tail. Native public data-plane replay sets this to the
   // number of stdout/stderr events already durably captured so output emitted
   // while a client was disconnected is replayed from the guest journal.
+  //
+  // A cursor outside the retained output ends the stream with a status whose
+  // `space-error-reason` metadata names why:
+  // - past the output the process has written: OUT_OF_RANGE,
+  //   `process-output-cursor-ahead`;
+  // - before the oldest output the guest still retains: RESOURCE_EXHAUSTED,
+  //   `process-output-lagged`, with `space-process-output-first-sequence`
+  //   metadata giving the cursor of that oldest output, in decimal, while the
+  //   guest still holds the process.
+  // Older guests end a lagged stream with RESOURCE_EXHAUSTED and no reason,
+  // and wait for output to reach a cursor past it.
   optional uint64 output_cursor = 3;
+  // With `output_cursor` before the oldest output the guest still retains,
+  // start the stream at that oldest output instead of ending it as lagged.
+  // The guest chooses the start under the lock that also gives the stream
+  // its reader position, so output written meanwhile cannot evict it, and
+  // reports it in `ProcessConnected.output_cursor`. Older guests ignore it.
+  bool resume_from_oldest_retained = 4;
 }
 message ListProcessesRequest {
   // Also list processes that have exited but are still retained, with their
@@ -288,7 +305,13 @@ message ProcessEvent {
   }
 }
 message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
-message ProcessConnected {}
+message ProcessConnected {
+  // The journal cursor of the first output this stream sends, when the
+  // request set `output_cursor`: that cursor, or a later one when
+  // `resume_from_oldest_retained` moved the start past evicted output.
+  // Unset by older guests.
+  optional uint64 output_cursor = 1;
+}
 message ProcessOutput { bytes data = 1; }
 message ProcessExit {
   oneof outcome {

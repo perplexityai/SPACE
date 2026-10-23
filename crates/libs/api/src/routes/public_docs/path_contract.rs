@@ -184,6 +184,7 @@ pub(super) fn insert_sandbox_operation_paths(
                 "413": { "description": "Request body is too large" },
                 "415": { "description": "Content-Type must be application/json" },
                 "422": { "description": "JSON body does not match CreateSandboxRequest" },
+                "429": { "description": "The organization or per-user sandbox limit is reached (`quota_exceeded`). Not retryable: the limit lifts once a delete completes or an in-flight create ends" },
                 "500": { "description": "Sandbox operation could not be persisted" },
                 "503": { "description": "Sandbox operation is temporarily unavailable" }
             }
@@ -590,7 +591,16 @@ pub(super) fn complete_control_plane_responses(spec: &mut Value) {
                     "x-request-id".to_string(),
                     json!({ "$ref": "#/components/headers/RequestId" }),
                 );
-                if matches!(status.as_str(), "429" | "503") {
+                // createSandbox's only 429 is its sandbox limit, which a delay
+                // does not lift.
+                let create_sandbox = path == CREATE_SANDBOX.relative_path()
+                    && method == CREATE_SANDBOX.method().openapi_name();
+                let retry_after = match status.as_str() {
+                    "429" => !create_sandbox,
+                    "503" => true,
+                    _ => false,
+                };
+                if retry_after {
                     headers.insert(
                         "Retry-After".to_string(),
                         json!({

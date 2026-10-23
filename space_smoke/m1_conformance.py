@@ -87,7 +87,7 @@ KNOWN_SESSION_STATES = frozenset({
 KNOWN_PROCESS_EXIT_STATUSES = frozenset({"exited", "signaled", "timed_out", "unknown"})
 KNOWN_PUBLIC_ERROR_CODES = frozenset({
     "invalid_request", "unauthorized", "forbidden", "not_found", "conflict",
-    "failed_precondition", "capacity_unavailable", "rate_limited",
+    "failed_precondition", "capacity_unavailable", "rate_limited", "quota_exceeded",
     "idempotency_conflict", "operation_failed", "service_unavailable", "internal",
 })
 MARKER = b"m1-conformance"
@@ -623,9 +623,9 @@ class M1Conformance:
                     f"match process_started {streamed_process_id!r}"
                 )
 
-            # Reconnect with Last-Event-ID. The documented guarantee: the live
-            # stream resumes at last+1 behind resync_required, missed output is
-            # not replayed, and the process is still controllable.
+            # Reconnect with Last-Event-ID. The documented guarantee: the stream
+            # resumes with the output after that event, without a resync while
+            # the output is retained, and the process is still controllable.
             resumed: list[dict[str, object]] = []
             second = self.read_session_events(
                 api, command.session_id, first.last_id, resumed,
@@ -634,21 +634,16 @@ class M1Conformance:
             )
             if not second.attached_first:
                 raise InvariantViolation("reconnected stream did not start with an attached frame")
-            if not second.identified:
-                raise InvariantViolation("reconnected stream delivered no identified events")
-            first_id, first_frame = second.identified[0]
-            if first_frame.get("type") != "resync_required":
+            # Only output and resync_required carry ids, so a resume that sends
+            # neither has none; any it does send must follow Last-Event-ID.
+            if second.identified and second.identified[0][0] <= first.last_id:
                 raise InvariantViolation(
-                    f"reconnect did not start with resync_required: {first_frame}"
+                    f"resumed stream restarted ids at {second.identified[0][0]}, "
+                    f"after {first.last_id}"
                 )
-            if first_frame.get("reason") != "cursor_replay_unavailable":
-                raise InvariantViolation(
-                    f"unexpected resync reason on Last-Event-ID resume: {first_frame}"
-                )
-            if first_id != first.last_id + 1:
-                raise InvariantViolation(
-                    f"resumed stream restarted ids at {first_id}, expected {first.last_id + 1}"
-                )
+            resyncs = [frame for frame in resumed if frame.get("type") == "resync_required"]
+            if resyncs:
+                raise InvariantViolation(f"lossless Last-Event-ID resume asked to resync: {resyncs}")
             frames.extend(resumed)
 
         exits = [frame for frame in frames if frame.get("type") == "process_exited"]
@@ -657,8 +652,10 @@ class M1Conformance:
         for frame in exits:
             assert_known("process_exited.status", frame.get("status"), KNOWN_PROCESS_EXIT_STATUSES)
         stdout = stdout_of(frames)
-        if MARKER not in stdout:
-            raise InvariantViolation(f"session event stream omitted command output: {stdout!r}")
+        if stdout.count(MARKER) != 1:
+            raise InvariantViolation(
+                f"session event streams did not carry the command output once: {stdout!r}"
+            )
 
     def read_session_events(
         self,
@@ -671,7 +668,8 @@ class M1Conformance:
     ) -> SessionRead:
         """Read one SSE connection until `stop()` holds, asserting id monotonicity.
 
-        Every identified frame must carry exactly the previous id plus one;
+        Every identified frame must carry a greater id than the one before, and
+        on a process stream only output and resync_required frames carry one;
         `on_connected` runs once the stream reports the process (started or
         reconnected), so process control can be exercised while attached.
         """
@@ -688,10 +686,14 @@ class M1Conformance:
                 if first:
                     result.attached_first = frame.get("type") == "attached" and frame_id is None
                     first = False
+                if (frame_id is not None) != (
+                    frame.get("type") in {"stdout", "stderr", "resync_required"}
+                ):
+                    raise InvariantViolation(f"unexpected SSE id {frame_id} on {frame}")
                 if frame_id is not None:
-                    if result.last_id is not None and frame_id != result.last_id + 1:
+                    if result.last_id is not None and frame_id <= result.last_id:
                         raise InvariantViolation(
-                            f"SSE ids must increase by one: got {frame_id} after {result.last_id}"
+                            f"SSE ids must increase: got {frame_id} after {result.last_id}"
                         )
                     result.last_id = frame_id
                     result.identified.append((frame_id, frame))

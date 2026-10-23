@@ -88,7 +88,7 @@ fn openapi_identifier(value: &str) -> String {
 
 pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
     let response = json!({
-        "description": "### Read the stream\n\n- Each SSE event carries one `DataPlaneServerFrame` JSON object. Ignore comment heartbeats.\n- Decode stdout and stderr's `data_base64` using standard base64.\n- Success requires `process_exited` with exit code zero and no error or missing output. HTTP 200 or a closed stream alone is not success.\n\n### Example output\n\nExcerpt, not a complete stream:\n\n```text\nid: 2\nevent: stdout\ndata: {\"type\":\"stdout\",\"seq\":0,\"data_base64\":\"SGVsbG8gZnJvbSBTUEFDRQo=\"}\n\nid: 3\nevent: process_exited\ndata: {\"type\":\"process_exited\",\"process_id\":\"proc_00000000-0000-0000-0000-000000000000\",\"exit_code\":0,\"status\":\"exited\"}\n\n```",
+        "description": "### Read the stream\n\n- Each SSE event carries one `DataPlaneServerFrame` JSON object. Ignore comment heartbeats.\n- Decode stdout and stderr's `data_base64` using standard base64.\n- Success requires `process_exited` with exit code zero and no error or missing output. HTTP 200 or a closed stream alone is not success.\n\n### Example output\n\nExcerpt, not a complete stream:\n\n```text\nid: 4503599627632640\nevent: stdout\ndata: {\"type\":\"stdout\",\"seq\":1,\"data_base64\":\"SGVsbG8gZnJvbSBTUEFDRQo=\"}\n\nevent: process_exited\ndata: {\"type\":\"process_exited\",\"process_id\":\"proc_00000000-0000-0000-0000-000000000000\",\"exit_code\":0,\"status\":\"exited\"}\n\n```",
         "content": {
             "text/event-stream": {
                 "schema": { "type": "string" },
@@ -117,7 +117,7 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
             "name": "Last-Event-ID",
             "in": "header",
             "required": false,
-            "description": "SSE `id` of the last frame received.\n\n- Resumes the live stream; missed output is not replayed.\n- The first identified frame is `resync_required` (`cursor_replay_unavailable`), with id `Last-Event-ID + 1`.\n- Values above the `int64` maximum return 400.",
+            "description": "SSE `id` of the last frame received.\n\n- Echo the `id` exactly as received, on the same session's stream.\n- A process stream resumes with the output after that frame while it is retained; otherwise `resync_required` precedes the output it continues with: `cursor_out_of_window` when the output is evicted or the `id` is past it, `cursor_replay_unavailable` when the `id` does not resume exactly.\n- A file-watch stream resumes live; its first identified frame is `resync_required` (`cursor_replay_unavailable`), with id `Last-Event-ID + 1`.\n- Values above the `int64` maximum, and process stream values too high to number a later frame above, return 400.",
             "schema": {
                 "type": "integer",
                 "format": "int64",

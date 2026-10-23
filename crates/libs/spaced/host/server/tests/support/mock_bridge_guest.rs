@@ -447,7 +447,9 @@ impl Process for MockBridgeGuest {
             pid: Some(123),
             event: Some(
                 pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Connected(
-                    pplx_space_spaced_common::proto::bridge_guest::ProcessConnected {},
+                    pplx_space_spaced_common::proto::bridge_guest::ProcessConnected {
+                        output_cursor: None,
+                    },
                 ),
             ),
         })];

@@ -2579,9 +2579,27 @@ type ConnectProcessRequest struct {
 	// follows the live tail. Native public data-plane replay sets this to the
 	// number of stdout/stderr events already durably captured so output emitted
 	// while a client was disconnected is replayed from the guest journal.
-	OutputCursor  *uint64 `protobuf:"varint,3,opt,name=output_cursor,json=outputCursor,proto3,oneof" json:"output_cursor,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	//
+	// A cursor outside the retained output ends the stream with a status whose
+	// `space-error-reason` metadata names why:
+	//   - past the output the process has written: OUT_OF_RANGE,
+	//     `process-output-cursor-ahead`;
+	//   - before the oldest output the guest still retains: RESOURCE_EXHAUSTED,
+	//     `process-output-lagged`, with `space-process-output-first-sequence`
+	//     metadata giving the cursor of that oldest output, in decimal, while the
+	//     guest still holds the process.
+	//
+	// Older guests end a lagged stream with RESOURCE_EXHAUSTED and no reason,
+	// and wait for output to reach a cursor past it.
+	OutputCursor *uint64 `protobuf:"varint,3,opt,name=output_cursor,json=outputCursor,proto3,oneof" json:"output_cursor,omitempty"`
+	// With `output_cursor` before the oldest output the guest still retains,
+	// start the stream at that oldest output instead of ending it as lagged.
+	// The guest chooses the start under the lock that also gives the stream
+	// its reader position, so output written meanwhile cannot evict it, and
+	// reports it in `ProcessConnected.output_cursor`. Older guests ignore it.
+	ResumeFromOldestRetained bool `protobuf:"varint,4,opt,name=resume_from_oldest_retained,json=resumeFromOldestRetained,proto3" json:"resume_from_oldest_retained,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *ConnectProcessRequest) Reset() {
@@ -2633,6 +2651,13 @@ func (x *ConnectProcessRequest) GetOutputCursor() uint64 {
 		return *x.OutputCursor
 	}
 	return 0
+}
+
+func (x *ConnectProcessRequest) GetResumeFromOldestRetained() bool {
+	if x != nil {
+		return x.ResumeFromOldestRetained
+	}
+	return false
 }
 
 type ListProcessesRequest struct {
@@ -3426,7 +3451,12 @@ func (x *ProcessStarted) GetStartTime() *timestamppb.Timestamp {
 }
 
 type ProcessConnected struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The journal cursor of the first output this stream sends, when the
+	// request set `output_cursor`: that cursor, or a later one when
+	// `resume_from_oldest_retained` moved the start past evicted output.
+	// Unset by older guests.
+	OutputCursor  *uint64 `protobuf:"varint,1,opt,name=output_cursor,json=outputCursor,proto3,oneof" json:"output_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3459,6 +3489,13 @@ func (x *ProcessConnected) ProtoReflect() protoreflect.Message {
 // Deprecated: Use ProcessConnected.ProtoReflect.Descriptor instead.
 func (*ProcessConnected) Descriptor() ([]byte, []int) {
 	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{53}
+}
+
+func (x *ProcessConnected) GetOutputCursor() uint64 {
+	if x != nil && x.OutputCursor != nil {
+		return *x.OutputCursor
+	}
+	return 0
 }
 
 type ProcessOutput struct {
@@ -4191,12 +4228,13 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x04rows\x18\x01 \x01(\rR\x04rows\x12\x12\n" +
 	"\x04cols\x18\x02 \x01(\rR\x04cols\"D\n" +
 	"\tPtyConfig\x127\n" +
-	"\x04size\x18\x01 \x01(\v2#.space.spaced.operations.v1.PtySizeR\x04size\"\xb8\x01\n" +
+	"\x04size\x18\x01 \x01(\v2#.space.spaced.operations.v1.PtySizeR\x04size\"\xf7\x01\n" +
 	"\x15ConnectProcessRequest\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\x128\n" +
 	"\atimeout\x18\x02 \x01(\v2\x19.google.protobuf.DurationH\x00R\atimeout\x88\x01\x01\x12(\n" +
-	"\routput_cursor\x18\x03 \x01(\x04H\x01R\foutputCursor\x88\x01\x01B\n" +
+	"\routput_cursor\x18\x03 \x01(\x04H\x01R\foutputCursor\x88\x01\x01\x12=\n" +
+	"\x1bresume_from_oldest_retained\x18\x04 \x01(\bR\x18resumeFromOldestRetainedB\n" +
 	"\n" +
 	"\b_timeoutB\x10\n" +
 	"\x0e_output_cursor\"p\n" +
@@ -4264,8 +4302,10 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x0eProcessStarted\x12>\n" +
 	"\n" +
 	"start_time\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampH\x00R\tstartTime\x88\x01\x01B\r\n" +
-	"\v_start_time\"\x12\n" +
-	"\x10ProcessConnected\"#\n" +
+	"\v_start_time\"N\n" +
+	"\x10ProcessConnected\x12(\n" +
+	"\routput_cursor\x18\x01 \x01(\x04H\x00R\foutputCursor\x88\x01\x01B\x10\n" +
+	"\x0e_output_cursor\"#\n" +
 	"\rProcessOutput\x12\x12\n" +
 	"\x04data\x18\x01 \x01(\fR\x04data\"\xbc\x02\n" +
 	"\vProcessExit\x12C\n" +
@@ -4496,6 +4536,7 @@ func file_spaced_operations_v1_operations_proto_init() {
 		(*ProcessEvent_Exit)(nil),
 	}
 	file_spaced_operations_v1_operations_proto_msgTypes[52].OneofWrappers = []any{}
+	file_spaced_operations_v1_operations_proto_msgTypes[53].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[55].OneofWrappers = []any{
 		(*ProcessExit_Exited)(nil),
 		(*ProcessExit_Signaled)(nil),

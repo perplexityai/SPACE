@@ -16256,6 +16256,7 @@ pub(crate) mod service_tests {
                     process_id: "process".to_string(),
                     timeout: None,
                     output_cursor: Some(7),
+                    resume_from_oldest_retained: false,
                 },
             ),
         });

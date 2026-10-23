@@ -16,6 +16,6 @@ sequenceDiagram
         DP->>K: exit early
     else --shutdown-grace-secs set and passed, or a second stop signal
         DP->>L: cancel stream_shutdown_token
-        Note over L: native SSE: body ends → reconnect with Last-Event-ID<br/>(live resume, missed output not replayed)<br/>native WebSocket: close 1012<br/>ECW connect: unavailable end-stream → reconnect<br/>(unreported start: unknown, no retry)<br/>streamed StreamInput: 409<br/>other upgrades: closed
+        Note over L: native SSE: body ends → reconnect with Last-Event-ID<br/>(resumes output the sandbox still retains)<br/>native WebSocket: close 1012<br/>ECW connect: unavailable end-stream → reconnect<br/>(unreported start: unknown, no retry)<br/>streamed StreamInput: 409<br/>other upgrades: closed
         DP->>K: exit (after ≤ 5s cancel grace)
     end

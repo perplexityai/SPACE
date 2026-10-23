@@ -979,6 +979,7 @@ open_wire_enum!(PublicErrorCode, "public error code", {
     FailedPrecondition => "failed_precondition",
     CapacityUnavailable => "capacity_unavailable",
     RateLimited => "rate_limited",
+    QuotaExceeded => "quota_exceeded",
     IdempotencyConflict => "idempotency_conflict",
     OperationFailed => "operation_failed",
     ServiceUnavailable => "service_unavailable",
@@ -1941,7 +1942,9 @@ pub struct DataPlaneAttachInfo {
     /// and validate the destination before sending credentials.
     pub url: String,
     /// HTTP SSE endpoint for this session, when supported. Attaching a command
-    /// starts execution; streams are live and do not replay missed output.
+    /// starts execution. Reconnecting with `Last-Event-ID` resumes with the
+    /// output after that event while the sandbox retains it, a bounded amount
+    /// per process; otherwise the stream sends `resync_required` first.
     pub events_url: Option<String>,
     /// Session-scoped credential, not a management API token. Keep it secret
     /// and send it only to the verified attachment destination.

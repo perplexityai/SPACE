@@ -77,6 +77,10 @@ pub const PUBLIC_OPERATION_CLAIM_LOCK_KEY: i64 = 0x7370_6163_655f_6f70;
 
 mod responses;
 pub(crate) use responses::ResponseAdmissionError;
+mod sandbox_quota;
+pub use sandbox_quota::{
+    SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal, SubjectSandboxQuota,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiProduct {
