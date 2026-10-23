@@ -465,7 +465,13 @@ pub(crate) async fn bridge_process_session(
 ) -> Result<BridgeEnd, StreamBridgeError> {
     let shutdown_token = state.stream_shutdown_token.child_token();
     let (mut sink, mut source) = socket.split();
-    let open = open_native_process_stream(&state, session_id, &mut attached, None);
+    let open = open_native_process_stream(
+        &state,
+        session_id,
+        &mut attached,
+        None,
+        ProcessInput::Writable,
+    );
     // The deadline can pass while the backend stream is still opening.
     let opened = tokio::select! {
         () = shutdown_token.cancelled() => None,

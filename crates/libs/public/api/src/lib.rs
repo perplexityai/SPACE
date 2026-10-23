@@ -1587,7 +1587,19 @@ pub struct CreateCommandRequest {
     #[cfg_attr(feature = "serde", serde(default))]
     #[cfg_attr(feature = "schema", schemars(schema_with = "schema::environment_map"))]
     pub env: EnvMap,
+    /// Runs the command in a pseudo-terminal of this size. Server-sent events
+    /// carry no input and a pty cannot be closed, so a command with `pty` is
+    /// rejected with `invalid_request` when created with
+    /// `Accept: text/event-stream`, even one that never reads input, and
+    /// `/sessions/{session_id}/events` refuses to start it. Only a WebSocket
+    /// attach can start it; after the WebSocket detaches, `/events` can
+    /// reconnect and read its output.
     pub pty: Option<TerminalSize>,
+    /// Keeps standard input open for a WebSocket attach to write. Server-sent
+    /// events carry no input, so when `/sessions/{session_id}/events` starts
+    /// the command, including through `Accept: text/event-stream`, standard
+    /// input is at end of file instead and a later WebSocket attach cannot
+    /// write to it.
     pub stdin: Option<bool>,
     /// Guest user to run as. Defaults to the sandbox's configured user.
     #[cfg_attr(
@@ -2012,7 +2024,9 @@ pub struct PublicErrorEnvelope {
     /// the sandbox is yours and the path inside it does not exist; any other
     /// `not_found`, including a missing or unowned sandbox, carries none. A
     /// `conflict` from replaying a session create whose session has ended
-    /// carries `{"key": "reason", "value": "session_ended"}`.
+    /// carries `{"key": "reason", "value": "session_ended"}`. An
+    /// `invalid_request` for a command streamed with a `pty` carries
+    /// `{"key": "field", "value": "pty"}`.
     pub details: Vec<PublicErrorDetail>,
 }
 
@@ -2023,6 +2037,14 @@ pub const NOT_FOUND_RESOURCE_DETAIL_KEY: &str = "resource";
 /// a sandbox the caller owns. Never set for the sandbox itself, so a missing
 /// sandbox and another org's sandbox stay indistinguishable.
 pub const NOT_FOUND_RESOURCE_PATH: &str = "path";
+
+/// [`PublicErrorDetail::key`] naming a request field an `invalid_request`
+/// rejects; the value is the field's name.
+pub const INVALID_REQUEST_FIELD_DETAIL_KEY: &str = "field";
+
+/// [`INVALID_REQUEST_FIELD_DETAIL_KEY`] value of an `invalid_request` for a
+/// command created with `Accept: text/event-stream` and a `pty`.
+pub const INVALID_REQUEST_FIELD_PTY: &str = "pty";
 
 /// [`PublicErrorDetail::key`] naming why a `conflict` was refused.
 pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";

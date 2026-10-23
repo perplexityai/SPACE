@@ -81,7 +81,7 @@ pub(super) fn insert_command_paths(
         CREATE_COMMAND,
         json!({
                 "summary": "Create command",
-                "description": "Returns a command handle and a session token. Creating the handle does not start the process.\n\n- Attach to `/sessions/{session_id}/events` with the returned session token, not your management API token. Attaching to the stream starts execution.\n- Read stdout, stderr, and the exit status from that stream.\n- To create and attach in one request, send `Accept: text/event-stream`. The 201 response is then that event stream, preceded by a `command` event whose data is `{\"type\":\"command\",\"command\":<PublicCommand>}`. That event has no `id`, and clients that skip unknown frame types may ignore it. When the stream cannot be opened, the response is the JSON handle instead; attach to `events_url` as usual. Reconnect through `/sessions/{session_id}/events`.\n- Interactive input and terminals use a separate WebSocket API, outside this reference.\n\n### Example request\n\n```json\n{\"command\":[\"sh\",\"-c\",\"printf 'Hello from SPACE\\\\n'\"],\"timeout\":\"30s\"}\n```",
+                "description": "Returns a command handle and a session token. Creating the handle does not start the process.\n\n- Attach to `/sessions/{session_id}/events` with the returned session token, not your management API token. Attaching to the stream starts execution.\n- Read stdout, stderr, and the exit status from that stream.\n- To create and attach in one request, send `Accept: text/event-stream`. The 201 response is then that event stream, preceded by a `command` event whose data is `{\"type\":\"command\",\"command\":<PublicCommand>}`. That event has no `id`, and clients that skip unknown frame types may ignore it. When the stream cannot be opened, the response is the JSON handle instead; attach to `events_url` as usual. Reconnect through `/sessions/{session_id}/events`.\n- Interactive input and terminals use a separate WebSocket API, outside this reference. Server-sent events carry no input: a command the events stream starts has standard input at end of file, even with `stdin: true`. A pty cannot be closed, so a `pty` with `Accept: text/event-stream` is rejected with `invalid_request` whether or not the command reads input, and `details` carries `{\"key\":\"field\",\"value\":\"pty\"}`. Without that header the handle is created, but `/sessions/{session_id}/events` refuses to start it with `invalid_request`; after a WebSocket attach starts it and detaches, the events stream can reconnect and read its output.\n\n### Example request\n\n```json\n{\"command\":[\"sh\",\"-c\",\"printf 'Hello from SPACE\\\\n'\"],\"timeout\":\"30s\"}\n```",
                 "parameters": [idempotency_key_parameter.clone()],
                 "requestBody": {
                     "required": true,
@@ -116,7 +116,7 @@ pub(super) fn insert_command_paths(
                             }
                         }
                     },
-                    "400": { "description": "Invalid sandbox id, idempotency key, or command request" },
+                    "400": { "description": "Invalid sandbox id, idempotency key, or command request, or pty with Accept: text/event-stream" },
                     "401": { "description": "Authentication required" },
                     "404": { "description": "Sandbox not found" },
                     "409": { "description": "Idempotency conflict, or a replayed create whose session was revoked" },
