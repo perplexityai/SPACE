@@ -38,7 +38,9 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_INTERNAL_API_DELETED_SUPPRESS_ABSOLUTE` | 500 | |
 | `SPACE_KUBE_NODE_SYNC_ENABLED` | on | Also records the Kubernetes UID of each node running a node-api pod, builders included. Off, only an admin node listing (node-status refresh, reconcile or template listing) records a new or replaced builder's UID; until then the credential-manager authority refuses its callers and tenant template publication from it waits. Turning it off doesn't erase a recorded UID. |
 | `SPACE_OBSERVED_PROJECTION_GC_ENABLED` | on | |
-| `SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED` | on | Without it, create requests are accepted and never complete. |
+| `SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED` | on | Without it, create requests are accepted and never complete, and a failed create's compensation gets only the attempt its request runs. |
+| `SPACE_PLACEMENT_TERMINATION_FENCE` | on | Emergency kill switch for the termination fence: every writer of a sandbox's node placement locks the node row and refuses a node that is `drained`, `terminating`, in an unrecognized phase, or already deleted. Only a recognized false value turns it off, which removes the lock as well as the check. Set it on the API and the cluster controller together; node-drain's cohort restore runs the same placement writer. |
+| `SPACE_CREATE_COMPENSATION_QUEUE` | on | Queues a failed create's teardown as a durable `compensate_create_sandbox` operation. Off, the create claims the sandbox and tears it down immediately, with no operation to retry it: a teardown that fails leaves the row `deleting`, and on the direct substrate nothing else collects it or its guest. Only a recognized false value turns it off. Set it on the API and the cluster controller together, since both run creates; turning it off is the first step of rolling the operation kind back. |
 | `SPACE_SNAPSHOT_STORAGE_SWEEPER_ENABLED` | on | Does nothing without `SPACE_SNAPSHOT_BUCKET`. |
 | `SPACE_ORPHANED_SANDBOX_RECONCILER_ENABLED` | on | |
 | `SPACE_API_RECONCILER_DRY_RUN` | true | The orphaned-sandbox reconciler classifies and logs only until set to false. |

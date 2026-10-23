@@ -155,18 +155,21 @@ const LIVE_POD_REQUIRED_LIFECYCLES: &[&str] =
 ///   be classified after the grace period.
 ///
 /// The Normal SELECT/UPDATE for these lifecycles requires the active
-/// execution row to be older than `CREATE_AGE_THRESHOLD_SECS`: young rows
-/// are presumed in-flight and skipped; old rows are treated as crashed
-/// and reconciled. The Forgotten path catches the variant where the
+/// execution row to be older than `CREATE_AGE_THRESHOLD_SECS` and any
+/// materialization attempt lease to have expired: young or currently-owned
+/// rows are presumed in-flight and skipped. An expired `creating` row is
+/// cleanup work even when its pod is present; classification first commits
+/// `lifecycle='deleting'`, which prevents a successor activation, and only
+/// then deletes the pod. The Forgotten path catches the variant where the
 /// failed-create handler got to run `forget_pod_tracking` (different
 /// signal, same intent).
 const PENDING_POD_LIFECYCLES: &[&str] = &["creating", "starting"];
 
-/// Minimum age of the active execution materialization lease before the
-/// Normal path acts on a `creating`/`starting` candidate. 5 minutes is
-/// comfortably longer than any healthy `pods.create` round-trip including
-/// scheduling and image pull, and short enough that genuinely-stuck rows
-/// don't linger.
+/// Minimum execution age before the Normal path acts on a
+/// `creating`/`starting` candidate. A non-NULL materialization lease must also
+/// be expired. 5 minutes is comfortably longer than any healthy
+/// `pods.create` round-trip including scheduling and image pull, and short
+/// enough that genuinely-stuck rows don't linger.
 const CREATE_AGE_THRESHOLD_SECS: i64 = 300;
 
 #[derive(Debug, Clone)]
@@ -650,9 +653,16 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                     let presence = self.presence.check_pod(&candidate.pod_name).await;
                     match presence {
                         PodPresenceStatus::Present => {
-                            report.pod_present += 1;
-                            self.first_missing_at.remove(&candidate.sandbox_id);
-                            continue;
+                            if candidate.lifecycle != SandboxLifecycle::Creating {
+                                report.pod_present += 1;
+                                self.first_missing_at.remove(&candidate.sandbox_id);
+                                continue;
+                            }
+                            // A creating candidate is selected only after its
+                            // materialization attempt expired. A present pod is
+                            // therefore the orphan to remove, not proof that an
+                            // active request still owns the row.
+                            PodEvidence::Present
                         }
                         PodPresenceStatus::TerminalSucceeded => {
                             report.pod_unready += 1;
@@ -679,7 +689,8 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
 
             // Forgotten and legacy-deleting rows have no pod-presence probe,
             // but still need the same repeated-observation grace as normal
-            // candidates before a guarded mutation.
+            // candidates before a guarded mutation. Expired creates with a
+            // present pod get the same repeated-observation delay.
             if !self.observe_missing_within_grace(&candidate, now, &mut report) {
                 continue;
             }
@@ -1148,9 +1159,21 @@ impl OrphanActionSink for SubstrateActionSink {
             });
         }
 
-        if let OrphanDisposition::FinalizeDelete(_) = plan.disposition {
+        if let OrphanDisposition::FinalizeDelete(delete_reason) = plan.disposition {
             let from_lifecycle = plan.from_lifecycle;
-            tx.rollback().await?;
+            let final_guard = if delete_reason == OrphanDeleteReason::AbandonedCreate {
+                if !claim_abandoned_create_delete(&mut tx, sandbox_id, &guard).await? {
+                    tx.rollback().await?;
+                    return Ok(ClassifyOutcome::SkippedTerminal);
+                }
+                tx.commit().await?;
+                ClassifyGuard::LegacyDeleting {
+                    pod_name: guard.observed_pod_cleanup_name(),
+                }
+            } else {
+                tx.rollback().await?;
+                guard.clone()
+            };
             if !self
                 .delete_observed_pod(sandbox_id, &guard, guard_reason)
                 .await
@@ -1166,13 +1189,12 @@ impl OrphanActionSink for SubstrateActionSink {
             // change prevents finalization rather than deleting fresh state.
             let mut finalize_tx = self.pool.begin().await?;
             let Some(final_plan) =
-                plan_orphan_in_tx(&mut finalize_tx, sandbox_id, &guard, true).await?
+                plan_orphan_in_tx(&mut finalize_tx, sandbox_id, &final_guard, true).await?
             else {
                 finalize_tx.rollback().await?;
                 return Ok(ClassifyOutcome::SkippedTerminal);
             };
-            let OrphanDisposition::FinalizeDelete(final_delete_reason) = final_plan.disposition
-            else {
+            let OrphanDisposition::FinalizeDelete(_) = final_plan.disposition else {
                 finalize_tx.rollback().await?;
                 return Ok(ClassifyOutcome::SkippedTerminal);
             };
@@ -1183,13 +1205,13 @@ impl OrphanActionSink for SubstrateActionSink {
                 SandboxEventType::DeleteCompleted,
                 guard_reason,
                 details_for_guard(&guard)
-                    .with_from_state(final_plan.from_lifecycle.as_str())
+                    .with_from_state(from_lifecycle.as_str())
                     .with_to_state("deleted")
-                    .result(final_delete_reason.as_str()),
+                    .result(delete_reason.as_str()),
             );
             return Ok(ClassifyOutcome::Deleted {
-                from_lifecycle: final_plan.from_lifecycle,
-                reason: final_delete_reason,
+                from_lifecycle,
+                reason: delete_reason,
             });
         }
 
@@ -1331,6 +1353,104 @@ impl OrphanActionSink for SubstrateActionSink {
         .await?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
+}
+
+/// Turn an abandoned initial create into durable delete intent before the pod
+/// is touched. The exact active execution and expired materialization attempt
+/// are rechecked under the locks acquired by `plan_orphan_in_tx`; once this
+/// commits, a successor activation cannot reuse the parent while cleanup is in
+/// flight. The legacy-deleting path will retry both pod deletion and database
+/// finalization after a crash or kube error.
+async fn claim_abandoned_create_delete(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+    guard: &ClassifyGuard,
+) -> Result<bool, sqlx::Error> {
+    // **The `Forgotten` guard needs its own claim, and gets one.**
+    //
+    // `AbandonedCreate` is decided from lifecycle and recoverability alone
+    // (`from_lifecycle == Creating && !recoverable`), so it is reached through
+    // *either* guard — and `ACTIVE_EXECUTION_REQUIRED_LIFECYCLES` documents why
+    // `creating` is in the Forgotten path: a failed pod creation calls
+    // `forget_pod_tracking` while the row is still `creating`, leaving a
+    // non-recoverable shell with no active execution.
+    //
+    // Returning `false` for that guard, as an earlier revision did, made the
+    // caller roll back and report `SkippedTerminal` on every sweep, forever, with
+    // no other owner — the transient sweeper only ages `creating` to `failed`,
+    // which is a different terminal state and does not clean up the shell. So a
+    // shape this path exists to collect became the one it could never collect.
+    //
+    // The pod-based claim below cannot serve it: it requires an *active*
+    // execution matching the observed pod, and Forgotten means precisely that
+    // none is active. This branch therefore claims on the same invariants minus
+    // the pod: still `creating`, still no active execution, the newest execution
+    // still `forgotten`, and no in-flight `creating` snapshot.
+    if matches!(guard, ClassifyGuard::Forgotten) {
+        let forgotten = sqlx::query(sql!(
+            "UPDATE sandboxes s
+                SET lifecycle = 'deleting'
+              WHERE s.id = $1
+                AND s.lifecycle = 'creating'
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM sandbox_k8s_executions active_execution
+                     WHERE active_execution.sandbox_id = s.id
+                       AND active_execution.active
+                )
+                AND EXISTS (
+                    SELECT 1
+                      FROM sandbox_k8s_executions forgotten_execution
+                     WHERE forgotten_execution.sandbox_id = s.id
+                       AND forgotten_execution.state = 'forgotten'
+                       AND forgotten_execution.generation = (
+                           SELECT MAX(generation)
+                             FROM sandbox_k8s_executions
+                            WHERE sandbox_id = s.id
+                       )
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM snapshots creating_snapshot
+                     WHERE creating_snapshot.sandbox_id = s.id
+                       AND creating_snapshot.state = 'creating'
+                )"
+        ))
+        .bind(sandbox_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(forgotten.rows_affected() == 1);
+    }
+    let ClassifyGuard::PodName { name, uid } = guard else {
+        return Ok(false);
+    };
+    let result = sqlx::query(sql!(
+        "UPDATE sandboxes s
+            SET lifecycle = 'deleting'
+           FROM sandbox_k8s_executions e
+          WHERE s.id = $1
+            AND s.lifecycle = 'creating'
+            AND e.sandbox_id = s.id
+            AND e.active
+            AND e.pod_name = $2
+            AND NULLIF(BTRIM(e.pod_uid), '') IS NOT DISTINCT FROM $3
+            AND e.updated_at <= NOW() - ($4 * INTERVAL '1 second')
+            AND (e.activation_attempt_expires_at IS NULL
+                 OR e.activation_attempt_expires_at < NOW())
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM snapshots creating_snapshot
+                 WHERE creating_snapshot.sandbox_id = s.id
+                   AND creating_snapshot.state = 'creating'
+            )"
+    ))
+    .bind(sandbox_id)
+    .bind(name)
+    .bind(uid)
+    .bind(CREATE_AGE_THRESHOLD_SECS)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 impl SubstrateActionSink {
@@ -1688,10 +1808,12 @@ fn classify_guard_sql(guard: &ClassifyGuard) -> &'static str {
                         OR e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
                     )
                 )
-              OR (
-                  s.lifecycle = ANY($6)
-                  AND e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
-              )
+                  OR (
+                      s.lifecycle = ANY($6)
+                      AND e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
+                      AND (e.activation_attempt_expires_at IS NULL
+                           OR e.activation_attempt_expires_at < NOW())
+                  )
             )"
         }
         ClassifyGuard::Forgotten => {
@@ -1814,8 +1936,9 @@ async fn list_candidates_after(
                   --   is still in flight.
                   --   Pending-pod lifecycles ($6) — pod creation may still
                   --   be in flight, so require the execution row to be
-                  --   stale by $7 seconds (crashed-create signal) before
-                  --   acting; younger rows are presumed healthy.
+                  --   stale by $7 seconds (crashed-create signal) and have
+                  --   no unexpired materialization attempt before acting;
+                  --   younger/currently-owned rows are presumed healthy.
                   --   Dormant lifecycles (stopped/suspended/created) are
                   --   excluded entirely — those are intentionally-dormant
                   --   sandboxes the user can recover via `start`.
@@ -1830,6 +1953,8 @@ async fn list_candidates_after(
                       OR (
                           s.lifecycle = ANY($6)
                           AND e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
+                          AND (e.activation_attempt_expires_at IS NULL
+                               OR e.activation_attempt_expires_at < NOW())
                       )
                   ))
                   -- Forgotten: state='forgotten' is the precise orphan
@@ -1851,20 +1976,32 @@ async fn list_candidates_after(
                   )
                   OR s.lifecycle = 'deleting'
               )
-              -- A node-local observed state excludes the row from every
-              -- orphan path: the kube pod may be missing, but the sandbox
-              -- still exists in sbx-mgr and can converge through node publish
-              -- or a later wake. Deleting the stable row here would strand
-              -- external references to the sandbox id. The projection GC is
-              -- the authority that bounds stale observed-state rows.
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM sandbox_observed_states sos
-                  WHERE sos.sandbox_id = s.id
-                    AND (
-                        s.active_node_id IS NULL
-                        OR sos.node_id IS NOT DISTINCT FROM s.active_node_id
-                    )
+              -- A node-local observed state excludes stable rows: the kube
+              -- pod may be missing, but sbx-mgr still has user-owned state
+              -- that can converge through node publish or a later wake. An
+              -- expired initial create is different: no successful API
+              -- response established user ownership, and preserving its
+              -- Present pod is exactly the crash leak this path cleans up.
+              --
+              -- `deleting` is exempt for the same reason, and it has to be:
+              -- `claim_abandoned_create_delete` commits that lifecycle as an
+              -- explicit cleanup intent, so a published observed state means the
+              -- pod is *still there* — the thing to delete, not a reason to skip.
+              -- Without the exemption a claimed row whose pod had already
+              -- published state filtered itself back out on the next pass, and
+              -- `deleting` is not in `SWEEPABLE_LIFECYCLES` either, so nothing
+              -- else would have picked it up.
+              AND (
+                  s.lifecycle IN ('creating', 'deleting')
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sandbox_observed_states sos
+                      WHERE sos.sandbox_id = s.id
+                        AND (
+                            s.active_node_id IS NULL
+                            OR sos.node_id IS NOT DISTINCT FROM s.active_node_id
+                        )
+                  )
               )
               AND ($2::uuid IS NULL OR s.id > $2)
               AND s.id <= $3

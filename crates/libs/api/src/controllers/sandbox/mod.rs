@@ -1426,7 +1426,9 @@ pub(crate) use queries::org_byok_enabled;
 #[cfg(test)]
 pub(crate) use queries::pooled_prepare_error_is_reclaimable;
 pub use queries::{FederatedSandboxCreateContext, RestoreForkDiskAsNewContext};
+pub(crate) use responses::{PostWakeUpdate, post_wake_cas_lost, post_wake_update};
 pub use responses::{
     fetch_sandbox, sandbox_query, sandbox_to_response, update_and_fetch_post_wake_sandbox,
 };
+pub(crate) use updates::CreateCompensation;
 pub(crate) use updates::{AccessIdleTimeoutOutcome, AutoLifecycleTouchOutcome};

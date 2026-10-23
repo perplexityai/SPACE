@@ -9,6 +9,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use pplx_space_common_core::types::{
     AutoLifecycleConditionRuntimeState, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStage,
+    SandboxActivationAttemptId,
 };
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
 
@@ -604,6 +605,58 @@ async fn candidate_scan_lists_missing_pod_without_node_observation() -> TestResu
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn candidate_scan_waits_for_creating_attempt_expiry() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(&db.pool, node_id).await?;
+    insert_started_sandbox_with_active_execution(&db.pool, sandbox_id, node_id).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'creating' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET state = 'creating',
+                updated_at = NOW() - INTERVAL '1 hour',
+                activation_attempt_id = $2,
+                activation_attempt_expires_at = NOW() + INTERVAL '5 minutes'
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .bind(SandboxActivationAttemptId::new())
+    .execute(&db.pool)
+    .await?;
+    insert_observed_sandbox_state(&db.pool, sandbox_id, node_id, 60).await?;
+
+    let active_attempt =
+        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10).await?;
+    assert!(
+        active_attempt.is_empty(),
+        "a live materialization attempt must keep ownership despite an old execution clock"
+    );
+
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_expires_at = NOW() - INTERVAL '1 second'
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let expired_attempt =
+        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10).await?;
+    assert_eq!(expired_attempt.len(), 1);
+    assert_eq!(expired_attempt[0].sandbox_id, sandbox_id);
+    assert_eq!(expired_attempt[0].lifecycle, SandboxLifecycle::Creating);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn classification_reports_lifecycle_observed_inside_guarded_transaction() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
@@ -1194,6 +1247,16 @@ async fn unconfirmed_cleanup_keeps_abandoned_create_for_retry() -> TestResult {
     assert_eq!(
         sandbox_count, 1,
         "an unconfirmed pod cleanup must leave the row eligible for retry"
+    );
+    let lifecycle: SandboxLifecycle =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        lifecycle,
+        SandboxLifecycle::Deleting,
+        "pod cleanup must be backed by durable deleting intent before the external call"
     );
     Ok(())
 }
@@ -2097,6 +2160,23 @@ async fn pod_present_skips_action_and_clears_state() {
 }
 
 #[tokio::test]
+async fn stale_creating_with_present_pod_is_cleaned_after_its_attempt_expires() {
+    let mut cand = candidate("abandoned-create-present");
+    cand.lifecycle = SandboxLifecycle::Creating;
+    let sink = FakeSink::new(vec![cand.clone()]);
+    let mut reconciler = Reconciler::new(
+        config(0, 1000, false),
+        FakePresence::with_present([cand.pod_name.clone()]),
+        sink,
+    );
+
+    let report = reconciler.tick(Instant::now()).await;
+
+    assert_eq!(report.deleted, 1);
+    assert_eq!(reconciler.sink.action_count(), 1);
+}
+
+#[tokio::test]
 async fn pod_unready_uses_grace_then_classifies() {
     let cand = candidate("stuck-container-creating");
     let sink = FakeSink::new(vec![cand.clone()]);
@@ -2690,6 +2770,90 @@ async fn direct_rows_do_not_bound_the_sweep_or_become_candidates() -> TestResult
         list_candidates_after(&db.pool, None, upper, 10)
             .await?
             .is_empty()
+    );
+    Ok(())
+}
+
+/// A `creating` shell reached through the **Forgotten** guard must be claimable.
+///
+/// `AbandonedCreate` is decided from lifecycle and recoverability alone, so it is
+/// reached through either guard, and `ACTIVE_EXECUTION_REQUIRED_LIFECYCLES`
+/// documents why `creating` belongs to the Forgotten path: a failed pod creation
+/// calls `forget_pod_tracking` while the row is still `creating`, leaving a
+/// non-recoverable shell with no active execution.
+///
+/// An earlier revision's claim began `let ClassifyGuard::PodName { .. } = guard
+/// else { return Ok(false) }`, so this shape was refused, the plan transaction
+/// rolled back, and the sweep reported `SkippedTerminal` on every pass — forever,
+/// with no other owner. The existing Forgotten test could not see it: it uses a
+/// `Started` lifecycle and a fake sink, so it exercises neither `Creating` nor
+/// this claim.
+///
+/// Asserting the claim directly, against Postgres, because that is where the
+/// guard mismatch lived.
+#[tokio::test]
+async fn abandoned_create_claim_accepts_the_forgotten_guard() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(&db.pool, node_id).await?;
+    insert_started_sandbox_with_active_execution(&db.pool, sandbox_id, node_id).await?;
+    // The post-`forget_pod_tracking` shape: still `creating`, newest execution
+    // `forgotten`, nothing active.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'creating' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET state = 'forgotten', active = FALSE
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+
+    let mut tx = db.pool.begin().await?;
+    let claimed =
+        claim_abandoned_create_delete(&mut tx, sandbox_id, &ClassifyGuard::Forgotten).await?;
+    tx.commit().await?;
+    assert!(
+        claimed,
+        "the Forgotten guard must be claimable, or this shape is skipped on every \
+         sweep with nothing else owning it"
+    );
+    let lifecycle: String =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        lifecycle, "deleting",
+        "the claim's whole purpose is durable delete intent on the row"
+    );
+
+    // The other half: a row with an *active* execution is a live create, not an
+    // abandoned shell, and must not be claimed through this guard.
+    let live_sandbox_id = SandboxId::new();
+    insert_started_sandbox_with_active_execution(&db.pool, live_sandbox_id, node_id).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'creating' WHERE id = $1"
+    ))
+    .bind(live_sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let mut tx = db.pool.begin().await?;
+    let live_claimed =
+        claim_abandoned_create_delete(&mut tx, live_sandbox_id, &ClassifyGuard::Forgotten).await?;
+    tx.rollback().await?;
+    assert!(
+        !live_claimed,
+        "an active execution means a live create; claiming it would delete a \
+         sandbox still being built"
     );
     Ok(())
 }

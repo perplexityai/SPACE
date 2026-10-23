@@ -2,6 +2,8 @@ use pplx_space_common_core::types::SandboxId;
 
 use super::*;
 use pplx_space_common_core::sql;
+
+use crate::controllers::placement_fence::{Writer, check_placement_fence, fence_refusal_message};
 use pplx_space_net_common::NetworkPolicy;
 
 fn proto_spaced_version(value: Option<&str>) -> Option<SemVer> {
@@ -771,11 +773,46 @@ pub async fn fetch_sandbox(pool: &PgPool, id: SandboxId) -> Result<Option<Sandbo
 /// if a supervisor moved the row into an inert lifecycle while wake was in
 /// flight, this helper must surface the CAS miss rather than resurrecting it
 /// as started.
+///
+/// Runs in a transaction so the termination fence's `nodes` row lock is still
+/// held when the `UPDATE` commits. Two independent refusals, and they are
+/// deliberately different errors: losing the lifecycle CAS means somebody else
+/// owns this row, while the fence refusing means the *node* is leaving and the
+/// caller should retry to be placed elsewhere.
 pub async fn update_and_fetch_post_wake_sandbox(
     pool: &PgPool,
     id: SandboxId,
     active_node_id: Option<NodeId>,
 ) -> Result<Sandbox, ControllerError> {
+    match post_wake_update(pool, id, active_node_id).await? {
+        PostWakeUpdate::Updated(sandbox) => Ok(*sandbox),
+        PostWakeUpdate::LifecycleCasLost => Err(post_wake_cas_lost()),
+    }
+}
+
+/// What a pooled post-wake update found.
+pub(crate) enum PostWakeUpdate {
+    Updated(Box<Sandbox>),
+    /// Another supervisor moved the row to an inert lifecycle while the wake was
+    /// in flight, so the row is theirs now: a caller must not roll it back.
+    LifecycleCasLost,
+}
+
+pub(crate) fn post_wake_cas_lost() -> ControllerError {
+    ControllerError::internal(
+        "pooled sandbox wake lost the lifecycle CAS — another supervisor flipped the row \
+         to an inert lifecycle while pooled wake was in flight",
+    )
+}
+
+/// [`update_and_fetch_post_wake_sandbox`], with a lost lifecycle CAS reported as
+/// an outcome rather than an error, so a caller can tell "someone else owns this
+/// row" apart from a failure it should roll back.
+pub(crate) async fn post_wake_update(
+    pool: &PgPool,
+    id: SandboxId,
+    active_node_id: Option<NodeId>,
+) -> Result<PostWakeUpdate, ControllerError> {
     let sql = sandbox_query(
         "WITH updated AS (
              UPDATE sandboxes
@@ -791,28 +828,55 @@ pub async fn update_and_fetch_post_wake_sandbox(
          FROM updated s
          {sandbox_join_tail}",
     );
-    sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sql.as_str())))
+    // Opened unconditionally, so a wake that attaches no node pays a BEGIN and a
+    // COMMIT to lock nothing. Kept deliberately for the same reason as
+    // `finalize_created_sandbox`: the alternative extracts this CTE into its own
+    // executor-generic function and separates the write from the fence that
+    // guards it, and the adjacency is the property worth more than two round
+    // trips.
+    let mut tx = pool.begin().await.map_err(|err| {
+        ControllerError::internal(format!("failed to start pooled post-wake update: {err}"))
+    })?;
+    // A wake that attaches no node has nothing to order against the terminate
+    // path; the lifecycle flip below still has to happen.
+    if let Some(node_id) = active_node_id {
+        let fence = check_placement_fence(&mut tx, node_id, id, Writer::PooledPostWake)
+            .await
+            .map_err(|err| {
+                ControllerError::internal(format!(
+                    "failed to check the pooled post-wake placement fence: {err}"
+                ))
+            })?;
+        if fence.refuses() {
+            // The transaction is dropped unwritten, so the row keeps whatever
+            // lifecycle it had rather than being published as `started` on a
+            // node that is about to stop existing. The woken guest is lost
+            // either way — it is on that node — and the caller's create/wake
+            // failure path is what tears it down.
+            return Err(ControllerError::service_unavailable(fence_refusal_message(
+                node_id, fence,
+            )));
+        }
+    }
+    let updated = sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sql.as_str())))
         .bind(active_node_id)
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
-        // Not classified, deliberately, and for the same reason as the
-        // `fetch_sandbox` arm this shares an `if` with in
-        // `queries::try_create_from_pool`: by the time this runs the warm slot
-        // is claimed, bound, and prepared and the pod is running, with no
-        // rollback on this arm. `create` mints a fresh `SandboxId` per request
-        // with no idempotency key, so a retryable 503 here claims a second
-        // slot and starts a second sandbox while the first stays `started`
-        // under an id the caller never sees. See `db_contention_error`'s
-        // exception. This is the `wait_until_ready` arm — the one ECW create
-        // takes — so it is the more common of the two, not the edge case.
+        // Not classified, deliberately: by the time this runs the warm slot
+        // is claimed, bound, and prepared and the pod is running. Both callers
+        // roll the claim back on any error from here, but `create` mints a
+        // fresh `SandboxId` per request with no idempotency key, so a retryable
+        // 503 would invite a retry that claims a second slot even if that
+        // rollback itself failed. See `db_contention_error`'s exception.
         .map_err(|err| {
             crate::controllers::internal_error("pooled sandbox post-wake update failed", err)
-        })?
-        .ok_or_else(|| {
-            ControllerError::internal(
-                "pooled sandbox wake lost the lifecycle CAS — another supervisor flipped the row \
-                 to an inert lifecycle while pooled wake was in flight",
-            )
-        })
+        })?;
+    let Some(updated) = updated else {
+        return Ok(PostWakeUpdate::LifecycleCasLost);
+    };
+    tx.commit().await.map_err(|err| {
+        ControllerError::internal(format!("failed to commit pooled post-wake update: {err}"))
+    })?;
+    Ok(PostWakeUpdate::Updated(Box::new(updated)))
 }

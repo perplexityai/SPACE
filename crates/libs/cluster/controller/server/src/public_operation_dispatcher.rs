@@ -258,6 +258,7 @@ const NATIVE_PUBLIC_OPERATION_KINDS: &[OperationKind] = &[
     OperationKind::RollbackSandbox,
     OperationKind::DeleteTemplate,
     OperationKind::ForkSandbox,
+    OperationKind::CompensateCreateSandbox,
 ];
 
 #[async_trait]
@@ -278,6 +279,12 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
             OperationKind::ForkSandbox => self
                 .fork_sandbox
                 .execute(claim_token, &operation)
+                .await
+                .into(),
+            // Compensation records its teardown progress under the claim.
+            OperationKind::CompensateCreateSandbox => self
+                .sandbox_lifecycle
+                .execute_claimed(claim_token, &operation)
                 .await
                 .into(),
             OperationKind::DeleteSandbox
