@@ -7,7 +7,7 @@ use hickory_resolver::proto::rr::rdata::A;
 use hickory_resolver::{ConnectionProvider, PoolContext, TlsConfig};
 use parking_lot::Mutex;
 use rustls::pki_types::PrivateKeyDer;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -18,6 +18,151 @@ use super::upstream::LoggingConnectionProvider;
 use super::*;
 
 const UPSTREAM_NAME: &str = "dns.example.test";
+
+// Real-time measurements are opt-in even when CI includes ignored tests.
+// A warm connection makes the cutoff observable; cold startup can fan out
+// before a connection has entered Hickory's pool. Every result records both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real-time DNS cutoff characterization"]
+async fn cutoff_timing_matrix() {
+    if std::env::var("SPACE_DNS_TIMING_EXPERIMENT").as_deref() != Ok("1") {
+        return;
+    }
+    let _tracing =
+        tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
+    let output = std::env::var("SPACE_DNS_TIMING_OUTPUT").expect("measurement output JSONL path");
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output)
+        .unwrap();
+    use std::io::Write;
+    for (label, timeout_ms, attempts, max_active) in [
+        ("baseline", 4000, 1, 64),
+        ("short", 500, 1, 64),
+        ("short_retries", 500, 3, 64),
+        ("one_second", 1000, 2, 64),
+        ("active32", 4000, 1, 32),
+        ("combined", 500, 3, 32),
+    ] {
+        for close in [false, true] {
+            for repeated in [false, true] {
+                for warm in [true, false] {
+                    let mut upstream = TestUpstream::start(true).await;
+                    let resolver = upstream.resolver_with(|options| {
+                        options.timeout = Duration::from_millis(timeout_ms);
+                        options.attempts = attempts;
+                        options.max_active_requests = max_active;
+                        options.num_concurrent_reqs = 1;
+                    });
+                    if warm {
+                        lookup(&resolver, "warm.example.").await.unwrap();
+                        for control in upstream.state.controls.lock().iter() {
+                            control.answered.store(0, Ordering::Relaxed);
+                        }
+                    }
+                    upstream.state.answer_limit.store(46, Ordering::Relaxed);
+                    upstream
+                        .state
+                        .close_at_limit
+                        .store(close, Ordering::Relaxed);
+                    let names: Vec<_> = (0..80)
+                        .map(|i| format!("query-{}.example.", if repeated { i % 4 } else { i }))
+                        .collect();
+                    let started = std::time::Instant::now();
+                    let results = join_all(names.iter().enumerate().map(|(id, name)| {
+                        let resolver = &resolver;
+                        async move {
+                            let started = std::time::Instant::now();
+                            let result =
+                                tokio::time::timeout(TOTAL_LOOKUP_TIMEOUT, lookup(resolver, name))
+                                    .await;
+                            let (ok, error) = match result {
+                                Ok(Ok(_)) => (true, None),
+                                Ok(Err(error)) => (false, Some(format!("{error:?}"))),
+                                Err(_) => (false, Some("TotalLookupTimeout".to_owned())),
+                            };
+                            serde_json::json!({
+                                "id": id, "name": name, "ok": ok, "error": error,
+                                "latency_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            })
+                        }
+                    }))
+                    .await;
+                    let mut latencies: Vec<_> = results
+                        .iter()
+                        .map(|result| result["latency_ms"].as_f64().unwrap())
+                        .collect();
+                    latencies.sort_by(f64::total_cmp);
+                    let sends: std::collections::BTreeMap<_, _> = names
+                        .iter()
+                        .map(|name| (name.clone(), upstream.queries(name)))
+                        .collect();
+                    let buckets: Vec<_> = [(0.0, 50.0), (50.0, 500.0), (500.0, 1500.0),
+                        (1500.0, 3900.0), (3900.0, 4500.0), (4500.0, 7900.0),
+                        (7900.0, f64::INFINITY)].into_iter()
+                        .map(|(lower, upper)| serde_json::json!({
+                            "lower_ms": lower, "upper_ms": if upper.is_finite() { Some(upper) } else { None },
+                            "count": latencies.iter().filter(|&&value| value >= lower && value < upper).count(),
+                        })).collect();
+                    let row = serde_json::json!({
+                        "label": label, "timeout_ms": timeout_ms, "attempts": attempts,
+                        "max_active": max_active, "close": close, "repeated": repeated,
+                        "warm": warm, "answer_limit": 46, "n": 80,
+                        "ok": results.iter().filter(|result| result["ok"] == true).count(),
+                        "wall_ms": started.elapsed().as_secs_f64() * 1000.0,
+                        "p50_ms": latencies[39], "p90_ms": latencies[71],
+                        "p99_ms": latencies[79], "connections": upstream.connections().accepted,
+                        "sends_per_name": sends, "buckets": buckets, "results": results,
+                    });
+                    writeln!(output, "{row}").unwrap();
+                    output.flush().unwrap();
+                    tracing::info!(
+                        label,
+                        close,
+                        repeated,
+                        warm,
+                        p99_ms = latencies[79],
+                        connections = upstream.connections().accepted,
+                        "DNS cutoff timing"
+                    );
+                    assert!(
+                        results.iter().all(|result| result["ok"] == true),
+                        "healthy retry connections must complete every lookup"
+                    );
+                    if label == "baseline" && warm && !repeated {
+                        assert!(
+                            latencies.iter().any(|&value| value < 500.0),
+                            "initial answers must arrive"
+                        );
+                        if !close {
+                            assert!(
+                                latencies.iter().any(|&value| value >= 3900.0),
+                                "silent queries must hold their attempt deadline"
+                            );
+                            assert!(
+                                sends.values().any(|&count| count >= 2),
+                                "timed-out names must be retried"
+                            );
+                        } else {
+                            assert!(
+                                latencies[79] < 2000.0,
+                                "a close must wake pending lookups before their four-second deadline"
+                            );
+                        }
+                    }
+                    // Connections are scoped to this fixture. Dropping the
+                    // resolver then closing them avoids idle tasks across rows.
+                    drop(resolver);
+                    tokio::time::timeout(Duration::from_secs(2), upstream.close_connections())
+                        .await
+                        .expect("fixture connections must close");
+                    upstream.stop_accepting().await;
+                }
+            }
+        }
+    }
+}
 
 // Hickory's exchange reports a send on a connection the upstream closed as
 // Busy. Concurrent sends through Hickory's clones of the pooled connection
@@ -252,12 +397,15 @@ struct UpstreamState {
     // One per accepted connection, in accept order.
     controls: Mutex<Vec<Arc<ConnectionControl>>>,
     hold_handshakes: watch::Sender<bool>,
+    answer_limit: AtomicUsize,
+    close_at_limit: AtomicBool,
 }
 
 #[derive(Default)]
 struct ConnectionControl {
     close: CancellationToken,
     stall: AtomicBool,
+    answered: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -301,6 +449,8 @@ impl TestUpstream {
                 queries: Mutex::default(),
                 controls: Mutex::default(),
                 hold_handshakes: watch::Sender::new(false),
+                answer_limit: AtomicUsize::new(usize::MAX),
+                close_at_limit: AtomicBool::new(false),
             }),
             listener: None,
         };
@@ -338,19 +488,28 @@ impl TestUpstream {
     }
 
     fn resolver(&self) -> RecoveringResolver {
+        self.resolver_with(|_| {})
+    }
+
+    fn resolver_with(&self, configure: impl FnOnce(&mut ResolverOpts)) -> RecoveringResolver {
         let mut server = NameServerConfig::tcp(self.addr.ip());
         server.connections = vec![self.connection_config()];
         let mut options = ResolverOpts::default();
         options.attempts = 1;
         options.max_active_requests = MAX_CONCURRENT_LOOKUPS;
         options.use_hosts_file = ResolveHosts::Never;
-        RecoveringResolver::new(
+        configure(&mut options);
+        let mut resolver = RecoveringResolver::new(
             ResolverConfig::from_parts(None, Vec::new(), vec![server]),
             options,
             runtime(),
             ReservedResolver::Google,
         )
-        .unwrap()
+        .unwrap();
+        if self.acceptor.is_some() {
+            resolver.set_test_tls(self.client_tls.clone());
+        }
+        resolver
     }
 
     fn connections(&self) -> Connections {
@@ -476,6 +635,15 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         let name = response.queries[0].name.clone();
         *state.queries.lock().entry(name.clone()).or_default() += 1;
         if control.stall.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        if control.answered.fetch_add(1, Ordering::Relaxed)
+            >= state.answer_limit.load(Ordering::Relaxed)
+        {
+            if state.close_at_limit.load(Ordering::Relaxed) {
+                // Dropping the TLS stream closes TCP without close_notify.
+                return;
+            }
             continue;
         }
         response.answers.push(Record::from_rdata(

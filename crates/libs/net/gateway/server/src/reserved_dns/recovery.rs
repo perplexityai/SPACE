@@ -16,6 +16,8 @@ pub(super) struct RecoveringResolver {
     config: ResolverConfig,
     provider: LoggingConnectionProvider,
     state: Mutex<ResolverState>,
+    #[cfg(test)]
+    test_tls: Option<rustls::ClientConfig>,
 }
 
 struct ResolverState {
@@ -43,7 +45,21 @@ impl RecoveringResolver {
                 resolver: Arc::new(resolver),
                 last_reset: None,
             }),
+            #[cfg(test)]
+            test_tls: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_tls(&mut self, tls: rustls::ClientConfig) {
+        let state = self.state.get_mut();
+        let resolver = Resolver::builder_with_config(self.config.clone(), self.provider.clone())
+            .with_options(state.resolver.options().clone())
+            .with_tls_config(tls.clone())
+            .build()
+            .expect("test TLS resolver");
+        state.resolver = Arc::new(resolver);
+        self.test_tls = Some(tls);
     }
 
     // The caller's deadline, cancellation, and lookup permit cover both attempts.
@@ -75,6 +91,11 @@ impl RecoveringResolver {
                 let builder =
                     Resolver::builder_with_config(self.config.clone(), self.provider.clone())
                         .with_options(original.options().clone());
+                #[cfg(test)]
+                let builder = match &self.test_tls {
+                    Some(tls) => builder.with_tls_config(tls.clone()),
+                    None => builder,
+                };
                 match pplx_space_metrics::gateway::with_reserved_dns_hickory_metrics(|| {
                     builder.build()
                 }) {
