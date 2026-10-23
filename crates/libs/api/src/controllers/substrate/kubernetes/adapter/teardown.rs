@@ -151,8 +151,10 @@ impl KubernetesSubstrate {
     /// `delete_execution` makes.
     ///
     /// `Ok(true)` when the sandbox was torn down (or had nothing left to tear
-    /// down), `Ok(false)` when an active execution appeared and nothing was
-    /// changed.
+    /// down), `Ok(false)` when an active execution appeared and this call
+    /// changed nothing. Reached through
+    /// [`Self::delete_execution_retired_by_current_stop`], `Ok(false)` can
+    /// follow that wrapper's committed retirement of the pre-stop execution.
     pub async fn delete_execution_with_no_active_execution(
         &self,
         sandbox_id: SandboxId,
@@ -165,6 +167,97 @@ impl KubernetesSubstrate {
             )
             .await?;
         Ok(matches!(outcome, RetireExecutionOutcome::Retired))
+    }
+
+    /// [`Self::delete_execution_with_no_active_execution`] for a `stopped`
+    /// sandbox whose stop left its execution active, which on Kubernetes is
+    /// every ordinarily stopped sandbox.
+    ///
+    /// That execution is retired first, under the same lock execution creation
+    /// takes, and only if no active execution postdates the stop and no `start`
+    /// holds a live activation attempt on it
+    /// ([`K8sStore::retire_executions_predating_current_stop`]). The no-execution
+    /// teardown then runs as before: the now-inactive pods are deleted, no
+    /// in-VM request is sent, and the placement clear re-proves the absence. So
+    /// a `start` that lands at any point still keeps its pod, its rootfs and its
+    /// placement; the most it can lose is the pre-stop execution it would have
+    /// replaced anyway.
+    pub async fn delete_execution_retired_by_current_stop(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, SubstrateError> {
+        if !self
+            .store
+            .retire_executions_predating_current_stop(sandbox_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.delete_execution_with_no_active_execution(sandbox_id)
+            .await
+    }
+
+    /// Delete the pod a stopped re-placement left running, once the drain has
+    /// settled the row `stopped`.
+    ///
+    /// That pod runs no VM: its shim materialized the disk and stood a
+    /// placeholder task in for the runtime so the stopped wake could confirm
+    /// the result through it. Left running, it holds a network slot on the
+    /// destination until the next `start`. An ordinarily stopped sandbox's pod
+    /// stops running with its VM (the shim ends the task when the VM process
+    /// exits), while its execution row stays active until that `start`.
+    /// Deleting the pod gives the re-placed sandbox that shape. The shim's
+    /// task is detached, so the delete never reaches the sandbox-manager row
+    /// the `start` boots from.
+    ///
+    /// Only the execution the current stop predates is touched
+    /// (`execution_predates_current_stop`): a `start` that has already
+    /// replaced it owns a newer generation and keeps its pod. A `start` can
+    /// also keep the generation: one that finds no pod under the execution's
+    /// name creates a new pod under that same name. So the delete is
+    /// preconditioned on the UID the execution row recorded, and the apiserver
+    /// refuses it for any other pod. Such a `start` records its own pod's UID
+    /// while it's still in flight, so an execution carrying an activation
+    /// attempt is skipped as well: the materialization's own attempt is
+    /// released before the finalize, and any other is a `start` this must not
+    /// interrupt. A leftover attempt costs the pod's slot until the next
+    /// `start`, and refuses that `start` until the attempt's lease expires,
+    /// but never deletes a start's pod. `Ok(false)` when there was nothing
+    /// to release: no active execution, one the stop doesn't predate, one
+    /// carrying an activation attempt, no recorded UID, no pod under that
+    /// name, or one that isn't the recorded pod.
+    pub async fn release_stopped_materialization_pod(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, SubstrateError> {
+        let Some(execution) = self.store.active_execution_status(sandbox_id).await? else {
+            return Ok(false);
+        };
+        if !self
+            .store
+            .execution_predates_current_stop(sandbox_id, execution.generation)
+            .await?
+        {
+            return Ok(false);
+        }
+        if execution.activation_attempt_id.is_some() {
+            return Ok(false);
+        }
+        let Some(pod_uid) = execution.pod_uid else {
+            return Ok(false);
+        };
+        match delete_sandbox_pod_if_uid(&self.k8s, &execution.pod_name, &pod_uid).await {
+            Ok(()) => Ok(true),
+            Err(err) => match classify_fenced_pod_delete_error(&err) {
+                Some(_) => Ok(false),
+                None => Err(SubstrateError::Failed {
+                    message: format!(
+                        "failed to delete stopped materialization pod {}: {err}",
+                        execution.pod_name
+                    ),
+                }),
+            },
+        }
     }
 
     /// Check a caller's pod-identity fence before anything destructive runs.

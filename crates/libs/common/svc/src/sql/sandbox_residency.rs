@@ -235,12 +235,19 @@ pub fn occupies_node_predicate(
 ///
 ///   **The exclusion outlived half its reason.** `suspend` still refuses a
 ///   `stopped` sandbox, but the drain no longer only knows how to suspend:
-///   where `SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS` is on, node-drain
-///   publishes such a sandbox's disk artifact to S3, releases the node holding
+///   where `SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS`,
+///   `SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE` and
+///   `SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS` are all on, a forced drain
+///   publishes such a sandbox's disk artifact (an unencrypted one; encrypted
+///   stopped residents aren't evacuated) to S3, or reuses one already durable
+///   there, releases the node holding
 ///   its copy once those bytes are durable, and hands the row to the restore sweep
-///   to re-place it `stopped` elsewhere — no suspend anywhere in it. That also
-///   makes the "nor does anything publish the sandbox's disk" above true only
-///   where the flag is off. `stopped` is deliberately still
+///   to re-place it `stopped` elsewhere — no suspend anywhere in it. So the
+///   "nor does anything publish the sandbox's disk" above no longer holds
+///   wherever all three are on. Of the three, only turning off
+///   `SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS` makes an already-claimed
+///   evacuation's release wait.
+///   `stopped` is deliberately still
 ///   absent from this list all the same: what holds the node long enough for
 ///   that to run is [`active_resident_predicate`] via node-drain's fourth gate
 ///   term, not this include-list, and adding it here would hold a node in every

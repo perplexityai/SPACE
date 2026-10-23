@@ -177,11 +177,30 @@ pub(super) const NOTE_FAILED_CLEANUP_ATTEMPT_SQL: &str = sql!(
 /// routable; putting it back to `started` would hand out a sandbox its create request
 /// never returned, and for any activation a `started` row with no pod IP to
 /// reach it at.
+///
+/// A repaired start drops a `disk` artifact pin, as the API's own post-start
+/// write does (`maybe_mark_started_after_start`): the node ran the start, which
+/// drops its row's pin, and a cluster pin left naming the stopped rootfs would
+/// make a later forced drain refuse the sandbox as unattributable. A `full`
+/// pin is kept, as there.
+///
 /// Bind order: `$1` = sandbox id, `$2` = [`SubstrateKind::Kubernetes`] (see
 /// [`failed_active_execution_scope`]).
 pub(super) const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
     "UPDATE sandboxes s
-     SET lifecycle = 'started'
+     SET lifecycle = 'started',
+         current_local_artifact_id = CASE
+             WHEN s.current_local_artifact_kind = 'disk' THEN NULL
+             ELSE s.current_local_artifact_id
+         END,
+         current_local_artifact_kind = CASE
+             WHEN s.current_local_artifact_kind = 'disk' THEN NULL
+             ELSE s.current_local_artifact_kind
+         END,
+         current_local_artifact_origin = CASE
+             WHEN s.current_local_artifact_kind = 'disk' THEN NULL
+             ELSE s.current_local_artifact_origin
+         END
    WHERE s.id = $1
      AND s.managed_by = $2
      AND s.lifecycle = 'failed'

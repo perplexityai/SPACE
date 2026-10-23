@@ -76,10 +76,11 @@
 //!   `started`/`paused` sandbox immediately, with the 409 gates closed for the
 //!   whole drain window so users cannot race the pipeline. Per-node disruption
 //!   is proportional to resident live-sandbox count. Where
-//!   [`ReconcilerConfig::evacuate_stopped_residents`] is on, forced mode also
-//!   evacuates resident `stopped` sandboxes — no VM to suspend, so that path
-//!   publishes the disk artifact, waits for it to be durable in S3, and then
-//!   releases the node, giving up the node-local copy.
+//!   [`ReconcilerConfig::evacuates_stopped_residents`] holds, forced mode also
+//!   evacuates resident `stopped` sandboxes other than encrypted ones — no VM
+//!   to suspend, so that path publishes the disk artifact, waits for it to be
+//!   durable in S3, and then releases the node, giving up the node-local copy.
+//!   The restore sweep then places the sandbox `stopped` on another node.
 //!
 //! That escalation is one UPDATE in the admin endpoint's transaction. It moves
 //! `drain_mode` to `'forced'` and clears `drain_last_error` — including an error
@@ -260,20 +261,12 @@ pub(crate) use pplx_space_common_svc::sql::sandbox_residency::RESIDENT_LIFECYCLE
 ///   row is then handed to the cluster-wide restore sweep to be placed
 ///   `stopped` on another node.
 ///
-///   **That last leg does not work yet, and this constant is why the flag
-///   guarding it is off.** `begin_evacuation_restore_lifecycle` admits a
-///   released stopped evacuation for a `Stopped` target, but two refusals
-///   still stand between the sweep and a placed sandbox, and neither is in
-///   this crate:
-///   `sandbox_lifecycle_to_wake_target_proto` accepts only `Started`/`Paused`
-///   (and `restore_execution_inner` checks it before claiming, so the row stays
-///   `stopped`), and the evacuation restore's source selector
-///   (`selected_suspend_restore_storage_uri`) requires a `full` snapshot — a
-///   disk-only selector exists, but only a user `start` of a `stopped` row
-///   reaches it, and it serves only `lifecycle = 'stopped'`, which the claim
-///   moves the row out of. Until both admit a stopped evacuation, a torn-down sandbox
-///   retries, backs off, and escalates to an operator — visible and
-///   recoverable, since the bytes are in S3, but not converged.
+///   The sweep re-places it with a `Stopped` restore target: the substrate
+///   creates a pod for it on another node, whose shim has that node's
+///   sandbox-manager stage the pinned disk artifact and leave the sandbox
+///   `stopped`, with no microVM launched. That leg has its own flag,
+///   [`ReconcilerConfig::replace_stopped_evacuations`], which this one
+///   requires.
 ///
 /// **Membership is validity, not enablement.** The stopped path is gated per
 /// environment by [`ReconcilerConfig::evacuate_stopped_residents`], and the
@@ -319,9 +312,10 @@ pub(crate) fn stopped_replacement_needs_escalation(
 /// parameter.
 ///
 /// Only `Stopped` is conditional, and the condition is
-/// [`ReconcilerConfig::evacuate_stopped_residents`] resolved against the
-/// fourth-term gate; see [`ReconcilerConfig::evacuates_stopped_residents`] for
-/// why the two are one decision.
+/// [`ReconcilerConfig::evacuates_stopped_residents`]:
+/// [`ReconcilerConfig::evacuate_stopped_residents`] together with the
+/// fourth-term gate and stopped re-placement; see that method for why the
+/// three are one decision.
 ///
 /// Two constants rather than a filter, because there are only two answers and
 /// the disabled one is worth being able to point at. `the_enabled_subset_narrows_only_stopped`
@@ -471,9 +465,11 @@ pub(crate) const DEFAULT_MAX_PER_CLUSTER: usize = 64;
 /// `ActivationOptions::ready_timeout`. The Kubernetes substrate clamps every
 /// blocking wake wait to its API-side [`NODE_RPC_BLOCKING_BUDGET`] (~135s,
 /// held below the node-RPC channel timeout), so values at or above that
-/// budget do not extend the wait: each attempt is cut at the budget and
-/// resolves to [`RestoreOutcome::Converging`], and a restore slower than one
-/// budget converges across sweep re-drives. Values *below* the budget do
+/// budget do not extend the wait: each attempt is cut at the budget. For a
+/// `started` or `paused` target it resolves to [`RestoreOutcome::Converging`],
+/// and a restore slower than one budget converges across sweep re-drives; for a
+/// `stopped` re-placement, which has no guest to wait for, it's a failure that
+/// backs off (see `store::converging_restore_outcome`). Values *below* the budget do
 /// bind and shorten the per-attempt wait (the kind chart sets 60s for faster
 /// local feedback). The 600s default therefore means "defer to the substrate
 /// budget": it bounds one task's slot occupancy, not the end-to-end restore.
@@ -615,13 +611,14 @@ pub struct ReconcilerConfig {
     /// Whether a forced drain evacuates resident `stopped` sandboxes: publish
     /// the disk artifact to S3, wait for it to be durable, release the node
     /// holding the local copy, and hand the row to the restore sweep to be placed `stopped`
-    /// elsewhere. Defaults to `false`, and the substrate cannot yet serve that
-    /// last leg — see [`EVACUABLE_LIFECYCLES`] for the three refusals in its
-    /// way.
+    /// elsewhere. Defaults to `false`.
     ///
     /// Read through [`Self::evacuates_stopped_residents`], never directly —
     /// the path only turns on together with
-    /// [`Self::termination_blocking_gate`]. That is a rollout policy, not a
+    /// [`Self::termination_blocking_gate`] and
+    /// [`Self::replace_stopped_evacuations`]. The second is mechanical: without
+    /// re-placement an evacuated sandbox is on no node and nothing places it.
+    /// The first is a rollout policy, not a
     /// mechanical dependency: [`Reconciler::handle_draining_node`] spawns
     /// evacuations before it evaluates the `drained` gate, and a spawned
     /// evacuation alone keeps the node in `draining` (`spawned_this_tick`).
@@ -634,9 +631,9 @@ pub struct ReconcilerConfig {
     /// a cluster that has not taken that step keeps exactly its existing
     /// behaviour whatever this flag says.
     ///
-    /// So the two flags are enabled in a specific order: the fourth term
-    /// first, then this one. Turning this on alone does nothing, and the
-    /// wiring warns when it is set that way round.
+    /// So the flags are enabled in a specific order: the fourth term and
+    /// re-placement first, then this one. Turning this on without both does
+    /// nothing, and the wiring warns when it is set that way round.
     ///
     /// **Forced drains only**, like every other evacuation. Gentle mode's whole
     /// promise is that it does not touch residents, and a stopped evacuation
@@ -651,6 +648,50 @@ pub struct ReconcilerConfig {
     /// still has its existing exits — the owner starting or deleting the
     /// sandbox, or [`Self::gentle_escalate`] rewriting the mode.
     pub evacuate_stopped_residents: bool,
+    /// Whether the restore sweep re-places an evacuated `stopped` sandbox:
+    /// claims it and creates a `stopped-materialization` pod on another node,
+    /// whose containerd shim has sandbox-manager stage the durable disk
+    /// artifact and leave the sandbox `stopped` without launching a microVM;
+    /// a stopped wake through that pod then confirms it. Defaults to `false`.
+    ///
+    /// Its own flag because that pod needs every worker's shim to understand
+    /// the checkpoint. A shim that predates it forwards the unknown checkpoint
+    /// to sandbox-manager, which refuses it with nothing staged and nothing
+    /// booted, so a mixed fleet fails closed, but the re-placement never
+    /// converges on such a node. Each wait it outlasts is a failed restore, so
+    /// it backs off and, from its fifth attempt, is named by id at ERROR;
+    /// `node_drain.stopped_replacement_pending` is what counts it. A worker
+    /// whose node-manager predates `BtrfsCreateSandboxInstance` refuses too,
+    /// provided its sandbox-manager is from the same release: that
+    /// sandbox-manager won't stage a re-placement into an `instance/` no later
+    /// disk backup could snapshot, where an older one would. This flag is the
+    /// cutover the shim, sandbox-manager and node-manager rollout gates.
+    ///
+    /// The pod is kept off the nodes the sandbox's retired executions record
+    /// (`stopped_replacement_excluded_nodes` in the Kubernetes substrate,
+    /// which names the cases that record misses): sandbox-manager there may
+    /// hold a `stopped` row pinned to
+    /// another artifact, which it refuses to materialize over rather than
+    /// discard. With every worker excluded the pod is `Unschedulable`, which
+    /// the restore reports as a failure, so the row backs off and escalates
+    /// by id, still counted as pending, until a new node can take it.
+    ///
+    /// With it off, the sweep doesn't open a re-placement: a released stopped
+    /// evacuation's restore fails before the claim, as it did before
+    /// re-placement existed, so the row keeps its marker, backs off and
+    /// escalates through [`stopped_replacement_needs_escalation`]. A
+    /// re-placement already claimed (the row is `restoring`) still proceeds,
+    /// for the reason [`Self::evacuate_stopped_residents`] lets a claimed
+    /// evacuation finish: the user restore claim won't take a `restoring` row
+    /// while its marker is set, so refusing it would leave the sandbox
+    /// unstartable until the flag came back.
+    ///
+    /// [`Self::evacuates_stopped_residents`] requires it, because opening a
+    /// stopped evacuation without it would leave the sandbox on no node with
+    /// nothing to place it. For the same reason a claimed evacuation doesn't
+    /// release its node while this is off: its teardown defers, so the sandbox
+    /// keeps its copy on that node until the flag comes back.
+    pub replace_stopped_evacuations: bool,
     pub tick: Duration,
     pub max_per_node: usize,
     /// Cluster-wide budget on concurrent drain-driven substrate operations.
@@ -663,9 +704,10 @@ pub struct ReconcilerConfig {
     /// Per-attempt wake wait for the cohort restore
     /// (see [`DEFAULT_EVACUATE_TIMEOUT_SECS`]), clamped by the substrate's
     /// [`NODE_RPC_BLOCKING_BUDGET`] — see [`DEFAULT_EVACUATE_TIMEOUT_SECS`]
-    /// for the clamp story. NOT an end-to-end restore deadline: an attempt
-    /// that hits the budget resolves to [`RestoreOutcome::Converging`] and is
-    /// re-driven by the next sweep.
+    /// for the clamp story. NOT an end-to-end restore deadline: a `started` or
+    /// `paused` attempt that hits the budget resolves to
+    /// [`RestoreOutcome::Converging`] and is re-driven by the next sweep (a
+    /// `stopped` one fails and backs off instead).
     pub evacuate_timeout: PositiveDuration,
     /// Age threshold for the abandon-stuck-transient policy. A sandbox
     /// whose lifecycle has been one of [`NON_EVACUATABLE_RESIDENT_LIFECYCLES`]
@@ -733,6 +775,7 @@ impl Default for ReconcilerConfig {
             enabled: false,
             termination_blocking_gate: false,
             evacuate_stopped_residents: false,
+            replace_stopped_evacuations: false,
             tick: DEFAULT_TICK,
             max_per_node: DEFAULT_MAX_PER_NODE,
             max_per_cluster: DEFAULT_MAX_PER_CLUSTER,
@@ -774,6 +817,10 @@ impl ReconcilerConfig {
                 "SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS",
                 default.evacuate_stopped_residents,
             ),
+            replace_stopped_evacuations: config.truthy_default(
+                "SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS",
+                default.replace_stopped_evacuations,
+            ),
             tick: default.tick,
             max_per_node: default.max_per_node,
             max_per_cluster: default.max_per_cluster,
@@ -793,11 +840,14 @@ impl ReconcilerConfig {
     ///
     /// The conjunction, not the raw flag: see
     /// [`Self::evacuate_stopped_residents`] for why the fourth-term gate is a
-    /// precondition rather than a companion. Every consumer reads this so the
-    /// resolution lives in one place, and the wiring warns once at startup
-    /// when the pair is set the ineffective way round.
+    /// precondition rather than a companion, and
+    /// [`Self::replace_stopped_evacuations`] for why re-placement is one too.
+    /// Every consumer reads this so the resolution lives in one place, and the
+    /// wiring warns once at startup when the flag is set without the others.
     pub fn evacuates_stopped_residents(&self) -> bool {
-        self.evacuate_stopped_residents && self.termination_blocking_gate
+        self.evacuate_stopped_residents
+            && self.termination_blocking_gate
+            && self.replace_stopped_evacuations
     }
 }
 
@@ -1271,7 +1321,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         &self,
         honor_backoff_windows: bool,
     ) -> impl std::future::Future<Output = Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error>> + Send;
-    /// How many evacuated `stopped` sandboxes are currently on no node.
+    /// How many evacuated `stopped` sandboxes can't serve a `start` yet:
+    /// released and on no node, or claimed for re-placement and unsettled.
     ///
     /// Not derivable from [`Self::list_restore_pending_evacuations`], which is
     /// a *work list*: it honours the retry backoff, so a re-placement that
@@ -1346,7 +1397,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// `evacuate_timeout` bounds one attempt's blocking wake wait, clamped by
     /// the substrate's [`NODE_RPC_BLOCKING_BUDGET`] (see
     /// [`DEFAULT_EVACUATE_TIMEOUT_SECS`]). A wait that exhausts the budget
-    /// resolves to [`RestoreOutcome::Converging`], not an error.
+    /// resolves to [`RestoreOutcome::Converging`], not an error, unless the
+    /// target is `stopped`.
     ///
     /// Returns an explicit `+ Send` future because it is awaited inside
     /// `tokio::spawn` (the restore polls until the rebuilt pod is
@@ -2007,10 +2059,14 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                                             attempts,
                                             "node_drain: evacuated stopped sandbox has failed \
                                              re-placement on every attempt so far; its disk \
-                                             artifact is durable in S3 but the sandbox is on no \
-                                             node and cannot be started until it is placed. \
+                                             artifact is durable in S3 but the sandbox cannot be \
+                                             started until a re-placement lands. \
                                              This needs an operator: check target-cohort \
-                                             capacity and placement admission"
+                                             capacity and placement admission, that \
+                                             SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS is \
+                                             on, and that the destination's shim, \
+                                             sandbox-manager and node-manager support stopped \
+                                             materialization"
                                         );
                                     }
                                 }

@@ -18032,6 +18032,60 @@ pub(crate) mod service_tests {
         }
     }
 
+    /// What a shim that predates stopped materialization sends for a stopped
+    /// re-placement pod: the pod's `stopped-materialization` checkpoint passed
+    /// through unchanged, the artifact URI, and the default (started) target.
+    /// The pod renderer picked that checkpoint value so this request fails
+    /// closed, and this is where it has to: refused whether or not the node
+    /// holds a row for the sandbox, with nothing staged and nothing launched.
+    #[tokio::test]
+    async fn an_old_shims_stopped_materialization_start_is_refused_without_booting() {
+        for local_row in [false, true] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            if local_row {
+                insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
+            }
+            let mut service = service_with_runtime_probe(conn, false);
+            shut_the_launch_gate(&mut service);
+
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                service.start(internal_request(StartRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    checkpoint: Some("stopped-materialization".to_string()),
+                    netns_path: Some("/var/run/netns/test".to_string()),
+                    suspend_restore_storage_uri: Some(format!(
+                        "s3://snapshots/suspend/{sandbox_id}/{}?region=us-east-1",
+                        Uuid::now_v7()
+                    )),
+                    route_identity: Some(pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity {
+                        execution_generation: Some(7),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("the refusal must not wait behind the Firecracker launch gate")
+            .expect_err("an unknown checkpoint must not start the sandbox");
+
+            let lookup = service.lookup_sandbox(&sandbox_id);
+            if local_row {
+                assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+                let row = lookup.expect("the stopped row must survive the refusal");
+                assert_eq!(row.state, SandboxState::Stopped);
+                assert_eq!(row.pid, None, "nothing may have launched");
+            } else {
+                assert_eq!(error.code(), tonic::Code::NotFound, "{error}");
+                assert!(
+                    lookup.is_err(),
+                    "a refused request must not have materialized a row"
+                );
+            }
+        }
+    }
+
     /// A `Wake` asking for the stopped target with no start context carries
     /// neither the artifact URI nor the expected artifact id, so delegating it
     /// to `Start` now refuses it at the wire boundary instead of letting it

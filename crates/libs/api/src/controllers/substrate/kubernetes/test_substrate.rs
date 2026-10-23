@@ -136,3 +136,19 @@ pub(super) fn assemble_substrate(
         task_tracker,
     }
 }
+
+/// The database half of
+/// [`KubernetesSubstrate::delete_execution_retired_by_current_stop`]: retire
+/// the execution a `stopped` sandbox's stop left active, unless the teardown
+/// fence refuses. It runs the production statement and transaction
+/// ([`K8sStore::retire_executions_predating_current_stop`]), so another
+/// crate's test that fakes only the pod delete still exercises the real fence.
+/// `Ok(false)` when the fence refused and nothing changed.
+pub async fn retire_executions_predating_current_stop(
+    pool: PgPool,
+    sandbox_id: SandboxId,
+) -> Result<bool, SubstrateError> {
+    K8sStore::new(pool, TEST_SANDBOX_NAMESPACE.to_string())
+        .retire_executions_predating_current_stop(sandbox_id)
+        .await
+}

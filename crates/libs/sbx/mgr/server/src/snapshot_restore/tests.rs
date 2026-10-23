@@ -1848,3 +1848,32 @@ fn only_the_stopped_refusals_are_classified_as_permanent() {
     assert!(mismatch.is_stopped_materialization_refusal());
     assert!(!RestoreError::MissingSandboxOwnershipMetadata.is_stopped_materialization_refusal());
 }
+
+/// A Full-codec restore falls back to a plain `instance/` directory on a
+/// node-manager that can't make a subvolume only when the sandbox just has to
+/// boot. A stopped re-placement refuses instead: a plain directory would leave
+/// its next drain retrying a disk backup that can never succeed.
+#[test]
+fn only_a_bootable_instance_falls_back_to_a_plain_directory() {
+    use crate::btrfs_via_nodemgr::PreparedInstance;
+    use InstanceRequirement::{Bootable, Snapshottable};
+    for (prepared, instance, mkdir) in [
+        (PreparedInstance::Subvolume, Bootable, false),
+        (PreparedInstance::Subvolume, Snapshottable, false),
+        (PreparedInstance::PlainDirectory, Bootable, false),
+        (PreparedInstance::Unsupported, Bootable, true),
+    ] {
+        assert_eq!(
+            plain_instance_fallback(prepared, instance).unwrap(),
+            mkdir,
+            "{prepared:?} {instance:?}"
+        );
+    }
+    for prepared in [
+        PreparedInstance::PlainDirectory,
+        PreparedInstance::Unsupported,
+    ] {
+        plain_instance_fallback(prepared, Snapshottable)
+            .expect_err("a stopped re-placement must not proceed without a snapshottable instance");
+    }
+}

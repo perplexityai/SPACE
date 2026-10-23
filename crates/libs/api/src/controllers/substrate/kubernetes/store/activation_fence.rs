@@ -221,7 +221,9 @@ impl K8sStore {
     }
 
     /// Release ownership when this caller proves either that no Wake was
-    /// dispatched or that its activation reached command readiness. A completed
+    /// dispatched, that its activation reached command readiness, or, for a
+    /// stopped re-placement, that the node confirmed the stopped row it
+    /// materialized (nothing is activated, so no receipt will). A completed
     /// activation may already have been stopped again; its exact lease can be
     /// released without changing the newer lifecycle or published route identity.
     /// Potentially dispatched, unfinished work must retain its lease.

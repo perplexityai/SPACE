@@ -1928,6 +1928,14 @@ impl SandboxManagerService {
             execution_fence,
             &self.node_manager,
             self.template_resolver.as_ref(),
+            match target {
+                CrossNodeRestoreTarget::StoppedDiskArtifact { .. } => {
+                    crate::snapshot_restore::InstanceRequirement::Snapshottable
+                }
+                CrossNodeRestoreTarget::SuspendedCheckpoint => {
+                    crate::snapshot_restore::InstanceRequirement::Bootable
+                }
+            },
         )
         .instrument(phase2_span)
         .await;

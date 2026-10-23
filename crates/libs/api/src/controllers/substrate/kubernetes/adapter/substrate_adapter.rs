@@ -297,6 +297,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             Some((restore, storage_uri)) => {
                 restore_source_sandbox_id = restore.source_sandbox_id.to_string();
                 SandboxPodRequest::Restore {
+                    stopped_materialization: None,
                     artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
                     common,
                     runtime,

@@ -175,15 +175,16 @@ async fn claim(
     sandbox: SandboxId,
     node: NodeId,
 ) -> TestResult<StoppedEvacuationClaim> {
-    claim_stopped_evacuation(pool, sandbox, node, true)
+    claim_stopped_evacuation(pool, sandbox, node, true, None)
         .await
         .map_err(Into::into)
 }
 
 /// Claim first, then record the artifact — the order production uses, since
 /// [`claim_stopped_evacuation`] refuses to open an evacuation on a row that
-/// already carries a pin. A fixture that pins first is asserting against a
-/// state the claim guard exists to reject.
+/// already carries a pin unless the caller matched it against the node. A
+/// fixture that pins first is asserting against a state the claim guard exists
+/// to reject.
 async fn claim_and_publish(
     pool: &PgPool,
     sandbox: SandboxId,
@@ -767,13 +768,13 @@ async fn disabling_the_feature_stops_new_claims_without_abandoning_in_flight_one
     );
 
     assert_eq!(
-        claim_stopped_evacuation(&db.pool, in_flight, node_id, false,).await?,
+        claim_stopped_evacuation(&db.pool, in_flight, node_id, false, None).await?,
         StoppedEvacuationClaim::Resumed,
         "the claim must resume an evacuation in flight even with new ones disabled — \
          refusing here is what strands the sandbox"
     );
     assert_eq!(
-        claim_stopped_evacuation(&db.pool, untouched, node_id, false,).await?,
+        claim_stopped_evacuation(&db.pool, untouched, node_id, false, None).await?,
         StoppedEvacuationClaim::Refused,
         "and it must refuse to open a new one"
     );
@@ -847,6 +848,22 @@ async fn the_pending_count_sees_sandboxes_the_retry_backoff_hides() -> TestResul
     let still_resident = insert_sandbox(&db.pool, Some(node_id), "stopped").await?;
     claim(&db.pool, still_resident, node_id).await?;
 
+    // 5. Claimed for re-placement and bound to a destination that never
+    //    confirms it (a shim that predates stopped materialization, say): on a
+    //    node, but not startable until the drain settles it. No durable copy
+    //    is seeded, so the work list drops it and only the gauge can see it.
+    let destination = forced_draining_node(&db.pool).await?;
+    let stuck = insert_sandbox(&db.pool, Some(node_id), "stopped").await?;
+    claim(&db.pool, stuck, node_id).await?;
+    clear_placement(&db.pool, stuck).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'restoring', active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(stuck)
+    .bind(destination)
+    .execute(&db.pool)
+    .await?;
+
     let work_list: Vec<SandboxId> = restore_pending(&db.pool)
         .await?
         .into_iter()
@@ -863,10 +880,10 @@ async fn the_pending_count_sees_sandboxes_the_retry_backoff_hides() -> TestResul
         .fetch_one(&db.pool)
         .await?;
     assert_eq!(
-        pending, 3,
-        "every sandbox that is on no node must count — the eligible one, the one waiting out \
-         its backoff, and the one whose artifact can no longer be resolved — while the row \
-         still resident on its node must not"
+        pending, 4,
+        "every sandbox that can't serve a start must count — the eligible one, the one waiting \
+         out its backoff, the one whose artifact can no longer be resolved, and the bound \
+         re-placement that hasn't settled — while the row still resident on its node must not"
     );
     Ok(())
 }
@@ -1060,9 +1077,10 @@ async fn an_evacuation_opens_only_on_a_row_whose_artifact_it_will_mint() -> Test
     assert_eq!(
         claim(&db.pool, inherited, node_id).await?,
         StoppedEvacuationClaim::Refused,
-        "a row carrying a pin this drain did not mint must not be evacuated: publishing it \
-         would upload bytes that may predate the user's work, and the teardown would then \
-         give up the rootfs holding it"
+        "a row carrying a pin this drain did not mint must not be claimed without the \
+         node's confirmation that it holds those bytes: publishing it would upload bytes \
+         that may predate the user's work, and the teardown would then give up the rootfs \
+         holding it"
     );
     assert_eq!(
         marker_of(&db.pool, inherited).await?,
@@ -2011,6 +2029,58 @@ async fn a_node_that_disagrees_about_the_sandbox_defers_rather_than_refusing_for
 /// the teardown only records that it was asked. Lets a case drive the whole
 /// entry point against a real Postgres and then assert on whether the
 /// irreversible step ran.
+/// **No route to the release runs while stopped re-placement is off.** The
+/// teardown is reached both from a row already durable (the evacuation's step
+/// 0) and from a pin recorded on the same tick (its step 5), so the gate lives
+/// in the teardown itself; calling it directly is the route-independent check.
+/// The same claim and node are released with the flag on, so the refusal is
+/// the flag's.
+#[tokio::test(flavor = "current_thread")]
+async fn the_teardown_itself_refuses_while_re_placement_is_off() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = forced_draining_node(&db.pool).await?;
+    let sandbox = insert_sandbox(&db.pool, Some(node_id), "stopped").await?;
+    let pin = LocalArtifactId::new();
+    claim_and_publish(&db.pool, sandbox, node_id, pin, "ready").await?;
+    let agreeing = NodeReportedArtifact {
+        present: true,
+        pinned_artifact: Some(pin),
+        reports_stopped: true,
+        ..NodeReportedArtifact::default()
+    };
+
+    let mut off = SubstrateSink::with_stopped_path_teardown_node_state(
+        db.pool.clone(),
+        enqueued(pin),
+        agreeing.clone(),
+    );
+    off.replace_stopped_evacuations = false;
+    let outcome = off
+        .tear_down_stopped_local_copy(sandbox, node_id, &node_id.to_string(), Some(pin))
+        .await?;
+    assert!(
+        matches!(outcome, StoppedEvacuationOutcome::Deferred { .. }),
+        "with re-placement off the teardown must defer, got {outcome:?}"
+    );
+    assert_eq!(off.recorded_teardowns(), Vec::<SandboxId>::new());
+
+    let on = SubstrateSink::with_stopped_path_teardown_node_state(
+        db.pool.clone(),
+        enqueued(pin),
+        agreeing,
+    );
+    let outcome = on
+        .tear_down_stopped_local_copy(sandbox, node_id, &node_id.to_string(), Some(pin))
+        .await?;
+    assert!(
+        matches!(outcome, StoppedEvacuationOutcome::Released { .. }),
+        "the same claim with re-placement on must release, got {outcome:?}"
+    );
+    Ok(())
+}
+
 fn stopped_path_sink(pool: PgPool, pin: LocalArtifactId) -> SubstrateSink {
     SubstrateSink::with_stopped_path(pool, enqueued(pin))
 }
@@ -2279,6 +2349,25 @@ async fn a_durable_evacuation_is_released_only_while_the_node_still_holds_its_ar
             "{shape}: the evacuation must defer, got {outcome:?}"
         );
     }
+
+    // An agreeing node, but with stopped re-placement off: nothing could place
+    // the sandbox again, so its node keeps the copy.
+    let mut sink = SubstrateSink::with_stopped_path_teardown_node_state(
+        db.pool.clone(),
+        enqueued(pin),
+        agreeing.clone(),
+    );
+    sink.replace_stopped_evacuations = false;
+    let outcome = sink.evacuate_stopped_sandbox(sandbox, node_id).await?;
+    assert_eq!(
+        sink.recorded_teardowns(),
+        Vec::<SandboxId>::new(),
+        "with re-placement off the node must not be released"
+    );
+    assert!(
+        matches!(outcome, StoppedEvacuationOutcome::Deferred { .. }),
+        "with re-placement off the evacuation must defer, got {outcome:?}"
+    );
 
     let sink = SubstrateSink::with_stopped_path_teardown_node_state(
         db.pool.clone(),

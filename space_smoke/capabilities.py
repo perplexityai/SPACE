@@ -1463,6 +1463,87 @@ class NodeDrainControl(NodeFaultControl, Protocol):
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
 
 
+@dataclass(frozen=True)
+class StoppedResidency:
+    """The `sandboxes` columns a stopped-resident evacuation moves.
+
+    `placement` is `sandboxes.placement` (`on_node` / `unplaced`), and
+    `evacuation_restore_target` is the drain's claim marker, None once the
+    re-placement finalized or before any claim.
+    """
+
+    lifecycle: str
+    active_node_id: str | None
+    placement: str
+    evacuation_restore_target: str | None
+
+
+class StoppedReplacementControl(NodeDrainControl, Protocol):
+    """Kind-only operations for re-placing an evacuated stopped sandbox.
+
+    The node-drain operations from [`NodeDrainControl`], plus a scoped
+    override of the three cluster-controller env flags the stopped-resident
+    evacuation needs (closed key list, closed value vocabulary, under the
+    controller-mutation Lease the retention and GC scenarios share), the
+    sandbox row's placement columns, the sandbox's pods, and sandbox-manager's
+    own lifecycle for the sandbox on one worker.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def stopped_replacement_env(self) -> dict[str, str | None]:
+        """The literal value of every flag on the controller Deployment, None if unset."""
+        ...
+
+    def running_controller_stopped_replacement_envs(self) -> list[dict[str, str | None]]:
+        """The same literals on every running, not-terminating controller pod."""
+        ...
+
+    def set_stopped_replacement_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_stopped_replacement_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets) and await the controller rollout."""
+        ...
+
+    def stopped_residency(self, sandbox_id: str) -> StoppedResidency: ...
+
+    def disk_snapshot_ids(self, sandbox_id: str) -> list[str]:
+        """Every `disk` snapshot row of the sandbox, in any state, by id."""
+        ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]: ...
+
+    def restore_pod_document(self, pod_name: str) -> dict[str, Any] | None:
+        """The apiserver's JSON for one sandbox pod, None when it does not exist."""
+        ...
+
+    def watch_sandbox_pods(self, sandbox_id: str) -> SandboxPodWatch:
+        """Start recording every version of the sandbox's pods the apiserver delivers."""
+        ...
+
+    def sandbox_manager_lifecycle(self, node_name: str, sandbox_id: str) -> str:
+        """sandbox-manager's lifecycle label for the sandbox on that worker (`space-sbxmgr doctor`)."""
+        ...
+
+    def reclaim_local_sandbox_everywhere(self, sandbox_id: str) -> None:
+        """Once the sandbox is gone from the cluster, delete its local rows on every worker."""
+        ...
+
+    def sandbox_manager_log(
+        self,
+        sandbox_id: str,
+        *,
+        node_names: Collection[str] | None = None,
+        since_time: str,
+    ) -> list[str]:
+        """The worker sandbox-managers' recent lines naming the sandbox. Failure evidence only."""
+        ...
+
+
 class RestoreStateRead(Protocol):
     """Control-plane reads about where and whether a sandbox can restore."""
 
@@ -1579,6 +1660,29 @@ class SandboxPodView:
     restore_source_node: str
     restore_storage_uri: str
     deleting: bool
+
+
+class SandboxPodWatch(Protocol):
+    """A watch of one sandbox's pods, keeping every version it was sent.
+
+    It starts from a listing taken when it was created and receives every
+    change after that listing, so a pod that is created, bound and deleted
+    between two polls still shows up here, its deletion included.
+    """
+
+    def versions(self) -> list[tuple[SandboxPodView, Mapping[str, Any]]]:
+        """The listing's pods, then every version delivered since, oldest first."""
+        ...
+
+    def listed_uids(self) -> frozenset[str]:
+        """The UIDs of the pods in the listing the watch started from."""
+        ...
+
+    def failure(self) -> str | None:
+        """Why the watch lost events or ended before `stop`; None otherwise."""
+        ...
+
+    def stop(self) -> None: ...
 
 
 class ConcurrentRestoreControl(Protocol):

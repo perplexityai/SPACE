@@ -1220,6 +1220,53 @@ async fn reap_undo_reverts_only_its_own_failed_write() -> TestResult {
 // Failed-active repair, on the Kubernetes substrate.
 // ---------------------------------------------------------------------------
 
+/// A repaired start drops a `disk` pin and keeps a `full` one, as the API's
+/// post-start write does: the node ran the start and dropped its own pin, so a
+/// disk pin left on the row would park a later forced drain on the sandbox.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_active_repair_drops_a_disk_pin_and_keeps_a_full_pin() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let substrate = kubernetes_substrate(pool)?;
+    let sink = SubstrateSweepSink::new(
+        pool.clone(),
+        Arc::new(Substrate::from_kubernetes(substrate)),
+    );
+    for (kind, origin, kept) in [("disk", "stop", false), ("full", "suspend", true)] {
+        let sandbox_id = SandboxId::new();
+        let seed = SandboxSeed::new("failed", "k8s").on_node(NodeId::new());
+        insert_sandbox(pool, sandbox_id, &seed).await?;
+        insert_execution(pool, sandbox_id, ExecutionSeed::RUNNING).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET current_local_artifact_id = $2,
+                    current_local_artifact_kind = $3,
+                    current_local_artifact_origin = $4
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(uuid::Uuid::now_v7())
+        .bind(kind)
+        .bind(origin)
+        .execute(pool)
+        .await?;
+
+        assert!(
+            sink.repair_failed_active_execution(sandbox_id).await?,
+            "{kind}"
+        );
+
+        let pinned_kind: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT current_local_artifact_kind FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(pinned_kind.is_some(), kept, "{kind} pin after the repair");
+    }
+    Ok(())
+}
+
 /// The failed-active repair moves a placed Kubernetes row with an active
 /// execution back to `started` only out of `failed`: an on-node `k8s` row
 /// with an active execution in any other stored lifecycle is left alone.

@@ -14,9 +14,9 @@
 
 use pplx_space_node_mgr_client::execution_fence::{ExecutionFence, InstanceTarget};
 use pplx_space_node_mgr_client::proto::{
-    BtrfsDeleteSandboxInstanceRequest, BtrfsEncodeRootfsSendRequest,
-    BtrfsEncodeSnapshotRootfsSendRequest, BtrfsInspectSendSourceRequest,
-    BtrfsReceiveInstanceRequest, GetBtrfsSendCapabilitiesRequest,
+    BtrfsCreateSandboxInstanceRequest, BtrfsDeleteSandboxInstanceRequest,
+    BtrfsEncodeRootfsSendRequest, BtrfsEncodeSnapshotRootfsSendRequest,
+    BtrfsInspectSendSourceRequest, BtrfsReceiveInstanceRequest, GetBtrfsSendCapabilitiesRequest,
 };
 use thiserror::Error;
 use tonic::Status;
@@ -232,6 +232,49 @@ pub(crate) async fn receive_instance(
             status,
         })?;
     Ok(())
+}
+
+/// What node-manager left at a sandbox's `instance/` for a restore that writes
+/// the rootfs into it itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedInstance {
+    /// A btrfs subvolume, which a later disk backup can snapshot.
+    Subvolume,
+    /// A plain directory: one already there, or one made on a filesystem that
+    /// isn't btrfs. It boots, but nothing can snapshot it.
+    PlainDirectory,
+    /// Nothing: the node-manager predates the RPC.
+    Unsupported,
+}
+
+/// Create a sandbox's empty `instance/` as a btrfs subvolume, for a restore
+/// that writes the rootfs into it itself, and report what is there.
+pub(crate) async fn create_sandbox_instance(
+    sandbox_id: &str,
+    target: InstanceTarget,
+    node_manager: &NodeManagerConnector,
+) -> Result<PreparedInstance, BtrfsViaNodemgrError> {
+    let mut client = node_manager
+        .connect()
+        .await
+        .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
+    match client
+        .btrfs_create_sandbox_instance(BtrfsCreateSandboxInstanceRequest {
+            sandbox_id: sandbox_id.to_string(),
+            target: Some(target.into()),
+        })
+        .await
+    {
+        Ok(response) if response.get_ref().subvolume => Ok(PreparedInstance::Subvolume),
+        Ok(_) => Ok(PreparedInstance::PlainDirectory),
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            Ok(PreparedInstance::Unsupported)
+        }
+        Err(status) => Err(BtrfsViaNodemgrError::Rpc {
+            rpc: "BtrfsCreateSandboxInstance",
+            status,
+        }),
+    }
 }
 
 /// Subvolume-aware delete of a sandbox's `instance/` (and any stray
