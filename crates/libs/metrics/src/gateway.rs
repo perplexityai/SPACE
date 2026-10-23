@@ -146,12 +146,16 @@ pub fn dns_attribution_cache_lookup(kind: DnsAttributionCacheLookupKind, hit: bo
     );
 }
 
-/// Occupied UDP slots sampled immediately after each reserved-DNS admission attempt.
-pub fn reserved_dns_udp_in_flight(active: usize) {
+/// Occupied UDP slots for one reserved resolver, sampled immediately after
+/// each reserved-DNS admission attempt.
+pub fn reserved_dns_udp_in_flight(resolver: &str, active: usize) {
     distribution(
         "gateway.reserved_dns.udp.in_flight",
         active as f64,
-        &[tag("git_sha", pplx_space_observability::git_sha())],
+        &[
+            tag("resolver", resolver),
+            tag("git_sha", pplx_space_observability::git_sha()),
+        ],
     );
 }
 
