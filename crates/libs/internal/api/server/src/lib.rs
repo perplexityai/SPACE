@@ -23,6 +23,7 @@ pub mod ingress_activation;
 mod node_inventory;
 mod route_identity;
 mod run;
+mod runtime_desired_state;
 mod sandbox_service_ports;
 mod trusted_storage;
 mod visibility_observations;
@@ -321,6 +322,10 @@ pub struct ClusterApiService {
     /// than a `static` so each instance — and each test fixture — owns its own.
     /// See `template_visibility_cache`.
     template_visibility_cache: template_visibility_cache::TemplateVisibilityCache,
+    /// Whether `GetNodeRuntimeDesiredState` serves the cluster policy. Off
+    /// unless `from_env_with_security_state` reads it on, so tests don't
+    /// inherit the developer's shell.
+    runtime_desired_state: runtime_desired_state::RuntimeDesiredState,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -585,6 +590,7 @@ impl ClusterApiService {
             template_releases_store,
             route_ed25519_authority,
             ecw_credential_keyring,
+            runtime_desired_state: runtime_desired_state::RuntimeDesiredState::Disabled,
         }
     }
 
@@ -635,6 +641,7 @@ impl ClusterApiService {
         service.trusted_template_storage =
             trusted_storage::TrustedTemplateStorageBuckets::from_env()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        service.runtime_desired_state = runtime_desired_state::RuntimeDesiredState::from_env();
         Ok(service)
     }
 

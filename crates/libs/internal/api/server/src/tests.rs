@@ -1,5 +1,6 @@
 mod prefetch_catalog;
 mod reconcile_claim_origins;
+mod runtime_desired_state;
 mod substrate_scope;
 #[cfg(feature = "kubernetes")]
 mod template_node_identity;

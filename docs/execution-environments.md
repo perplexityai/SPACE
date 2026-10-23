@@ -743,7 +743,9 @@ attempts, including retries, rather than completed launches. Transient exact-sou
 errors follow the existing inventory refresh backoff and the caller's activation
 retry/deadline; selection itself does not wait or write a consumer.
 
-The temporary node settings will yield authority to cluster desired policy.
+Cluster desired policy (below) will add restrictions within these node settings
+once nodes apply it; the node settings stay the upper bound on what a node may
+execute.
 Until placement consumes environment eligibility and fresh usability evidence,
 keep allowed/default policy uniform within each role/host-platform cohort and
 verify that builder outputs work on every worker cohort that may receive them.
@@ -765,6 +767,66 @@ infer permission from `SPACE_ENV`: absent settings revoke non-E0 bindings even o
 Kind and development nodes. Before upgrading a deployment that needs those existing
 bindings, configure its explicit allowlist while keeping the default at E0. Do not
 expand every development deployment's policy merely because of its name.
+
+### Cluster desired policy
+
+Cluster policy lives in the control-plane tables `runtime_environment_policy`
+and `runtime_environment_states`. Services read and write them only through
+`pplx-space-runtime-environment-policy-store`. The exceptions are the direct SQL
+a cluster administrator runs to reset the policy before rolling back its
+migration, and the `ON DELETE SET NULL` cascade that clears a deleted user from
+the audit columns. Each environment with a state is
+`allowed`, `deprecated` or `blocked`; the first two execute. The policy row names
+the cluster default, the legacy permission and a generation that every store
+write raises. The store keeps the default `allowed`, replaces it but never clears it,
+and refuses a block while the cluster has no default.
+
+Cluster API serves the policy in the `execution_policy` field of
+`GetNodeRuntimeDesiredState` when `SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED`
+is truthy. It's off by default, and the field is then absent, so nodes keep their
+startup settings. An unset default or legacy permission in a served policy
+likewise leaves the node's configured value in place. A policy that can't be read
+fails the whole call rather than coming back absent, since absence would send a
+node back to its startup settings. The setting is read per cluster API replica at
+startup, so while it changes, or during a rolling deploy that changes it, some
+replicas serve the field and others don't. Rolling the cluster API back to a
+binary without the field has the same effect. Since a missing field sends a node
+back to its startup settings, which would lift any cluster block, change the
+setting or roll the binary back only while no node applies the field. No node
+reads the field yet. A node that does
+combines the policy with its own settings by these rules, so policy narrows what
+a node allows, and may pick its default among the environments left, but never
+widens it:
+
+- **Allowed set.** With no cluster default, state rows narrow nothing: the node
+  keeps its configured allowlist. Since the store refuses a block without a
+  default, those rows are normally `allowed` or `deprecated`; only direct SQL
+  can leave a block behind. Once the cluster has a default, the node
+  executes the intersection of its configured allowlist and the policy's
+  executing set. A reference the node doesn't compile or allow is ignored. An
+  environment with no state then doesn't execute, just like a blocked one, so
+  setting the first default narrows every node to the environments that have
+  a state. Mark the environments nodes must keep `allowed` before setting it.
+- **Default.** The node adopts the cluster default when it's in that
+  intersection. Otherwise, as on an older build during a rollout, it keeps its
+  configured default if that's still in the intersection, and has no compiled
+  default if it isn't. Either way, it should report the divergence once node
+  policy publication carries the cluster policy, which it doesn't yet.
+- **Legacy permission.** The node allows unbound historical contracts only when
+  both its own setting and the cluster's allow them. The cluster can revoke
+  `legacy`, never grant it.
+- **aarch64.** No compiled environment qualifies, so the intersection is empty
+  and the node has no compiled default whatever the cluster says. Only the
+  legacy permission applies, and the cluster can revoke it.
+
+Apply each response in full, and never skip one because of its generation.
+Rolling the schema back and reapplying it restarts the generation at 0. A node
+that accepted only higher generations would then ignore changes until the
+generation passed the last value it saw, and one that skipped equal generations
+could keep a different policy that happened to share a number. The generation
+orders and identifies policy versions only within one schema lifetime. `updated_at`
+on either table isn't policy history: deleting a user changes it through the
+`ON DELETE SET NULL` cascade.
 
 ### Selecting a restore consumer
 
@@ -792,15 +854,20 @@ object garbage collection, never by deleting S3 vmstate and editing lifecycle ro
 The whole-node `runtime-provisioning` facet reads
 `ClusterApi.GetNodeRuntimeDesiredState` on each periodic inbound tick, even with
 no installed artifacts or templates. The response optionally carries a
-`RuntimeProvisioningRecipe` of immutable compiled environment references. It
-contains neither execution permissions/defaults nor arbitrary download URLs,
-paths or artifact hashes. The cluster authenticates the registered node by the
+`RuntimeProvisioningRecipe` of immutable compiled environment references. The
+recipe contains neither execution permissions/defaults nor arbitrary download URLs,
+paths or artifact hashes; the response's separate `execution_policy` field
+(see "Cluster desired policy") carries execution policy, and installation never
+reads it. The cluster authenticates the registered node by the
 existing origin check before answering.
 
-The current cluster handler returns no recipe. A policy store and producer must
+The current cluster handler returns no recipe. A recipe store and producer must
 be connected before deployment can request installations; this endpoint does not
 implicitly commission E0. Older cluster services return `Unimplemented`, which
-node-ctl also treats as no recipe. Other fetch errors remain visible failures.
+node-ctl also treats as no recipe. Other fetch errors remain visible failures,
+including a cluster execution policy the cluster API can't read while
+`SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED` is on: that fails the whole
+call, recipe included.
 Neither absence nor an empty recipe uninstalls anything.
 
 Node-ctl validates the complete recipe's size, reference syntax and uniqueness

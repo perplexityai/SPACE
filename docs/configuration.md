@@ -111,6 +111,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_BUILDER_BLOB_MIN_AVAILABLE_BYTES` | 50 GiB | |
 | `SPACE_NODE_API_UDS_PER_SANDBOX` | 64 | Per-sandbox control-socket permits, `1..=node permits`. |
 | `SPACE_INTERNAL_API_VISIBILITY_CACHE_TTL_SECS`, `SPACE_INTERNAL_API_VISIBILITY_CACHE_STALE_CEILING_SECS` | built-in | Template visibility cache freshness and stale ceiling. |
+| `SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED` | off | Whether `GetNodeRuntimeDesiredState` serves the cluster execution environment policy. Off, it returns no policy, so nodes have no cluster restrictions to apply on top of `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS` and `SPACE_DEFAULT_EXECUTION_ENVIRONMENT`. Read per replica at startup, which logs the value it read and its decision; an unrecognized value reads as off. See "Cluster desired policy" in [execution-environments.md](execution-environments.md). |
 | `SPACE_SBXMGR_ACTIVATION_ADMISSION_MAX_CONCURRENT` | 5 | |
 | `SPACE_SBX_EVICT_ENABLED`, `SPACE_SBX_EVICT_ENGAGE_FRACTION`, `SPACE_SBX_EVICT_TARGET_FRACTION`, `SPACE_SBX_EVICT_MIN_IDLE_SECS` | off, 0.75, 0.70, 25 h | |
 | `SPACE_SBX_EVICT_INTERVAL_SECS`, `SPACE_SBX_EVICT_MAX_PER_TICK`, `SPACE_SBX_EVICT_REUPLOAD_MAX_PER_TICK` | 600, 100, 5 | |
@@ -466,7 +467,7 @@ forwarding never relabels it.
 | `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS` | `e0,legacy` on x86_64; `legacy` on aarch64 | Comma-separated compiled environment names and optional historical-unbound permission. Surrounding whitespace is ignored; empty, duplicate and unknown entries fail startup. |
 | `SPACE_DEFAULT_EXECUTION_ENVIRONMENT` | `e0` on x86_64; `legacy` on aarch64 | Must be allowed. Used for unpinned scratch builds, not to replace a bound source. |
 
-These settings replace the former `SPACE_ENV` admission rule. Before upgrading
+The two node settings replace the former `SPACE_ENV` admission rule. Before upgrading
 a node that runs non-E0 work, explicitly allow every environment that must remain
 usable. Leaving settings absent revokes those bindings even on development or
 Kind nodes. See [execution policy and rollout](execution-environments.md) for
