@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use pplx_space_metrics::payload::{self, Budget, Outcome, Site};
+use pplx_space_grpc_metrics::payload::{self, Budget, Outcome, Site};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 

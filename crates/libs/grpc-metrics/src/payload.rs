@@ -21,7 +21,7 @@
 //! cleanup has no duration sample yet; compare the two slot counters over the
 //! same process lifetime.
 
-use crate::emit::{counter, distribution, tag};
+use pplx_space_metrics_emit::{counter, distribution, tag};
 
 metric_vocabulary! {
     /// Shared guest payload budget, independent of transport.
