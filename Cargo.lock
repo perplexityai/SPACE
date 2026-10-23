@@ -6617,6 +6617,8 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
+ "pplx-space-node-runtime-core",
+ "pplx-space-node-runtime-manager-client",
  "pplx-space-sbx-mgr-client",
  "pplx-space-sqlite",
  "pplx-space-template-mgr-client",

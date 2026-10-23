@@ -79,6 +79,10 @@ service ClusterApi {
   // Postgres but whose local side effects are owned by template-manager.
   rpc GetNodeTemplateDesiredState(GetNodeTemplateDesiredStateRequest) returns (GetNodeTemplateDesiredStateResponse);
 
+  // Whole-node installation intent, including nodes with empty local inventory.
+  // This does not authorize execution or change the default environment.
+  rpc GetNodeRuntimeDesiredState(GetNodeRuntimeDesiredStateRequest) returns (GetNodeRuntimeDesiredStateResponse);
+
   // Return the control-plane desired sandbox state for node-local sandboxes.
   // This is a cluster -> node facet; observed node-local state is published
   // back through PublishNodeState.
@@ -1239,4 +1243,22 @@ message GetSuspendSnapshotLocationResponse {
   int64 bytes_uploaded = 3;
   // Empty for snapshots finalized before digests were recorded.
   repeated SnapshotArtifactDigest artifact_digests = 4;
+}
+
+// The server authenticates the registered node independently of these hints.
+message GetNodeRuntimeDesiredStateRequest {
+  string node_id = 1;
+  optional NodeRole role = 2;
+}
+
+message RuntimeProvisioningRecipe {
+  // Immutable compiled environment references, not names, paths or new hashes.
+  // Nodes validate the complete set before submitting any installation.
+  // Omission never authorizes removal. Empty means no required installations.
+  repeated string required_environments = 1;
+}
+
+message GetNodeRuntimeDesiredStateResponse {
+  // Absent means no policy is assigned; it is not an empty applied recipe.
+  RuntimeProvisioningRecipe recipe = 1;
 }
