@@ -4,6 +4,7 @@ mod list;
 mod metadata;
 mod ownership;
 mod read;
+mod terminal;
 pub(super) mod watch;
 mod write;
 

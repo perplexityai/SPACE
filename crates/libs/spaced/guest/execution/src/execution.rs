@@ -182,14 +182,18 @@ impl ExecutionService {
     /// Close admission through every existing handle without cancelling admitted
     /// work. This is idempotent; admitted operations other than worker watches
     /// can finish, including uploads and filesystem mutations.
-    /// Worker watches retire quietly at close; Direct watches retire during
-    /// drain or cancellation. Use [`Self::cancel`] to request abortive shutdown.
+    /// Worker watches retire with recoverable `Unavailable` at close; Direct
+    /// watches retire during drain or cancellation. Send required process input,
+    /// close stdin and send signals before closing admission: control calls are
+    /// refused afterward. Use [`Self::cancel`] to request abortive shutdown.
     pub fn close(&self) {
         self.inner.lifecycle.close();
     }
 
     /// Close admission and request cancellation of owned work. This does not wait,
-    /// cancel the caller's token or roll back effects. Cleanup can outlast it.
+    /// cancel the caller's token or roll back effects. Identity workers can be
+    /// terminated immediately; the request cancellation grace does not apply.
+    /// Cleanup can outlast this call.
     pub fn cancel(&self) {
         self.inner.lifecycle.cancel();
     }
