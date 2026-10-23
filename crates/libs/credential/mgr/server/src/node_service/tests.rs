@@ -273,18 +273,42 @@ async fn gateway_signing_authorizes_sandbox_manager_before_acquiring_a_ca() {
             (0, Code::PermissionDenied),
             (65534, Code::PermissionDenied),
         ] {
-            let mut request = Request::new(IssueIntermediateCertificateRequest::default());
-            request
-                .extensions_mut()
-                .insert(PeerIdentity::new(uid, uid, Some(1)));
-            assert_eq!(
-                node.issue_intermediate_certificate(request)
-                    .await
-                    .unwrap_err()
-                    .code(),
-                expected
-            );
+            for issuer in [
+                crate::proto::GatewayCaIssuer::Unspecified,
+                crate::proto::GatewayCaIssuer::Shared,
+            ] {
+                let mut request = Request::new(IssueIntermediateCertificateRequest {
+                    issuer: issuer as i32,
+                    ..Default::default()
+                });
+                request
+                    .extensions_mut()
+                    .insert(PeerIdentity::new(uid, uid, Some(1)));
+                assert_eq!(
+                    node.issue_intermediate_certificate(request)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    expected
+                );
+            }
         }
+        let mut anchor = Request::new(IssueIntermediateCertificateRequest {
+            issuer: crate::proto::GatewayCaIssuer::Anchor as i32,
+            ..Default::default()
+        });
+        anchor.extensions_mut().insert(PeerIdentity::new(
+            users::SPACE_SBXMGR.uid,
+            users::SPACE_SBXMGR.primary_group.gid,
+            Some(1),
+        ));
+        assert_eq!(
+            node.issue_intermediate_certificate(anchor)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
         assert_eq!(
             node.issue_intermediate_certificate(Request::new(
                 IssueIntermediateCertificateRequest::default()
