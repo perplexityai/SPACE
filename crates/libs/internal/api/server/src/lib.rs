@@ -963,6 +963,7 @@ impl ClusterApiService {
         // node, so a stale runtime on a node the sandbox has since moved off
         // still learns so and releases itself instead of retrying a
         // permission refusal.
+        let mut generation_fence_admitted = false;
         if outcome == snapshot_store::InsertOutcome::Created
             && let Some(execution_generation) = execution_generation
             && !snapshot_store::artifact_registered_by_another_attempt(
@@ -980,6 +981,7 @@ impl ClusterApiService {
                 execution_generation,
             )
             .await?;
+            generation_fence_admitted = true;
         }
         // Authorize on the persisted row: a replay stays bound to the node
         // that registered the attempt even after retirement or relocation,
@@ -1008,6 +1010,7 @@ impl ClusterApiService {
             local_artifact_id: local_artifact_id.to_string(),
             backup_attempt_id: backup_attempt_id.to_string(),
             fence_verdict_only: req.fence_verdict_only,
+            generation_fence_admitted,
         }))
     }
 
@@ -1565,6 +1568,7 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 mod adapter;
 mod auto_lifecycle_delete_completions;
 mod backup_generation_fence;
+mod execution_currency;
 mod execution_observation;
 mod metadata;
 mod node_local_backup_pending;

@@ -683,3 +683,60 @@ async fn verdict_only_registration_persists_nothing() -> TestResult {
     assert!(!pplx_space_sandbox_store::durably_restorable(pool, sandbox_id).await?);
     Ok(())
 }
+
+/// The reply says whether the generation fence ran and admitted the
+/// registration: only a fresh attempt bound to a generation, with no other
+/// attempt's row for its bytes, is fenced. A replay, a retry of bytes another
+/// attempt registered and an unbound registration are admitted without it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_reply_says_whether_the_fence_admitted_the_registration() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, source_ip, _) = seed_sandbox_on_source_node(pool).await?;
+    insert_execution(pool, sandbox_id, 1, "running", true).await?;
+    let begin = |request: BeginArtifactBackupRequest| {
+        fixture
+            .service
+            .begin_artifact_backup(request_from_node(request, source_ip))
+    };
+
+    let captured = LocalArtifactId::new();
+    let first = teardown_backup_request(sandbox_id, captured, SnapshotId::new(), 1);
+    let verdict_only = BeginArtifactBackupRequest {
+        fence_verdict_only: true,
+        ..first.clone()
+    };
+    assert!(
+        begin(verdict_only)
+            .await?
+            .into_inner()
+            .generation_fence_admitted,
+        "a verdict-only request is fenced like the registration"
+    );
+    assert!(
+        begin(first.clone())
+            .await?
+            .into_inner()
+            .generation_fence_admitted,
+        "a capture's first registration is fenced"
+    );
+    assert!(
+        !begin(first).await?.into_inner().generation_fence_admitted,
+        "a replay isn't"
+    );
+    let retry = teardown_backup_request(sandbox_id, captured, SnapshotId::new(), 1);
+    assert!(
+        !begin(retry).await?.into_inner().generation_fence_admitted,
+        "a retry of bytes another attempt registered isn't"
+    );
+    let mut unbound =
+        teardown_backup_request(sandbox_id, LocalArtifactId::new(), SnapshotId::new(), 1);
+    unbound.execution_generation = None;
+    assert!(
+        !begin(unbound).await?.into_inner().generation_fence_admitted,
+        "an unbound registration isn't"
+    );
+    Ok(())
+}

@@ -318,6 +318,40 @@ pub(super) fn fresh_runtime_activation_identity(
 }
 
 impl SandboxManagerService {
+    /// Refuse to start the runtime of an activation this node already began
+    /// for `claim` once the control plane has retired its execution. Kubelet
+    /// retries a pod whose first launch failed with the same route identity,
+    /// which still matches the claim the failure kept open, so only the
+    /// control plane can tell that a newer execution replaced it; started
+    /// anyway, the runtime is an orphan whose capture the backup fence refuses.
+    /// A first activation isn't asked: its execution was current when the
+    /// control plane made its pod.
+    pub(in crate::service) async fn refuse_retired_activation_retry(
+        &self,
+        sandbox_id: &str,
+        claim: Option<&crate::db::route_activation_claims::OpenRouteActivationClaim>,
+    ) -> Result<(), Status> {
+        let Some(claim) = claim else {
+            return Ok(());
+        };
+        let retry = {
+            let db = self.db_conn()?;
+            crate::db::read::sandbox_view(&db, sandbox_id)
+                .route_claim()
+                .matches(claim)
+                .map_err(|error| Status::internal(format!("db error: {error}")))?
+        };
+        let generation = claim.execution_generation();
+        if retry && crate::route_activation_claims::retired_on_cluster(sandbox_id, generation).await
+        {
+            return Err(Status::failed_precondition(format!(
+                "execution generation {generation} of sandbox {sandbox_id} was retired; \
+                 its runtime must not start"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn resolve_runtime_activation_identity(
         &self,
         sandbox_id: &str,

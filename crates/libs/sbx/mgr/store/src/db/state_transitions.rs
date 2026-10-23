@@ -385,6 +385,58 @@ pub fn mark_teardown_suspend_backup_permanently_failed(
     Ok(changed == 1)
 }
 
+/// What [`clear_teardown_suspend_backup_permanently_failed`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TeardownBackupMarkerClear {
+    /// The row carried the marker for the artifact, and no longer does.
+    Cleared,
+    /// The row still stages the artifact as `suspending`, without the marker.
+    Unmarked,
+    /// The row is gone, has left `suspending`, or stages another artifact:
+    /// a cluster-deleted eviction may have claimed it.
+    MovedOn,
+}
+
+/// Clear the terminal-teardown-suspend marker
+/// [`mark_teardown_suspend_backup_permanently_failed`] stamped for
+/// `staged_artifact`, once the cluster admits the backup it refused: the
+/// suspend can publish again. The check and the clear share one transaction,
+/// so a cluster-deleted eviction's claim lands before or after both.
+pub fn clear_teardown_suspend_backup_permanently_failed(
+    conn: &Connection,
+    id: &str,
+    staged_artifact: LocalArtifactId,
+) -> Result<TeardownBackupMarkerClear> {
+    let tx = immediate_transaction(conn)?;
+    let marker = pplx_space_sbx_mgr_protocol::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON;
+    let cleared = tx.execute(
+        "UPDATE sandboxes
+         SET failure_reason = NULL,
+             updated_at = ?1
+         WHERE id = ?2
+           AND state = 'suspending'
+           AND current_local_artifact_id = ?3
+           AND failure_reason = ?4",
+        params![now()?, id, staged_artifact.to_string(), marker],
+    )? == 1;
+    let outcome = if cleared {
+        TeardownBackupMarkerClear::Cleared
+    } else if tx.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM sandboxes
+             WHERE id = ?1 AND state = 'suspending' AND current_local_artifact_id = ?2
+         )",
+        params![id, staged_artifact.to_string()],
+        |row| row.get::<_, bool>(0),
+    )? {
+        TeardownBackupMarkerClear::Unmarked
+    } else {
+        TeardownBackupMarkerClear::MovedOn
+    };
+    tx.commit()?;
+    Ok(outcome)
+}
+
 pub fn mark_cross_node_restore_staging_failed(
     conn: &Connection,
     id: &str,

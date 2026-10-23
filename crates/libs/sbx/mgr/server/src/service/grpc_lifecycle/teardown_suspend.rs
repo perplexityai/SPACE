@@ -3,6 +3,15 @@
 
 use super::*;
 
+mod backup_refusal;
+
+/// The target of everything this module logs, its children included, so that
+/// moving code into a child keeps the target searches select on.
+const LOG_TARGET: &str = module_path!();
+
+pub(super) use self::backup_refusal::teardown_artifact_backup_status;
+use self::backup_refusal::*;
+
 pub(in crate::service) const SUSPEND_TRIGGER_METADATA: &str = "x-space-suspend-trigger";
 
 /// What a teardown suspend that needs an artifact's backup does with the
@@ -17,10 +26,13 @@ pub(in crate::service) enum KeyedUploadUse {
     NewAttempt,
 }
 
-/// How many of an artifact's uploads may fail permanently before a teardown
-/// stops starting new ones: the original upload, which may have met an outage
+/// How many of an artifact's uploads may fail an attempt permanently before a
+/// teardown stops starting new ones: the first, which may have met an outage
 /// such as a transfer vol-mgr gave up on, and one recovery attempt. A failure
-/// that recurs on a fresh attempt is treated as the artifact's own.
+/// that recurs on a fresh attempt is treated as the artifact's own. Refusals
+/// of the artifact don't count against it: after one, the teardown starts an
+/// attempt only once the fence admits the registration, though other callers
+/// under the artifact's key may start their own.
 pub(in crate::service) const PERMANENTLY_FAILED_UPLOAD_LIMIT: u64 = 2;
 
 /// The teardown's rule for the newest upload under the artifact's key, in
@@ -30,15 +42,18 @@ pub(in crate::service) const PERMANENTLY_FAILED_UPLOAD_LIMIT: u64 = 2;
 /// - an active or completed upload is joined;
 /// - a retriable failure only ran out of attempts, so a new attempt follows;
 /// - a permanent failure of the artifact itself (see
-///   [`crate::snapshot_upload::UploadFailureScope`]) is final;
+///   [`crate::snapshot_upload::UploadFailureScope`]) is joined, which makes it
+///   final unless the cluster has since stopped refusing the registration
+///   (see [`SandboxManagerService::ensure_teardown_suspend_backup`]);
 /// - a permanent failure of an attempt gets a new attempt while fewer than
 ///   [`PERMANENTLY_FAILED_UPLOAD_LIMIT`] uploads have failed permanently, and
 ///   is final after that.
 ///
 /// The limit bounds the attempt-scoped rule, so a failure recorded as the
-/// attempt's that is really the artifact's still ends. The failed jobs it
-/// counts persist across restarts until the jobs retention pruner removes
-/// them.
+/// attempt's that is really the artifact's still ends. It counts no failure
+/// recorded as the artifact's: a refusal of the artifact, even one that
+/// lapses, isn't an attempt's failure. The failed jobs it counts persist across
+/// restarts until the jobs retention pruner removes them.
 pub(in crate::service) fn teardown_keyed_upload_use(
     status: pplx_space_common_jobs::JobStatus,
     failure: Option<pplx_space_common_jobs::JobFailure>,
@@ -176,75 +191,6 @@ fn durable_teardown_suspend_prepare_response(
         snapshot_name: None,
     });
     Ok(Response::new(response))
-}
-
-const TEARDOWN_BACKUP_FAILED_ARTIFACT_METADATA: &str =
-    "x-space-teardown-backup-failed-artifact-bin";
-const TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA: &str =
-    "x-space-teardown-backup-superseded-generation";
-
-pub(super) fn teardown_artifact_backup_status(
-    error: ArtifactBackupSubmissionError,
-    artifact: LocalArtifactId,
-) -> Status {
-    let (permanent, superseded_generation) = match &error {
-        ArtifactBackupSubmissionError::Begin {
-            error,
-            superseded_generation,
-        } => (
-            error.kind() == pplx_space_common_jobs::JobFailureKind::Permanent,
-            *superseded_generation,
-        ),
-        _ => (false, None),
-    };
-    let mut status = artifact_backup_fence_status(error.to_string());
-    if permanent {
-        status = teardown_backup_failure_status(status, artifact);
-        // The refusal reached the drive before the upload job failed, so the
-        // driver can't recover the verdict from the job; carry it here.
-        if let Some(generation) = superseded_generation {
-            status.metadata_mut().insert(
-                TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA,
-                tonic::metadata::MetadataValue::from(generation.get()),
-            );
-        }
-    }
-    status
-}
-
-/// The generation a teardown backup's own registration was refused for as
-/// superseded, when that refusal reached the drive directly.
-fn teardown_backup_superseded_generation(
-    status: &Status,
-) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
-    status
-        .metadata()
-        .get(TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
-}
-
-// The shared publication path returns tonic Status. Keep backup provenance on
-// its teardown-only errors until the driver has verified control-plane absence.
-fn teardown_backup_failure_status(mut status: Status, artifact: LocalArtifactId) -> Status {
-    status.metadata_mut().insert_bin(
-        TEARDOWN_BACKUP_FAILED_ARTIFACT_METADATA,
-        tonic::metadata::MetadataValue::from_bytes(artifact.as_uuid().as_bytes()),
-    );
-    status
-}
-
-fn teardown_failed_backup_artifact(status: &Status) -> Option<LocalArtifactId> {
-    let value = status
-        .metadata()
-        .get_bin(TEARDOWN_BACKUP_FAILED_ARTIFACT_METADATA)?
-        .to_bytes()
-        .ok()?;
-    Some(LocalArtifactId::from_uuid(
-        uuid::Uuid::from_slice(&value).ok()?,
-    ))
 }
 
 /// The wake and artifact locks the teardown driver holds for its whole run.
@@ -753,8 +699,11 @@ impl SandboxManagerService {
             // another node doesn't prove the sandbox is gone. Leave the
             // teardown running so the next drive asks again.
             RegistrationProbe::Unanswered => backup_lookup = None,
-            // A verdict about another generation still proves the row exists.
-            RegistrationProbe::Superseded(_) => backup_lookup = None,
+            // A verdict about another generation, or an admission, still
+            // proves the row exists. An admitted refusal of the artifact is
+            // the next drive's to register again (see
+            // `ensure_teardown_suspend_backup`).
+            RegistrationProbe::Superseded(_) | RegistrationProbe::Admitted => backup_lookup = None,
             RegistrationProbe::NotSuperseded => {}
         }
         self.settle_teardown_suspend_driver_failure(
@@ -843,47 +792,6 @@ impl SandboxManagerService {
             tracing::warn!(%sandbox_id, %error, "cannot persist teardown retry deadline");
         }
         result
-    }
-
-    /// The terminal upload job that staged `staged_artifact` for this
-    /// generation's teardown suspend and has no transfer IDs, or `None`.
-    /// Only that payload's registration can carry the cluster's verdict about
-    /// this execution.
-    pub(super) fn teardown_backup_payload_bound_to(
-        &self,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-        staged_artifact: LocalArtifactId,
-    ) -> Option<crate::snapshot_upload::SnapshotUploadJobs> {
-        let job = match self.snapshot_upload_worker.find_job_by_dedup_key(
-            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(staged_artifact),
-        ) {
-            // A live job still owns its attempt: its own Begin will meet the
-            // same refusal and make the job terminal, and the next drive probes.
-            Ok(job) => job.filter(|job| job.is_terminal())?,
-            Err(error) => {
-                tracing::warn!(%staged_artifact, %error,
-                    "could not read the refused teardown backup's upload job");
-                return None;
-            }
-        };
-        match job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>() {
-            // Transfer IDs mean the registration was admitted, so a re-sent
-            // Begin is an unfenced replay that can't carry a refusal. Their
-            // absence doesn't prove the opposite; the probe tolerates a replay.
-            Ok(payload)
-                if payload.execution_generation == Some(execution_generation)
-                    && payload.job_ids.is_empty() =>
-            {
-                Some(payload)
-            }
-            Ok(_) => None,
-            Err(error) => {
-                tracing::warn!(%staged_artifact, %error,
-                    "could not decode the refused teardown backup's upload job");
-                None
-            }
-        }
     }
 
     pub(super) fn record_teardown_suspend_driver_failure(
@@ -1227,58 +1135,6 @@ impl SandboxManagerService {
         Ok(())
     }
 
-    /// Record that a teardown suspend's durable backup is over, on the row
-    /// the shim keeps polling.
-    ///
-    /// A permanent job failure the teardown can't retry ends the artifact's
-    /// upload for good: [`teardown_keyed_upload_use`] refuses a fresh
-    /// attempt for it, so every later poll rejoins the same terminal job. A
-    /// permanent failure that still gets a new attempt is not marked.
-    /// The suspend therefore can never publish, the row can never leave
-    /// `suspending`, and nothing on this node distinguishes it from a suspend
-    /// still uploading — a distinction the cluster-deleted eviction needs
-    /// before it may reclaim anything. The marker supplies exactly that
-    /// terminality proof and nothing else; whether the sandbox is *gone*
-    /// stays the cluster's call.
-    ///
-    /// Best-effort: a failed stamp leaves the pre-existing stuck row, which is
-    /// the behavior without this marker at all, and the next poll retries.
-    fn record_teardown_suspend_backup_permanent_failure(
-        &self,
-        sandbox_id: &str,
-        staged_artifact: LocalArtifactId,
-    ) {
-        let marked = self.db_conn().and_then(|db| {
-            crate::db::mark_teardown_suspend_backup_permanently_failed(
-                &db,
-                sandbox_id,
-                staged_artifact,
-            )
-            .map_err(|error| Status::internal(format!("db error: {error}")))
-        });
-        match marked {
-            Ok(true) => {
-                tracing::warn!(
-                    sandbox_id,
-                    %staged_artifact,
-                    "generation suspend backup was permanently refused; marked the suspending \
-                     row terminal so a cluster-deleted report can reclaim it"
-                );
-                mark_sandbox_dirty(&self.db, sandbox_id);
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(
-                    sandbox_id,
-                    %staged_artifact,
-                    %error,
-                    "failed to mark a permanently refused generation suspend backup; the \
-                     suspending row stays unreclaimable until a later attempt marks it"
-                );
-            }
-        }
-    }
-
     pub(super) async fn ensure_teardown_suspend_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -1303,9 +1159,39 @@ impl SandboxManagerService {
         {
             return self.verify_teardown_suspend_backup_ownership(sandbox, &backup);
         }
+        let mut superseded = None;
         let joined = match persisted_job {
             Some(job) => match self.teardown_use_of_upload(&backup, &job)? {
-                KeyedUploadUse::Join => Some(job.job_id),
+                KeyedUploadUse::Join => {
+                    match self.teardown_backup_refusal_verdict(&backup, &job).await {
+                        // The cluster refused this execution's registration, and
+                        // its fence now admits it: a supersession lapsed when
+                        // every execution that superseded this one ended
+                        // without running. Rejoining would replay the stale
+                        // refusal on every drive and hold the runtime, and the
+                        // pod the next wake waits on, for good.
+                        Some(crate::snapshot_upload_jobs::RegistrationProbe::Admitted)
+                            if self.clear_teardown_suspend_backup_permanent_failure(
+                                &sandbox.id,
+                                backup.artifact.local_artifact_id,
+                            ) =>
+                        {
+                            tracing::info!(sandbox_id = %sandbox.id, job_id = %job.job_id,
+                                "the cluster now admits a teardown backup it refused; \
+                                 starting a new upload");
+                            None
+                        }
+                        // Carry a standing verdict to the settle, which then
+                        // needn't ask again.
+                        Some(crate::snapshot_upload_jobs::RegistrationProbe::Superseded(
+                            generation,
+                        )) => {
+                            superseded = Some(generation);
+                            Some(job.job_id)
+                        }
+                        _ => Some(job.job_id),
+                    }
+                }
                 KeyedUploadUse::NewAttempt => None,
             },
             None => None,
@@ -1363,6 +1249,9 @@ impl SandboxManagerService {
                 Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
             ) {
                 error = teardown_backup_failure_status(error, backup.artifact.local_artifact_id);
+                if let Some(generation) = superseded {
+                    error = teardown_backup_superseded_status(error, generation);
+                }
             }
             return Err(error);
         }
@@ -1381,7 +1270,7 @@ impl SandboxManagerService {
 
     /// [`teardown_keyed_upload_use`] for `job`, the newest upload under the
     /// artifact's key.
-    fn teardown_use_of_upload(
+    pub(super) fn teardown_use_of_upload(
         &self,
         backup: &TeardownSuspendBackup<'_>,
         job: &pplx_space_common_jobs::Job,
@@ -1404,13 +1293,17 @@ impl SandboxManagerService {
         let scope = job
             .payload_as::<RecordedScope>()
             .map_or_else(|_| Default::default(), |recorded| recorded.failure_scope);
-        let permanently_failed = self.snapshot_upload_worker.count_failed_jobs_by_dedup_key(
-            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(
-                backup.artifact.local_artifact_id,
-            ),
-            pplx_space_common_jobs::JobFailureKind::Permanent,
-        )?;
+        let permanently_failed = {
+            let db = self.db_conn()?;
+            crate::db::snapshot_upload_jobs::count_permanent_upload_failures_outside_scope(
+                &db,
+                &crate::snapshot_upload_jobs::artifact_backup_dedup_key(
+                    backup.artifact.local_artifact_id,
+                ),
+                crate::snapshot_upload::UploadFailureScope::Artifact.as_str(),
+            )
+            .map_err(|error| Status::internal(format!("db error: {error}")))?
+        };
         Ok(teardown_keyed_upload_use(
             status,
             job.failure,

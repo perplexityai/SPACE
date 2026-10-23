@@ -121,6 +121,59 @@ impl KubernetesSubstrate {
             .await
     }
 
+    /// Confirm every pod of `sandbox_id` from a generation strictly older than
+    /// `generation` gone, deleting each first (see
+    /// [`Self::delete_lingering_prior_generation_pod`]). A pod not confirmed
+    /// gone, or a pod-reflector cache too cold to enumerate them, defers the
+    /// caller with a retryable [`SubstrateError::Unavailable`].
+    pub(super) async fn sweep_lingering_prior_generation_pods(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+    ) -> Result<(), SubstrateError> {
+        if !self.pod_reflector_ready.is_ready() {
+            return Err(SubstrateError::Unavailable {
+                message: format!(
+                    "deferring restore: pod reflector cache not ready to verify \
+                     lingering prior-generation pods for sandbox {sandbox_id}; retry"
+                ),
+            });
+        }
+        let lingering = lingering_sandbox_pod_names(
+            self.pod_store.state().iter().map(|pod| pod.as_ref()),
+            sandbox_id,
+            generation,
+        );
+        for stale_pod in lingering {
+            match self.delete_lingering_prior_generation_pod(&stale_pod).await {
+                Ok(K8sBlockingDeleteOutcome::Deleted | K8sBlockingDeleteOutcome::NotFound) => {
+                    tracing::info!(
+                        %sandbox_id,
+                        stale_pod = %stale_pod,
+                        successor_generation = generation,
+                        "confirmed lingering prior-generation restore pod gone before create"
+                    );
+                }
+                outcome => {
+                    tracing::warn!(
+                        %sandbox_id,
+                        stale_pod = %stale_pod,
+                        ?outcome,
+                        "deferring restore: lingering prior-generation pod not confirmed \
+                         gone; retry"
+                    );
+                    return Err(SubstrateError::Unavailable {
+                        message: format!(
+                            "deferring restore: lingering prior-generation pod {stale_pod} \
+                             for sandbox {sandbox_id} not confirmed gone; retry"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Blocking, absence-confirming delete of a lingering strictly-older-
     /// generation pod before a restore create. Name-scoped (no UID/RV
     /// precondition): selection is already generation-fenced

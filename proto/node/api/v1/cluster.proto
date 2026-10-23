@@ -201,6 +201,15 @@ service ClusterApi {
   // backups with `GetArtifactBackupLocation`.
   rpc GetSuspendSnapshotLocation(GetSuspendSnapshotLocationRequest) returns (GetSuspendSnapshotLocationResponse);
 
+  // Whether an execution generation of a sandbox is still the sandbox's
+  // active execution, for a node about to start that execution's runtime
+  // again: a kubelet retry of a pod whose first launch failed can arrive after
+  // the control plane retired the execution, and its runtime must not run.
+  // The caller must be the registered node the execution's pod was placed
+  // on; for any other caller, and for an execution with no recorded node, the
+  // answer is `EXECUTION_CURRENCY_UNSPECIFIED`.
+  rpc GetExecutionCurrency(GetExecutionCurrencyRequest) returns (GetExecutionCurrencyResponse);
+
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
   // storage) is owned end to end by the credential manager
   // (credmgr GetOrIssueSandboxVolumeDek), so
@@ -1126,6 +1135,13 @@ message BeginArtifactBackupResponse {
   // predates the field and registered the attempt, which the caller then
   // closes.
   bool fence_verdict_only = 3;
+  // Set when the execution-generation fence ran on this registration and
+  // admitted it. Unset when the fence didn't run: an unbound registration, a
+  // replay of an already-registered attempt, or a fresh attempt for bytes
+  // another attempt registered. A server that predates the field leaves it
+  // unset. A node that wants to know whether a fresh attempt for a capture
+  // the fence refused would now be admitted reads this, not the reply alone.
+  bool generation_fence_admitted = 4;
 }
 
 message FinalizeArtifactBackupRequest {
@@ -1252,6 +1268,26 @@ message GetSandboxSnapshotStorageUriResponse {
   // the cluster API does not parse or validate it (parsing is done by the
   // node-side `SnapshotUploadConfig::from_uri`).
   optional string storage_uri = 1;
+}
+
+enum ExecutionCurrency {
+  // Unknown: no execution with that generation is recorded on the caller's
+  // node. A caller proceeds as it would without asking.
+  EXECUTION_CURRENCY_UNSPECIFIED = 0;
+  // The execution is the sandbox's active execution.
+  EXECUTION_CURRENCY_CURRENT = 1;
+  // The control plane retired the execution; its runtime must not run.
+  EXECUTION_CURRENCY_RETIRED = 2;
+}
+
+message GetExecutionCurrencyRequest {
+  string sandbox_id = 1;
+  // Positive.
+  int64 execution_generation = 2;
+}
+
+message GetExecutionCurrencyResponse {
+  ExecutionCurrency currency = 1;
 }
 
 message GetSuspendSnapshotLocationRequest {

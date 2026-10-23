@@ -1853,4 +1853,11 @@ impl ClusterApi for ClusterApiService {
     ) -> Result<Response<GetSuspendSnapshotLocationResponse>, Status> {
         ClusterApiService::get_suspend_snapshot_location(self, request).await
     }
+
+    async fn get_execution_currency(
+        &self,
+        request: Request<crate::proto::GetExecutionCurrencyRequest>,
+    ) -> Result<Response<crate::proto::GetExecutionCurrencyResponse>, Status> {
+        ClusterApiService::get_execution_currency(self, request).await
+    }
 }
