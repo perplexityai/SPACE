@@ -208,7 +208,7 @@ const DIAL_WAVE_PAUSE: Duration = Duration::from_millis(10);
 /// The proxy's admission cap and its listener depth, as the gateway sets them.
 /// This crate cannot read the gateway's own constants; update both sides
 /// together when either limit changes.
-const PROXY_ADMISSION_CAP: u64 = 1_776;
+const PROXY_ADMISSION_CAP: u64 = 1_680;
 const PROXY_LISTEN_BACKLOG: u64 = 1_024;
 /// How much of the backlog is reserved for what the arithmetic cannot see.
 ///
