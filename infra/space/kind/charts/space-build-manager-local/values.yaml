@@ -40,6 +40,9 @@ auth:
 # Kind sizing: one build at a time fits the 40 GiB local btrfs cache with the
 # 20 GiB default build disk.
 maxConcurrentBuilds: 1
+
+# Optional OS ID -> VERSION_ID -> guest seed reference for stock-seed OCI builds.
+ociGuestSeeds: {}
 # On SIGTERM build-manager stops claiming work and waits up to this long for
 # running builds before it exits (--drain-timeout-seconds, the binary's
 # default; crates/libs/build/mgr/server/src/run.rs).
