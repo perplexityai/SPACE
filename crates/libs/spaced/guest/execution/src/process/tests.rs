@@ -1,10 +1,8 @@
 use super::*;
 use futures_util::StreamExt;
 use pplx_space_common_core::types::GuestUserName;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::StartRequest;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_server::Process;
-use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
-    StartRequest, process_event, process_exit,
-};
 
 #[test]
 fn dropping_a_pending_pty_read_releases_blocking_capacity() {
@@ -2184,6 +2182,8 @@ async fn image_working_directory_is_used_unless_command_overrides_it() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn graceful_drain_waits_for_an_admitted_start_without_killing_it() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{process_event, process_exit};
+
     let (service, placement) = stalled_placement_service();
     let start = tokio::spawn({
         let service = service.clone();
