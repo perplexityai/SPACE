@@ -33,14 +33,14 @@ uuid = { workspace = true, features = ["v7"] }
 
 # internal
 pplx-space-common-core = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-grpc-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
-pplx-space-metrics = { workspace = true, features = ["test-capture"] }
+pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }

@@ -1,0 +1,21 @@
+[package]
+name = "pplx-space-service-lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "signal", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+nix = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["rt"] }

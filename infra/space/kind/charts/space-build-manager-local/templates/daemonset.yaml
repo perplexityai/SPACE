@@ -58,7 +58,7 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       # TokenReview needs the pod's own API credentials (the in-cluster
       # config of traced_kube_client_from_env,
-      # crates/libs/common/svc/src/kube_client.rs), and the allowlists name
+      # crates/libs/kube-client/src/lib.rs), and the allowlists name
       # accounts in the namespace read from the same mount (auth_namespace,
       # crates/libs/common/svc/src/auth/k8s.rs). The account may only
       # create TokenReviews (RBAC above).

@@ -15,7 +15,7 @@ spec:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
   # Delete first: runtime-manager holds no service mutex, so nothing makes a
   # successor wait for its predecessor. The successor binds at once and takes
-  # the socket path by rename (crates/libs/common/svc/src/bootstrap/unix_socket.rs), while
+  # the socket path by rename (crates/libs/unix-socket-bind/src/unix_socket.rs), while
   # both probes target that one shared socket rather than an instance-local
   # health socket; and with installs enabled the successor's installer empties
   # the shared staging directory on open, which it may only do "when nothing in

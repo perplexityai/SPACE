@@ -876,7 +876,9 @@ impl ProcessSignalHandle {
         // Keep independent ownership for signal delivery and exit observation.
         let observer_fd = pidfd.try_clone()?;
         let observer = ProcessExitObserver {
-            pidfd: tokio::io::unix::AsyncFd::new(observer_fd)?,
+            // SAFETY: AsyncFd takes the owned duplicate. ProcessExitObserver
+            // never replaces or closes it; deregistration precedes its drop.
+            pidfd: unsafe { tokio::io::unix::AsyncFd::register(observer_fd)? },
         };
         Ok((Self { pid, pidfd }, observer))
     }

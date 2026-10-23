@@ -16,7 +16,7 @@ A distillation of the [Rust API Guidelines](https://rust-lang.github.io/api-guid
 - **Iterators** (C-ITER, C-ITER-TY): `.iter()`, `.iter_mut()`, `.into_iter()`; the iterator types are named after the methods (`Iter<'a, T>`, `IterMut<'a, T>`, `IntoIter<T>`).
 - **Word order** (C-WORD-ORDER) is consistent. If we have `for_each` and `try_for_each`, we do not also have `each_try`.
 
-For SPACE-specific concepts: prefer the shared noun from `crates/libs/common/core/src/types/` and `common/svc/src/types/`. If you find yourself debating `SbxId` vs `SandboxId` vs `SandboxIdentifier`, you are doing the wrong work — go look at what already exists in `common-core` and use that name.
+For SPACE-specific concepts: prefer the existing noun from the crate that owns the concept. If you find yourself debating `SbxId` vs `SandboxId` vs `SandboxIdentifier`, you are doing the wrong work — go look at what already exists in the workspace and use that name.
 
 ---
 
@@ -105,10 +105,10 @@ We do **not** require a doc comment on every public item. The codebase is large,
 
 Before introducing a new struct/enum/alias for a domain concept (template reference, runtime kind, content digest, build id, service name, endpoint, socket path, auth context, transport error, etc.):
 
-1. Search `crates/libs/common/core/src/types/` and `crates/libs/common/svc/src/types/`.
-2. If the noun exists, reuse it. `pplx-space-common-svc` re-exports `pplx-space-common-core` as `core::*`, so service-side code can pull both from a single crate.
-3. If the noun *almost* exists but lacks a field or constructor you need, **extend the shared type in the common crate** (with tests) rather than forking a parallel type next to your handler. Parallel types fragment vocabulary and force lossy conversions at every boundary.
-4. Only if the concept is genuinely new and crate-local, define it locally. Even then, write its doc comment to explain why it isn't in `common-core`.
+1. Search the workspace for the crate that owns the concept: the value-type crates (`pplx-space-byte-size`, `pplx-space-semver`, `pplx-space-durations`, `pplx-space-content-digest`, `pplx-space-cpu-arch`, `pplx-space-k8s-ids`, `pplx-space-cluster-id`), the protocol crates (for example `pplx-space-sbx-mgr-protocol`), and the service's own crates.
+2. If the noun exists, reuse it, imported from the crate that owns it.
+3. If the noun *almost* exists but lacks a field or constructor you need, **extend it in the crate that defines it** (with tests) rather than forking a parallel type next to your handler. Parallel types fragment vocabulary and force lossy conversions at every boundary.
+4. If the concept is genuinely new and crate-local, define it locally. A new shared type goes in the existing crate that owns the concept: a wire type in that service's protocol crate, a generic value in the matching value-type crate, a service's domain type in that service's crate. If no crate fits, create a small single-responsibility crate named for its responsibility (archcheck's `crate_names` rule bans `common`, `shared`, `util(s)`, `helper(s)`, `misc` and `core`). Do not add new types or modules to `pplx-space-common-core` or `pplx-space-common-svc`.
 
 ---
 
@@ -119,7 +119,7 @@ Before introducing a new struct/enum/alias for a domain concept (template refere
 - [ ] Conversions use `From` / `TryFrom` / `AsRef` / `FromStr`, not bespoke names.
 - [ ] Method names match Rust conventions (`as_*` / `to_*` / `into_*`, `iter` family, no `get_field` for plain getters).
 - [ ] Non-obvious behavior is documented (latency, retries, idempotency, side effects). `unsafe` has a `# Safety` block.
-- [ ] No new domain noun introduced if `common-core` / `common-svc` already has one.
+- [ ] No new domain noun introduced if the crate that owns the concept already has one; a new shared type lives in its owning crate, not in `common-core` / `common-svc`.
 - [ ] Generic arguments where reasonable (`impl AsRef<Path>`, `impl Into<String>`); not where they obscure the signature.
 - [ ] `#[must_use]` applied where forgetting the result is genuinely dangerous — not as decoration.
 

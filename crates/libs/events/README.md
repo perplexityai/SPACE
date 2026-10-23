@@ -135,3 +135,16 @@ context. Keep event names domain-level: prefer `pause_requested` or
 - Add new event types only when they describe a domain transition or durable
   handoff that helps reconstruct sandbox state. Put implementation details in
   `source`, `reason`, or other detail fields.
+
+## Observing Events
+
+A process can install one `SandboxEventObserver` with
+`install_sandbox_event_observer`. After each event is logged, the observer
+receives the `SandboxEvent` (`sandbox_id`, `event_type`, `source`) and its
+`SandboxEventDetails`, whose fields are public. The observer runs on the
+emitting thread and must not block; a panic in it is caught. Without an
+observer, nothing changes.
+
+Set detail fields through the `SandboxEventDetails` builder methods, not by
+assigning fields: the typed setters keep vocabulary fields such as `trigger`
+bounded.

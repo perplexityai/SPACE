@@ -47,8 +47,11 @@ members = [
     "crates/libs/bearer-token",
     "crates/libs/tokio-runtime",
     "crates/libs/sandbox/store",
+    "crates/libs/sandbox/quarantine-store",
     "crates/libs/sandbox/teardown",
     "crates/libs/sandbox/portability",
+    "crates/libs/sandbox/auto-lifecycle-receipt",
+    "crates/libs/sandbox/routability",
     "crates/libs/snapshot/store",
     "crates/libs/snapshot/storage",
     "crates/libs/snapshot/retention",
@@ -59,18 +62,25 @@ members = [
     "crates/libs/sbx/mgr/store",
     "crates/libs/rustls-provider",
     "crates/libs/sql-locator",
+    "crates/libs/service-lifecycle",
     "crates/libs/service-mutex",
     "crates/libs/sqlite",
     "crates/libs/unix-socket-path",
+    "crates/libs/uds-peer-auth",
+    "crates/libs/unix-socket-bind",
+    "crates/libs/valkey",
+    "crates/libs/grpc-rate-limiter",
     "crates/libs/systemd-watchdog",
     "crates/libs/node/api/client",
     "crates/libs/node/api/server",
     "crates/libs/node/ctl/server",
     "crates/libs/node/ctl/client",
+    "crates/libs/node/k8s-node-id",
     "crates/libs/node/api/sim",
     "crates/libs/node/mgr/client",
     "crates/libs/node/mgr/protocol",
     "crates/libs/node/mgr/server",
+    "crates/libs/node/registration-store",
     "crates/libs/node/runtime/core",
     "crates/libs/node/runtime/manager/client",
     "crates/libs/node/runtime/manager/server",
@@ -85,10 +95,12 @@ members = [
     "crates/libs/build/mgr/server",
     "crates/libs/object-store",
     "crates/libs/page-cache",
+    "crates/libs/postgres-contention",
     "crates/libs/placement/executor",
     "crates/libs/placement/machine",
     "crates/libs/public/api",
     "crates/libs/api",
+    "crates/libs/api-route",
     "crates/libs/byte-size",
     "crates/libs/common/core",
     "crates/libs/semver",
@@ -109,17 +121,37 @@ members = [
     "crates/libs/db-test-fixtures",
     "crates/libs/db/migrator",
     "crates/libs/dependency-drain",
+    "crates/libs/ecw-credential",
     "crates/libs/migration-checksums",
     "crates/libs/aws/client",
     "crates/libs/aws/s3-http-client",
     "crates/libs/env-vars",
     "crates/libs/feature-flags",
     "crates/libs/events",
+    "crates/libs/federated-grant-store",
+    "crates/libs/ingress-admission",
     "crates/libs/metrics",
+    "crates/libs/metrics-emit",
+    "crates/libs/grpc-metrics",
     "crates/libs/observability",
     "crates/libs/internal/api/server",
     "crates/libs/k8s-ids",
+    "crates/libs/kube-client",
+    "crates/libs/state-reconciliation",
     "crates/libs/cluster-id",
+    "crates/libs/accounts",
+    "crates/libs/federated-identity",
+    "crates/libs/guest-process",
+    "crates/libs/request-id",
+    "crates/libs/execution-spec",
+    "crates/libs/linux-ids",
+    "crates/libs/network-roles",
+    "crates/libs/auto-lifecycle",
+    "crates/libs/pii",
+    "crates/libs/rpc-contracts",
+    "crates/libs/btrfs",
+    "crates/libs/db-identity",
+    "crates/libs/http-server",
     "crates/libs/cluster/controller/server",
     "crates/libs/cluster/pool",
     "crates/libs/cluster/reconciler",
@@ -309,6 +341,7 @@ zstd = { version = "0.14", features = ["zstdmt"] }
 
 # internal
 pplx-space-api = { path = "crates/libs/api" }
+pplx-space-api-route = { path = "crates/libs/api-route" }
 pplx-space-aws-client = { path = "crates/libs/aws/client" }
 pplx-space-s3-http-client = { path = "crates/libs/aws/s3-http-client" }
 pplx-space-bearer-token = { path = "crates/libs/bearer-token" }
@@ -334,11 +367,14 @@ pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
 pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }
 pplx-space-dependency-drain = { path = "crates/libs/dependency-drain" }
+pplx-space-ecw-credential = { path = "crates/libs/ecw-credential" }
 pplx-space-env-vars = { path = "crates/libs/env-vars" }
 pplx-space-migration-checksums = { path = "crates/libs/migration-checksums" }
 pplx-space-execution-common = { path = "crates/libs/execution/common" }
 pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
 pplx-space-events = { path = "crates/libs/events" }
+pplx-space-federated-grant-store = { path = "crates/libs/federated-grant-store" }
+pplx-space-ingress-admission = { path = "crates/libs/ingress-admission" }
 pplx-space-credmgr = { path = "crates/libs/credential/mgr/server" }
 pplx-space-credmgr-client = { path = "crates/libs/credential/mgr/client" }
 pplx-space-credential-injection-core = { path = "crates/libs/credential/injection/core" }
@@ -354,10 +390,12 @@ pplx-space-node-api-client = { path = "crates/libs/node/api/client" }
 pplx-space-node-ctl-client = { path = "crates/libs/node/ctl/client" }
 pplx-space-node-api-server = { path = "crates/libs/node/api/server" }
 pplx-space-node-ctl-server = { path = "crates/libs/node/ctl/server" }
+pplx-space-k8s-node-id = { path = "crates/libs/node/k8s-node-id" }
 pplx-space-node-api-sim = { path = "crates/libs/node/api/sim" }
 pplx-space-node-mgr = { path = "crates/libs/node/mgr/server" }
 pplx-space-node-mgr-client = { path = "crates/libs/node/mgr/client" }
 pplx-space-node-mgr-protocol = { path = "crates/libs/node/mgr/protocol" }
+pplx-space-node-registration-store = { path = "crates/libs/node/registration-store" }
 pplx-space-node-runtime-core = { path = "crates/libs/node/runtime/core" }
 pplx-space-node-runtime-manager = { path = "crates/libs/node/runtime/manager/server" }
 pplx-space-node-runtime-manager-client = { path = "crates/libs/node/runtime/manager/client" }
@@ -365,21 +403,41 @@ pplx-space-node-runtime-supervisor = { path = "crates/libs/node/runtime/supervis
 pplx-space-net-common = { path = "crates/libs/net/common" }
 pplx-space-object-store = { path = "crates/libs/object-store" }
 pplx-space-page-cache = { path = "crates/libs/page-cache" }
+pplx-space-postgres-contention = { path = "crates/libs/postgres-contention" }
 pplx-space-public-api = { path = "crates/libs/public/api" }
 pplx-space-metrics = { path = "crates/libs/metrics" }
+pplx-space-metrics-emit = { path = "crates/libs/metrics-emit" }
+pplx-space-grpc-metrics = { path = "crates/libs/grpc-metrics" }
 pplx-space-observability = { path = "crates/libs/observability", default-features = false }
 pplx-space-placement = { path = "crates/libs/placement/machine" }
 pplx-space-internal-api-server = { path = "crates/libs/internal/api/server" }
 pplx-space-internal-api-svc = { path = "crates/apps/internal/api/svc" }
 pplx-space-k8s-ids = { path = "crates/libs/k8s-ids" }
+pplx-space-kube-client = { path = "crates/libs/kube-client" }
 pplx-space-cluster-id = { path = "crates/libs/cluster-id" }
+pplx-space-accounts = { path = "crates/libs/accounts" }
+pplx-space-federated-identity = { path = "crates/libs/federated-identity" }
+pplx-space-guest-process = { path = "crates/libs/guest-process" }
+pplx-space-request-id = { path = "crates/libs/request-id" }
+pplx-space-execution-spec = { path = "crates/libs/execution-spec" }
+pplx-space-linux-ids = { path = "crates/libs/linux-ids" }
+pplx-space-network-roles = { path = "crates/libs/network-roles" }
+pplx-space-auto-lifecycle = { path = "crates/libs/auto-lifecycle" }
+pplx-space-pii = { path = "crates/libs/pii" }
+pplx-space-rpc-contracts = { path = "crates/libs/rpc-contracts" }
+pplx-space-btrfs = { path = "crates/libs/btrfs" }
+pplx-space-db-identity = { path = "crates/libs/db-identity" }
+pplx-space-http-server = { path = "crates/libs/http-server" }
 pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
 pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }
 pplx-space-cluster-trigger-queue = { path = "crates/libs/cluster/trigger-queue" }
 pplx-space-sandbox-portability = { path = "crates/libs/sandbox/portability" }
+pplx-space-sandbox-quarantine-store = { path = "crates/libs/sandbox/quarantine-store" }
+pplx-space-sandbox-routability = { path = "crates/libs/sandbox/routability" }
 pplx-space-sandbox-store = { path = "crates/libs/sandbox/store" }
 pplx-space-sandbox-teardown = { path = "crates/libs/sandbox/teardown" }
+pplx-space-auto-lifecycle-receipt = { path = "crates/libs/sandbox/auto-lifecycle-receipt" }
 pplx-space-snapshot-storage = { path = "crates/libs/snapshot/storage" }
 pplx-space-snapshot-retention = { path = "crates/libs/snapshot/retention" }
 pplx-space-snapshot-store = { path = "crates/libs/snapshot/store" }
@@ -391,6 +449,8 @@ pplx-space-sbx-mgr-store = { path = "crates/libs/sbx/mgr/store" }
 pplx-space-rustls-provider = { path = "crates/libs/rustls-provider" }
 pplx-space-semver = { path = "crates/libs/semver" }
 pplx-space-sql-locator = { path = "crates/libs/sql-locator" }
+pplx-space-service-lifecycle = { path = "crates/libs/service-lifecycle" }
+pplx-space-state-reconciliation = { path = "crates/libs/state-reconciliation" }
 pplx-space-service-mutex = { path = "crates/libs/service-mutex" }
 pplx-space-sqlite = { path = "crates/libs/sqlite" }
 pplx-space-systemd-watchdog = { path = "crates/libs/systemd-watchdog" }
@@ -407,6 +467,10 @@ pplx-space-template-mgr-client = { path = "crates/libs/template/mgr-client" }
 pplx-space-template-publisher = { path = "crates/libs/template/publish" }
 pplx-space-test-env = { path = "crates/libs/test-env" }
 pplx-space-unix-socket-path = { path = "crates/libs/unix-socket-path" }
+pplx-space-uds-peer-auth = { path = "crates/libs/uds-peer-auth" }
+pplx-space-unix-socket-bind = { path = "crates/libs/unix-socket-bind" }
+pplx-space-valkey = { path = "crates/libs/valkey" }
+pplx-space-grpc-rate-limiter = { path = "crates/libs/grpc-rate-limiter" }
 pplx-space-tokio-runtime = { path = "crates/libs/tokio-runtime" }
 [profile.release]
 lto = "thin"

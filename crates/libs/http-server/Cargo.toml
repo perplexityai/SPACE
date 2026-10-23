@@ -1,0 +1,26 @@
+[package]
+name = "pplx-space-http-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true, features = ["trace"] }
+tracing = { workspace = true }
+
+# internal
+pplx-space-observability = { workspace = true }
+pplx-space-request-id = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt"] }

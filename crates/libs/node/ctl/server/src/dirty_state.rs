@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use pplx_space_common_svc::types::{
-    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
-    FACET_TEMPLATE_BASE_SNAPSHOT_POLICY, FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
-    NetworkPolicyTarget, ReconcileFacet,
+    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
+    FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NetworkPolicyTarget, ReconcileFacet,
 };
 use pplx_space_node_api_client::proto::{
     FacetDirection, FacetQueueItem, FacetRef as ProtoFacetRef, FacetSyncOverride,
@@ -114,6 +114,7 @@ fn proto_facet(value: ReconcileFacet) -> ProtoReconcileFacet {
         ReconcileFacet::SandboxDesiredState => ProtoReconcileFacet::SandboxDesiredState,
         ReconcileFacet::TemplateDesiredState => ProtoReconcileFacet::TemplateDesiredState,
         ReconcileFacet::NodeStatus => ProtoReconcileFacet::NodeStatus,
+        ReconcileFacet::RuntimeProvisioning => ProtoReconcileFacet::RuntimeProvisioning,
     }
 }
 
@@ -126,6 +127,7 @@ fn proto_facet_name(value: ProtoReconcileFacet) -> Result<&'static str, String> 
         ProtoReconcileFacet::SandboxDesiredState => Ok(FACET_SANDBOX_DESIRED_STATE),
         ProtoReconcileFacet::TemplateDesiredState => Ok(FACET_TEMPLATE_DESIRED_STATE),
         ProtoReconcileFacet::NodeStatus => Ok(FACET_NODE_STATUS),
+        ProtoReconcileFacet::RuntimeProvisioning => Ok(FACET_RUNTIME_PROVISIONING),
         ProtoReconcileFacet::Unspecified => Err("facet must be specified".to_string()),
     }
 }
@@ -149,7 +151,9 @@ fn proto_facet_element(
             | FACET_TEMPLATE_DESIRED_STATE,
             Some(facet_ref::Element::Template(template)),
         ) => Ok(Some(template)),
-        (FACET_NODE_STATUS, Some(_)) => Err("node-status facet does not accept an element".into()),
+        (FACET_NODE_STATUS | FACET_RUNTIME_PROVISIONING, Some(_)) => {
+            Err("whole-node facet does not accept an element".into())
+        }
         (facet, Some(_)) => Err(format!("element type does not match facet {facet:?}")),
     }
 }
@@ -199,7 +203,9 @@ fn element_to_proto(facet: ReconcileFacet, element: &str) -> Result<facet_ref::E
         | ReconcileFacet::TemplateDesiredState => {
             Ok(facet_ref::Element::Template(element.to_string()))
         }
-        ReconcileFacet::NodeStatus => Err("node-status facet does not accept an element".into()),
+        ReconcileFacet::NodeStatus | ReconcileFacet::RuntimeProvisioning => {
+            Err("whole-node facet does not accept an element".into())
+        }
     }
 }
 
