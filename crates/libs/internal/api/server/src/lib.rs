@@ -54,9 +54,10 @@ use pplx_space_common_core::types::{
     SnapshotKind, SnapshotName, SnapshotState, SubstrateKind, TemplateName,
 };
 use pplx_space_common_svc::types::{
-    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
-    FACET_TEMPLATE_BASE_SNAPSHOT_POLICY, FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
-    NODE_RECONCILE_CLAIM_STALE_SECS, NetworkPolicyTarget, ReconcileFacet,
+    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
+    FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NODE_RECONCILE_CLAIM_STALE_SECS,
+    NetworkPolicyTarget, ReconcileFacet,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -76,7 +77,8 @@ use crate::proto::{
     GetArtifactBackupLocationResponse, GetDataPlaneOrgRevocationEpochRequest,
     GetDataPlaneOrgRevocationEpochResponse, GetDataPlaneSessionRevocationStateRequest,
     GetDataPlaneSessionRevocationStateResponse, GetNodeNetworkPolicyStateRequest,
-    GetNodeNetworkPolicyStateResponse, GetNodeSandboxDesiredStateRequest,
+    GetNodeNetworkPolicyStateResponse, GetNodeRuntimeDesiredStateRequest,
+    GetNodeRuntimeDesiredStateResponse, GetNodeSandboxDesiredStateRequest,
     GetNodeSandboxDesiredStateResponse, GetNodeTemplateBaseSnapshotPolicyStateRequest,
     GetNodeTemplateBaseSnapshotPolicyStateResponse, GetNodeTemplateDesiredStateRequest,
     GetNodeTemplateDesiredStateResponse, GetQuarantineRecoveryPlanRequest,

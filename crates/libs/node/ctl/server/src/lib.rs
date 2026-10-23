@@ -59,6 +59,7 @@ const NETWORK_POLICY_RECONCILER: &str = "network-policies";
 const SANDBOX_DESIRED_STATE_RECONCILER: &str = "sandbox-desired-state";
 const TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER: &str = "template-base-snapshot-policy";
 const TEMPLATE_DESIRED_STATE_RECONCILER: &str = "template-desired-state";
+const RUNTIME_PROVISIONING_RECONCILER: &str = "runtime-provisioning";
 const NODE_STATE_OUTBOUND_RECONCILER: &str = "node-state-outbound";
 const NETWORK_POLICY_OUTBOUND_RECONCILER: &str = "network-policy-outbound";
 const SANDBOX_INVENTORY_OUTBOUND_RECONCILER: &str = "sandbox-inventory-outbound";
@@ -725,6 +726,7 @@ fn init_reconciliation_status(conn: &Connection, poll_interval_secs: u64) -> rus
         SANDBOX_DESIRED_STATE_RECONCILER,
         TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
         TEMPLATE_DESIRED_STATE_RECONCILER,
+        RUNTIME_PROVISIONING_RECONCILER,
         NODE_STATE_OUTBOUND_RECONCILER,
         NETWORK_POLICY_OUTBOUND_RECONCILER,
         SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
@@ -1502,6 +1504,7 @@ impl NodeCtlWorker {
             SANDBOX_DESIRED_STATE_RECONCILER,
             TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
             TEMPLATE_DESIRED_STATE_RECONCILER,
+            RUNTIME_PROVISIONING_RECONCILER,
             NODE_STATE_OUTBOUND_RECONCILER,
             NETWORK_POLICY_OUTBOUND_RECONCILER,
             SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
@@ -2082,6 +2085,7 @@ fn inbound_reconciler_name(facet: facets::FacetKind) -> &'static str {
         facets::FacetKind::SandboxDesiredState => SANDBOX_DESIRED_STATE_RECONCILER,
         facets::FacetKind::TemplateBaseSnapshotPolicy => TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
         facets::FacetKind::TemplateDesiredState => TEMPLATE_DESIRED_STATE_RECONCILER,
+        facets::FacetKind::RuntimeProvisioning => RUNTIME_PROVISIONING_RECONCILER,
         facets::FacetKind::SandboxInventory
         | facets::FacetKind::TemplateInventory
         | facets::FacetKind::NodeStatus => NODE_STATE_OUTBOUND_RECONCILER,
@@ -2096,7 +2100,8 @@ fn outbound_reconciler_name(facet: facets::FacetKind) -> &'static str {
         facets::FacetKind::NodeStatus => NODE_STATUS_OUTBOUND_RECONCILER,
         facets::FacetKind::SandboxDesiredState
         | facets::FacetKind::TemplateBaseSnapshotPolicy
-        | facets::FacetKind::TemplateDesiredState => NODE_STATE_OUTBOUND_RECONCILER,
+        | facets::FacetKind::TemplateDesiredState
+        | facets::FacetKind::RuntimeProvisioning => NODE_STATE_OUTBOUND_RECONCILER,
     }
 }
 

@@ -786,3 +786,57 @@ the old pair until the new cold boot is verified; a failed cold boot must not
 mutate the only rollback disk. Retention is not permission to restore a revoked
 runtime. Retire the checkpoint through a durable lifecycle operation before later
 object garbage collection, never by deleting S3 vmstate and editing lifecycle rows.
+
+### Node runtime provisioning
+
+The whole-node `runtime-provisioning` facet reads
+`ClusterApi.GetNodeRuntimeDesiredState` on each periodic inbound tick, even with
+no installed artifacts or templates. The response optionally carries a
+`RuntimeProvisioningRecipe` of immutable compiled environment references. It
+contains neither execution permissions/defaults nor arbitrary download URLs,
+paths or artifact hashes. The cluster authenticates the registered node by the
+existing origin check before answering.
+
+The current cluster handler returns no recipe. A policy store and producer must
+be connected before deployment can request installations; this endpoint does not
+implicitly commission E0. Older cluster services return `Unimplemented`, which
+node-ctl also treats as no recipe. Other fetch errors remain visible failures.
+Neither absence nor an empty recipe uninstalls anything.
+
+Node-ctl validates the entire recipe against its compiled host-specific catalog,
+expands the environments into distinct artifact identities, and reads rtmgr's
+local inventory. Only valid, digest-matching managed copies satisfy installation
+intent; baked/external files remain externally owned. Incomplete inventory stops
+the pass without submissions. Missing identities go through the existing
+`InstallArtifact` API with at most four simultaneous submissions. The entire
+pass has a 30-second deadline, including connections and discovery. It does not
+wait for downloads: accepted jobs are durable in rtmgr, active repeats deduplicate
+by artifact identity, and the next tick observes completion. Transfer attempts
+are bounded by rtmgr; later ticks can submit another attempt after a terminal job
+failure. Persistent failures remain visible until the source, node or recipe is
+repaired. Replacing a recipe does not cancel already accepted jobs; their extra
+artifacts are retained.
+
+The facet's existing reconciliation status reports pending installation counts
+and submission failures. A successful pass is not an environment-readiness or
+recipe-revision attestation: it can also mean no recipe was assigned. Runtime
+inventory and execution-policy observations continue through `PublishNodeState`;
+node-manager remains the independent publication and execution authority. The
+cluster must compare desired identities against fresh observations, not use the
+facet's last-success time as proof that an environment can run. Recipe changes
+never change the allowlist, default, placement or running sandboxes.
+
+Node-ctl is authorized to read rtmgr and install approved artifacts, but not to
+uninstall or cancel operations. Deploy the rtmgr peer authorization and node-ctl's
+`space-rtmgrclients` supplementary group before assigning a recipe. Existing
+node processes must restart after direct-host group membership changes. New
+node-ctl against old rtmgr reports permission failures without claiming success.
+New cluster endpoints and old node-ctl coexist because provisioning is not
+mandatory until the policy producer explicitly requires it.
+
+The control-plane integration owns recipe storage and admin mutations, cohort
+selection, rollout/convergence tracking, and fresh environment-aware placement.
+It must keep required installations separate from allowed/default execution
+policy and retain compatibility checks at node admission. Retirement and garbage
+collection require a separate reference-aware operation; recipe omission alone
+never grants deletion authority.
