@@ -53,6 +53,8 @@ impl Drop for PermitInner {
 
 /// Observes a dropped request without retaining its admission or spawning work.
 /// Completion, including an error response, is not request cancellation.
+#[must_use = "observe the request future to avoid recording cancellation immediately"]
+#[derive(Debug)]
 pub struct RequestLifetime {
     permit: Weak<PermitInner>,
 }

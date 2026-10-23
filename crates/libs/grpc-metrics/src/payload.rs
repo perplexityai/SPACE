@@ -15,9 +15,11 @@
 //! slots still owned when cancellation is observed. `cancelled_released_slots`
 //! counts their eventual release. `cancelled_hold_ms` measures time from that
 //! observation until the last permit owner drops; `cancelled_slot_ms` weights
-//! that time by slots. These four metrics carry only `budget`. They include work
-//! settling after a dropped request and filesystem cancellation cleanup, not
-//! process lifetime or the time before cancellation is observed. Incomplete
+//! that time by slots. These four metrics carry only `budget`. Observation includes
+//! caller cancellation and server-initiated upload aborts or shutdown. Brief
+//! transport-only permit retention can produce near-zero samples: these measure
+//! slot retention, not exclusively caller cancellation or physical cleanup. They
+//! exclude process lifetime and time before cancellation is observed. Incomplete
 //! cleanup has no duration sample yet; compare the two slot counters over the
 //! same process lifetime.
 
