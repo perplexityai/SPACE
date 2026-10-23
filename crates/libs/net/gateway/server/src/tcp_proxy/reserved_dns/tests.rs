@@ -286,7 +286,9 @@ fn proxy(
     shutdown_token: CancellationToken,
 ) -> TcpProxy {
     TcpProxy {
-        sandbox_id: "test",
+        // Reserved DNS keeps this sandbox on the provider it addresses, so
+        // tests can assert the resolver IP.
+        sandbox_id: "sandbox-a",
         stats: Arc::new(ProxyStats::new()),
         network_state,
         tls_interception: Default::default(),

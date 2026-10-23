@@ -10,6 +10,11 @@ use tokio::sync::Notify;
 use super::*;
 use crate::reserved_dns::test_support::RecordedResolver;
 
+/// Sandbox ids whose queries go to the addressed provider, or to the other one.
+/// Shared helpers use `KEEPS_ADDRESSED` so their resolver assertions hold.
+const KEEPS_ADDRESSED: &str = "sandbox-a";
+const SWAPS_ADDRESSED: &str = "sbx-1";
+
 fn core_with_backend(resolver: Arc<dyn ResolverBackend>, capacity: usize) -> ReservedDnsCore {
     ReservedDnsCore::with_resolver(resolver, capacity)
 }
@@ -47,6 +52,71 @@ fn classifier_uses_only_reserved_ip() {
         Some(ReservedResolver::Google)
     );
     assert!(core.resolver_for("9.9.9.9".parse().unwrap()).is_none());
+}
+
+#[test]
+fn sandboxes_split_evenly_across_upstream_providers() {
+    let sandboxes = 10_000;
+    let swapped = (0..sandboxes)
+        .filter(|index| sandbox_swaps_resolvers(&format!("sbx-{index:08x}")))
+        .count();
+    // 50/50 within a few percent; a fixed hash keeps this deterministic.
+    assert!(
+        (4_800..=5_200).contains(&swapped),
+        "{swapped} of {sandboxes} sandboxes swapped providers",
+    );
+}
+
+#[test]
+fn each_sandbox_keeps_a_fixed_provider_per_address_and_falls_back_to_the_other() {
+    for sandbox_id in ["sandbox-a", "test", "sbx-1", "sbx-2"] {
+        let primary = upstream_for(sandbox_id, ReservedResolver::Google);
+        let fallback = upstream_for(sandbox_id, ReservedResolver::Cloudflare);
+        assert_ne!(
+            primary, fallback,
+            "{sandbox_id}: fallback must reach the other provider"
+        );
+        assert_eq!(primary, upstream_for(sandbox_id, ReservedResolver::Google));
+    }
+    assert_eq!(
+        upstream_for(KEEPS_ADDRESSED, ReservedResolver::Google),
+        ReservedResolver::Google
+    );
+    assert_eq!(
+        upstream_for(SWAPS_ADDRESSED, ReservedResolver::Google),
+        ReservedResolver::Cloudflare
+    );
+}
+
+#[tokio::test]
+async fn query_to_8_8_8_8_is_served_by_the_sandboxes_assigned_provider() {
+    let resolver = Arc::new(RecordedResolver::new(Ipv4Addr::new(192, 0, 2, 1)));
+    let policy = policy(
+        EgressDefaultAction::Deny,
+        &[destination("8.8.8.8"), destination("allowed.example")],
+        &[],
+    );
+    let core = resolver.core();
+    let wire = guest_message("allowed.example", RecordType::A)
+        .to_vec()
+        .unwrap();
+    for (sandbox_id, upstream) in [(KEEPS_ADDRESSED, "8.8.8.8"), (SWAPS_ADDRESSED, "1.1.1.1")] {
+        let outcome = core
+            .resolve(
+                sandbox_id,
+                ReservedResolver::Google,
+                &wire,
+                &policy,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(outcome, ResolveOutcome::Reply(_)));
+        assert_eq!(
+            resolver.requests().last().unwrap().0,
+            upstream.parse::<IpAddr>().unwrap(),
+            "{sandbox_id}",
+        );
+    }
 }
 
 #[test]
@@ -471,7 +541,13 @@ async fn resolve_wire(
         .resolver_for(destination.parse().unwrap())
         .expect("test destination must be a reserved resolver");
     match core
-        .resolve("test", resolver, request, policy, &CancellationToken::new())
+        .resolve(
+            KEEPS_ADDRESSED,
+            resolver,
+            request,
+            policy,
+            &CancellationToken::new(),
+        )
         .await
     {
         ResolveOutcome::Reply(reply) => reply,
