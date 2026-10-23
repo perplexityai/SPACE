@@ -1658,7 +1658,7 @@ impl SandboxController {
                     if !execution.completion.should_finalize_lifecycle() {
                         return Ok(body);
                     }
-                    maybe_update_sandbox_state(pool, id, "started", "on_node").await;
+                    maybe_mark_started_after_start(pool, id).await;
                     self.substrate
                         .complete_activation_lease(typed_id, execution.lease_completion)
                         .await;
@@ -2411,6 +2411,10 @@ mod drain_guard_postgres_tests;
 
 #[cfg(test)]
 mod wake_completion_postgres_tests;
+
+/// A successful start drops a stopped rootfs's disk pin, and only that.
+#[cfg(test)]
+mod start_pin_postgres_tests;
 
 #[cfg(test)]
 mod characterization_tests;

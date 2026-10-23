@@ -199,15 +199,23 @@ pub(super) enum WakeWaitPolicy {
     RequireIdentity,
     RequireLifecycle,
     ResidentProbe,
+    /// A `Stopped` target: the drain re-placing an evacuated stopped sandbox.
+    /// Waits and retries like [`Self::RequireIdentity`], but the node answers
+    /// with no route identity, because nothing was launched and its stopped
+    /// finalize clears the route fields. The evidence is the node's own
+    /// refusal of any row that isn't `stopped` and pinning the requested
+    /// artifact.
+    RequireMaterialization,
 }
 
 impl WakeWaitPolicy {
     /// Lifecycle-changing wakes must echo the selected route too: Paused and
     /// restoring paths have no command-readiness probe that could otherwise
     /// prove which runtime accepted the transition. Only an unchanged Started
-    /// resident may treat the acknowledgement as optional.
+    /// resident may treat the acknowledgement as optional, and a stopped
+    /// materialization has no route to echo.
     pub(super) const fn requires_route_identity(self) -> bool {
-        !matches!(self, Self::ResidentProbe)
+        !matches!(self, Self::ResidentProbe | Self::RequireMaterialization)
     }
 }
 
@@ -267,8 +275,9 @@ pub(super) fn activation_wake_action(
     let route_identity = k8s_execution_route_identity(execution)?;
     let route_activation_id = execution.route_activation_id;
     let operation_activation_id = execution.activation_attempt_id;
-    let policy = if route_activation_id.is_none() || route_activation_id == operation_activation_id
-    {
+    let policy = if target == SandboxLifecycle::Stopped {
+        WakeWaitPolicy::RequireMaterialization
+    } else if route_activation_id.is_none() || route_activation_id == operation_activation_id {
         WakeWaitPolicy::RequireIdentity
     } else if target != SandboxLifecycle::Started
         || !execution.lifecycle.trim().eq_ignore_ascii_case("started")

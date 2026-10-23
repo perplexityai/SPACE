@@ -217,6 +217,7 @@ impl KubernetesSubstrate {
                     _ => Vec::new(),
                 };
                 SandboxPodRequest::Restore {
+                    stopped_materialization: None,
                     artifact_kind: if sandbox.lifecycle.parse::<SandboxLifecycle>()
                         == Ok(SandboxLifecycle::Stopped)
                     {
@@ -248,14 +249,19 @@ impl KubernetesSubstrate {
                 suspend_restore_storage_uri,
                 extra_tolerations,
                 extra_required_affinity,
+                stopped_materialization,
             }) => SandboxPodRequest::Restore {
-                artifact_kind: if sandbox.lifecycle.parse::<SandboxLifecycle>()
-                    == Ok(SandboxLifecycle::Stopped)
+                // A stopped re-placement restores a disk artifact even though
+                // its row reads `restoring` by now.
+                artifact_kind: if stopped_materialization.is_some()
+                    || sandbox.lifecycle.parse::<SandboxLifecycle>()
+                        == Ok(SandboxLifecycle::Stopped)
                 {
                     pplx_space_common_core::types::ArtifactKind::Disk
                 } else {
                     pplx_space_common_core::types::ArtifactKind::Full
                 },
+                stopped_materialization,
                 common,
                 runtime,
                 node_group_placement,

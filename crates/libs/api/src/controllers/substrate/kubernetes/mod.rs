@@ -21,7 +21,7 @@ use pplx_space_common_core::{
         NodeSelectorLabelsParseError, SANDBOX_NETWORK_POLICY_ANNOTATION,
         SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION, SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
         SandboxPodCommon, SandboxPodConfig, SandboxPodConfigValues, SandboxPodRequest,
-        SandboxRuntimePodMetadata, build_sandbox_pod, node_group_label,
+        SandboxRuntimePodMetadata, StoppedMaterialization, build_sandbox_pod, node_group_label,
     },
     types::{
         NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId, StorageUri,
@@ -1253,4 +1253,4 @@ pub use node_sync::SyncNodeInventoryError;
 use pod_ops::ExecutionHydrationOutcome;
 use pod_ops::{ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership};
 #[cfg(any(test, feature = "test-hooks"))]
-pub use test_substrate::TEST_SANDBOX_NAMESPACE;
+pub use test_substrate::{TEST_SANDBOX_NAMESPACE, retire_executions_predating_current_stop};

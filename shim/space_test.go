@@ -21,10 +21,12 @@ import (
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/errdefs"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	gatewaypb "github.com/perplexityai/SPACE/shim/proto/net/gateway/v1"
 	netpb "github.com/perplexityai/SPACE/shim/proto/net/policy/v1"
@@ -2968,5 +2970,167 @@ func TestInitialCreateEnvMetadataBoundaries(t *testing.T) {
 				t.Fatal("initial Create environment contract mismatch")
 			}
 		})
+	}
+}
+
+// A stopped re-placement pod's Start asks sbx-manager to materialize exactly
+// the named disk artifact and leave the sandbox stopped. Each field is one
+// sbx-manager requires together for that target, or refuses alongside it.
+func TestStoppedMaterializationRequest(t *testing.T) {
+	newRequest := func() *pb.StartRequest {
+		return &pb.StartRequest{
+			SandboxId:                "sbx",
+			Checkpoint:               ptr(stoppedMaterializationCheckpoint),
+			NetnsPath:                ptr("/var/run/netns/cni-1"),
+			SuspendRestoreStorageUri: ptr("s3://example/disk"),
+			SuspendRestoreSourceNode: ptr("drained-node"),
+		}
+	}
+
+	request := newRequest()
+	if err := stoppedMaterializationRequest(request, "019f8000-0000-7000-8000-000000000001"); err != nil {
+		t.Fatalf("stoppedMaterializationRequest() error = %v", err)
+	}
+	if request.GetCheckpoint() != "suspend" {
+		t.Fatalf("checkpoint = %q, want suspend", request.GetCheckpoint())
+	}
+	if request.GetTargetState() != pb.WakeTargetState_WAKE_TARGET_STATE_STOPPED {
+		t.Fatalf("target state = %s, want STOPPED", request.GetTargetState())
+	}
+	if request.GetExpectedLocalArtifactId() != "019f8000-0000-7000-8000-000000000001" {
+		t.Fatalf("expected artifact = %q", request.GetExpectedLocalArtifactId())
+	}
+	if request.NetnsPath != nil || request.SuspendRestoreSourceNode != nil {
+		t.Fatal("a materialization launches nothing and has no source node")
+	}
+	if request.GetSuspendRestoreStorageUri() != "s3://example/disk" {
+		t.Fatal("the exact artifact URI must reach sbx-manager")
+	}
+
+	for _, tc := range []struct {
+		name       string
+		artifactID string
+		clearURI   bool
+	}{
+		{"no artifact id", "", false},
+		{"no storage URI", "019f8000-0000-7000-8000-000000000001", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := newRequest()
+			if tc.clearURI {
+				request.SuspendRestoreStorageUri = nil
+			}
+			err := stoppedMaterializationRequest(request, tc.artifactID)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("code = %s, want InvalidArgument (err=%v)", status.Code(err), err)
+			}
+			if request.GetTargetState() == pb.WakeTargetState_WAKE_TARGET_STATE_STOPPED {
+				t.Fatal("a refused request must not be turned into a materialization")
+			}
+		})
+	}
+}
+
+// The pod of a sandbox materialized stopped owns no runtime: killing and
+// deleting it, as the next start's pod replacement does, must not reach
+// sbx-manager, which would otherwise be asked to release or delete the stopped
+// row the next start boots from. A legacy pod task beside it still reaches the
+// manager, so the fake below is one that would record the calls.
+func TestMaterializedStoppedTaskIsTornDownWithoutTheManager(t *testing.T) {
+	client := &fakeSandboxManagerClient{
+		results: []sandboxStateResult{
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}},
+		},
+	}
+	managerCalls := 0
+	materialized := &task{id: "materialized", status: tasktypes.Status_RUNNING}
+	markMaterializedStopped(materialized, "sbx", "", "")
+	if materialized.pid != os.Getpid() {
+		t.Fatalf("pid = %d, want the shim's own pid", materialized.pid)
+	}
+	service := &spaceTaskService{
+		tasks: map[string]*task{"materialized": materialized},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			managerCalls++
+			return client, fakeConn{}, nil
+		},
+	}
+
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "materialized"}); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "materialized"}); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if managerCalls != 0 || client.stopCalls != 0 || client.deleteCalls != 0 || len(client.teardownRequests) != 0 {
+		t.Fatalf("materialized task reached sbx-manager: connections:%d stop:%d delete:%d teardown:%d",
+			managerCalls, client.stopCalls, client.deleteCalls, len(client.teardownRequests))
+	}
+	if _, ok := service.tasks["materialized"]; ok {
+		t.Fatal("Delete() left the materialized task in the task map")
+	}
+
+	// The same service with a legacy pod task does reach the manager, so the
+	// zero counts above are not a fake that records nothing.
+	service.tasks["legacy"] = &task{id: "legacy", sandboxID: "sbx", status: tasktypes.Status_RUNNING}
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "legacy"}); err != nil {
+		t.Fatalf("legacy Kill() error = %v", err)
+	}
+	if managerCalls == 0 {
+		t.Fatal("a legacy pod task must reach sbx-manager on Kill")
+	}
+}
+
+// A materialized stopped pod's task is still running, unlike an ordinarily
+// stopped sandbox's, so containerd lets an exec into it through to the shim.
+// The shim must turn it away: forwarded, the exec is guest activity to
+// sbx-manager, and a wake-on-access policy cold-starts the sandbox on it. The
+// same holds for pause, resume and checkpoint. The same exec into a pod with no
+// materialized task is accepted, so the refusal is the marker's.
+func TestMaterializedStoppedPodRefusesWhatWouldWakeIt(t *testing.T) {
+	spec := &anypb.Any{Value: []byte(`{"args":["true"]}`)}
+	newService := func(materialized bool) *spaceTaskService {
+		pod := &task{id: "pod", status: tasktypes.Status_RUNNING}
+		if materialized {
+			markMaterializedStopped(pod, "sbx", "", "")
+		} else {
+			pod.sandboxID = "sbx"
+		}
+		return &spaceTaskService{tasks: map[string]*task{
+			"pod": pod,
+			"app": {id: "app", status: tasktypes.Status_RUNNING},
+		}}
+	}
+
+	service := newService(true)
+	_, err := service.Exec(context.Background(), &taskAPI.ExecProcessRequest{ID: "app", ExecID: "e1", Spec: spec})
+	if !errors.Is(err, errdefs.ErrFailedPrecondition) {
+		t.Fatalf("Exec() error = %v, want a failed precondition", err)
+	}
+	if len(service.tasks["app"].execs) != 0 {
+		t.Fatal("a refused exec must not be recorded")
+	}
+	// An exec recorded before the pod was marked still can't start.
+	service.tasks["app"].execs = map[string]*execProcess{"e0": {id: "e0", args: []string{"true"}, done: make(chan struct{})}}
+	if _, err := service.Start(context.Background(), &taskAPI.StartRequest{ID: "app", ExecID: "e0"}); !errors.Is(err, errdefs.ErrFailedPrecondition) {
+		t.Fatalf("Start(exec) error = %v, want a failed precondition", err)
+	}
+	if _, err := service.Pause(context.Background(), &taskAPI.PauseRequest{ID: "pod"}); !errors.Is(err, errdefs.ErrFailedPrecondition) {
+		t.Fatalf("Pause() error = %v, want a failed precondition", err)
+	}
+	if _, err := service.Resume(context.Background(), &taskAPI.ResumeRequest{ID: "pod"}); !errors.Is(err, errdefs.ErrFailedPrecondition) {
+		t.Fatalf("Resume() error = %v, want a failed precondition", err)
+	}
+	if _, err := service.Checkpoint(context.Background(), &taskAPI.CheckpointTaskRequest{ID: "pod"}); !errors.Is(err, errdefs.ErrFailedPrecondition) {
+		t.Fatalf("Checkpoint() error = %v, want a failed precondition", err)
+	}
+
+	ordinary := newService(false)
+	if _, err := ordinary.Exec(context.Background(), &taskAPI.ExecProcessRequest{ID: "app", ExecID: "e1", Spec: spec}); err != nil {
+		t.Fatalf("Exec() into a pod with no materialized task error = %v", err)
+	}
+	if _, ok := ordinary.tasks["app"].execs["e1"]; !ok {
+		t.Fatal("an exec into a pod with no materialized task must be recorded")
 	}
 }

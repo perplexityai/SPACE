@@ -1359,7 +1359,15 @@ pub async fn prepare_restore_dir(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, owner, execution_fence, node_manager, templates).await?;
+    restore_pull_rootfs(
+        &staged,
+        owner,
+        execution_fence,
+        node_manager,
+        templates,
+        InstanceRequirement::Bootable,
+    )
+    .await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1388,7 +1396,15 @@ pub async fn prepare_restore_dir_from_uri(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, owner, execution_fence, node_manager, templates).await?;
+    restore_pull_rootfs(
+        &staged,
+        owner,
+        execution_fence,
+        node_manager,
+        templates,
+        InstanceRequirement::Bootable,
+    )
+    .await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1950,6 +1966,7 @@ pub async fn restore_pull_rootfs(
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
+    instance: InstanceRequirement,
 ) -> Result<(), RestoreError> {
     use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
     let target = stage.filesystem_scope_id.map_or(
@@ -2006,18 +2023,43 @@ pub async fn restore_pull_rootfs(
         // explicitly tagged as Full. Either lands in the historical
         // download-rootfs + reflink path for backwards compatibility.
         RestoreCodec::Full => {
-            std::fs::create_dir_all(&stage.instance_dir).map_err(|e| {
-                RestoreError::Other(format!("mkdir {}: {e}", stage.instance_dir.display()))
-            })?;
-            let instance_rootfs = stage.instance_dir.join("rootfs.ext4");
-            stage_full_codec_artifacts(
-                transfer_identity,
-                &stage.config,
-                &stage.snapshot_dir,
-                &instance_rootfs,
-                stage.transfer_scope_id,
-                crate::snapshot_upload::artifact_kind_from_meta(&stage.meta) == ArtifactKind::Full,
-            )
+            // A subvolume, not a plain directory: the sandbox boots from either,
+            // but every later disk backup snapshots `instance/`, and a plain
+            // directory can't be snapshotted. A node-manager that predates the
+            // RPC gets the plain directory, as before, unless `instance` asks
+            // for a snapshottable one (see `plain_instance_fallback`). Inside
+            // the staging result, so a failure here is cleaned up like any
+            // other staging failure.
+            async {
+                let prepared = crate::btrfs_via_nodemgr::create_sandbox_instance(
+                    sandbox_id,
+                    target,
+                    node_manager,
+                )
+                .await
+                .map_err(|e| {
+                    RestoreError::Other(format!(
+                        "create {} as a btrfs subvolume: {e}",
+                        stage.instance_dir.display()
+                    ))
+                })?;
+                if plain_instance_fallback(prepared, instance)? {
+                    std::fs::create_dir_all(&stage.instance_dir).map_err(|e| {
+                        RestoreError::Other(format!("mkdir {}: {e}", stage.instance_dir.display()))
+                    })?;
+                }
+                let instance_rootfs = stage.instance_dir.join("rootfs.ext4");
+                stage_full_codec_artifacts(
+                    transfer_identity,
+                    &stage.config,
+                    &stage.snapshot_dir,
+                    &instance_rootfs,
+                    stage.transfer_scope_id,
+                    crate::snapshot_upload::artifact_kind_from_meta(&stage.meta)
+                        == ArtifactKind::Full,
+                )
+                .await
+            }
             .await
         }
     };
@@ -2026,6 +2068,43 @@ pub async fn restore_pull_rootfs(
         handle_restore_stage_failure(stage, target, e, node_manager).await;
     }
     stage_result
+}
+
+/// Whether a Full-codec restore's `instance/` has to be one a later disk
+/// backup can snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceRequirement {
+    /// A plain directory is acceptable when node-manager can't make a
+    /// subvolume: the sandbox boots, as it always did.
+    Bootable,
+    /// Only a subvolume. A stopped re-placement exists so the sandbox can be
+    /// drained again later, and a plain directory would leave its next
+    /// drain retrying a disk backup that can never succeed; refusing here
+    /// leaves the re-placement unconverged and visible instead.
+    Snapshottable,
+}
+
+/// Whether to make a plain `instance/` directory, given what node-manager left
+/// there. A restore that needs a snapshottable instance refuses anything but a
+/// subvolume, including a plain directory node-manager kept.
+fn plain_instance_fallback(
+    prepared: crate::btrfs_via_nodemgr::PreparedInstance,
+    instance: InstanceRequirement,
+) -> Result<bool, RestoreError> {
+    use crate::btrfs_via_nodemgr::PreparedInstance;
+    match (prepared, instance) {
+        (PreparedInstance::Subvolume, _) => Ok(false),
+        (PreparedInstance::PlainDirectory, InstanceRequirement::Bootable) => Ok(false),
+        (PreparedInstance::Unsupported, InstanceRequirement::Bootable) => Ok(true),
+        (
+            PreparedInstance::PlainDirectory | PreparedInstance::Unsupported,
+            InstanceRequirement::Snapshottable,
+        ) => Err(RestoreError::Other(
+            "the sandbox instance isn't a btrfs subvolume, and a stopped re-placement needs \
+             one its later disk backups can snapshot"
+                .to_string(),
+        )),
+    }
 }
 
 async fn handle_restore_stage_failure(

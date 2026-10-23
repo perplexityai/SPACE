@@ -176,6 +176,52 @@ async fn assert_other_node_report_is_inert(
 }
 
 // ---------------------------------------------------------------------------
+// `stopped` convergence and the drain's restores.
+// ---------------------------------------------------------------------------
+
+/// A `stopped` report doesn't converge a `restoring` row marked for a stopped
+/// re-placement: that row is the drain's restore in flight, and its node
+/// reports `stopped` before the drain has confirmed and finalized it. The same
+/// report still converges the row unmarked, or marked for a suspended
+/// sandbox's restore, so the refusal is that one marker's.
+#[tokio::test(flavor = "current_thread")]
+async fn stopped_report_leaves_a_stopped_re_placement_to_the_drain() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = ready_node(pool).await?;
+
+    for marker in [Some("stopped"), Some("paused"), Some("started"), None] {
+        let (sandbox_id, before) = insert_running(pool, node_id, "restoring").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET evacuation_restore_target = $2 WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(marker)
+        .execute(pool)
+        .await?;
+        publish(
+            pool,
+            node_id,
+            published_sandbox_state(sandbox_id, "stopped"),
+        )
+        .await?;
+        let after = row(pool, sandbox_id).await?;
+        if marker == Some("stopped") {
+            assert_eq!(
+                after.lifecycle, before.lifecycle,
+                "the drain owns a restoring row marked for a stopped re-placement"
+            );
+        } else {
+            assert_eq!(
+                after.lifecycle, "stopped",
+                "{marker:?}: any other restoring row still converges to stopped"
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // `failed` and `quarantined` projections.
 // ---------------------------------------------------------------------------
 

@@ -383,3 +383,183 @@ fn apiserver_double(
             .into_response(),
     }
 }
+
+/// Pods [`kubernetes_substrate_creating_pods`]'s apiserver has been asked to
+/// create, as the request bodies it received, in arrival order.
+pub(crate) type CreatedPods = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+/// A `KubernetesSubstrate` like [`kubernetes_substrate_with_pods`] with no pods
+/// held, whose apiserver also accepts pod creates: each create is recorded,
+/// and the pod is then served by name as `Running` on [`WORKER_NODE_NAME`]
+/// with `pod_ip` and no conditions. That node
+/// is served too, with `pod_ip` as its InternalIP. A create under a name
+/// already served is refused `AlreadyExists`, and only accepted creates are
+/// recorded. A pod whose every required node-affinity term carries
+/// `metadata.name NotIn` that node is left `Pending` and `Unschedulable`
+/// instead, as kube-scheduler leaves a pod no node fits. A delete removes a
+/// served pod at once (no `Terminating` phase), refused when its UID
+/// precondition names another pod; its resourceVersion precondition isn't
+/// checked. Nothing created or deleted here reaches the substrate's pod
+/// caches, which start warm and empty and have no reflector, so a cache-only
+/// lookup always finds no pod.
+pub(crate) fn kubernetes_substrate_creating_pods(
+    pool: &PgPool,
+    sandbox_proxy_port: u16,
+    pod_ip: std::net::Ipv4Addr,
+) -> TestResult<(KubernetesSubstrate, CreatedPods)> {
+    let created: CreatedPods = Arc::default();
+    let served = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let apiserver = {
+        let created = Arc::clone(&created);
+        axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let created = Arc::clone(&created);
+            let served = Arc::clone(&served);
+            async move {
+                use axum::http::{Method, StatusCode};
+                let path = request.uri().path().to_owned();
+                let pods_path = format!("/api/v1/namespaces/{KUBERNETES_NAMESPACE}/pods");
+                if request.method() == Method::POST && path == pods_path {
+                    let Ok(body) = axum::body::to_bytes(request.into_body(), usize::MAX).await
+                    else {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    };
+                    let Ok(mut pod) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    };
+                    let name = pod["metadata"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    // A real apiserver refuses a second pod under a live
+                    // pod's name; the substrate's conflict recovery then reads
+                    // the existing one.
+                    if served
+                        .lock()
+                        .expect("served pods")
+                        .iter()
+                        .any(|held| held["metadata"]["name"] == name.as_str())
+                    {
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "kind": "Status",
+                                "apiVersion": "v1",
+                                "status": "Failure",
+                                "reason": "AlreadyExists",
+                                "message": format!("pods \"{name}\" already exists"),
+                                "code": 409,
+                            })),
+                        )
+                            .into_response();
+                    }
+                    created.lock().expect("created pods").push(pod.clone());
+                    pod["metadata"]["uid"] = serde_json::json!(format!("{name}-uid"));
+                    pod["metadata"]["resourceVersion"] = serde_json::json!("1");
+                    if excludes_the_worker(&pod) {
+                        pod["status"] = serde_json::json!({
+                            "phase": "Pending",
+                            "conditions": [{
+                                "type": "PodScheduled",
+                                "status": "False",
+                                "reason": "Unschedulable",
+                                "message": "0/1 nodes are available: 1 node(s) didn't match \
+                                            Pod's node affinity/selector.",
+                            }],
+                        });
+                    } else {
+                        pod["spec"]["nodeName"] = serde_json::json!(WORKER_NODE_NAME);
+                        pod["status"] = serde_json::json!({
+                            "phase": "Running",
+                            "podIP": pod_ip.to_string(),
+                            "podIPs": [{ "ip": pod_ip.to_string() }],
+                        });
+                    }
+                    served.lock().expect("served pods").push(pod.clone());
+                    return (StatusCode::CREATED, axum::Json(pod)).into_response();
+                }
+                if request.method() == Method::GET
+                    && path == format!("/api/v1/nodes/{WORKER_NODE_NAME}")
+                {
+                    return axum::Json(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": { "name": WORKER_NODE_NAME, "uid": "node-a-uid" },
+                        "status": {
+                            "addresses": [{ "type": "InternalIP", "address": pod_ip.to_string() }],
+                        },
+                    }))
+                    .into_response();
+                }
+                // A delete removes the pod, so a test sees a delete-and-recreate
+                // for what it is; a UID precondition that names another pod is
+                // refused, as the apiserver refuses it.
+                if request.method() == Method::DELETE
+                    && let Some(name) = path.strip_prefix(&format!("{pods_path}/"))
+                {
+                    let name = name.to_owned();
+                    let Ok(body) = axum::body::to_bytes(request.into_body(), usize::MAX).await
+                    else {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    };
+                    let precondition_uid = serde_json::from_slice::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|options| {
+                            options["preconditions"]["uid"].as_str().map(str::to_owned)
+                        });
+                    let mut held = served.lock().expect("served pods");
+                    let Some(index) = held
+                        .iter()
+                        .position(|pod| pod["metadata"]["name"] == name.as_str())
+                    else {
+                        return StatusCode::NOT_FOUND.into_response();
+                    };
+                    if precondition_uid
+                        .is_some_and(|uid| held[index]["metadata"]["uid"] != uid.as_str())
+                    {
+                        return StatusCode::CONFLICT.into_response();
+                    }
+                    let deleted = held.remove(index);
+                    return (StatusCode::OK, axum::Json(deleted)).into_response();
+                }
+                let held = served.lock().expect("served pods").clone();
+                apiserver_double(&held, &request)
+            }
+        })
+    };
+    Ok((
+        KubernetesSubstrate::with_seeded_caches(
+            pool.clone(),
+            kube::Client::new(apiserver, KUBERNETES_NAMESPACE),
+            sandbox_proxy_port,
+            Vec::new(),
+        ),
+        created,
+    ))
+}
+
+/// The Kubernetes node [`kubernetes_substrate_creating_pods`] schedules every
+/// created pod onto.
+pub(crate) const WORKER_NODE_NAME: &str = "node-a";
+
+/// Whether every required node-affinity term of `pod` excludes
+/// [`WORKER_NODE_NAME`] by a `metadata.name NotIn`, so no node fits it. Terms
+/// OR, so one term that doesn't exclude the worker lets the pod land there.
+fn excludes_the_worker(pod: &serde_json::Value) -> bool {
+    let terms = pod["spec"]["affinity"]["nodeAffinity"]
+        ["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    !terms.is_empty()
+        && terms.iter().all(|term| {
+            term["matchFields"].as_array().is_some_and(|fields| {
+                fields.iter().any(|field| {
+                    field["key"] == "metadata.name"
+                        && field["operator"] == "NotIn"
+                        && field["values"]
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|v| v == WORKER_NODE_NAME))
+                })
+            })
+        })
+}

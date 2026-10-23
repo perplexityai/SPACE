@@ -32,6 +32,7 @@ use pplx_space_common_svc::core::host::linux::identities::user_names;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
+    BtrfsCreateSandboxInstanceRequest, BtrfsCreateSandboxInstanceResponse,
     BtrfsCreateTemplateSubvolumeRequest, BtrfsCreateTemplateSubvolumeResponse,
     BtrfsDeleteSandboxInstanceRequest, BtrfsDeleteSandboxInstanceResponse,
     BtrfsDeleteTemplateSubvolumeRequest, BtrfsDeleteTemplateSubvolumeResponse,
@@ -999,6 +1000,185 @@ impl NodeManagerService {
             delete_sandbox_instance_artifacts(&sandbox_id, sandbox_root)
         })
         .await
+    }
+}
+
+impl NodeManagerService {
+    pub(super) async fn btrfs_create_sandbox_instance(
+        &self,
+        request: Request<BtrfsCreateSandboxInstanceRequest>,
+    ) -> Result<Response<BtrfsCreateSandboxInstanceResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsCreateSandboxInstance",
+            ALLOW_NODEMGR_ADMIN_OR_SBXMGR,
+        )?;
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        self.run_artifact_mutation(&sandbox_id, |service| async move {
+            service.btrfs_create_sandbox_instance_inner(request).await
+        })
+        .await
+    }
+
+    async fn btrfs_create_sandbox_instance_inner(
+        &self,
+        request: Request<BtrfsCreateSandboxInstanceRequest>,
+    ) -> Result<Response<BtrfsCreateSandboxInstanceResponse>, Status> {
+        let req = request.get_ref();
+        validate_sandbox_id(&req.sandbox_id)?;
+        let sandbox_id = req.sandbox_id.clone();
+        let target = req
+            .target
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("instance target is required"))?
+            .try_into()?;
+        let gate = self.lock_sandbox_cgroups(&sandbox_id).await;
+        let sandbox_root = self.instance_target_root(&sandbox_id, target).await?;
+        let subvolume = self
+            .off_runtime("create sandbox instance subvolume", move || {
+                let _gate = gate;
+                create_sandbox_instance_subvolume(&sandbox_root)
+            })
+            .await?;
+        tracing::info!(sandbox_id, subvolume, "prepared sandbox instance");
+        Ok(Response::new(BtrfsCreateSandboxInstanceResponse {
+            subvolume,
+        }))
+    }
+}
+
+/// What is already at a sandbox's `instance/` path when a restore asks for an
+/// empty subvolume there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingInstance {
+    Absent,
+    /// What this RPC creates (a subvolume, or on a filesystem that isn't
+    /// btrfs a plain directory), left by a call that died before handing it
+    /// over: still root's, and empty.
+    Unowned,
+    /// Any other subvolume, such as a retry's that was handed over.
+    Subvolume,
+    /// A plain directory, as every earlier Full-codec restore left behind.
+    PlainDirectory,
+    /// Anything else, which can't be opened as a directory.
+    Other,
+}
+
+/// What to do about the path. A restore staging in place over a plain
+/// directory keeps it, as the plain `mkdir` this RPC replaces did: refusing
+/// would fail every retry of that restore, and replacing it could discard a
+/// rootfs. A subvolume left by a create that died before its ownership change
+/// is finished. Only something that isn't a directory refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceAction {
+    Create,
+    HandOver,
+    Keep,
+}
+
+fn instance_action(existing: ExistingInstance) -> Result<InstanceAction, Status> {
+    match existing {
+        ExistingInstance::Absent => Ok(InstanceAction::Create),
+        ExistingInstance::Unowned => Ok(InstanceAction::HandOver),
+        ExistingInstance::Subvolume | ExistingInstance::PlainDirectory => Ok(InstanceAction::Keep),
+        ExistingInstance::Other => Err(Status::failed_precondition(
+            "sandbox instance path exists and is not a directory",
+        )),
+    }
+}
+
+/// Whether `instance` is what only this RPC could have made: owned by root,
+/// with nothing in it, and on btrfs a subvolume root (elsewhere `create` makes
+/// a plain directory, and nothing can snapshot one there anyway). The parent
+/// is writable by the caller, so between the create and a reopen by name it
+/// could swap another directory in; ownership is handed over only to the
+/// fresh one.
+fn is_unowned_fresh_instance(instance: &std::fs::File, on_btrfs: bool) -> Result<bool, Status> {
+    use std::os::unix::fs::MetadataExt;
+    if on_btrfs && !artifact_fs::btrfs::is_subvolume(instance).map_err(artifact_fs::error)? {
+        return Ok(false);
+    }
+    let metadata = instance.metadata().map_err(artifact_fs::error)?;
+    Ok(metadata.uid() == 0 && artifact_fs::entries(instance)?.is_empty())
+}
+
+/// Prepare `instance/` and report whether it is a btrfs subvolume.
+fn create_sandbox_instance_subvolume(sandbox_root: &Path) -> Result<bool, Status> {
+    let parent = trusted_paths::open_directory(sandbox_root)?;
+    let on_btrfs = artifact_fs::btrfs::is_on_btrfs(&parent).map_err(artifact_fs::error)?;
+    let name = std::ffi::OsStr::new("instance");
+    let existing = match artifact_fs::directory(&parent, name) {
+        Ok(instance) => {
+            if is_unowned_fresh_instance(&instance, on_btrfs)? {
+                ExistingInstance::Unowned
+            } else if artifact_fs::btrfs::is_subvolume(&instance).map_err(artifact_fs::error)? {
+                ExistingInstance::Subvolume
+            } else {
+                ExistingInstance::PlainDirectory
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExistingInstance::Absent,
+        // Not a directory, or a symlink the no-follow open refuses.
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTDIR) | Some(libc::ELOOP)
+            ) =>
+        {
+            ExistingInstance::Other
+        }
+        Err(error) => return Err(artifact_fs::error(error)),
+    };
+    match instance_action(existing)? {
+        InstanceAction::Keep => return Ok(existing == ExistingInstance::Subvolume),
+        InstanceAction::Create => {
+            artifact_fs::btrfs::create(&parent, name).map_err(artifact_fs::error)?;
+        }
+        InstanceAction::HandOver => {}
+    }
+    let instance = artifact_fs::directory(&parent, name).map_err(artifact_fs::error)?;
+    if !is_unowned_fresh_instance(&instance, on_btrfs)? {
+        return Err(Status::failed_precondition(
+            "sandbox instance changed between its creation and its ownership change",
+        ));
+    }
+    // Owned by sandbox-manager, which writes the rootfs into it next; the
+    // launch path sets the traversal permissions it needs later.
+    nix::unistd::fchown(
+        &instance,
+        Some(nix::unistd::Uid::from_raw(users::SPACE_SBXMGR.uid)),
+        Some(nix::unistd::Gid::from_raw(
+            users::SPACE_SBXMGR.primary_group.gid,
+        )),
+    )
+    .map_err(artifact_fs::error)?;
+    trusted_paths::set_permissions(&instance, None, 0o755)?;
+    Ok(on_btrfs)
+}
+
+#[cfg(test)]
+mod create_sandbox_instance_tests {
+    use super::*;
+
+    /// A restore that writes its own rootfs gets an empty subvolume, so the
+    /// sandbox's later disk backups can snapshot it. What's already there is
+    /// kept, as the plain `mkdir` this replaces kept it, except an instance a
+    /// dead create left unowned, which is finished; only a path that isn't a
+    /// directory refuses.
+    #[test]
+    fn the_instance_is_created_finished_or_kept_and_only_a_non_directory_refuses() {
+        for (existing, expected) in [
+            (ExistingInstance::Absent, InstanceAction::Create),
+            (ExistingInstance::Unowned, InstanceAction::HandOver),
+            (ExistingInstance::Subvolume, InstanceAction::Keep),
+            (ExistingInstance::PlainDirectory, InstanceAction::Keep),
+        ] {
+            assert_eq!(instance_action(existing).unwrap(), expected, "{existing:?}");
+        }
+        assert_eq!(
+            instance_action(ExistingInstance::Other).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 }
 

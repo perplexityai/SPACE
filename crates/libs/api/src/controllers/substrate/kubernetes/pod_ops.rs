@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
 
 use super::support::*;
 use super::*;
@@ -115,6 +115,7 @@ pub(super) enum RestoreContext<'a> {
         suspend_restore_storage_uri: Option<&'a str>,
         extra_tolerations: &'a [PodToleration],
         extra_required_affinity: Option<(&'a str, &'a str)>,
+        stopped_materialization: Option<StoppedMaterialization<'a>>,
     },
 }
 
@@ -246,6 +247,10 @@ pub(super) struct PodMaterializationOwnership {
     /// Per-attempt fence because an activation retry may reuse an execution
     /// generation.
     activation_attempt: Option<ActivationAttemptAssignment>,
+    /// The pinned disk artifact a drain's stopped re-placement materializes,
+    /// read with the storage URI handed alongside it so the two can't name
+    /// different artifacts. `None` for every other materialization.
+    stopped_materialization_artifact_id: Option<LocalArtifactId>,
 }
 
 impl PodMaterializationOwnership {
@@ -258,7 +263,15 @@ impl PodMaterializationOwnership {
             started_recovery,
             restore_lease_token,
             activation_attempt,
+            stopped_materialization_artifact_id: None,
         }
+    }
+
+    /// Make the pod this materializes a stopped re-placement pod for
+    /// `artifact_id`; see [`EvacuationContext::stopped_materialization`].
+    pub(super) fn materializing_stopped(mut self, artifact_id: Option<LocalArtifactId>) -> Self {
+        self.stopped_materialization_artifact_id = artifact_id;
+        self
     }
 }
 
@@ -304,12 +317,14 @@ pub(super) fn parse_pod_create_context<'a>(
     if let Some(EvacuationContext {
         extra_tolerations,
         extra_required_affinity,
+        stopped_materialization,
     }) = evacuation
     {
         return Ok(PodCreateContext::Restore(RestoreContext::Evacuation {
             suspend_restore_storage_uri,
             extra_tolerations,
             extra_required_affinity,
+            stopped_materialization,
         }));
     }
 
@@ -360,6 +375,9 @@ pub(super) fn parse_pod_create_context<'a>(
 pub(super) struct EvacuationContext<'a> {
     pub extra_tolerations: &'a [PodToleration],
     pub extra_required_affinity: Option<(&'a str, &'a str)>,
+    /// A stopped re-placement's pinned disk artifact and the workers it must
+    /// avoid; `None` for a suspended evacuation's restore.
+    pub stopped_materialization: Option<StoppedMaterialization<'a>>,
 }
 
 /// Identity of a pod that proves the active execution routable: the values to

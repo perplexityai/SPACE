@@ -80,6 +80,7 @@ const (
 	sandboxSuspendRestoreStorageURIAnnotation    = "space.pplx.net/suspend-restore-storage-uri"
 	sandboxSuspendRestoreSourceNodeAnnotation    = "space.pplx.net/suspend-restore-source-node"
 	sandboxArtifactRestoreAsNewAnnotation        = "space.pplx.net/fork-disk-restore"
+	sandboxStoppedMaterializationArtifactID      = "space.pplx.net/stopped-materialization-artifact-id"
 	sandboxDiskMibAnnotation                     = "space.pplx.net/disk-mib"
 	sandboxDiskIOMaxOperationsPerSecAnnotation   = "space.pplx.net/disk-io-max-operations-per-sec"
 	sandboxDiskIOMaxBandwidthMiBPerSecAnnotation = "space.pplx.net/disk-io-max-bandwidth-mib-per-sec"
@@ -294,6 +295,7 @@ type task struct {
 	traceparent         string // create's serialized trace context, which teardown spans link to
 	generationTeardown  bool   // final durable-teardown policy captured from the pod contract
 	sandboxDetached     bool   // sbx-manager released this execution; teardown never polls it again
+	materializedStopped bool   // the sandbox was staged stopped with no VM; nothing may wake it through this pod
 	legacyStopIssued    bool   // this task initiated the stop preceding legacy deletion
 	releasedAfterExit   bool   // release proof arrived after the VM exited; Kill re-announces the exit
 	containerID         string // OCI container type
@@ -538,6 +540,19 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 				sandboxActivationAttemptID,
 			),
 		}
+		materializeStopped := sandboxCheckpoint != nil && *sandboxCheckpoint == stoppedMaterializationCheckpoint
+		if materializeStopped {
+			err = stoppedMaterializationRequest(startRequest, spec.sandboxStoppedMaterializationArtifactID())
+			if err != nil {
+				startSpanSbxmgr.End(err)
+				emitShimStepError("create", "stopped_materialization", "stopped_materialization", err)
+				redirect := <-redirectCh
+				if redirect.podIP != "" {
+					removeDataPlaneRedirect(netnsPath, sbxID)
+				}
+				return nil, err
+			}
+		}
 		if sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" {
 			startRequest.Checkpoint, err = stoppedRestartCheckpoint(startCtx, client, sbxID, startRequest.SuspendRestoreStorageUri)
 			if err != nil {
@@ -556,7 +571,7 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			err = requireActivationPolicySupport(startCtx, conn)
 		}
 		if err == nil {
-			if sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil {
+			if materializeStopped || (sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil) {
 				startResp, err = startStoppedCheckpoint(startCtx, client, startRequest)
 			} else {
 				startResp, err = client.Start(startCtx, startRequest)
@@ -579,6 +594,17 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			return nil, status.Errorf(codes.Unavailable, "prepare data-plane redirect: %v", redirect.err)
 		}
 		emitShimStepLatency("create", "sbxmgr_start", startRPCStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
+		if materializeStopped {
+			// sbx-manager staged the disk and left the sandbox stopped. The
+			// data-plane redirect stays, so the control plane can confirm the
+			// materialization through it.
+			markMaterializedStopped(t, sbxID, redirect.podIP, netnsPath)
+			s.tasks[r.ID] = t
+			createSucceeded = true
+			logShim("Create: materialized stopped sandbox %s without a VM (template=%s)", sbxID, sandboxTemplate)
+			emitShimOperationLatency("create", createStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
+			return &taskAPI.CreateTaskResponse{Pid: uint32(t.pid)}, nil
+		}
 		if startResp.GetPid() == 0 {
 			if redirect.podIP != "" {
 				removeDataPlaneRedirect(netnsPath, sbxID)
@@ -789,6 +815,9 @@ func (s *spaceTaskService) Start(ctx context.Context, r *taskAPI.StartRequest) (
 		ep, ok := t.execs[r.ExecID]
 		if !ok {
 			return nil, errdefs.ErrNotFound
+		}
+		if err := s.refuseMaterializedStoppedLocked("exec"); err != nil {
+			return nil, err
 		}
 		ep.status = tasktypes.Status_RUNNING
 		sandboxID := s.findSandboxIDLocked()
@@ -1575,7 +1604,11 @@ func (s *spaceTaskService) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequ
 func (s *spaceTaskService) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*ptypes.Empty, error) {
 	s.mu.Lock()
 	t := s.tasks[r.ID]
+	refused := s.refuseMaterializedStoppedLocked("pause")
 	s.mu.Unlock()
+	if refused != nil {
+		return nil, refused
+	}
 	if t == nil || t.sandboxID == "" {
 		return &ptypes.Empty{}, nil
 	}
@@ -1599,7 +1632,11 @@ func (s *spaceTaskService) Pause(ctx context.Context, r *taskAPI.PauseRequest) (
 func (s *spaceTaskService) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes.Empty, error) {
 	s.mu.Lock()
 	t := s.tasks[r.ID]
+	refused := s.refuseMaterializedStoppedLocked("resume")
 	s.mu.Unlock()
+	if refused != nil {
+		return nil, refused
+	}
 	if t == nil || t.sandboxID == "" {
 		return &ptypes.Empty{}, nil
 	}
@@ -1623,7 +1660,11 @@ func (s *spaceTaskService) Resume(ctx context.Context, r *taskAPI.ResumeRequest)
 func (s *spaceTaskService) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskRequest) (*ptypes.Empty, error) {
 	s.mu.Lock()
 	t := s.tasks[r.ID]
+	refused := s.refuseMaterializedStoppedLocked("checkpoint")
 	s.mu.Unlock()
+	if refused != nil {
+		return nil, refused
+	}
 	if t == nil || t.sandboxID == "" {
 		return &ptypes.Empty{}, nil
 	}
@@ -1654,6 +1695,9 @@ func (s *spaceTaskService) Exec(ctx context.Context, r *taskAPI.ExecProcessReque
 	t, ok := s.tasks[r.ID]
 	if !ok {
 		return nil, errdefs.ErrNotFound
+	}
+	if err := s.refuseMaterializedStoppedLocked("exec"); err != nil {
+		return nil, err
 	}
 
 	if t.execs != nil {
@@ -1922,6 +1966,19 @@ func closeExecFIFOs(ep *execProcess) {
 	}
 }
 
+// refuseMaterializedStoppedLocked refuses an operation that would reach the
+// sandbox through a pod whose sandbox was materialized stopped (see
+// markMaterializedStopped). Must be called with s.mu held.
+func (s *spaceTaskService) refuseMaterializedStoppedLocked(op string) error {
+	for _, t := range s.tasks {
+		if t.materializedStopped {
+			return fmt.Errorf("%w: %s refused: sandbox %s was materialized stopped and runs no VM in this pod",
+				errdefs.ErrFailedPrecondition, op, t.sandboxID)
+		}
+	}
+	return nil
+}
+
 // findSandboxIDLocked returns the sandbox ID from the pod sandbox task.
 // Must be called with s.mu held.
 func (s *spaceTaskService) findSandboxIDLocked() string {
@@ -2180,6 +2237,52 @@ func (s *ociSpec) sandboxSuspendRestoreStorageURI() *string {
 		return nil
 	}
 	return ptr(value)
+}
+
+func (s *ociSpec) sandboxStoppedMaterializationArtifactID() string {
+	return strings.TrimSpace(s.Annotations[sandboxStoppedMaterializationArtifactID])
+}
+
+// stoppedMaterializationCheckpoint is the checkpoint annotation of a pod that
+// re-places an evacuated stopped sandbox. A shim that predates it forwards the
+// value to sbx-manager unchanged, and sbx-manager neither restores from nor
+// boots on a checkpoint it doesn't know, so an old shim fails closed.
+const stoppedMaterializationCheckpoint = "stopped-materialization"
+
+// markMaterializedStopped makes t the task of a pod whose sandbox was
+// materialized stopped: no VM, so the task stands in on the shim's own pid,
+// and detached, so Kill and Delete never ask sbx-manager to release, suspend or
+// delete the sandbox the next start boots from. Unlike an ordinarily stopped
+// sandbox's task, this one is still running, so containerd would let an exec
+// through; refuseMaterializedStoppedLocked turns those away before they reach
+// sbx-manager, where an exec counts as guest activity and a wake-on-access
+// policy would cold-start the sandbox.
+func markMaterializedStopped(t *task, sandboxID, podIP, netnsPath string) {
+	t.sandboxID = sandboxID
+	t.sandboxDetached = true
+	t.materializedStopped = true
+	t.pid = os.Getpid()
+	t.podIP = podIP
+	t.netnsPath = netnsPath
+}
+
+// stoppedMaterializationRequest turns a stopped re-placement pod's Start into
+// the materialization sbx-manager expects: the exact disk artifact by URI and
+// id, the suspend checkpoint, the stopped target, and no network namespace,
+// since nothing launches.
+func stoppedMaterializationRequest(request *pb.StartRequest, artifactID string) error {
+	if request.SuspendRestoreStorageUri == nil {
+		return status.Errorf(codes.InvalidArgument, "%s requires %s", stoppedMaterializationCheckpoint, sandboxSuspendRestoreStorageURIAnnotation)
+	}
+	if artifactID == "" {
+		return status.Errorf(codes.InvalidArgument, "%s requires %s", stoppedMaterializationCheckpoint, sandboxStoppedMaterializationArtifactID)
+	}
+	request.Checkpoint = ptr("suspend")
+	request.TargetState = pb.WakeTargetState_WAKE_TARGET_STATE_STOPPED
+	request.ExpectedLocalArtifactId = ptr(artifactID)
+	request.NetnsPath = nil
+	request.SuspendRestoreSourceNode = nil
+	return nil
 }
 
 func (s *ociSpec) sandboxSuspendRestoreSourceNode() *string {
