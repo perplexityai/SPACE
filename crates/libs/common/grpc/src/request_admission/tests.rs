@@ -1,6 +1,6 @@
 use super::*;
 use crate::QueuedSlots;
-use pplx_space_metrics::test_capture::{capture_counters_guard, capture_values_guard};
+use pplx_space_metrics_emit::test_capture::{capture_counters_guard, capture_values_guard};
 use std::convert::Infallible;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};

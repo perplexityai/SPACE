@@ -89,7 +89,7 @@ and error evolution, requires a separate crate-level policy before stabilization
   `ResourceExhausted`. Use `pplx_space_common_grpc::is_refused_before_start`
   to identify refusal before execution rather than parsing error messages.
   An error without that marker does not establish that retrying is safe.
-  [Payload metrics](../../../metrics/src/payload.rs) distinguish transport and
+  [Payload metrics](../../../grpc-metrics/src/payload.rs) distinguish transport and
   handler admission decisions and measure slots retained after observed
   cancellation until their final release. Handler acquisition includes normal
   native calls; it must not be treated as evidence of a lost transport permit.
