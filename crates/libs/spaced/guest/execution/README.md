@@ -12,6 +12,15 @@ The guest bridge and worker schemas live in `pplx-space-spaced-guest-protocol`.
 distinct from `execution/common`, which describes portable sandbox runtimes and
 execution metadata.
 
+## Rust API compatibility
+
+This embedding API is experimental and has no Rust source-compatibility promise
+across revisions. Independent consumers must pin a revision and adapt when
+upgrading, including configuration literals and exhaustive error matches. The
+[service versioning policy](../../../../../docs/versioning.md) does not cover Rust
+crate APIs. A stable external API, including supported configuration construction
+and error evolution, requires a separate crate-level policy before stabilization.
+
 ## Guest process requirements
 
 - Linux identity workers require `ExecutionServiceConfig::worker_executable`.

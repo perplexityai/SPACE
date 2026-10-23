@@ -164,6 +164,12 @@ pub struct FilesystemHandle {
     native_upload_idle_timeout: std::time::Duration,
 }
 
+impl std::fmt::Debug for FilesystemHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilesystemHandle").finish_non_exhaustive()
+    }
+}
+
 impl FilesystemHandle {
     pub(crate) fn with_native_upload_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.native_upload_idle_timeout = timeout;
