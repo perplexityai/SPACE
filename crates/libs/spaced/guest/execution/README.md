@@ -131,9 +131,10 @@ and error evolution, requires a separate crate-level policy before stabilization
   on cancellation. The service owns a child of the supplied token: caller
   cancellation closes admission, but `close()` and `drain()` do not cancel the
   caller's token. Closure signals cancellation of admitted work immediately;
-  supervised filesystem mutations can finish during `cancellation_grace`, then
-  identity workers are terminated and the outcome may be unknown. Direct execution
-  still waits for outstanding I/O. This is abortive shutdown, not graceful
+  service or parent-token cancellation can terminate identity workers immediately,
+  leaving outcomes unknown. `cancellation_grace` applies to supervised work after
+  request cancellation, not service shutdown. Direct execution still waits for
+  outstanding I/O. This is abortive shutdown, not graceful
   admission-only closure; it neither waits nor rolls back effects. Already-admitted
   same-key retries can still wait for the owner or the retry retention deadline;
   closure does not directly wake them.

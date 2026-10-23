@@ -31,6 +31,8 @@ pub struct ExecutionServiceConfig {
     pub identity_policy: IdentityPolicy,
     /// Required on Linux when using identity workers. Never inferred from the host.
     pub worker_executable: Option<crate::WorkerExecutable>,
+    /// Grace for supervised filesystem work after request cancellation. Service
+    /// cancellation can terminate identity workers immediately, without this grace.
     pub cancellation_grace: Duration,
     /// Maximum wait for each native upload message, including the initial `Open`.
     /// Defaults to 30 seconds. Applies only to native `write_file`; the gRPC
@@ -181,11 +183,12 @@ impl ExecutionService {
     ///
     /// Calls through every service clone and previously obtained filesystem handle
     /// are refused once admission is closed. Repeated calls are harmless. Work
-    /// admitted earlier is signalled to cancel immediately. Supervised filesystem
-    /// mutations can finish during [`ExecutionServiceConfig::cancellation_grace`];
-    /// after that grace, identity workers are terminated and the outcome may be
-    /// unknown. Direct execution still waits for its outstanding I/O. This is
-    /// abortive shutdown, not graceful admission-only closure. It neither waits
+    /// admitted earlier is signalled to cancel immediately. Service or caller-token
+    /// cancellation can terminate identity workers immediately, leaving outcomes
+    /// unknown. [`ExecutionServiceConfig::cancellation_grace`] applies to request
+    /// cancellation, not service shutdown. Direct execution still waits for its
+    /// outstanding I/O. This is abortive shutdown, not graceful admission-only
+    /// closure. It neither waits
     /// for cleanup nor cancels the caller's token, and cannot roll back effects.
     pub fn close(&self) {
         let _start_gate = self
