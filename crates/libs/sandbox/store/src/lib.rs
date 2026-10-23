@@ -70,6 +70,7 @@ use sqlx::types::JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod anchor_placement;
 mod create;
 pub mod fork_source_lifecycle;
 

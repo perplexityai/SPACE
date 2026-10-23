@@ -15,6 +15,9 @@ use pplx_space_spaced_common::proto::bridge_guest::{
     PingResponse as BridgeGuestPingResponse, WaitReadyRequest as BridgeGuestWaitReadyRequest,
     WaitReadyResponse as BridgeGuestWaitReadyResponse,
 };
+use pplx_space_spaced_common::proto::bridge_guest::{
+    InstallSandboxTrustRequest, InstallSandboxTrustResponse,
+};
 use pplx_space_spaced_common::proto::bridge_host::{
     ActivityState, RequestActiveForRequest as BridgeHostRequestActiveForRequest,
     RequestShutdownRequest as BridgeHostShutdownRequest,
@@ -50,6 +53,15 @@ impl Drop for ActiveWaitReadyCall {
 
 #[tonic::async_trait]
 impl BridgeGuestMeta for ReadyWaitGuest {
+    async fn install_sandbox_trust(
+        &self,
+        _request: Request<InstallSandboxTrustRequest>,
+    ) -> Result<Response<InstallSandboxTrustResponse>, Status> {
+        Err(Status::unimplemented(
+            "this fixture does not install sandbox trust",
+        ))
+    }
+
     async fn ping(
         &self,
         _request: Request<BridgeGuestPingRequest>,

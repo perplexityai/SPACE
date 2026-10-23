@@ -4,6 +4,30 @@ use crate::protocol::*;
 
 #[tonic::async_trait]
 impl Meta for SpacedHostService {
+    async fn install_sandbox_trust(
+        &self,
+        request: Request<proto::InstallSandboxTrustRequest>,
+    ) -> Result<Response<proto::InstallSandboxTrustResponse>, Status> {
+        let request = request.into_inner();
+        self.call_bridge_guest_once(
+            "bridge_guest_install_sandbox_trust",
+            BridgeGuestOperationBudget::RuntimeMetadata,
+            |mut client| {
+                let request = request.clone();
+                async move {
+                    client.install_sandbox_trust(
+                    pplx_space_spaced_common::proto::bridge_guest::InstallSandboxTrustRequest {
+                        certificate_der: request.certificate_der,
+                        sandbox_id: request.sandbox_id,
+                    }
+                ).await
+                }
+            },
+        )
+        .await?;
+        Ok(Response::new(proto::InstallSandboxTrustResponse {}))
+    }
+
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         tracing::debug!(command = "ping", "spaced host grpc command succeeded");
         Ok(Response::new(PingResponse {}))

@@ -1108,12 +1108,7 @@ class KindHarness:
             self._assert_retention_lease_owned()
 
         assert_lease()
-        if self.config.context != "kind-space-local" or urlsplit(
-            self.config.api_url
-        ).hostname not in {"localhost", "127.0.0.1"}:
-            raise SmokeConfigurationError(
-                "cold setup requires the isolated local Kind API"
-            )
+        self._require_isolated_kind("cold setup")
         token_file = self.environment.get("SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
         receipts = self.environment.get("SPACE_SMOKE_KIND_COLD_RECEIPTS")
         if not token_file or not receipts:
@@ -2607,6 +2602,67 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
             cleared.append(name)
         return tuple(cleared)
+
+    def probe_anchor_placement(self, sandbox_id: str) -> Mapping[str, str]:
+        import hashlib
+        from space_smoke.credmgr_socket import sandbox_anchor
+
+        self._require_isolated_kind("sandbox anchor placement probes")
+        placement = self.sandbox_pod_placement(sandbox_id)
+        if placement is None:
+            raise SmokeConfigurationError("anchor probe needs one active sandbox execution")
+        generation = int(placement.execution_generation)
+        other = next((node for node in self.sandbox_worker_nodes() if node != placement.node_name), None)
+        if other is None:
+            raise SmokeConfigurationError("anchor isolation proof requires a second worker")
+
+        def probe(node: str, execution: int, user: str = "space-sbxmgr") -> tuple[bytes, str]:
+            argv = relay_argv(
+                ["kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE],
+                self._node_shell_pod(node), KIND_NODE_SHELL_CONTAINER,
+                "/space/run/credential-manager/credmgr.sock",
+                user=user, groups=("space-sbxclients",),
+            )
+            return sandbox_anchor(argv, sandbox_id=_sql_uuid(sandbox_id), generation=execution)
+
+        certificate, assigned = probe(placement.node_name, generation)
+        _, foreign = probe(other, generation)
+        _, stale = probe(placement.node_name, generation + 1_000_000)
+        _, unprivileged = probe(placement.node_name, generation, "nobody")
+        return {
+            "assigned_node": placement.node_name,
+            "foreign_node": other,
+            "generation": str(generation),
+            "assigned_status": assigned,
+            "foreign_node_status": foreign,
+            "forged_generation_status": stale,
+            "unprivileged_peer_status": unprivileged,
+            "public_certificate_sha256": hashlib.sha256(certificate).hexdigest(),
+        }
+
+    def recover_anchor_keyring(self) -> Mapping[str, str]:
+        from space_smoke.anchor_recovery import AnchorRecoveryDriver
+
+        self._require_isolated_kind("sandbox anchor keyring recovery")
+
+        def driver(ownership: _LeaseOwnership) -> AnchorRecoveryDriver:
+            return AnchorRecoveryDriver(
+                self.kubectl,
+                lambda action, annotations: self._renew_lease(ownership, action, annotations),
+            )
+
+        def repair(previous: Mapping[str, object], ownership: _LeaseOwnership) -> None:
+            driver(ownership).repair(_lease_annotations(previous))
+
+        ownership = self._acquire_named_mutation_lease(
+            "space-smoke-sandbox-anchor-recovery",
+            "sandbox anchor recovery",
+            repair=repair,
+        )
+        try:
+            return driver(ownership).run()
+        finally:
+            self._release_lease(ownership)
 
     def _require_isolated_kind(self, action: str) -> None:
         if urlsplit(self.config.api_url).hostname not in {"localhost", "127.0.0.1"}:

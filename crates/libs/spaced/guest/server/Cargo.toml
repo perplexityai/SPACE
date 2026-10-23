@@ -42,6 +42,8 @@ datadog-otel = ["otel", "datadog"]
 test-support = []
 
 [dependencies]
+pem = "4"
+x509-parser = { workspace = true, features = ["verify-aws"] }
 futures-util = { version = "0.3" }
 hyper-util = { workspace = true, features = ["tokio"] }
 nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time"] }

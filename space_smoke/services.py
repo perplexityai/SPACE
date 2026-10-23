@@ -371,6 +371,7 @@ class SmokeServices:
             fixture._leader_election_control = cast(Any, kind)
             fixture._sandbox_network_isolation_control = cast(Any, kind)
             fixture._storage_exchange_control = cast(Any, kind)
+            fixture._sandbox_anchor_control = cast(Any, kind)
             fixture._template_selector = template
             fixture._warm_pool_observer = cast(Any, kind)
             fixture._warm_pool_candidate = warm_pool_candidate

@@ -208,6 +208,19 @@ fn require_activity_state(state: LocalActivityState) -> Result<LocalActivityStat
 
 #[tonic::async_trait]
 impl BridgeGuestMeta for SpacedGuestService {
+    async fn install_sandbox_trust(
+        &self,
+        request: Request<pplx_space_spaced_common::proto::bridge_guest::InstallSandboxTrustRequest>,
+    ) -> Result<
+        Response<pplx_space_spaced_common::proto::bridge_guest::InstallSandboxTrustResponse>,
+        Status,
+    > {
+        crate::sandbox_trust::install(request.into_inner()).await?;
+        Ok(Response::new(
+            pplx_space_spaced_common::proto::bridge_guest::InstallSandboxTrustResponse {},
+        ))
+    }
+
     async fn ping(
         &self,
         request: Request<BridgeGuestPingRequest>,

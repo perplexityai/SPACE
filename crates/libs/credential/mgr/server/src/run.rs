@@ -116,6 +116,12 @@ pub struct CredmgrRunConfig {
 /// Why [`run`] returned without a clean shutdown.
 #[derive(Debug, thiserror::Error)]
 pub enum RunCredmgrError {
+    #[cfg(feature = "split-trust-prototype")]
+    #[error("sandbox anchors require a placement database")]
+    SandboxAnchorDatabase,
+    #[cfg(feature = "split-trust-prototype")]
+    #[error("sandbox anchor initialization failed: {0}")]
+    SandboxAnchor(#[source] crate::split_trust::AuthorityError),
     #[error(
         "refusing to start a keyless authority on the node-local Unix socket: \
          role=authority with no DATABASE_URL answers health checks but fails every \
@@ -472,6 +478,11 @@ pub async fn run(
             return Err(RunCredmgrError::NoUdsWithoutTcpListen);
         };
         let service = initialize_authority_service(peer_process_check_mode).await?;
+        #[cfg(feature = "split-trust-prototype")]
+        let _anchor_reconciler = service
+            .sandbox_anchors
+            .as_ref()
+            .map(|authority| authority.start_reconciler(shutdown_token.clone()));
         tracing::info!(
             tcp_listen = %addr,
             "credential manager active; listening on TCP"
@@ -491,6 +502,11 @@ pub async fn run(
         return Ok(());
     };
     let listener = CredentialListeners::bind(&config)?;
+    #[cfg(feature = "split-trust-prototype")]
+    let _anchor_reconciler = service
+        .sandbox_anchors
+        .as_ref()
+        .map(|authority| authority.start_reconciler(shutdown_token.clone()));
 
     tracing::info!(
         socket_path = %config.socket_path.display(),
@@ -745,6 +761,19 @@ async fn initialize_authority_service(
         }
     }
 
+    #[cfg(feature = "split-trust-prototype")]
+    if std::env::var("SPACE_SPLIT_TRUST_PROTOTYPE").as_deref() == Ok("true") {
+        service.sandbox_anchors = Some(
+            crate::split_trust::Authority::load(
+                service
+                    .database_pool
+                    .clone()
+                    .ok_or(RunCredmgrError::SandboxAnchorDatabase)?,
+            )
+            .await
+            .map_err(RunCredmgrError::SandboxAnchor)?,
+        );
+    }
     Ok(service)
 }
 
@@ -1483,14 +1512,17 @@ async fn run_agent(
     // already made.
     let node_ca = Arc::new(NodeCa::new(upstream.clone()).map_err(RunCredmgrError::NodeCaKeypair)?);
 
+    let node_service = NodeCredentialManager::new(
+        upstream,
+        node_ca,
+        peer_process_check_mode,
+        shutdown_token.clone(),
+    );
+    #[cfg(feature = "split-trust-prototype")]
+    let _anchor_sweeper = node_service.start_anchor_sweeper(shutdown_token.clone());
     serve_node_local_uds(
         listener,
-        NodeCredentialManager::new(
-            upstream,
-            node_ca,
-            peer_process_check_mode,
-            shutdown_token.clone(),
-        ),
+        node_service,
         config.socket_path,
         node_local,
         shutdown_token,

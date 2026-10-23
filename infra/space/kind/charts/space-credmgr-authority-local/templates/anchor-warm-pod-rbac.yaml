@@ -1,0 +1,25 @@
+{{- if .Values.splitTrust.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.service.name }}-warm-anchor-pods
+  namespace: {{ .Values.splitTrust.sandboxNamespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.service.name }}-warm-anchor-pods
+  namespace: {{ .Values.splitTrust.sandboxNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.service.name }}-warm-anchor-pods
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.service.name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -240,6 +240,12 @@ rust_build_args() {
       --build-arg SPACE_KIND_GUEST_TEST_HOOK_FEATURES=
       --build-arg "SPACE_KIND_CARGO_EXCLUDE=$CARGO_EXCLUDE")
   fi
+  if [[ "${SPACE_SPLIT_TRUST_PROTOTYPE:-false}" == true ]]; then
+    [[ "$RUST_BUILD" != release ]] || die "split-trust prototype is forbidden in the release lane"
+    local prototype_features
+    prototype_features="$(test_hook_features SPACE_KIND_TEST_HOOK_FEATURES | paste -sd,)"
+    BUILD_ARGS+=(--build-arg "SPACE_KIND_TEST_HOOK_FEATURES=$prototype_features,pplx-space-credmgr/split-trust-prototype")
+  fi
 }
 
 build_docker() {
@@ -492,6 +498,9 @@ assert_glibc_compatible() {
 build_incremental() {
   local release_dir host_release_dir features bins sup_features stamp
   mapfile -t features < <(main_build_features; test_hook_features SPACE_KIND_TEST_HOOK_FEATURES)
+  if [[ "${SPACE_SPLIT_TRUST_PROTOTYPE:-false}" == true ]]; then
+    features+=("pplx-space-credmgr/split-trust-prototype")
+  fi
   mapfile -t bins < <(main_build_bins)
   mapfile -t sup_features < <(supervisor_features)
   (( ${#features[@]} > 0 && ${#bins[@]} > 0 && ${#sup_features[@]} > 0 )) \
@@ -604,7 +613,7 @@ build_incremental() {
 # supervisor helper rewrites its compatibility file on every run.
 assembly_key() {
   {
-    echo "$PROFILE $RUST_BUILD $RUNTIME_LIBC_IMAGE"
+    echo "$PROFILE $RUST_BUILD $RUNTIME_LIBC_IMAGE split-trust=${SPACE_SPLIT_TRUST_PROTOTYPE:-false}"
     sha256sum "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" "$HOST_DOCKERFILE" \
       docker/run-cargo-with-sccache.sh infra/space/kind/scripts/build-rust-artifacts.sh \
       infra/space/kind/scripts/sync-rust-sources.py

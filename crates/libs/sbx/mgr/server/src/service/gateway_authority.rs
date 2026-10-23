@@ -192,8 +192,23 @@ impl SandboxManagerService {
                 request.get_ref().execution_generation,
             )
             .await?;
+            let requested_issuer =
+                if std::env::var("SPACE_SPLIT_TRUST_PROTOTYPE").as_deref() == Ok("true") {
+                    pplx_space_credmgr_client::proto::GatewayCaIssuer::Anchor
+                } else {
+                    pplx_space_credmgr_client::proto::GatewayCaIssuer::Shared
+                };
             let issued = issuer(NodeRequest {
                 csr: request.get_ref().csr.clone(),
+                issuer: requested_issuer as i32,
+                sandbox_id: before.id.clone(),
+                execution_generation: before
+                    .space_api_route_identity
+                    .execution_generation
+                    .ok_or_else(|| {
+                        Status::failed_precondition("sandbox execution identity is missing")
+                    })?
+                    .get(),
             })
             .await?;
             self.authorize_gateway_launch(
@@ -213,6 +228,11 @@ impl SandboxManagerService {
             if !same_execution_authority(&before, &after) {
                 return Err(Status::aborted(
                     "gateway CA execution ownership changed during issuance",
+                ));
+            }
+            if issued.issuer() != requested_issuer {
+                return Err(Status::failed_precondition(
+                    "node returned a different gateway CA issuer mode",
                 ));
             }
             if [&issued.certificate_der, &issued.issuer_certificate_der]

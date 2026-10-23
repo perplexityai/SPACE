@@ -256,7 +256,9 @@ impl Intermediate {
         params.use_authority_key_identifier_extension = true;
         params.serial_number = Some(random_serial());
         params.not_before = OffsetDateTime::now_utc() - LEAF_CLOCK_SKEW;
-        params.not_after = self.not_after;
+        params.not_after = self
+            .not_after
+            .min(OffsetDateTime::now_utc() + time::Duration::days(365));
         params
             .signed_by(public_key, &self.issuer)
             .map(|certificate| certificate.der().to_vec())
@@ -558,6 +560,7 @@ impl NodeCa {
         Ok(IssueIntermediateCertificateResponse {
             certificate_der: intermediate.sign_gateway(&public_key)?,
             issuer_certificate_der: intermediate.certificate_der.clone(),
+            issuer: crate::proto::GatewayCaIssuer::Shared as i32,
         })
     }
 
@@ -568,6 +571,8 @@ impl NodeCa {
                 upstream
                     .issue_intermediate_certificate(IssueIntermediateCertificateRequest {
                         csr: csr_der,
+                        issuer: crate::proto::GatewayCaIssuer::Shared as i32,
+                        ..Default::default()
                     })
                     .await
                     .map(|response| response.into_inner().certificate_der)

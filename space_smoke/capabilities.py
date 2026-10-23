@@ -2521,6 +2521,14 @@ class StorageRequestResult:
     detail: str
 
 
+class SandboxAnchorControl(Protocol):
+    """Isolated-Kind fault injection; never exposes seed or private-key bytes."""
+
+    def recover_anchor_keyring(self) -> Mapping[str, str]: ...
+
+    def probe_anchor_placement(self, sandbox_id: str) -> Mapping[str, str]: ...
+
+
 class StorageExchangeControl(Protocol):
     """Kind-only access to credential-manager's storage exchange and the store.
 

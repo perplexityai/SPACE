@@ -13,6 +13,35 @@ use crate::kek_store::KekRecord;
 
 mod assume_role;
 
+#[cfg(feature = "split-trust-prototype")]
+#[tokio::test]
+async fn anchor_keys_require_a_node_bound_agent_not_local_root_or_plaintext() {
+    let service = CredentialManagerService::new(
+        Arc::new(InMemoryKeyWrapper::new()),
+        PeerProcessCheckMode::Off,
+    );
+    let message = crate::proto::ReleaseSandboxAnchorRequest {
+        sandbox_id: Uuid::now_v7().to_string(),
+        execution_generation: Some(1),
+    };
+    for request in [
+        root_request(message.clone()),
+        plaintext_request(message.clone()),
+    ] {
+        let error = service.release_sandbox_anchor(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+    let error = service
+        .release_sandbox_anchor(agent_request(message))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        tonic::Code::FailedPrecondition,
+        "authenticated agent reaches the disabled-feature gate"
+    );
+}
+
 /// In-memory KEK-row map standing in for Postgres.
 struct TestKekStore {
     rows: HashMap<(Uuid, OrgId), KekRecord>,
@@ -1489,6 +1518,8 @@ async fn a_valid_request_reaches_the_backend_and_its_certificate_is_returned() {
     let response = service_with_issuer(Ok(Vec::new()))
         .issue_intermediate_certificate(agent_request(IssueIntermediateCertificateRequest {
             csr: csr.clone(),
+            issuer: crate::proto::GatewayCaIssuer::Shared as i32,
+            ..Default::default()
         }))
         .await
         .expect("issuance succeeds")
@@ -1510,6 +1541,8 @@ async fn instance_without_an_issuer_refuses_intermediate_issuance() {
     )
     .issue_intermediate_certificate(agent_request(IssueIntermediateCertificateRequest {
         csr: node_csr(),
+        issuer: crate::proto::GatewayCaIssuer::Shared as i32,
+        ..Default::default()
     }))
     .await
     .expect_err("no backend configured");
@@ -1531,7 +1564,11 @@ async fn only_the_node_agent_may_request_an_intermediate() {
         ClientService::ApiSvc,
     ] {
         for csr in [node_csr(), b"not a csr".to_vec()] {
-            let mut request = Request::new(IssueIntermediateCertificateRequest { csr });
+            let mut request = Request::new(IssueIntermediateCertificateRequest {
+                csr,
+                issuer: crate::proto::GatewayCaIssuer::Shared as i32,
+                ..Default::default()
+            });
             request
                 .extensions_mut()
                 .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
@@ -1559,13 +1596,19 @@ async fn precondition_and_validation_failures_are_metered() {
         Arc::new(InMemoryKeyWrapper::new()),
         PeerProcessCheckMode::Off,
     )
-    .issue_intermediate(IssueIntermediateCertificateRequest { csr: node_csr() })
+    .issue_intermediate(IssueIntermediateCertificateRequest {
+        csr: node_csr(),
+        issuer: crate::proto::GatewayCaIssuer::Shared as i32,
+        ..Default::default()
+    })
     .await;
     assert_eq!(intermediate_result_tag(&no_backend), "not_configured");
 
     let rejected = service_with_issuer(Ok(Vec::new()))
         .issue_intermediate(IssueIntermediateCertificateRequest {
             csr: b"not der".to_vec(),
+            issuer: crate::proto::GatewayCaIssuer::Shared as i32,
+            ..Default::default()
         })
         .await;
     assert_eq!(intermediate_result_tag(&rejected), "invalid_csr");

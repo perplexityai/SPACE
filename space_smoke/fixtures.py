@@ -47,6 +47,7 @@ from space_smoke.capabilities import (
     SuspendCodecControl,
     SandboxNetworkIsolationControl,
     StorageExchangeControl,
+    SandboxAnchorControl,
     TelemetryBackendControl,
     LeaderElectionControl,
     RestoreFailure,
@@ -2588,6 +2589,14 @@ class KindEcw(Ecw):
 
     fixture_name: ClassVar[str] = "kind_ecw"
     allow_committed_pause_not_running: ClassVar[bool] = True
+
+    _sandbox_anchor_control: SandboxAnchorControl | None = None
+
+    @property
+    def sandbox_anchor_authority(self) -> SandboxAnchorControl:
+        if self._sandbox_anchor_control is None:
+            raise SmokeConfigurationError("sandbox anchor recovery requires an isolated Kind backend")
+        return self._sandbox_anchor_control
 
     _private_template_build_setup: Callable[[], PrivateTemplateBuildAssertions] | None = None
     _private_template_build_assertions: PrivateTemplateBuildAssertions | None = None

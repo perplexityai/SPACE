@@ -20,6 +20,7 @@ pub mod proto {
     // that carries a raw credential or plaintext secret as one opaque value so
     // adding a new field cannot silently make it loggable.
     redacted_debug! {
+        ReleaseSandboxAnchorResponse => "ReleaseSandboxAnchorResponse",
         ExchangeTokenRequest => "ExchangeTokenRequest",
         ExchangeTokenResponse => "ExchangeTokenResponse",
         exchange_token_response::Payload => "Payload",

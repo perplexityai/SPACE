@@ -20,6 +20,9 @@ use pplx_space_spaced_common::proto::bridge_guest::{
     StartRequest, StatRequest, WaitReadyRequest, WaitReadyResponse, WatchRequest,
     WriteBatchRequest, WriteBatchResponse, WriteRequest, WriteResponse,
 };
+use pplx_space_spaced_common::proto::bridge_guest::{
+    InstallSandboxTrustRequest, InstallSandboxTrustResponse,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -530,6 +533,15 @@ impl Process for MockBridgeGuest {
 
 #[tonic::async_trait]
 impl Meta for MockBridgeGuest {
+    async fn install_sandbox_trust(
+        &self,
+        _request: Request<InstallSandboxTrustRequest>,
+    ) -> Result<Response<InstallSandboxTrustResponse>, Status> {
+        Err(Status::unimplemented(
+            "this fixture does not install sandbox trust",
+        ))
+    }
+
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse::default()))
     }

@@ -165,6 +165,8 @@ pub struct NodeCredentialManager {
     /// This node's intermediate CA. Its private key is generated in this process
     /// and never leaves it; the certificate over it comes from `upstream`.
     node_ca: Arc<NodeCa>,
+    #[cfg(feature = "split-trust-prototype")]
+    anchors: crate::split_trust::NodeAnchors,
     /// Local authorization for certificate signing and credential-injection resolution.
     /// The authority sees this agent's credential rather than the local caller's.
     caller_resolver: CallerResolver,
@@ -172,6 +174,14 @@ pub struct NodeCredentialManager {
 }
 
 impl NodeCredentialManager {
+    #[cfg(feature = "split-trust-prototype")]
+    pub(crate) fn start_anchor_sweeper(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> tokio_util::task::AbortOnDropHandle<()> {
+        self.anchors.start_sweeper(shutdown)
+    }
+
     /// `peer_process_check_mode` is threaded from startup so an armed switch is
     /// consistently live on this resolver rather than silently dropped. It bears
     /// on the configured accounts. Sandbox-manager remains the only principal
@@ -183,6 +193,8 @@ impl NodeCredentialManager {
         shutdown_token: CancellationToken,
     ) -> Self {
         Self {
+            #[cfg(feature = "split-trust-prototype")]
+            anchors: crate::split_trust::NodeAnchors::new(upstream.clone()),
             upstream,
             node_ca,
             shutdown_token,
@@ -317,6 +329,35 @@ fn forwarded_exchange_request(
 
 #[tonic::async_trait]
 impl CredentialManager for NodeCredentialManager {
+    async fn release_sandbox_anchor(
+        &self,
+        request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+    ) -> Result<Response<crate::proto::ReleaseSandboxAnchorResponse>, Status> {
+        self.authorize_sandbox_anchor(&request)?;
+        #[cfg(feature = "split-trust-prototype")]
+        {
+            return self
+                .anchors
+                .public_anchor(request.into_inner())
+                .await
+                .map(Response::new);
+        }
+        #[cfg(not(feature = "split-trust-prototype"))]
+        Err(Status::failed_precondition(
+            "sandbox anchors are not compiled in",
+        ))
+    }
+
+    async fn forget_sandbox_anchor(
+        &self,
+        request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+    ) -> Result<Response<crate::proto::ForgetSandboxAnchorResponse>, Status> {
+        self.authorize_sandbox_anchor(&request)?;
+        #[cfg(feature = "split-trust-prototype")]
+        self.anchors.forget(request.into_inner()).await;
+        Ok(Response::new(crate::proto::ForgetSandboxAnchorResponse {}))
+    }
+
     async fn resolve_network_credentials(
         &self,
         request: Request<ResolveNetworkCredentialsRequest>,
@@ -441,8 +482,25 @@ impl CredentialManager for NodeCredentialManager {
             ALLOW_GATEWAY_CA_ISSUANCE,
             &[],
         )?;
+        let request = request.into_inner();
+        match request.issuer() {
+            crate::proto::GatewayCaIssuer::Anchor => {
+                #[cfg(feature = "split-trust-prototype")]
+                return self.anchors.issue(request).await.map(Response::new);
+                #[cfg(not(feature = "split-trust-prototype"))]
+                return Err(Status::failed_precondition(
+                    "sandbox anchors are not compiled in",
+                ));
+            }
+            crate::proto::GatewayCaIssuer::Shared => {}
+            crate::proto::GatewayCaIssuer::Unspecified => {
+                return Err(Status::invalid_argument(
+                    "gateway CA issuer must be explicit",
+                ));
+            }
+        }
         self.node_ca
-            .issue_intermediate(request.into_inner())
+            .issue_intermediate(request)
             .await
             .map(Response::new)
             .map_err(|error| error.to_status())
@@ -451,3 +509,21 @@ impl CredentialManager for NodeCredentialManager {
 
 #[cfg(test)]
 mod tests;
+
+impl NodeCredentialManager {
+    fn authorize_sandbox_anchor<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let caller = self.caller_resolver.resolve(request)?;
+        if !matches!(caller, ResolvedCaller::UdsPeer(_)) {
+            return Err(Status::permission_denied(
+                "sandbox anchor requests are node-local only",
+            ));
+        }
+        self.caller_resolver.authorize_caller(
+            &caller,
+            "ReleaseSandboxAnchor",
+            ALLOW_GATEWAY_CA_ISSUANCE,
+            &[],
+        )?;
+        Ok(())
+    }
+}

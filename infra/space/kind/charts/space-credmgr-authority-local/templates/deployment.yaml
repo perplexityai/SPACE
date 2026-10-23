@@ -58,6 +58,17 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list", "watch"]
+  {{- if .Values.splitTrust.enabled }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["space-anchor-keyring"]
+    verbs: ["get", "update"]
+  {{- if .Values.splitTrust.bootstrap }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  {{- end }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -163,6 +174,26 @@ spec:
             capabilities:
               drop: ["ALL"]
           env:
+            - name: SPACE_SPLIT_TRUST_PROTOTYPE
+              value: {{ .Values.splitTrust.enabled | quote }}
+            {{- if .Values.splitTrust.enabled }}
+            - name: SPACE_ANCHOR_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SPACE_ANCHOR_BOOTSTRAP
+              value: {{ .Values.splitTrust.bootstrap | quote }}
+            - name: SPACE_ANCHOR_KMS_KEY_ID
+              value: {{ .Values.splitTrust.kmsKeyId | quote }}
+            - name: SPACE_ANCHOR_ROTATION_INTERVAL_SECONDS
+              value: {{ .Values.splitTrust.rotationIntervalSeconds | quote }}
+            - name: SPACE_ANCHOR_ACTIVATION_DELAY_SECONDS
+              value: {{ .Values.splitTrust.activationDelaySeconds | quote }}
+            - name: SPACE_ANCHOR_BACKUP_BUCKET
+              value: {{ .Values.splitTrust.backupBucket | quote }}
+            - name: SPACE_ANCHOR_BACKUP_ENDPOINT
+              value: {{ .Values.splitTrust.backupEndpoint | quote }}
+            {{- end }}
             - name: SPACE_CLUSTER_ID
               value: {{ .Values.clusterId | quote }}
             {{- include "space-kind-telemetry.env" . | nindent 12 }}

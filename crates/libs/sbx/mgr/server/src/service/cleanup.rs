@@ -2226,6 +2226,33 @@ impl SandboxManagerService {
                 // a flush and a retried termination.
                 self.flush_guest_before_termination(sandbox_id, guest_flush)
                     .await;
+                if std::env::var("SPACE_SPLIT_TRUST_PROTOTYPE").as_deref() == Ok("true") {
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        let mut credentials = self
+                            .credential_manager_endpoint
+                            .connect()
+                            .await
+                            .map_err(|error| Status::unavailable(error.to_string()))?;
+                        credentials
+                            .forget_sandbox_anchor(
+                                pplx_space_credmgr_client::proto::ReleaseSandboxAnchorRequest {
+                                    sandbox_id: sandbox_id.to_owned(),
+                                    execution_generation: None,
+                                },
+                            )
+                            .await?;
+                        Ok::<(), Status>(())
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Status::deadline_exceeded("anchor eviction timed out"))
+                    });
+                    if let Err(error) = result {
+                        // Cleanup must still stop the VM if the agent is down.
+                        // Its memory-only cache is bounded by the TTL sweeper.
+                        tracing::warn!(sandbox_id, %error, "sandbox anchor cache eviction failed");
+                    }
+                }
                 service_cleanup_via_node_with_options(
                     &self.db,
                     &mut node_client,

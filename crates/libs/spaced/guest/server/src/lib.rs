@@ -172,6 +172,7 @@ mod memlock;
 mod meta;
 mod networking;
 mod port_forward;
+mod sandbox_trust;
 #[cfg(test)]
 mod transport;
 

@@ -997,7 +997,8 @@ pub(super) async fn configure_process_env_for_activation(
     phase: &'static str,
     cleanup_id: Option<SandboxCleanupEpisodeId>,
 ) -> Result<(), Status> {
-    if process_env.is_empty() {
+    let anchor_enabled = std::env::var("SPACE_SPLIT_TRUST_PROTOTYPE").as_deref() == Ok("true");
+    if process_env.is_empty() && !anchor_enabled {
         return Ok(());
     }
     let read = || {
@@ -1028,6 +1029,43 @@ pub(super) async fn configure_process_env_for_activation(
         Ok(sandbox)
     };
     let initial = read()?;
+    if anchor_enabled {
+        let endpoint = pplx_space_credmgr_client::CredmgrEndpoint::default();
+        let mut credentials = endpoint
+            .connect()
+            .await
+            .map_err(|_| Status::unavailable("node credential agent is unavailable"))?;
+        let response = credentials
+            .release_sandbox_anchor(
+                pplx_space_credmgr_client::proto::ReleaseSandboxAnchorRequest {
+                    sandbox_id: sandbox_id.to_owned(),
+                    execution_generation: initial
+                        .space_api_route_identity
+                        .execution_generation
+                        .map(|generation| generation.get()),
+                },
+            )
+            .await?
+            .into_inner();
+        if !response.private_key_der.is_empty() || response.certificate_der.is_empty() {
+            return Err(Status::failed_precondition(
+                "invalid public anchor response from node",
+            ));
+        }
+        let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default()
+            .with_socket_path(spaced_host_socket_path(sandbox_id));
+        let client = pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        client
+            .install_sandbox_trust(sandbox_id.to_owned(), response.certificate_der.clone())
+            .await?;
+        if !activation_env_matches(&initial, &read()?, process_env) {
+            return Err(Status::aborted(
+                "activation changed while installing sandbox trust",
+            ));
+        }
+    }
     // Activation owns the wake lock and rejects live metadata replacement while
     // Starting/Restoring/Resuming. Replaying this fixed map is safe even if a
     // guest applied it before losing the reply. Do not generalize this to the

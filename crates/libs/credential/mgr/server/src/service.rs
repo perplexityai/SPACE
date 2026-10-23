@@ -153,6 +153,8 @@ pub struct CredentialManagerService {
     kek_store: Option<Arc<dyn KekStore>>,
     /// Shared authority pool used for TCP caller node-registration checks.
     pub(crate) database_pool: Option<sqlx::PgPool>,
+    #[cfg(feature = "split-trust-prototype")]
+    pub(crate) sandbox_anchors: Option<crate::split_trust::Authority>,
     /// Sandbox-owner reads for volume encryption.
     /// Present only on instances with database access.
     credential_store: Option<Arc<dyn CredentialStore>>,
@@ -235,6 +237,8 @@ impl CredentialManagerService {
             key_wrapper,
             kek_store: None,
             database_pool: None,
+            #[cfg(feature = "split-trust-prototype")]
+            sandbox_anchors: None,
             credential_store: None,
             storage_vend_store: None,
             volume_wrap_store: None,
@@ -362,6 +366,54 @@ impl CredentialManagerService {
 
 #[tonic::async_trait]
 impl CredentialManager for CredentialManagerService {
+    async fn release_sandbox_anchor(
+        &self,
+        request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+    ) -> Result<Response<crate::proto::ReleaseSandboxAnchorResponse>, Status> {
+        #[cfg(feature = "split-trust-prototype")]
+        {
+            let crate::auth::ResolvedCaller::K8sJwt(identity) =
+                self.caller_resolver.resolve(&request)?
+            else {
+                return Err(Status::permission_denied(
+                    "sandbox anchors require a node-bound credential agent",
+                ));
+            };
+            if identity.service() != crate::auth::ClientService::NodeCredentialAgent {
+                return Err(Status::permission_denied(
+                    "sandbox anchors require a credential agent",
+                ));
+            }
+            let authority = self
+                .sandbox_anchors
+                .as_ref()
+                .ok_or_else(|| Status::failed_precondition("sandbox anchors are disabled"))?;
+            let pool = self.database_pool.as_ref().ok_or_else(|| {
+                Status::failed_precondition("sandbox placement store is unavailable")
+            })?;
+            return authority
+                .release(pool, identity.node(), request.get_ref())
+                .await
+                .map(Response::new);
+        }
+        #[cfg(not(feature = "split-trust-prototype"))]
+        {
+            let _ = request;
+            Err(Status::failed_precondition(
+                "sandbox anchors are not compiled in",
+            ))
+        }
+    }
+
+    async fn forget_sandbox_anchor(
+        &self,
+        _: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+    ) -> Result<Response<crate::proto::ForgetSandboxAnchorResponse>, Status> {
+        Err(Status::permission_denied(
+            "cache eviction is node-local only",
+        ))
+    }
+
     async fn resolve_network_credentials(
         &self,
         request: Request<ResolveNetworkCredentialsRequest>,
@@ -800,6 +852,11 @@ impl CredentialManager for CredentialManagerService {
         &self,
         request: Request<IssueIntermediateCertificateRequest>,
     ) -> Result<Response<IssueIntermediateCertificateResponse>, Status> {
+        if request.get_ref().issuer() != crate::proto::GatewayCaIssuer::Shared {
+            return Err(Status::invalid_argument(
+                "authority intermediate issuer must be shared",
+            ));
+        }
         self.authorize_caller(
             &request,
             "IssueIntermediateCertificate",
@@ -819,6 +876,7 @@ impl CredentialManager for CredentialManagerService {
         Ok(Response::new(IssueIntermediateCertificateResponse {
             certificate_der: issued.map_err(intermediate_error_to_status)?,
             issuer_certificate_der: Vec::new(),
+            issuer: crate::proto::GatewayCaIssuer::Shared as i32,
         }))
     }
 }

@@ -261,3 +261,27 @@ def exchange_token(
         except _grpc().RpcError as error:
             return None, error.code().name, error.details() or ""
     return decode_exchange_response(response), "OK", ""
+
+
+def sandbox_anchor(
+    argv: Sequence[str], *, sandbox_id: str, generation: int, timeout: float = 30
+) -> tuple[bytes, str]:
+    """Return only the public certificate and status; reject a private-key leak."""
+    request = _string_field(1, sandbox_id) + _varint(2 << 3) + _varint(generation)
+    with relayed_channel(argv) as channel:
+        call = channel.unary_unary(
+            "/space.credential.manager.v1.CredentialManager/ReleaseSandboxAnchor",
+            request_serializer=lambda message: message,
+            response_deserializer=lambda message: message,
+        )
+        try:
+            response = call(request, timeout=timeout)
+        except _grpc().RpcError as error:
+            return b"", error.code().name
+    certificate = b""
+    for number, value in _fields(response):
+        if number == 3 and value:
+            raise RuntimeError("node agent leaked private anchor material to its local caller")
+        if number == 2 and isinstance(value, bytes):
+            certificate = value
+    return certificate, "OK"

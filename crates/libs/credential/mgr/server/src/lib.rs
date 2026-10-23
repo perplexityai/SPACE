@@ -20,6 +20,8 @@ pub mod node_ca;
 pub mod node_service;
 mod run;
 pub mod service;
+#[cfg(feature = "split-trust-prototype")]
+mod split_trust;
 mod storage_exchange;
 pub mod storage_vend_store;
 pub mod tcp_auth;

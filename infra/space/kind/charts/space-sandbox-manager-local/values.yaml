@@ -167,3 +167,6 @@ resources:
   requests:
     cpu: 50m
     memory: 64Mi
+# Must match the authority rollout; there is no anchor-to-shared fallback.
+splitTrust:
+  enabled: false

@@ -124,6 +124,7 @@ async fn exercise_recovery(restore: bool) {
                 Ok(IssueIntermediateCertificateResponse {
                     certificate_der: csr.signed_by(&root).unwrap().der().to_vec(),
                     issuer_certificate_der: Vec::new(),
+                    issuer: pplx_space_credmgr_client::proto::GatewayCaIssuer::Shared as i32,
                 })
             }
         }

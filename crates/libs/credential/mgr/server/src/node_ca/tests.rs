@@ -123,6 +123,8 @@ fn ca_request(key: &KeyPair) -> IssueIntermediateCertificateRequest {
         .push(DnType::CommonName, CSR_COMMON_NAME);
     IssueIntermediateCertificateRequest {
         csr: params.serialize_request(key).unwrap().der().to_vec(),
+        issuer: crate::proto::GatewayCaIssuer::Shared as i32,
+        ..Default::default()
     }
 }
 
@@ -442,7 +444,11 @@ async fn gateway_issuance_validates_the_csr_before_acquiring_the_node_ca() {
     // and proof of key possession before the node contacts its authority.
     for csr in [vec![], bad_signature] {
         let error = node
-            .issue_intermediate(IssueIntermediateCertificateRequest { csr })
+            .issue_intermediate(IssueIntermediateCertificateRequest {
+                csr,
+                issuer: crate::proto::GatewayCaIssuer::Shared as i32,
+                ..Default::default()
+            })
             .await
             .unwrap_err();
         assert_eq!(error.to_status().code(), Code::InvalidArgument);
