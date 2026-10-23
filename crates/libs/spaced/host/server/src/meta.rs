@@ -6,11 +6,36 @@ use crate::protocol::*;
 impl Meta for SpacedHostService {
     async fn install_sandbox_trust(
         &self,
-        _request: Request<proto::InstallSandboxTrustRequest>,
+        request: Request<proto::InstallSandboxTrustRequest>,
     ) -> Result<Response<proto::InstallSandboxTrustResponse>, Status> {
-        Err(Status::unimplemented(
-            "sandbox trust installation is not enabled",
-        ))
+        #[cfg(feature = "split-trust-prototype")]
+        {
+            let request = request.into_inner();
+            self.call_bridge_guest_once(
+                "bridge_guest_install_sandbox_trust",
+                BridgeGuestOperationBudget::RuntimeMetadata,
+                |mut client| {
+                    let request = request.clone();
+                    async move {
+                        client.install_sandbox_trust(
+                            pplx_space_spaced_common::proto::bridge_guest::InstallSandboxTrustRequest {
+                                certificate_der: request.certificate_der,
+                                sandbox_id: request.sandbox_id,
+                            },
+                        ).await
+                    }
+                },
+            )
+            .await?;
+            Ok(Response::new(proto::InstallSandboxTrustResponse {}))
+        }
+        #[cfg(not(feature = "split-trust-prototype"))]
+        {
+            let _ = request;
+            Err(Status::unimplemented(
+                "sandbox trust installation is not compiled",
+            ))
+        }
     }
 
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {

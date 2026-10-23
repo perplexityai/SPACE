@@ -22,6 +22,8 @@ required-features = ["otel"]
 workspace = true
 
 [features]
+# Public trust installation is absent from ordinary guest builds.
+split-trust-prototype = ["dep:pem", "dep:x509-parser"]
 # The service entry point: process-mode dispatch, telemetry init, the Tokio
 # runtime, and the readiness loop that `spaced-svc`'s `main` calls. Off by
 # default because it is the only thing here that needs `common-svc`: consumers
@@ -42,6 +44,8 @@ datadog-otel = ["otel", "datadog"]
 test-support = []
 
 [dependencies]
+pem = { version = "4", optional = true }
+x509-parser = { workspace = true, features = ["verify-aws"], optional = true }
 futures-util = { version = "0.3" }
 hyper-util = { workspace = true, features = ["tokio"] }
 nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time"] }

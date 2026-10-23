@@ -4,6 +4,27 @@
 use super::*;
 
 impl SpacedHostClient {
+    pub async fn install_sandbox_trust(
+        &self,
+        sandbox_id: String,
+        certificate_der: Vec<u8>,
+    ) -> Result<(), tonic::Status> {
+        self.call_meta_once("install_sandbox_trust", |mut client| {
+            let sandbox_id = sandbox_id.clone();
+            let certificate_der = certificate_der.clone();
+            async move {
+                client
+                    .install_sandbox_trust(proto::InstallSandboxTrustRequest {
+                        sandbox_id,
+                        certificate_der,
+                    })
+                    .await
+            }
+        })
+        .await
+        .map(|_: proto::InstallSandboxTrustResponse| ())
+    }
+
     pub async fn ping(&self) -> Result<proto::PingResponse, tonic::Status> {
         self.call_meta("ping", |mut client| async move {
             client.ping(PingRequest {}).await

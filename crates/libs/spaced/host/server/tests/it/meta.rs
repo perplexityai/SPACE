@@ -45,6 +45,37 @@ struct ReadyWaitGuest {
 
 struct ActiveWaitReadyCall(Arc<AtomicUsize>);
 
+#[tokio::test]
+async fn sandbox_trust_install_is_gated_and_preserves_unsupported_guest_status() {
+    use crate::mock_bridge_guest::{MockBridgeGuest, start_mock_bridge_guest_with_service};
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("guest.sock");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let guest = start_mock_bridge_guest_with_service(
+        socket.clone(),
+        MockBridgeGuest {
+            trust_install_calls: calls.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let fixture = HostFixture::start(Some(socket)).await;
+    let result = fixture
+        .client()
+        .await
+        .install_sandbox_trust("unused-by-unsupported-guest".to_owned(), Vec::new())
+        .await;
+    let forwarded = calls.load(Ordering::SeqCst);
+    fixture.stop().await;
+    guest.abort();
+    let _ = guest.await;
+    assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+    assert_eq!(
+        forwarded,
+        usize::from(cfg!(feature = "split-trust-prototype"))
+    );
+}
+
 impl Drop for ActiveWaitReadyCall {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);

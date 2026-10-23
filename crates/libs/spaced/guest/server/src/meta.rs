@@ -1,5 +1,7 @@
 use super::*;
-use pplx_space_spaced_common::proto::bridge_guest;
+use pplx_space_spaced_common::proto::bridge_guest::{
+    InstallSandboxTrustRequest, InstallSandboxTrustResponse,
+};
 
 #[cfg(target_os = "linux")]
 fn flush_filesystem_at_path_with_syncfs(
@@ -211,11 +213,20 @@ fn require_activity_state(state: LocalActivityState) -> Result<LocalActivityStat
 impl BridgeGuestMeta for SpacedGuestService {
     async fn install_sandbox_trust(
         &self,
-        _request: Request<bridge_guest::InstallSandboxTrustRequest>,
-    ) -> Result<Response<bridge_guest::InstallSandboxTrustResponse>, Status> {
-        Err(Status::unimplemented(
-            "sandbox trust installation is not enabled",
-        ))
+        request: Request<InstallSandboxTrustRequest>,
+    ) -> Result<Response<InstallSandboxTrustResponse>, Status> {
+        #[cfg(feature = "split-trust-prototype")]
+        {
+            crate::sandbox_trust::install(request.into_inner()).await?;
+            Ok(Response::new(InstallSandboxTrustResponse {}))
+        }
+        #[cfg(not(feature = "split-trust-prototype"))]
+        {
+            let _ = request;
+            Err(Status::unimplemented(
+                "sandbox trust installation is not compiled",
+            ))
+        }
     }
 
     async fn ping(

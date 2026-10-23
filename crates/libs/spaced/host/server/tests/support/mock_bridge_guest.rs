@@ -43,6 +43,7 @@ pub(crate) struct MockBridgeGuest {
     pub(crate) list_body_error: bool,
     pub(crate) read_continue: Option<Arc<tokio::sync::Notify>>,
     pub(crate) flush_calls: Arc<AtomicUsize>,
+    pub(crate) trust_install_calls: Arc<AtomicUsize>,
     pub(crate) env_reply_failure: Option<(Arc<AtomicUsize>, tonic::Code)>,
     pub(crate) lost_reply_calls: Option<Arc<AtomicUsize>>,
 }
@@ -59,6 +60,7 @@ impl Default for MockBridgeGuest {
             list_body_error: false,
             read_continue: None,
             flush_calls: Arc::default(),
+            trust_install_calls: Arc::default(),
             lost_reply_calls: None,
             env_reply_failure: None,
         }
@@ -537,6 +539,7 @@ impl Meta for MockBridgeGuest {
         &self,
         _request: Request<InstallSandboxTrustRequest>,
     ) -> Result<Response<InstallSandboxTrustResponse>, Status> {
+        self.trust_install_calls.fetch_add(1, Ordering::SeqCst);
         Err(Status::unimplemented(
             "this fixture does not install sandbox trust",
         ))

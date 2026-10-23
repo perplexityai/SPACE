@@ -172,6 +172,8 @@ mod memlock;
 mod meta;
 mod networking;
 mod port_forward;
+#[cfg(feature = "split-trust-prototype")]
+mod sandbox_trust;
 #[cfg(test)]
 mod transport;
 

@@ -12,6 +12,7 @@ workspace = true
 
 [features]
 default = []
+split-trust-prototype = []
 test-support = []
 # Telemetry pipelines forward to `common-svc`, which is where this
 # crate's service telemetry is initialized.

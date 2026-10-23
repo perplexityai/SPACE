@@ -2,6 +2,39 @@ use super::*;
 #[cfg(target_os = "linux")]
 use std::io;
 
+#[tokio::test]
+async fn sandbox_trust_install_is_opt_in_and_validates_before_filesystem_changes() {
+    let shutdown = CancellationToken::new();
+    let service = SpacedGuestService::with_config(
+        shutdown.clone(),
+        SpacedGuestServiceConfig {
+            filesystem_execution: FilesystemExecutionMode::Direct,
+            local_socket_path: None,
+            bridge_socket_path: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let error = BridgeGuestMeta::install_sandbox_trust(
+        &service,
+        Request::new(InstallSandboxTrustRequest {
+            sandbox_id: uuid::Uuid::now_v7().to_string(),
+            certificate_der: Vec::new(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    shutdown.cancel();
+    assert_eq!(
+        error.code(),
+        if cfg!(feature = "split-trust-prototype") {
+            tonic::Code::InvalidArgument
+        } else {
+            tonic::Code::Unimplemented
+        }
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn flush_filesystem_helper_reports_syncfs_success() {
