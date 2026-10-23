@@ -33,7 +33,8 @@ pub(crate) const MAX_DNS_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_INPUT_RECORDS: usize = 64;
 const MAX_RESPONSE_RECORDS: usize = 64;
 const MAX_CNAME_HOPS: usize = 8;
-const MAX_CONCURRENT_LOOKUPS: usize = crate::resource_budget::MAX_ACTIVE_RESERVED_DNS_DATAGRAMS;
+const MAX_CONCURRENT_LOOKUPS: usize =
+    crate::resource_budget::MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER;
 const MAX_POSITIVE_TTL: u32 = 300;
 const MAX_NEGATIVE_TTL: Duration = Duration::from_secs(5);
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -73,22 +74,19 @@ impl ReservedResolver {
     }
 }
 
-/// Independent admission slots for each reserved resolver. A stalled upstream
-/// (for example, one that serializes pipelined queries) can only exhaust its
-/// own slots, so guests can still fall back to the other resolver.
+/// One admission semaphore per reserved resolver, so a stalled upstream can
+/// only exhaust its own slots and guests can still fall back to the other.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolverSlots {
-    capacity_per_resolver: usize,
     cloudflare: Arc<Semaphore>,
     google: Arc<Semaphore>,
 }
 
 impl ResolverSlots {
-    pub(crate) fn new(capacity_per_resolver: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            capacity_per_resolver,
-            cloudflare: Arc::new(Semaphore::new(capacity_per_resolver)),
-            google: Arc::new(Semaphore::new(capacity_per_resolver)),
+            cloudflare: Arc::new(Semaphore::new(capacity)),
+            google: Arc::new(Semaphore::new(capacity)),
         }
     }
 
@@ -97,10 +95,6 @@ impl ResolverSlots {
             ReservedResolver::Cloudflare => &self.cloudflare,
             ReservedResolver::Google => &self.google,
         }
-    }
-
-    pub(crate) fn in_flight(&self, resolver: ReservedResolver) -> usize {
-        self.capacity_per_resolver - self.get(resolver).available_permits()
     }
 }
 

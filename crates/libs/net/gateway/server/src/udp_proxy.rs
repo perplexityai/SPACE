@@ -753,10 +753,11 @@ impl UdpProxy {
         policy_cancellation: CancellationToken,
         response_socket_factory: impl FnOnce(SocketAddr) -> std::io::Result<UdpSocket>,
     ) {
-        let permit = Arc::clone(self.reserved_dns_task_slots.get(resolver)).try_acquire_owned();
+        let slots = self.reserved_dns_task_slots.get(resolver);
+        let permit = Arc::clone(slots).try_acquire_owned();
         pplx_space_metrics::gateway::reserved_dns_udp_in_flight(
             resolver.as_str(),
-            self.reserved_dns_task_slots.in_flight(resolver),
+            MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER - slots.available_permits(),
         );
         let permit = match permit {
             Ok(permit) => permit,

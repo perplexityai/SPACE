@@ -19,13 +19,11 @@ pub const MAX_ACTIVE_UDP_SESSIONS: usize = 128;
 /// operation owns one transparent response socket. Bound those tasks and file
 /// descriptors independently so a guest flood cannot grow either without
 /// limit. Together with the TCP cap, this retains the required 64-descriptor
-/// process headroom below.
-pub const MAX_ACTIVE_RESERVED_DNS_DATAGRAMS: usize = 256;
-/// The reserved-DNS budget is split evenly between the two reserved resolvers
-/// so one stalled upstream cannot starve the guest's fallback resolver.
-pub const RESERVED_DNS_RESOLVERS: usize = 2;
-pub const MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER: usize =
-    MAX_ACTIVE_RESERVED_DNS_DATAGRAMS / RESERVED_DNS_RESOLVERS;
+/// process headroom below. Each of the two reserved resolvers gets its own
+/// slots so one stalled upstream cannot starve the guest's fallback.
+pub const MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER: usize = 128;
+pub const MAX_ACTIVE_RESERVED_DNS_DATAGRAMS: usize =
+    2 * MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER;
 pub use pplx_space_net_gateway_client::MAX_ACTIVE_SERVICE_PORT_INGRESS_STREAMS;
 pub const MAX_CONTROL_CONNECTIONS: usize = 96;
 /// Accepted control transports left for policy, stats, health, and lifecycle
@@ -43,10 +41,6 @@ const MAX_DATA_PLANE_DESCRIPTORS: usize = MAX_ACTIVE_TCP_CONNECTIONS * 2
 pub const RESERVED_DESCRIPTORS: usize = PROCESS_NOFILE_LIMIT - MAX_DATA_PLANE_DESCRIPTORS;
 
 const _: () = assert!(MAX_DATA_PLANE_DESCRIPTORS < PROCESS_NOFILE_LIMIT);
-const _: () = assert!(
-    MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER * RESERVED_DNS_RESOLVERS
-        == MAX_ACTIVE_RESERVED_DNS_DATAGRAMS
-);
 const _: () = assert!(RESERVED_DESCRIPTORS >= 64);
 const _: () = assert!(
     MAX_CONTROL_CONNECTIONS
