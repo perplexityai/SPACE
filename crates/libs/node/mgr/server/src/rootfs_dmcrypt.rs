@@ -165,6 +165,19 @@ fn composite_name(sandbox_id: &SandboxId) -> String {
     format!("sbxroot-{sandbox_id}")
 }
 
+/// Write the composite device's page cache down through dm-snapshot and
+/// dm-crypt into the COW backing file, so a copy of that file holds every
+/// guest write. Firecracker opens the composite buffered; while it keeps the
+/// device open nothing else forces this flush, which its last close otherwise
+/// performs. A sandbox without the composite has no buffered rootfs writes.
+pub(crate) async fn flush_composite(sandbox_id: &SandboxId) -> Result<(), DmCryptError> {
+    let device = format!("/dev/mapper/{}", composite_name(sandbox_id));
+    if !Path::new(&device).exists() {
+        return Ok(());
+    }
+    run("blockdev", &["--flushbufs", &device]).await.map(drop)
+}
+
 /// dm name of the dm-crypt COW device backing the snapshot's writes.
 fn cow_mapper_name(sandbox_id: &SandboxId) -> String {
     format!("sbxroot-{sandbox_id}-cow")

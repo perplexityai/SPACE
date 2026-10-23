@@ -982,6 +982,7 @@ pub async fn do_checkpoint(
                 dest_dir: Some(snapshot_dir.clone()),
                 snapshot_volume_mount_dir: None,
                 environment: None,
+                retain_runtime: false,
             },
             execution.as_ref(),
         ))

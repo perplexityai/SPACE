@@ -216,3 +216,63 @@ fn stage_dst_name_must_be_a_bare_file_name() {
         );
     }
 }
+
+/// A retained capture's staging names only identifiers: node-manager derives
+/// the capture's staging dir and each role's canonical source and staged name.
+#[test]
+fn retained_capture_artifacts_derive_canonical_paths_from_identifiers() {
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let capture = pplx_space_common_core::types::LocalArtifactId::new();
+    let (stage_dir, artifacts) = retained_capture_artifacts(
+        &sandbox_id,
+        "snapshot",
+        &capture.to_string(),
+        &[
+            EncryptedStagedArtifactRole::VolumeBacking as i32,
+            EncryptedStagedArtifactRole::RootfsCow as i32,
+        ],
+    )
+    .unwrap();
+    let cache = PathBuf::from(paths::sandbox_cache_dir(&sandbox_id.to_string()));
+    assert_eq!(
+        stage_dir,
+        cache.join(format!("snapshots/.suspend-publish-{capture}"))
+    );
+    assert_eq!(
+        artifacts,
+        [
+            (
+                cache.join("instance/snapshot.luks"),
+                "snapshot.luks".to_string()
+            ),
+            (cache.join("instance/cow.luks"), "cow.luks".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn retained_capture_artifacts_reject_malformed_identifiers_and_roles() {
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let capture = pplx_space_common_core::types::LocalArtifactId::new().to_string();
+    let backing = EncryptedStagedArtifactRole::VolumeBacking as i32;
+    for (artifact_id, roles) in [
+        ("", vec![backing]),
+        ("../escape", vec![backing]),
+        ("not-a-uuid", vec![backing]),
+        (capture.as_str(), vec![]),
+        (
+            capture.as_str(),
+            vec![EncryptedStagedArtifactRole::Unspecified as i32],
+        ),
+        (capture.as_str(), vec![99]),
+        (capture.as_str(), vec![backing, backing]),
+    ] {
+        let error = retained_capture_artifacts(&sandbox_id, "snapshot", artifact_id, &roles)
+            .expect_err("malformed staging request must be refused");
+        assert_eq!(
+            error.code(),
+            tonic::Code::InvalidArgument,
+            "{artifact_id:?} {roles:?}"
+        );
+    }
+}

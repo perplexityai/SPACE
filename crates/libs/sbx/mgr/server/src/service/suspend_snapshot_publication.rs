@@ -14,7 +14,9 @@ use crate::state::SandboxState;
 
 pub(super) const LOCAL_SNAPSHOT_DIR: &str = "snapshot";
 const SUSPEND_STAGING_PARENT_DIR: &str = "snapshots";
-pub(super) const SUSPEND_STAGING_PREFIX: &str = ".suspend-publish-";
+// node-manager derives the same staging directory from the local artifact id.
+pub(super) const SUSPEND_STAGING_PREFIX: &str =
+    pplx_space_common_core::host::linux::paths::SUSPEND_STAGING_PREFIX;
 
 pub(super) fn canonical_suspend_snapshot_dir(sandbox_dir: &Path) -> PathBuf {
     sandbox_dir.join(LOCAL_SNAPSHOT_DIR)
@@ -83,6 +85,17 @@ pub(super) fn commit_encrypted_capture_record(staging_dir: &Path) -> std::io::Re
         staging_dir.join(ENCRYPTED_CAPTURE_RECORD),
     )?;
     std::fs::File::open(staging_dir)?.sync_all()
+}
+
+/// Drop the record of a capture whose runtime is still live. Such a capture
+/// never needs recovery to seal it, so its record is discarded instead of
+/// committed.
+pub(super) fn discard_encrypted_capture_intent(staging_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(staging_dir.join(ENCRYPTED_CAPTURE_INTENT)) {
+        Ok(()) => std::fs::File::open(staging_dir)?.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn read_encrypted_capture_record(

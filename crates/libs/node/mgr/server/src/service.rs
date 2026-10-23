@@ -52,10 +52,10 @@ use crate::proto::{
     ReservePreparedRootfsResponse, ResumeSandboxRequest, ResumeSandboxResponse,
     RollbackBtrfsSnapshotRequest, RollbackBtrfsSnapshotResponse, SandboxEndpointProof,
     SetNetworkPoolConfigRequest, SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest,
-    SetNetworkPoolDrainResponse, StopProcessRequest, StopProcessResponse, SyncGuestRequest,
-    SyncGuestResponse, UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest,
-    UpdateCgroupResponse, ValidateSandboxEndpointProofRequest,
-    ValidateSandboxEndpointProofResponse,
+    SetNetworkPoolDrainResponse, StageEncryptedVolumeRequest, StageEncryptedVolumeResponse,
+    StopProcessRequest, StopProcessResponse, SyncGuestRequest, SyncGuestResponse,
+    UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest, UpdateCgroupResponse,
+    ValidateSandboxEndpointProofRequest, ValidateSandboxEndpointProofResponse,
 };
 use crate::slot_pool::{
     ActiveLeaseMemoryReservationError, AllocateSlotError, NETWORK_POOL_SCHEMA_VERSION, NetworkPool,

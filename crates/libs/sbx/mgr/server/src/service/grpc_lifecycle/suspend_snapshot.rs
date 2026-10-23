@@ -33,6 +33,8 @@ pub(in crate::service) enum EncryptedCaptureSealError {
     Record(#[from] crate::service::suspend_snapshot_publication::SuspendSnapshotPublicationError),
     #[error("{0}")]
     Release(String),
+    #[error("{0}")]
+    Stage(String),
     #[error("local artifact metadata creation failed: {0}")]
     Metadata(#[from] crate::snapshot_upload::SnapshotMetadataWriteError),
     #[error("remove encrypted capture record failed: {0}")]
@@ -247,6 +249,38 @@ impl SandboxManagerService {
             None,
         )?;
         remove_encrypted_capture_record(staging_dir)
+            .map_err(EncryptedCaptureSealError::RemoveRecord)
+    }
+
+    /// Stage a capture whose runtime node-manager kept: node-manager stages
+    /// both ciphertext artifacts of the still-open volume into the capture's
+    /// staging dir, `staging_dir`, then
+    /// the sidecar is written from `metadata`. The live runtime still holds the
+    /// sandbox's state, so a failure rolls back to paused and the next suspend
+    /// captures again; the capture record written before the capture is
+    /// therefore discarded rather than committed.
+    pub(in crate::service) async fn stage_retained_encrypted_capture(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        local_artifact_id: LocalArtifactId,
+        staging_dir: &std::path::Path,
+        metadata: &crate::snapshot_upload::SnapshotMeta,
+    ) -> Result<(), EncryptedCaptureSealError> {
+        crate::snapshot_encryption::stage_encrypted_snapshot_volume(
+            &sandbox.id,
+            sandbox.node_execution_fence(),
+            local_artifact_id,
+            &self.node_manager,
+        )
+        .await
+        .map_err(EncryptedCaptureSealError::Stage)?;
+        crate::snapshot_upload::write_snapshot_metadata(
+            metadata,
+            staging_dir,
+            &crate::snapshot_upload::encrypted_vm_artifacts(),
+            None,
+        )?;
+        discard_encrypted_capture_intent(staging_dir)
             .map_err(EncryptedCaptureSealError::RemoveRecord)
     }
 
@@ -669,14 +703,15 @@ impl SandboxManagerService {
             let encrypted = enc_snapshot.is_some();
             let enc_snapshot_mount_dir = enc_snapshot.as_ref().map(|e| e.mount_dir.clone());
 
-            // The encrypted capture stops the runtime inside create_snapshot to
-            // release Firecracker's mmap pin on the volume before it is sealed.
-            // Stop watching first so the watchdog does not race that teardown with
-            // sidecar-restart attempts. Idempotent: the removes near the end of
-            // suspend are a no-op once already removed. Plaintext keeps its
-            // existing ordering (removed only there). `monitoring_guard` re-arms
-            // the watchdog on any live rollback (or dropped future) after this
-            // point, so the unsubscribe here can never strand a live sandbox.
+            // A node-manager that predates `retain_runtime` stops the runtime
+            // inside create_snapshot to release Firecracker's mmap pin on the
+            // volume before it is sealed. Stop watching first so the watchdog
+            // does not race that teardown with sidecar-restart attempts.
+            // Idempotent: the removes near the end of suspend are a no-op once
+            // already removed. Plaintext keeps its existing ordering (removed
+            // only there). `monitoring_guard` re-arms the watchdog on any live
+            // rollback (or dropped future) after this point, so the unsubscribe
+            // here can never strand a live sandbox.
             if encrypted {
                 self.watchdog.remove_sandbox(&sandbox.id).await;
                 self.snapshot_scheduler.remove_sandbox(&sandbox.id).await;
@@ -684,7 +719,11 @@ impl SandboxManagerService {
 
             let fc_create_started_at = std::time::Instant::now();
             self.ensure_teardown_suspend_owner_for_durability(&sandbox.id, durability)?;
-            if let Err(e) = node_client
+            // An encrypted capture asks node-manager to keep the runtime: the
+            // open volume is staged below and cleanup stops the runtime once the
+            // capture is published, so a capture that outlives this RPC leaves a
+            // live sandbox the failure handler rolls back to paused.
+            let created = node_client
                 .create_snapshot(crate::service::snapshot_capture::bind(CreateSnapshotRequest {
                     execution_fence: sandbox.node_execution_fence(),
                     sandbox_id: sandbox.id.clone(),
@@ -693,56 +732,60 @@ impl SandboxManagerService {
                     dest_dir: Some(staging_dir_string.clone()),
                     snapshot_volume_mount_dir: enc_snapshot_mount_dir,
                     environment: None,
+                    retain_runtime: encrypted,
                 }, sandbox.execution_metadata.as_ref()))
-                .await
-            {
-                let reason = format!("snapshot failed: {e}");
-                // An RPC failure is not proof that Firecracker stopped. While
-                // it is still live, its mmap is the Diff snapshot's memory base:
-                // unmounting or force-freeing that volume would leave the retry
-                // unable to reuse the base safely. A stopped runtime cannot be
-                // rolled back to paused, so only that path may release before
-                // the failure is quarantined.
-                let runtime_live = (self.sandbox_runtime_live)(&sandbox.id);
-                if enc_snapshot.is_some()
-                    && failed_encrypted_capture_may_release_volume(runtime_live)
-                    && let Err(release_error) =
-                        crate::snapshot_encryption::release_encrypted_snapshot_volume(
-                            &sandbox.id,
-                            sandbox.node_execution_fence(),
-                            "",
-                            &self.node_manager,
-                        )
-                        .await
-                {
-                    tracing::warn!(
-                        sandbox_id = %sandbox.id,
-                        %release_error,
-                        "failed to release encrypted snapshot volume after stopped capture failure"
+                .await;
+            let runtime_retained = match created {
+                Ok(response) => response.into_inner().runtime_retained,
+                Err(e) => {
+                    let reason = format!("snapshot failed: {e}");
+                    // An RPC failure is not proof that Firecracker stopped. While
+                    // it is still live, its mmap is the Diff snapshot's memory base:
+                    // unmounting or force-freeing that volume would leave the retry
+                    // unable to reuse the base safely. A stopped runtime cannot be
+                    // rolled back to paused, so only that path may release before
+                    // the failure is quarantined.
+                    let runtime_live = (self.sandbox_runtime_live)(&sandbox.id);
+                    if enc_snapshot.is_some()
+                        && failed_encrypted_capture_may_release_volume(runtime_live)
+                        && let Err(release_error) =
+                            crate::snapshot_encryption::release_encrypted_snapshot_volume(
+                                &sandbox.id,
+                                sandbox.node_execution_fence(),
+                                "",
+                                &self.node_manager,
+                            )
+                            .await
+                    {
+                        tracing::warn!(
+                            sandbox_id = %sandbox.id,
+                            %release_error,
+                            "failed to release encrypted snapshot volume after stopped capture failure"
+                        );
+                    }
+                    self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
+                        &sandbox.id,
+                        &reason,
+                        runtime_live,
                     );
+                    pplx_space_metrics::snapshot::create_failed(
+                        create_kind,
+                        create_codec,
+                        sandbox.volume_encryption,
+                        "fc_create",
+                        "fc_create_failed",
+                        create_started_at,
+                    );
+                    emit_suspend_failed_event(
+                        &sandbox.id,
+                        &suspend_event_details,
+                        "fc_create",
+                        "fc_create_failed",
+                        reason.clone(),
+                    );
+                    return Err(Status::internal(reason));
                 }
-                self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
-                    &sandbox.id,
-                    &reason,
-                    runtime_live,
-                );
-                pplx_space_metrics::snapshot::create_failed(
-                    create_kind,
-                    create_codec,
-                    sandbox.volume_encryption,
-                    "fc_create",
-                    "fc_create_failed",
-                    create_started_at,
-                );
-                emit_suspend_failed_event(
-                    &sandbox.id,
-                    &suspend_event_details,
-                    "fc_create",
-                    "fc_create_failed",
-                    reason.clone(),
-                );
-                return Err(Status::internal(reason));
-            }
+            };
             pplx_space_metrics::snapshot::create_step(
                 create_kind,
                 create_codec,
@@ -752,30 +795,39 @@ impl SandboxManagerService {
             );
 
             // BYOK: Firecracker wrote vmstate+memory into the encrypted snapshot
-            // volume. Seal it (unmount+close) and stage the two encrypted artifacts
-            // — `snapshot.luks` (vmstate+memory) and the rootfs delta `cow.luks` —
-            // into the publication dir. Both are already-encrypted LUKS2 containers,
+            // volume. Stage the two encrypted artifacts — `snapshot.luks`
+            // (vmstate+memory) and the rootfs delta `cow.luks` — into the
+            // publication dir. Both are already-encrypted LUKS2 containers,
             // carried to durable storage as opaque blobs; reflink keeps the copy
             // instant and sparse. The plaintext rootfs codec branch below is skipped
             // for encrypted snapshots (there is no plaintext `rootfs.ext4` to diff).
             if let Some(metadata) = &encrypted_capture_metadata {
-                // The runtime is gone, so this capture now exists only in the
-                // volume. Commit its record before sealing, so a failed seal
-                // leaves a capture recovery can still seal and publish. The
-                // commit is a rename of the record written before the capture;
-                // if even that fails, the staging filesystem is failing, and
-                // sealing now is the capture's only chance.
-                if let Err(error) = commit_encrypted_capture_record(&staging_dir) {
-                    tracing::error!(
-                        sandbox_id = %sandbox.id,
-                        %error,
-                        "cannot commit encrypted capture record; a failed seal will not be recoverable"
-                    );
-                }
-                if let Err(error) = self
-                    .seal_encrypted_capture(&sandbox, &staging_dir, metadata)
+                let staged = if runtime_retained {
+                    self.stage_retained_encrypted_capture(
+                        &sandbox,
+                        local_artifact_id,
+                        &staging_dir,
+                        metadata,
+                    )
                     .await
-                {
+                } else {
+                    // The runtime is gone, so this capture now exists only in
+                    // the volume. Commit its record before sealing, so a failed
+                    // seal leaves a capture recovery can still seal and publish.
+                    // The commit is a rename of the record written before the
+                    // capture; if even that fails, the staging filesystem is
+                    // failing, and sealing now is the capture's only chance.
+                    if let Err(error) = commit_encrypted_capture_record(&staging_dir) {
+                        tracing::error!(
+                            sandbox_id = %sandbox.id,
+                            %error,
+                            "cannot commit encrypted capture record; a failed seal will not be recoverable"
+                        );
+                    }
+                    self.seal_encrypted_capture(&sandbox, &staging_dir, metadata)
+                        .await
+                };
+                if let Err(error) = staged {
                     let reason = format!("seal/stage encrypted snapshot volume failed: {error}");
                     if self.record_suspend_snapshot_publication_failure_after_staging(
                         &sandbox.id,

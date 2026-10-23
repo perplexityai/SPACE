@@ -328,6 +328,22 @@ pub mod paths {
         format!("{}/snapshots", sandbox_cache_dir(sandbox_id))
     }
 
+    /// Name prefix of a suspend's publication staging directory under the
+    /// sandbox's snapshots directory; the suffix is the capture's local
+    /// artifact id.
+    pub const SUSPEND_STAGING_PREFIX: &str = ".suspend-publish-";
+
+    /// Returns the publication staging directory of one suspend capture.
+    pub fn sandbox_suspend_staging_dir(
+        sandbox_id: &str,
+        local_artifact_id: crate::types::LocalArtifactId,
+    ) -> String {
+        format!(
+            "{}/{SUSPEND_STAGING_PREFIX}{local_artifact_id}",
+            sandbox_snapshots_dir(sandbox_id)
+        )
+    }
+
     /// Returns the directory path for one sandbox snapshot.
     pub fn sandbox_snapshot_dir(sandbox_id: &str, snapshot_name: &str) -> String {
         format!("{}/{snapshot_name}", sandbox_snapshots_dir(sandbox_id))
