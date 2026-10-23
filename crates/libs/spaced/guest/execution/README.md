@@ -106,7 +106,7 @@ execution metadata.
 - `configure_process_env(EnvMap)` replaces defaults for future process starts;
   request entries override them and `clean_env` skips them. Running processes
   retain their environment. `EnvMap` already enforces the shared key/value,
-  entry-count and total-byte [limits](../../../common/core/src/types/env/contract.rs).
+  entry-count and total-byte [limits](../../../guest-process/src/env/contract.rs).
   Native callers can use `EnvMap::try_from` to reject invalid maps. The daemon
   retains its wire adapter's sanitization of invalid entries before configuration.
   Native `StartRequest.env` still uses `parse_env`: invalid entries are dropped
