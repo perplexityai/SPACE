@@ -583,12 +583,7 @@ impl BlockingResolver {
 }
 
 impl ResolverBackend for BlockingResolver {
-    fn lookup<'a>(
-        &'a self,
-        _resolver: ReservedResolver,
-        question: Query,
-        _shutdown: &'a CancellationToken,
-    ) -> ResolverFuture<'a> {
+    fn lookup<'a>(&'a self, _resolver: ReservedResolver, question: Query) -> ResolverFuture<'a> {
         Box::pin(async move {
             self.started.notify_one();
             self.released.notified().await;
@@ -614,4 +609,310 @@ fn exhausted_resolver_slots_do_not_block_the_other_resolver() {
         .get(ReservedResolver::Cloudflare)
         .try_acquire()
         .unwrap();
+}
+
+/// Blocks every lookup until `release_all`, counting upstream lookups and
+/// tracking how many are still alive (not yet completed or dropped).
+struct GatedResolver {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    alive: Arc<std::sync::atomic::AtomicUsize>,
+    started: Arc<Notify>,
+    gate: Arc<Semaphore>,
+}
+
+impl GatedResolver {
+    fn new() -> Self {
+        Self {
+            calls: Arc::default(),
+            alive: Arc::default(),
+            started: Arc::new(Notify::new()),
+            gate: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn alive(&self) -> usize {
+        self.alive.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_started(&self) {
+        self.started.notified().await;
+    }
+
+    fn release_all(&self) {
+        self.gate.close();
+    }
+}
+
+struct AliveGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl ResolverBackend for GatedResolver {
+    fn lookup<'a>(&'a self, _resolver: ReservedResolver, question: Query) -> ResolverFuture<'a> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.alive.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _alive = AliveGuard(self.alive.clone());
+            self.started.notify_one();
+            // Closed => released; acquire fails immediately for every waiter.
+            let _ = self.gate.acquire().await;
+            Ok(ResolverAnswer {
+                question: question.clone(),
+                code: ResponseCode::NoError,
+                answers: vec![Record::from_rdata(
+                    question.name.clone(),
+                    60,
+                    RData::A(A::new(192, 0, 2, 1)),
+                )],
+                valid_until: Instant::now() + Duration::from_secs(60),
+            })
+        })
+    }
+}
+
+fn spawn_resolve(
+    core: &ReservedDnsCore,
+    resolver: ReservedResolver,
+    name: &str,
+    policy: NetworkPolicyV1,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<ResolveOutcome> {
+    let core = core.clone();
+    let wire = query(name, RecordType::A);
+    tokio::spawn(async move {
+        core.resolve("test", resolver, &wire, &policy, &cancellation)
+            .await
+    })
+}
+
+fn expect_reply(outcome: ResolveOutcome) -> Vec<u8> {
+    match outcome {
+        ResolveOutcome::Reply(reply) => reply,
+        ResolveOutcome::Cancelled => panic!("resolution unexpectedly cancelled"),
+    }
+}
+
+/// Let spawned resolves reach (and register with) the shared lookup.
+async fn settle() {
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn concurrent_identical_queries_share_one_upstream_lookup_and_slot() {
+    let backend = Arc::new(GatedResolver::new());
+    // One lookup slot: uncoalesced, every query after the first would fail
+    // with lookup capacity.
+    let core = core_with_backend(backend.clone(), 1);
+    let policy = NetworkPolicyV1::allow_all();
+
+    // Mixed spellings of one name: the coalescing key is the canonical
+    // (lowercased) question, so these must all share one lookup.
+    let spellings = ["example.com", "Example.COM", "EXAMPLE.com", "eXaMpLe.CoM"];
+    let tasks: Vec<_> = (0..8)
+        .map(|i| {
+            spawn_resolve(
+                &core,
+                ReservedResolver::Google,
+                spellings[i % spellings.len()],
+                policy.clone(),
+                CancellationToken::new(),
+            )
+        })
+        .collect();
+    backend.wait_started().await;
+    settle().await;
+    assert_eq!(backend.calls(), 1);
+
+    backend.release_all();
+    for task in tasks {
+        let reply = expect_reply(task.await.unwrap());
+        let message = Message::from_vec(&reply).unwrap();
+        assert_eq!(message.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(message.answers.len(), 1);
+    }
+    assert_eq!(backend.calls(), 1);
+    assert_eq!(core.inflight.len(), 0);
+    assert_eq!(
+        core.lookup_slots
+            .get(ReservedResolver::Google)
+            .available_permits(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn coalescing_is_keyed_by_resolver_and_question() {
+    let backend = Arc::new(GatedResolver::new());
+    let core = core_with_backend(backend.clone(), 8);
+    let policy = NetworkPolicyV1::allow_all();
+
+    let tasks = [
+        spawn_resolve(
+            &core,
+            ReservedResolver::Google,
+            "a.example",
+            policy.clone(),
+            CancellationToken::new(),
+        ),
+        spawn_resolve(
+            &core,
+            ReservedResolver::Cloudflare,
+            "a.example",
+            policy.clone(),
+            CancellationToken::new(),
+        ),
+        spawn_resolve(
+            &core,
+            ReservedResolver::Google,
+            "b.example",
+            policy.clone(),
+            CancellationToken::new(),
+        ),
+        spawn_resolve(
+            &core,
+            ReservedResolver::Google,
+            "a.example",
+            policy.clone(),
+            CancellationToken::new(),
+        ),
+    ];
+    settle().await;
+    assert_eq!(backend.calls(), 3);
+
+    backend.release_all();
+    for task in tasks {
+        expect_reply(task.await.unwrap());
+    }
+    assert_eq!(core.inflight.len(), 0);
+}
+
+#[tokio::test]
+async fn cancelling_one_waiter_does_not_cancel_the_shared_lookup() {
+    let backend = Arc::new(GatedResolver::new());
+    let core = core_with_backend(backend.clone(), 4);
+    let policy = NetworkPolicyV1::allow_all();
+
+    let cancelled = CancellationToken::new();
+    let first = spawn_resolve(
+        &core,
+        ReservedResolver::Google,
+        "example.com",
+        policy.clone(),
+        cancelled.clone(),
+    );
+    backend.wait_started().await;
+    let second = spawn_resolve(
+        &core,
+        ReservedResolver::Google,
+        "example.com",
+        policy,
+        CancellationToken::new(),
+    );
+    settle().await;
+
+    cancelled.cancel();
+    assert!(matches!(first.await.unwrap(), ResolveOutcome::Cancelled));
+    assert_eq!(backend.alive(), 1);
+
+    backend.release_all();
+    let reply = expect_reply(second.await.unwrap());
+    assert_eq!(response_code(&reply), ResponseCode::NoError);
+    assert_eq!(backend.calls(), 1);
+}
+
+#[tokio::test]
+async fn abandoned_lookup_is_dropped_and_releases_its_slot() {
+    let backend = Arc::new(GatedResolver::new());
+    let core = core_with_backend(backend.clone(), 1);
+    let policy = NetworkPolicyV1::allow_all();
+
+    let cancellation = CancellationToken::new();
+    let waiters: Vec<_> = (0..3)
+        .map(|_| {
+            spawn_resolve(
+                &core,
+                ReservedResolver::Google,
+                "example.com",
+                policy.clone(),
+                cancellation.clone(),
+            )
+        })
+        .collect();
+    backend.wait_started().await;
+    settle().await;
+    cancellation.cancel();
+    for waiter in waiters {
+        assert!(matches!(waiter.await.unwrap(), ResolveOutcome::Cancelled));
+    }
+    assert_eq!(backend.alive(), 0);
+    assert_eq!(core.inflight.len(), 0);
+    assert_eq!(
+        core.lookup_slots
+            .get(ReservedResolver::Google)
+            .available_permits(),
+        1
+    );
+
+    // A later query starts a fresh lookup instead of joining the dead one.
+    backend.release_all();
+    let reply = expect_reply(
+        spawn_resolve(
+            &core,
+            ReservedResolver::Google,
+            "example.com",
+            policy,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(response_code(&reply), ResponseCode::NoError);
+    assert_eq!(backend.calls(), 2);
+}
+
+#[tokio::test]
+async fn shared_answer_is_sanitized_against_each_waiters_policy() {
+    let backend = Arc::new(GatedResolver::new());
+    let core = core_with_backend(backend.clone(), 4);
+    let allowing = NetworkPolicyV1::allow_all();
+    let denying = policy(
+        EgressDefaultAction::Allow,
+        &[],
+        &[destination("192.0.2.0/24")],
+    );
+
+    let allowed = spawn_resolve(
+        &core,
+        ReservedResolver::Google,
+        "example.com",
+        allowing,
+        CancellationToken::new(),
+    );
+    backend.wait_started().await;
+    let denied = spawn_resolve(
+        &core,
+        ReservedResolver::Google,
+        "example.com",
+        denying,
+        CancellationToken::new(),
+    );
+    settle().await;
+    backend.release_all();
+
+    let allowed = Message::from_vec(&expect_reply(allowed.await.unwrap())).unwrap();
+    assert_eq!(allowed.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(allowed.answers.len(), 1);
+    let denied = expect_reply(denied.await.unwrap());
+    assert_eq!(response_code(&denied), ResponseCode::ServFail);
+    assert_eq!(backend.calls(), 1);
 }

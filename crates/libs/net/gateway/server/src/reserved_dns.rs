@@ -22,11 +22,13 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+mod inflight;
 mod metrics;
 mod recovery;
 mod upstream;
 
 use crate::egress::allows_dns_query as domain_is_allowed;
+use inflight::{InflightLookups, LookupRole};
 use recovery::RecoveringResolver;
 
 pub(crate) const MAX_DNS_MESSAGE_BYTES: usize = 4 * 1024;
@@ -51,7 +53,7 @@ pub enum BuildReservedDnsCoreError {
     Resolver(#[source] NetError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ReservedResolver {
     Cloudflare,
     Google,
@@ -109,6 +111,8 @@ pub enum ResolveOutcome {
 pub struct ReservedDnsCore {
     resolver: Arc<dyn ResolverBackend>,
     lookup_slots: ResolverSlots,
+    /// Concurrent identical questions share one upstream lookup.
+    inflight: Arc<InflightLookups>,
 }
 
 impl fmt::Debug for ReservedDnsCore {
@@ -123,6 +127,7 @@ impl ReservedDnsCore {
         Ok(Self {
             resolver: Arc::new(HickoryResolverSet::new(&lookup_slots)?),
             lookup_slots,
+            inflight: Arc::default(),
         })
     }
 
@@ -131,6 +136,7 @@ impl ReservedDnsCore {
         Self {
             resolver,
             lookup_slots: ResolverSlots::new(lookup_capacity),
+            inflight: Arc::default(),
         }
     }
 
@@ -141,15 +147,29 @@ impl ReservedDnsCore {
         admitted_policy: &NetworkPolicyV1,
         shutdown: &CancellationToken,
     ) -> Result<SanitizedAnswer, ResolverFailure> {
-        let _permit = self
-            .lookup_slots
-            .get(resolver)
-            .try_acquire()
-            .map_err(|_| ResolverFailure::Capacity)?;
-        let answer = self
-            .resolver
-            .lookup(resolver, request.question.clone(), shutdown)
-            .await?;
+        // Identical concurrent questions to the same reserved resolver share
+        // one upstream lookup (and one lookup slot). The shared answer is
+        // still sanitized against this request's own admitted policy below.
+        let (lookup, role) = self.inflight.join_or_start(
+            &self.resolver,
+            self.lookup_slots.get(resolver),
+            resolver,
+            &request.question,
+        );
+        // Leaders are counted inside the shared lookup once it holds its slot.
+        if role == LookupRole::Follower {
+            pplx_space_metrics::gateway::reserved_dns_lookup_coalesce(
+                resolver.as_str(),
+                role.as_str(),
+            );
+        }
+        // Policy cancellation detaches only this waiter; the shared lookup
+        // keeps running for any other waiter and is dropped with the last one.
+        let answer = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(ResolverFailure::Cancelled),
+            answer = lookup => answer?,
+        };
         let answer = sanitize_resolver_answer(request, answer, admitted_policy)
             .map_err(ResolverFailure::Sanitization)?;
         if shutdown.is_cancelled() {
@@ -389,7 +409,7 @@ struct ResolverAnswer {
     valid_until: Instant,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 enum ResolverFailure {
     #[error("DNS lookup cancelled")]
     Cancelled,
@@ -426,12 +446,7 @@ type ResolverFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ResolverAnswer, ResolverFailure>> + Send + 'a>>;
 
 trait ResolverBackend: Send + Sync {
-    fn lookup<'a>(
-        &'a self,
-        resolver: ReservedResolver,
-        question: Query,
-        shutdown: &'a CancellationToken,
-    ) -> ResolverFuture<'a>;
+    fn lookup<'a>(&'a self, resolver: ReservedResolver, question: Query) -> ResolverFuture<'a>;
 }
 
 struct HickoryResolverSet {
@@ -457,22 +472,14 @@ impl HickoryResolverSet {
 }
 
 impl ResolverBackend for HickoryResolverSet {
-    fn lookup<'a>(
-        &'a self,
-        resolver: ReservedResolver,
-        question: Query,
-        shutdown: &'a CancellationToken,
-    ) -> ResolverFuture<'a> {
+    fn lookup<'a>(&'a self, resolver: ReservedResolver, question: Query) -> ResolverFuture<'a> {
         Box::pin(async move {
-            // The deadline and policy cancellation cover both the original
-            // lookup and its one recovery attempt, under the same lookup slot.
+            // The deadline covers both the original lookup and its one
+            // recovery attempt, under the same lookup slot. Policy
+            // cancellation is applied per waiter by the coalescing layer;
+            // dropping this future (last waiter gone) cancels the lookup.
             let lookup = self.get(resolver).lookup(resolver, &question);
-            let result = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return Err(ResolverFailure::Cancelled),
-                result = tokio::time::timeout(TOTAL_LOOKUP_TIMEOUT, lookup) => result,
-            };
-            let lookup = match result {
+            let lookup = match tokio::time::timeout(TOTAL_LOOKUP_TIMEOUT, lookup).await {
                 Err(_) => return Err(ResolverFailure::LookupDeadline),
                 Ok(Err(NetError::Dns(DnsError::NoRecordsFound(no_records)))) => {
                     return Ok(ResolverAnswer {

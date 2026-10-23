@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use hickory_resolver::proto::op::{Query, ResponseCode};
 use hickory_resolver::proto::rr::rdata::A;
 use hickory_resolver::proto::rr::{RData, Record};
-use tokio_util::sync::CancellationToken;
 
 use super::{
     CLOUDFLARE_DNS, GOOGLE_DNS, MAX_CONCURRENT_LOOKUPS, ReservedDnsCore, ReservedResolver,
@@ -57,12 +56,7 @@ pub(crate) fn test_core() -> ReservedDnsCore {
 }
 
 impl ResolverBackend for RecordedResolver {
-    fn lookup<'a>(
-        &'a self,
-        resolver: ReservedResolver,
-        question: Query,
-        _shutdown: &'a CancellationToken,
-    ) -> ResolverFuture<'a> {
+    fn lookup<'a>(&'a self, resolver: ReservedResolver, question: Query) -> ResolverFuture<'a> {
         Box::pin(async move {
             let resolver_ip = match resolver {
                 ReservedResolver::Cloudflare => IpAddr::V4(CLOUDFLARE_DNS),
