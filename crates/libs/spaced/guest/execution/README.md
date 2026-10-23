@@ -69,9 +69,20 @@ execution metadata.
   neither policy restricts reachable paths or replaces caller-provided isolation.
   Changing policy requires constructing a new execution service. Use a worker
   built with the same library: older worker protocols are rejected before dispatch.
+- Native callers use the generated `Process` trait and the owned, cloneable
+  `Filesystem` implementation returned by `filesystem_service()`. Unary calls
+  check the existing protobuf message-size limits. Payload-bearing calls share
+  the same weighted capacity with gRPC; filesystem mutations retain admission
+  through owned execution and cleanup, including after caller cancellation.
+  Native callers remain responsible for allocations made before calling the service.
+  Oversized messages return `OutOfRange`; exhausted payload capacity returns
+  `ResourceExhausted`. Use `pplx_space_common_grpc::is_refused_before_start`
+  to identify refusal before execution rather than parsing error messages.
+  An error without that marker does not establish that retrying is safe.
 - The daemon registers `filesystem_grpc_service()` and `process_grpc_service()`
-  to retain transport payload admission as well as the execution limits. Calling
-  generated traits directly does not install the transport admission layer.
+  to retain predecode protection. Handlers reuse that admission without charging
+  twice. Native calls cannot install predecode protection retroactively.
+  Uploads retain the generated trait's Tonic input-stream type and bounded relay.
 - The daemon cancels the shared token and coordinates listener shutdown with draining work.
   `drain()` joins tracked work; it is not a reusable shutdown-and-reject contract
   for subsequent direct calls. Direct filesystem calls can still have effects.
@@ -83,10 +94,11 @@ execution metadata.
   or redirect inherited output can outlive a completed leader; draining this
   service does not establish that every descendant has exited.
 
-This crate retains the daemon contract. General application embedding requires
-native admission and shutdown semantics, and
-stronger descendant ownership. Explicit launching alone does not establish those
-guarantees or advertise general embedding support.
+This crate retains the daemon contract. Native upload input, bounded
+process-environment configuration, consistent shutdown semantics and complete
+operation acceptance remain follow-up work. General application embedding also
+requires stronger descendant ownership. Explicit launching alone does not
+establish those guarantees or advertise general embedding support.
 
 The Linux `embedding` integration in the worker app uses the execution crate
 without the guest server. It covers a separate worker artifact, atomic path

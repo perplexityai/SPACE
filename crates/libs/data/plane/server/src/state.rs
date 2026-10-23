@@ -463,9 +463,13 @@ pub(super) async fn build_backend_channels(
     endpoint: &str,
     pool_size: usize,
 ) -> Result<Vec<Channel>, pplx_space_common_grpc::internal_transport::TransportError> {
+    // Each pooled channel carries calls for many sandboxes on one connection.
     let endpoint = pplx_space_node_api_client::configure_node_api_endpoint(
         Endpoint::from_shared(normalize_backend_endpoint(endpoint)?)?,
         pplx_space_node_api_client::NodeApiEndpointConfig::default(),
+    )
+    .initial_connection_window_size(
+        pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES,
     );
     let endpoint = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,
@@ -497,9 +501,9 @@ impl RevocationCache {
         epoch: u64,
         org_id: OrgId,
         org_epoch: u64,
-        refresh_after: Duration,
+        read: RevocationRead,
     ) {
-        self.remember_state(session_id, epoch, true, org_id, org_epoch, refresh_after);
+        self.remember_state(session_id, epoch, true, org_id, org_epoch, read);
     }
 
     pub(super) fn remember(
@@ -507,7 +511,7 @@ impl RevocationCache {
         session_id: DataPlaneSessionId,
         org_id: OrgId,
         revocation: &DataPlaneRevocationState,
-        refresh_after: Duration,
+        read: RevocationRead,
     ) {
         self.remember_state(
             session_id,
@@ -515,7 +519,7 @@ impl RevocationCache {
             revocation_state_is_active(revocation),
             org_id,
             revocation.org_epoch,
-            refresh_after,
+            read,
         );
     }
 
@@ -526,13 +530,41 @@ impl RevocationCache {
         active: bool,
         org_id: OrgId,
         org_epoch: u64,
-        refresh_after: Duration,
+        read: RevocationRead,
     ) {
+        if self.remember_session(session_id, epoch, active, org_id, org_epoch) {
+            self.remember_org_epoch(org_id, org_epoch, read);
+        }
+    }
+
+    /// Record an active session from a route this replica resolved earlier
+    /// and still caches. The cluster API was not asked, so the org's last
+    /// confirmation and next refresh stay as the resolve left them.
+    pub(super) fn remember_cached_active(
+        &self,
+        session_id: DataPlaneSessionId,
+        epoch: u64,
+        org_id: OrgId,
+        org_epoch: u64,
+    ) {
+        self.remember_session(session_id, epoch, true, org_id, org_epoch);
+    }
+
+    /// Record the session's verdict unless a newer epoch is already cached;
+    /// returns whether it was recorded.
+    fn remember_session(
+        &self,
+        session_id: DataPlaneSessionId,
+        epoch: u64,
+        active: bool,
+        org_id: OrgId,
+        org_epoch: u64,
+    ) -> bool {
         let key = session_id.to_string();
         if let Some(existing) = self.entries.get(&key)
             && epoch < existing.epoch
         {
-            return;
+            return false;
         }
         self.entries.insert(
             key,
@@ -543,26 +575,45 @@ impl RevocationCache {
                 org_epoch,
             },
         );
-        self.remember_org_epoch(org_id, org_epoch, refresh_after);
+        true
     }
 
-    pub(super) fn remember_org_epoch(&self, org_id: OrgId, epoch: u64, refresh_after: Duration) {
-        if let Some(existing) = self.orgs.get(&org_id)
-            && epoch < existing.epoch
-        {
-            return;
+    /// Record the org epoch `read` returned. An older epoch than the cached
+    /// one is ignored, and the same epoch only moves its confirmation and next
+    /// refresh later, so an answer that arrives late cannot undo a newer one.
+    pub(super) fn remember_org_epoch(&self, org_id: OrgId, epoch: u64, read: RevocationRead) {
+        let refresh_after = read.started_at + read.fresh_for;
+        match self.orgs.entry(org_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut current) => {
+                let current = current.get_mut();
+                if epoch < current.epoch
+                    || (epoch == current.epoch && read.started_at < current.confirmed_at)
+                {
+                    return;
+                }
+                current.epoch = epoch;
+                current.confirmed_at = read.started_at;
+                current.refresh_after = refresh_after;
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(OrgRevocationCacheEntry {
+                    epoch,
+                    confirmed_at: read.started_at,
+                    refresh_after,
+                    refreshing: Arc::new(AtomicBool::new(false)),
+                });
+            }
         }
-        self.orgs.insert(
-            org_id,
-            OrgRevocationCacheEntry {
-                epoch,
-                refresh_after: tokio::time::Instant::now() + refresh_after,
-                refreshing: Arc::new(AtomicBool::new(false)),
-            },
-        );
     }
 
-    pub(super) fn probe(self: &Arc<Self>, session_id: DataPlaneSessionId) -> RevocationProbe {
+    /// Probe the session's cached verdict. A refresh another stream has in
+    /// flight answers from the cache only while that verdict is younger than
+    /// `tolerance`; past it, this session is re-read instead.
+    pub(super) fn probe(
+        self: &Arc<Self>,
+        session_id: DataPlaneSessionId,
+        tolerance: Duration,
+    ) -> RevocationProbe {
         let key = session_id.to_string();
         let Some(entry) = self.entries.get(&key) else {
             return RevocationProbe::RefreshSession;
@@ -589,6 +640,7 @@ impl RevocationCache {
             return RevocationProbe::Fresh(active);
         }
         let cached_org_epoch = org.epoch.max(session_org_epoch);
+        let confirmed_recently = org.confirmed_at.elapsed() < tolerance;
         let refreshing = Arc::clone(&org.refreshing);
         drop(org);
         if refreshing
@@ -603,9 +655,31 @@ impl RevocationCache {
                     refreshing: Some(refreshing),
                 },
             })
-        } else {
+        } else if confirmed_recently {
             RevocationProbe::RefreshInFlight(active)
+        } else {
+            RevocationProbe::RefreshSession
         }
+    }
+
+    /// Whether the session's last confirmed verdict is active and younger
+    /// than `tolerance`. The verdict's age is its org entry's: every
+    /// revocation advances the org epoch, so a check that confirms the org's
+    /// epoch unchanged also confirms each session read under that epoch. A
+    /// newer org epoch than the session was read under means a revocation in
+    /// its org since, so the verdict no longer counts.
+    pub(super) fn confirmed_active(
+        &self,
+        session_id: DataPlaneSessionId,
+        tolerance: Duration,
+    ) -> bool {
+        let Some(entry) = self.entries.get(&session_id.to_string()) else {
+            return false;
+        };
+        let Some(org) = self.orgs.get(&entry.org_id) else {
+            return false;
+        };
+        entry.active && entry.org_epoch >= org.epoch && org.confirmed_at.elapsed() < tolerance
     }
 
     pub(super) fn forget(&self, session_id: DataPlaneSessionId) {
@@ -633,9 +707,30 @@ pub(super) struct RevocationCacheEntry {
     pub(super) org_epoch: u64,
 }
 
+/// When a revocation read began, and how long its answer stays fresh. The
+/// cluster API may have read its rows at any point before it answered, so an
+/// answer is dated from when the read began, not from when it arrived.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RevocationRead {
+    pub(super) started_at: tokio::time::Instant,
+    pub(super) fresh_for: Duration,
+}
+
+impl RevocationRead {
+    /// A read beginning now.
+    pub(super) fn start(fresh_for: Duration) -> Self {
+        Self {
+            started_at: tokio::time::Instant::now(),
+            fresh_for,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct OrgRevocationCacheEntry {
     pub(super) epoch: u64,
+    /// When the latest read that confirmed this epoch began.
+    pub(super) confirmed_at: tokio::time::Instant,
     pub(super) refresh_after: tokio::time::Instant,
     pub(super) refreshing: Arc<AtomicBool>,
 }

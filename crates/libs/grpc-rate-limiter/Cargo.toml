@@ -1,0 +1,28 @@
+[package]
+name = "pplx-space-grpc-rate-limiter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+pin-project-lite = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+
+# internal
+pplx-space-common-grpc = { workspace = true }
+pplx-space-metrics = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

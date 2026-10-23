@@ -198,6 +198,16 @@ pub(super) fn process_stream_start_http_error(error: &StreamBridgeError) -> Resp
     )
 }
 
+/// Public messages for the error frames that report a backend or internal
+/// error. That error can name internal endpoints or carry the guest's own
+/// wording, so these frames carry one of these instead and the detail goes to
+/// the log. Frames about the client's own request carry their own fixed text.
+pub(super) const PROCESS_STREAM_FAILED: &str = "process event stream failed";
+pub(super) const FILE_WATCH_STREAM_FAILED: &str = "file watch event stream failed";
+pub(super) const STREAM_OPEN_FAILED: &str = "event stream could not be opened";
+pub(super) const STREAM_OPEN_REFUSED: &str = "this request was refused";
+pub(super) const RESIZE_REFUSED: &str = "terminal resize is not supported by this process";
+
 pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneServerFrame {
     // A refusal made before anything started is retryable here as on SSE.
     if let StreamBridgeError::BackendStatus(status) = error
@@ -205,7 +215,7 @@ pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneSe
     {
         return DataPlaneServerFrame::Error {
             code: DataPlaneErrorCode::BackendStreamError,
-            message: format!("this request was refused: {}", status.message()),
+            message: STREAM_OPEN_REFUSED.to_string(),
             retryable: true,
         };
     }
@@ -215,9 +225,10 @@ pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneSe
             if !pplx_space_common_grpc::is_terminal_guest_process_error(status)
                 && backend_stream_status_retryable(status)
     );
+    // The bridge logs the error.
     DataPlaneServerFrame::Error {
         code: DataPlaneErrorCode::BackendStreamError,
-        message: error.to_string(),
+        message: STREAM_OPEN_FAILED.to_string(),
         retryable,
     }
 }

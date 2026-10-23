@@ -36,7 +36,7 @@ Error samples are illustrative, not exhaustive. Messages can change, and the sam
 
 Only endpoints that declare a required `Idempotency-Key` deduplicate mutations, and not all for the same time:
 
-- **Sandbox lifecycle operations and command creation:** the API keeps the key for 24 hours. Reuse the same method, path, body, and key within that window.
+- **Sandbox lifecycle operations and command creation:** the API keeps the key for 24 hours. Reuse the same method, path, body, and key within that window. Replaying the creation of a command whose session was revoked returns `409` `conflict` with the detail `{"key": "reason", "value": "session_ended"}` and no session token; create a new command with a new key instead.
 - **File writes, batch writes, and renames:** the sandbox keeps the key in memory for 60 seconds after the change completes. A retry after that, or after the sandbox's agent restarts, can apply the change again, so an append can land twice. Retry these promptly.
 - **File `mkdir`, `remove`, and change tracking:** they require the key but do not deduplicate.
 

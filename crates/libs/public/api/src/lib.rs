@@ -2008,7 +2008,9 @@ pub struct PublicErrorEnvelope {
     /// Bounded typed details; empty when the error has none. A `not_found`
     /// from a file route carries `{"key": "resource", "value": "path"}` when
     /// the sandbox is yours and the path inside it does not exist; any other
-    /// `not_found`, including a missing or unowned sandbox, carries none.
+    /// `not_found`, including a missing or unowned sandbox, carries none. A
+    /// `conflict` from replaying a session create whose session has ended
+    /// carries `{"key": "reason", "value": "session_ended"}`.
     pub details: Vec<PublicErrorDetail>,
 }
 
@@ -2019,6 +2021,15 @@ pub const NOT_FOUND_RESOURCE_DETAIL_KEY: &str = "resource";
 /// a sandbox the caller owns. Never set for the sandbox itself, so a missing
 /// sandbox and another org's sandbox stay indistinguishable.
 pub const NOT_FOUND_RESOURCE_PATH: &str = "path";
+
+/// [`PublicErrorDetail::key`] naming why a `conflict` was refused.
+pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";
+
+/// [`CONFLICT_REASON_DETAIL_KEY`] value of a `conflict` for replaying a
+/// session create whose session was revoked, has expired or is no longer
+/// retained. The replay returns no token; create a new session with a new
+/// idempotency key.
+pub const CONFLICT_REASON_SESSION_ENDED: &str = "session_ended";
 
 open_wire_enum!(DataPlaneHttpErrorCode, "data-plane HTTP error code", {
     InvalidRequest => "invalid_request",

@@ -202,6 +202,19 @@ impl SandboxEvent {
             }
             _ => sandbox_event!(tracing::Level::INFO, self, details),
         }
+        crate::observer::notify(&self, &details);
+    }
+
+    pub const fn sandbox_id(&self) -> SandboxId {
+        self.sandbox_id
+    }
+
+    pub const fn event_type(&self) -> SandboxEventType {
+        self.event_type
+    }
+
+    pub const fn source(&self) -> SandboxEventSource {
+        self.source
     }
 }
 

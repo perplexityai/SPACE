@@ -257,3 +257,127 @@ async fn process_adapter_requires_guest_readiness_and_observes_shutdown() {
         tonic::Code::Unavailable,
     );
 }
+
+#[tokio::test]
+async fn daemon_payload_adapters_reuse_transport_admission() {
+    use pplx_space_spaced_common::proto::bridge_guest::{
+        RenameRequest, WriteBatchRequest, WriteOpen, WriteRequest,
+        filesystem_client::FilesystemClient, process_client::ProcessClient, write_request::Message,
+    };
+    use pplx_space_spaced_guest_execution::FilesystemExecutionMode;
+    use tonic::{body::Body, codegen::http};
+    use tower::Service;
+
+    let shutdown = CancellationToken::new();
+    let service = SpacedGuestService::with_config(
+        shutdown.clone(),
+        SpacedGuestServiceConfig {
+            filesystem_execution: FilesystemExecutionMode::Direct,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.inner.ready.send_replace(true);
+    let execution = &service.inner.execution;
+    let mut processes = execution.process_grpc_service(service.clone());
+    let mut files = execution.filesystem_grpc_service();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(processes.clone())
+            .add_service(files.clone())
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                shutdown.clone().cancelled_owned(),
+            ),
+    );
+    let endpoint = format!("http://{address}");
+    let mut process_client = ProcessClient::connect(endpoint.clone()).await.unwrap();
+    let mut file_client = FilesystemClient::connect(endpoint).await.unwrap();
+    let pending = |service: &str, method: &str| {
+        http::Request::builder()
+            .uri(format!("/space.spaced.bridge.guest.v1.{service}/{method}"))
+            .header("content-type", "application/grpc")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // Unpolled transport calls own capacity before decoding. Leave exactly the
+    // tested method's weight: losing its permit in any adapter would force a
+    // second acquisition and return ResourceExhausted instead of input validation.
+    for (method, weight) in [("Start", 4), ("SendInput", 1)] {
+        let held: Vec<_> = (weight..8)
+            .map(|_| processes.call(pending("Process", "SendInput")))
+            .collect();
+        let code = match method {
+            "Start" => process_client
+                .start(StartRequest {
+                    command: vec!["/bin/true".into()],
+                    user: Some("space-no-such-user".into()),
+                    ..Default::default()
+                })
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            _ => process_client
+                .send_input(SendInputRequest {
+                    process_id: String::new(),
+                    data: vec![],
+                })
+                .await
+                .unwrap_err()
+                .code(),
+        };
+        assert_eq!(
+            code,
+            tonic::Code::InvalidArgument,
+            "{method} must reuse admission"
+        );
+        drop(held);
+    }
+    for (method, weight) in [("Write", 1), ("WriteBatch", 4), ("Rename", 1)] {
+        let held: Vec<_> = (weight..8)
+            .map(|_| files.call(pending("Filesystem", "Write")))
+            .collect();
+        let code = match method {
+            "Write" => file_client
+                .write(tokio_stream::iter([WriteRequest {
+                    message: Some(Message::Open(WriteOpen {
+                        user: Some("invalid/user".into()),
+                        ..Default::default()
+                    })),
+                }]))
+                .await
+                .unwrap_err()
+                .code(),
+            "WriteBatch" => file_client
+                .write_batch(WriteBatchRequest {
+                    user: Some("invalid/user".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            _ => file_client
+                .rename(RenameRequest {
+                    idempotency_key: Some("admission-guard".into()),
+                    user: Some("invalid/user".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+        };
+        assert_eq!(
+            code,
+            tonic::Code::InvalidArgument,
+            "{method} must reuse admission"
+        );
+        drop(held);
+    }
+    shutdown.cancel();
+    server.await.unwrap().unwrap();
+    execution.drain().await;
+}

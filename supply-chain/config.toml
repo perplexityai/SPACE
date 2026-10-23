@@ -378,8 +378,9 @@ version = "0.10.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ctutils]]
-version = "0.4.2"
+version = "0.4.4"
 criteria = "safe-to-deploy"
+notes = "Explicitly approved carry-forward of the existing ctutils exemption to the security-patched release. This is a version-specific exemption, not an independent full audit or constant-time proof."
 
 [[exemptions.darling]]
 version = "0.20.11"

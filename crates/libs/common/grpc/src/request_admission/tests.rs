@@ -189,3 +189,38 @@ async fn queue_deadline_includes_time_before_first_poll() {
     drop(occupied);
     assert_eq!(queued.await.unwrap().headers()["grpc-status"], "8");
 }
+
+#[test]
+fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
+    for (same_budget, held_weight, closed, admitted) in [
+        (true, 2, false, true),
+        (true, 1, false, false),
+        (false, 2, true, false),
+        (false, 2, false, true),
+    ] {
+        let slots = Arc::new(Semaphore::new(2));
+        let origin = if same_budget {
+            slots.clone()
+        } else {
+            Arc::new(Semaphore::new(2))
+        };
+        let held = RequestPermit::try_acquire(origin.clone(), held_weight, None).unwrap();
+        let observed = held.clone();
+        if closed {
+            slots.close();
+        }
+        let result = RequestPermit::try_acquire(slots.clone(), 2, Some(held));
+        assert_eq!(result.is_ok(), admitted);
+        if admitted {
+            assert_eq!(
+                slots.available_permits(),
+                0,
+                "the target budget owns the work"
+            );
+        }
+        drop(result);
+        assert_eq!(origin.available_permits(), 2 - held_weight as usize);
+        drop(observed);
+        assert_eq!(origin.available_permits(), 2);
+    }
+}

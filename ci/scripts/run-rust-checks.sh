@@ -8,7 +8,8 @@
 # inventory, including ignored tests.
 #
 # clippy lints every feature of workspace libraries and binaries while every
-# target is compiled in the same Cargo graph.
+# target is compiled in the same Cargo graph. isolated-crates lints each
+# library that lib/rust-isolated-crates.sh selects in a Cargo graph of its own.
 #
 # GitHub CI splits `tests` across two containers on one runner, built once:
 # `tests-unprivileged` builds everything and runs the nextest inventory outside
@@ -37,6 +38,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/lib/test-deps.sh"
 # shellcheck source=lib/rust-side-checks.sh
 source "${SCRIPT_DIR}/lib/rust-side-checks.sh"
+# shellcheck source=lib/rust-isolated-crates.sh
+source "${SCRIPT_DIR}/lib/rust-isolated-crates.sh"
 
 PROTOC_VERSION="${PROTOC_VERSION:-35.0}"
 CARGO_NEXTEST_VERSION="${CARGO_NEXTEST_VERSION:-0.9.133}"
@@ -318,11 +321,13 @@ run_sbxmgr_production_checks() {
         sbxmgr_assert_direct_dependents pplx-space-sqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store
         # rusqlite enters only through the store, the helpers it depends on,
-        # and two shared crates whose rusqlite use hands no connection out:
-        # common-jobs' functions take a connection in, and common-core only
-        # implements rusqlite's value conversion traits for its types.
+        # and three shared crates whose rusqlite use hands no connection out:
+        # common-jobs' functions take a connection in, and common-core and
+        # accounts only implement rusqlite's value conversion traits for
+        # their types.
         sbxmgr_assert_direct_dependents rusqlite "${sbxmgr_feature_args[@]}" -- \
-            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core
+            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core \
+            pplx-space-accounts
     done
 }
 
@@ -362,196 +367,15 @@ run_clippy_checks() {
         -- \
         -D warnings
 
-    # Built alone, so a sqlx or common-svc feature these crates need but only
-    # get through unification with the rest of the workspace fails here.
-    echo "--- :rust: Running isolated SQLite helper and migration-checksums clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-sqlite \
-        --lib \
-        -- \
-        -D warnings
+    # Built alone, so a sqlx feature common-svc's migration-checksums feature
+    # needs but only gets through unification with the rest of the workspace
+    # fails here.
+    echo "--- :rust: Running common-svc migration-checksums clippy"
     CARGO_TARGET_DIR="${target_dir}" cargo clippy \
         --locked \
         -p pplx-space-common-svc \
         --no-default-features \
         --features migration-checksums \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-migration-checksums \
-        --lib \
-        -- \
-        -D warnings
-
-    # Built alone, so a nix feature the dependency-drain crate gets only
-    # through unification with common-svc fails here.
-    echo "--- :rust: Running isolated dependency-drain clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-dependency-drain \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone, so a tonic feature the bearer-token crate needs but only
-    # gets through unification with the rest of the workspace fails here. Its
-    # tests build alone too, so they are linted with it.
-    echo "--- :rust: Running isolated bearer-token clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-bearer-token \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone, so a rustls feature the provider install needs but only
-    # gets through unification with the rest of the workspace fails here.
-    echo "--- :rust: Running isolated rustls provider clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-rustls-provider \
-        --no-default-features \
-        -- \
-        -D warnings
-
-    # Built alone, so a tokio feature the runtime builder needs but only gets
-    # through unification with the rest of the workspace fails here.
-    echo "--- :rust: Running isolated Tokio runtime builder clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-tokio-runtime \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone, so a tokio feature the watchdog needs but only gets
-    # through unification fails here; its notify path is Linux-specific.
-    echo "--- :rust: Running isolated systemd watchdog clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-systemd-watchdog \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone with no features and with all of them, so a serde or sqlx
-    # feature the semantic-version crate needs but only gets through
-    # common-core's features fails here.
-    echo "--- :rust: Running isolated semantic-version clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-semver \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-semver \
-        --all-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone, so a serde derive that only compiles through feature
-    # unification with common-core's dependents fails here.
-    echo "--- :rust: Running isolated content-digest clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-content-digest \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-content-digest \
-        --all-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone with no features and with all of them, so a dependency
-    # feature the duration types need but only get through unification with
-    # common-core or the rest of the workspace fails here.
-    echo "--- :rust: Running isolated durations clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-durations \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-durations \
-        --all-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone, so a tokio feature the service mutex needs but only gets
-    # through common-svc's broader tokio features fails here.
-    echo "--- :rust: Running isolated service mutex clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-service-mutex \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone, so a libc or nix feature the Linux-only page-cache calls
-    # need but only get through unification fails here.
-    echo "--- :rust: Running isolated page-cache clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-page-cache \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone, so a serde feature the CPU architecture crate needs but only
-    # gets through unification with common-core fails here.
-    echo "--- :rust: Running isolated CPU architecture clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-cpu-arch \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-cpu-arch \
-        --all-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone with and without its `serde` feature, so a dependency
-    # feature the byte-size types need but only get through unification with
-    # common-core or the rest of the workspace fails here.
-    echo "--- :rust: Running isolated byte-size clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-byte-size \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-byte-size \
-        --all-features \
-        --all-targets \
         -- \
         -D warnings
 
@@ -570,59 +394,26 @@ run_clippy_checks() {
         -- \
         -D warnings
 
-    # Built alone, so a serde or sqlx feature the Kubernetes identifier crate
-    # needs but only gets through unification with common-core fails here.
-    echo "--- :rust: Running isolated Kubernetes identifier clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-k8s-ids \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-k8s-ids \
-        --all-features \
-        --all-targets \
-        -- \
-        -D warnings
+    # Each of the account identity crate's features by itself, so one that
+    # relies on another being enabled fails here; the isolated-crates mode
+    # builds it only with no features and with all of them.
+    echo "--- :rust: Running account identity clippy with each feature alone"
+    local accounts_feature
+    for accounts_feature in serde sqlx rusqlite; do
+        CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+            --locked \
+            -p pplx-space-accounts \
+            --no-default-features \
+            --features "${accounts_feature}" \
+            --all-targets \
+            -- \
+            -D warnings
+    done
 
-    # Built alone, so a net-common feature the generated net-gateway contract
-    # needs but only gets through unification with the client fails here.
-    echo "--- :rust: Running isolated net-gateway protocol clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-net-gateway-protocol \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-net-gateway-protocol \
-        --all-features \
-        --all-targets \
-        -- \
-        -D warnings
-
-    # Built alone, so a serde feature the cluster identity crate needs but
-    # only gets through unification with common-core fails here.
-    echo "--- :rust: Running isolated cluster identity clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-cluster-id \
-        --no-default-features \
-        --all-targets \
-        -- \
-        -D warnings
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-cluster-id \
-        --all-features \
-        --all-targets \
-        -- \
-        -D warnings
+    # The crates split out of common-core and common-svc, and the other
+    # libraries beside them, are linted alone by run_isolated_crate_checks in
+    # lib/rust-isolated-crates.sh (the isolated-crates mode), which finds them
+    # in the workspace metadata. A new crate needs no step here.
 }
 
 nextest_test_threads() {
@@ -1050,13 +841,13 @@ main() {
 cd "$REPO_ROOT"
 
 validation_mode="${1:-all}"
-usage="Usage: $0 [fmt|clippy|tests|tests-unprivileged|tests-privileged|all]"
+usage="Usage: $0 [fmt|clippy|isolated-crates|tests|tests-unprivileged|tests-privileged|all]"
 if [ "$#" -gt 1 ]; then
     echo "${usage}" >&2
     exit 2
 fi
 case "${validation_mode}" in
-    fmt | clippy | tests | tests-unprivileged | tests-privileged | all) ;;
+    fmt | clippy | isolated-crates | tests | tests-unprivileged | tests-privileged | all) ;;
     *)
         echo "${usage}" >&2
         exit 2
@@ -1090,7 +881,7 @@ on_exit() {
 }
 trap on_exit EXIT
 case "${validation_mode}" in
-    clippy)
+    clippy | isolated-crates)
         needs_build_dependencies=true
         ;;
     tests | all)
@@ -1251,6 +1042,9 @@ case "${validation_mode}" in
     clippy)
         run_clippy_checks
         ;;
+    isolated-crates)
+        run_isolated_crate_checks
+        ;;
     tests | tests-unprivileged)
         run_test_checks
         ;;
@@ -1260,6 +1054,7 @@ case "${validation_mode}" in
     all)
         run_fmt_check
         run_clippy_checks
+        run_isolated_crate_checks
         run_test_checks
         ;;
 esac

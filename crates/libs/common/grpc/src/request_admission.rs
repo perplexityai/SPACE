@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::queued_slots::{QueuedSlots, SlotRequest};
 use tonic::{Status, body::Body};
@@ -15,6 +15,27 @@ use tower::Service;
 #[derive(Clone, Debug)]
 pub struct RequestPermit {
     _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl RequestPermit {
+    /// Retain admission from this budget, or acquire it for a native call.
+    /// A permit from a different budget or with insufficient weight cannot
+    /// stand in for this operation's capacity. No queue is added here.
+    pub fn try_acquire(
+        slots: Arc<Semaphore>,
+        weight: u32,
+        admitted: Option<Self>,
+    ) -> Result<Self, TryAcquireError> {
+        if let Some(permit) = admitted
+            && Arc::ptr_eq(permit._permit.semaphore(), &slots)
+            && permit._permit.num_permits() >= weight as usize
+        {
+            return Ok(permit);
+        }
+        Ok(Self {
+            _permit: Arc::new(slots.try_acquire_many_owned(weight)?),
+        })
+    }
 }
 
 /// Admission for selected request payloads (including uploads).

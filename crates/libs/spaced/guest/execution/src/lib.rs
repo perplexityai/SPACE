@@ -1,7 +1,7 @@
 //! Process and filesystem service implementation for the SPACE guest daemon.
 //!
 //! The daemon uses the existing generated gRPC contract and owns listener
-//! admission, readiness, worker entrypoint dispatch, and shutdown orchestration.
+//! predecode protection, readiness, worker entrypoint dispatch, and shutdown orchestration.
 //! See the crate README for the guest process assumptions.
 
 use pplx_space_common_core::types::{DEFAULT_GUEST_USER, EnvMap, GuestUserName};
@@ -38,6 +38,7 @@ mod guest_path;
 mod idempotency;
 mod identity;
 mod identity_policy;
+mod payload;
 mod placement;
 mod process;
 mod worker_executable;

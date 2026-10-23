@@ -96,6 +96,7 @@ async fn process_start_http_errors_preserve_permanent_guest_failures() {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["retryable"], retryable, "{code:?}: {body}");
         let DataPlaneServerFrame::Error {
+            message,
             retryable: actual_websocket_retryable,
             ..
         } = stream_start_error_frame(&error)
@@ -106,6 +107,7 @@ async fn process_start_http_errors_preserve_permanent_guest_failures() {
             actual_websocket_retryable, websocket_retryable,
             "WebSocket opening errors retain the established stream retry contract"
         );
+        assert_eq!(message, STREAM_OPEN_FAILED, "{code:?}");
     }
 }
 
@@ -378,10 +380,14 @@ async fn refusals_before_start_are_retryable_with_retry_after() {
         assert_eq!(body["error"]["code"], expected_code, "{body}");
         assert_eq!(body["error"]["retryable"], true, "{body}");
         assert!(!body.to_string().contains("synthetic guest wording"));
-        let DataPlaneServerFrame::Error { retryable, .. } = stream_start_error_frame(&error) else {
+        let DataPlaneServerFrame::Error {
+            message, retryable, ..
+        } = stream_start_error_frame(&error)
+        else {
             panic!("expected error frame")
         };
         assert!(retryable, "WebSocket agrees with SSE for {code:?}");
+        assert_eq!(message, STREAM_OPEN_REFUSED, "{code:?}");
     }
 }
 
@@ -714,4 +720,992 @@ async fn binding_survives_a_client_that_disconnects_mid_bind() {
     .await
     .expect("the binding completed after the client left");
     assert_eq!(fake.bound_process_ids.lock().unwrap().len(), 1);
+}
+
+/// How a fake cluster API answers revocation checks.
+#[derive(Clone, Copy)]
+enum FakeRevocation {
+    Active,
+    /// The cluster API is unreachable; its status names an internal address.
+    Down,
+    /// The cluster API takes the check and never answers.
+    Hung,
+    /// The org epoch moved on, and the session check then never answers.
+    HungAfterOrgEpochChange,
+    /// The org read takes most of a check timeout and finds the epoch moved
+    /// on, and the session read then never answers.
+    SlowOrgThenHungSession,
+    /// Every call, route resolves included, answers as `Active` does after
+    /// [`FAKE_SLOW_ANSWER`].
+    Slow,
+    Revoked,
+    /// The cluster API refuses the check.
+    Rejected,
+}
+
+/// How long [`FakeRevocation::Slow`] takes to answer.
+const FAKE_SLOW_ANSWER: Duration = Duration::from_millis(300);
+/// The check timeout for [`FakeRevocation::SlowOrgThenHungSession`], and how
+/// long its org read takes.
+const SPLIT_CHECK_TIMEOUT: Duration = Duration::from_millis(2_000);
+const SPLIT_CHECK_ORG_READ: Duration = Duration::from_millis(1_200);
+
+/// A fake cluster API and worker for one running process. The test sets how
+/// revocation checks are answered and sends stdout chunks down the open
+/// process stream.
+struct RevocationFake {
+    endpoint: String,
+    revocation: Arc<std::sync::Mutex<FakeRevocation>>,
+    /// Revocation checks answered with an error.
+    failed_answers: Arc<std::sync::atomic::AtomicUsize>,
+    stdout: tokio::sync::mpsc::UnboundedSender<&'static str>,
+}
+
+impl RevocationFake {
+    fn answer(&self, revocation: FakeRevocation) {
+        *self.revocation.lock().unwrap() = revocation;
+    }
+
+    fn print(&self, data: &'static str) {
+        self.stdout.send(data).unwrap();
+    }
+
+    fn failed_answers(&self) -> usize {
+        self.failed_answers.load(Ordering::SeqCst)
+    }
+}
+
+/// Make the session's org due for a refresh, so its next check reads the
+/// cluster API however soon the last read answered.
+fn make_org_refresh_due(state: &DataPlaneState, session_id: DataPlaneSessionId) {
+    let org_id = state
+        .revocation_cache
+        .entries
+        .get(&session_id.to_string())
+        .unwrap()
+        .org_id;
+    state
+        .revocation_cache
+        .orgs
+        .get_mut(&org_id)
+        .unwrap()
+        .refresh_after = tokio::time::Instant::now();
+}
+
+const FAKE_CLUSTER_API_OUTAGE: &str = "connection refused: 192.0.2.10:9443";
+
+fn grpc_message(message: &impl prost::Message) -> bytes::Bytes {
+    let encoded = message.encode_to_vec();
+    let mut framed = vec![0];
+    framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    framed.extend(encoded);
+    bytes::Bytes::from(framed)
+}
+
+async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake {
+    use pplx_space_node_api_client::proto::{
+        GetDataPlaneOrgRevocationEpochResponse, GetDataPlaneSessionRevocationStateResponse,
+    };
+    use prost::Message as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut route = crate::tests::route_response_with_token(session_id, None);
+    route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+    route.adapter_state_json = r#"{"command":["sleep","600"]}"#.to_string();
+    let org_id = route.org_id.clone();
+    let route = route.encode_to_vec();
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+    let revocation = Arc::new(std::sync::Mutex::new(FakeRevocation::Active));
+    let failed_answers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (stdout, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stdout_rx = Arc::new(std::sync::Mutex::new(Some(stdout_rx)));
+    let fake = RevocationFake {
+        endpoint,
+        revocation: Arc::clone(&revocation),
+        failed_answers: Arc::clone(&failed_answers),
+        stdout,
+    };
+    let service = axum::Router::new().fallback(move |request: Request<Body>| {
+        let route = route.clone();
+        let org_id = org_id.clone();
+        let process_id = process_id.clone();
+        let answer = *revocation.lock().unwrap();
+        let failed_answers = Arc::clone(&failed_answers);
+        let stdout_rx = Arc::clone(&stdout_rx);
+        async move {
+            let path = request.uri().path().to_string();
+            if path.ends_with("/Check") {
+                return crate::tests::grpc_test_response(vec![8, 1]);
+            }
+            if matches!(answer, FakeRevocation::Slow) {
+                tokio::time::sleep(FAKE_SLOW_ANSWER).await;
+            }
+            if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                return crate::tests::grpc_test_response(route);
+            }
+            if path.ends_with("/BindDataPlaneSessionProcess") {
+                return crate::tests::grpc_test_response(Vec::new());
+            }
+            let org_epoch_request = path.ends_with("/GetDataPlaneOrgRevocationEpoch");
+            if org_epoch_request || path.ends_with("/GetDataPlaneSessionRevocationState") {
+                let failed = || failed_answers.fetch_add(1, Ordering::SeqCst);
+                let (epoch, status) = match answer {
+                    FakeRevocation::Active | FakeRevocation::Slow => {
+                        (1, DataPlaneRevocationStatus::Active)
+                    }
+                    FakeRevocation::Down => {
+                        failed();
+                        return tonic::Status::unavailable(FAKE_CLUSTER_API_OUTAGE)
+                            .into_http::<Body>();
+                    }
+                    FakeRevocation::Rejected => {
+                        failed();
+                        return tonic::Status::permission_denied(FAKE_CLUSTER_API_OUTAGE)
+                            .into_http::<Body>();
+                    }
+                    FakeRevocation::Hung => std::future::pending().await,
+                    FakeRevocation::HungAfterOrgEpochChange
+                    | FakeRevocation::SlowOrgThenHungSession
+                        if !org_epoch_request =>
+                    {
+                        std::future::pending().await
+                    }
+                    FakeRevocation::SlowOrgThenHungSession => {
+                        tokio::time::sleep(SPLIT_CHECK_ORG_READ).await;
+                        (2, DataPlaneRevocationStatus::Active)
+                    }
+                    FakeRevocation::Revoked => (2, DataPlaneRevocationStatus::Revoked),
+                    FakeRevocation::HungAfterOrgEpochChange => {
+                        (2, DataPlaneRevocationStatus::Active)
+                    }
+                };
+                if org_epoch_request {
+                    return crate::tests::grpc_test_response(
+                        GetDataPlaneOrgRevocationEpochResponse {
+                            org_id,
+                            epoch,
+                            updated_at: None,
+                        }
+                        .encode_to_vec(),
+                    );
+                }
+                return crate::tests::grpc_test_response(
+                    GetDataPlaneSessionRevocationStateResponse {
+                        session_id: session_id.to_string(),
+                        protocol_session_id: None,
+                        revocation: Some(DataPlaneRevocationState {
+                            epoch,
+                            status: status as i32,
+                            updated_at: None,
+                            reason: None,
+                            org_epoch: epoch,
+                        }),
+                        org_id,
+                    }
+                    .encode_to_vec(),
+                );
+            }
+            assert!(
+                path.ends_with("/SpacedStartProcess"),
+                "unexpected call {path}"
+            );
+            let event = move |event| {
+                Ok::<_, Infallible>(hyper::body::Frame::data(grpc_message(&ProcessEvent {
+                    process_id: process_id.clone(),
+                    pid: Some(42),
+                    event: Some(event),
+                })))
+            };
+            let started = event(spaced_process_event::Event::Started(
+                pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
+            ));
+            let output = tokio_stream::wrappers::UnboundedReceiverStream::new(
+                stdout_rx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one process stream"),
+            )
+            .map(move |data: &'static str| {
+                event(spaced_process_event::Event::Stdout(
+                    pplx_space_sbx_mgr_client::proto::SpacedProcessOutput {
+                        data: data.as_bytes().to_vec(),
+                    },
+                ))
+            });
+            let frames = futures_util::stream::iter([started]).chain(output);
+            Response::builder()
+                .header("content-type", "application/grpc")
+                .body(Body::new(http_body_util::StreamBody::new(frames)))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    fake
+}
+
+/// Revocation timings for the stream tests below. Checks run every 20ms. The
+/// staleness bound and check timeout are production's unless a test shortens
+/// them; their assertions count checks or wait on outcomes rather than
+/// measure time.
+struct RevocationTimings {
+    max_staleness: Duration,
+    check_timeout: Duration,
+}
+
+impl Default for RevocationTimings {
+    fn default() -> Self {
+        Self {
+            max_staleness: REVOCATION_MAX_STALENESS,
+            check_timeout: REVOCATION_CHECK_TIMEOUT,
+        }
+    }
+}
+
+/// Opens a process session's event stream against the fake and reads it until
+/// the process has started.
+async fn open_revocation_checked_events(
+    fake: &RevocationFake,
+    session_id: DataPlaneSessionId,
+    timings: RevocationTimings,
+) -> (tokio::sync::mpsc::UnboundedReceiver<String>, String) {
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    state.revocation_check_interval = Duration::from_millis(20);
+    state.revocation_max_staleness = timings.max_staleness;
+    state.revocation_check_timeout = timings.check_timeout;
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    let response = tower::ServiceExt::oneshot(
+        router(state),
+        Request::get(format!("/v1/sessions/{session_id}/events"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let (chunk_tx, mut chunks) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Ok(data) = frame.into_data()
+                && chunk_tx
+                    .send(String::from_utf8_lossy(&data).into_owned())
+                    .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "process_started").await;
+    (chunks, seen)
+}
+
+async fn assert_stream_ends(chunks: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while chunks.recv().await.is_some() {}
+    })
+    .await
+    .expect("the stream ends");
+}
+
+fn stdout_marker(data: &str) -> String {
+    BASE64_STANDARD.encode(data)
+}
+
+#[tokio::test]
+async fn process_stream_survives_a_revocation_outage_within_the_staleness_bound() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let (mut chunks, mut seen) =
+        open_revocation_checked_events(&fake, session_id, RevocationTimings::default()).await;
+
+    // Failed checks well inside the bound: output keeps flowing.
+    fake.answer(FakeRevocation::Down);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.failed_answers() < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("checks failed");
+    fake.print("during the outage");
+    read_until(&mut chunks, &mut seen, &stdout_marker("during the outage")).await;
+
+    fake.answer(FakeRevocation::Active);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fake.print("after the outage");
+    read_until(&mut chunks, &mut seen, &stdout_marker("after the outage")).await;
+    assert!(
+        !seen.contains("backend_stream_error") && !seen.contains("closed"),
+        "{seen}"
+    );
+}
+
+#[tokio::test]
+async fn process_stream_keeps_delivering_while_revocation_checks_hang() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let timings = RevocationTimings {
+        check_timeout: Duration::from_millis(100),
+        ..RevocationTimings::default()
+    };
+    let (mut chunks, mut seen) = open_revocation_checked_events(&fake, session_id, timings).await;
+
+    // Output sent while checks hang arrives as each one times out, long
+    // before the cluster API client's own 30-second deadline.
+    fake.answer(FakeRevocation::Hung);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fake.print("during the hang");
+    read_until(&mut chunks, &mut seen, &stdout_marker("during the hang")).await;
+
+    fake.answer(FakeRevocation::Active);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fake.print("after the hang");
+    read_until(&mut chunks, &mut seen, &stdout_marker("after the hang")).await;
+    assert!(
+        !seen.contains("backend_stream_error") && !seen.contains("closed"),
+        "{seen}"
+    );
+}
+
+#[tokio::test]
+async fn hung_check_after_an_org_revocation_fails_closed_once_it_times_out() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let timings = RevocationTimings {
+        check_timeout: Duration::from_millis(100),
+        ..RevocationTimings::default()
+    };
+    let (mut chunks, mut seen) = open_revocation_checked_events(&fake, session_id, timings).await;
+
+    // The org's epoch moved on, so the cached verdict no longer counts, and
+    // the session check that would settle it never answers.
+    fake.answer(FakeRevocation::HungAfterOrgEpochChange);
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    assert_stream_ends(&mut chunks).await;
+}
+
+#[tokio::test]
+async fn process_stream_fails_closed_once_its_verdict_is_older_than_the_bound() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let timings = RevocationTimings {
+        max_staleness: Duration::from_millis(500),
+        check_timeout: Duration::from_millis(50),
+    };
+    let (mut chunks, mut seen) = open_revocation_checked_events(&fake, session_id, timings).await;
+
+    fake.answer(FakeRevocation::Down);
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    // About 20 checks fit in the 430ms the verdict is kept; well over a few
+    // of them were ridden out before the stream failed closed.
+    assert!(
+        fake.failed_answers() >= 5,
+        "failed closed after {} failed checks",
+        fake.failed_answers()
+    );
+    assert!(seen.contains(r#""retryable":true"#), "{seen}");
+    assert!(
+        seen.contains(r#""message":"process event stream failed""#),
+        "{seen}"
+    );
+    assert!(
+        !seen.contains("192.0.2.10"),
+        "internal detail leaked: {seen}"
+    );
+    assert_stream_ends(&mut chunks).await;
+}
+
+#[tokio::test]
+async fn refused_revocation_check_fails_closed_at_once() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let (mut chunks, mut seen) =
+        open_revocation_checked_events(&fake, session_id, RevocationTimings::default()).await;
+
+    // The verdict is fresh, but a refusal is not an outage to ride out: the
+    // first one ends the stream.
+    fake.answer(FakeRevocation::Rejected);
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    assert_eq!(fake.failed_answers(), 1, "{seen}");
+    assert_stream_ends(&mut chunks).await;
+}
+
+/// Which failed checks keep a fresh verdict: every status the cluster API
+/// could not answer with, and nothing else.
+#[tokio::test]
+async fn only_unanswered_revocation_checks_keep_the_last_verdict() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let state = crate::tests::test_data_plane_state().await;
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    state.revocation_cache.remember_active(
+        session_id,
+        1,
+        OrgId::new(),
+        1,
+        start_revocation_read(&state),
+    );
+    for code in (0..=16).map(tonic::Code::from) {
+        let keeps = match code {
+            tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Internal
+            | tonic::Code::Unknown => true,
+            tonic::Code::Ok
+            | tonic::Code::InvalidArgument
+            | tonic::Code::NotFound
+            | tonic::Code::AlreadyExists
+            | tonic::Code::PermissionDenied
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::Aborted
+            | tonic::Code::OutOfRange
+            | tonic::Code::Unimplemented
+            | tonic::Code::DataLoss
+            | tonic::Code::Unauthenticated => false,
+        };
+        let error = StreamBridgeError::RevocationStatus(tonic::Status::new(code, "synthetic"));
+        assert_eq!(
+            keeps_last_verdict(&state, session_id, &error),
+            keeps,
+            "{code:?}"
+        );
+    }
+    // Answers that decoded but could not be used.
+    for error in [
+        StreamBridgeError::MissingRevocationState,
+        StreamBridgeError::RouteState("invalid_org_id"),
+    ] {
+        assert!(!keeps_last_verdict(&state, session_id, &error), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn revoked_session_ends_its_stream_at_once() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let (mut chunks, mut seen) =
+        open_revocation_checked_events(&fake, session_id, RevocationTimings::default()).await;
+
+    // Even mid-outage, a revocation the next check confirms ends the stream
+    // without waiting out the minute-long staleness bound.
+    fake.answer(FakeRevocation::Down);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fake.answer(FakeRevocation::Revoked);
+    read_until(&mut chunks, &mut seen, r#""reason":"revoked""#).await;
+    assert_stream_ends(&mut chunks).await;
+}
+
+/// At production timings and on a paused clock, for every phase of the stream's
+/// checks against its last confirmed read: failed checks keep the verdict
+/// while the stream can still end within the bound, and no longer.
+#[tokio::test]
+async fn failed_checks_keep_a_verdict_only_while_the_stream_ends_within_the_bound() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let mut state = crate::tests::test_data_plane_state().await;
+    // Nothing below reaches the network, so the clock moves only as told.
+    tokio::time::pause();
+    state.revocation_check_interval =
+        Duration::from_millis(crate::DEFAULT_REVOCATION_CHECK_INTERVAL_MS);
+    let interval = state.revocation_check_interval;
+    // The check that fails closed may take the whole check timeout, so it
+    // must start no later than this after the read that confirmed the
+    // verdict; and since checks are an interval apart, no earlier than one
+    // interval before it.
+    let latest_start = REVOCATION_MAX_STALENESS - REVOCATION_CHECK_TIMEOUT;
+    let unavailable =
+        StreamBridgeError::RevocationStatus(tonic::Status::unavailable("synthetic outage"));
+    let step = Duration::from_millis(250);
+    let phases = (interval.as_millis() / step.as_millis()) as u32;
+    for phase in (0..phases).map(|n| step * n) {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        state.revocation_cache.remember_active(
+            session_id,
+            1,
+            OrgId::new(),
+            1,
+            start_revocation_read(&state),
+        );
+        let confirmed = tokio::time::Instant::now();
+        // The first check `phase` after the confirmation, then one per
+        // interval, each decided as soon as it starts.
+        tokio::time::advance(phase).await;
+        let failing_check_started = loop {
+            if !keeps_last_verdict(&state, session_id, &unavailable) {
+                break confirmed.elapsed();
+            }
+            tokio::time::advance(interval).await;
+        };
+        assert!(
+            failing_check_started <= latest_start,
+            "phase {phase:?}: the failing check started {failing_check_started:?} after \
+             the confirmed read"
+        );
+        assert!(
+            failing_check_started >= latest_start - interval,
+            "phase {phase:?}: the failing check started {failing_check_started:?} after \
+             the confirmed read, a whole interval early"
+        );
+    }
+}
+
+/// A stream alone in its org re-reads the org on each of its checks, even
+/// when a check starts a little sooner than one interval after the previous
+/// read began.
+#[tokio::test]
+async fn lone_stream_rereads_its_org_on_every_check() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let mut state = crate::tests::test_data_plane_state().await;
+    tokio::time::pause();
+    state.revocation_check_interval =
+        Duration::from_millis(crate::DEFAULT_REVOCATION_CHECK_INTERVAL_MS);
+    let interval = state.revocation_check_interval;
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let org_id = OrgId::new();
+    state
+        .revocation_cache
+        .remember_active(session_id, 1, org_id, 1, start_revocation_read(&state));
+    for early in [0, 1, 50, 500].map(Duration::from_millis) {
+        tokio::time::advance(interval - early).await;
+        let RevocationProbe::RefreshOrg(refresh) = state
+            .revocation_cache
+            .probe(session_id, revocation_tolerance(&state))
+        else {
+            panic!("a check {early:?} early answered from the cache");
+        };
+        state
+            .revocation_cache
+            .remember_org_epoch(org_id, 1, start_revocation_read(&state));
+        drop(refresh.guard);
+    }
+}
+
+/// The org's confirmation is dated from when each read that confirmed it
+/// began, whether a route resolve or a revocation check, not from when its
+/// slow answer arrived.
+#[tokio::test]
+async fn revocation_verdicts_are_dated_from_when_their_read_began() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    // Every answer is due for a refresh by the time the next read starts.
+    state.revocation_check_interval = Duration::from_millis(1);
+    fake.answer(FakeRevocation::Slow);
+    let assert_dated_from = |read: &str, began: tokio::time::Instant, state: &DataPlaneState| {
+        let org_id = state
+            .revocation_cache
+            .entries
+            .get(&session_id.to_string())
+            .unwrap()
+            .org_id;
+        let confirmed_at = state
+            .revocation_cache
+            .orgs
+            .get(&org_id)
+            .unwrap()
+            .confirmed_at;
+        assert!(
+            confirmed_at >= began && confirmed_at < began + FAKE_SLOW_ANSWER,
+            "{read}: confirmed {:?} after the read began",
+            confirmed_at - began
+        );
+    };
+
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    let began = tokio::time::Instant::now();
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+    assert_dated_from("route resolve", began, &state);
+
+    let began = tokio::time::Instant::now();
+    resolve_session_route_internal(&state, session_id)
+        .await
+        .unwrap();
+    assert_dated_from("internal route resolve", began, &state);
+
+    let began = tokio::time::Instant::now();
+    assert!(!session_is_revoked(&state, session_id).await.unwrap());
+    assert_dated_from("org check", began, &state);
+
+    state.revocation_cache.forget(session_id);
+    let began = tokio::time::Instant::now();
+    assert!(!session_is_revoked(&state, session_id).await.unwrap());
+    assert_dated_from("session check", began, &state);
+}
+
+/// A check that reads the org and then the session gets one timeout for
+/// both reads, not one each.
+#[tokio::test]
+async fn revocation_check_has_one_timeout_across_its_reads() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    state.revocation_check_timeout = SPLIT_CHECK_TIMEOUT;
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+
+    fake.answer(FakeRevocation::SlowOrgThenHungSession);
+    make_org_refresh_due(&state, session_id);
+    let started = tokio::time::Instant::now();
+    let error = session_is_revoked(&state, session_id)
+        .await
+        .expect_err("the org moved on, so the hung session read fails closed");
+    let took = started.elapsed();
+    assert!(
+        matches!(&error, StreamBridgeError::RevocationStatus(status)
+            if status.code() == tonic::Code::DeadlineExceeded),
+        "{error}"
+    );
+    // Halfway between one timeout and the org read plus a second timeout.
+    assert!(
+        took < SPLIT_CHECK_TIMEOUT + SPLIT_CHECK_ORG_READ / 2,
+        "the check took {took:?}"
+    );
+}
+
+#[tokio::test]
+async fn route_cache_hit_does_not_confirm_the_revocation_verdict() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    let interval = Duration::from_millis(crate::DEFAULT_REVOCATION_CHECK_INTERVAL_MS);
+    state.revocation_check_interval = interval;
+    state.route_cache_ttl = 10 * REVOCATION_MAX_STALENESS;
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+    let tolerance = Duration::from_secs(1);
+    assert!(
+        state
+            .revocation_cache
+            .confirmed_active(session_id, tolerance)
+    );
+
+    // Past the tolerance, an attach answered from the route cache asked the
+    // cluster API nothing, so the verdict is as old as it was. Nothing below
+    // reaches the network, so the paused clock moves only as told.
+    tokio::time::pause();
+    tokio::time::advance(2 * tolerance).await;
+    state.revocation_cache.forget(session_id);
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+    assert!(
+        !state
+            .revocation_cache
+            .confirmed_active(session_id, tolerance)
+    );
+    assert!(matches!(
+        state
+            .revocation_cache
+            .probe(session_id, revocation_tolerance(&state)),
+        RevocationProbe::Fresh(true)
+    ));
+    // The resolve set the next refresh just under one interval after it
+    // began; the cache hit must not have moved it later. This lands a
+    // tolerance past that refresh, and a tolerance short of where one set by
+    // the cache hit would fall.
+    let fresh_for = interval - interval / 10;
+    tokio::time::advance(fresh_for - tolerance).await;
+    assert!(
+        matches!(
+            state
+                .revocation_cache
+                .probe(session_id, revocation_tolerance(&state)),
+            RevocationProbe::RefreshOrg(_)
+        ),
+        "the cache hit pushed the org's next refresh out"
+    );
+}
+
+/// How the fake backend fails a native WebSocket session.
+#[derive(Clone, Copy)]
+enum BackendFailure {
+    /// The backend stream errors after its first event.
+    MidStream,
+    /// The stream stays open, and a terminal resize is refused.
+    ResizeRefused,
+}
+
+/// Backend status text naming an internal endpoint, which must stay out of
+/// public frames.
+const BACKEND_FAILURE_DETAIL: &str = "dial 192.0.2.10:9443: connection refused";
+
+/// A fake cluster API and worker for one native session that fail it as
+/// `failure` says. Returns its endpoint.
+async fn spawn_backend_failure_fake(
+    session_id: DataPlaneSessionId,
+    failure: BackendFailure,
+) -> String {
+    use prost::Message as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut route = crate::tests::route_response_with_token(session_id, None);
+    route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+    route.adapter_state_json = match session_id.kind() {
+        SessionKind::FileWatch => r#"{"path":"/tmp"}"#,
+        _ => r#"{"command":["sleep","600"]}"#,
+    }
+    .to_string();
+    let route = route.encode_to_vec();
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+    let service = axum::Router::new().fallback(move |request: Request<Body>| {
+        let route = route.clone();
+        let process_id = process_id.clone();
+        async move {
+            let path = request.uri().path().to_string();
+            if path.ends_with("/Check") {
+                return crate::tests::grpc_test_response(vec![8, 1]);
+            }
+            if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                return crate::tests::grpc_test_response(route);
+            }
+            if path.ends_with("/BindDataPlaneSessionProcess") {
+                return crate::tests::grpc_test_response(Vec::new());
+            }
+            if path.ends_with("/SpacedResizePty") {
+                return tonic::Status::failed_precondition(BACKEND_FAILURE_DETAIL)
+                    .into_http::<Body>();
+            }
+            let first = if path.ends_with("/SpacedWatch") {
+                grpc_message(&FileEvent {
+                    path: "/tmp/changed".to_string(),
+                    kind: SpacedFileEventKind::Modified as i32,
+                    ..Default::default()
+                })
+            } else {
+                assert!(
+                    path.ends_with("/SpacedStartProcess"),
+                    "unexpected call {path}"
+                );
+                grpc_message(&ProcessEvent {
+                    process_id,
+                    pid: Some(42),
+                    event: Some(spaced_process_event::Event::Started(
+                        pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
+                    )),
+                })
+            };
+            let mut trailers = HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("13"));
+            trailers.insert(
+                "grpc-message",
+                HeaderValue::from_static(BACKEND_FAILURE_DETAIL),
+            );
+            let end = match failure {
+                BackendFailure::MidStream => Some(hyper::body::Frame::trailers(trailers)),
+                BackendFailure::ResizeRefused => None,
+            };
+            let frames = futures_util::stream::iter(
+                [Some(hyper::body::Frame::data(first)), end]
+                    .into_iter()
+                    .flatten()
+                    .map(Ok::<_, Infallible>),
+            )
+            .chain(futures_util::stream::pending());
+            Response::builder()
+                .header("content-type", "application/grpc")
+                .body(Body::new(http_body_util::StreamBody::new(frames)))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    endpoint
+}
+
+/// Serves the data plane against the fake at `endpoint` and attaches a native
+/// WebSocket to the session, returning the upgraded connection.
+async fn attach_native_websocket(
+    endpoint: &str,
+    session_id: DataPlaneSessionId,
+) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(endpoint.to_string(), "test")
+            .await
+            .unwrap(),
+    );
+    state.revocation_check_interval = Duration::from_secs(3600);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(
+        format!(
+            "GET /v1/sessions/{session_id}/attach HTTP/1.1\r\n\
+             Host: data-plane.test\r\n\
+             Authorization: Bearer {DATA_PLANE_TOKEN_PREFIX}{}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: {}\r\n\r\n",
+            "c".repeat(64),
+            BASE64_STANDARD.encode(b"native-test-nonc"),
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0_u8; 1];
+        tcp.read_exact(&mut byte).await.expect("upgrade response");
+        response.push(byte[0]);
+    }
+    assert!(response.starts_with(b"HTTP/1.1 101"));
+    tcp
+}
+
+/// Reads server text frames into `seen` until one contains `marker`.
+async fn read_websocket_until(tcp: &mut tokio::net::TcpStream, seen: &mut String, marker: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !seen.contains(marker) {
+            let (opcode, payload) = crate::tests::read_server_frame(tcp).await;
+            assert_eq!(opcode, 0x1, "text frames until {marker}; saw {seen}");
+            seen.push_str(&String::from_utf8_lossy(&payload));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{marker} within 5s; saw {seen}"));
+}
+
+/// Sends one short client text frame. Client frames must be masked; an
+/// all-zero key leaves the payload as written.
+async fn send_websocket_text(tcp: &mut tokio::net::TcpStream, text: &str) {
+    use tokio::io::AsyncWriteExt;
+    let len = u8::try_from(text.len())
+        .ok()
+        .filter(|len| *len < 126)
+        .unwrap();
+    let mut frame = vec![0x81, 0x80 | len, 0, 0, 0, 0];
+    frame.extend_from_slice(text.as_bytes());
+    tcp.write_all(&frame).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_backend_stream_errors_carry_a_fixed_message() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    for (kind, live, message) in [
+        (
+            SessionKind::Process,
+            "process_started",
+            PROCESS_STREAM_FAILED,
+        ),
+        (
+            SessionKind::FileWatch,
+            "file_event",
+            FILE_WATCH_STREAM_FAILED,
+        ),
+    ] {
+        let session_id = DataPlaneSessionId::new_for_kind(kind);
+        let endpoint = spawn_backend_failure_fake(session_id, BackendFailure::MidStream).await;
+        let mut tcp = attach_native_websocket(&endpoint, session_id).await;
+        let mut seen = String::new();
+        read_websocket_until(&mut tcp, &mut seen, live).await;
+        read_websocket_until(&mut tcp, &mut seen, "backend_stream_error").await;
+        assert!(
+            seen.contains(&format!(r#""message":"{message}""#)),
+            "{kind:?}: {seen}"
+        );
+        assert!(
+            !seen.contains("192.0.2.10"),
+            "{kind:?}: internal detail leaked: {seen}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn websocket_resize_refusal_carries_a_fixed_message() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let endpoint = spawn_backend_failure_fake(session_id, BackendFailure::ResizeRefused).await;
+    let mut tcp = attach_native_websocket(&endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "process_started").await;
+    send_websocket_text(&mut tcp, r#"{"type":"resize","cols":80,"rows":24}"#).await;
+    read_websocket_until(&mut tcp, &mut seen, "resize_not_supported").await;
+    assert!(
+        seen.contains(r#""message":"terminal resize is not supported by this process""#),
+        "{seen}"
+    );
+    assert!(
+        !seen.contains("192.0.2.10"),
+        "internal detail leaked: {seen}"
+    );
 }

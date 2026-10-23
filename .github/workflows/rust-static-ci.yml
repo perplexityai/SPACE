@@ -37,6 +37,20 @@ jobs:
             cargo_registry: restore
             timeout: 45
             archcheck: true
+          # Lints libraries one at a time (ci/scripts/lib/rust-isolated-crates.sh)
+          # in a job of its own, so it lengthens neither clippy nor the tests.
+          # Its compiler cache is a family of its own: its crates build with
+          # other feature sets than the workspace pass, and two jobs saving one
+          # family would replace and trim each other's snapshots.
+          - name: Rust isolated crates
+            command: bash ci/scripts/run-rust-checks.sh isolated-crates
+            runner: ubuntu-24.04-16core
+            rust_cache: true
+            rust_cache_key: isolated-crates
+            rust_cache_size: 2G
+            rust_cache_refresh_misses: 20
+            cargo_registry: restore
+            timeout: 45
 
     steps:
       - name: Check out SPACE

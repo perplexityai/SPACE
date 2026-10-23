@@ -1,0 +1,31 @@
+[package]
+name = "pplx-space-ecw-credential"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes `EcwCredentialKeyring::from_current_key_for_test` to other crates'
+# tests. Unit tests get it under `cfg(test)`.
+test-support = []
+
+[dependencies]
+base64 = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true }
+
+[dev-dependencies]
+pplx-space-test-env = { workspace = true }

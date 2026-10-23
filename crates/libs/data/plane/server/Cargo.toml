@@ -38,6 +38,9 @@ rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# `all` gates TcpKeepalive::with_retries, which the listener sets, and the
+# socket option getters the listener test reads.
+socket2 = { workspace = true, features = ["all"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["formatting"] }

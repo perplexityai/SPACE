@@ -22,7 +22,7 @@ node: {}
 # for tracked tasks while it holds its service mutex
 # (crates/libs/node/mgr/server/src/run.rs); the kubelet's SIGKILL ends that
 # wait. 60 s is the grace the shared lifecycle defaults are sized against
-# (crates/libs/common/svc/src/lifecycle.rs) and stays inside the successor's
+# (crates/libs/service-lifecycle/src/lib.rs) and stays inside the successor's
 # 180 s mutex wait (--service-mutex-timeout-secs default).
 terminationGracePeriodSeconds: 60
 

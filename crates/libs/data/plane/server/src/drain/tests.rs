@@ -1,5 +1,5 @@
 use super::*;
-use crate::tests::test_data_plane_state;
+use crate::tests::{read_server_frame, test_data_plane_state};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -28,7 +28,7 @@ async fn start_drain(
     let force_token = CancellationToken::new();
     let tasks = TaskTracker::new();
     let server = tokio::spawn(serve_and_drain(
-        pplx_space_common_svc::http_listener::nodelay(listener),
+        data_plane_listener(listener),
         app(stream_shutdown_token.clone()),
         DrainLifecycle {
             shutdown_token: shutdown_token.clone(),
@@ -372,28 +372,6 @@ async fn drain_refusals_close_http1_connections_only() {
     assert!(response.headers().get(header::CONNECTION).is_none());
 }
 
-/// Read one server WebSocket frame header from `tcp` and return its opcode and
-/// payload. Server frames are never masked, so the header is two bytes plus an
-/// optional extended length.
-async fn read_server_frame(tcp: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
-    let mut header = [0_u8; 2];
-    tcp.read_exact(&mut header).await.expect("frame header");
-    let opcode = header[0] & 0x0f;
-    let len = match header[1] & 0x7f {
-        126 => {
-            let mut extended = [0_u8; 2];
-            tcp.read_exact(&mut extended)
-                .await
-                .expect("extended length");
-            usize::from(u16::from_be_bytes(extended))
-        }
-        len => usize::from(len),
-    };
-    let mut payload = vec![0_u8; len];
-    tcp.read_exact(&mut payload).await.expect("frame payload");
-    (opcode, payload)
-}
-
 #[tokio::test]
 async fn unattached_websocket_is_told_to_reconnect_when_the_drain_starts() {
     if !insecure_dev_test_process() {
@@ -409,7 +387,7 @@ async fn unattached_websocket_is_told_to_reconnect_when_the_drain_starts() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_and_drain(
-        pplx_space_common_svc::http_listener::nodelay(listener),
+        data_plane_listener(listener),
         router(state),
         DrainLifecycle {
             shutdown_token: shutdown_token.clone(),

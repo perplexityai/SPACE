@@ -463,6 +463,7 @@ fn policy_facets_pull_periodically_but_do_not_publish_unprompted() {
     assert_eq!(
         ref_names(periodic_inbound_refs()),
         vec![
+            FACET_RUNTIME_PROVISIONING,
             FACET_NETWORK_POLICY,
             FACET_SANDBOX_DESIRED_STATE,
             FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,

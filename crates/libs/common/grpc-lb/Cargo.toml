@@ -25,7 +25,7 @@ k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["aws-lc-rs", "client", "config", "runtime", "rustls-tls"], optional = true }
 
 # internal
-pplx-space-metrics = { workspace = true }
+pplx-space-grpc-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 
 [dev-dependencies]

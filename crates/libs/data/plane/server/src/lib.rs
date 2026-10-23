@@ -143,6 +143,21 @@ pub const DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX: usize = 512;
 pub const DEFAULT_BACKEND_CHANNEL_POOL_SIZE: usize = 4;
 pub const DEFAULT_REVOCATION_CHECK_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_ROUTE_CACHE_TTL_MS: u64 = 1_000;
+/// How long after its last confirmed revocation check an attached stream may
+/// keep running while later checks fail, before it fails closed.
+const REVOCATION_MAX_STALENESS: Duration = Duration::from_secs(60);
+/// How long one revocation check may wait on the cluster API, across all of
+/// its reads. A check that takes longer counts as unavailable.
+const REVOCATION_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// The longest revocation check interval the service accepts: a third of
+/// what is left of the staleness bound after one check timeout, 19 s at the
+/// defaults. A failed check keeps a verdict until it is that bound less one
+/// interval and one timeout old, so at this interval or below that is at
+/// least two intervals: a stream rides out at least the first failed check
+/// after a confirmed one, and a refresh another stream has in flight can
+/// still answer for it.
+pub const MAX_REVOCATION_CHECK_INTERVAL_MS: u64 =
+    ((REVOCATION_MAX_STALENESS.as_millis() - REVOCATION_CHECK_TIMEOUT.as_millis()) / 3) as u64;
 /// The shortest drain deadline the service accepts: the 8-second stream-open
 /// budget, so a `Process.Start` already opening when SIGTERM arrives finishes
 /// opening, and can report whether the command started, before the deadline.
@@ -205,6 +220,8 @@ pub struct DataPlaneConfig {
     pub max_attached_streams_per_org: usize,
     pub max_attached_streams_per_sandbox: usize,
     pub backend_channel_pool_size: usize,
+    /// At most [`MAX_REVOCATION_CHECK_INTERVAL_MS`]; [`run`] refuses a longer
+    /// one.
     pub revocation_check_interval: Duration,
     pub route_cache_ttl: Duration,
     /// `None` leaves `POST /files` unbounded.
@@ -252,6 +269,8 @@ struct DataPlaneState {
     ecw_process_input_locks: Arc<EcwProcessInputLocks>,
     ecw_hosts: Arc<EcwHostConfig>,
     revocation_check_interval: Duration,
+    revocation_max_staleness: Duration,
+    revocation_check_timeout: Duration,
     route_cache_ttl: Duration,
     /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
     /// streams are refused once it is cancelled, and sockets still
@@ -361,8 +380,26 @@ fn cluster_api_flag_attributes() -> Attributes {
     attributes
 }
 
+impl DataPlaneConfig {
+    /// Check the settings [`run`] cannot serve with.
+    pub fn validate(&self) -> Result<(), RunDataPlaneError> {
+        if self.revocation_check_interval > Duration::from_millis(MAX_REVOCATION_CHECK_INTERVAL_MS)
+        {
+            return Err(RunDataPlaneError::RevocationCheckIntervalTooLong {
+                interval_ms: self.revocation_check_interval.as_millis(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RunDataPlaneError {
+    #[error(
+        "revocation check interval of {interval_ms} ms is above the maximum of {} ms",
+        MAX_REVOCATION_CHECK_INTERVAL_MS
+    )]
+    RevocationCheckIntervalTooLong { interval_ms: u128 },
     #[error("failed to connect to SPACE internal ClusterApi: {0}")]
     ConnectClusterApi(#[source] ConnectClusterApiError),
     #[error("failed to bind data-plane listener at {listen}: {source}")]
@@ -382,6 +419,7 @@ pub async fn run(
     config: DataPlaneConfig,
     stop: pplx_space_common_svc::StopTokens,
 ) -> Result<(), RunDataPlaneError> {
+    config.validate()?;
     let pplx_space_common_svc::StopTokens {
         shutdown: shutdown_token,
         forced: force_token,
@@ -420,12 +458,20 @@ pub async fn run(
         revocation_check_interval: config
             .revocation_check_interval
             .max(Duration::from_millis(1)),
+        revocation_max_staleness: REVOCATION_MAX_STALENESS,
+        revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
         drain_started,
         stream_shutdown_token: stream_shutdown_token.clone(),
         upgrade_tasks: upgrade_tasks.clone(),
     };
 
+    tracing::info!(
+        revocation_check_interval_ms = state.revocation_check_interval.as_millis(),
+        revocation_tolerance_ms = native::revocation_tolerance(&state).as_millis(),
+        "attached streams keep a confirmed revocation verdict through failed checks \
+         for up to the revocation tolerance"
+    );
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -436,7 +482,7 @@ pub async fn run(
     tracing::info!(listen = %config.listen, "space-data-plane-svc listening");
 
     serve_and_drain(
-        pplx_space_common_svc::http_listener::nodelay(listener),
+        data_plane_listener(listener),
         app,
         DrainLifecycle {
             shutdown_token,
@@ -449,6 +495,49 @@ pub async fn run(
     )
     .await
     .map_err(RunDataPlaneError::Serve)
+}
+
+/// How long an accepted connection may sit idle before its first keepalive
+/// probe.
+const DATA_PLANE_TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+/// How long between keepalive probes.
+const DATA_PLANE_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// How many unanswered keepalive probes drop the connection.
+const DATA_PLANE_TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+type DataPlaneListener = axum::serve::TapIo<
+    pplx_space_common_svc::http_listener::NodelayListener,
+    fn(&mut tokio::net::TcpStream),
+>;
+
+/// Accept connections with `TCP_NODELAY` and the data plane's dead-peer
+/// detection set, on every route this listener serves, ECW's included.
+///
+/// Keepalive probes a connection that carries nothing for 30 seconds and drops
+/// it after about a minute of silence, so an idle connection that dies
+/// silently releases its stream, and the node's per-sandbox permit behind it.
+/// It detects the immediate TCP peer, which is often a proxy rather than the
+/// end client. It never closes a connection whose peer still answers, so it
+/// sets no limit on how long a client may stop reading. A stream that sends
+/// regularly, such as SSE with its 15-second keep-alive comments, is never
+/// idle, so a dead peer on it waits out the kernel's retransmission timeout.
+/// No `TCP_USER_TIMEOUT` is set: this listener serves ECW routes too, and on
+/// Linux that option would also decide when keepalive gives up.
+fn data_plane_listener(listener: tokio::net::TcpListener) -> DataPlaneListener {
+    fn set_dead_peer_detection(tcp: &mut tokio::net::TcpStream) {
+        let socket = socket2::SockRef::from(&*tcp);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(DATA_PLANE_TCP_KEEPALIVE_TIME)
+            .with_interval(DATA_PLANE_TCP_KEEPALIVE_INTERVAL)
+            .with_retries(DATA_PLANE_TCP_KEEPALIVE_RETRIES);
+        if let Err(error) = socket.set_tcp_keepalive(&keepalive) {
+            tracing::debug!(%error, "failed to set TCP keepalive on an accepted connection");
+        }
+    }
+    axum::serve::ListenerExt::tap_io(
+        pplx_space_common_svc::http_listener::nodelay(listener),
+        set_dead_peer_detection as fn(&mut tokio::net::TcpStream),
+    )
 }
 
 async fn connect_cluster_api_clients_for_startup(

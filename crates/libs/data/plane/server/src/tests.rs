@@ -870,6 +870,36 @@ async fn spawn_cluster_api_stub() -> std::net::SocketAddr {
     addr
 }
 
+#[tokio::test]
+async fn accepted_connections_detect_dead_peers() {
+    use axum::serve::Listener;
+
+    let mut listener =
+        data_plane_listener(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let address = listener.local_addr().unwrap();
+    let _client = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (accepted, _peer) = listener.accept().await;
+    assert!(accepted.nodelay().unwrap());
+    let socket = socket2::SockRef::from(&accepted);
+    assert!(socket.keepalive().unwrap());
+    assert_eq!(
+        socket.tcp_keepalive_time().unwrap(),
+        DATA_PLANE_TCP_KEEPALIVE_TIME
+    );
+    assert_eq!(
+        socket.tcp_keepalive_interval().unwrap(),
+        DATA_PLANE_TCP_KEEPALIVE_INTERVAL
+    );
+    assert_eq!(
+        socket.tcp_keepalive_retries().unwrap(),
+        DATA_PLANE_TCP_KEEPALIVE_RETRIES
+    );
+    // A user timeout would cap how long a client may stop reading, ECW's
+    // included, and on Linux would decide when keepalive gives up.
+    #[cfg(target_os = "linux")]
+    assert_eq!(socket.tcp_user_timeout().unwrap(), None);
+}
+
 pub(crate) async fn test_data_plane_state() -> DataPlaneState {
     let addr = spawn_cluster_api_stub().await;
     let cluster_api =
@@ -891,6 +921,8 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         ecw_process_input_locks: Arc::new(EcwProcessInputLocks::default()),
         ecw_hosts: Arc::default(),
         revocation_check_interval: Duration::from_secs(1),
+        revocation_max_staleness: REVOCATION_MAX_STALENESS,
+        revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
         route_cache_ttl: Duration::from_secs(60),
         drain_started: CancellationToken::new(),
         stream_shutdown_token: CancellationToken::new(),
@@ -1137,6 +1169,68 @@ async fn backend_channels_accept_bare_direct_node_endpoints() {
 
     assert_eq!(channels.len(), 2);
     assert_eq!(dns_channels.len(), 1);
+}
+
+#[tokio::test]
+async fn backend_channels_advertise_the_configured_connection_window() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const FRAME_SETTINGS: u8 = 0x4;
+    const FRAME_WINDOW_UPDATE: u8 = 0x8;
+    const DEFAULT_WINDOW: u32 = 65_535;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let channel = build_backend_channels(&endpoint, 1)
+        .await
+        .expect("backend channel")
+        .remove(0);
+    // A lazy channel dials on its first call; the call itself never completes.
+    let call = tokio::spawn(
+        channel.oneshot(
+            tonic::codegen::http::Request::builder()
+                .uri(format!("http://{endpoint}/probe"))
+                .body(tonic::body::Body::empty())
+                .unwrap(),
+        ),
+    );
+
+    let increment = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut preface = [0; PREFACE.len()];
+        socket.read_exact(&mut preface).await.unwrap();
+        assert_eq!(preface, PREFACE);
+        socket
+            .write_all(&[0, 0, 0, FRAME_SETTINGS, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        // The client raises the connection window past the protocol default
+        // with a WINDOW_UPDATE on stream 0.
+        loop {
+            let mut header = [0; 9];
+            socket.read_exact(&mut header).await.unwrap();
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
+            let mut payload = vec![0; len];
+            socket.read_exact(&mut payload).await.unwrap();
+            if header[3] == FRAME_WINDOW_UPDATE && stream & 0x7fff_ffff == 0 {
+                break u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fff_ffff;
+            }
+        }
+    })
+    .await
+    .expect("connection WINDOW_UPDATE");
+    call.abort();
+
+    assert_eq!(
+        DEFAULT_WINDOW + increment,
+        pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES
+    );
 }
 
 #[tokio::test]
@@ -1815,6 +1909,41 @@ fn native_session_limiter_allows_one_terminal_or_process_attach() {
     );
 }
 
+/// The tolerance production derives from its default check interval.
+fn production_revocation_tolerance() -> Duration {
+    crate::native::revocation_tolerance_within(
+        REVOCATION_MAX_STALENESS,
+        Duration::from_millis(DEFAULT_REVOCATION_CHECK_INTERVAL_MS),
+        REVOCATION_CHECK_TIMEOUT,
+    )
+}
+
+#[tokio::test]
+async fn run_refuses_a_revocation_check_interval_above_the_maximum() {
+    let maximum = Duration::from_millis(MAX_REVOCATION_CHECK_INTERVAL_MS);
+    let config = |revocation_check_interval| DataPlaneConfig {
+        revocation_check_interval,
+        ..DataPlaneConfig::default()
+    };
+    config(maximum).validate().unwrap();
+    let above = config(maximum + Duration::from_millis(1));
+    assert!(matches!(
+        above.validate(),
+        Err(RunDataPlaneError::RevocationCheckIntervalTooLong { .. })
+    ));
+    // Refused before it connects to anything.
+    let stop = pplx_space_common_svc::StopTokens {
+        shutdown: CancellationToken::new(),
+        forced: CancellationToken::new(),
+    };
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), run(above, stop)).await,
+        Ok(Err(
+            RunDataPlaneError::RevocationCheckIntervalTooLong { .. }
+        ))
+    ));
+}
+
 #[test]
 fn revocation_cache_uses_epoch_and_coalesces_refresh() {
     let cache = Arc::new(RevocationCache::default());
@@ -1822,41 +1951,67 @@ fn revocation_cache_uses_epoch_and_coalesces_refresh() {
     let org_id = OrgId::new();
 
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, production_revocation_tolerance()),
         RevocationProbe::RefreshSession
     ));
 
-    cache.remember_active(session_id, 10, org_id, 20, Duration::from_secs(60));
+    cache.remember_active(
+        session_id,
+        10,
+        org_id,
+        20,
+        RevocationRead::start(Duration::from_secs(60)),
+    );
     assert_eq!(cache.cached_epoch(session_id), Some(10));
     assert_eq!(cache.cached_org_epoch(org_id), Some(20));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, production_revocation_tolerance()),
         RevocationProbe::Fresh(true)
     ));
 
-    cache.remember_state(session_id, 9, false, org_id, 19, Duration::from_secs(60));
+    cache.remember_state(
+        session_id,
+        9,
+        false,
+        org_id,
+        19,
+        RevocationRead::start(Duration::from_secs(60)),
+    );
     assert_eq!(cache.cached_epoch(session_id), Some(10));
     assert_eq!(cache.cached_org_epoch(org_id), Some(20));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, production_revocation_tolerance()),
         RevocationProbe::Fresh(true)
     ));
 
-    cache.remember_state(session_id, 11, false, org_id, 21, Duration::from_secs(60));
+    cache.remember_state(
+        session_id,
+        11,
+        false,
+        org_id,
+        21,
+        RevocationRead::start(Duration::from_secs(60)),
+    );
     assert_eq!(cache.cached_epoch(session_id), Some(11));
     assert_eq!(cache.cached_org_epoch(org_id), Some(21));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, production_revocation_tolerance()),
         RevocationProbe::Fresh(false)
     ));
 
-    cache.remember_active(session_id, 12, org_id, 22, Duration::from_millis(0));
-    let guard = match cache.probe(session_id) {
+    cache.remember_active(
+        session_id,
+        12,
+        org_id,
+        22,
+        RevocationRead::start(Duration::from_millis(0)),
+    );
+    let guard = match cache.probe(session_id, production_revocation_tolerance()) {
         RevocationProbe::RefreshOrg(refresh) => refresh.guard,
         other => panic!("expected refresh probe for expired entry, got {other:?}"),
     };
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, production_revocation_tolerance()),
         RevocationProbe::RefreshInFlight(true)
     ));
     drop(guard);
@@ -1871,9 +2026,15 @@ fn revocation_cache_refreshes_session_behind_org_epoch() {
     let session_id = DataPlaneSessionId::Process(Default::default());
     let org_id = OrgId::new();
 
-    cache.remember_active(session_id, 10, org_id, 20, Duration::from_secs(60));
+    cache.remember_active(
+        session_id,
+        10,
+        org_id,
+        20,
+        RevocationRead::start(Duration::from_secs(60)),
+    );
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, production_revocation_tolerance()),
         RevocationProbe::Fresh(true)
     ));
 
@@ -1881,17 +2042,23 @@ fn revocation_cache_refreshes_session_behind_org_epoch() {
     // refresh recorded the new epoch before this session's tick. The org
     // entry's TTL is fresh, but this session's own row was last read under
     // the old epoch, so it must be re-fetched rather than reported fresh.
-    cache.remember_org_epoch(org_id, 21, Duration::from_secs(60));
+    cache.remember_org_epoch(org_id, 21, RevocationRead::start(Duration::from_secs(60)));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, production_revocation_tolerance()),
         RevocationProbe::RefreshSession
     ));
 
     // Once the session row has been re-read under the current epoch the
     // cache answers from memory again.
-    cache.remember_active(session_id, 11, org_id, 21, Duration::from_secs(60));
+    cache.remember_active(
+        session_id,
+        11,
+        org_id,
+        21,
+        RevocationRead::start(Duration::from_secs(60)),
+    );
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, production_revocation_tolerance()),
         RevocationProbe::Fresh(true)
     ));
 }
@@ -1901,9 +2068,15 @@ async fn revocation_cache_coalesces_concurrent_org_refreshes() {
     let cache = Arc::new(RevocationCache::default());
     let session_id = DataPlaneSessionId::Process(Default::default());
     let org_id = OrgId::new();
-    cache.remember_active(session_id, 10, org_id, 20, Duration::ZERO);
+    cache.remember_active(
+        session_id,
+        10,
+        org_id,
+        20,
+        RevocationRead::start(Duration::ZERO),
+    );
 
-    let guard = match cache.probe(session_id) {
+    let guard = match cache.probe(session_id, production_revocation_tolerance()) {
         RevocationProbe::RefreshOrg(refresh) => refresh.guard,
         other => panic!("expected first probe to own refresh, got {other:?}"),
     };
@@ -1912,7 +2085,7 @@ async fn revocation_cache_coalesces_concurrent_org_refreshes() {
             let cache = Arc::clone(&cache);
             tokio::spawn(async move {
                 matches!(
-                    cache.probe(session_id),
+                    cache.probe(session_id, production_revocation_tolerance()),
                     RevocationProbe::RefreshInFlight(true)
                 )
             })
@@ -1924,6 +2097,90 @@ async fn revocation_cache_coalesces_concurrent_org_refreshes() {
     }
 
     drop(guard);
+}
+
+#[test]
+fn revocation_cache_keeps_a_confirmed_verdict_only_within_the_staleness_bound() {
+    let cache = Arc::new(RevocationCache::default());
+    let session_id = DataPlaneSessionId::Process(Default::default());
+    let org_id = OrgId::new();
+    assert!(!cache.confirmed_active(session_id, production_revocation_tolerance()));
+
+    // Confirmed just now, and already due for a refresh.
+    cache.remember_active(
+        session_id,
+        10,
+        org_id,
+        20,
+        RevocationRead::start(Duration::ZERO),
+    );
+    assert!(cache.confirmed_active(session_id, production_revocation_tolerance()));
+    assert!(!cache.confirmed_active(session_id, Duration::ZERO));
+
+    // While another stream's refresh is in flight the cached verdict answers
+    // within the bound; past it, this session is re-read.
+    let _guard = match cache.probe(session_id, production_revocation_tolerance()) {
+        RevocationProbe::RefreshOrg(refresh) => refresh.guard,
+        other => panic!("expected the first probe to own the refresh, got {other:?}"),
+    };
+    assert!(matches!(
+        cache.probe(session_id, production_revocation_tolerance()),
+        RevocationProbe::RefreshInFlight(true)
+    ));
+    assert!(matches!(
+        cache.probe(session_id, Duration::ZERO),
+        RevocationProbe::RefreshSession
+    ));
+
+    // A verdict read under an older org epoch no longer counts, nor does a
+    // revoked one.
+    cache.remember_org_epoch(org_id, 21, RevocationRead::start(Duration::from_secs(60)));
+    assert!(!cache.confirmed_active(session_id, production_revocation_tolerance()));
+    cache.remember_state(
+        session_id,
+        11,
+        false,
+        org_id,
+        21,
+        RevocationRead::start(Duration::from_secs(60)),
+    );
+    assert!(!cache.confirmed_active(session_id, production_revocation_tolerance()));
+}
+
+#[test]
+fn revocation_cache_org_confirmation_only_moves_forward() {
+    let cache = RevocationCache::default();
+    let org_id = OrgId::new();
+    let fresh_for = Duration::from_secs(60);
+    let earlier = RevocationRead::start(fresh_for);
+    let later = RevocationRead {
+        started_at: earlier.started_at + Duration::from_secs(5),
+        fresh_for,
+    };
+    let org = |cache: &RevocationCache| {
+        let entry = cache.orgs.get(&org_id).unwrap();
+        (entry.epoch, entry.confirmed_at, entry.refresh_after)
+    };
+    cache.remember_org_epoch(org_id, 20, later);
+    let confirmed = (20, later.started_at, later.started_at + fresh_for);
+    assert_eq!(org(&cache), confirmed);
+
+    // A slower read that began first and answers last moves nothing back.
+    cache.remember_org_epoch(org_id, 20, earlier);
+    assert_eq!(org(&cache), confirmed);
+    // Nor does an older epoch, however recent its read.
+    let latest = RevocationRead {
+        started_at: later.started_at + Duration::from_secs(5),
+        fresh_for,
+    };
+    cache.remember_org_epoch(org_id, 19, latest);
+    assert_eq!(org(&cache), confirmed);
+    // A newer epoch replaces it, dated from its own read.
+    cache.remember_org_epoch(org_id, 21, earlier);
+    assert_eq!(
+        org(&cache),
+        (21, earlier.started_at, earlier.started_at + fresh_for)
+    );
 }
 
 #[test]
@@ -3952,6 +4209,28 @@ async fn legacy_ingress_eof_delivers_buffered_body_without_completion_frames() {
         !abort.is_cancelled(),
         "normal legacy EOF must not cancel buffered delivery"
     );
+}
+
+/// Read one server WebSocket frame header from `tcp` and return its opcode and
+/// payload. Server frames are never masked, so the header is two bytes plus an
+/// optional extended length.
+pub(crate) async fn read_server_frame(tcp: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    let mut header = [0_u8; 2];
+    tcp.read_exact(&mut header).await.expect("frame header");
+    let opcode = header[0] & 0x0f;
+    let len = match header[1] & 0x7f {
+        126 => {
+            let mut extended = [0_u8; 2];
+            tcp.read_exact(&mut extended)
+                .await
+                .expect("extended length");
+            usize::from(u16::from_be_bytes(extended))
+        }
+        len => usize::from(len),
+    };
+    let mut payload = vec![0_u8; len];
+    tcp.read_exact(&mut payload).await.expect("frame payload");
+    (opcode, payload)
 }
 
 pub(crate) fn grpc_test_response(bytes: Vec<u8>) -> Response {

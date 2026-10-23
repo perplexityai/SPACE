@@ -222,6 +222,39 @@ async fn transfer_registry_covers_kubernetes_sources() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn runtime_recipe_authenticates_empty_nodes_without_inventing_policy() -> TestResult {
+    use pplx_space_node_api_client::proto::GetNodeRuntimeDesiredStateRequest;
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let node = NodeId::new();
+    insert_data_plane_worker_node(&fixture.service.pool, node, "192.0.2.20").await?;
+    let message = GetNodeRuntimeDesiredStateRequest {
+        node_id: node.to_string(),
+        role: Some(ProtoNodeRole::Worker as i32),
+    };
+    let error = fixture
+        .service
+        .get_node_runtime_desired_state(Request::new(message.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+    let error = fixture
+        .service
+        .get_node_runtime_desired_state(request_from_node(message.clone(), "192.0.2.21".parse()?))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+    let response = fixture
+        .service
+        .get_node_runtime_desired_state(request_from_node(message, "192.0.2.20".parse()?))
+        .await?
+        .into_inner();
+    assert!(response.recipe.is_none());
+    Ok(())
+}
+
 async fn cluster_fixture() -> TestResult<Option<ClusterFixture>> {
     cluster_fixture_with_max_connections(2).await
 }

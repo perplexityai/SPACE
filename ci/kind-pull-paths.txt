@@ -81,3 +81,8 @@ crates/libs/api/src/public_sandbox_operations/**
 crates/libs/api/src/public_sandbox_projection.rs
 crates/libs/data/plane/**
 crates/apps/data/plane/svc/**
+
+# Guest execution and shared gRPC admission run in every sandbox.
+crates/libs/spaced/**
+crates/apps/spaced/**
+crates/libs/common/grpc/**
