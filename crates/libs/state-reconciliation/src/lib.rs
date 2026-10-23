@@ -24,6 +24,7 @@ pub const FACET_TEMPLATE_BASE_SNAPSHOT_POLICY: &str = "template-base-snapshot-po
 pub const FACET_SANDBOX_DESIRED_STATE: &str = "sandbox-desired-state";
 pub const FACET_TEMPLATE_DESIRED_STATE: &str = "template-desired-state";
 pub const FACET_NODE_STATUS: &str = "node-status";
+pub const FACET_RUNTIME_PROVISIONING: &str = "runtime-provisioning";
 pub const SANDBOX_FAILURE_EPISODE_KEY: &str = "failure_episode";
 pub const SANDBOX_FAILURE_EXECUTION_GENERATION_KEY: &str = "execution_generation";
 pub const SANDBOX_FAILURE_POD_UID_KEY: &str = "pod_uid";
@@ -115,6 +116,7 @@ pub enum ReconcileFacet {
     SandboxDesiredState,
     TemplateDesiredState,
     NodeStatus,
+    RuntimeProvisioning,
 }
 
 pub const RECONCILE_FACETS: &[ReconcileFacet] = &[
@@ -125,6 +127,7 @@ pub const RECONCILE_FACETS: &[ReconcileFacet] = &[
     ReconcileFacet::SandboxDesiredState,
     ReconcileFacet::TemplateDesiredState,
     ReconcileFacet::NodeStatus,
+    ReconcileFacet::RuntimeProvisioning,
 ];
 
 impl ReconcileFacet {
@@ -137,6 +140,7 @@ impl ReconcileFacet {
             Self::SandboxDesiredState => FACET_SANDBOX_DESIRED_STATE,
             Self::TemplateDesiredState => FACET_TEMPLATE_DESIRED_STATE,
             Self::NodeStatus => FACET_NODE_STATUS,
+            Self::RuntimeProvisioning => FACET_RUNTIME_PROVISIONING,
         }
     }
 
@@ -149,6 +153,7 @@ impl ReconcileFacet {
             FACET_SANDBOX_DESIRED_STATE => Some(Self::SandboxDesiredState),
             FACET_TEMPLATE_DESIRED_STATE => Some(Self::TemplateDesiredState),
             FACET_NODE_STATUS => Some(Self::NodeStatus),
+            FACET_RUNTIME_PROVISIONING => Some(Self::RuntimeProvisioning),
             _ => None,
         }
     }
@@ -311,7 +316,7 @@ impl ReconcileRef {
         element: Option<&str>,
     ) -> Result<Self, ReconcileElementParseError> {
         let element = match facet {
-            ReconcileFacet::NodeStatus => {
+            ReconcileFacet::NodeStatus | ReconcileFacet::RuntimeProvisioning => {
                 if element.is_some_and(|value| !value.trim().is_empty()) {
                     return Err(ReconcileElementParseError::UnexpectedElement(facet));
                 }

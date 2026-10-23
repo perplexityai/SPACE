@@ -39,9 +39,9 @@ use pplx_space_template_mgr_client::proto::{
 use tonic::{Code, Request};
 
 use crate::dirty_state::{
-    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
-    FACET_TEMPLATE_BASE_SNAPSHOT_POLICY, FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
-    FacetRef,
+    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
+    FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, FacetRef,
 };
 use crate::{InboundFacetResult, ReconcileStats, connect_cluster_api, local_manager_request, util};
 
@@ -51,6 +51,8 @@ mod inventory_publish;
 mod local_state;
 mod network_policy;
 mod port_exposure;
+mod runtime_provisioning;
+pub(crate) use runtime_provisioning::Provisioning;
 mod sandbox_desired_state;
 mod template_desired_state;
 
@@ -71,6 +73,7 @@ pub enum FacetKind {
     TemplateBaseSnapshotPolicy,
     TemplateDesiredState,
     NodeStatus,
+    RuntimeProvisioning,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,9 +167,15 @@ pub const FACETS: &[FacetKind] = &[
     FacetKind::TemplateBaseSnapshotPolicy,
     FacetKind::TemplateDesiredState,
     FacetKind::NodeStatus,
+    FacetKind::RuntimeProvisioning,
 ];
 
 pub const FACET_PLUGINS: &[FacetPlugin] = &[
+    FacetPlugin {
+        kind: FacetKind::RuntimeProvisioning,
+        inbound_tick: FacetTickMode::EveryTickFull,
+        outbound_tick: FacetTickMode::Disabled,
+    },
     FacetPlugin {
         kind: FacetKind::NetworkPolicy,
         inbound_tick: FacetTickMode::EveryTickFull,
@@ -248,6 +257,7 @@ impl FacetKind {
             Self::TemplateBaseSnapshotPolicy => FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
             Self::TemplateDesiredState => FACET_TEMPLATE_DESIRED_STATE,
             Self::NodeStatus => FACET_NODE_STATUS,
+            Self::RuntimeProvisioning => FACET_RUNTIME_PROVISIONING,
         }
     }
 
@@ -292,24 +302,31 @@ impl FacetKind {
                     return Err(format!("{} element must be non-empty", self.name()));
                 }
             }
-            Self::NodeStatus => {
+            Self::NodeStatus | Self::RuntimeProvisioning => {
                 if element.is_some() {
-                    return Err("node-status facet does not accept an element".to_string());
+                    return Err("whole-node facet does not accept an element".to_string());
                 }
             }
         }
         Ok(())
     }
 
-    pub async fn run_inbound(
+    pub(crate) async fn run_inbound(
         self,
         node_id: &str,
         node_role: Option<NodeRole>,
         scope: FacetScope,
         progress: crate::FacetProgress,
         sync_interval: std::time::Duration,
+        provisioning: &Provisioning,
     ) -> Result<InboundFacetResult, String> {
         match self {
+            Self::RuntimeProvisioning => {
+                runtime_provisioning::refresh(node_id, node_role, provisioning)
+                    .await
+                    .map(|()| InboundFacetResult::default())
+                    .map_err(|error| error.to_string())
+            }
             Self::NetworkPolicy => refresh_network_policy(node_id, node_role, scope, progress)
                 .await
                 .map(InboundFacetResult::from_stats),
@@ -348,9 +365,9 @@ impl FacetKind {
             Self::TemplateInventory => {
                 publish_template_inventory(node_id, node_role, scope, node_status).await
             }
-            Self::TemplateBaseSnapshotPolicy | Self::TemplateDesiredState => {
-                Ok(ReconcileStats::default())
-            }
+            Self::TemplateBaseSnapshotPolicy
+            | Self::TemplateDesiredState
+            | Self::RuntimeProvisioning => Ok(ReconcileStats::default()),
             Self::NodeStatus => publish_node_status(node_id, node_role, node_status).await,
         }
     }

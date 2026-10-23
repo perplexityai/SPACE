@@ -906,6 +906,20 @@ impl ClusterApi for ClusterApiService {
         ))
     }
 
+    async fn get_node_runtime_desired_state(
+        &self,
+        request: Request<GetNodeRuntimeDesiredStateRequest>,
+    ) -> Result<Response<GetNodeRuntimeDesiredStateResponse>, Status> {
+        let role_hint = optional_db_role_from_proto(request.get_ref().role)?;
+        self.authenticated_origin_node_id(&request, &request.get_ref().node_id, role_hint)
+            .await?;
+        // No provisioning policy store is configured. Absence must not become
+        // an implicit E0 installation or permission to delete existing files.
+        Ok(Response::new(GetNodeRuntimeDesiredStateResponse {
+            recipe: None,
+        }))
+    }
+
     async fn get_node_template_desired_state(
         &self,
         request: Request<GetNodeTemplateDesiredStateRequest>,
