@@ -18,7 +18,7 @@ class PolicySandbox(CommandSandbox, Protocol):
 
 @smoke.scenario(
     "native.split_trust_tls",
-    templates=(),
+    ignored="Requires the explicitly enabled split-trust prototype and local KMS/S3 fixture",
     api_surfaces=("native",),
     sandbox=smoke.SandboxConfig(timeout=600),
 )

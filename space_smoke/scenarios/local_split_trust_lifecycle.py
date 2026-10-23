@@ -32,7 +32,7 @@ def _anchor(test: smoke.CommandSandboxFixture, sandbox: CommandSandbox) -> str:
 
 @smoke.scenario(
     "local.split_trust_lifecycle",
-    templates=(),
+    ignored="Requires the explicitly enabled split-trust prototype and local KMS/S3 fixture",
     sandbox=smoke.SandboxConfig(
         timeout=900,
         kind_cold_create=KindColdCreateConfig(vcpu=2, memory_mib=1024),

@@ -6,7 +6,7 @@ from space_smoke.scenarios.local_split_trust_lifecycle import _anchor
 
 @smoke.scenario(
     "local.split_trust_warm_pool",
-    templates=(),
+    ignored="Requires the explicitly enabled split-trust prototype and local KMS/S3 fixture",
     sandbox=smoke.SandboxConfig(
         timeout=600,
         kind_warm_pool=smoke.KindWarmPoolConfig(vcpu=2, memory_mib=1024),

@@ -27,6 +27,26 @@ from space_smoke.suite import (
 
 
 class SmokeSuiteTests(unittest.TestCase):
+    def test_split_trust_prototype_is_explicit_only_but_remains_discoverable(self) -> None:
+        prototype_ids = {
+            "local.split_trust_authority_recovery",
+            "local.split_trust_lifecycle",
+            "local.split_trust_placement",
+            "local.split_trust_warm_pool",
+            "native.split_trust_tls",
+        }
+        implicit_ids = {scenario.id for scenario in REGISTRY.select()}
+        explicit_ids = {
+            scenario.id for scenario in REGISTRY.select(include_ignored=True)
+        }
+        self.assertTrue(prototype_ids.isdisjoint(implicit_ids))
+        self.assertTrue(prototype_ids <= explicit_ids)
+        for scenario_id in prototype_ids:
+            registered = REGISTRY.get(scenario_id)
+            self.assertIsNotNone(registered.ignored)
+            self.assertIsNone(registered.quarantined)
+            self.assertTrue(callable(registered.verify))
+
     def test_category_with_no_scenarios_for_the_template_fails_before_bootstrap(
         self,
     ) -> None:
