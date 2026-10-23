@@ -23,7 +23,7 @@ service RuntimeManager {
   // Catalog-authorized artifacts for this node. Does not affect execution.
   rpc ListAvailableArtifacts(ListAvailableArtifactsRequest) returns (ListAvailableArtifactsResponse);
   // Stage and verify bytes, then ask node-manager to publish them. Durable;
-  // disconnecting does not cancel the operation. Requires root/operator.
+  // disconnecting does not cancel the operation. Requires root/operator or node-ctl.
   rpc InstallArtifact(InstallArtifactRequest) returns (InstallArtifactResponse);
   // Delete this immutable identity from the managed store only. Node-manager
   // refuses removal of compiled E0; external image files cannot be addressed.

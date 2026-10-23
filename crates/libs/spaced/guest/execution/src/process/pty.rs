@@ -16,7 +16,11 @@ impl PtyIo {
         use nix::fcntl::{FcntlArg, OFlag, fcntl};
         let flags = OFlag::from_bits_retain(fcntl(&fd, FcntlArg::F_GETFL)?);
         fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-        Ok(Self(Arc::new(AsyncFd::new(std::fs::File::from(fd))?)))
+        // SAFETY: File takes ownership of the open descriptor. PtyIo exposes
+        // only shared borrows, so it cannot be closed or replaced before the
+        // final Arc drops AsyncFd and deregisters it.
+        let registered = unsafe { AsyncFd::register(std::fs::File::from(fd))? };
+        Ok(Self(Arc::new(registered)))
     }
 }
 

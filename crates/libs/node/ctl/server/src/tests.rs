@@ -361,6 +361,7 @@ async fn timer_test_worker(
         resource_status_reader: NodeResourceStatusReader::new(),
         network_pool_status_reader: NetworkPoolStatusReader::new(),
         orphan_inventory: orphan_inventory::Observer::default(),
+        runtime_provisioning: Arc::default(),
         node_objects: Some(Box::new(CountingNodeObjects(passes.clone()))),
         rx,
     };
