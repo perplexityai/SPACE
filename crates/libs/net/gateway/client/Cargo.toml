@@ -11,11 +11,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-hyper-util = { workspace = true, features = ["tokio"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
-tower = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }

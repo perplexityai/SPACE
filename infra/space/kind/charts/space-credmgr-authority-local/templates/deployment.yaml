@@ -208,7 +208,7 @@ spec:
             # Role above), and the node must be registered under that name
             # and UID in node_k8s, read through the DATABASE_URL pool above
             # (registered_node,
-            # crates/libs/common/svc/src/sql/node_registration.rs); without
+            # crates/libs/node/registration-store/src/lib.rs); without
             # DATABASE_URL the listener refuses to start (run.rs). With
             # TokenReview on, the listener never accepts SPACE_INTERNAL_TOKEN
             # (run.rs).

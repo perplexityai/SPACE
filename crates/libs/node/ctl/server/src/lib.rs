@@ -59,6 +59,7 @@ const NETWORK_POLICY_RECONCILER: &str = "network-policies";
 const SANDBOX_DESIRED_STATE_RECONCILER: &str = "sandbox-desired-state";
 const TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER: &str = "template-base-snapshot-policy";
 const TEMPLATE_DESIRED_STATE_RECONCILER: &str = "template-desired-state";
+const RUNTIME_PROVISIONING_RECONCILER: &str = "runtime-provisioning";
 const NODE_STATE_OUTBOUND_RECONCILER: &str = "node-state-outbound";
 const NETWORK_POLICY_OUTBOUND_RECONCILER: &str = "network-policy-outbound";
 const SANDBOX_INVENTORY_OUTBOUND_RECONCILER: &str = "sandbox-inventory-outbound";
@@ -408,6 +409,7 @@ struct NodeCtlWorker {
     resource_status_reader: NodeResourceStatusReader,
     network_pool_status_reader: NetworkPoolStatusReader,
     orphan_inventory: orphan_inventory::Observer,
+    runtime_provisioning: Arc<facets::Provisioning>,
     /// The Kubernetes node-local controller when this node runs one.
     node_objects: Option<Box<dyn NodeObjectReconciles>>,
     rx: mpsc::Receiver<WorkItem>,
@@ -561,6 +563,7 @@ pub async fn run(
         resource_status_reader,
         network_pool_status_reader,
         orphan_inventory: orphan_inventory::Observer::default(),
+        runtime_provisioning: Arc::default(),
         #[cfg(feature = "kubernetes")]
         node_objects: kubernetes_controller
             .map(|controller| Box::new(controller) as Box<dyn NodeObjectReconciles>),
@@ -725,6 +728,7 @@ fn init_reconciliation_status(conn: &Connection, poll_interval_secs: u64) -> rus
         SANDBOX_DESIRED_STATE_RECONCILER,
         TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
         TEMPLATE_DESIRED_STATE_RECONCILER,
+        RUNTIME_PROVISIONING_RECONCILER,
         NODE_STATE_OUTBOUND_RECONCILER,
         NETWORK_POLICY_OUTBOUND_RECONCILER,
         SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
@@ -1198,6 +1202,7 @@ impl NodeCtlWorker {
                     let node_id = self.node_id.clone();
                     let node_role = self.node_role;
                     let poll_interval = self.poll_interval;
+                    let provisioning = self.runtime_provisioning.clone();
                     let facet_token = shutdown_token.child_token();
                     let (scope_kind, scope_items) = facet_scope_span_fields(&scope);
                     let span = tracing::info_span!(
@@ -1222,7 +1227,7 @@ impl NodeCtlWorker {
                                     facet.name(),
                                     FACET_RUN_TIMEOUT.as_secs()
                                 )),
-                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone(), poll_interval) => result,
+                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone(), poll_interval, &provisioning) => result,
                             };
                             (facet, status_name, started_at, result)
                         }
@@ -1502,6 +1507,7 @@ impl NodeCtlWorker {
             SANDBOX_DESIRED_STATE_RECONCILER,
             TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
             TEMPLATE_DESIRED_STATE_RECONCILER,
+            RUNTIME_PROVISIONING_RECONCILER,
             NODE_STATE_OUTBOUND_RECONCILER,
             NETWORK_POLICY_OUTBOUND_RECONCILER,
             SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
@@ -2082,6 +2088,7 @@ fn inbound_reconciler_name(facet: facets::FacetKind) -> &'static str {
         facets::FacetKind::SandboxDesiredState => SANDBOX_DESIRED_STATE_RECONCILER,
         facets::FacetKind::TemplateBaseSnapshotPolicy => TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
         facets::FacetKind::TemplateDesiredState => TEMPLATE_DESIRED_STATE_RECONCILER,
+        facets::FacetKind::RuntimeProvisioning => RUNTIME_PROVISIONING_RECONCILER,
         facets::FacetKind::SandboxInventory
         | facets::FacetKind::TemplateInventory
         | facets::FacetKind::NodeStatus => NODE_STATE_OUTBOUND_RECONCILER,
@@ -2096,7 +2103,8 @@ fn outbound_reconciler_name(facet: facets::FacetKind) -> &'static str {
         facets::FacetKind::NodeStatus => NODE_STATUS_OUTBOUND_RECONCILER,
         facets::FacetKind::SandboxDesiredState
         | facets::FacetKind::TemplateBaseSnapshotPolicy
-        | facets::FacetKind::TemplateDesiredState => NODE_STATE_OUTBOUND_RECONCILER,
+        | facets::FacetKind::TemplateDesiredState
+        | facets::FacetKind::RuntimeProvisioning => NODE_STATE_OUTBOUND_RECONCILER,
     }
 }
 

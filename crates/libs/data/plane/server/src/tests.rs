@@ -1172,6 +1172,68 @@ async fn backend_channels_accept_bare_direct_node_endpoints() {
 }
 
 #[tokio::test]
+async fn backend_channels_advertise_the_configured_connection_window() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const FRAME_SETTINGS: u8 = 0x4;
+    const FRAME_WINDOW_UPDATE: u8 = 0x8;
+    const DEFAULT_WINDOW: u32 = 65_535;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let channel = build_backend_channels(&endpoint, 1)
+        .await
+        .expect("backend channel")
+        .remove(0);
+    // A lazy channel dials on its first call; the call itself never completes.
+    let call = tokio::spawn(
+        channel.oneshot(
+            tonic::codegen::http::Request::builder()
+                .uri(format!("http://{endpoint}/probe"))
+                .body(tonic::body::Body::empty())
+                .unwrap(),
+        ),
+    );
+
+    let increment = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut preface = [0; PREFACE.len()];
+        socket.read_exact(&mut preface).await.unwrap();
+        assert_eq!(preface, PREFACE);
+        socket
+            .write_all(&[0, 0, 0, FRAME_SETTINGS, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        // The client raises the connection window past the protocol default
+        // with a WINDOW_UPDATE on stream 0.
+        loop {
+            let mut header = [0; 9];
+            socket.read_exact(&mut header).await.unwrap();
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
+            let mut payload = vec![0; len];
+            socket.read_exact(&mut payload).await.unwrap();
+            if header[3] == FRAME_WINDOW_UPDATE && stream & 0x7fff_ffff == 0 {
+                break u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fff_ffff;
+            }
+        }
+    })
+    .await
+    .expect("connection WINDOW_UPDATE");
+    call.abort();
+
+    assert_eq!(
+        DEFAULT_WINDOW + increment,
+        pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES
+    );
+}
+
+#[tokio::test]
 async fn backend_channel_pool_normalizes_cache_key() {
     if !pplx_space_test_env::enter_test_process(&[(
         "SPACE_INTERNAL_RPC_INSECURE_DEV",

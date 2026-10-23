@@ -263,7 +263,7 @@ where
                     return Err(error);
                 }
                 retry_index += 1;
-                pplx_space_metrics::grpc::client_retry(
+                pplx_space_grpc_metrics::client_retry(
                     service_name,
                     "Connect",
                     "connect",
@@ -558,7 +558,7 @@ where
             error: &error,
         });
         retry_index += 1;
-        pplx_space_metrics::grpc::client_retry(service_name, "Connect", "connect", "connect_error");
+        pplx_space_grpc_metrics::client_retry(service_name, "Connect", "connect", "connect_error");
         pplx_space_observability::with_peer_service!(tracing::debug!(
             peer.service = service_name,
             target,

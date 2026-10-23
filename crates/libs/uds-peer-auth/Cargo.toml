@@ -1,0 +1,26 @@
+[package]
+name = "pplx-space-uds-peer-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+http = { workspace = true }
+nix = { workspace = true, features = ["user"] }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-metrics = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

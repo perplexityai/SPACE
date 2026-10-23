@@ -751,7 +751,7 @@ _TRANSFER_JOB_ROW = re.compile(r"│\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 # A storage URI's query can carry endpoint credentials; log evidence keeps the
 # scheme and drops the rest.
 _STORAGE_URI = re.compile(r"s3://[^\s\"',}\]]*")
-# `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/libs/common/core/src/host/btrfs.rs):
+# `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/libs/btrfs/src/lib.rs):
 # a template installed from `(name, content_hash)` is stamped with
 # `UUIDv5(NS, "name@content_hash")` so a btrfs-send stream produced against
 # it on one node can be received against an independently installed copy

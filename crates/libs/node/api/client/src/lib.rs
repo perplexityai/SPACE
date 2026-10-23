@@ -52,6 +52,12 @@ pub const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_NODE_CTL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const NODE_API_DRAINING_MESSAGE: &str = "node-api draining";
+/// HTTP/2 connection window for a node-api connection that carries many
+/// callers' streams at once: 16 default-sized (2 MiB) stream windows, so
+/// concurrent calls share a larger buffer. It bounds the response data one
+/// connection can buffer; each stream's share stays within its stream window.
+/// Callers opt in per connection; others keep the transport default.
+pub const MULTIPLEXED_CONNECTION_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
 
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";
 

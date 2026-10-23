@@ -19,24 +19,22 @@ pub use pplx_space_bearer_token as bearer_token;
 pub mod bootstrap;
 pub use pplx_space_dependency_drain as dependency_drain;
 pub mod disk_admission;
-pub mod ecw_credential;
-pub mod federated_identity;
-pub mod http_listener;
+pub use pplx_space_ecw_credential as ecw_credential;
+pub use pplx_space_federated_identity as federated_identity;
+pub use pplx_space_http_server::http_listener;
 #[cfg(feature = "k8s")]
-pub mod kube_client;
-pub mod lifecycle;
+pub use pplx_space_kube_client as kube_client;
+pub use pplx_space_service_lifecycle as lifecycle;
 pub mod local_health;
+pub use pplx_space_api_route as space_api_route;
+pub use pplx_space_api_route::capability as space_api_route_capability;
+pub use pplx_space_api_route::ed25519 as space_api_route_ed25519;
+pub use pplx_space_grpc_rate_limiter as rate_limiter;
 pub use pplx_space_page_cache as page_cache;
-pub mod peer_auth;
-pub mod rate_limiter;
-pub mod redis;
 pub use pplx_space_service_mutex as service_mutex;
-#[cfg(test)]
-mod service_mutex_handoff_tests;
-pub mod shared_valkey;
-pub mod space_api_route;
-pub mod space_api_route_capability;
-pub mod space_api_route_ed25519;
+pub use pplx_space_uds_peer_auth as peer_auth;
+pub use pplx_space_valkey::redis;
+pub use pplx_space_valkey::shared_valkey;
 pub mod sql;
 pub mod template_lookup;
 pub use pplx_space_systemd_watchdog as systemd;
@@ -156,4 +154,4 @@ pub use peer_auth::{
     peer_may_set_local_authority, require_local_authority_peer,
 };
 
-pub mod ingress_admission;
+pub use pplx_space_ingress_admission as ingress_admission;

@@ -4214,3 +4214,46 @@ async fn autoscale_merges_hash_spellings_and_default_shapes_into_one_demand_grou
 
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn config_reads_decode_blake3_release_hashes() -> TestResult {
+    // Template-manager registers BLAKE3 identities by default. Every config
+    // read the warm-pool pass makes must decode them as stored; one
+    // undecodable row fails the whole pass for every template.
+    let fixture = postgres_fixture().await?;
+    let release_id = Uuid::now_v7();
+    let config_id = Uuid::now_v7();
+    let content_hash = ContentHash::new(Digest::blake3([0x3b; 32]));
+    insert_pool_config(&fixture.pool, release_id, config_id, content_hash).await?;
+
+    let enabled = fixture.store.enabled_configs().await?;
+    assert_eq!(enabled.len(), 1);
+    assert_eq!(enabled[0].content_hash, content_hash);
+
+    let reconcilable = fixture.store.reconcilable_configs().await?;
+    assert_eq!(reconcilable.len(), 1);
+    assert_eq!(reconcilable[0].content_hash, content_hash);
+
+    sqlx::query(
+        "UPDATE kubernetes_pool_configs
+         SET enabled = false, managed_by = 'autoscaler', updated_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(config_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    let recently_disabled = fixture
+        .store
+        .recently_disabled_configs(Duration::from_secs(10 * 60))
+        .await?;
+    assert_eq!(recently_disabled.len(), 1);
+    assert_eq!(recently_disabled[0].content_hash, content_hash);
+
+    let retired = fixture.store.autoscale_configs("space").await?;
+    assert_eq!(retired.len(), 1);
+    assert_eq!(retired[0].id, config_id);
+    assert_eq!(retired[0].content_hash, content_hash);
+
+    Ok(())
+}

@@ -8,10 +8,11 @@ use crate::installs::{
 };
 use crate::protection::{self, AuditIdentity, PathRole};
 use crate::run::SERVICE_NAME;
+use pplx_space_common_core::host::linux::identities::{user_names, users};
 use pplx_space_common_core::types::{
     ComponentIdentity, Digest, JobId, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
-use pplx_space_common_svc::{LocalRole, UdsPeerAuthorizer, UdsPeerPrincipal};
+use pplx_space_common_svc::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use pplx_space_execution_common::proto::{self as execution, ArtifactComponentKind};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
     self, ArtifactKinds, ArtifactScan, DigestCache, ScanLimits, ScanRoots, SystemScanClock,
@@ -22,16 +23,24 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
 /// Listing, status, and operation lookups are read-only: root and any local
-/// role may call them.
+/// role, plus node-ctl, may call them.
 const ALLOW_READ: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Observer),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
-/// Installing, uninstalling, and cancelling change what is on the node: root
-/// and the local operator role, as for the other node services.
+/// Destructive operations require root or the local operator role.
 const ALLOW_MUTATE: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Operator),
+];
+
+// Provisioning may add approved artifacts but cannot delete or cancel another
+// operator's work. Publication still independently checks node-manager's pins.
+const ALLOW_INSTALL: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Operator),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
 
 #[derive(Clone)]
@@ -76,7 +85,7 @@ impl RuntimeManagerService {
             audit_identity: AuditIdentity::of_this_process(),
             peer_authorizer: UdsPeerAuthorizer::new_with_default_local_roles(
                 SERVICE_NAME.as_str(),
-                std::iter::empty(),
+                [UdsPeerAccount::with_linux_user(users::SPACE_NODECTL)],
             ),
             kernel_source: None,
             installer: None,
@@ -538,7 +547,7 @@ impl RuntimeManager for RuntimeManagerService {
         request: Request<InstallArtifactRequest>,
     ) -> Result<Response<InstallArtifactResponse>, Status> {
         self.peer_authorizer
-            .authorize_request(&request, "InstallArtifact", ALLOW_MUTATE)?;
+            .authorize_request(&request, "InstallArtifact", ALLOW_INSTALL)?;
         let identity = parse_identity(request.get_ref().identity.as_ref())?;
         let installer = self.installer()?.clone();
         let operation = match identity {
