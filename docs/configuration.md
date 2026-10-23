@@ -75,6 +75,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODE_GROUP_LABELER_ENABLED`, `SPACE_NODE_GROUP_MIRROR_ENABLED` | off | |
 | `SPACE_NODE_SERVICE_READINESS_ENABLED` | off | |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED` | off | |
+| `SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN` | off | When on, the sweeper scans and reports what it would prune, but deletes nothing. Set it with `ENABLED` to observe a new environment before pruning. Accepts `true`/`1`/`yes`/`on` and their negations, ignoring case and surrounding spaces; any other value, empty included, keeps dry run on and logs a warning. |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N`, `SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_PER_TICK` | built-in | |
 | `SPACE_ADMIN_AUDIT_RETENTION_GRACE_SECS` | 30 days | The retention loops themselves always run. |
 | `SPACE_ADMIN_AUDIT_RETENTION_MAX_RECORDS` | 100,000 | Row cap applied regardless of age; raise it to keep more history (ceiling 10,000,000). |

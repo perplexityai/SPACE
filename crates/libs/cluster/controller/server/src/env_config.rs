@@ -10,10 +10,6 @@ impl EnvConfig<'_> {
         pplx_space_common_core::env::test_hook(self.0, var)
     }
 
-    pub(crate) fn test_truthy_default(&self, var: &str, default: bool) -> bool {
-        pplx_space_common_core::env::env_flag(self.test_raw(var).as_deref(), default)
-    }
-
     pub(crate) fn test_duration_secs(&self, var: &str, default: Duration) -> Duration {
         match self.test_raw(var).and_then(|raw| raw.parse::<u64>().ok()) {
             Some(secs) if secs > 0 => Duration::from_secs(secs),
@@ -49,6 +45,26 @@ impl EnvConfig<'_> {
             Ok("0" | "false" | "False" | "FALSE") => false,
             _ => default,
         }
+    }
+
+    /// A switch whose `true` is the non-destructive mode, such as a dry run.
+    /// Unset keeps `default`; a value in the shared `env_flag` vocabulary
+    /// wins; any other present value, empty included, turns it on with a
+    /// warning. A misspelled dry-run switch must keep the dry run, never start
+    /// deleting.
+    pub(crate) fn safe_mode_flag(&self, var: &str, default: bool) -> bool {
+        let Some(raw) = self.0.var_os(var) else {
+            return default;
+        };
+        let raw = raw.to_string_lossy();
+        pplx_space_common_core::env::parse_env_flag(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                variable = var,
+                value = %raw,
+                "unrecognized value for a safe-mode switch; keeping it on"
+            );
+            true
+        })
     }
 
     /// Kill switch for a reconciler that writes or deletes and ships enabled:

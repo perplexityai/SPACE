@@ -11,8 +11,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# This crate only backs tests, so it always enables the test hooks it reads.
-pplx-space-common-core = { workspace = true, features = ["serde", "sqlx", "test-hooks"] }
+# No `test-hooks`: this is a workspace member with normal dependencies, so a
+# feature enabled here unifies into every release build that resolves the
+# whole workspace. The crate reads its own variables directly instead.
+pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["postgres"] }

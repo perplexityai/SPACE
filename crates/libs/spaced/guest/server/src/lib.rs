@@ -176,8 +176,8 @@ mod port_forward;
 mod transport;
 
 /// Internal diagnostics support; not part of the stable guest service API.
-#[cfg(feature = "test-support")]
-pub mod test_support {
+#[cfg(feature = "loopback-diagnostic")]
+pub mod loopback_diagnostic {
     pub use crate::port_forward::LoopbackBridgeManager;
 }
 mod process;

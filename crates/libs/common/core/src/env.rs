@@ -7,7 +7,7 @@
 
 pub use pplx_space_env_vars::{
     Environment, ProcessEnvironment, env_destructive_gate, env_destructive_gate_var, env_flag,
-    env_flag_var, parse_positive_f64_env, valid_positive_f64,
+    env_flag_var, parse_env_flag, parse_positive_f64_env, valid_positive_f64,
 };
 
 /// Admission gate for create-time sandbox node-pool placement.

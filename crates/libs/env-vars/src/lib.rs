@@ -21,13 +21,16 @@
 /// Interpret an env var's raw value as an on/off flag, falling back to
 /// `default` when the value is absent or not in the shared vocabulary.
 pub fn env_flag(raw: Option<&str>, default: bool) -> bool {
-    let Some(raw) = raw else {
-        return default;
-    };
+    raw.and_then(parse_env_flag).unwrap_or(default)
+}
+
+/// The shared vocabulary itself: `None` when `raw` is not in it, for a caller
+/// whose fallback for an unrecognized value differs from its unset default.
+pub fn parse_env_flag(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" | "enabled" => true,
-        "0" | "false" | "no" | "off" | "disabled" => false,
-        _ => default,
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
     }
 }
 

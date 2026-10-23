@@ -55,6 +55,30 @@ fn environment_overrides_policy_and_scope() {
 }
 
 #[test]
+fn dry_run_fails_toward_not_deleting() {
+    for (value, expected) in [
+        (None, false),
+        (Some("true"), true),
+        (Some("false"), false),
+        (Some("yes"), true),
+        (Some("no"), false),
+        (Some("on"), true),
+        (Some("off"), false),
+        (Some(" TRUE "), true),
+        (Some("bogus"), true),
+        (Some(""), true),
+    ] {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        if let Some(value) = value {
+            env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN", value);
+        }
+        let config = ReconcilerConfig::from_environment(&env);
+        assert_eq!(config.dry_run, expected, "DRY_RUN={value:?}");
+        assert_eq!(RetentionPolicy::from(config).dry_run, expected);
+    }
+}
+
+#[test]
 fn invalid_and_dangerous_values_fall_back_or_clamp() {
     let mut env = pplx_space_test_env::TestEnv::default();
     env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS", "invalid");
