@@ -173,6 +173,16 @@ impl ExecutionService {
         *self.inner.process_env.write().await = env;
     }
 
+    /// Native calls use the same filesystem operations and payload budgets as gRPC.
+    /// Streaming uploads retain the generated trait's Tonic input-stream type.
+    pub fn filesystem_service(
+        &self,
+    ) -> impl pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::Filesystem
+    + Clone
+    + use<> {
+        self.inner.filesystem.clone()
+    }
+
     pub fn filesystem_grpc_service(
         &self,
     ) -> pplx_space_common_grpc::RequestAdmission<

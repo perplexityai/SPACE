@@ -35,8 +35,8 @@ from dataclasses import dataclass
 NAMESPACE = "space"
 LABEL = "space.pplx.net/kind-rust-build"
 BUILDS = ("test-hooks", "release")
-# The runtime images built from the Rust artifact image (build-images.sh and
-# the Tiltfile's rust runtime builds). space-seed-publish carries only the
+# The runtime images built from the Rust artifact image (the Tiltfile's rust
+# runtime builds). space-seed-publish carries only the
 # seed's guest binaries, and its Job's pod does not stay running.
 RUST_IMAGES = frozenset(
     {"space-api", "space-data-plane", "space-cluster-controller", "space-worker", "space-kind-key-broker"}

@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 use tonic::Status;
 
 use super::{
-    AuthConfigError, AuthSurface, DataPlaneSessionRefreshAuthority, NetworkPolicyMutationAuthority,
-    NodeApiAuthenticatedCaller, NodeRole, SPACE_K8S_TOKEN_AUTH_ENABLED_ENV,
-    WaitReadyLifecycleAuthority,
+    AuthConfigError, AuthSurface, AuthenticatedNodeIdentity, DataPlaneSessionRefreshAuthority,
+    NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, NodeRole,
+    SPACE_K8S_TOKEN_AUTH_ENABLED_ENV, WaitReadyLifecycleAuthority,
 };
 
 // The namespace is read from the pod's service account mount. The override is a
@@ -260,8 +260,8 @@ impl K8sTokenReviewer {
                 }
             }
         };
-        let username = match self.review_token(token, policy.audience).await {
-            Ok(username) => username,
+        let identity = match self.review_token(token, policy.audience).await {
+            Ok(identity) => identity,
             Err(TokenReviewFailure::Rejected { reason }) => {
                 self.cache_result(
                     key.clone(),
@@ -299,13 +299,14 @@ impl K8sTokenReviewer {
             self.cache_result(
                 key.clone(),
                 CachedTokenReviewResult::Accepted {
-                    username: username.clone(),
+                    username: identity.username.clone(),
+                    node_identity: identity.node_identity.clone(),
                 },
                 expires_at,
             );
         }
-        self.authorize_username(&policy, surface, method, &username, true)?;
-        Ok(policy.authenticated_caller(&username))
+        self.authorize_username(&policy, surface, method, &identity.username, true)?;
+        Ok(policy.authenticated_caller(&identity.username, identity.node_identity))
     }
 
     fn cached_result(&self, key: &TokenCacheKey) -> Option<CachedTokenReviewResult> {
@@ -330,10 +331,13 @@ impl K8sTokenReviewer {
         cached: CachedTokenReviewResult,
     ) -> Result<NodeApiAuthenticatedCaller, Status> {
         match cached {
-            CachedTokenReviewResult::Accepted { username } => {
+            CachedTokenReviewResult::Accepted {
+                username,
+                node_identity,
+            } => {
                 pplx_space_metrics::auth::token_review_cache("hit_authenticated");
                 self.authorize_username(policy, surface, method, &username, false)?;
-                Ok(policy.authenticated_caller(&username))
+                Ok(policy.authenticated_caller(&username, node_identity))
             }
             CachedTokenReviewResult::Rejected { reason } => {
                 pplx_space_metrics::auth::token_review_cache("hit_deny");
@@ -445,7 +449,7 @@ impl K8sTokenReviewer {
         &self,
         token: &str,
         audience: &str,
-    ) -> Result<String, TokenReviewFailure> {
+    ) -> Result<ReviewedIdentity, TokenReviewFailure> {
         let review = TokenReview {
             metadata: Default::default(),
             spec: TokenReviewSpec {
@@ -829,12 +833,17 @@ impl AuthPolicy<'_> {
         }
     }
 
-    fn authenticated_caller(&self, username: &str) -> NodeApiAuthenticatedCaller {
+    fn authenticated_caller(
+        &self,
+        username: &str,
+        node_identity: AuthenticatedNodeIdentity,
+    ) -> NodeApiAuthenticatedCaller {
         let mut caller = NodeApiAuthenticatedCaller::kubernetes_service_account(
             self.wait_ready_lifecycle_authority(username),
             self.network_policy_mutation_authority(username),
             self.data_plane_session_refresh_authority(username),
         );
+        caller.node_identity = node_identity;
         if matches!(self.role, NodeRole::Worker | NodeRole::Builder)
             && self.template_transfer_usernames.contains(username)
             && !self.guest_bridge_usernames.contains(username)
@@ -860,8 +869,13 @@ struct CachedTokenReview {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CachedTokenReviewResult {
-    Accepted { username: String },
-    Rejected { reason: TokenReviewRejectReason },
+    Accepted {
+        username: String,
+        node_identity: AuthenticatedNodeIdentity,
+    },
+    Rejected {
+        reason: TokenReviewRejectReason,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -997,10 +1011,16 @@ fn jwt_exp_cache_deadline(token: &str, now: Instant, now_system: SystemTime) -> 
     now.checked_add(duration).or(Some(now))
 }
 
+#[derive(Debug)]
+struct ReviewedIdentity {
+    username: String,
+    node_identity: AuthenticatedNodeIdentity,
+}
+
 fn validate_token_review_status(
     status: Option<TokenReviewStatus>,
     audience: &str,
-) -> Result<String, TokenReviewFailure> {
+) -> Result<ReviewedIdentity, TokenReviewFailure> {
     let status = status.ok_or(TokenReviewFailure::Rejected {
         reason: TokenReviewRejectReason::MissingStatus,
     })?;
@@ -1027,12 +1047,17 @@ fn validate_token_review_status(
             reason: TokenReviewRejectReason::AudienceMismatch,
         });
     }
-    status
-        .user
-        .and_then(|user| user.username)
-        .ok_or(TokenReviewFailure::Rejected {
-            reason: TokenReviewRejectReason::MissingUser,
-        })
+    let user = status.user.ok_or(TokenReviewFailure::Rejected {
+        reason: TokenReviewRejectReason::MissingUser,
+    })?;
+    let node_identity = AuthenticatedNodeIdentity::from_reviewed_user_info(&user);
+    let username = user.username.ok_or(TokenReviewFailure::Rejected {
+        reason: TokenReviewRejectReason::MissingUser,
+    })?;
+    Ok(ReviewedIdentity {
+        username,
+        node_identity,
+    })
 }
 
 fn token_digest(token: &str) -> [u8; 32] {

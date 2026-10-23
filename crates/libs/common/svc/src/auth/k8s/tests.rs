@@ -175,6 +175,7 @@ fn accepted_cache_entry(username: &str, expires_at: Instant) -> CachedTokenRevie
     CachedTokenReview {
         result: CachedTokenReviewResult::Accepted {
             username: username.to_string(),
+            node_identity: AuthenticatedNodeIdentity::MissingKubernetesClaims,
         },
         expires_at,
     }
@@ -675,6 +676,7 @@ fn cache_token_review_result_evicts_earliest_expiring_entry_at_capacity() {
         inserted.clone(),
         CachedTokenReviewResult::Accepted {
             username: "third-sa".to_string(),
+            node_identity: AuthenticatedNodeIdentity::MissingKubernetesClaims,
         },
         now + Duration::from_secs(20),
         now,
@@ -1093,6 +1095,7 @@ async fn concurrent_cache_inserts_at_capacity_do_not_panic() {
                 cache_key(&format!("token-{index}"), "space-node-api"),
                 CachedTokenReviewResult::Accepted {
                     username: format!("system:serviceaccount:space:space-api-{index}"),
+                    node_identity: AuthenticatedNodeIdentity::MissingKubernetesClaims,
                 },
                 Instant::now() + Duration::from_secs(30),
             );
@@ -1108,13 +1111,13 @@ async fn concurrent_cache_inserts_at_capacity_do_not_panic() {
 
 #[test]
 fn validate_token_review_status_accepts_confirmed_audience() {
-    let username = validate_token_review_status(
+    let identity = validate_token_review_status(
         Some(accepted_token_review_status("space-node-api")),
         "space-node-api",
     )
     .unwrap();
 
-    assert_eq!(username, "system:serviceaccount:space:space-api");
+    assert_eq!(identity.username, "system:serviceaccount:space:space-api");
 }
 
 #[test]

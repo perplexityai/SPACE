@@ -521,7 +521,7 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
         }
         if let Some(failures) = &self.stop_failures
             && failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 })
                 .is_err()

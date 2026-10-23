@@ -23,8 +23,9 @@
 # and copies the add-on images each node image preloads into the containerd
 # directories that are still empty (`seed-node-containerd.sh`).
 #
-# `bootstrap.sh` and the smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh`
-# source the library themselves and do not need this wrapper.
+# The bring-up (`up.sh` and the smoke suites, through
+# `scripts/tests/lib/bootstrap-kind-stack.sh`) sources the library itself and
+# does not need this wrapper.
 #
 # Env knobs: SPACE_VENDOR_ROOT, SPACE_KIND_DATA_ROOT, SPACE_KIND_CONFIG —
 # all documented in `lib/kind-host-paths.sh`.
@@ -48,14 +49,9 @@ source "$SCRIPT_DIR/lib/kind-host-paths.sh"
 #     preflight passes. An operator who hits a missing vendor tree, fixes it,
 #     and reuses the path from their scrollback must not find the render that
 #     preceded the fix. Publishing by rename rather than deleting on failure
-#     also leaves a sibling worktree's `bootstrap.sh` config alone — deleting
-#     it was the previous approach and could take a config that run had
-#     rendered and not yet used.
-#
-# `bootstrap.sh` renders and publishes separately because it stages the vendor
-# tree between its render and its preflight, so its config has to exist across
-# that step. This wrapper does both in one go, so publishing last costs it
-# nothing.
+#     also leaves a sibling worktree's config alone — deleting it was the
+#     previous approach and could take a config that run had rendered and not
+#     yet used.
 mkdir -p "$(dirname "$SPACE_KIND_CONFIG")"
 # In $TMPDIR because the caller reads it after this script is gone, so nothing
 # here can clean it up on the success path — $TMPDIR is reaped, the published

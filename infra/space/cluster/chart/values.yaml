@@ -17,7 +17,7 @@ buildManager:
 
 space-api-local:
   # install.sh runs the space-db-migrate Job from this chart before the
-  # release, as bootstrap.sh does; a Job owned by the release could not be
+  # release, as the Kind harness does; a Job owned by the release could not be
   # replaced on the next upgrade (its pod template is immutable).
   migrate:
     enabled: false

@@ -11,7 +11,7 @@ use pplx_space_common_core::types::{
 };
 use tonic::Status;
 
-use pplx_space_sbx_mgr_client::proto;
+use pplx_space_sbx_mgr_protocol::proto;
 
 const ACCESS_IDLE_CONDITION_SET: AutoLifecycleConditionSetId =
     AutoLifecycleConditionSetId::AccessIdle;

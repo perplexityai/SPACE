@@ -1,3 +1,4 @@
+import { OperationFailedError, OperationTimeoutError } from './accepted-create';
 import { adminApi, api } from './api';
 import { publicSandboxIdFromAny } from './sandbox-id';
 import {
@@ -68,12 +69,12 @@ export async function waitForPublicOperation(
       if (last.state === 'succeeded') {
         return last;
       }
-      throw new Error(last.progress_message || `operation ${last.state}`);
+      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`);
     }
     await new Promise((resolve) => setTimeout(resolve, OPERATION_POLL_INTERVAL_MS));
   }
 
-  throw new Error(last?.progress_message || 'operation still running');
+  throw new OperationTimeoutError(last?.progress_message || 'operation still running');
 }
 
 export async function waitForAdminOperation(
@@ -89,12 +90,12 @@ export async function waitForAdminOperation(
       if (last.state === 'succeeded') {
         return last;
       }
-      throw new Error(last.progress_message || `operation ${last.state}`);
+      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`);
     }
     await new Promise((resolve) => setTimeout(resolve, OPERATION_POLL_INTERVAL_MS));
   }
 
-  throw new Error(last?.progress_message || 'operation still running');
+  throw new OperationTimeoutError(last?.progress_message || 'operation still running');
 }
 
 export async function runPublicSandboxOperation(

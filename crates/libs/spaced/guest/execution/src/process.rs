@@ -220,7 +220,7 @@ struct ProcessLaunch {
     claim: ProcessIdClaim,
     process_reservation: ProcessRecordReservation,
     /// Held until the child is published.
-    start_admission: ProcessStartAdmission,
+    start_admission: pplx_space_common_grpc::RequestPermit,
     account_lookup: Duration,
     inner: Arc<crate::execution::ExecutionServiceInner>,
 }
@@ -486,6 +486,10 @@ impl ProcessLaunch {
 }
 
 impl ExecutionService {
+    /// Wraps a process adapter with predecode payload admission.
+    ///
+    /// The adapter must preserve request extensions when forwarding to this
+    /// service so handlers can reuse admission instead of charging twice.
     pub fn process_grpc_service<S: Process>(
         &self,
         adapter: S,
@@ -500,35 +504,16 @@ impl ExecutionService {
     }
 }
 
-#[derive(Debug)]
-enum ProcessStartAdmission {
-    Ingress {
-        _permit: pplx_space_common_grpc::RequestPermit,
-    },
-    Direct {
-        _permit: OwnedSemaphorePermit,
-    },
-}
-
 async fn resolve_process_account(
     slots: Arc<Semaphore>,
     ingress: Option<pplx_space_common_grpc::RequestPermit>,
     resolve: impl FnOnce() -> Result<GuestAccount, Status> + Send + 'static,
-) -> Result<(GuestAccount, ProcessStartAdmission), Status> {
-    let admission = match ingress {
-        Some(permit) => ProcessStartAdmission::Ingress { _permit: permit },
-        None => ProcessStartAdmission::Direct {
-            _permit: slots
-                .try_acquire_many_owned(
-                    pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
-                )
-                .map_err(|_| {
-                    crate::refused(Status::resource_exhausted(
-                        "payload request capacity exhausted",
-                    ))
-                })?,
-        },
-    };
+) -> Result<(GuestAccount, pplx_space_common_grpc::RequestPermit), Status> {
+    let admission = crate::payload::acquire(
+        &slots,
+        pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
+        ingress,
+    )?;
     // NSS may block on external account providers. Keep the existing Start
     // admission with the physical lookup even if its requesting future drops.
     tokio::task::spawn_blocking(move || resolve().map(|account| (account, admission)))
@@ -1915,6 +1900,10 @@ impl Process for ExecutionService {
         mut request: Request<StartRequest>,
     ) -> Result<Response<Self::StartStream>, Status> {
         self.require_running()?;
+        crate::payload::check_message(
+            request.get_ref(),
+            pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+        )?;
         let received_at = Instant::now();
         let ingress = request
             .extensions_mut()
@@ -1922,10 +1911,8 @@ impl Process for ExecutionService {
         let request = request.into_inner();
         let process_command =
             ProcessCommand::new(request.command).map_err(invalid_argument_status)?;
-        let listed_command = process_command.argv().to_vec();
         let requested_cwd = request.cwd;
-        let env = parse_env(request.env);
-        let listed_env = proto_env(&env);
+        let requested_env = request.env;
         let user = request
             .user
             .map(GuestUserName::parse)
@@ -1973,6 +1960,9 @@ impl Process for ExecutionService {
         )
         .await?;
         let account_lookup = received_at.elapsed();
+        let listed_command = process_command.argv().to_vec();
+        let env = parse_env(requested_env);
+        let listed_env = proto_env(&env);
         let cwd = requested_cwd
             .as_deref()
             .map(|cwd| guest_path::normalize_for_account(cwd, &account))
@@ -2189,6 +2179,10 @@ impl Process for ExecutionService {
         request: Request<ConnectProcessRequest>,
     ) -> Result<Response<Self::ConnectProcessStream>, Status> {
         self.require_running()?;
+        crate::payload::check_message(
+            request.get_ref(),
+            pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+        )?;
         let request = request.into_inner();
         let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
         // Validate the field for wire compatibility, but do not turn it into a
@@ -2224,9 +2218,13 @@ impl Process for ExecutionService {
 
     async fn list_processes(
         &self,
-        _request: Request<ListProcessesRequest>,
+        request: Request<ListProcessesRequest>,
     ) -> Result<Response<Self::ListProcessesStream>, Status> {
         self.require_running()?;
+        crate::payload::check_message(
+            request.get_ref(),
+            pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+        )?;
         let processes = self.inner.processes.list();
         tracing::debug!(
             command = "bridge_guest_process_list",
@@ -2244,6 +2242,10 @@ impl Process for ExecutionService {
         request: Request<SendSignalRequest>,
     ) -> Result<Response<SendSignalResponse>, Status> {
         self.require_running()?;
+        crate::payload::check_message(
+            request.get_ref(),
+            pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+        )?;
         let request = request.into_inner();
         let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
         let signal =
@@ -2274,9 +2276,15 @@ impl Process for ExecutionService {
 
     async fn send_input(
         &self,
-        request: Request<SendInputRequest>,
+        mut request: Request<SendInputRequest>,
     ) -> Result<Response<SendInputResponse>, Status> {
         self.require_running()?;
+        let _admission = crate::payload::admit(
+            &mut request,
+            &self.inner.process_payload_slots,
+            1,
+            pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+        )?;
         let mut request = request.into_inner();
         let process_id = ProcessId::parse(std::mem::take(&mut request.process_id))
             .map_err(invalid_argument_status)?;
@@ -2300,6 +2308,10 @@ impl Process for ExecutionService {
         request: Request<CloseStdinRequest>,
     ) -> Result<Response<CloseStdinResponse>, Status> {
         self.require_running()?;
+        crate::payload::check_message(
+            request.get_ref(),
+            pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+        )?;
         let request = request.into_inner();
         let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
         let record = self
@@ -2321,6 +2333,10 @@ impl Process for ExecutionService {
         request: Request<ResizePtyRequest>,
     ) -> Result<Response<ResizePtyResponse>, Status> {
         self.require_running()?;
+        crate::payload::check_message(
+            request.get_ref(),
+            pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+        )?;
         let request = request.into_inner();
         let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
         let size = request

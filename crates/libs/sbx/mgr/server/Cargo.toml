@@ -82,6 +82,7 @@ pplx-space-sbx-mgr-store = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+rstest = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
 pplx-space-sbx-mgr-store = { workspace = true, features = ["test-support"] }
 pplx-space-net-gateway = { workspace = true, features = ["test-support"] }

@@ -113,6 +113,7 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
     let execution = test_execution();
     let inventory = NodeExecutionInventory {
+        policy: None,
         runtimes: vec![RuntimeInstallation {
             runtime: Some(execution.runtime().into()),
             supported_guests: vec![execution.guest().into()],

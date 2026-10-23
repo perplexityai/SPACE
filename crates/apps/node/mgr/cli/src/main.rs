@@ -314,6 +314,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let response = client
                 .resolve_execution_environment(
                     pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentRequest {
+                        compatible: None,
                         reference: reference.map(|value| value.to_string()),
                     },
                 )

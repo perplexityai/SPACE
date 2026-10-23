@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
+use crate::emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};
 
 /// Terminal result of one build-manager operation; the `result` tag on
 /// `template.build.latency_ms` for `op:build`.
@@ -239,9 +239,8 @@ pub fn rootfs_expansion(template: &str, trigger: &str, size_bytes: u64) {
 /// separate tag values rather than one `failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisibilityLookupDegradation {
-    /// No `templates.visibility` column (SQLSTATE 42703). Expected only
-    /// while a control plane predating the visibility migration is
-    /// still serving; sustained non-zero afterwards means schema drift.
+    /// No `templates.visibility` column (SQLSTATE 42703). The column is in
+    /// the baseline schema, so any occurrence means schema drift.
     ColumnMissing,
     /// Any other query failure: pool exhaustion, connection reset,
     /// permission denied, or the app role's server-side
@@ -266,6 +265,14 @@ impl VisibilityLookupDegradation {
             Self::TemplateMissing => "template_missing",
         }
     }
+
+    /// Reasons a monitor acts on. `template_missing` is caller-driven and never
+    /// alertable.
+    pub const ALERTABLE: [Self; 3] = [
+        Self::ColumnMissing,
+        Self::QueryFailed,
+        Self::UnrecognizedValue,
+    ];
 }
 
 impl std::fmt::Display for VisibilityLookupDegradation {
@@ -279,13 +286,34 @@ impl std::fmt::Display for VisibilityLookupDegradation {
 ///
 /// Alertability differs per reason, so don't alert on the bare metric:
 /// `template_missing` is caller-driven and never alertable;
-/// `column_missing` is expected while the visibility migration is still
-/// rolling out and alertable once it has completed everywhere;
-/// `query_failed` and `unrecognized_value` are always alertable.
+/// `query_failed`, `unrecognized_value` and `column_missing` are all
+/// alertable and feed [`visibility_lookup_alertable_last_hour`].
 pub fn visibility_lookup_degraded(reason: VisibilityLookupDegradation) {
     counter(
         "template.visibility_lookup.degraded",
         1,
+        &[tag("reason", reason.as_str())],
+    );
+}
+
+/// Alertable `template.visibility_lookup.degraded` events one cluster-API
+/// replica saw in the trailing hour (60 to 61 minutes), per `reason`.
+///
+/// Emitted on a fixed period with explicit zeros, so a monitor can test
+/// persistence with `min(last_4h)` and treat absence as a dead emitter; the
+/// sparse `degraded` counter can't separate a clean hour from lost data. A
+/// distribution rather than a gauge so `max:` sees the worst replica: gauges
+/// from replicas sharing a node agent collapse into one last-write-wins series.
+/// Query it with `max:` only. Each replica reports the same trailing count
+/// twice a minute, so `count:` counts samples rather than events, `sum:` counts
+/// each event once per sample for the hour it stays in the window, and `avg:`
+/// dilutes the worst replica across the healthy ones. A lookup answered from a stale cache entry is not a
+/// degradation, so a read failure the cache absorbs doesn't count here; see
+/// `template.visibility_lookup.cache{outcome:served_stale}`.
+pub fn visibility_lookup_alertable_last_hour(reason: VisibilityLookupDegradation, count: u64) {
+    distribution(
+        "template.visibility_lookup.alertable_last_hour",
+        count as f64,
         &[tag("reason", reason.as_str())],
     );
 }

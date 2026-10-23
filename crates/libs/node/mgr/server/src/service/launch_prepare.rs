@@ -1091,7 +1091,7 @@ fn warn_legacy_execution(sandbox_id: &str) {
         .elapsed()
         .as_secs();
     if NEXT_WARNING
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             (elapsed >= next).then_some(elapsed.saturating_add(60))
         })
         .is_ok()

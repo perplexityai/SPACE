@@ -168,42 +168,16 @@ impl SandboxManagerService {
     async fn resolve_create_environment(
         &self,
         reference: pplx_space_common_core::types::EnvironmentReference,
-    ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    ) -> Result<pplx_space_node_mgr_client::environment_selection::SelectedEnvironment, Status>
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let mut node = connect_node(&self.node_manager)
                 .await
                 .map_err(|error| Status::unavailable(error.to_string()))?;
-            node.resolve_execution_environment(
-                pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentRequest {
-                    reference: Some(reference.to_string()),
-                },
-            )
-            .await
+            super::environment_selection::resolve_exact(&mut node, reference).await
         })
         .await
-        .map_err(|_| Status::deadline_exceeded("environment admission timed out"))??
-        .into_inner();
-        let definition = pplx_space_execution_common::environment::EnvironmentDefinition::try_from(
-            response.definition.as_ref().ok_or_else(|| {
-                Status::failed_precondition("node did not return environment definition")
-            })?,
-        )
-        .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        let actual = pplx_space_common_core::types::ExecutionMetadata::try_from(
-            response.execution.as_ref().ok_or_else(|| {
-                Status::failed_precondition("node did not acknowledge execution environment")
-            })?,
-        )
-        .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        if definition.reference() != reference || actual.environment() != Some(reference) {
-            return Err(Status::failed_precondition(
-                "node returned a different or missing environment binding",
-            ));
-        }
-        definition
-            .bind_execution(actual)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        Ok(definition)
+        .map_err(|_| Status::deadline_exceeded("environment admission timed out"))?
     }
 
     pub(super) async fn create(
@@ -240,14 +214,30 @@ impl SandboxManagerService {
                 super::validation::validate_environment_create_fields(req)?;
             }
             let verified = if let Some(reference) = environment {
-                let definition = self.resolve_create_environment(reference).await?;
-                let pplx_space_common_core::types::RuntimeBinding::ManagedRelease(release) = &definition.descriptor().spec().runtime;
+                let selected = self.resolve_create_environment(reference).await?;
+                let pplx_space_common_core::types::RuntimeBinding::ManagedRelease(release) = &selected.definition.descriptor().spec().runtime;
                 request.get_mut().runtime = release.runtime.kind.alias().to_owned();
-                Some(definition)
+                Some(selected)
             } else { None };
             let req = request.get_ref();
             let template = &req.template;
             let runtime = &req.runtime;
+
+            use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+            let mut scope = template_lookup_scope(&sandbox_owner, req.sandbox_id.as_deref())?;
+            if peer.principal() == UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI) {
+                scope = match (scope, TemplateLookupScope::from_request(&request)?) {
+                    (TemplateLookupScope::Sandbox { id, .. }, Some(TemplateLookupScope::Node(address))) =>
+                        TemplateLookupScope::Sandbox { id, caller_node: Some(address) },
+                    (scope @ TemplateLookupScope::Sandbox { .. }, Some(TemplateLookupScope::Cluster)) => scope,
+                    (_, Some(scope @ (TemplateLookupScope::Node(_) | TemplateLookupScope::Cluster))) => scope,
+                    (scope, None) => {
+                        pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+                        scope
+                    }
+                    _ => return Err(Status::permission_denied("invalid remote template caller scope")),
+                };
+            }
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
@@ -258,23 +248,17 @@ impl SandboxManagerService {
                     content_hash: req.content_hash.clone(),
                     tag: None,
                 },
+                scope,
             )
             .await?;
-            if let Some(definition) = &verified {
-                resolved_template.execution = definition.bind_execution(resolved_template.execution)
+            if let Some(selected) = &verified {
+                selected.definition.check_cold_boot_source(&resolved_template.execution)
                     .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                resolved_template.execution = selected.execution.clone();
             }
-            let non_default = super::validation::validate_environment_create(
+            super::validation::validate_environment_create(
                 req, environment, &resolved_template.execution,
             )?;
-            if non_default || environment.is_some() {
-                let reference = resolved_template.execution.environment().ok_or_else(|| Status::failed_precondition("explicit selection requires a bound template"))?;
-                if verified.is_none() {
-                    let definition = self.resolve_create_environment(reference).await?;
-                    resolved_template.execution = definition.bind_execution(resolved_template.execution)
-                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                }
-            }
             if let Some(policy) = template_network_policy_from_proto(
                 req.template_network_policy.as_ref(),
                 req.template_network_policy_generation,
@@ -504,33 +488,25 @@ impl SandboxManagerService {
                         effective_mode,
                     )));
                 }
-                return self
-                    .create_with_id(CreateWithIdArgs {
-                        req,
-                        sandbox_owner: &sandbox_owner,
-                        effective_mode,
-                        id: requested_id.to_string(),
-                        template_dir: &resolved_template.template_dir,
-                        execution: resolved_template
-                            .execution
-                            .environment()
-                            .map(|_| &resolved_template.execution),
-                        snapshot_dir_resolved: resolved_template.snapshot_dir.as_deref(),
-                        snapshot_vcpu: resolved_template.snapshot_vcpu,
-                        content_hash_resolved: resolved_template.content_hash.as_deref(),
-                        auto_lifecycle: &auto_lifecycle,
-                        auto_lifecycle_authority,
-                        default_network_policy_authority: resolved_template
-                            .default_network_policy_authority,
-                    })
-                    .await;
+            }
+
+            // Reused IDs return above before selection. Cluster placement and
+            // pool identity still require their existing exact environment.
+            if environment.is_none()
+                && resolved_template.execution.environment().is_some()
+                && super::validation::allows_node_local_environment_selection(req)
+            {
+                resolved_template.execution = self.select_compatible_execution(
+                    &resolved_template.execution,
+                    pplx_space_node_mgr_client::proto::ExecutionEnvironmentSelection::ColdBoot,
+                ).await?;
             }
 
             self.create_with_id(CreateWithIdArgs {
                 req,
                 sandbox_owner: &sandbox_owner,
                 effective_mode,
-                id: Uuid::now_v7().to_string(),
+                id: requested_id.unwrap_or_else(Uuid::now_v7).to_string(),
                 template_dir: &resolved_template.template_dir,
                 execution: resolved_template
                     .execution

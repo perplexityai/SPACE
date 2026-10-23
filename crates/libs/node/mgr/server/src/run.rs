@@ -117,6 +117,8 @@ pub struct NodeMgrRunConfig {
 /// variable, or value that was misread.
 #[derive(Debug, thiserror::Error)]
 pub enum RunNodeMgrError {
+    #[error("execution selection configuration: {0}")]
+    SelectionConfiguration(#[from] crate::config::SelectionConfigurationError),
     #[error(transparent)]
     DiskIoCeiling(#[from] crate::service::disk_io_ceiling::InvalidCeiling),
     #[error("failed to read node config {path}: {source}")]
@@ -577,7 +579,7 @@ pub async fn run(
     let memory_admission_config = resolve_memory_admission_config(&cli, &file.memory_admission)?;
     let mut disk_io_reservation_config =
         resolve_disk_io_reservation_config(file.disk_io_reservation)?;
-    let service_settings = crate::config::ServiceSettings::from_env();
+    let service_settings = crate::config::ServiceSettings::from_env()?;
     let disk_io_ceiling = crate::service::disk_io_ceiling::DiskIoCeiling::from_env()?;
     tracing::info!(
         maximum_iops = disk_io_ceiling.configured(),

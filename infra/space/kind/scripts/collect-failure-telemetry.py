@@ -46,7 +46,7 @@ SUMMARY_SANDBOX = re.compile(r"^\s+sandbox_id: (\S+)\s*$")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 KIND_CONTEXT = "kind-space-local"
-# The localhost forwards both bring-up paths keep open, and the Service each
+# The localhost forwards the Tiltfile keeps open, and the Service each
 # forwards to, for when they are gone.
 BACKENDS = {
     "tempo": ("http://127.0.0.1:13200", "space-traces", "svc/tempo", 3200, "/ready"),

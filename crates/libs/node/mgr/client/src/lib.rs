@@ -1,5 +1,6 @@
 pub use pplx_space_node_mgr_protocol::proto;
 
+pub mod environment_selection;
 pub mod execution_fence;
 
 /// One sequential inventory walk. An expired/consumed cursor is an error, never EOF.

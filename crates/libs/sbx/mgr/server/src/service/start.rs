@@ -546,6 +546,7 @@ pub(super) struct ResolvedSandboxMemoryPolicy {
 
 async fn prepare_suspend_restore_dir(
     service: &SandboxManagerService,
+    owner: &pplx_space_common_core::types::SandboxOwner,
     sandbox_id: String,
     storage_uri: Option<String>,
     execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
@@ -628,6 +629,7 @@ async fn prepare_suspend_restore_dir(
         Some(storage_uri) => {
             crate::snapshot_restore::prepare_restore_dir_from_uri(
                 &sandbox_id,
+                owner,
                 execution_fence,
                 storage_uri,
                 transfer_scope_id,
@@ -639,6 +641,7 @@ async fn prepare_suspend_restore_dir(
         None => {
             crate::snapshot_restore::prepare_restore_dir(
                 &sandbox_id,
+                owner,
                 execution_fence,
                 transfer_scope_id,
                 &service.node_manager,
@@ -1497,6 +1500,7 @@ impl SandboxManagerService {
                     |sandbox_id, storage_uri| {
                         prepare_suspend_restore_dir(
                             self,
+                            &sandbox.user,
                             sandbox_id,
                             storage_uri,
                             ctx.execution_generation,
@@ -1625,6 +1629,7 @@ impl SandboxManagerService {
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
                 },
+                sandbox,
             )
             .await?;
             reject_incompatible_template_spaced_compatibility(

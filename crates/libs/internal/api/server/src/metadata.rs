@@ -249,6 +249,7 @@ pub(super) fn proto_facet(value: ReconcileFacet) -> ProtoReconcileFacet {
         ReconcileFacet::SandboxDesiredState => ProtoReconcileFacet::SandboxDesiredState,
         ReconcileFacet::TemplateDesiredState => ProtoReconcileFacet::TemplateDesiredState,
         ReconcileFacet::NodeStatus => ProtoReconcileFacet::NodeStatus,
+        ReconcileFacet::RuntimeProvisioning => ProtoReconcileFacet::RuntimeProvisioning,
     }
 }
 
@@ -296,8 +297,8 @@ pub(super) fn facet_element_to_proto(
         | ReconcileFacet::TemplateDesiredState => {
             Ok(facet_ref::Element::Template(element.to_string()))
         }
-        ReconcileFacet::NodeStatus => Err(Status::internal(
-            "queued node-status facet must not have an element",
+        ReconcileFacet::NodeStatus | ReconcileFacet::RuntimeProvisioning => Err(Status::internal(
+            "queued whole-node facet must not have an element",
         )),
     }
 }
@@ -313,6 +314,7 @@ pub(super) fn proto_facet_ref_to_storage(value: FacetRef) -> Result<QueuedFacetR
         ProtoReconcileFacet::SandboxDesiredState => FACET_SANDBOX_DESIRED_STATE,
         ProtoReconcileFacet::TemplateDesiredState => FACET_TEMPLATE_DESIRED_STATE,
         ProtoReconcileFacet::NodeStatus => FACET_NODE_STATUS,
+        ProtoReconcileFacet::RuntimeProvisioning => FACET_RUNTIME_PROVISIONING,
         ProtoReconcileFacet::Unspecified => {
             return Err(Status::invalid_argument("facet is required"));
         }
@@ -332,9 +334,9 @@ pub(super) fn proto_facet_ref_to_storage(value: FacetRef) -> Result<QueuedFacetR
             | FACET_TEMPLATE_DESIRED_STATE,
             Some(facet_ref::Element::Template(template)),
         ) => Some(template),
-        (FACET_NODE_STATUS, Some(_)) => {
+        (FACET_NODE_STATUS | FACET_RUNTIME_PROVISIONING, Some(_)) => {
             return Err(Status::invalid_argument(
-                "node-status facet does not accept an element",
+                "whole-node facet does not accept an element",
             ));
         }
         (facet, Some(_)) => {
@@ -468,14 +470,14 @@ pub(super) struct TemplateReleaseStorageLocationRow {
 }
 
 /// SQLSTATE `undefined_column`, raised when the control-plane schema has no
-/// `templates.visibility` column. This is the one lookup failure with a benign
-/// explanation (a server running ahead of the visibility migration), so it is
-/// the only one reported as such.
+/// `templates.visibility` column. The column is in the baseline schema, so
+/// this means schema drift; it gets its own reason
+/// because its remediation differs from a failing read.
 const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
 
 /// Classify a failed visibility lookup by the SQLSTATE the server returned.
 ///
-/// Only `undefined_column` earns the "schema predates the migration" story.
+/// Only `undefined_column` reports `column_missing`.
 /// Note the consequence for the other durable codes — a renamed table
 /// (`42P01`), a revoked grant (`42501`), a wrong database (`3D000`) and a dropped
 /// database (`57P04`), which is `DURABLE_SQLSTATES` in full besides `42703`: they
@@ -487,10 +489,9 @@ const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
 /// denied, the role's `statement_timeout` — reaches the same arm, and since the
 /// visibility migration is already in the chain, DB trouble is the common case
 /// and schema skew the rare one. Getting this backwards is not cosmetic: it
-/// tells an operator to ignore a live incident as expected rollout noise, and
-/// it silences the `column_missing` signal that the rollout is actually
-/// watching for. Split out from the call site so the mapping is unit-testable
-/// without a database.
+/// points an operator at the schema during a live DB incident, and it muddies
+/// the `column_missing` signal that means the schema itself drifted. Split out
+/// from the call site so the mapping is unit-testable without a database.
 ///
 /// Cached prepared statements do not defeat this in either direction. Dropping
 /// the column invalidates the relcache entry, which forces revalidation of the
@@ -517,8 +518,16 @@ fn degradation_for_sqlstate(code: Option<&str>) -> VisibilityLookupDegradation {
 /// other, which would leave either the cache-hit-rate series or the
 /// prefetch-suppression monitor quietly under-counting. Returning
 /// `Unspecified` from here means an arm cannot report a miss and then answer
-/// with something else.
-fn visibility_miss(reason: VisibilityLookupDegradation) -> TemplateVisibility {
+/// with something else. The same call records the degradation in the
+/// trailing-hour window behind `template.visibility_lookup.alertable_last_hour`,
+/// so while the emitter runs that series and the `degraded` counter count the
+/// same events. The emitter stops at shutdown, so a degradation during the
+/// request drain reaches only the counter.
+fn visibility_miss(
+    reason: VisibilityLookupDegradation,
+    observations: &crate::visibility_observations::Observations,
+) -> TemplateVisibility {
+    observations.record(reason);
     visibility_degraded_with(VisibilityLookupCacheOutcome::Miss, reason)
 }
 
@@ -906,6 +915,7 @@ mod visibility_degradation_tests;
 pub(super) async fn template_visibility(
     pool: &sqlx::PgPool,
     cache: &TemplateVisibilityCache,
+    observations: &crate::visibility_observations::Observations,
     template_name: &str,
 ) -> TemplateVisibility {
     // `started` doubles as the cache entry's `read_at` on success. It is not
@@ -962,7 +972,7 @@ pub(super) async fn template_visibility(
                     error = %error,
                     "unrecognized templates.visibility value; reporting unspecified"
                 );
-                visibility_miss(VisibilityLookupDegradation::UnrecognizedValue)
+                visibility_miss(VisibilityLookupDegradation::UnrecognizedValue, observations)
             }
         },
         // No `templates` row. Routine for `list_latest_template_releases`, whose
@@ -1030,7 +1040,7 @@ pub(super) async fn template_visibility(
                     template = template_name,
                     error = %error,
                     "templates.visibility column is absent; reporting unspecified \
-                     (expected when the control plane predates the visibility migration)"
+                     (schema drift: the column is in the baseline schema)"
                 );
             } else {
                 tracing::warn!(
@@ -1039,7 +1049,7 @@ pub(super) async fn template_visibility(
                     "templates.visibility lookup failed; reporting unspecified"
                 );
             }
-            visibility_miss(reason)
+            visibility_miss(reason, observations)
         }
     }
 }

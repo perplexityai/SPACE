@@ -91,10 +91,13 @@ local evidence only for the scope they cover; report commands and limitations.
 
 Cross-cutting changes to shared crates, workspace dependencies/features, build
 configuration, or code generation need broad workspace validation. The owning
-runner is `ci/scripts/run-rust-checks.sh` (`fmt`, `clippy`, `tests`, or
-`all`; GitHub CI splits `tests` into `tests-unprivileged` and
+runner is `ci/scripts/run-rust-checks.sh` (`fmt`, `clippy`, `isolated-crates`,
+`tests`, or `all`; GitHub CI splits `tests` into `tests-unprivileged` and
 `tests-privileged`); use its current checks rather than maintaining a second
-command matrix here. CI retains its complete workspace inventory, including all targets,
+command matrix here. Its `clippy` mode does not lint crates alone: when a change
+adds a crate or changes dependency features, also run its `isolated-crates`
+mode (see `$space-validation`'s CI pipeline reference for running the check
+alone). CI retains its complete workspace inventory, including all targets,
 features, ignored tests, and doc tests. Do not narrow CI to local selectors.
 
 On macOS, Rust changes behind `cfg(target_os = "linux")` also require targeted

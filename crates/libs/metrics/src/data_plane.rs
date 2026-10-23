@@ -508,6 +508,11 @@ pub fn revocation_cache_probe(kind: &str, result: &str) {
     );
 }
 
+/// Counts one revocation check outcome. A check can record more than one: an
+/// org read that finds the epoch changed records `org_epoch_changed` and then
+/// the session read's result, and a failed check that keeps the last verdict
+/// records `status_error` or `timeout` and then `kept_last_verdict`. The sum
+/// over results is therefore not a count of checks.
 pub fn revocation_check(kind: &str, result: &str) {
     counter(
         "data_plane.revocation.check",

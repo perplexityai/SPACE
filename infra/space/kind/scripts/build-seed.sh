@@ -20,7 +20,7 @@
 #
 # The sandbox SSH public key is baked into the seed like the Packer AMI build
 # does. On a devbox there is no Packer, so we generate a per-devbox keypair
-# once under ~/.space-devbox/kind/ssh/ — bootstrap.sh ships the key pair to
+# once under ~/.space-devbox/kind/ssh/ — the Tiltfile ships the key pair to
 # build-manager (Secret mounted at /root/.ssh), which SSHes into build VMs as
 # a builder does with its node image's key.
 #

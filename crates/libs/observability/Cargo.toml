@@ -17,7 +17,7 @@ default = []
 # crate.
 test-capture = []
 # Enables the trace-parity fixture overrides (see `pplx_space_common_core::env::test_hook`).
-test-hooks = ["pplx-space-common-core/test-hooks"]
+test-hooks = ["dep:pplx-space-common-core", "pplx-space-common-core/test-hooks"]
 # Vendor-neutral traces, propagation, and OTLP metrics.
 otel = [
     "otlp-metrics",
@@ -50,7 +50,8 @@ http = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "metrics"], optional = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "spec_unstable_metrics_views"], optional = true }
-pplx-space-common-core = { workspace = true }
+pplx-space-cluster-id = { workspace = true }
+pplx-space-common-core = { workspace = true, optional = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt"], optional = true }

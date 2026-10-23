@@ -240,6 +240,17 @@ clusterActivationAdmission:
 clientConcurrency:
   mode: "observe"
 
+# Native operations the manifest hides by default (docs/configuration.md):
+# `orgs` is SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS, `*` or comma-separated org
+# ids; `flagEnabled` is the space-native-hidden-operations flag's env master.
+# Both empty, so the binary's defaults stand: no org listed, master on. Keep
+# `orgs` empty here, since infra/space/cluster installs this chart too: set it
+# per install, for example `--set nativeHiddenOperations.orgs=<org id>` on a
+# local bench that needs snapshots in the console.
+nativeHiddenOperations:
+  orgs: ""
+  flagEnabled: ""
+
 # The store both limiters keep their state in: the space-redis Deployment
 # (charts/space-redis-local). Each limiter reads SPACE_REDIS_URL when the
 # process builds its state, above the `--surface` branch
@@ -296,8 +307,8 @@ byokVolumeEncryption: "1"
 # either way — so what the bench buys is the query executing. The discount
 # itself is `node_drain/store/residency_tests.rs`, against real Postgres.
 #
-# On this bench api and cluster-controller are separate chart renders — via
-# `bootstrap.sh`'s `helm template | kubectl apply` or via Tilt — so one cannot
+# On this bench api and cluster-controller are separate chart renders (Tilt's
+# `helm template` of each), so one cannot
 # read the other's values the way the EKS chart has both containers render
 # from the controller's own key. Nothing in Helm can stop these two from drifting;
 # `scripts/tests/test_node_drain_activation_parity.py` is what holds them

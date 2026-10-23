@@ -353,6 +353,12 @@ pub struct AdminNodeStatusSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminExecutionInventoryObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<super::ExecutionPolicyObservation>,
+    /// Independent receipt: older cluster writers may refresh inventory without
+    /// understanding policy. Their publication must not renew policy evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_received_at: Option<String>,
     /// Diagnostic label: complete, unavailable, or legacy. Preserve future
     /// labels for display during mixed-version rollout; never infer eligibility.
     pub status: String,

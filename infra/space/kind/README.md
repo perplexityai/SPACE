@@ -15,28 +15,53 @@ production" below.
 
 ## Default workflow: Tilt
 
-Tilt does not create the cluster. The `Tiltfile` attaches to the existing
-`kind-space-local` context (`allow_k8s_contexts`) and refuses any other, so a
-fresh host needs the prerequisites and the cluster first. The first-time path
-is the scripted bring-up in the root README, which creates the cluster, stages
-the Firecracker vendor tree, builds every image, and deploys the stack:
+Tilt is the one Kind bring-up. `scripts/up.sh` creates the cluster, stages the
+Firecracker vendor tree, starts `tilt up` on the repository's `Tiltfile`
+detached in its own session, and returns once the stack is ready, printing its
+endpoints; [docs/installation.md](../../../docs/installation.md) walks through
+it on a fresh host:
 
 ```bash
-bash infra/space/kind/scripts/install-prereqs.sh    # kind, kubectl, helm, grpcurl, go
+bash infra/space/kind/scripts/install-prereqs.sh    # kind, kubectl, helm, grpcurl, tilt, go
 bash infra/space/kind/scripts/install-fc-vendor.sh  # Firecracker, jailer, guest kernel
-bash infra/space/kind/scripts/bootstrap.sh          # creates space-local and deploys
-tilt up                                             # from the repository root
+bash infra/space/kind/scripts/up.sh                 # creates space-local, starts Tilt, waits
 ```
 
-Do not create the cluster by hand: `kind-cluster.yaml` bind-mounts per-node
-containerd host directories and the staged vendor tree, which must exist
-before `kind create`, and Tilt's bootstrap resources run only after the
-cluster is up. `bootstrap.sh` performs that preparation first.
+"Ready" is what the smoke suites wait for, since both run
+`scripts/tests/lib/bootstrap-kind-stack.sh`: Tilt has nothing pending, every
+workload in the namespace has rolled, `space-seed-publish` has completed, every
+node is published and schedulable, and the API and data plane answer on
+`localhost:8080` and `:8090`. Rerun on a live stack, `up.sh` reuses the running
+Tilt and returns once it has settled, or fails with the log of any resource
+whose update failed. It restarts Tilt when Tilt was started with other values of
+the settings Tilt reads from its environment once, at start: the list is
+`TILT_SETTINGS` in `up.sh` (the telemetry, Datadog and storage credentials
+modes, the prune and parallel-update switches, `SPACE_LOOP_DEVICE_TARGET`,
+`SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile, and
+`SPACE_KIND_RUST_BUILD`), each compared with its default, plus the optional
+AWS credentials when storage credentials are `static`. Nothing else restarts
+it, so a refreshed AWS session token in the default mode keeps the running
+Tilt. Before stopping it, `up.sh` checks its own refusals (the timeout, storage
+mode, Rust build and profile, and parallelism, and the cluster's mounts,
+node image, layout, Postgres data and nodes' vendor copies, after staging the
+vendor tree as the bring-up does); a refusal at Tiltfile load is not
+pre-checked. Tilt's log
+is `~/.space-devbox/kind/tilt-space-local.log`, its pid is in
+`~/.space-devbox/kind/tilt-space-local.pid`, and `teardown.sh` stops it.
 
-Once the cluster exists, `tilt up` is the everyday loop: it builds any image
+Tilt does not create the cluster itself. `up.sh` starts it with
+`--context kind-space-local`, and the `Tiltfile` refuses any other context
+before it runs a command. Do not create the cluster by hand: `kind-cluster.yaml` bind-mounts
+per-node containerd host directories and the staged vendor tree, which must
+exist before `kind create`, and Tilt's bootstrap resources run only after the
+cluster is up. `up.sh` performs that preparation first.
+
+Once the cluster is up, Tilt is the everyday loop: it builds any image
 that is missing, then watches the tree, rebuilding affected images and rolling
 the corresponding workloads without recreating the cluster or its persistent
-data. Every Rust binary comes from one artifact image,
+data. Tilt orders resources only on their first build: on a later update an
+API image can roll before that revision's `space-db-migrate` Job has finished,
+which a fresh bring-up never does. Every Rust binary comes from one artifact image,
 `space-rust-build-kind:local` (the union of the production artifact sets),
 owned by `scripts/build-rust-artifacts.sh`: on Linux/x86_64 it runs **one
 incremental cargo build inside the production `chef-base` builder image** —
@@ -59,35 +84,42 @@ are compiled in only for these images, and release images never enable the
 feature. `SPACE_KIND_RUST_BUILD=release` builds and deploys binaries without
 it instead (see [Release-build lane](#release-build-lane)).
 Follow build progress at `http://localhost:10350`.
-`tilt down && kind delete cluster --name space-local` tears it down.
+`bash infra/space/kind/scripts/teardown.sh` stops Tilt and deletes the cluster.
 
 If startup reports that the Tilt server on `:10350` could not be verified as
 `kind-space-local`, inspect `tilt get cluster default --port 10350 -o yaml`.
 A watcher for another cluster must be stopped in its owning session before
 starting this stack. An initializing watcher can be retried
-once its cluster context is available. Bootstrap leaves a responsive unverified
+once its cluster context is available. The bring-up leaves a responsive unverified
 watcher running rather than terminating it.
 
 A watcher that *does* verify as `kind-space-local` can still be bound to a
 cluster that was deleted and recreated underneath it: the context name is the
 same, only the apiserver's host port changed, and Tilt loaded the old one at
-startup. The smoke bring-up (`scripts/tests/lib/bootstrap-kind-stack.sh`)
+startup. The bring-up (`scripts/tests/lib/bootstrap-kind-stack.sh`)
 restarts such a watcher instead of waiting on it, judging it stale when Tilt
 reports a cluster connection error or
 when its process predates the current `space-local-control-plane` container.
 It likewise restarts a watcher that serves this cluster from a different
 checkout, or from one deleted since it started, so the code built and deployed
 is always the checkout the bring-up ran from; the cluster and its pods stay up.
-The same bring-up ends with a Tilt build error, printing that resource's log,
-rather than consuming its timeout — Tilt does not retry a failed build until a
+The same bring-up ends with a Tilt build error, printing that resource's log
+(including an error Tilt has settled with on a warm stack, whose old pods still
+pass every rollout), or with a failed `space-db-migrate` Job once Tilt has
+finished replacing it, printing its log, rather than consuming its timeout — Tilt does not retry a failed build until a
 watched file changes or you run `tilt trigger <resource>` — and it returns only
 once Tilt has nothing pending and every workload in the namespace has finished
-rolling. `teardown.sh` also stops a watcher serving this context that its
+rolling. When `:10350` does not answer, it stops only a `tilt up` its pidfile
+names or one started from this checkout, and leaves any other watcher on the
+host running. Before it starts Tilt it also stops the self-restarting
+`port-forward.sh` supervisors the retired scripted bring-up left on `:3000`,
+`:8333` and the telemetry ports, so Tilt's own forwards can bind. `teardown.sh`
+also stops a watcher serving this context that its
 pidfile does not name, so a `kind-down` cannot leave the stale watcher behind.
 
 ### Build identity and provenance
 
-Every image Tilt or `build-images.sh` builds goes through
+Every image Tilt builds goes through
 `scripts/image-provenance.py`, which gives it a build identity when it is
 built, not when Tilt starts: the checkout's commit (`git rev-parse --short=12
 HEAD`) when the image is what that commit builds, and
@@ -114,7 +146,7 @@ package install.
 
 "The commit's for the whole build" is judged from two snapshots of the
 build's inputs (`image-provenance.py snapshot`): one taken before the build's
-first step (each Tilt build chain's, and `build-images.sh`'s own start), since
+first step (the start of each Tilt build chain), since
 the chain compiles Rust and assembles the seed before the image's
 `docker build`, and one after that `docker build`. Each snapshot holds HEAD,
 `git status` and the stat data of every tracked and untracked file, so an edit
@@ -249,8 +281,8 @@ the Kind services with no crate's `test-hooks` feature enabled:
   build in the `space.pplx.net/kind-rust-build` label, `prebuilt` mode refuses
   an image labelled for the other build, and each Rust runtime image copies the
   label from the artifact image it was built from (`runtime-image-cache.sh`).
-- **Charts.** Tilt and `bootstrap.sh` render every chart with
-  `rustBuild=release`, which drops each hook the charts otherwise set on every
+- **Charts.** The Tiltfile renders every chart with `rustBuild=release`,
+  which drops each hook the charts otherwise set on every
   run: sandbox-manager's `SPACE_SBX_GC_TARGET_FRACTION`,
   `SPACE_SBX_GC_INTERVAL_SECS`, `SPACE_SBX_GC_GRACE_SECS` and
   `SPACE_SBX_GC_IDLE_SECS`, template-manager's `SPACE_TEMPLATE_GC_INTERVAL_SECS`,
@@ -266,11 +298,8 @@ the Kind services with no crate's `test-hooks` feature enabled:
   image each running container of a SPACE Rust image uses, on its node, and
   requires every one of them, and each pod's rendered label, to agree. A pod
   or image without the label predates the lane and counts as `test-hooks`.
-  `bootstrap.sh` refuses to render the charts when the artifact or a Rust
-  runtime image carries the other build (as `--skip-images` can leave them),
-  and fails unless every container runs the requested build once the
-  Deployments and DaemonSets have rolled out. The smoke bring-up applies the
-  same check after Tilt settles.
+  The bring-up (`up.sh` and the smoke bring-up) fails unless every container
+  runs the requested build once Tilt settles.
 - **Scenarios.** A scenario declared `test_hooks=` (naming the hooks it needs)
   is skipped, and printed as `SKIPPED`, on a bench whose Rust containers run
   the release build. With `SPACE_KIND_RUST_BUILD` set, the smoke bring-up
@@ -308,7 +337,7 @@ producer builds the release image in Docker mode, and the four shards check its
 label and run the baseline and their partitions. No required check depends on
 it and nothing schedules it.
 
-## Bring it up (scripted)
+## Bring it up
 
 ### CI layer cache
 
@@ -366,8 +395,7 @@ Each runtime Dockerfile ends those layers at a named stage before its first
 SPACE binary, script or seed (`runtime-deps`, plus `smoke-build` for the API's
 smoke environment and `deps` for the UI's `npm ci`), and each stage has its own
 `kind-<image>-<stage>-e<epoch>` tag; `infra/space/kind/scripts/runtime-image-cache.sh`
-lists them and runs every runtime image build, for Tilt and `build-images.sh`
-alike. The seed builder's tag, `kind-seed-builder-e<epoch>`, also holds the
+lists them and runs every runtime image build. The seed builder's tag, `kind-seed-builder-e<epoch>`, also holds the
 recipe's dated Ubuntu cloud image with its signed checksums, which
 `rootfs-builder.sh` verifies again before use. Only the Kind seed build reuses
 cached checksums (`SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1`); the production build
@@ -412,8 +440,7 @@ cannot be reached, builds fetch from upstream as before.
 
 ### Scripted steps
 
-The same first-time steps with the validation suites, for CI and scripted fixture setup
-without Tilt:
+The same first-time steps with the validation suites, for CI and scripted fixture setup:
 
 ```bash
 # 1. user-local prereqs (kind, kubectl, helm, grpcurl, go 1.25)
@@ -422,8 +449,8 @@ bash infra/space/kind/scripts/install-prereqs.sh
 # 2. Firecracker binary + jailer + vmlinux into the vendor tree
 bash infra/space/kind/scripts/install-fc-vendor.sh
 
-# 3. the actual cluster
-bash infra/space/kind/scripts/bootstrap.sh
+# 3. the actual cluster, under Tilt
+bash infra/space/kind/scripts/up.sh
 
 # 4. validate
 SKIP_BOOTSTRAP=1 bash scripts/tests/smoke-kind-e2e.sh
@@ -437,7 +464,7 @@ No AWS credentials are needed anywhere in the default bring-up: the seed
 template is built locally by the production seed builder and published
 in-cluster (see "Seed template" below).
 
-`bootstrap.sh` auto-invokes `install-fc-vendor.sh` unless
+`up.sh` auto-invokes `install-fc-vendor.sh` unless
 `install-fc-vendor.sh --check` finds the vendor tree staged: this Firecracker
 release, and the guest kernel at the sha256 the installer pins (set
 `SPACE_FC_KERNEL_VERSION` and `SPACE_FC_KERNEL_SHA256` together to change it).
@@ -446,19 +473,20 @@ kernel is staged again, so step 2 is optional in practice. A change to the
 host tree reaches only nodes created after it: each node copies the tree on
 its first boot and keeps its copy ([The node layer](#the-node-layer)), so on
 a reused cluster the bring-up refuses nodes whose copy differs and names the
-remedy, recreating the cluster (`scripts/check-node-vendor.sh`). It is otherwise
-idempotent: it
-creates the kind cluster (if missing) with the SPACE Kind node image on the
-sandbox workers and builders (see [The node layer](#the-node-layer)), labels
-nodes, installs the local observability backends when the `otel` profile is
-selected, installs the containerd shim on the sandbox workers, applies the `space` and
-`sandboxes` Namespaces + `RuntimeClass` and the sandbox namespace's
-NetworkPolicies,
-builds every image and `kind load`s it (first run is the long step; the
-incremental build reuses its target dir and the Docker build is
-cargo-chef-cached after that), applies every chart with
-`helm template | kubectl apply`, and waits for every node-service DaemonSet
-to roll out and every SPACE node to be published and schedulable.
+remedy, recreating the cluster (`scripts/check-node-vendor.sh`). Before
+anything else it validates the telemetry selection and the console
+password, checks for the tools and a reachable Docker daemon, and warns when
+either disk is short (see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure)).
+It then creates the kind cluster (if missing) with the SPACE Kind node image
+on the sandbox workers and builders (see [The node layer](#the-node-layer)),
+and starts Tilt, which labels nodes, installs the local observability backends
+when the `otel` profile is selected, installs the containerd shim on the
+sandbox workers, applies the `space` and `sandboxes` Namespaces +
+`RuntimeClass` and the sandbox namespace's NetworkPolicies, builds every image
+and loads it into the nodes (first run is the long step; the incremental build
+reuses its target dir and the Docker build is cargo-chef-cached after that),
+and applies every chart rendered with `helm template`. `up.sh` waits for all
+of that, then verifies the Datadog Agent when a Datadog backend is selected.
 
 ### Metrics (opt-in local backend)
 
@@ -480,9 +508,9 @@ Loki and its data. Builder log exclusions remain in both collection paths.
 
 ### Querying telemetry
 
-In `otel` mode both bring-up paths forward the selected local backends to localhost, as they
-do the UI and the object store (bootstrap unless `--no-port-forward`), and
-restart a forward whenever its pod restarts. External metrics/traces receivers
+In `otel` mode the Tiltfile forwards the selected local backends to localhost, as it
+does the UI and the object store, and
+restarts a forward whenever its pod restarts. External metrics/traces receivers
 have no local query forward; Grafana is forwarded only when it is installed:
 
 | Backend | URL |
@@ -494,8 +522,7 @@ have no local query forward; Grafana is forwarded only when it is installed:
 
 Each backend's own `local.sh ui` helper uses the same port, for a backend
 installed on its own. The typed `local.telemetry_reaches_local_backends`
-scenario reads these forwards, so it needs them (`bootstrap.sh
---no-port-forward` turns them off). The suite skips it on a bench running
+scenario reads these forwards, so it needs a running Tilt. The suite skips it on a bench running
 another mode, but fails if that is not the mode the runner's
 `SPACE_KIND_TELEMETRY_MODE` names. Every signal can be read with `curl`:
 
@@ -603,11 +630,10 @@ non-secret JSON profile for transport, owned log routing and backend policy:
 
 ```bash
 SPACE_KIND_OBSERVABILITY_CONFIG="$PWD/infra/space/kind/profiles/observability-otel.json" \
-  bash infra/space/kind/scripts/bootstrap.sh
-# The same profile is supported by Tilt:
-SPACE_KIND_OBSERVABILITY_CONFIG="$PWD/infra/space/kind/profiles/observability-otel.json" tilt up
+  bash infra/space/kind/scripts/up.sh
 # Native transport and owned Alloy quiescence, without installing an Agent:
-SPACE_KIND_OBSERVABILITY_CONFIG="$PWD/infra/space/kind/profiles/observability-datadog.json" tilt up
+SPACE_KIND_OBSERVABILITY_CONFIG="$PWD/infra/space/kind/profiles/observability-datadog.json" \
+  bash infra/space/kind/scripts/up.sh
 ```
 
 The loader accepts one flat JSON object of supported string-valued options.
@@ -617,7 +643,7 @@ it. `otel` selects OTLP metrics/traces and local Alloy/Loki logs; `datadog`
 selects native metrics/traces and permits Agent collection of the managed Pods.
 `off` disables metrics and traces without changing application stdout logging.
 
-Bootstrap and Tilt reconcile the profile before changing producer manifests.
+Tilt reconciles the profile before changing producer manifests.
 With `SPACE_KIND_OBSERVABILITY=auto`, `otel` installs the necessary local
 metrics/traces receivers plus Alloy/Loki/Grafana before updating producers.
 An explicit per-signal receiver skips that signal's local backend and disables
@@ -627,9 +653,9 @@ The fixed node-side Collector addresses keep exporter configuration renderable
 without a cluster, and exporters retry if a receiver is later restarted.
 
 On a cold OTLP start, image loading and receiver installation happen during
-Tiltfile evaluation, before Tilt registers its cluster context. The smoke
+Tiltfile evaluation, before Tilt registers its cluster context. The
 bring-up allows its existing `BOOTSTRAP_TIMEOUT` budget (1800 seconds by
-default) for that initialization, while still requiring the selected context.
+default; `SPACE_BOOTSTRAP_TIMEOUT` for `up.sh`) for that initialization, while still requiring the selected context.
 An exited Tilt process or failed evaluation ends the wait early with a log
 tail. Detached bring-up also waits for this initialization, but not application
 builds or rollouts; the timeout is per stage, not a whole-bring-up deadline.
@@ -644,11 +670,11 @@ The `off` and `datadog` modes install no local OSS backends:
 
 ```bash
 # No metrics or traces; pause owned Alloy without deleting its backend.
-SPACE_KIND_TELEMETRY_MODE=off bash infra/space/kind/scripts/bootstrap.sh
+SPACE_KIND_TELEMETRY_MODE=off bash infra/space/kind/scripts/up.sh
 
 # Native Datadog with a local intake instead of SaaS.
 SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
-  bash infra/space/kind/scripts/bootstrap.sh
+  bash infra/space/kind/scripts/up.sh
 ```
 
 `off` sets `SPACE_METRICS_SINK=off` and `SPACE_TRACE_EXPORTER=off` for every
@@ -698,11 +724,11 @@ operation locks are never stolen; inspect an interrupted operation and recover
 it through Helm, without deleting release records to bypass the lock.
 
 Healthy unchanged receiver renders do not create another Helm revision.
-`tilt down` skips receiver reconciliation entirely. Detached bootstrap uses
+`tilt down` skips receiver reconciliation entirely. A detached bring-up uses
 `SPACE_TILT_DETACH_TIMEOUT` for context registration (60 seconds by default,
 at most 240); a timeout reports failure but leaves its detached Tilt process
 running. Cold initialization can continue in the background, and the normal
-blocking bootstrap still uses `BOOTSTRAP_TIMEOUT` for its longer readiness
+blocking bring-up still uses `BOOTSTRAP_TIMEOUT` for its longer readiness
 wait.
 
 With implicit local destinations, Rust workloads send metrics to
@@ -762,24 +788,23 @@ telemetry egress to Datadog SaaS:
 
 ```bash
 SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
-  bash infra/space/kind/scripts/bootstrap.sh --skip-images
-
-# Or start the Tilt-managed stack in the same mode:
-SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake tilt up
+  bash infra/space/kind/scripts/up.sh
 ```
 
-Both paths install Agent `7.81.1`, expose Fake Intake at
-`http://localhost:8088`, and set the Agent and SPACE workloads to the same
-local environment. Environment-only settings require a Tilt restart; the
-optional `SPACE_KIND_OBSERVABILITY_CONFIG` JSON file is watched and authoritative
-over the launch environment, including during rollback.
+This installs Agent `7.81.1`, exposes Fake Intake at
+`http://localhost:8088`, and sets the Agent and SPACE workloads to the same
+local environment; `up.sh` then verifies the running Agents' configuration.
+Environment-only settings require a Tilt restart, which `up.sh` performs when
+they changed; the optional `SPACE_KIND_OBSERVABILITY_CONFIG` JSON file is
+watched and authoritative over the launch environment, including during
+rollback.
 
 The explicit `otel` profile sends Rust custom metrics and traces through
 the upstream OpenTelemetry SDKs and local Collectors. On an existing Kind
 cluster, full-stack Tilt installs the backends automatically:
 
 ```bash
-SPACE_KIND_TELEMETRY_MODE=otel tilt up
+SPACE_KIND_TELEMETRY_MODE=otel bash infra/space/kind/scripts/up.sh
 ```
 
 Add `SPACE_KIND_DATADOG_MODE=fakeintake` alongside it to keep an Agent running
@@ -805,10 +830,12 @@ rejected because its host-port deployment and intake URLs belong to this Kind
 harness. A direct render must choose `values-fakeintake.yaml` or an existing
 SaaS Secret explicitly. The ordinary chart defaults do not deploy a backend.
 
-SPACE bootstrap completes application readiness before installing the optional
-Datadog Agent; selected local OTLP backends are installed before the shim.
-Ownership and configuration errors fail before producer changes. A later Agent
-rollout failure is reported after the SPACE releases have been installed.
+Tilt applies the optional Datadog Agent with the SPACE releases, and `up.sh`
+verifies it only once the stack is ready, so an Agent rollout failure is
+reported after the SPACE releases are up; selected local OTLP backends are
+installed before the shim. Ownership and configuration errors fail before
+producer changes: the Tiltfile refuses to replace an Agent this harness did not
+deploy (`datadog_backend.py guard-owner`) when it loads.
 Comparison runs still require verified Agents and received payloads.
 
 Fake Intake is a single-replica, in-memory test backend. It captures the real
@@ -874,7 +901,7 @@ reach than `fakeintake`:
    anything else in that organization.
 4. Use `session` for a best-effort timed rollback after
    `SPACE_KIND_DATADOG_DURATION_MINUTES`. The timer runs in that foreground
-   process and is not a hard spending cap. Direct `apply`, bootstrap and Tilt
+   process and is not a hard spending cap. Direct `apply` and Tilt
    require the additional `SPACE_KIND_DATADOG_UNBOUNDED=yes` acknowledgement;
    they export until explicitly stopped and do not run that timer.
 5. Stop explicitly with the rollback below when finished. Neither `off` nor
@@ -884,7 +911,7 @@ After a successful helper-driven switch to SaaS, the helper deletes only its
 labelled Fake Intake Deployment, Service and dummy Secret. Rollback recreates
 those resources; a failed switch leaves the receiver available.
 
-Both Tilt and bootstrap use the same preflight and renderer. Neither creates a
+Tilt and the helper's own commands use the same preflight and renderer. None creates a
 real API-key Secret or copies a key into arguments, rendered values or captures.
 Fake Intake uses `datadog-fakeintake-key`; SaaS rejects that and the legacy
 `datadog-secret` name. Normal SaaS endpoint TLS verification remains enabled;
@@ -940,8 +967,8 @@ kubectl --context kind-space-local -n space-metrics delete svc collector
 bash infra/space/kind/metrics/local.sh up
 ```
 
-Do the same for `space-traces`, then re-run `install-shim.sh` (bootstrap and
-Tilt both do) so the wrapper names the pinned addresses.
+Do the same for `space-traces`, then re-run `install-shim.sh` (Tilt's
+`install-space-shim` resource does) so the wrapper names the pinned addresses.
 
 The shim takes `SPACE_METRICS_SINK` from the same telemetry mode as the Rust
 workloads: `datadog` keeps DogStatsD, `otel` selects OTLP, and `off` selects
@@ -971,14 +998,14 @@ manual chown the smoke-test runbook describes.
 
 ### Shared experiment identity
 
-Tilt, bootstrap, and the node-hosted shim read the same optional non-secret
+Tilt and the node-hosted shim read the same optional non-secret
 JSON file named by `SPACE_KIND_OBSERVABILITY_CONFIG`. Tilt watches this file;
 changing it reconciles workload identity and the shim wrapper. File values
 override the corresponding environment variables. Never store API keys here.
 
 Replace that file by rename (`mv` a fully written temporary over it) rather
-than editing in place: a truncated or half-written file aborts bootstrap and
-Tiltfile evaluation, and `bootstrap.sh` already writes its own state this way.
+than editing in place: a truncated or half-written file aborts `up.sh` and
+Tiltfile evaluation, and `datadog_backend.py stop` already writes it this way.
 
 The identity options are `SPACE_KIND_ENV`, `SPACE_KIND_OWNER`,
 `SPACE_KIND_VERSION` (the source revision), and `SPACE_KIND_PHASE`
@@ -987,8 +1014,8 @@ revision and phase are supplied, the application version is `<revision>-<phase>`
 so even native trace/log clients can distinguish phases. Agent-side tags alone
 do not override an application's explicit environment/version. Without
 `SPACE_KIND_VERSION`, every Rust service and the shim report the checkout's
-commit (`git rev-parse --short=12 HEAD`) as their version, read when Tilt or
-bootstrap starts. The build SHA each image records, which the startup banner's
+commit (`git rev-parse --short=12 HEAD`) as their version, read when Tilt
+starts. The build SHA each image records, which the startup banner's
 `git_sha` and the node's host sidecars report, is computed when the image is
 built instead ([Build identity and provenance](#build-identity-and-provenance)).
 
@@ -1025,17 +1052,16 @@ and fail on the first sandbox with a healthy-looking cluster.
 | `SPACE_VENDOR_ROOT` | `~/.space-devbox/space/vendor` | mounted read-only at `/opt/space-kind/host-vendor` on the sandbox and builder nodes, each of which copies it into its own `/space/vendor` on its first boot ([The node layer](#the-node-layer)) |
 | `SPACE_KIND_DATA_ROOT` | `~/.kind-data` | mounted at `/var/lib/containerd` on every node |
 | `SPACE_KIND_PRUNE_SUPERSEDED_IMAGES` | on | `0` keeps every superseded build of SPACE's own images in the `SPACE_KIND_DATA_ROOT` stores; see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure) |
-| `SPACE_TILT_PRUNE_HOST_IMAGES` | on | `0` keeps every superseded build of SPACE's own images in the host's Docker store, under Tilt and after `bootstrap.sh`; see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure) |
-| `SPACE_KIND_CONFIG` | `~/.space-devbox/kind/kind-cluster.yaml` | the rendered config itself |
+| `SPACE_TILT_PRUNE_HOST_IMAGES` | on | `0` keeps every superseded build of SPACE's own images in the host's Docker store; see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure) |
+| `SPACE_KIND_CONFIG` | `~/.space-devbox/kind/kind-cluster.yaml` | where `render-cluster-config.sh` publishes a verified render |
 
-That path is where a completed render is *published*, not the file any given
-run hands to `kind create`. Each bring-up renders its own copy first and
-creates from that, because the published path is per-user rather than per-run:
-two bring-ups on one box would otherwise be able to replace each other's
-config in the window between rendering it and reading it back, and the cluster
-that won would come up on the other run's host roots with every mount it
-declares present. `bootstrap.sh` publishes its copy once it has verified, so
-the documented path still names something real and current.
+That path is where `render-cluster-config.sh` *publishes* a completed render,
+not the file any given run hands to `kind create`. The bring-up renders its
+own copy and creates from that, because the published path is per-user rather
+than per-run: two bring-ups on one box would otherwise be able to replace each
+other's config in the window between rendering it and reading it back, and the
+cluster that won would come up on the other run's host roots with every mount
+it declares present.
 
 The node images preload kind's add-on images (kindnetd and the local-path
 provisioner from Docker Hub, the control-plane images from registry.k8s.io) in
@@ -1069,25 +1095,21 @@ all of them.
 If you already have a `space-local` cluster that was created before these
 paths were parameterised, it keeps the mounts it was built with — Docker fixes
 bind mounts when it creates the node container, and `kind create` is the only
-thing that reads the config. Both bring-up paths detect that and stop, naming
+thing that reads the config. The bring-up detects that and stops, naming
 each drifted mount and its rendered value; `kind delete cluster --name
 space-local` once is the remedy, and a delete leaves the containerd image
 caches on disk so the rebuild does not re-pull.
 
 The defaults follow `$HOME`, so none of the three needs setting on a devbox,
-and none needs setting under another username either. Three other paths in
-this directory are still `/home/dev` by default and are *not* covered by that:
-`infra/space/kind/scripts/setup.sh`'s `INSTALL_DIR` and `SPACE_KIND_ENV_FILE`,
-and `infra/space/kind/scripts/start-dind.sh`'s `DIND_DATA_ROOT`. Neither
-script is `$HOME`-derived, and for the same reason: `setup.sh` is documented
-to run under `sudo` (where `$HOME` may be root's) and it is what invokes
-`start-dind.sh`, so deriving either from `$HOME` would put a dind data root
-or a binary install under root's home. Set those three variables explicitly
-if you run either script as another user.
+and none needs setting under another username either. One other path in this
+directory is still `/home/dev` by default and is *not* covered by that:
+`infra/space/kind/scripts/start-dind.sh`'s `DIND_DATA_ROOT`. The script runs
+under `sudo`, where `$HOME` may be root's, so deriving it from `$HOME` would
+put the dind data root under root's home. Set it explicitly if you run the
+script for another user.
 
-Both bring-up paths — `infra/space/kind/scripts/bootstrap.sh` and the suites'
-`scripts/tests/lib/bootstrap-kind-stack.sh` — render before creating. For a
-hand-run `kind create`, use
+The bring-up (`scripts/tests/lib/bootstrap-kind-stack.sh`, behind `up.sh` and
+the smoke suites) renders before creating. For a hand-run `kind create`, use
 `infra/space/kind/scripts/render-cluster-config.sh`, which prints the path of a
 render private to that invocation — pass that to `kind create` rather than
 `$SPACE_KIND_CONFIG`, so a second run cannot replace the file between the two
@@ -1095,20 +1117,20 @@ commands. Point `SPACE_VENDOR_ROOT` at a tree you staged elsewhere and
 `install-fc-vendor.sh`, its `--check`, and the mount all follow it
 together.
 
-Once the script returns, the API and data plane answer on the cluster's own
+Once `up.sh` returns, the API and data plane answer on the cluster's own
 host port mappings (see [Load-balanced entry and replicas](#load-balanced-entry-and-replicas)),
-and a tile of background `kubectl port-forward`s exposes the single-replica
-rest:
+and Tilt's port forwards expose the single-replica rest for as long as Tilt
+runs:
 
 | Service     | URL                       | Through |
 |-------------|---------------------------|---------|
 | API         | http://localhost:8080     | host port mapping → `space-api-entry` NodePort |
 | Data-plane  | http://localhost:8090     | host port mapping → `space-data-plane-entry` NodePort |
-| UI          | http://localhost:3000     | port-forward |
-| Object store (S3) | http://localhost:8333 | port-forward |
-| Fake Intake (when enabled) | http://localhost:8088 | port-forward |
+| UI          | http://localhost:3000     | Tilt port-forward |
+| Object store (S3) | http://localhost:8333 | Tilt port-forward |
+| Fake Intake (when enabled) | http://localhost:8088 | Tilt port-forward |
 
-Log in as `root@local` with the initial password (`password` by default). Set `SPACE_CONSOLE_PASSWORD` before running bootstrap or Tilt to choose a custom password. Neither path prints or retains it in a Kubernetes Secret. It is set only while the seeded account is locked; rerunning does not reset an existing password.
+Log in as `root@local` with the initial password (`password` by default). Set `SPACE_CONSOLE_PASSWORD` before the bring-up starts Tilt to choose a custom password. It is never printed or retained in a Kubernetes Secret. It is set only while the seeded account is locked; rerunning does not reset an existing password.
 
 ### Recovering from an unbundled migration version
 
@@ -1137,14 +1159,14 @@ The same reset applies to a cluster whose database was created by an earlier
 revision of the `space-postgres` chart (PostgreSQL 16, superuser connection
 string): PostgreSQL 17 cannot start on that data directory, and the role
 setup the pod's init script provides runs only when it initializes an empty
-one. `bootstrap.sh`, the smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh`
-(under `SKIP_BOOTSTRAP=1` too) and the `Tiltfile` run
+one. The bring-up, `scripts/tests/lib/bootstrap-kind-stack.sh`
+(under `SKIP_BOOTSTRAP=1` too), and the `Tiltfile` run
 `infra/space/kind/scripts/check-postgres-data.sh` before they apply anything
 or query the database. It reads the data directory's `PG_VERSION` on the node
 that holds the volume, so it answers the same whether the old server is still
 running or the new one is crash-looping, and on a mismatch it prints the reset
 commands and stops without changing anything (the scripts exit 1; Tilt
-reports a Tiltfile load error). Without Tilt, rerun `bootstrap.sh` (or the
+reports a Tiltfile load error). Without a running Tilt, rerun `up.sh` (or the
 smoke suite) after the three `kubectl delete` commands above; a running Tilt
 reloads with `tilt trigger "(Tiltfile)"`. Recreating the cluster has the same
 effect.
@@ -1158,17 +1180,16 @@ Tilt build adds another `:tilt-<hash>` tag, so unpruned stores keep every
 image of every build on all six nodes. A full store reports image extraction
 or build failures while the host root filesystem may still have space.
 
-Both bring-up paths therefore remove superseded builds themselves:
-`bootstrap.sh` at the end of a successful bring-up, and the Tilt resource
-`prune-superseded-images` whenever an update has settled.
+The bring-up therefore removes superseded builds itself: the Tilt resource
+`prune-superseded-images` does whenever an update has settled.
 `scripts/prune-superseded-images.py` removes an image from a node only when
 all of these hold:
 
 - It is one of the images in `lib/space-images.sh`, which the harness builds
   locally and Kind cannot pull: each of its tags names one of them or, once
   untagged, its `org.opencontainers.image.title` label does.
-- Nothing current names it. Current means the `:local` tags `build-images.sh`
-  loads, every image a workload in the cluster references (the rendered charts
+- Nothing current names it. Current means the `:local` tags (the retired
+  scripted bring-up loaded its builds under them), every image a workload in the cluster references (the rendered charts
   as applied, including Jobs whose pods have finished), and the images the Tilt
   serving the cluster last built.
 - No container on that node uses it, running or exited.
@@ -1182,7 +1203,7 @@ The Tilt resource retries an image a container still held every few minutes
 until it is gone.
 Third-party images, and images of repositories the harness no longer builds,
 are never touched. `--dry-run` lists what it would remove;
-`SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0` turns it off on both paths.
+`SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0` turns it off.
 
 The host's Docker store, where the images are built, keeps old builds too.
 Every Tilt build of an image adds two tags to it: `:tilt-build-<time>`, the
@@ -1192,11 +1213,10 @@ these builds, whatever their labels, because it passes over every image with
 more than one tag. On Docker's graph-driver store, a rebuilt `:local` image
 also leaves its previous build behind untagged; the containerd image store
 drops it. So the same script runs with `--host`: as the Tilt resource
-`prune-host-images` whenever an update has settled, and in `bootstrap.sh` after
-the node pass. It applies the rules above to the host's images, with any
+`prune-host-images` whenever an update has settled. It applies the rules above to the host's images, with any
 container on the host holding an image, and also keeps each image's newest
 build that nothing current names, so the build before the current one stays.
-`SPACE_TILT_PRUNE_HOST_IMAGES=0` turns it off on both paths.
+`SPACE_TILT_PRUNE_HOST_IMAGES=0` turns it off.
 
 Do not run `crictl rmi --prune` in a node instead. It removes every image no
 container is using at that moment, which includes SPACE images Kind cannot pull
@@ -1204,7 +1224,7 @@ back: the seed publisher between publishes, or the worker image while a builder
 or debug pod on that node is restarting. The next pod that needs one fails with
 `ImagePullBackOff` until the image is rebuilt and loaded.
 
-Before it creates anything, `bootstrap.sh` warns, without refusing, when the
+Before it creates anything, `up.sh` warns, without refusing, when the
 Docker data root or `$SPACE_KIND_DATA_ROOT` has less than
 `SPACE_KIND_MIN_FREE_GIB` (default 30) GiB free, and names the cleanups that
 cannot remove anything a bring-up needs. To inspect a node:
@@ -1390,7 +1410,7 @@ load-balanced entry, scaled on load.
   The migrator asks for this: it serializes on a session advisory lock, but a
   competing runner can turn a retried lock race into a failed run
   (`crates/libs/db/migrator/src/migration_retry.rs`). Tilt makes `space-api`
-  wait for the Job and bootstrap waits for it before applying the API.
+  wait for the Job.
 - **cluster-controller** runs two replicas with leader election on: the Lease
   holder runs every reconciler and the other stands by, Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
@@ -1459,8 +1479,8 @@ too. Each chart's values cite the code behind its numbers.
   infra node; the node-drain scenarios drain sandbox workers, which carry
   none of them. A Deployment rollout is not an eviction and follows its own
   strategy.
-- **Priority.** `manifests/priorityclasses.yaml`, applied by both bring-up
-  paths before any workload, defines `space-control-plane` (the control-plane
+- **Priority.** `manifests/priorityclasses.yaml`, applied by Tilt before any
+  workload, defines `space-control-plane` (the control-plane
   Deployments and the in-cluster Postgres, object store, Redis and key
   broker) and `space-replaceable` (the UI and the one-shot Jobs; it never
   preempts). Node-service DaemonSets run as `system-node-critical`.
@@ -1489,7 +1509,7 @@ and upserts `nodes` / `node_k8s` / `node_status_snapshots` /
 `node_template_inventory`. The cluster-controller's `kube_node_sync`
 reconciler covers kube-Node inventory. **Nothing on the node touches
 Postgres**: credential state belongs to the control-plane credential-manager
-authority (below). Node status uses the normal 30-second freshness window. Both bring-up paths end by waiting until
+authority (below). Node status uses the normal 30-second freshness window. The bring-up ends by waiting until
 the admin node list (`GET /admin/api/v1/nodes`) reports every sandbox and
 builder node reachable, with scheduling status `ready`, and observed within the
 five node-ctl ticks the API trusts a census for
@@ -1505,8 +1525,8 @@ the node layer. So does this harness: each service has a chart under
 chart, rendered once per role — release `space` on the sandbox workers and
 release `space-builder` (`--set node.role=builder` plus the chart's
 `values-builder.yaml`) on the builders, which also run build-manager. The list
-lives in `lib/node-services.sh`, which `bootstrap.sh`, Tilt and the smoke
-bring-up read. Every pod runs the production worker image
+lives in `lib/node-services.sh`, which Tilt and the bring-up's DaemonSet
+waits read. Every pod runs the production worker image
 (`docker/Dockerfile.worker`) unchanged, with its service's production launch
 path, under the identity `infra/space/identity/node-identities.sh` assigns (the
 library reads that file through each chart's `identity/` link). Pods carry
@@ -1521,7 +1541,7 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | runtime-manager | space-rtmgr + SPACE_RUNTIME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/vendor` and `/space/bin` read-only, `/space/cache` HostToContainer | lists runtimes and kernels, and installs the catalog's: downloads them from the compiled sources over the pod network into its private `/space/cache/.rtmgr-staging`, then asks node-manager over its socket to publish them (`crates/libs/node/runtime/manager/server`); the account writes nothing else in the cache or the store |
 | volume-manager | space-volmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); the account `docs/installation.md` describes: node-manager's btrfs send-lease RPCs authorize it and credential-manager serves it on the volume socket |
 | credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
-| template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because its template-release reads are scoped by source address (below) |
+| template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, pod network; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); template-release reads bind the reviewed token's node name/UID |
 | sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs |
 | node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
 | node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800; its ServiceAccount's API credentials (TokenReview only) and projected node-api and, on builders, build-manager tokens | reviews callers' tokens; the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager through the node-local `space-builder-build-manager` Service and sleeps 5 s in preStop (below) |
@@ -1538,13 +1558,14 @@ The check reads neither the credential nor the transport: it applies alike to
 the static token and to TokenReview-authenticated projected tokens, and internal
 RPC TLS, being server-auth only, does not change it. So node-ctl and
 sandbox-manager run in the node's network namespace. template-manager makes no
-node-bound call, but under TokenReview authentication its template-release reads
-are scoped to the node whose registered address is the caller's source address
-(`template_read_scope`, `crates/libs/internal/api/server/src/adapter.rs`), and
-nothing maps a pod IP to its node. From the pod network an org's private
-templates do not resolve: sandbox creates from them and private-base builds
-fail, which a pod-network trial confirmed, so template-manager runs on the host
-network too. build-manager's only source-scoped read checks for an existing
+node-bound call. Its template-release reads use the reviewed token's node name
+and UID to match live inventory (`template_read_scope`,
+`crates/libs/internal/api/server/src/adapter.rs`), so it runs on the pod network.
+This makes `local.ecw_template_build_from_oci_boots` and
+`local.private_template_build_isolation` exercise private-template resolution
+when the caller's pod IP differs from the registered node IP. Missing claims
+retain address matching; malformed claims and unmatched complete bindings do
+not fall back. build-manager's only source-scoped read checks for an existing
 upload, and an org-private base is resolved by template-manager, so it runs on
 the pod network; node-api reaches it through the node-local
 `space-builder-build-manager` Service, named as its TLS leaf.
@@ -1632,8 +1653,8 @@ A cluster created before the per-service DaemonSets runs one `space-node-stack`
 pod per node, with runtime-supervisor and every Firecracker VM inside that pod.
 Those VMs cannot move to the node's supervisor, and the two layouts must not run
 on one node, so such a cluster is recreated once rather than upgraded.
-`bootstrap.sh`, the smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh`
-and the `Tiltfile` run `infra/space/kind/scripts/check-node-layout.sh` against
+The bring-up (`scripts/tests/lib/bootstrap-kind-stack.sh`) and the `Tiltfile`
+run `infra/space/kind/scripts/check-node-layout.sh` against
 an existing cluster before they apply anything; when it still has resources of
 the old `space-node-stack` chart, they list them and stop without changing
 anything (the scripts exit 1; Tilt reports a Tiltfile load error). The same
@@ -1645,7 +1666,7 @@ containerd image caches:
 
 ```bash
 bash infra/space/kind/scripts/teardown.sh
-bash infra/space/kind/scripts/bootstrap.sh   # then `tilt up`, for the Tilt loop
+bash infra/space/kind/scripts/up.sh
 ```
 
 A cluster already on the per-service layout takes the move to internal RPC TLS
@@ -1815,7 +1836,7 @@ The public template build API needs none of this and is the supported path.
 IngressActivationApi and the credential-manager authority over authenticated
 TLS, as deployed services do
 ([Internal RPC TLS](../../../docs/internal-rpc-tls.md));
-`SPACE_INTERNAL_RPC_INSECURE_DEV` is not set anywhere. Both bring-up paths run
+`SPACE_INTERNAL_RPC_INSECURE_DEV` is not set anywhere. Tilt runs
 [`scripts/internal-rpc-tls.sh`](scripts/internal-rpc-tls.sh) before any
 workload, which keeps the cluster's material in Secrets named as on EKS
 (`internal_rpc_tls.tf`, `credmgr_authority_tls.tf`): a per-cluster ECDSA P-256
@@ -1852,10 +1873,10 @@ asks of the hosting deployment.
 | One DaemonSet per node service, systemd watchdogs via k8s probes | One DaemonSet per node service and role from the Kind charts (`charts/space-<service>-local`), probed on each service's health socket; runtime-supervisor is the same host systemd unit node-manager's init container installs |
 | Node image (packer) provides `/space/cache`, the cgroup subtree, loop devices, device permissions, SPACE accounts and the `/space` skeleton before any pod starts | Sandbox workers and builders boot the SPACE Kind node image, which bakes in the same as systemd units that run before kubelet on every node start (see [The node layer](#the-node-layer)) |
 | `/space/cache` is btrfs on instance-store NVMe, reformatted on every boot | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted `nosuid,noatime` on the node's `/space/cache` by `space-cache.service`, which reformats it on every start of the node container, so like the NVMe it outlives pod restarts but not node restarts |
-| The node bootstrap installs a checksum-verified `containerd-shim-space-v2` before containerd starts, and registers the `space` runtime under `io.containerd.cri.v1.runtime` with a `CniConfDir` option | the node image registers the same runtime with the same options (in kind's version 2 config format, which containerd migrates to that plugin), so containerd loads it on its first start; the binary arrives after the cluster exists, copied onto each running sandbox worker by `install-shim.sh`, which checks its SHA-256 on the node. Installing it at boot would need the shim built and staged on a host path before `kind create` in every bring-up path |
+| The node bootstrap installs a checksum-verified `containerd-shim-space-v2` before containerd starts, and registers the `space` runtime under `io.containerd.cri.v1.runtime` with a `CniConfDir` option | the node image registers the same runtime with the same options (in kind's version 2 config format, which containerd migrates to that plugin), so containerd loads it on its first start; the binary arrives after the cluster exists, copied onto each running sandbox worker by `install-shim.sh`, which checks its SHA-256 on the node. Installing it at boot would need the shim built and staged on a host path before `kind create` |
 | Every node group's bootstrap sets kubelet `eventRecordQPS: 0` and `--fail-swap-on=false` | the same settings on sandbox workers and builders, baked into the node image as a kubelet `--config-dir` drop-in (`node/kubelet/50-space.conf`); the infra node runs the unmodified base image, so its kubelet keeps kind's event rate limit (`failSwapOn` is already `false` there). No sandbox pod runs on it, so none of their events pass through that limit |
 | Release binaries read no test hooks | by default every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 60 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 60 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); and the disk-admission reservation below. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values. The release lane (`SPACE_KIND_RUST_BUILD=release`) builds every Kind service with no crate's `test-hooks` feature, renders none of these chart hooks, and skips the scenarios that need one ([Release-build lane](#release-build-lane)) |
-| space-api waits up to 120 s for a new sandbox pod's IP and proxy (`SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS`, binary default) | 45 s, set only by the Kind bring-up (`charts/space-api-local/values-kind.yaml`, which Tilt and `bootstrap.sh` pass and the caller-provided-cluster chart does not). A restore that cannot complete keeps its pod retrying, so the two btrfs-send failure scenarios wait the whole timeout; healthy creates and restores on Kind take a few seconds |
+| space-api waits up to 120 s for a new sandbox pod's IP and proxy (`SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS`, binary default) | 45 s, set only by the Kind bring-up (`charts/space-api-local/values-kind.yaml`, which the Tiltfile passes and the caller-provided-cluster chart does not). A restore that cannot complete keeps its pod retrying, so the two btrfs-send failure scenarios wait the whole timeout; healthy creates and restores on Kind take a few seconds |
 | Services export OTLP metrics every 10 s (the SDK default) | in `otel` mode the Rust services in Pods export every 2 s (`telemetry.otlpMetricExportIntervalMillis`, `scripts/telemetry_config.py`) to the bench's own Prometheus, and Tempo search withholds the newest 5 s instead of 30 s (`tempo.queryEndCutoff` in the traces chart's Kind profile); the shim and runtime-supervisor keep 10 s |
 | 8 GiB disk-admission reservation per cache allocation (release default) | 1 GiB through the `SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES` test hook, with the 1 GiB `MIN_AVAILABLE_BYTES` floor, so allocations fit the 40 GiB cache (`charts/space-node-service/values.yaml`); the release lane renders only the floor, and the cache admits its binaries' release 8 GiB reservation too ([Release-build lane](#release-build-lane)) |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, one pod on a 1 GiB volume, static Kubernetes Secrets |
@@ -1864,7 +1885,7 @@ asks of the hosting deployment.
 | Bootstrap and migrations run as the managed service's master user, which is not a superuser but a member of `rds_superuser` | The same branch of `bootstrap-roles`: every connection string names `space_admin`, which has `CREATEDB CREATEROLE` and `rds_superuser` WITH ADMIN OPTION and owns the database. A stock server has none of that, so the pod's init script creates it, including the `rds_superuser` role itself and its `SET` privilege on `log_statement`, which a managed service grants that role and `bootstrap-roles` needs before writing passwords. The image's superuser remains, used only by the image's init and the harness's direct-state `psql` |
 | Per-service pools: the api tier far above the binary's default of 25, internal-api somewhat above it, every other service on the default; no connection pooler | `POSTGRES_POOL_MAX_CONNECTIONS` 100 for space-api and space-admin-api, 30 for internal-api, unset elsewhere; no pooler. `max_connections` (1400) holds every replica's pools at their HPA maxima plus a rollout surge, the migrate Job and headroom, so a service runs out of its own pool before the server refuses it. The pod's memory limit (8 GiB) is sized for that many backends rather than for the suites' usual load |
 | Server logs lock waits; the application roles' `lock_timeout` is off (`SPACE_DB_APP_LOCK_TIMEOUT` `0`) | `log_lock_waits = on`; `SPACE_DB_APP_LOCK_TIMEOUT` is unset, which leaves `lock_timeout` off the same way. Other server parameters are the image's defaults rather than a managed parameter group |
-| The migration Job fails fast: one attempt, no restarts, its deadline passed to the migrator | The same `space-db-migrate` Job shape (`backoffLimit: 0`, `restartPolicy: Never`, `activeDeadlineSeconds` = `SPACE_DB_MIGRATE_JOB_DEADLINE_SECONDS`), bootstrap-roles → migrate → bootstrap-roles. `bootstrap.sh` stops on a failed Job with its logs; rerunning it replaces the Job |
+| The migration Job fails fast: one attempt, no restarts, its deadline passed to the migrator | The same `space-db-migrate` Job shape (`backoffLimit: 0`, `restartPolicy: Never`, `activeDeadlineSeconds` = `SPACE_DB_MIGRATE_JOB_DEADLINE_SECONDS`), bootstrap-roles → migrate → bootstrap-roles. The bring-up stops on a failed Job with its logs; `tilt trigger space-db-migrate` replaces the Job |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
 | volume-manager gets each transfer's credentials from its node's credential-manager agent; the authority authorizes the subject and object and assumes the S3 vend role through STS with a session policy for that one object, which S3 enforces on every request | the same path on sandbox workers and builders ([Object-store credentials](#object-store-credentials)): the authority's unchanged `AssumeRole` reaches the Kind-only STS bridge (`space-kind-sts-bridge`), which exchanges it at versitygw's IAM service; that service checks the vend role's trust and maximum duration and stores the session, whose policy the gateway enforces. What stays different: the authority signs `AssumeRole` with the bridge's static vend keys (a Secret `sts-bridge-secret.sh` issues per cluster) where a deployment uses its workload identity, so those keys replace `space-aws-creds` and the authority's AWS Secrets Manager integration is off in this mode; and STS runs beside the store: the IAM service is its own Deployment, so an outage refuses every session-signed request while the gateway stays Ready and root keys keep working, but no AWS account boundary separates STS from S3. `SPACE_KIND_STORAGE_CREDENTIALS=static` opts out: volume-manager and build-manager then read static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) and no vend role is configured |
 | Rate limiters (cluster activation admission at the binary defaults, per-client concurrency in `observe`) on a Redis-compatible store reached over TLS (`rediss://`), its URL delivered through the `space-redis` Secret (`app_deploy.tf`) | the same limiters, modes and defaults on the in-cluster `space-redis` Deployment (one in-memory replica on the infra node), reached over plaintext `redis://space-redis:6379` rendered as a literal: the workspace's Redis clients trust only the webpki roots (`tls-rustls-webpki-roots` in `Cargo.toml`), so they would refuse a CA `internal-rpc-tls.sh` could issue, and the `#insecure` URL fragment would be an environment-only switch. `local.rate_limiters_enforce_and_fail_open` shrinks the caps and scales the store to zero for its fail-open half |
@@ -1877,7 +1898,7 @@ asks of the hosting deployment.
 | Loop devices from the AMI's `max_loop=10000` on a real devtmpfs | The node's tmpfs `/dev` starts with 8 nodes; `space-loop-nodes.service` mknods the rest before kubelet, pods copy the node's `/dev`, and node-manager raises its pod's pool further. The cache device has autoclear set, so a node stop releases it (`scripts/lib/space-loop-devices.sh`) |
 | vhost-vsock jail nodes provided by the AMI                | the Kind-only `space-kind-vsock-jails.service` mknods them into each jail under `/space/cache/firecracker/jails` as it appears (kind-only) |
 | Sandbox SSH key generated by Packer per AMI               | generated per host by `build-seed.sh` under `~/.space-devbox/kind/ssh` |
-| ALB ingress in front of api / data-plane / ui             | NodePort entry Services behind the cluster's host port mappings for api and data-plane (kube-proxy balances per connection); `kubectl port-forward` for the single-replica ui |
+| ALB ingress in front of api / data-plane / ui             | NodePort entry Services behind the cluster's host port mappings for api and data-plane (kube-proxy balances per connection); Tilt's port forward for the single-replica ui |
 | preStop delays on api, admin-api, data-plane and internal-api sized for the load balancer's deregistration | the same hooks at 5 s: kube-proxy removes a terminating pod from the NodePort entry and ClusterIP Services in about a second, so a deployment-sized delay would only slow every rollout |
 | Control-plane replicas spread across nodes | no anti-affinity or topology spread: every control-plane pod runs on the one infra node, where a spread constraint has nothing to spread over and a required anti-affinity would leave second replicas Pending |
 | space-admin-api under a PodDisruptionBudget like the public API | one replica (operator traffic only) under the same `maxUnavailable: 1` budget, so it never holds a drain and does not keep the admin surface up during one; it rolls by `Recreate`, so a rollout leaves the admin surface down while the old pod drains and the new one starts |
@@ -1994,7 +2015,8 @@ to `/space/vendor`, the root-owned tree a deployed node's image bakes; the
 node's rootfs keeps it, and what node-manager publishes into
 `/space/vendor/artifacts`, across node restarts, and a changed host tree
 reaches a node only when the node is recreated. `scripts/check-node-vendor.sh`,
-which `bootstrap.sh`, the smoke harness and Tilt run on a reused cluster,
+which `up.sh` (before it stops a running Tilt), the smoke harness and Tilt
+run on a reused cluster,
 refuses one whose nodes' copies differ from the host tree (contents and link
 targets, `artifacts/` aside). A `/space/vendor` that is a
 mount, the layout of a cluster created before this copy, fails the unit. At
@@ -2011,7 +2033,7 @@ Recreate existing Kind clusters to pick up this node-image change.
 Dockerfile and every file it copies), and the build context holds exactly those
 files. `ensure` uses a local image with that tag, else pulls it from
 `ghcr.io/perplexityai/space-kind-node`, else builds it (about ten seconds on a
-warm Docker cache). Both bring-up paths run it before `kind create`, and the
+warm Docker cache). The bring-up runs it before `kind create`, and the
 renderer writes the tag into the cluster config. Main CI publishes each new tag
 once; Kind CI jobs pull it and fall back to a build. Builds take the
 `kindest/node` base from the third-party image mirror (`ci/mirrored-images.txt`)
@@ -2055,16 +2077,15 @@ clean.
 
 **Clusters created before this image, or from an older build of it, must be
 recreated.** A kind node keeps the image it was created from, so such a
-cluster's SPACE nodes lack the layer or carry a stale one. Every bring-up path
-(`bootstrap.sh`, the smoke suites' bring-up, and Tilt's `check-kind-node-image`
-resource) runs
+cluster's SPACE nodes lack the layer or carry a stale one. The bring-up and
+Tilt's `check-kind-node-image` resource run
 [`check-kind-node-image.sh`](scripts/check-kind-node-image.sh), which compares
 each SPACE node's image label with the tag this tree builds and, on a mismatch,
 stops with the command to run:
 
 ```bash
 kind delete cluster --name space-local   # keeps the containerd image caches
-bash infra/space/kind/scripts/bootstrap.sh   # or `tilt up` via the smoke bring-up
+bash infra/space/kind/scripts/up.sh
 ```
 
 Recreating rather than patching nodes in place is the production model: a new
@@ -2169,9 +2190,11 @@ SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=ecw \
   uv run --frozen --python 3.11 -m space_smoke run local.ecw_template_build_from_oci_boots
 
 # 6. Explicit AWS Secrets Manager network-credential injection. Before
-#    bootstrap, put short-lived sandbox-account AWS_ACCESS_KEY_ID,
+#    up.sh, export short-lived sandbox-account AWS_ACCESS_KEY_ID,
 #    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, and
-#    SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN in private.env. The selected
+#    SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN (for example from the gitignored
+#    infra/space/kind/private.env); with static storage credentials, Tilt's
+#    space-aws-creds resource copies them into the authority's Secret. The selected
 #    identity must be able to sts:AssumeRole and sts:TagSession on that role;
 #    the role reads the task-owned ARN only when the secret's space-org-id tag
 #    equals the smoke organization's ID (docs/configuration.md).
@@ -2298,7 +2321,7 @@ aws --endpoint-url http://localhost:8333 s3 ls s3://templates/ --recursive
 
 `SPACE_KIND_STORAGE_CREDENTIALS` selects how the node services that transfer
 objects, volume-manager on sandbox workers and builders and the builders'
-build-manager, authenticate to the object store, for every bring-up path
+build-manager, authenticate to the object store
 ([`lib/storage-credentials.sh`](lib/storage-credentials.sh)):
 
 - `exchange` (the default): as deployed, volume-manager holds no keys. For
@@ -2378,8 +2401,8 @@ Kind's STS is two pieces, both running in either mode:
   that never resolves. The vend identity is no store user, so its keys open
   nothing on S3 by themselves. [`scripts/sts-bridge-secret.sh`](scripts/sts-bridge-secret.sh)
   issues the bridge's Secret once per cluster (the vend identity, the signing
-  key, and the issuer's CA and leaf) and keeps it across upgrades; both
-  bring-up paths run it before the charts and pass its checksum to the bridge,
+  key, and the issuer's CA and leaf) and keeps it across upgrades; the
+  Tiltfile runs it before the charts and passes its checksum to the bridge,
   the authority and the object store's bucket-init Job, which roll or rerun
   when it changes. Tilt runs it when the Tiltfile loads, so a smoke bring-up
   that reuses a running Tilt does not reissue a deleted Secret;
@@ -2421,9 +2444,9 @@ bash scripts/tests/smoke-kind-e2e.sh                                         # b
 ```
 
 A switch re-renders the authority and the volume-manager and build-manager
-DaemonSets, which roll; a running Tilt reads the mode once, so the smoke
-bring-up restarts a Tilt that runs the other one, and `tilt up` users restart it
-themselves. The authority's Deployment records the mode in its
+DaemonSets, which roll; a running Tilt reads the mode once, so the bring-up
+(`up.sh` or a smoke run) restarts a Tilt that runs the other one. The
+authority's Deployment records the mode in its
 `space.pplx.net/kind-storage-credentials` label, and the worker and builder
 volume-manager and build-manager DaemonSets must agree, in their pod templates
 and in every pod they run: in `exchange` no container, init containers
@@ -2433,9 +2456,10 @@ with `SKIP_BOOTSTRAP=1` refuses a cluster in the other mode or with a
 disagreeing node service, the bring-up checks both after Tilt settles, and
 `local.storage_exchange_scoping` fails on a cluster where they disagree. The
 refusal names each disagreeing DaemonSet and pod, and its remedy is one
-bring-up without `SKIP_BOOTSTRAP=1`, which runs Tilt from this checkout,
-re-applies the charts and waits for their rollouts. A cluster brought up
-before the builders exchanged their credentials needs exactly that once.
+bring-up (`up.sh`, or a smoke run without `SKIP_BOOTSTRAP=1`), which runs Tilt
+from this checkout, re-applies the charts and waits for their rollouts. A
+cluster brought up before the builders exchanged their credentials needs
+exactly that once.
 `local.storage_exchange_scoping` exchanges through a worker's agent socket as
 volume-manager does, then shows the store refusing the session for another
 sandbox's snapshot, the templates bucket and a write under read scope, and
@@ -2477,12 +2501,12 @@ a cluster would leave its restores and template pulls depending on a
 deployment nothing manages any more, and pointing the old Service at the new
 gateway would not help, because the objects are not in it.
 
-An existing cluster is therefore recreated, not migrated. `bootstrap.sh`, the
-smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh` and the `Tiltfile`
+An existing cluster is therefore recreated, not migrated. The bring-up
+(`scripts/tests/lib/bootstrap-kind-stack.sh`) and the `Tiltfile`
 run `infra/space/kind/scripts/check-object-store-transition.sh` against an
 existing cluster before they apply anything; when it still has resources from
 the `space-seaweedfs` chart, they list those resources and stop without
-changing anything: the two scripts exit with status 1, and Tilt reports a
+changing anything: the bring-up exits with status 1, and Tilt reports a
 Tiltfile load error. The same check refuses a cluster whose
 `space-object-store` Deployment itself runs SeaweedFS, as an early prototype
 of [exchanged credentials](#object-store-credentials) did. Switching
@@ -2491,7 +2515,7 @@ snapshots and templates, and keeps the containerd image caches:
 
 ```bash
 bash infra/space/kind/scripts/teardown.sh
-bash infra/space/kind/scripts/bootstrap.sh   # then `tilt up`, for the Tilt loop
+bash infra/space/kind/scripts/up.sh
 ```
 
 A smoke suite such as `scripts/tests/smoke-kind-e2e.sh` creates the cluster

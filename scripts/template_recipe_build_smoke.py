@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Build the canonical seed chain through the authenticated Admin API."""
+"""Build the canonical seed chain through the authenticated Admin API.
+
+Builds seed, then a derived recipe on that exact seed digest. The derived
+recipe is chosen by SPACE_TEMPLATE_RECIPE_BUILD_PROFILE (see DERIVED_PROFILES).
+"""
 
 from __future__ import annotations
 
@@ -28,6 +32,29 @@ TERMINAL_BUILD_STATES = {"succeeded", "failed", "publish_failed"}
 TERMINAL_OPERATION_STATES = {"succeeded", "failed", "canceled", "expired"}
 FULL_DIGEST = re.compile(r"(?:sha256|blake3):[0-9a-f]{64}\Z")
 TEMPLATE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+# Derived recipe built on the fresh seed, by SPACE_TEMPLATE_RECIPE_BUILD_PROFILE.
+# `offline` is the per-deploy default: it proves Admin API -> build-manager ->
+# build VM -> publish without any download, so an upstream archive outage
+# cannot fail the deploy signal. `code-runtime` builds the shipped recipe, which
+# installs from snapshot.ubuntu.com, nodesource, GitHub and PyPI; run it on a
+# schedule or when that recipe changes.
+DERIVED_PROFILES = {
+    "offline": ("build-pipeline-smoke.toml", "build-pipeline"),
+    "code-runtime": ("code-runtime.toml", "code-runtime"),
+}
+DEFAULT_DERIVED_PROFILE = "offline"
+# Step types that fetch from the network; an offline recipe may not use them.
+NETWORK_STEP_TYPES = {
+    "apt-install",
+    "pip-install",
+    "npm-install",
+    "npm-install-global",
+    "playwright-install",
+}
+# Commands that fetch from the network when they appear in a `run` step.
+NETWORK_COMMANDS = re.compile(
+    r"\b(?:apt-get|apt|curl|wget|pip3?|npm|npx|uv|git\s+clone|gh)\b"
+)
 PACKAGE_MANAGERS = {
     "apt-install": "apt",
     "pip-install": "pip",
@@ -356,12 +383,27 @@ class TemplateRecipeSmoke:
         self.seed_name = os.environ.get(
             "SPACE_TEMPLATE_RECIPE_BUILD_SEED_ID", f"seed-bk-smoke-{stamp}"
         )
+        # An empty value (e.g. a Buildkite env passed through unset) is the default.
+        self.profile = (
+            os.environ.get("SPACE_TEMPLATE_RECIPE_BUILD_PROFILE")
+            or DEFAULT_DERIVED_PROFILE
+        )
+        if self.profile not in DERIVED_PROFILES:
+            raise SmokeFailure(
+                "configuration",
+                f"unknown SPACE_TEMPLATE_RECIPE_BUILD_PROFILE {self.profile!r}; "
+                f"expected one of {sorted(DERIVED_PROFILES)}",
+            )
+        derived_file, derived_prefix = DERIVED_PROFILES[self.profile]
+        self.derived_recipe = repo_root / "templates/firecracker/recipes" / derived_file
         self.derived_name = os.environ.get(
             "SPACE_TEMPLATE_RECIPE_BUILD_CODE_RUNTIME_ID",
-            f"code-runtime-bk-smoke-{stamp}",
+            f"{derived_prefix}-bk-smoke-{stamp}",
         )
         self._validate_name(self.seed_name, "seed")
-        self._validate_name(self.derived_name, "code-runtime")
+        self._validate_name(self.derived_name, derived_prefix)
+        if self.profile == "offline":
+            self._require_offline(self.derived_recipe)
         self.client: JsonClient | None = None
         self.auth_client: JsonClient | None = None
         self.owns_session = False
@@ -370,12 +412,18 @@ class TemplateRecipeSmoke:
         self.evidence: dict[str, JsonValue] = {
             "target": os.environ.get("SPACE_TEMPLATE_RECIPE_BUILD_TARGET", "testing"),
             "source_sha": os.environ.get("BUILDKITE_COMMIT", "unknown"),
+            "profile": self.profile,
             "deployed_images": json.loads(
                 os.environ.get("SPACE_TEMPLATE_RECIPE_DEPLOYED_IMAGES_JSON", "{}")
             ),
             "templates": {
                 "seed": {"name": self.seed_name},
-                "code_runtime": {"name": self.derived_name},
+                # Key kept as `code_runtime` for existing evidence readers; it
+                # holds whichever derived recipe the profile selected.
+                "code_runtime": {
+                    "name": self.derived_name,
+                    "recipe": str(self.derived_recipe.relative_to(repo_root)),
+                },
             },
             "request_ids": [],
             "first_failure": None,
@@ -385,6 +433,29 @@ class TemplateRecipeSmoke:
                 "reason": "admin recipe-build API exposes no builder placement control",
             },
         }
+
+    @staticmethod
+    def _require_offline(recipe_path: Path) -> None:
+        try:
+            recipe = tomllib.loads(recipe_path.read_text())
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise SmokeFailure(
+                "configuration", f"read {recipe_path}: {error}"
+            ) from error
+        fetching = [
+            str(step.get("name") or step.get("type"))
+            for step in recipe.get("steps", [])
+            if step.get("type") in NETWORK_STEP_TYPES
+            or (
+                step.get("type") == "run"
+                and NETWORK_COMMANDS.search(str(step.get("command", "")))
+            )
+        ]
+        if fetching:
+            raise SmokeFailure(
+                "configuration",
+                f"offline smoke recipe {recipe_path.name} has network steps: {fetching}",
+            )
 
     @staticmethod
     def _validate_name(name: str, prefix: str) -> None:
@@ -693,16 +764,14 @@ class TemplateRecipeSmoke:
                 self.seed_name, "Buildkite recipe smoke seed"
             )
             derived_template = self.create_template(
-                self.derived_name, "Buildkite recipe smoke code runtime"
+                self.derived_name, f"Buildkite recipe smoke derived ({self.profile})"
             )
             if seed_template["org_id"] != derived_template["org_id"]:
                 raise SmokeFailure(
                     "create_templates", "smoke templates have different owners"
                 )
             seed_recipe = self.repo_root / "templates/firecracker/recipes/seed.toml"
-            derived_recipe = (
-                self.repo_root / "templates/firecracker/recipes/code-runtime.toml"
-            )
+            derived_recipe = self.derived_recipe
             seed_job, seed_hash = self.start_build(self.seed_name, seed_recipe, "seed")
             seed_release = self.authoritative_release(self.seed_name, seed_hash)
             seed_ref = f"{self.seed_name}@{seed_hash}"
@@ -780,6 +849,9 @@ def main() -> int:
         return TemplateRecipeSmoke(repo_root).execute()
     except (KeyError, ValueError, json.JSONDecodeError) as error:
         print(f"ERROR [configuration]: {error}", file=sys.stderr)
+        return 1
+    except SmokeFailure as error:
+        print(f"ERROR [{error.phase}]: {error}", file=sys.stderr)
         return 1
 
 

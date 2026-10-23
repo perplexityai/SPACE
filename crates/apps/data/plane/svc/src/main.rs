@@ -6,7 +6,7 @@ use pplx_space_data_plane_server::{
     DEFAULT_MAX_ATTACHED_STREAMS, DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG,
     DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
     DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP, DataPlaneConfig,
-    MIN_SHUTDOWN_GRACE, UploadAdmissionArgs,
+    MAX_REVOCATION_CHECK_INTERVAL_MS, MIN_SHUTDOWN_GRACE, UploadAdmissionArgs,
 };
 
 // Same allocator choice as space-api-svc: glibc arenas keep the peak of an
@@ -75,8 +75,13 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_BACKEND_CHANNEL_POOL_SIZE)]
     backend_channel_pool_size: usize,
 
-    /// Interval between revocation checks for long-lived attached streams.
-    #[arg(long, default_value_t = DEFAULT_REVOCATION_CHECK_INTERVAL_MS)]
+    /// Interval between revocation checks for long-lived attached streams; at
+    /// most 19000, so a failed check can keep the last confirmed verdict.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
+        value_parser = clap::value_parser!(u64).range(..=MAX_REVOCATION_CHECK_INTERVAL_MS)
+    )]
     revocation_check_interval_ms: u64,
 
     /// Short-lived TTL for token-scoped route resolution cache entries.

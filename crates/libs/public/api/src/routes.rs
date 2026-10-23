@@ -31,6 +31,12 @@ pub const MAX_AGGREGATE_UTF8_BYTES_EXTENSION: &str = "x-space-max-aggregate-utf8
 pub enum NativeOperationStatus {
     M1Supported,
     Incubating,
+    /// Incubating and not served by default: unless the caller's org is
+    /// enabled for hidden operations, the API answers a hidden route as an
+    /// unmounted one and a hidden sandbox action as an unknown action.
+    /// `/openapi.json` omits it for every caller; only the authenticated
+    /// `/openapi-full.json` documents it.
+    IncubatingHidden,
 }
 
 impl NativeOperationStatus {
@@ -38,11 +44,16 @@ impl NativeOperationStatus {
         match self {
             Self::M1Supported => "m1-supported",
             Self::Incubating => "incubating",
+            Self::IncubatingHidden => "incubating-hidden",
         }
     }
 
     pub const fn is_m1_supported(self) -> bool {
         matches!(self, Self::M1Supported)
+    }
+
+    pub const fn is_hidden_by_default(self) -> bool {
+        matches!(self, Self::IncubatingHidden)
     }
 }
 
@@ -172,7 +183,7 @@ macro_rules! native_operations {
 }
 
 use NativeHttpMethod::{Delete, Get, Patch, Post};
-use NativeOperationStatus::{Incubating, M1Supported};
+use NativeOperationStatus::{Incubating, IncubatingHidden, M1Supported};
 
 native_operations! {
     REGISTER_CREDENTIAL_REFERENCE = NativeOperation::new("/v1/credential-references", Post, "unstableRegisterCredentialReference", Incubating);
@@ -185,7 +196,7 @@ native_operations! {
     GET_SANDBOX = NativeOperation::new("/v1/sandboxes/{sandbox_id}", Get, "getSandbox", M1Supported);
     UPDATE_SANDBOX = NativeOperation::new("/v1/sandboxes/{sandbox_id}", Patch, "updateSandbox", Incubating);
     CREATE_COMMAND = NativeOperation::new("/v1/sandboxes/{sandbox_id}/commands", Post, "createCommand", M1Supported);
-    CREATE_FILE_WATCH_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/file-watch-sessions", Post, "createFileWatchSession", Incubating);
+    CREATE_FILE_WATCH_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/file-watch-sessions", Post, "createFileWatchSession", IncubatingHidden);
     DISABLE_FILE_CHANGES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:changes_disable", Post, "disableFileChanges", Incubating);
     ENABLE_FILE_CHANGES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:changes_enable", Post, "enableFileChanges", Incubating);
     LIST_FILES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:list", Post, "listFiles", Incubating);
@@ -197,8 +208,8 @@ native_operations! {
     STAT_FILE = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:stat", Post, "statFile", Incubating);
     WRITE_FILE = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:write", Post, "writeFile", Incubating);
     WRITE_FILE_BATCH = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:write_batch", Post, "writeFileBatch", Incubating);
-    STREAM_SANDBOX_LIFECYCLE_EVENTS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/lifecycle-events", Get, "streamSandboxLifecycleEvents", Incubating);
-    STREAM_SANDBOX_METRICS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/metrics-stream", Get, "streamSandboxMetrics", Incubating);
+    STREAM_SANDBOX_LIFECYCLE_EVENTS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/lifecycle-events", Get, "streamSandboxLifecycleEvents", IncubatingHidden);
+    STREAM_SANDBOX_METRICS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/metrics-stream", Get, "streamSandboxMetrics", IncubatingHidden);
     GET_SANDBOX_NETWORK_POLICY = NativeOperation::new("/v1/sandboxes/{sandbox_id}/network-policy", Get, "getSandboxNetworkPolicy", Incubating);
     CREATE_PORT_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/port-sessions", Post, "createPortSession", Incubating);
     LIST_PORTS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/ports", Get, "listPorts", Incubating);
@@ -209,22 +220,22 @@ native_operations! {
     GET_PROCESS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/processes/{process_id}", Get, "getProcess", M1Supported);
     KILL_PROCESS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}/processes/{process_id}:kill", PROCESS_ACTION_RUNTIME_PATH, Post, "killProcess", M1Supported);
     SIGNAL_PROCESS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}/processes/{process_id}:signal", PROCESS_ACTION_RUNTIME_PATH, Post, "signalProcess", M1Supported);
-    CREATE_PROTOCOL_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/protocol-sessions", Post, "createProtocolSession", Incubating);
+    CREATE_PROTOCOL_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/protocol-sessions", Post, "createProtocolSession", IncubatingHidden);
     LIST_SESSIONS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/sessions", Get, "listSessions", Incubating);
     REVOKE_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/sessions/{session_id}", Delete, "revokeSession", Incubating);
     GET_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/sessions/{session_id}", Get, "getSession", Incubating);
-    LIST_SNAPSHOTS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/snapshots", Get, "listSnapshots", Incubating);
-    GET_SNAPSHOT = NativeOperation::new("/v1/sandboxes/{sandbox_id}/snapshots/{snapshot_id}", Get, "getSnapshot", Incubating);
+    LIST_SNAPSHOTS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/snapshots", Get, "listSnapshots", IncubatingHidden);
+    GET_SNAPSHOT = NativeOperation::new("/v1/sandboxes/{sandbox_id}/snapshots/{snapshot_id}", Get, "getSnapshot", IncubatingHidden);
     GET_SANDBOX_STATS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/stats", Get, "getSandboxStats", Incubating);
     CREATE_TERMINAL_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/terminal-sessions", Post, "createTerminalSession", Incubating);
-    CHECKPOINT_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:checkpoint", SANDBOX_ACTION_RUNTIME_PATH, Post, "checkpointSandbox", Incubating);
+    CHECKPOINT_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:checkpoint", SANDBOX_ACTION_RUNTIME_PATH, Post, "checkpointSandbox", IncubatingHidden);
     DISABLE_SANDBOX_SNAPSHOTS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:disable_snapshots", SANDBOX_ACTION_RUNTIME_PATH, Post, "disableSandboxSnapshots", Incubating);
-    ENABLE_SANDBOX_SNAPSHOTS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:enable_snapshots", SANDBOX_ACTION_RUNTIME_PATH, Post, "enableSandboxSnapshots", Incubating);
+    ENABLE_SANDBOX_SNAPSHOTS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:enable_snapshots", SANDBOX_ACTION_RUNTIME_PATH, Post, "enableSandboxSnapshots", IncubatingHidden);
     KILL_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:kill", SANDBOX_ACTION_RUNTIME_PATH, Post, "killSandbox", Incubating);
     PAUSE_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:pause", SANDBOX_ACTION_RUNTIME_PATH, Post, "pauseSandbox", M1Supported);
     RESTORE_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:restore", SANDBOX_ACTION_RUNTIME_PATH, Post, "restoreSandbox", Incubating);
     RESUME_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:resume", SANDBOX_ACTION_RUNTIME_PATH, Post, "resumeSandbox", Incubating);
-    ROLLBACK_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:rollback", SANDBOX_ACTION_RUNTIME_PATH, Post, "rollbackSandbox", Incubating);
+    ROLLBACK_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:rollback", SANDBOX_ACTION_RUNTIME_PATH, Post, "rollbackSandbox", IncubatingHidden);
     START_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:start", SANDBOX_ACTION_RUNTIME_PATH, Post, "startSandbox", Incubating);
     STOP_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:stop", SANDBOX_ACTION_RUNTIME_PATH, Post, "stopSandbox", Incubating);
     SUSPEND_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:suspend", SANDBOX_ACTION_RUNTIME_PATH, Post, "suspendSandbox", M1Supported);

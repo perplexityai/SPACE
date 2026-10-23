@@ -1,10 +1,14 @@
 //! Kubernetes pod and node identifiers: pod UID, name and resource version,
-//! and node name and UID. They encode Kubernetes' own naming rules; no SPACE
-//! node-model types or logic.
+//! and node name and UID; and the Kubernetes label value. They encode
+//! Kubernetes' own naming rules; no SPACE node-model types or logic.
 //!
 //! They are their own crate so that code can name them without depending on
-//! `pplx-space-common-core`. `pplx-space-common-core` re-exports them from
-//! `types::node`.
+//! `pplx-space-common-core`. `pplx-space-common-core` re-exports the
+//! identifiers from `types::node` and the label value from `types::label`.
+
+mod label;
+
+pub use label::{LabelValue, LabelValueParseError};
 
 use std::{fmt, str::FromStr};
 

@@ -207,9 +207,22 @@ fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
                 binding
                     .resolve(Some(&legacy), RuntimeKind::Firecracker, mode)
                     .is_ok(),
-                allowed,
-                "legacy marker {target} must not silently change kernels"
+                allowed || mode == ExecutionSelectionMode::PersistedStateRestore,
+                "only a cold boot depends on the legacy marker {target}"
             );
+            if mode == ExecutionSelectionMode::PersistedStateRestore {
+                let resolved = binding
+                    .resolve(Some(&legacy), RuntimeKind::Firecracker, mode)
+                    .unwrap();
+                assert!(resolved.components.is_empty());
+                assert!(resolved.execution.components().is_empty());
+                assert_eq!(
+                    resolved.environment,
+                    (legacy.guest() == initial.definition().unwrap().descriptor().spec().guest)
+                        .then(|| initial.definition().unwrap().reference())
+                );
+                assert_eq!(resolved.execution.environment(), None);
+            }
         }
     }
     let mut component = selected.components[0].metadata.clone();
@@ -520,7 +533,12 @@ fn legacy_asset_alias_retains_e0_boot_and_restore() {
         let selected = managed
             .resolve(requested, RuntimeKind::Firecracker, mode)
             .unwrap_or_else(|error| panic!("{mode:?}: {error}"));
-        assert_eq!(selected.components[0].path, image.canonicalize().unwrap());
+        if mode == ExecutionSelectionMode::PersistedStateRestore {
+            assert!(selected.components.is_empty());
+            assert_eq!(selected.execution.components(), legacy.components());
+        } else {
+            assert_eq!(selected.components[0].path, image.canonicalize().unwrap());
+        }
     }
     assert!(managed.check_files_unchanged());
     let other = assets.join("v1.16.0/kernel/vmlinux.bin");
@@ -660,7 +678,13 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
                     .path(RuntimeFileRole::FirecrackerBinary),
                 Some(legacy_bin.join("firecracker").as_path())
             );
-            assert_eq!(legacy.components[0].path, legacy_kernel);
+            if mode == ExecutionSelectionMode::PersistedStateRestore {
+                assert_eq!(legacy.environment, None);
+                assert!(legacy.components.is_empty());
+                assert_eq!(legacy.execution.components(), legacy_request.components());
+            } else {
+                assert_eq!(legacy.components[0].path, legacy_kernel);
+            }
         }
         let report = inventory.to_proto();
         assert!(report.runtimes.iter().any(|entry| {
@@ -1021,6 +1045,107 @@ fn baked_kernel_aliases_report_one_binding_outcome() {
         if let Some(component) = components.first() {
             assert!(component.default_for_new);
             assert!(component.legacy_default);
+        }
+    }
+}
+
+#[test]
+fn discovered_initial_failure_is_not_replaced_by_an_unrelated_runtime_error() {
+    use crate::{
+        catalog::CompiledEnvironment,
+        selection::{self, CompatibleSelection, ExecutionPolicy, SelectionError},
+    };
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Absent,
+        Corrupt,
+        Transient,
+    }
+    for failure in [Failure::Absent, Failure::Corrupt, Failure::Transient] {
+        let fixture = Fixture::new();
+        let initial = synthetic_initial_environment();
+        let e0 = initial.compiled_environment().unwrap();
+        let source = e0.definition().execution_requirements().unwrap();
+        let candidate = CompiledEnvironment::for_test(
+            pin("1.17.0", 7),
+            initial.kernel().clone(),
+            "12.0.0",
+            true,
+        );
+        fixture.place_release("1.17.0", 7);
+        let kernel = fixture
+            .kernels
+            .join(crate::artifact_store::managed_kernel_directory(
+                &initial.kernel().version,
+                initial.kernel().sha256,
+            ));
+        std::fs::create_dir_all(&kernel).unwrap();
+        std::fs::write(kernel.join(KERNEL_IMAGE), binary(42)).unwrap();
+        let e0_path = fixture.release_path("1.15.1", 1);
+        match failure {
+            Failure::Absent | Failure::Transient => std::fs::remove_dir_all(&e0_path).unwrap(),
+            Failure::Corrupt => {
+                std::fs::write(e0_path.join("bin/firecracker"), binary(99)).unwrap()
+            }
+        }
+        let cache = fixture._dir.path().join("cache/firecracker");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut inventory = RuntimeInventory::discover_with_store(
+            &fixture.store,
+            &initial,
+            &fixture._dir.path().join("vendor"),
+            &cache.join("assets"),
+            &cache.join("kernels"),
+        )
+        .unwrap();
+        assert!(
+            !inventory
+                .environments
+                .contains_key(&e0.definition().reference())
+        );
+        inventory
+            .include_environment(&fixture.store, &candidate, &cache.join("kernels"))
+            .unwrap();
+        // Synthetic binaries use the test host architecture; the qualification
+        // under test is x86_64, including when these filesystem tests run on ARM.
+        for environment in inventory.environments.values_mut() {
+            if let Ok(runtime) = &mut environment.runtime {
+                runtime.guest = source.guest();
+            }
+        }
+        let io_failure = || {
+            std::sync::Arc::new(RuntimeInventoryError::ReadDir {
+                path: fixture._dir.path().join("injected-read-failure"),
+                source: std::io::Error::from(std::io::ErrorKind::Interrupted),
+            })
+        };
+        // Inject the I/O outcome at the discovery boundary; do not put E0 in
+        // environments, which would bypass production's unavailable remapping.
+        if matches!(failure, Failure::Transient) {
+            inventory.unavailable.push(UnavailableArtifact::Runtime {
+                identity: initial.release().release.clone(),
+                error: io_failure(),
+            });
+        }
+        inventory.unavailable.push(UnavailableArtifact::Runtime {
+            identity: firecracker("1.16.0"),
+            error: io_failure(),
+        });
+        let policy = ExecutionPolicy::parse(Some("e0,synthetic"), None, &[e0, candidate]).unwrap();
+        let selected = selection::select(
+            &inventory,
+            &policy,
+            CompatibleSelection::ColdBoot { source: &source },
+        );
+        if matches!(failure, Failure::Transient) {
+            assert!(
+                matches!(selected, Err(SelectionError::Unavailable(error)) if error.is_transient())
+            );
+        } else {
+            assert_eq!(
+                selected.unwrap().1.execution.runtime().version.as_str(),
+                "1.17.0"
+            );
         }
     }
 }

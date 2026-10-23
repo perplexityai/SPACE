@@ -660,7 +660,7 @@ pub(crate) async fn bridge_process_session(
                                 &mut sink,
                                 &DataPlaneServerFrame::Error {
                                     code: DataPlaneErrorCode::BackendStreamError,
-                                    message: status.message().to_string(),
+                                    message: PROCESS_STREAM_FAILED.to_string(),
                                     retryable: backend_stream_status_retryable(&status),
                                 },
                             )
@@ -928,7 +928,7 @@ pub(crate) async fn bridge_file_watch_session(
                                 &mut sink,
                                 &DataPlaneServerFrame::Error {
                                     code: DataPlaneErrorCode::BackendStreamError,
-                                    message: status.message().to_string(),
+                                    message: FILE_WATCH_STREAM_FAILED.to_string(),
                                     retryable: backend_stream_status_retryable(&status),
                                 },
                             )
@@ -1104,11 +1104,12 @@ where
                 Err(StreamBridgeError::BackendStatus(status))
                     if status.code() == tonic::Code::FailedPrecondition =>
                 {
+                    tracing::debug!(grpc_message = %status.message(), "terminal resize was refused");
                     send_server_frame(
                         sink,
                         &DataPlaneServerFrame::Error {
                             code: DataPlaneErrorCode::ResizeNotSupported,
-                            message: status.message().to_string(),
+                            message: RESIZE_REFUSED.to_string(),
                             retryable: false,
                         },
                     )

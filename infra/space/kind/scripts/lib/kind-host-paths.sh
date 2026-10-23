@@ -455,8 +455,8 @@ kind_assert_live_cluster_mounts() {
 
   # The loop above can only disagree with a mount that exists, so a same-named
   # cluster created without this config — no extraMounts at all — passes it
-  # untouched. bootstrap.sh does fail eventually, but two minutes later and
-  # blaming node labels: `apply_node_labels` waits for pools that never appear.
+  # untouched. The bring-up does fail eventually, but minutes later and
+  # blaming whatever first needed a mount.
   # Count what the config asks for instead: a per-destination count is what
   # makes a wholly missing mount visible, and it covers every destination the
   # config declares, so adding a mount to the template extends this

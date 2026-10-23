@@ -260,23 +260,8 @@ impl BuildTokenReviewer {
 fn publication_node(
     user: &k8s_openapi::api::authentication::v1::UserInfo,
 ) -> Result<AuthenticatedBuildNode, Status> {
-    use pplx_space_common_core::types::{PodName, PodUid};
-    let denied = || Status::permission_denied("publication requires a pod-bound node identity");
-    let extra = user.extra.as_ref().ok_or_else(denied)?;
-    let claim = |key| match extra.get(key).map(Vec::as_slice) {
-        Some([value]) if !value.is_empty() => Ok(value.as_str()),
-        _ => Err(denied()),
-    };
-    PodName::parse(claim("authentication.kubernetes.io/pod-name")?).map_err(|_| denied())?;
-    PodUid::parse(claim("authentication.kubernetes.io/pod-uid")?).map_err(|_| denied())?;
-    Ok(AuthenticatedBuildNode {
-        name: claim("authentication.kubernetes.io/node-name")?
-            .parse()
-            .map_err(|_| denied())?,
-        uid: claim("authentication.kubernetes.io/node-uid")?
-            .parse()
-            .map_err(|_| denied())?,
-    })
+    AuthenticatedBuildNode::from_reviewed_user_info(user)
+        .ok_or_else(|| Status::permission_denied("publication requires a pod-bound node identity"))
 }
 
 #[cfg(test)]

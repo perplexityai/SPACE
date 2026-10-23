@@ -1,3 +1,4 @@
+mod environment_selection;
 use pplx_space_common_core::types::NodeId;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1044,7 +1045,7 @@ pub struct SandboxManagerServiceOptions {
     /// reads in test builds. `None` reads the fixed sandbox run directory.
     #[cfg(test)]
     pub(crate) cleanup_run_dir: Option<PathBuf>,
-    /// Cache root used by logical Create in tests; other filesystem paths retain their own fixtures.
+    /// Cache root for logical Create and checkpoint admission tests; later VM work uses its own fixtures.
     #[cfg(test)]
     pub(crate) create_cache_dir: Option<PathBuf>,
 }
@@ -2041,6 +2042,7 @@ mod cleanup_support;
 mod cleanup_targets;
 mod create;
 mod create_support;
+pub(crate) use create_support::template_lookup_scope;
 pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;

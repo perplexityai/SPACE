@@ -6,8 +6,8 @@ use super::*;
 /// `SQLSTATE_UNDEFINED_COLUMN` at any other code and this test fails. Without
 /// it the mapping is silently mutable — the RPC-level tests only observe the
 /// resulting `Unspecified`, which is identical on both branches, so they pass
-/// either way while the rollout's `column_missing` signal never fires and a
-/// live DB incident gets logged as expected schema skew.
+/// either way while the schema-drift `column_missing` signal never fires and a
+/// live DB incident gets logged as schema drift.
 #[test]
 fn only_undefined_column_is_attributed_to_schema_skew() {
     assert_eq!(
@@ -19,7 +19,7 @@ fn only_undefined_column_is_attributed_to_schema_skew() {
 /// Every other failure class — including codes adjacent to `42703` in the
 /// `42xxx` syntax/access family, resource exhaustion, permission denial, and
 /// the `0A000` a rolled-back migration can surface through a cached plan —
-/// must read as a live query failure, not as rollout noise.
+/// must read as a live query failure, not as `column_missing`.
 #[test]
 fn other_sqlstates_are_attributed_to_query_failure() {
     for code in [
@@ -41,7 +41,7 @@ fn other_sqlstates_are_attributed_to_query_failure() {
 
 /// A non-database error (pool acquire timeout, connection reset, decode
 /// failure) carries no SQLSTATE at all. It is still a real failure, so it must
-/// not fall through to the benign `column_missing` story.
+/// not fall through to the `column_missing` schema-drift story.
 #[test]
 fn absent_sqlstate_is_attributed_to_query_failure() {
     assert_eq!(

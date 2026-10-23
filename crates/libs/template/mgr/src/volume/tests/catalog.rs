@@ -1,6 +1,7 @@
 use crate::volume::{PullFailure, PullOutcome, PullTrigger, VolumePuller};
 use pplx_space_common_core::types::OrgId;
 use pplx_space_common_svc::auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
+use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use pplx_space_internal_api_server::ClusterApiService;
 use pplx_space_node_api_client::proto::{
     RegisterTemplateReleaseRequest, RegisterTemplateRequest, TemplateVisibility,
@@ -18,6 +19,7 @@ const CHILD_ENDPOINT: &str = "SPACE_TEST_PREFETCH_CATALOG_ENDPOINT";
 pub(crate) struct Catalog {
     pub(crate) endpoint: String,
     pub(crate) token_file: tempfile::NamedTempFile,
+    pub(crate) lookup_scopes: Arc<Mutex<Vec<Option<TemplateLookupScope>>>>,
     server: tokio::task::JoinHandle<()>,
     _database: pplx_space_db_test_fixtures::TestDb,
 }
@@ -77,10 +79,21 @@ impl Catalog {
             None,
         )?;
         let auth = NodeApiAuthLayer::from_config(config).await?;
+        let lookup_scopes = Arc::new(Mutex::new(Vec::new()));
+        let observed_scopes = Arc::clone(&lookup_scopes);
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .layer(auth)
-                .add_service(ClusterApiServer::new(service))
+                .add_service(ClusterApiServer::with_interceptor(
+                    service,
+                    move |request: tonic::Request<()>| {
+                        observed_scopes
+                            .lock()
+                            .unwrap()
+                            .push(TemplateLookupScope::from_request(&request)?);
+                        Ok(request)
+                    },
+                ))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -88,6 +101,7 @@ impl Catalog {
         Ok(Self {
             endpoint,
             token_file,
+            lookup_scopes,
             server,
             _database: database,
         })
@@ -138,6 +152,10 @@ async fn final_catalog_resolution_controls_prefetch(
             retired_setting.map(OsStr::new)
         ),
     ]));
+    assert_eq!(
+        *catalog.lookup_scopes.lock().unwrap(),
+        vec![Some(TemplateLookupScope::Cluster); 2]
+    );
     Ok(())
 }
 
@@ -163,5 +181,73 @@ async fn assert_pull_outcome(visibility: TemplateVisibility, trigger: PullTrigge
         matches!(outcome, PullOutcome::ClassifiedFailure(actual) if actual == expected),
         "{outcome:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
+    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+    use pplx_space_node_api_client::proto::{
+        FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
+        cluster_api_client::ClusterApiClient,
+    };
+    let catalog = Catalog::start(TemplateVisibility::OrgSpecific).await?;
+    let mut client = ClusterApiClient::connect(catalog.endpoint.clone()).await?;
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let owner = "00000000-0000-0000-0000-000000000003";
+    let foreign = "00000000-0000-0000-0000-000000000004";
+    for scope in [None, Some(TemplateLookupScope::Cluster)] {
+        for org in [owner, foreign] {
+            for by_hash in [false, true] {
+                let metadata = |request: &mut tonic::metadata::MetadataMap| {
+                    request.insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+                };
+                let result = if by_hash {
+                    let mut request = tonic::Request::new(FindTemplateReleaseByHashRequest {
+                        template_name: TEMPLATE.into(),
+                        hash: digest.clone(),
+                        caller_org_id: Some(org.into()),
+                        generic_only: false,
+                    });
+                    metadata(request.metadata_mut());
+                    if let Some(scope) = scope {
+                        scope.attach(&mut request);
+                    }
+                    client.find_template_release_by_hash(request).await
+                } else {
+                    let mut request = tonic::Request::new(FindTemplateReleaseRequest {
+                        template_name: TEMPLATE.into(),
+                        runtime: "fc".into(),
+                        tag: "latest".into(),
+                        caller_org_id: Some(org.into()),
+                        generic_only: false,
+                    });
+                    metadata(request.metadata_mut());
+                    if let Some(scope) = scope {
+                        scope.attach(&mut request);
+                    }
+                    client.find_template_release(request).await
+                };
+                if org == foreign {
+                    assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+                } else {
+                    let response = result?;
+                    assert_eq!(response.get_ref().release.as_ref().unwrap().hash, digest);
+                    assert_eq!(response.get_ref().authorized_org_id.as_deref(), Some(owner));
+                    assert_eq!(
+                        response
+                            .metadata()
+                            .contains_key("x-space-template-lookup-scope-received"),
+                        scope.is_some()
+                    );
+                    assert!(
+                        !response
+                            .metadata()
+                            .contains_key("x-space-template-lookup-scope")
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }

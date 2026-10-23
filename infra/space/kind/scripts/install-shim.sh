@@ -170,7 +170,7 @@ render_wrapper "$SHIM_WRAPPER" "$SHIM_VERSION"
 # Refuse to operate against a missing cluster.
 if ! docker ps --format '{{.Names}}' --filter "label=io.x-k8s.kind.cluster=$KIND_CLUSTER" \
      | grep -q .; then
-  die "no kind containers labelled cluster=$KIND_CLUSTER; bring it up first with bootstrap.sh"
+  die "no kind containers labelled cluster=$KIND_CLUSTER; bring it up first with up.sh"
 fi
 
 workers=$(list_kind_workers)

@@ -139,6 +139,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_KEYED_CLAIM_ENABLED` | on | Kill switch for per-sandbox serialization. `0`, `false`, `False` or `FALSE` turns it off; `1`, `true`, `True` or `TRUE` keeps it on; any other value, including `off`, keeps the default (on). Off restores the unkeyed claim. Independent of retry deferral. |
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_RETRY_DEFERRAL_ENABLED` | on | Kill switch for retry deferral, with the same spellings as the keyed switch. Off keeps every retry wait inside the execution's slot. On, an execution blocked on a fenced restore claim keeps retrying in its slot for 2 s, then is requeued without spending an attempt, after the executor's hint (5 s) plus an equal-jittered eighth of the time since its first claim; that jittered term is capped at 60 s, so the longest delay is 65 s. Kinds with an age deadline keep it. Every deferring operation is also bounded by a 36-minute window of wall-clock time from its first claim, so dispatcher downtime, backpressure requeues and earlier counted retries count toward it; past it, the operation fails with its `retry_attempts_exhausted` error, which then also carries `deferred_retry_window_ms` and `elapsed_since_first_claim_ms`. Independent of the keyed claim. |
 | `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` | off | Env master for claiming a ready warm-pool slot when `POST /v1/sandboxes` admits a create, under the `space-native-create-pool-claim` flag (falls back off). Every `space-cluster-controller` replica must understand claim-carrying create payloads before this is turned on. |
+| `SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS` | empty | Orgs that may use the native operations hidden by default, the ones `/openapi-full.json` marks `x-space-m1-status: incubating-hidden`: `*` for every org, or comma-separated SPACE org ids. `*` must stand alone, and an invalid entry or a value that is not valid Unicode fails startup. The org is the request's effective org, the one that owns the data. For an integration key that asserts a federated owner, that is the org SPACE materialized for the owner: its own id, listed by the admin API's `GET /admin/api/v1/orgs` as `Federated <issuer> org <upstream org id>` once the owner has made a request, not the upstream org id the integrator sends, and not the key's own org. For every other org a hidden route answers `404 not_found` and a hidden lifecycle action answers `400 invalid sandbox action`, exactly as a route or action that does not exist, unless the `space-native-hidden-operations` flag opens them. `/openapi.json` omits hidden operations for every caller; `/openapi-full.json` documents them and requires a native credential, which need not resolve an owner. |
+| `SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED` | on | Env master for the `space-native-hidden-operations` flag (subject: SPACE org id, attribute `operation_id`, falls back off). `off` (or `false`, `0`, `no`, `disabled`) closes every org the flag opened; orgs listed in `SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS` stay open. Empty, `on`, `true`, `1`, `yes` or `enabled` keeps it on; any other value fails startup. |
 | `SPACE_NATIVE_CREATE_INLINE_ENABLED` | on | Kill switch for running a native create that won an admission-time warm-pool claim inside the `POST /v1/sandboxes` request instead of leaving it queued for the dispatcher. Read only while admission-time claiming is on; off keeps those creates queued. The API then runs the create executor itself, so it needs the same create settings as `space-cluster-controller` (for example `SPACE_BYOK_VOLUME_ENCRYPTION`). |
 | `SPACE_NATIVE_CREATE_INLINE_WAIT_MS` | `2000` | How long the create request waits for that inline execution before answering. A create that finishes within the wait answers with its terminal record in the response's `operation` field, so the client need not poll. Past the wait the request answers without it and the execution continues in the background; a malformed value uses the default, and values above 30000 are capped. |
 | `SPACE_REDIS_URL` | unset | |
@@ -457,11 +459,24 @@ forwarding never relabels it.
 | `SPACE_DB_APP_LOCK_TIMEOUT` | `bootstrap-roles` application-role `lock_timeout`; same as `--app-lock-timeout`. `0` resets it, unset leaves it unchanged. |
 | `SPACE_API_URL`, `SPACE_API_TOKEN` | Admin CLI. |
 
+## Execution eligibility
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS` | `e0,legacy` on x86_64; `legacy` on aarch64 | Comma-separated compiled environment names and optional historical-unbound permission. Surrounding whitespace is ignored; empty, duplicate and unknown entries fail startup. |
+| `SPACE_DEFAULT_EXECUTION_ENVIRONMENT` | `e0` on x86_64; `legacy` on aarch64 | Must be allowed. Used for unpinned scratch builds, not to replace a bound source. |
+
+These settings replace the former `SPACE_ENV` admission rule. Before upgrading
+a node that runs non-E0 work, explicitly allow every environment that must remain
+usable. Leaving settings absent revokes those bindings even on development or
+Kind nodes. See [execution policy and rollout](execution-environments.md) for
+cohort constraints and the separate permission for historical unbound work.
+
 ## Observability and feature flags
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `SPACE_ENV` | unset | Deployment identity for telemetry and node-manager execution admission. Recognized development identities, including `local-*`, permit approved non-default environments; missing or unrecognized identities restrict explicit selection to E0. |
+| `SPACE_ENV` | unset | Deployment identity for telemetry; it does not authorize execution environments. |
 | `SPACE_SERVICE_NAME`, `SPACE_VERSION` | unset | SPACE identity tier: outrank `OTEL_SERVICE_NAME`/`OTEL_RESOURCE_ATTRIBUTES` and `DD_*`. |
 | `SPACE_K8S_POD_NAME` | unset | Reported as `k8s.pod.name` on the metrics resource. |
 | `SPACE_LOG_FORMAT` | auto | `json`, `compact`, `pretty` or `text`. |

@@ -15,6 +15,7 @@ struct LegacyPublication {
 
 fn installed() -> NodeExecutionInventory {
     NodeExecutionInventory {
+        policy: None,
         runtimes: vec![RuntimeInstallation {
             runtime: Some(RuntimeIdentity {
                 kind: RuntimeKind::Firecracker.into(),
@@ -182,6 +183,7 @@ async fn observation_and_projection_follow_publication_outcomes_atomically() -> 
     tx.rollback().await?;
     assert_eq!(observed(&db.pool, node_id).await?, before);
     let malformed = complete(NodeExecutionInventory {
+        policy: None,
         runtimes: vec![RuntimeInstallation::default()],
         components: vec![],
     });
@@ -431,6 +433,87 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_receipts_clear_unknown_evidence_and_commit_atomically() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node = NodeId::new();
+    insert_ready_worker_node(&db.pool, node).await?;
+    let reference = format!("sha256:{}", "11".repeat(32));
+    let valid = pplx_space_execution_common::proto::ExecutionPolicyObservation {
+        schema_version: 1,
+        legacy_unbound_allowed: true,
+        allowed_environment_references: vec![reference.clone()],
+        default_environment_reference: Some(reference),
+    };
+    let invalid = pplx_space_execution_common::proto::ExecutionPolicyObservation {
+        schema_version: 99,
+        ..valid.clone()
+    };
+    for (policy, unavailable_report, expected) in [
+        (Some(valid.clone()), false, true),
+        (Some(invalid), false, false),
+        (Some(valid.clone()), false, true),
+        (None, false, false),
+        (Some(valid), false, true),
+        (None, true, false),
+    ] {
+        let report = if unavailable_report {
+            unavailable()
+        } else {
+            complete(NodeExecutionInventory {
+                policy,
+                ..Default::default()
+            })
+        };
+        let mut tx = db.pool.begin().await?;
+        publish_with_status(&mut tx, node, Some(&report), None).await?;
+        tx.commit().await?;
+        let read = || {
+            sqlx::query_scalar::<
+                _,
+                Option<
+                    sqlx::types::Json<pplx_space_common_core::types::ExecutionPolicyObservation>,
+                >,
+            >(sql!(
+                "SELECT execution_policy FROM node_status_snapshots WHERE node_id = $1"
+            ))
+            .bind(node)
+        };
+        let before = read().fetch_one(&db.pool).await?;
+        assert_eq!(before.is_some(), expected);
+        let receipt = || {
+            sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+                "SELECT execution_policy_received_at FROM node_status_snapshots WHERE node_id = $1"
+            ))
+            .bind(node)
+        };
+        let received_at = receipt().fetch_one(&db.pool).await?;
+        assert_eq!(received_at.is_some(), expected);
+        let mut tx = db.pool.begin().await?;
+        publish_with_status(&mut tx, node, None, None).await?;
+        tx.commit().await?;
+        assert_eq!(read().fetch_one(&db.pool).await?, before);
+        let mut tx = db.pool.begin().await?;
+        publish_with_status(&mut tx, node, Some(&unavailable()), None).await?;
+        tx.rollback().await?;
+        assert_eq!(read().fetch_one(&db.pool).await?, before);
+        assert_eq!(receipt().fetch_one(&db.pool).await?, received_at);
+        // The inventory receipt is independent storage. Updating it alone
+        // must not refresh policy evidence (this does not simulate an old writer).
+        sqlx::query(sql!(
+            "UPDATE node_status_snapshots SET execution_inventory_received_at = clock_timestamp()
+             WHERE node_id = $1"
+        ))
+        .bind(node)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(receipt().fetch_one(&db.pool).await?, received_at);
     }
     Ok(())
 }

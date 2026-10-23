@@ -3,18 +3,19 @@ use axum::{
     extract::DefaultBodyLimit,
     handler::Handler,
     middleware,
-    routing::{MethodFilter, MethodRouter, on},
+    routing::{MethodFilter, MethodRouter, any_service, on},
 };
 use pplx_space_public_api::routes::{self as native, NativeHttpMethod, NativeOperation};
-use std::collections::BTreeSet;
+use tower::Layer as _;
 
 use super::AppState;
-use crate::middleware::auth::require_native_auth;
+use crate::middleware::auth::{owner_not_required, require_native_auth};
 
 mod credential_references;
 mod cursors;
 pub(crate) mod error;
 mod files;
+pub(crate) mod hidden_operations;
 pub(crate) use files::{
     MAX_FILE_WRITE_BATCH_BYTES, WRITE_FILE_BATCH_BODY_LIMIT_BYTES, WRITE_FILE_BODY_LIMIT_BYTES,
 };
@@ -261,26 +262,82 @@ async fn native_data_plane(
 }
 
 pub fn v1_router(state: AppState) -> Router<AppState> {
-    let mut mounted = BTreeSet::new();
-    let mut router = Router::new();
+    // Each `(path, method)` mount: the operation whose entry installed the
+    // handler, the handler, and every operation the mount serves, which
+    // includes that one and its `:action` siblings.
+    let mut mounts: Vec<(
+        NativeOperation,
+        MethodRouter<AppState>,
+        Vec<NativeOperation>,
+    )> = Vec::new();
     for (operation, method_router) in mounted_operations() {
-        let path = operation.relative_runtime_path();
-        if mounted.insert((path, operation.method())) {
-            let method_router = if fails_over_from_silent_pods(operation) {
-                method_router.layer(middleware::from_fn(native_data_plane))
-            } else {
-                method_router
-            };
-            router = router.route(path, method_router);
+        let mount = (operation.relative_runtime_path(), operation.method());
+        match mounts
+            .iter_mut()
+            .find(|(first, _, _)| (first.relative_runtime_path(), first.method()) == mount)
+        {
+            Some((_, _, operations)) => operations.push(operation),
+            None => mounts.push((operation, method_router, vec![operation])),
         }
+    }
+    let gates = hidden_operations::route_gates(
+        &mounts
+            .iter()
+            .map(|(_, _, operations)| operations.as_slice())
+            .collect::<Vec<_>>(),
+    );
+    let mut router = Router::new();
+    for ((operation, method_router, _), gate) in mounts.into_iter().zip(gates) {
+        let method_router = if fails_over_from_silent_pods(operation) {
+            method_router.layer(middleware::from_fn(native_data_plane))
+        } else {
+            method_router
+        };
+        // Owner scoping runs per mount rather than router-wide so that the
+        // hidden-operation gate can run outside it: a hidden route answers as
+        // an unmounted one, whatever sandbox it names.
+        let method_router = method_router.layer(middleware::from_fn_with_state(
+            state.clone(),
+            owner_scope::authorize,
+        ));
+        let path = operation.relative_runtime_path();
+        router = match gate {
+            // Around the whole method router, not layered into it: axum adds
+            // a method router's `Allow` header to its 405 fallback after any
+            // layer inside it has answered, and an unmounted route has none.
+            // `any_service` sends every method through the gate and adds no
+            // `Allow` of its own.
+            Some(hidden) => router.route(
+                path,
+                any_service(
+                    middleware::from_fn_with_state(
+                        (state.clone(), hidden),
+                        hidden_operations::hide_unless_enabled,
+                    )
+                    .layer(method_router.with_state(state.clone())),
+                ),
+            ),
+            None => router.route(path, method_router),
+        };
     }
     router
         .fallback(error::public_route_not_found)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            owner_scope::authorize,
-        ))
         .layer(middleware::from_fn_with_state(state, require_native_auth))
+        .layer(middleware::from_fn(error::normalize_public_error_response))
+        .layer(middleware::from_fn(request_context::with_public_request_id))
+}
+
+/// `method_router` behind the same credentials and error envelope as
+/// [`v1_router`], for a document that is not itself a `/v1` operation. It
+/// reads no tenant data, so it needs no effective owner: a service credential
+/// that resolves no actor may fetch it too.
+pub(crate) fn with_native_auth(
+    state: AppState,
+    method_router: MethodRouter<AppState>,
+) -> MethodRouter<AppState> {
+    method_router
+        .layer(middleware::from_fn_with_state(state, require_native_auth))
+        .layer(middleware::from_fn(owner_not_required))
         .layer(middleware::from_fn(error::normalize_public_error_response))
         .layer(middleware::from_fn(request_context::with_public_request_id))
 }

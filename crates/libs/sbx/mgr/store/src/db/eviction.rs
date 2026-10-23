@@ -232,7 +232,7 @@ pub fn claim_teardown_suspend_failed_sandbox_for_eviction(
         params![
             now()?,
             id,
-            pplx_space_sbx_mgr_client::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON,
+            pplx_space_sbx_mgr_protocol::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON,
             staged_artifact.to_string(),
             expected_state_changed_at
         ],

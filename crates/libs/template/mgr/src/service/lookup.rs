@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::OrgId;
+use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 
 use super::*;
 
@@ -17,16 +18,27 @@ impl TemplateManagerService {
         &self,
         request: Request<crate::proto::GetTemplateRequest>,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
-        self.get_template_resolving(
-            request,
-            crate::volume::find_release_inner,
-            async |spec, resolve_elapsed, release| {
-                self.volume_puller
-                    .materialize_release(Arc::clone(&self.db), spec, resolve_elapsed, release)
-                    .await
-            },
-        )
-        .await
+        let scope = TemplateLookupScope::from_request(&request)?;
+        if scope.is_none() {
+            pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+        }
+        let mut response = self
+            .get_template_resolving(
+                request,
+                async |name, hash, tag, org| {
+                    crate::volume::find_release_in_scope(name, hash, tag, org, scope).await
+                },
+                async |spec, resolve_elapsed, release| {
+                    self.volume_puller
+                        .materialize_release(Arc::clone(&self.db), spec, resolve_elapsed, release)
+                        .await
+                },
+            )
+            .await?;
+        if let Some(scope) = scope {
+            scope.receipt(&mut response);
+        }
+        Ok(response)
     }
 
     pub(super) async fn get_template_resolving(
@@ -48,6 +60,7 @@ impl TemplateManagerService {
         ) -> crate::volume::PullOutcome,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
+        let scope = TemplateLookupScope::from_request(&request)?;
         let req = request.get_ref();
         let tmpl_ref = req
             .template
@@ -223,12 +236,13 @@ impl TemplateManagerService {
             }
             None => {
                 self.volume_puller
-                    .pull(
+                    .pull_in_scope(
                         Arc::clone(&self.db),
                         template_id,
                         &req_hash,
                         &req_tag,
                         crate::volume::PullTrigger::OnDemand,
+                        scope,
                     )
                     .await
             }

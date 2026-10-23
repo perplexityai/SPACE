@@ -221,6 +221,12 @@ spec:
               value: {{ .Values.clusterActivationAdmission.enabled | quote }}
             - name: SPACE_API_CLIENT_CONCURRENCY_MODE
               value: {{ .Values.clientConcurrency.mode | quote }}
+            # Hidden native operations; see `nativeHiddenOperations` in
+            # values.yaml. Rendered either way, empty by default.
+            - name: SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS
+              value: {{ .Values.nativeHiddenOperations.orgs | quote }}
+            - name: SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED
+              value: {{ .Values.nativeHiddenOperations.flagEnabled | quote }}
             {{- if .Values.redis.url }}
             # Both limiters' shared store; see `redis` in values.yaml.
             - name: SPACE_REDIS_URL

@@ -348,7 +348,7 @@ impl ProcessSseState {
         self.finished = true;
         self.push_frame(DataPlaneServerFrame::Error {
             code: DataPlaneErrorCode::BackendStreamError,
-            message: error.to_string(),
+            message: PROCESS_STREAM_FAILED.to_string(),
             retryable: true,
         });
     }
@@ -658,7 +658,7 @@ impl FileWatchSseState {
         self.finished = true;
         self.push_frame(DataPlaneServerFrame::Error {
             code: DataPlaneErrorCode::BackendStreamError,
-            message: error.to_string(),
+            message: FILE_WATCH_STREAM_FAILED.to_string(),
             retryable: true,
         });
     }

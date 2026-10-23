@@ -59,6 +59,7 @@
 //!   addressing.
 
 use crate::rootfs_backing::RootfsBackingPolicy;
+use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -406,6 +407,25 @@ impl VolumePuller {
     /// This keeps caller cancellation from multiplying rootfs
     /// decompressions while preserving the recover-from-disk behavior for
     /// process death.
+    pub async fn pull(
+        &self,
+        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        name: &str,
+        req_hash: &str,
+        req_tag: &str,
+        trigger: PullTrigger,
+    ) -> PullOutcome {
+        self.pull_in_scope(
+            db,
+            name,
+            req_hash,
+            req_tag,
+            trigger,
+            Some(TemplateLookupScope::Cluster),
+        )
+        .await
+    }
+
     #[tracing::instrument(
         skip_all,
         fields(
@@ -416,13 +436,14 @@ impl VolumePuller {
             content_hash = tracing::field::Empty,
         )
     )]
-    pub async fn pull(
+    pub(crate) async fn pull_in_scope(
         &self,
         db: Arc<std::sync::Mutex<rusqlite::Connection>>,
         name: &str,
         req_hash: &str,
         req_tag: &str,
         trigger: PullTrigger,
+        scope: Option<TemplateLookupScope>,
     ) -> PullOutcome {
         let started = Instant::now();
         let base_tags = pull_metric_tags(name, req_hash, req_tag, trigger);
@@ -434,7 +455,7 @@ impl VolumePuller {
             req_tag,
             trigger,
         };
-        let outcome = pull_inner(self, db, spec, &base_tags, &mut path_taken).await;
+        let outcome = pull_inner(self, db, spec, &base_tags, &mut path_taken, scope).await;
 
         pplx_space_metrics::template::pull_duration(
             &base_tags,
@@ -774,28 +795,28 @@ async fn pull_inner(
     spec: PullSpec<'_>,
     base_tags: &[String],
     path_taken: &mut PullPath,
+    scope: Option<TemplateLookupScope>,
 ) -> PullOutcome {
     let name = spec.name;
     // 1. Resolve (release.hash, storage_uris) via ClusterApi.
-    let release =
-        match find_release(name, spec.req_hash, spec.req_tag, base_tags, spec.trigger).await {
-            Ok(found) => found,
-            Err(FindReleaseError::NotFound) => {
-                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataMissing);
-            }
-            Err(FindReleaseError::Unavailable) => {
-                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataUnavailable);
-            }
-            Err(FindReleaseError::InvalidResponse) => {
-                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataInvalid);
-            }
-            Err(FindReleaseError::Status(status)) => {
-                return PullOutcome::DownstreamFailure {
-                    failure: PullFailure::ClusterMetadataUnavailable,
-                    status,
-                };
-            }
-        };
+    let release = match find_release(spec, base_tags, scope).await {
+        Ok(found) => found,
+        Err(FindReleaseError::NotFound) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataMissing);
+        }
+        Err(FindReleaseError::Unavailable) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataUnavailable);
+        }
+        Err(FindReleaseError::InvalidResponse) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataInvalid);
+        }
+        Err(FindReleaseError::Status(status)) => {
+            return PullOutcome::DownstreamFailure {
+                failure: PullFailure::ClusterMetadataUnavailable,
+                status,
+            };
+        }
+    };
 
     // The catalog has enforced generic-only selection in the same SQL snapshot
     // as the release and locations. Cached visibility is only an additional
@@ -943,15 +964,20 @@ async fn pull_resolved_owner(
 /// Connects to the cluster-role node-api and asks
 /// `FindTemplateRelease(name, runtime, tag)`.
 async fn find_release(
-    name: &str,
-    req_hash: &str,
-    req_tag: &str,
+    spec: PullSpec<'_>,
     base_tags: &[String],
-    trigger: PullTrigger,
+    scope: Option<TemplateLookupScope>,
 ) -> Result<ResolvedRelease, FindReleaseError> {
     let started = Instant::now();
+    let PullSpec {
+        name,
+        req_hash,
+        req_tag,
+        trigger,
+    } = spec;
     let generic_only = trigger.is_prefetch();
-    let result = find_release_with_requirement(name, req_hash, req_tag, None, generic_only).await;
+    let result =
+        find_release_with_requirement(name, req_hash, req_tag, None, generic_only, scope).await;
     let result_label = match &result {
         Ok(_) => "ok",
         Err(FindReleaseError::NotFound) => "not_found",
@@ -1003,7 +1029,24 @@ pub(crate) async fn find_release_inner(
     req_tag: &str,
     caller_org: Option<OrgId>,
 ) -> Result<ResolvedRelease, FindReleaseError> {
-    find_release_with_requirement(name, req_hash, req_tag, caller_org, false).await
+    find_release_in_scope(
+        name,
+        req_hash,
+        req_tag,
+        caller_org,
+        Some(TemplateLookupScope::Cluster),
+    )
+    .await
+}
+
+pub(crate) async fn find_release_in_scope(
+    name: &str,
+    req_hash: &str,
+    req_tag: &str,
+    caller_org: Option<OrgId>,
+    scope: Option<TemplateLookupScope>,
+) -> Result<ResolvedRelease, FindReleaseError> {
+    find_release_with_requirement(name, req_hash, req_tag, caller_org, false, scope).await
 }
 
 async fn find_release_with_requirement(
@@ -1012,6 +1055,7 @@ async fn find_release_with_requirement(
     req_tag: &str,
     caller_org: Option<OrgId>,
     generic_only: bool,
+    scope: Option<TemplateLookupScope>,
 ) -> Result<ResolvedRelease, FindReleaseError> {
     let mut client = connect_cluster_api_from_env().await.map_err(|error| {
         warn!(error = %error, "cluster api connect failed");
@@ -1027,16 +1071,17 @@ async fn find_release_with_requirement(
     // but not for the hash path (digests are runtime-scoped).
     let resp = if !req_hash.is_empty() {
         let hash = req_hash.to_string();
-        match client
-            .find_template_release_by_hash(FindTemplateReleaseByHashRequest {
-                generic_only,
-                caller_org_id: caller_org.map(|org| org.to_string()),
-                template_name: name.to_string(),
-                hash: hash.clone(),
-            })
-            .await
-        {
-            Ok(r) => r.into_inner(),
+        let mut request = tonic::Request::new(FindTemplateReleaseByHashRequest {
+            generic_only,
+            caller_org_id: caller_org.map(|org| org.to_string()),
+            template_name: name.to_string(),
+            hash: hash.clone(),
+        });
+        if let Some(scope) = scope {
+            scope.attach(&mut request);
+        }
+        match client.find_template_release_by_hash(request).await {
+            Ok(r) => r,
             Err(status) => {
                 if status.code() == tonic::Code::NotFound {
                     debug!(
@@ -1057,17 +1102,18 @@ async fn find_release_with_requirement(
         }
     } else {
         let tag = lookup_tag(req_tag);
-        match client
-            .find_template_release(FindTemplateReleaseRequest {
-                generic_only,
-                caller_org_id: caller_org.map(|org| org.to_string()),
-                template_name: name.to_string(),
-                runtime: DEFAULT_RUNTIME.to_string(),
-                tag: tag.clone(),
-            })
-            .await
-        {
-            Ok(r) => r.into_inner(),
+        let mut request = tonic::Request::new(FindTemplateReleaseRequest {
+            generic_only,
+            caller_org_id: caller_org.map(|org| org.to_string()),
+            template_name: name.to_string(),
+            runtime: DEFAULT_RUNTIME.to_string(),
+            tag: tag.clone(),
+        });
+        if let Some(scope) = scope {
+            scope.attach(&mut request);
+        }
+        match client.find_template_release(request).await {
+            Ok(r) => r,
             Err(status) => {
                 if status.code() == tonic::Code::NotFound {
                     debug!(template = name, %tag, "FindTemplateRelease returned NotFound");
@@ -1079,6 +1125,12 @@ async fn find_release_with_requirement(
         }
     };
 
+    if let Some(scope) = scope {
+        scope
+            .observe_response(&resp)
+            .map_err(FindReleaseError::Status)?;
+    }
+    let resp = resp.into_inner();
     parse_release_response(name, req_hash, caller_org, generic_only, resp)
 }
 

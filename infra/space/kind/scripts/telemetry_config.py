@@ -101,7 +101,7 @@ def options(environ=None):
 
 
 def default_environment():
-    """Per-devbox identity, matching bootstrap.sh's pre-selector behaviour.
+    """Per-devbox identity, matching the bring-up's pre-selector behaviour.
 
     The documented Datadog filter is `env:local-*` for all local-dev traffic and
     `env:local-<host>` for one devbox, so an ordinary bootstrap that supplies no

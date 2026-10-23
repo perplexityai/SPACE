@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Shared idempotent bootstrap for the local KinD + Tilt SPACE stack.
-# Sourced by `smoke-kind-e2e.sh`, and by the harness tests
-# `test-kind-port-forward-parity.sh`, `test-kind-stale-tilt-recovery.sh`, and
-# `test-kind-tombstone-sweep.sh`.
+# Shared idempotent bootstrap for the local KinD + Tilt SPACE stack, the only
+# Kind bring-up. Sourced by `infra/space/kind/scripts/up.sh` (the documented
+# command), `infra/space/kind/scripts/prepare-cluster.sh`, `smoke-kind-e2e.sh`,
+# and by the harness tests `test-kind-localhost-ports.sh`,
+# `test-kind-stale-tilt-recovery.sh`, and `test-kind-tombstone-sweep.sh`.
 #
 # Contract: after `bootstrap_kind_stack` returns successfully, the kind
 # cluster `$KIND_CLUSTER` exists, and — when docker is on PATH and the host
@@ -23,8 +24,11 @@
 # checked too, unless Tilt still has an update pending), (when DATA_PLANE_URL is
 # supplied) the public data plane is reachable, and no node carries a
 # tombstone contradicted by kube. A Tilt build that fails ends the bring-up
-# with that resource's log instead of consuming the timeout; a Tilt bound to a
-# deleted cluster is restarted.
+# with that resource's log instead of consuming the timeout, as does a
+# resource Tilt has settled in error and a failed space-db-migrate Job that
+# Tilt has finished replacing; a Tilt bound to a deleted cluster is restarted.
+# Tilt is started pinned to kind-$KIND_CLUSTER, and only a watcher identified
+# as this bring-up's is ever signalled.
 #
 # Public entry points: `bootstrap_kind_stack`, `kind_stack_prepare_cluster`,
 # `kind_stack_recheck_for_scenario` for each scenario of a suite whose runner
@@ -50,7 +54,8 @@
 #   SPACE_KIND_RUST_BUILD — test-hooks (default) or release
 #                       (infra/space/kind/lib/rust-build.sh); compared and
 #                       switched like the storage credentials mode
-#   BOOTSTRAP_TIMEOUT — per-stage seconds for blocking initialization/readiness
+#   BOOTSTRAP_TIMEOUT — seconds each blocking wait may take: Tilt's start, the
+#                       API, the seed Job, each rollout and node publication
 #   SPACE_KIND_RUN_DIR — the run's output directory, where the bring-up writes
 #                       provenance.json, the image every SPACE container runs
 #                       against the latest build of it (default: a new
@@ -89,6 +94,8 @@
 source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/storage-credentials.sh"
 # shellcheck source=../../../infra/space/kind/lib/rust-build.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/rust-build.sh"
+# shellcheck source=../../../infra/space/kind/lib/port-forward-supervisors.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/port-forward-supervisors.sh"
 
 # Assert the suites' prerequisites here, at the entry point every kind suite
 # already sources, so callers cannot accidentally omit the prerequisite gate.
@@ -103,7 +110,7 @@ kind_stack_assert_smoke_prereqs() {
     local missing
     missing="$(space_smoke_prereqs_missing_report)"
     if [[ -n "$missing" ]]; then
-        echo "ERROR: the kind smoke suites need commands this box does not have:" >&2
+        echo "ERROR: the kind bring-up and smoke suites need commands this box does not have:" >&2
         printf '       %s\n' "$missing" >&2
         echo "       Provision them with 'bash infra/space/kind/scripts/install-prereqs.sh'." >&2
         exit 1
@@ -225,9 +232,10 @@ bootstrap_kind_stack__tilt_pids() {
     done | sort -rn | awk '{ print $2 }'
 }
 
-# The `tilt up` this bring-up tracks: the pidfile when it names a live
-# `tilt up`, otherwise the oldest `tilt up` on the box (sessions started before
-# the pidfile existed). Prints nothing when there is none.
+# The `tilt up` this bring-up tracks: the pidfile's, when it names a live
+# `tilt up`. Prints nothing otherwise. Never "the oldest `tilt up` on the
+# box": that is whatever another project happens to run, and the stops below
+# would signal it.
 bootstrap_kind_stack__tilt_pid() {
     local state_dir pidfile pid
     state_dir="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}"
@@ -239,7 +247,7 @@ bootstrap_kind_stack__tilt_pid() {
             return 0
         fi
     fi
-    bootstrap_kind_stack__tilt_pids | head -n 1
+    return 0
 }
 
 # Epoch seconds at which a process started; fails when unknown.
@@ -278,7 +286,7 @@ bootstrap_kind_stack__tilt_stale_for_cluster() {
         echo "[bootstrap] tilt reports a cluster connection error: $error"
         return 0
     fi
-    pid="$(bootstrap_kind_stack__tilt_pid)"
+    pid="$(bootstrap_kind_stack__served_tilt_pid)"
     [[ -n "$pid" ]] || return 1
     tilt_started="$(bootstrap_kind_stack__process_start_epoch "$pid")" || return 1
     cluster_created="$(bootstrap_kind_stack__cluster_created_epoch)" || return 1
@@ -290,13 +298,21 @@ bootstrap_kind_stack__tilt_stale_for_cluster() {
     return 1
 }
 
-# The directory a `tilt up` runs in (the pid given, or the tracked one), which
+# The `tilt up` serving :10350 — the watcher whose context `__tilt_running`
+# just read — or, when the listener cannot be resolved (a proxy holds the port,
+# or another user's process lsof cannot see), the pidfile's verified watcher.
+# Prints nothing when neither resolves.
+bootstrap_kind_stack__served_tilt_pid() {
+    bootstrap_kind_stack__tilt_listener_pid || bootstrap_kind_stack__tilt_pid
+}
+
+# The directory a `tilt up` runs in (the pid given, or the serving one), which
 # is the checkout it watches and builds. Fails when that is unknown (no such
 # process, or no /proc to ask). A checkout deleted since Tilt started reads back
 # with a " (deleted)" suffix, so it never matches a live path.
 bootstrap_kind_stack__tilt_cwd() {
     local pid="${1:-}"
-    [[ -n "$pid" ]] || pid="$(bootstrap_kind_stack__tilt_pid)"
+    [[ -n "$pid" ]] || pid="$(bootstrap_kind_stack__served_tilt_pid)"
     [[ -n "$pid" ]] || return 1
     readlink "/proc/$pid/cwd" 2>/dev/null
 }
@@ -314,7 +330,7 @@ bootstrap_kind_stack__tilt_watches_other_checkout() {
     [[ -n "$cwd" ]] || return 1
     here="$(cd "$REPO_ROOT" && pwd -P)" || return 1
     [[ "$cwd" != "$here" ]] || return 1
-    echo "[bootstrap] tilt (pid $(bootstrap_kind_stack__tilt_pid)) is watching $cwd, not this checkout ($here)"
+    echo "[bootstrap] tilt (pid $(bootstrap_kind_stack__served_tilt_pid)) is watching $cwd, not this checkout ($here)"
 }
 
 # A responsive :10350 that `__tilt_running` rejected — no context, or a context
@@ -381,17 +397,31 @@ bootstrap_kind_stack__tilt_listener_pid() {
 # given, or the tracked one), then wait for :10350 to free. Unlike
 # `__kill_stale_tilt` this may take down a responsive server: the caller has
 # established that it serves kind-$KIND_CLUSTER and is either bound to a
-# cluster that no longer exists or watching another checkout, or that it is
-# ours and never connected to any cluster (`__tilt_orphaned`).
+# cluster that no longer exists, watching another checkout, running the other
+# storage credentials mode, or started with other settings (up.sh), or that it
+# is ours and never connected to any cluster (`__tilt_orphaned`).
+#
+# Only an identified process is signalled: the pid given (the :10350 listener,
+# resolved by the caller) or the pidfile's verified watcher. When neither
+# resolves and :10350 still answers, nothing is signalled and the bring-up
+# refuses.
 bootstrap_kind_stack__stop_stale_tilt() {
     local pid="${1:-}" state_dir pidfile
     [[ -n "$pid" ]] || pid="$(bootstrap_kind_stack__tilt_pid)"
     state_dir="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}"
     pidfile="${SPACE_TILT_PIDFILE:-$state_dir/tilt-${KIND_CLUSTER}.pid}"
-    if [[ -n "$pid" ]]; then
-        echo "[bootstrap] stopping stale tilt (pid $pid) before starting fresh"
-        kill "$pid" 2>/dev/null || true
+    if [[ -z "$pid" ]]; then
+        if curl -sf -m 1 http://localhost:10350/ >/dev/null 2>&1; then
+            echo "ERROR: the watcher on :10350 has to be restarted, but its process cannot be identified:" >&2
+            echo "       it is not a \`tilt up\` lsof can see, and the pidfile does not name one." >&2
+            echo "       Stop the watcher on :10350, then rerun." >&2
+            return 1
+        fi
+        rm -f "$pidfile"
+        return 0
     fi
+    echo "[bootstrap] stopping stale tilt (pid $pid) before starting fresh"
+    kill "$pid" 2>/dev/null || true
     rm -f "$pidfile"
     local deadline=$(( $(date +%s) + 20 ))
     while [[ $(date +%s) -lt $deadline ]]; do
@@ -400,7 +430,7 @@ bootstrap_kind_stack__stop_stale_tilt() {
         fi
         sleep 1
     done
-    [[ -z "$pid" ]] || kill -9 "$pid" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
     sleep 1
     if curl -sf -m 1 http://localhost:10350/ >/dev/null 2>&1; then
         echo "ERROR: stale tilt still holds :10350; stop it manually and retry" >&2
@@ -409,17 +439,20 @@ bootstrap_kind_stack__stop_stale_tilt() {
     return 0
 }
 
+# Every Tilt resource and its update status, one `name status` per line.
+bootstrap_kind_stack__tilt_update_statuses() {
+    timeout 10s tilt get uiresources --port 10350 \
+        -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.updateStatus}{"\n"}{end}' 2>/dev/null
+}
+
 # Resources whose last update failed, one name per line.
 bootstrap_kind_stack__tilt_failed_resources() {
-    timeout 10s tilt get uiresources --port 10350 \
-        -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.updateStatus}{"\n"}{end}' 2>/dev/null \
-        | awk '$2 == "error" { print $1 }'
+    bootstrap_kind_stack__tilt_update_statuses | awk '$2 == "error" { print $1 }'
 }
 
 # Resources Tilt is still updating, space-separated on one line.
 bootstrap_kind_stack__tilt_busy_resources() {
-    timeout 10s tilt get uiresources --port 10350 \
-        -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.updateStatus}{"\n"}{end}' 2>/dev/null \
+    bootstrap_kind_stack__tilt_update_statuses \
         | awk '$2 == "pending" || $2 == "in_progress" { print $1 }' | tr '\n' ' '
 }
 
@@ -448,12 +481,17 @@ bootstrap_kind_stack__die_on_failed_builds() {
         return 0
     fi
     echo "ERROR: Tilt reports failed builds; nothing else this bring-up waits for can complete:" >&2
+    bootstrap_kind_stack__report_failed_builds "$failed"
+}
+
+# Print each failed resource's log tail and the remedy, then exit 1.
+bootstrap_kind_stack__report_failed_builds() {
     local res
     while IFS= read -r res; do
         [[ -n "$res" ]] || continue
         echo "----- tilt logs $res (tail)" >&2
         timeout 15s tilt logs "$res" --port 10350 2>/dev/null | tail -n 40 >&2 || true
-    done <<<"$failed"
+    done <<<"$1"
     echo "       Fix the cause, then 'tilt trigger <resource>' (Tilt does not retry on its own)" >&2
     echo "       or rerun this bring-up. Full log: ${SPACE_TILT_LOG:-$HOME/.space-devbox/kind/tilt-${KIND_CLUSTER}.log}" >&2
     exit 1
@@ -466,14 +504,38 @@ bootstrap_kind_stack__die_on_failed_builds() {
 # refused. Wait until Tilt has nothing pending or in progress, then for every
 # workload rollout in the namespace, so "bring-up returned" means "stack
 # settled" and no caller needs its own ReplicaSet-age heuristic.
+#
+# Quiet is not success. On a warm stack a change whose build fails leaves the
+# old pods healthy, so every rollout below passes against the previous
+# Deployments; a resource still in error once nothing is pending is that
+# failure, and ends the bring-up with its log. Two sightings a poll apart, as
+# in `__die_on_failed_builds`, so a file change that is about to retrigger it
+# is not mistaken for a settled error.
 bootstrap_kind_stack__wait_for_tilt_quiet() {
     local deadline=$(( $(date +%s) + BOOTSTRAP_TIMEOUT ))
-    local busy now last_log_at=0
+    local busy failed settled_failed="" now last_log_at=0
     echo "[bootstrap] waiting for Tilt to finish every pending build"
     while :; do
         busy="$(bootstrap_kind_stack__tilt_busy_resources)"
-        [[ -n "${busy// /}" ]] || break
-        bootstrap_kind_stack__die_on_failed_builds
+        if [[ -z "${busy// /}" ]]; then
+            failed="$(bootstrap_kind_stack__tilt_failed_resources)"
+            if [[ -z "$failed" ]]; then
+                # A Job failure is not an update status: wait for the
+                # migration check below to confirm it rather than settle.
+                bootstrap_kind_stack__failed_migration_uid >/dev/null || break
+                busy="(settling: space-db-migrate failed)"
+            elif [[ "$failed" == "$settled_failed" ]]; then
+                echo "ERROR: Tilt finished updating with failed resources; the stack runs their previous build:" >&2
+                bootstrap_kind_stack__report_failed_builds "$failed"
+            else
+                settled_failed="$failed"
+                busy="(settling: $(tr '\n' ' ' <<<"$failed"))"
+            fi
+        else
+            settled_failed=""
+            bootstrap_kind_stack__die_on_failed_builds
+        fi
+        bootstrap_kind_stack__die_on_failed_migration
         now=$(date +%s)
         if (( now >= deadline )); then
             echo "ERROR: Tilt still building after ${BOOTSTRAP_TIMEOUT}s: $busy" >&2
@@ -489,8 +551,8 @@ bootstrap_kind_stack__wait_for_tilt_quiet() {
     local workload
     while IFS= read -r workload; do
         [[ -n "$workload" ]] || continue
-        if ! kubectl --context "kind-${KIND_CLUSTER}" -n space rollout status "$workload" --timeout=300s >/dev/null; then
-            echo "ERROR: $workload did not finish rolling within 300s" >&2
+        if ! kubectl --context "kind-${KIND_CLUSTER}" -n space rollout status "$workload" --timeout="${BOOTSTRAP_TIMEOUT}s" >/dev/null; then
+            echo "ERROR: $workload did not finish rolling within ${BOOTSTRAP_TIMEOUT}s" >&2
             kubectl --context "kind-${KIND_CLUSTER}" -n space get "$workload" -o wide >&2 || true
             exit 1
         fi
@@ -541,6 +603,101 @@ bootstrap_kind_stack__check_live_provenance() {
     bootstrap_kind_stack__check_provenance
 }
 
+# The space-db-migrate Job makes one attempt (backoffLimit 0) and gates the
+# api-server, so once it has failed nothing the API wait waits for can arrive.
+#
+# Only the current Job's failure is final. A Failed Job stays in the cluster
+# until Tilt replaces it, and after a user fixes `db/` and reruns, Tilt may
+# still be rebuilding the image or replacing the Job: that old Job's logs are
+# not this run's verdict. So a Job's failure counts once Tilt's resource of
+# the same name is idle (neither pending nor in progress), and only when the
+# same Job is seen failed that way on two checks a poll apart, which also
+# covers a file change Tilt has not registered yet. Callers poll
+# `__die_on_failed_migration` (and `__die_on_failed_job` for the seed and
+# bucket-init Jobs) at $BOOTSTRAP_TILT_FAILCHECK_INTERVAL seconds (default 15).
+#
+# The uid of Job $1 when it has failed and Tilt is not updating its resource;
+# fails otherwise.
+bootstrap_kind_stack__failed_job_uid() {
+    local name="$1" job uid conditions status
+    job="$(kubectl --context "kind-${KIND_CLUSTER}" -n space get job "$name" \
+        -o jsonpath='{.metadata.uid}{" "}{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}' 2>/dev/null)" \
+        || return 1
+    read -r uid conditions <<<"$job"
+    [[ -n "$uid" && " $conditions " == *" Failed "* ]] || return 1
+    status="$(bootstrap_kind_stack__tilt_update_statuses | awk -v r="$name" '$1 == r { print $2 }')"
+    [[ -n "$status" && "$status" != pending && "$status" != in_progress ]] || return 1
+    printf '%s\n' "$uid"
+}
+
+bootstrap_kind_stack__failed_migration_uid() {
+    bootstrap_kind_stack__failed_job_uid space-db-migrate
+}
+
+declare -gA BOOTSTRAP_KIND_STACK__JOB_FAILED_SEEN=()
+declare -gA BOOTSTRAP_KIND_STACK__JOB_CHECKED_AT=()
+# End the bring-up once Job $1 has failed as described above, with its logs;
+# $2 says what that failure blocks.
+bootstrap_kind_stack__die_on_failed_job() {
+    local name="$1" consequence="${2:-}" now interval="${BOOTSTRAP_TILT_FAILCHECK_INTERVAL:-15}" uid
+    now=$(date +%s)
+    (( now - ${BOOTSTRAP_KIND_STACK__JOB_CHECKED_AT[$name]:-0} >= interval )) || return 0
+    BOOTSTRAP_KIND_STACK__JOB_CHECKED_AT[$name]=$now
+    if ! uid="$(bootstrap_kind_stack__failed_job_uid "$name")"; then
+        BOOTSTRAP_KIND_STACK__JOB_FAILED_SEEN[$name]=""
+        return 0
+    fi
+    if [[ "${BOOTSTRAP_KIND_STACK__JOB_FAILED_SEEN[$name]:-}" != "$uid" ]]; then
+        BOOTSTRAP_KIND_STACK__JOB_FAILED_SEEN[$name]="$uid"
+        return 0
+    fi
+    echo "ERROR: the $name Job failed${consequence:+, so $consequence}. Its logs:" >&2
+    kubectl --context "kind-${KIND_CLUSTER}" -n space logs "job/$name" \
+        --all-containers --prefix --tail=50 >&2 || true
+    echo "       Fix the cause, then 'tilt trigger $name' to run it again." >&2
+    exit 1
+}
+
+bootstrap_kind_stack__die_on_failed_migration() {
+    bootstrap_kind_stack__die_on_failed_job space-db-migrate "the api-server cannot start"
+}
+
+# Wait for Job $1 to complete, up to $2 seconds, failing on its failure (see
+# `__die_on_failed_job`), a failed build or a failed migration instead of the
+# timeout. A plain `kubectl wait` diagnosed none of them until it expired.
+bootstrap_kind_stack__wait_for_job() {
+    local name="$1" timeout="$2" deadline conditions now last_log_at
+    deadline=$(( $(date +%s) + timeout ))
+    last_log_at=$(date +%s)
+    while :; do
+        conditions="$(kubectl --context "kind-${KIND_CLUSTER}" -n space get job "$name" \
+            -o jsonpath='{.metadata.uid}{" "}{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}' 2>/dev/null)" \
+            || conditions=""
+        [[ " $conditions " == *" Complete "* ]] && return 0
+        bootstrap_kind_stack__die_on_failed_job "$name"
+        bootstrap_kind_stack__die_on_failed_builds
+        bootstrap_kind_stack__die_on_failed_migration
+        now=$(date +%s)
+        if (( now >= deadline )); then
+            echo "ERROR: the $name Job did not complete within ${timeout}s" >&2
+            kubectl --context "kind-${KIND_CLUSTER}" get jobs -n space >&2 || true
+            kubectl --context "kind-${KIND_CLUSTER}" logs "job/$name" -n space --tail=50 >&2 || true
+            exit 1
+        fi
+        if (( now - last_log_at >= 30 )); then
+            echo "  ...waiting for the $name Job (timeout in $(( deadline - now ))s)"
+            last_log_at=$now
+        fi
+        sleep 2
+    done
+}
+
+# Every SPACE node published through ClusterApi and schedulable.
+bootstrap_kind_stack__wait_node_publication() {
+    SPACE_KIND_CLUSTER="$KIND_CLUSTER" SPACE_KIND_API_URL="$API_URL" \
+        bash "$REPO_ROOT/infra/space/kind/scripts/wait-node-publication.sh" "$BOOTSTRAP_TIMEOUT" || exit 1
+}
+
 bootstrap_kind_stack__wait_for_api() {
     local deadline=$(( $(date +%s) + BOOTSTRAP_TIMEOUT ))
     local last_log_at=0
@@ -549,6 +706,7 @@ bootstrap_kind_stack__wait_for_api() {
             return 0
         fi
         bootstrap_kind_stack__die_on_failed_builds
+        bootstrap_kind_stack__die_on_failed_migration
         local now
         now=$(date +%s)
         if (( now - last_log_at >= 15 )); then
@@ -594,8 +752,12 @@ bootstrap_kind_stack__start_tilt() {
         # leaving half-built images and a cluster nobody is reconciling
         # (measured on a cold devbox: `tilt up` died mid-compile at exactly
         # 300s). A new session puts Tilt in its own process group.
+        #
+        # `--context`: the Tiltfile's allow_k8s_contexts only permits a
+        # context, it does not select one, so a plain `tilt up` would apply
+        # the stack to whatever context the kubeconfig currently names.
         TILT_BROWSER_DISABLED=1 SPACE_KIND_CLUSTER="$KIND_CLUSTER" \
-            setsid nohup tilt up >"$log" 2>&1 </dev/null &
+            setsid nohup tilt up --context "kind-${KIND_CLUSTER}" >"$log" 2>&1 </dev/null &
         pid=$!
         printf '%s\n' "$pid" >"$pidfile"
         printf '%s\n' "$pid"
@@ -653,64 +815,95 @@ bootstrap_kind_stack__kill_stale_tilt() {
         echo "       Wait for it to initialize, or stop the other watcher and retry." >&2
         return 1
     fi
+    # Only a watcher positively identified as this bring-up's is signalled:
+    # the one the pidfile names, or a `tilt up` started from this checkout
+    # (sessions from before the pidfile existed) that does not name another
+    # context. Any other `tilt up` on the box — another project's, or one on
+    # another port — is left running. Candidates are only processes whose
+    # command line is `tilt up` itself (see __tilt_pids), never `pkill -f`.
     local stale_pids
     stale_pids="$(bootstrap_kind_stack__tilt_pids)"
-    if [[ -n "$stale_pids" ]]; then
-        echo "[bootstrap] stale 'tilt up' detected — killing before starting fresh"
-        local state_dir pidfile tilt_pid
-        state_dir="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}"
-        pidfile="${SPACE_TILT_PIDFILE:-$state_dir/tilt-${KIND_CLUSTER}.pid}"
-        if [[ -s "$pidfile" ]]; then
-            read -r tilt_pid <"$pidfile"
-            if [[ "$tilt_pid" =~ ^[0-9]+$ ]] \
-                    && bootstrap_kind_stack__tilt_pid_is_expected "$tilt_pid"; then
-                kill "$tilt_pid" 2>/dev/null || true
-            fi
-            rm -f "$pidfile"
+    [[ -n "$stale_pids" ]] || return 0
+    local state_dir pidfile named="" here tilt_pid command ours=()
+    state_dir="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}"
+    pidfile="${SPACE_TILT_PIDFILE:-$state_dir/tilt-${KIND_CLUSTER}.pid}"
+    [[ -s "$pidfile" ]] && read -r named <"$pidfile"
+    here="$(cd "$REPO_ROOT" && pwd -P)" || here=""
+    for tilt_pid in $stale_pids; do
+        command="$(ps -p "$tilt_pid" -o command= 2>/dev/null)" || continue
+        if [[ "$tilt_pid" == "$named" ]]; then
+            ours+=("$tilt_pid")
+        elif [[ "$command" =~ --context[[:space:]=]([^[:space:]]+) \
+                && "${BASH_REMATCH[1]}" != "kind-${KIND_CLUSTER}" ]]; then
+            echo "[bootstrap] leaving 'tilt up' (pid $tilt_pid) running: it serves ${BASH_REMATCH[1]}"
+        elif [[ -n "$here" && "$(bootstrap_kind_stack__tilt_cwd "$tilt_pid" || true)" == "$here" ]]; then
+            ours+=("$tilt_pid")
+        else
+            echo "[bootstrap] leaving 'tilt up' (pid $tilt_pid) running: not started from this checkout"
         fi
-        # Sessions started before the pidfile existed: only processes whose
-        # command line is `tilt up` itself (see __tilt_pids), never `pkill -f`.
-        for tilt_pid in $stale_pids; do
-            kill "$tilt_pid" 2>/dev/null || true
+    done
+    rm -f "$pidfile"
+    (( ${#ours[@]} > 0 )) || return 0
+    echo "[bootstrap] stale 'tilt up' detected (pid ${ours[*]}) — stopping it before starting fresh"
+    kill "${ours[@]}" 2>/dev/null || true
+    local kill_deadline=$(( $(date +%s) + 15 )) alive
+    while [[ $(date +%s) -lt $kill_deadline ]]; do
+        alive=""
+        for tilt_pid in "${ours[@]}"; do
+            bootstrap_kind_stack__tilt_pid_is_expected "$tilt_pid" && alive=1
         done
-        local kill_deadline=$(( $(date +%s) + 15 ))
-        while [[ $(date +%s) -lt $kill_deadline ]]; do
-            if ! curl -sf -m 1 http://localhost:10350/ >/dev/null 2>&1 \
-                    && [[ -z "$(bootstrap_kind_stack__tilt_pids)" ]]; then
-                return 0
-            fi
-            sleep 1
-        done
-        if curl -sf -m 1 http://localhost:10350/ >/dev/null 2>&1; then
-            echo "ERROR: failed to free port 10350; kill manually and retry" >&2
-            return 1
+        if [[ -z "$alive" ]] && ! curl -sf -m 1 http://localhost:10350/ >/dev/null 2>&1; then
+            return 0
         fi
+        sleep 1
+    done
+    if curl -sf -m 1 http://localhost:10350/ >/dev/null 2>&1; then
+        echo "ERROR: failed to free port 10350; kill manually and retry" >&2
+        return 1
     fi
     return 0
 }
 
-# Stop stale `kubectl port-forward` supervisors (and their kubectl children)
-# that a previous bring-up of THIS kind context left behind and no pidfile
-# names. bootstrap.sh starts each supervisor as
-# `setsid bash port-forward.sh <ctx> <ns> <target> <mapping> space-kind-pf:<ctx>`
-# — the label is deliberately its LAST argument — and the loop's kubectl child
-# carries `--context <ctx> … port-forward`. Both are matched on the process's
-# own command line, anchored: the label at the end, `kubectl` as the command.
-# Never `pkill -f '<label>|--context <ctx>.*port-forward'`: that unanchored
+# Stop the `kubectl port-forward` supervisors (and their kubectl children)
+# that a previous bring-up of THIS kind context left behind. The retired
+# scripted bring-up left them running under `setsid` on :3000, :8333 and the
+# telemetry ports, where they keep Tilt's own forwards from binding. Called
+# just before a fresh Tilt starts, so no watcher of ours is running; a
+# supervisor whose parent is a `tilt up` is a live Tilt's serve_cmd (the
+# Tiltfile's observability forwards, perhaps another port's watcher) and is
+# left alone. A supervisor is recognised by its whole command line
+# (lib/port-forward-supervisors.sh), and only its own kubectl children go with
+# it. Never `pkill -f '<label>|--context <ctx>.*port-forward'`: that unanchored
 # alternation matched any process whose arguments merely mention a context and
 # "port-forward" — on 2026-09-22 an automation runner whose task text did was
-# SIGTERMed by the bring-up it had just started. A forward to another context
-# is never touched (the suites' port-owner guard exists for that footgun).
+# SIGTERMed by the bring-up it had just started — and the label alone still
+# matches a search whose last argument it is. A forward nobody's supervisor
+# owns, or one to another context, is never touched (the suites' port-owner
+# guard exists for that footgun). The scripted bring-up's pidfile, shared by
+# every cluster on the host, is removed once nothing it lists is a live
+# supervisor of any context, so teardown never meets a pid that has since been
+# reused.
 kind_stack_reap_stale_port_forwards() {
-    local kctx="kind-${KIND_CLUSTER}" pid command
-    for pid in $(pgrep -f "space-kind-pf:${kctx}|--context ${kctx}" 2>/dev/null || true); do
-        command="$(ps -o command= -p "$pid" 2>/dev/null)" || continue
-        if [[ "$command" =~ [[:space:]]space-kind-pf:${kctx}[[:space:]]*$ ]] \
-            || [[ "$command" =~ ^[[:space:]]*([^[:space:]]*/)?kubectl[[:space:]].*--context[[:space:]=]${kctx}([[:space:]]|$).*port-forward ]]; then
-            echo "[bootstrap] stopping stale kind port-forward (pid $pid): ${command:0:80}"
-            kill "$pid" 2>/dev/null || true
-        fi
+    local kctx="kind-${KIND_CLUSTER}" pid parent pidfile live="" reaped=() attempt
+    for pid in $(pgrep -f "space-kind-pf:${kctx}" 2>/dev/null || true); do
+        space_kind_pf_is_supervisor "$pid" "$kctx" || continue
+        parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        [[ -n "$parent" ]] && bootstrap_kind_stack__tilt_pid_is_expected "$parent" && continue
+        echo "[bootstrap] stopping stale kind port-forward supervisor (pid $pid): $(ps -o command= -p "$pid" 2>/dev/null | cut -c1-80)"
+        space_kind_pf_stop_supervisor "$pid" "$kctx"
+        reaped+=("$pid")
     done
+    # Let the stopped loops exit before the pidfile is judged.
+    for ((attempt = 0; attempt < 20 && ${#reaped[@]} > 0; attempt++)); do
+        kill -0 "${reaped[@]}" 2>/dev/null || break
+        sleep 0.25
+    done
+    pidfile="$(space_kind_pf_pidfile)"
+    [[ -s "$pidfile" ]] || return 0
+    while IFS= read -r pid; do
+        space_kind_pf_is_supervisor "$pid" && live=1
+    done <"$pidfile"
+    [[ -n "$live" ]] || rm -f "$pidfile"
 }
 
 # Postgres in the kind cluster. Every piece of control-plane state a client can
@@ -871,8 +1064,8 @@ kind_stack_assert_cluster_mounts() {
     # nothing to compare and no honest verdict to give. Skip loudly rather
     # than fail: before this check existed, SKIP_BOOTSTRAP=1 read $HOME
     # nowhere, and turning an unevaluable comparison into a hard error would
-    # break every kind suite on a box that never needed one.
-    # `bootstrap.sh`, which actually creates clusters, still requires them.
+    # break every kind suite on a box that never needed one. Creating a
+    # cluster, below, still requires them.
     if [[ -z "${SPACE_VENDOR_ROOT:-}" || -z "${SPACE_KIND_DATA_ROOT:-}" ]]; then
         echo "[bootstrap] host roots not derivable (no HOME and no explicit" \
             "SPACE_VENDOR_ROOT/SPACE_KIND_DATA_ROOT); skipping the live-cluster" \
@@ -1013,14 +1206,12 @@ kind_stack_prepare_cluster() {
 
 bootstrap_kind_stack__prepare_cluster() {
     # `kind create` reads static YAML, so the host paths it bind-mounts are
-    # resolved and stamped in here the same way
-    # `infra/space/kind/scripts/bootstrap.sh` does it — including staging the
-    # vendor tree, because `kind_prepare_host_mounts` refuses a missing one and
-    # this suite is documented as self-bootstrapping.
+    # resolved and stamped in here — including staging the vendor tree, because
+    # `kind_prepare_host_mounts` refuses a missing one and this bring-up is
+    # documented as self-bootstrapping.
     # shellcheck source=../../../infra/space/kind/scripts/lib/kind-host-paths.sh
     source "$REPO_ROOT/infra/space/kind/scripts/lib/kind-host-paths.sh"
-    # Process-private, not the shared $SPACE_KIND_CONFIG, and for the same
-    # reason `bootstrap.sh` renders to `$SPACE_KIND_CONFIG.$$`: the vendor
+    # Process-private, not the shared $SPACE_KIND_CONFIG: the vendor
     # staging below can take a minute, and `kind create` reads this file
     # afterwards. Rendering into the shared per-user path leaves a window in
     # which another bring-up on the same box replaces it, and this cluster is
@@ -1028,10 +1219,9 @@ bootstrap_kind_stack__prepare_cluster() {
     # every mount it declares exists. Two bootstraps racing on one devbox is
     # the normal contended case, not a hypothetical.
     #
-    # Nothing publishes from here: `bootstrap.sh` and
-    # `infra/space/kind/scripts/render-cluster-config.sh` own the documented
-    # path, and a test library adding itself as a second writer to it is what
-    # created the window in the first place.
+    # Nothing publishes from here: `infra/space/kind/scripts/render-cluster-config.sh`
+    # owns the documented path, for the manual render-and-create flow, and a
+    # second writer to it is what created the window in the first place.
     # In $TMPDIR and reaped explicitly below, not by an EXIT trap: the smoke
     # scripts that source this library each install their own `trap cleanup
     # EXIT`, which deletes sandboxes and clusters, and a trap set here would
@@ -1044,14 +1234,7 @@ bootstrap_kind_stack__prepare_cluster() {
     kind_stack_config="$(mktemp "${TMPDIR:-/tmp}/kind-cluster-bringup.XXXXXX")"
     kind_render_cluster_config \
         "$REPO_ROOT/infra/space/kind/kind-cluster.yaml.tmpl" "$kind_stack_config"
-    # Staged unless the tree lacks this Firecracker release or the pinned
-    # guest kernel, as bootstrap.sh decides.
-    if ! SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
-        bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh" --check; then
-        echo "[bootstrap] staging Firecracker vendor tree → $SPACE_VENDOR_ROOT"
-        SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
-            bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh"
-    fi
+    kind_stack_stage_vendor
 
     if ! kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
         # Creates the containerd-storage dirs (a clean box has none until the
@@ -1090,18 +1273,48 @@ bootstrap_kind_stack__prepare_cluster() {
         echo "[bootstrap] kind cluster '$KIND_CLUSTER' already exists"
         # Mount drift was already checked by kind_stack_assert_cluster_mounts,
         # which runs in every mode rather than only this one.
-        # Before Tilt (re)starts and applies the versitygw charts: a cluster
-        # still on SeaweedFS has to be recreated, not half-switched.
-        bash "$REPO_ROOT/infra/space/kind/scripts/check-object-store-transition.sh" \
-            "$KIND_CLUSTER" || exit 1
-        # SPACE nodes get their node layer from their image, fixed at create.
-        bash "$REPO_ROOT/infra/space/kind/scripts/check-kind-node-image.sh" \
-            "$KIND_CLUSTER" || exit 1
-        # A cluster still running one node-stack pod per node has to be
-        # recreated before the per-service node DaemonSets land beside it.
-        bash "$REPO_ROOT/infra/space/kind/scripts/check-node-layout.sh" \
-            "$KIND_CLUSTER" || exit 1
+        kind_stack_assert_existing_cluster
     fi
+}
+
+# Stage the Firecracker vendor tree the cluster bind-mounts, unless it already
+# holds this Firecracker release and the pinned guest kernel
+# (`install-fc-vendor.sh --check`). Before `kind create`, which refuses a
+# missing tree, and before the existing-cluster refusals below, which compare
+# each node's copy with the tree this run stages.
+kind_stack_stage_vendor() {
+    # shellcheck source=../../../infra/space/kind/scripts/lib/kind-host-paths.sh
+    source "$REPO_ROOT/infra/space/kind/scripts/lib/kind-host-paths.sh"
+    if ! SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
+        bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh" --check; then
+        echo "[bootstrap] staging Firecracker vendor tree → $SPACE_VENDOR_ROOT"
+        SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
+            bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh"
+    fi
+}
+
+# The refusals an existing cluster can earn before Tilt (re)starts on it, once
+# the vendor tree is staged (`kind_stack_stage_vendor`). Exits on a refusal;
+# nothing to check when there is no cluster.
+kind_stack_assert_existing_cluster() {
+    kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
+    # Before Tilt (re)starts and applies the versitygw charts: a cluster
+    # still on SeaweedFS has to be recreated, not half-switched.
+    bash "$REPO_ROOT/infra/space/kind/scripts/check-object-store-transition.sh" \
+        "$KIND_CLUSTER" || exit 1
+    # SPACE nodes get their node layer from their image, fixed at create.
+    bash "$REPO_ROOT/infra/space/kind/scripts/check-kind-node-image.sh" \
+        "$KIND_CLUSTER" || exit 1
+    # Each of those nodes copied the host vendor tree on its first boot and
+    # keeps that copy, so a host tree changed since (kind_stack_stage_vendor
+    # replaces a kernel whose pin changed) would never reach it. The mount
+    # check makes the same comparison, but before this run stages the tree.
+    bash "$REPO_ROOT/infra/space/kind/scripts/check-node-vendor.sh" \
+        "$KIND_CLUSTER" || exit 1
+    # A cluster still running one node-stack pod per node has to be
+    # recreated before the per-service node DaemonSets land beside it.
+    bash "$REPO_ROOT/infra/space/kind/scripts/check-node-layout.sh" \
+        "$KIND_CLUSTER" || exit 1
 }
 
 # Prints the storage credentials mode the cluster runs when it differs from
@@ -1457,15 +1670,21 @@ bootstrap_kind_stack__bring_up() {
             fi
         fi
     else
+        # The watcher just verified is the one serving :10350; stop that one,
+        # not whichever `tilt up` the pidfile or process age would pick.
+        local served_pid=""
+        if [[ "$tilt_state" == stale || "$tilt_state" == elsewhere || "$tilt_state" == mode ]]; then
+            served_pid="$(bootstrap_kind_stack__served_tilt_pid)"
+        fi
         if [[ "$tilt_state" == "stale" ]]; then
             echo "[bootstrap] tilt is running but bound to a cluster that no longer exists; restarting it"
-            bootstrap_kind_stack__stop_stale_tilt || exit 1
+            bootstrap_kind_stack__stop_stale_tilt "$served_pid" || exit 1
         elif [[ "$tilt_state" == "elsewhere" ]]; then
             echo "[bootstrap] restarting tilt from this checkout so its code is what gets built and deployed"
-            bootstrap_kind_stack__stop_stale_tilt || exit 1
+            bootstrap_kind_stack__stop_stale_tilt "$served_pid" || exit 1
         elif [[ "$tilt_state" == "mode" ]]; then
             echo "[bootstrap] restarting tilt to switch to storage credentials ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange} and the ${SPACE_KIND_RUST_BUILD:-test-hooks} Rust build"
-            bootstrap_kind_stack__stop_stale_tilt || exit 1
+            bootstrap_kind_stack__stop_stale_tilt "$served_pid" || exit 1
         elif [[ "$tilt_state" == "orphaned" ]]; then
             bootstrap_kind_stack__stop_stale_tilt "$orphan_pid" || exit 1
         else
@@ -1476,6 +1695,7 @@ bootstrap_kind_stack__bring_up() {
             fi
             bootstrap_kind_stack__kill_stale_tilt || exit 1
         fi
+        kind_stack_reap_stale_port_forwards
         bootstrap_kind_stack__start_tilt || exit 1
         if [[ "${KIND_STACK_DETACH:-0}" == "1" ]]; then
             echo "[bootstrap] tilt is up and building; KIND_STACK_DETACH=1, returning without waiting"
@@ -1508,7 +1728,7 @@ bootstrap_kind_stack__bring_up() {
     # existence loop's budget and the Job had not failed at all -- it had not
     # been created yet, and completed fine 23s after bring-up gave up on it.
     local seed_exists_timeout="${SEED_PUBLISH_EXISTS_TIMEOUT:-$BOOTSTRAP_TIMEOUT}"
-    local seed_complete_timeout="${SEED_PUBLISH_COMPLETE_TIMEOUT:-300}"
+    local seed_complete_timeout="${SEED_PUBLISH_COMPLETE_TIMEOUT:-$BOOTSTRAP_TIMEOUT}"
     echo "[bootstrap] waiting up to ${seed_exists_timeout}s for the space-seed-publish Job to be applied"
     local seed_deadline=$(( $(date +%s) + seed_exists_timeout ))
     local seed_job_applied=0
@@ -1519,6 +1739,7 @@ bootstrap_kind_stack__bring_up() {
             break
         fi
         bootstrap_kind_stack__die_on_failed_builds
+        bootstrap_kind_stack__die_on_failed_migration
         sleep 3
     done
     # Never fall through: an expired existence loop is its own diagnosis, and
@@ -1530,13 +1751,7 @@ bootstrap_kind_stack__bring_up() {
         exit 1
     fi
     echo "[bootstrap] waiting up to ${seed_complete_timeout}s for the space-seed-publish Job to complete"
-    if ! kubectl --context "kind-${KIND_CLUSTER}" wait --for=condition=complete \
-            job/space-seed-publish -n space --timeout="${seed_complete_timeout}s" >/dev/null 2>&1; then
-        echo "ERROR: space-seed-publish Job was applied but did not complete within ${seed_complete_timeout}s" >&2
-        kubectl --context "kind-${KIND_CLUSTER}" get jobs -n space >&2 || true
-        kubectl --context "kind-${KIND_CLUSTER}" logs job/space-seed-publish -n space --tail=50 >&2 || true
-        exit 1
-    fi
+    bootstrap_kind_stack__wait_for_job space-seed-publish "$seed_complete_timeout"
 
     echo "[bootstrap] waiting for the worker and builder node-service DaemonSets to roll"
     # shellcheck source=../../../infra/space/kind/lib/node-services.sh
@@ -1544,8 +1759,8 @@ bootstrap_kind_stack__bring_up() {
     local node_daemonset
     while read -r node_daemonset; do
         if ! kubectl --context "kind-${KIND_CLUSTER}" rollout status \
-                "daemonset/$node_daemonset" -n space --timeout=600s >/dev/null; then
-            echo "ERROR: $node_daemonset did not become Ready within 600s" >&2
+                "daemonset/$node_daemonset" -n space --timeout="${BOOTSTRAP_TIMEOUT}s" >/dev/null; then
+            echo "ERROR: $node_daemonset did not become Ready within ${BOOTSTRAP_TIMEOUT}s" >&2
             kubectl --context "kind-${KIND_CLUSTER}" get \
                 "daemonset/$node_daemonset" -n space -o wide >&2 || true
             kubectl --context "kind-${KIND_CLUSTER}" get pods -n space -o wide \
@@ -1557,10 +1772,7 @@ bootstrap_kind_stack__bring_up() {
     # Ready pods are not a registered node: each node's node-ctl publishes it
     # through ClusterApi, and only then does the API schedule onto it.
     echo "[bootstrap] waiting for every SPACE node to be published and ready"
-    if ! SPACE_KIND_CLUSTER="$KIND_CLUSTER" SPACE_KIND_API_URL="$API_URL" \
-            bash "$REPO_ROOT/infra/space/kind/scripts/wait-node-publication.sh" 600; then
-        exit 1
-    fi
+    bootstrap_kind_stack__wait_node_publication
 
     # Cluster-controller rollout: any chart-value or image change Tilt
     # picked up needs to roll before the smoke tests touch reconciler-
@@ -1568,13 +1780,25 @@ bootstrap_kind_stack__bring_up() {
     # genuine "old pod gone, new pod available".
     echo "[bootstrap] waiting for cluster-controller deployment to roll"
     if ! kubectl --context "kind-${KIND_CLUSTER}" rollout status \
-            deploy/space-cluster-controller -n space --timeout=300s >/dev/null; then
-        echo "ERROR: space-cluster-controller did not become Available within 300s" >&2
+            deploy/space-cluster-controller -n space --timeout="${BOOTSTRAP_TIMEOUT}s" >/dev/null; then
+        echo "ERROR: space-cluster-controller did not become Available within ${BOOTSTRAP_TIMEOUT}s" >&2
         kubectl --context "kind-${KIND_CLUSTER}" get deploy/space-cluster-controller -n space >&2 || true
         exit 1
     fi
 
     bootstrap_kind_stack__wait_for_tilt_quiet
+
+    # The waits above can be satisfied by the previous revision: a warm rerun
+    # that changes the seed finds the old space-seed-publish Job complete, and
+    # Tilt applies its replacement only later. Once Tilt has settled, the Jobs
+    # in the cluster are the ones this revision applied, so check them again,
+    # and the node publication that depends on them.
+    echo "[bootstrap] verifying the Jobs Tilt settled on and node publication"
+    local settled_job
+    for settled_job in space-object-store-bucket-init space-seed-publish; do
+        bootstrap_kind_stack__wait_for_job "$settled_job" "${SEED_PUBLISH_COMPLETE_TIMEOUT:-$BOOTSTRAP_TIMEOUT}"
+    done
+    bootstrap_kind_stack__wait_node_publication
 
     deployed_mode="$(bootstrap_kind_stack__storage_mode_mismatch)" || exit 1
     if [[ -n "$deployed_mode" ]]; then

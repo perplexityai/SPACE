@@ -68,7 +68,7 @@ if (( ${#drifted[@]} > 0 )); then
     printf '       since (install-fc-vendor.sh with another SPACE_FC_KERNEL_VERSION, for\n'
     printf '       example) never reaches it. Recreate the cluster to copy the current tree:\n'
     printf '           %sbash infra/space/kind/scripts/teardown.sh\n' "$env_prefix"
-    printf '           %sbash infra/space/kind/scripts/bootstrap.sh\n' "$env_prefix"
+    printf '           %sbash infra/space/kind/scripts/up.sh\n' "$env_prefix"
     printf '       or restore the host tree the cluster was created from. Nothing was\n'
     printf '       changed. See "The node layer" in infra/space/kind/README.md.\n'
   } >&2

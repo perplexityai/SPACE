@@ -6,7 +6,7 @@
 //!
 //! [`WarmPoolStore`]: pplx_space_cluster_pool::WarmPoolStore
 
-use pplx_space_common_core::types::{NodeId, OrgId, SubstrateKind};
+use pplx_space_common_core::types::{NodeId, NodeRole, OrgId, SubstrateKind};
 
 use std::net::IpAddr;
 
@@ -65,7 +65,7 @@ struct LatestReleaseRow {
 /// `NodeScoped` is every TokenReview identity and the fallback static token.
 /// It resolves generic templates that are still present, plus org-specific
 /// templates the control plane has tied to one of the caller's registered
-/// nodes (`node_ids`, matched by remote address):
+/// nodes (`node_ids`, matched by reviewed Kubernetes identity or remote address):
 ///
 /// - a sandbox of that template placed on the node, active or target;
 /// - for a registered worker, a template an enabled warm pool warms: warm
@@ -138,24 +138,28 @@ impl TemplateReleasesStore {
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 
+    /// Match the reviewed node name and UID, independent of the caller's pod IP.
+    /// Missing or stale inventory yields an empty scope, never an address fallback.
+    pub(super) async fn node_scope_for_identity(
+        &self,
+        node: &pplx_space_common_svc::auth::AuthenticatedKubernetesNode,
+    ) -> Result<TemplateReadScope, sqlx::Error> {
+        let node_ids = self
+            .nodes_for_identity(node, &[NodeRole::Worker, NodeRole::Builder])
+            .await?
+            .into_iter()
+            .filter_map(|(id, uid_matches)| (uid_matches == Some(true)).then_some(id))
+            .collect();
+        Ok(TemplateReadScope::NodeScoped { node_ids })
+    }
+
     /// A registration without an inventory UID is not authority: wait for
     /// node sync to supply it.
     pub(super) async fn publisher_node_for_identity(
         &self,
         node: &pplx_space_common_svc::auth::build::AuthenticatedBuildNode,
     ) -> Result<PublicationNode, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (NodeId, Option<bool>)>(sql!(
-            "SELECT n.id, k.k8s_node_uid = $2
-             FROM nodes n JOIN node_k8s k ON k.node_id = n.id
-             WHERE k.k8s_node_name = $1
-               AND n.role = 'builder' AND n.managed_by = $3
-               AND COALESCE(n.state, 'registered') != 'deleted'"
-        ))
-        .bind(node.name.as_str())
-        .bind(node.uid.as_str())
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self.nodes_for_identity(node, &[NodeRole::Builder]).await?;
         if let Some((id, _)) = rows.iter().find(|(_, matches)| *matches == Some(true)) {
             Ok(PublicationNode::Registered(*id))
         } else if rows.iter().any(|(_, matches)| matches.is_none()) {
@@ -163,6 +167,26 @@ impl TemplateReleasesStore {
         } else {
             Ok(PublicationNode::Denied)
         }
+    }
+
+    async fn nodes_for_identity(
+        &self,
+        node: &pplx_space_common_svc::auth::AuthenticatedKubernetesNode,
+        roles: &[NodeRole],
+    ) -> Result<Vec<(NodeId, Option<bool>)>, sqlx::Error> {
+        sqlx::query_as(sql!(
+            "SELECT n.id, k.k8s_node_uid = $2
+             FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+             WHERE k.k8s_node_name = $1
+               AND n.managed_by = $3 AND n.role = ANY($4::TEXT[])
+               AND COALESCE(n.state, 'registered') != 'deleted'"
+        ))
+        .bind(node.name().as_str())
+        .bind(node.uid().as_str())
+        .bind(SubstrateKind::Kubernetes)
+        .bind(roles.iter().map(|role| role.as_str()).collect::<Vec<_>>())
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// Unscoped lookups with no caller organization or generic-only requirement

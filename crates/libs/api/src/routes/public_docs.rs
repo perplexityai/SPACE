@@ -3,7 +3,9 @@ use axum::{
     http::{HeaderValue, header},
     response::IntoResponse,
 };
-use pplx_space_public_api::routes::{M1_STATUS_EXTENSION, MAX_UTF8_BYTES_EXTENSION};
+use pplx_space_public_api::routes::{
+    M1_STATUS_EXTENSION, MAX_UTF8_BYTES_EXTENSION, NativeOperationStatus,
+};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
@@ -28,6 +30,10 @@ mod schema_contract;
 mod success_examples;
 
 pub(crate) async fn openapi_json() -> Json<Value> {
+    Json(default_openapi_value())
+}
+
+pub(crate) async fn full_openapi_json() -> Json<Value> {
     Json(public_openapi_value())
 }
 
@@ -41,7 +47,7 @@ pub(crate) async fn llms_txt() -> impl IntoResponse {
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
         )],
-        "SPACE API\n\n- SPACE OpenAPI: /openapi.json or /api/openapi.json\n- M1 SDK OpenAPI: /openapi-m1.json or /api/openapi-m1.json\n- Admin OpenAPI: /admin/api/openapi.json on shared hosts\n- SPACE API base path: /v1 on api.space hosts, /api/v1 on shared hosts\n- Admin API base path: /admin/api/v1 on shared hosts\n- ECW (E2B-compatible) API base path: / on e2b.api.space hosts, /e2b/api on shared hosts\n",
+        "SPACE API\n\n- SPACE OpenAPI (M1 SDK operations plus the incubating operations that are not hidden): /openapi.json or /api/openapi.json\n- M1 SDK OpenAPI: /openapi-m1.json or /api/openapi-m1.json\n- Full SPACE OpenAPI, hidden operations included (requires API credentials): /openapi-full.json or /api/openapi-full.json\n- Admin OpenAPI: /admin/api/openapi.json on shared hosts\n- SPACE API base path: /v1 on api.space hosts, /api/v1 on shared hosts\n- Admin API base path: /admin/api/v1 on shared hosts\n- ECW (E2B-compatible) API base path: / on e2b.api.space hosts, /e2b/api on shared hosts\n",
     )
 }
 
@@ -79,7 +85,7 @@ fn public_openapi_value() -> Value {
         "info": {
             "title": "SPACE API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "### Errors and retries\n\n- Keep `x-request-id` for troubleshooting. Management errors use `PublicErrorEnvelope`, with a stable `code` and a `retryable` flag; SSE admission errors use the nested `DataPlaneHttpErrorEnvelope`.\n- Follow the returned `retryable` flag, subject to the duplicate-work precautions below. If no valid envelope is available, HTTP 429 and 5xx may be transient, but do not blindly retry mutations with ambiguous outcomes.\n- Wait for `Retry-After` when present (whole seconds). Otherwise, start with a one-second delay and double it with jitter. Stop after five attempts.\n\n### Avoid duplicate work\n\nOnly endpoints declaring a required `Idempotency-Key` deduplicate mutations. Retry those with the same method, path, body, and key. Within 24 hours, this returns the original result. A different body returns `idempotency_conflict`; a new or expired key can start another operation. Process kill and signal do not use this mechanism: inspect ambiguous outcomes before repeating them, because a repeat can apply the action again.\n\n### Error codes\n\n- Management errors that are not retryable: `invalid_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` and `idempotency_conflict` (409), `failed_precondition` (412).\n- Usually retryable management errors: `rate_limited` (429), `capacity_unavailable` and `service_unavailable` (503), `internal` (500). Always check the returned `retryable` flag. Data-plane mappings differ; see each response's envelope.\n- Unsupported methods (405), oversized bodies (413), wrong content types (415), and invalid request schemas (422) use `invalid_request` with `retryable: false`. Other unhandled management 5xx errors use `internal`.\n- A file route's `not_found` lists `{\"key\": \"resource\", \"value\": \"path\"}` in `details` when the sandbox is yours and the path does not exist. Without that detail, treat it as the sandbox not being found: a missing sandbox and one you cannot access answer alike."
+            "description": "### Errors and retries\n\n- Keep `x-request-id` for troubleshooting. Management errors use `PublicErrorEnvelope`, with a stable `code` and a `retryable` flag; SSE admission errors use the nested `DataPlaneHttpErrorEnvelope`.\n- Follow the returned `retryable` flag, subject to the duplicate-work precautions below. If no valid envelope is available, HTTP 429 and 5xx may be transient, but do not blindly retry mutations with ambiguous outcomes.\n- Wait for `Retry-After` when present (whole seconds). Otherwise, start with a one-second delay and double it with jitter. Stop after five attempts.\n\n### Avoid duplicate work\n\nOnly endpoints declaring a required `Idempotency-Key` deduplicate mutations. Retry those with the same method, path, body, and key. Within 24 hours, this returns the original result, except that replaying a session or command create whose session was revoked returns `conflict` with `{\"key\": \"reason\", \"value\": \"session_ended\"}` in `details` and no token. A different body returns `idempotency_conflict`; a new or expired key can start another operation. Process kill and signal do not use this mechanism: inspect ambiguous outcomes before repeating them, because a repeat can apply the action again.\n\n### Error codes\n\n- Management errors that are not retryable: `invalid_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` and `idempotency_conflict` (409), `failed_precondition` (412).\n- Usually retryable management errors: `rate_limited` (429), `capacity_unavailable` and `service_unavailable` (503), `internal` (500). Always check the returned `retryable` flag. Data-plane mappings differ; see each response's envelope.\n- Unsupported methods (405), oversized bodies (413), wrong content types (415), and invalid request schemas (422) use `invalid_request` with `retryable: false`. Other unhandled management 5xx errors use `internal`.\n- A file route's `not_found` lists `{\"key\": \"resource\", \"value\": \"path\"}` in `details` when the sandbox is yours and the path does not exist. Without that detail, treat it as the sandbox not being found: a missing sandbox and one you cannot access answer alike."
         },
         "servers": [
             { "url": "/v1" },
@@ -133,7 +139,7 @@ fn public_openapi_value() -> Value {
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "201": { "description": "Terminal session with attach token" },
-                        "409": { "description": "Idempotency conflict" }
+                        "409": { "description": "Idempotency conflict, or a replayed create whose session was revoked" }
                     }
                 }
             },
@@ -143,7 +149,7 @@ fn public_openapi_value() -> Value {
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "201": { "description": "Process session with attach token" },
-                        "409": { "description": "Idempotency conflict" }
+                        "409": { "description": "Idempotency conflict, or a replayed create whose session was revoked" }
                     }
                 }
             },
@@ -153,7 +159,7 @@ fn public_openapi_value() -> Value {
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "201": { "description": "File watch session with attach token" },
-                        "409": { "description": "Idempotency conflict" }
+                        "409": { "description": "Idempotency conflict, or a replayed create whose session was revoked" }
                     }
                 }
             },
@@ -163,7 +169,7 @@ fn public_openapi_value() -> Value {
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "201": { "description": "Port session with scoped attach token" },
-                        "409": { "description": "Idempotency conflict" }
+                        "409": { "description": "Idempotency conflict, or a replayed create whose session was revoked" }
                     }
                 }
             },
@@ -173,7 +179,7 @@ fn public_openapi_value() -> Value {
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "201": { "description": "Protocol proxy session with scoped attach token" },
-                        "409": { "description": "Idempotency conflict" }
+                        "409": { "description": "Idempotency conflict, or a replayed create whose session was revoked" }
                     }
                 }
             },
@@ -419,12 +425,23 @@ fn apply_native_operation_manifest(spec: &mut Value) {
 }
 
 pub(crate) fn m1_sdk_openapi_value() -> Value {
+    operations_openapi_value(|status| status.is_m1_supported())
+}
+
+/// The document `/openapi.json` serves: every operation except those hidden
+/// by default, which `/openapi-full.json` still documents.
+pub(crate) fn default_openapi_value() -> Value {
+    operations_openapi_value(|status| !status.is_hidden_by_default())
+}
+
+/// The native contract narrowed to the operations whose status `keep` accepts.
+fn operations_openapi_value(keep: impl Fn(NativeOperationStatus) -> bool) -> Value {
     use pplx_space_public_api::routes::NATIVE_V1_OPERATIONS;
 
     let mut spec = public_openapi_value();
     let supported = NATIVE_V1_OPERATIONS
         .iter()
-        .filter(|operation| operation.status().is_m1_supported())
+        .filter(|operation| keep(operation.status()))
         .map(|operation| (operation.relative_path(), operation.method().openapi_name()))
         .collect::<BTreeSet<_>>();
     spec.get_mut("paths")

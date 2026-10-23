@@ -283,12 +283,7 @@ pub struct BuildAuthenticatedCaller {
     system: SystemTemplateAuthority,
 }
 
-/// Node identity from a freshly reviewed pod-bound Kubernetes token.
-#[derive(Clone, Debug)]
-pub struct AuthenticatedBuildNode {
-    pub name: pplx_space_common_core::types::K8sNodeName,
-    pub uid: pplx_space_common_core::types::K8sNodeUid,
-}
+pub use super::AuthenticatedKubernetesNode as AuthenticatedBuildNode;
 
 pub fn publication_node<T>(request: &Request<T>) -> Option<&AuthenticatedBuildNode> {
     request

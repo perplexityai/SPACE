@@ -26,6 +26,8 @@ use crate::proto::{
 
 use super::NodeManagerService;
 
+mod selection;
+
 use pplx_space_node_runtime_core::runtime_inventory::{
     ExecutionSelectionMode, ExecutionSourceIntegrity, ResolvedExecutionEnvironment,
     RuntimeInstallationFiles,
@@ -37,13 +39,7 @@ impl NodeManagerService {
         reference: Option<pplx_space_common_core::types::EnvironmentReference>,
         mode: ExecutionSelectionMode,
     ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
-        select_definition(
-            initial_environment()?,
-            compiled_environments,
-            self.production,
-            reference,
-            mode,
-        )
+        select_definition(&self.execution_policy, reference, mode)
     }
 
     async fn require_verified_environment_layout(&self) -> Result<(), Status> {
@@ -69,8 +65,19 @@ impl NodeManagerService {
             super::ALLOW_NODE_STATUS,
         )?;
         self.require_verified_environment_layout().await?;
+        let request = request.into_inner();
+        if let Some(compatible) = request.compatible {
+            if request.reference.is_some() {
+                return Err(Status::invalid_argument(
+                    "exact and compatible environment selection are mutually exclusive",
+                ));
+            }
+            return self
+                .resolve_compatible_environment(compatible)
+                .await
+                .map(Response::new);
+        }
         let reference = request
-            .into_inner()
             .reference
             .map(|reference| reference.parse())
             .transpose()
@@ -92,8 +99,12 @@ impl NodeManagerService {
         let execution = definition
             .bind_execution(resolved.execution)
             .map_err(|error| Status::failed_precondition(describe(&error)))?;
+        self.execution_policy
+            .check_execution(&execution, ExecutionSelectionMode::NewColdBoot)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         Ok(Response::new(
             crate::proto::ResolveExecutionEnvironmentResponse {
+                accepted_selection: 0,
                 definition: Some((&definition).into()),
                 execution: Some((&execution).into()),
             },
@@ -155,47 +166,37 @@ impl NodeManagerService {
                 .bind_execution(resolved.execution)
                 .map_err(|error| Status::failed_precondition(describe(&error)))?;
         }
+        self.execution_policy
+            .check_execution(&resolved.execution, mode)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         Ok(resolved)
     }
 }
 
-fn select_definition<'a>(
-    initial: &InitialEnvironment,
-    environments: impl FnOnce() -> Result<
-        &'a [pplx_space_node_runtime_core::catalog::CompiledEnvironment],
-        Status,
-    >,
-    production: bool,
+fn select_definition(
+    policy: &pplx_space_node_runtime_core::selection::ExecutionPolicy,
     reference: Option<pplx_space_common_core::types::EnvironmentReference>,
     mode: ExecutionSelectionMode,
 ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
-    let initial = initial
-        .definition()
-        .map_err(|error| Status::failed_precondition(describe(&error)))?;
-    if reference.is_none_or(|reference| reference == initial.reference()) {
-        return Ok(initial);
-    }
-    if production {
+    let reference = reference.or(policy.default_reference()).ok_or_else(|| {
+        Status::failed_precondition("host has no qualified initial execution environment")
+    })?;
+    if !policy.allows(reference) {
         return Err(Status::failed_precondition(
-            "production execution is restricted to the initial environment",
+            "execution environment is not allowed on this node",
         ));
     }
-    for environment in environments()? {
-        let definition = environment.definition();
-        if reference == Some(definition.reference()) {
-            if mode == ExecutionSelectionMode::PersistedStateRestore
-                && !environment.supports_memory_state()
-            {
-                return Err(Status::failed_precondition(
-                    "execution environment does not support memory-state restore",
-                ));
-            }
-            return Ok(definition.clone());
-        }
+    let entry = policy
+        .catalog()
+        .iter()
+        .find(|entry| entry.definition().reference() == reference)
+        .ok_or_else(|| Status::failed_precondition("unknown compiled execution environment"))?;
+    if mode == ExecutionSelectionMode::PersistedStateRestore && !entry.supports_memory_state() {
+        return Err(Status::failed_precondition(
+            "execution environment does not support memory-state restore",
+        ));
     }
-    Err(Status::failed_precondition(
-        "unknown compiled execution environment",
-    ))
+    Ok(entry.definition().clone())
 }
 
 const ALLOW_ROOT_OR_RTMGR: &[UdsPeerPrincipal] = &[
@@ -224,22 +225,27 @@ impl Artifact {
         }
     }
 
-    fn belongs_to_environment(&self) -> Result<bool, Status> {
-        Ok(compiled_environments()?
-            .iter()
-            .any(|environment| match self {
-                Self::Release(release, digest) => {
-                    release == &environment.release().release
-                        && *digest == environment.release().digest()
-                }
-                Self::Kernel(_, digest) => *digest == environment.kernel().sha256,
-            }))
+    fn belongs_to_environment(
+        &self,
+        environment: &pplx_space_node_runtime_core::catalog::CompiledEnvironment,
+    ) -> bool {
+        match self {
+            Self::Release(release, digest) => {
+                release == &environment.release().release
+                    && *digest == environment.release().digest()
+            }
+            Self::Kernel(_, digest) => *digest == environment.kernel().sha256,
+        }
     }
 
     fn check_removal(&self, initial: &InitialEnvironment) -> Result<(), Status> {
         // Compiled bindings remain protected across restarts and deployment changes.
         // Releasing them requires a future reference-aware retirement mechanism.
-        if self.belongs_to_initial(initial) || self.belongs_to_environment()? {
+        if self.belongs_to_initial(initial)
+            || compiled_environments()?
+                .iter()
+                .any(|environment| self.belongs_to_environment(environment))
+        {
             Err(Status::failed_precondition(
                 "artifact belongs to compiled E0 or another approved execution environment",
             ))
@@ -291,7 +297,7 @@ impl Artifact {
 
 pub(super) fn execution_inventory(
     paths: &crate::config::RuntimePaths,
-    production: bool,
+    policy: &pplx_space_node_runtime_core::selection::ExecutionPolicy,
 ) -> Result<super::RuntimeInventory, Status> {
     if execution_roots_overlap(paths)
         .map_err(|error| Status::failed_precondition(describe(&error)))?
@@ -326,39 +332,16 @@ pub(super) fn execution_inventory(
         &paths.kernels,
     )
     .map_err(super::RuntimeInventoryError::into_status)?;
-    if !production {
-        match non_default_environments() {
-            Ok(environments) => {
-                for environment in environments {
-                    if let Err(error) =
-                        inventory.include_environment(&store, environment, &paths.kernels)
-                    {
-                        tracing::warn!(%error, "environment inventory unavailable; retaining other bindings");
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "additional environment catalog unavailable; retaining initial execution")
-            }
+    for environment in policy
+        .catalog()
+        .iter()
+        .filter(|entry| !entry.is_initial() && policy.allows(entry.definition().reference()))
+    {
+        if let Err(error) = inventory.include_environment(&store, environment, &paths.kernels) {
+            tracing::warn!(%error, "environment inventory unavailable; retaining other bindings");
         }
     }
     Ok(inventory)
-}
-
-pub(super) fn non_default_environments()
--> Result<Vec<&'static pplx_space_node_runtime_core::catalog::CompiledEnvironment>, Status> {
-    let environments = compiled_environments()?;
-    if environments.is_empty() {
-        return Ok(Vec::new());
-    }
-    let initial = initial_environment()?
-        .definition()
-        .map_err(|error| Status::failed_precondition(describe(&error)))?
-        .reference();
-    Ok(environments
-        .iter()
-        .filter(|entry| entry.definition().reference() != initial)
-        .collect())
 }
 
 pub(super) fn compiled_environments()
@@ -612,9 +595,12 @@ impl NodeManagerService {
         publish: impl FnOnce() -> Result<Publication, Status> + Send + 'static,
     ) -> Result<Publication, Status> {
         let initial = initial_environment()?;
-        let production = self.production;
+        let policy = self.execution_policy.clone();
         let affects_execution = artifact.belongs_to_initial(initial)
-            || (!production && artifact.belongs_to_environment()?);
+            || policy.catalog().iter().any(|environment| {
+                policy.allows(environment.definition().reference())
+                    && artifact.belongs_to_environment(environment)
+            });
         let slot = self.artifact_slot()?;
         // Serialize selected publication with discovery, while readers keep the
         // previous immutable snapshot. Unselected artifacts skip this refresh lock, but
@@ -640,7 +626,7 @@ impl NodeManagerService {
             if affects_execution && !unchanged {
                 // Build first, then swap. E0 verification failures withdraw only
                 // that binding; a scan failure prevents advertising stale state.
-                match execution_inventory(&paths, production) {
+                match execution_inventory(&paths, &policy) {
                     Ok(inventory) => snapshot.store(Some(std::sync::Arc::new(inventory))),
                     Err(error) => {
                         snapshot.store(None);

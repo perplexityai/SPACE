@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Activate the Kind-only root@local login after API migrations complete.
-# Called by both scripted bootstrap and Tilt; the password is never rendered
+# Run by Tilt's provision-local-console resource; the password is never rendered
 # into a Kubernetes resource, and --if-locked preserves an existing login.
 set -euo pipefail
 set +x

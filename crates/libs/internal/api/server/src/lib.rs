@@ -25,6 +25,7 @@ mod route_identity;
 mod run;
 mod sandbox_service_ports;
 mod trusted_storage;
+mod visibility_observations;
 
 pub use run::run;
 pub use run::{
@@ -53,9 +54,10 @@ use pplx_space_common_core::types::{
     SnapshotKind, SnapshotName, SnapshotState, SubstrateKind, TemplateName,
 };
 use pplx_space_common_svc::types::{
-    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
-    FACET_TEMPLATE_BASE_SNAPSHOT_POLICY, FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
-    NODE_RECONCILE_CLAIM_STALE_SECS, NetworkPolicyTarget, ReconcileFacet,
+    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
+    FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NODE_RECONCILE_CLAIM_STALE_SECS,
+    NetworkPolicyTarget, ReconcileFacet,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -75,7 +77,8 @@ use crate::proto::{
     GetArtifactBackupLocationResponse, GetDataPlaneOrgRevocationEpochRequest,
     GetDataPlaneOrgRevocationEpochResponse, GetDataPlaneSessionRevocationStateRequest,
     GetDataPlaneSessionRevocationStateResponse, GetNodeNetworkPolicyStateRequest,
-    GetNodeNetworkPolicyStateResponse, GetNodeSandboxDesiredStateRequest,
+    GetNodeNetworkPolicyStateResponse, GetNodeRuntimeDesiredStateRequest,
+    GetNodeRuntimeDesiredStateResponse, GetNodeSandboxDesiredStateRequest,
     GetNodeSandboxDesiredStateResponse, GetNodeTemplateBaseSnapshotPolicyStateRequest,
     GetNodeTemplateBaseSnapshotPolicyStateResponse, GetNodeTemplateDesiredStateRequest,
     GetNodeTemplateDesiredStateResponse, GetQuarantineRecoveryPlanRequest,
@@ -301,6 +304,7 @@ pub struct ClusterApiService {
     /// [`ClusterApiService::with_visibility_pool`]. Tests share one pool because
     /// the isolation is a pool-configuration property, not request logic.
     visibility_pool: sqlx::PgPool,
+    visibility_observations: std::sync::Arc<visibility_observations::Observations>,
     template_releases_store: template_releases_store::TemplateReleasesStore,
     route_ed25519_authority: Option<
         std::sync::Arc<
@@ -572,6 +576,9 @@ impl ClusterApiService {
             reserved_template_names: template_publication::ReservedTemplateNames::default(),
             trusted_template_storage: trusted_storage::TrustedTemplateStorageBuckets::default(),
             visibility_pool: pool.clone(),
+            visibility_observations: std::sync::Arc::new(
+                visibility_observations::Observations::new(),
+            ),
             template_visibility_cache: template_visibility_cache::TemplateVisibilityCache::from_env(
             ),
             pool,

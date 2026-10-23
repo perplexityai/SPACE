@@ -22,7 +22,7 @@ use pplx_space_common_core::types::{
     ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
     SandboxId, SandboxRuntimeLabel, TransferScopeId,
 };
-use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
+use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
 use rusqlite::params;
 
 use crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt;

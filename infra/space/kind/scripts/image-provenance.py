@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Stamp each Kind image with what it was built from, and check what runs.
 
-`build` wraps one image build, as the Tiltfile's custom_builds and
-build-images.sh run it. The build identity it gives the image is the
-checkout's commit (`telemetry_config.checkout_commit`, Kind's one version
-source) when the image is what that commit builds, and
+`build` wraps one image build, as the Tiltfile's custom_builds run it. The
+build identity it gives the image is the checkout's commit
+(`telemetry_config.checkout_commit`, Kind's one version source) when the
+image is what that commit builds, and
 `<commit>-dirty-<content>` when it is not, where <content> is the first 12
 hex digits of the image's config digest as built with the plain commit.
 
@@ -50,9 +50,8 @@ image copied, and the build is not certified clean.
 
 Each build for a cluster writes its record, the image's ID, config digest and
 identity, to `<state>/provenance/<cluster>/<image>.json`; the last build of
-each image wins. A build without `--cluster` (build-images.sh --no-load) is
-recorded for no cluster, though a clean one still adds its content to the
-clean set. Nothing prunes `clean/`, the records or the bring-up's `runs/`;
+each image wins. A build without `--cluster` is recorded for no cluster,
+though a clean one still adds its content to the clean set. Nothing prunes `clean/`, the records or the bring-up's `runs/`;
 each entry is a few kilobytes and can be deleted at any time.
 
 `check` compares every SPACE container in the cluster's `space` namespace with

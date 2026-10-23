@@ -2,7 +2,7 @@
 
 Use the SPACE API to create sandboxes, run commands, and collect output. Browse the endpoint reference for request fields, responses, and examples. Fields labeled “Experimental” are outside the supported contract.
 
-This reference covers 14 supported HTTP operations: sandbox creation, inspection and lifecycle actions; command creation and process inspection/control; operation polling; and SSE event streams. Generated file-watch and WebSocket-related types do not make their session-creation or interactive APIs part of this supported surface.
+This reference covers 14 supported HTTP operations: sandbox creation, inspection and lifecycle actions; command creation and process inspection/control; operation polling; and SSE event streams. Generated file-watch and WebSocket-related types do not make their session-creation or interactive APIs part of this supported surface. Operations outside this reference are incubating; some, including snapshots, checkpoint, rollback, and file-watch sessions, are hidden and answer as if they did not exist unless the deployment enables them for your organization. `/openapi.json` lists the incubating operations that are not hidden; `/openapi-full.json` lists every operation and requires API credentials.
 
 Use the management API endpoint and bearer token for sandbox, command, process, and operation requests. Event streams use the separate data-plane endpoint and session-scoped token returned with the command. Response fields with open string values can gain new values; tolerate unknown values rather than treating the examples as a closed enum.
 
@@ -36,7 +36,7 @@ Error samples are illustrative, not exhaustive. Messages can change, and the sam
 
 Only endpoints that declare a required `Idempotency-Key` deduplicate mutations, and not all for the same time:
 
-- **Sandbox lifecycle operations and command creation:** the API keeps the key for 24 hours. Reuse the same method, path, body, and key within that window.
+- **Sandbox lifecycle operations and command creation:** the API keeps the key for 24 hours. Reuse the same method, path, body, and key within that window. Replaying the creation of a command whose session was revoked returns `409` `conflict` with the detail `{"key": "reason", "value": "session_ended"}` and no session token; create a new command with a new key instead.
 - **File writes, batch writes, and renames:** the sandbox keeps the key in memory for 60 seconds after the change completes. A retry after that, or after the sandbox's agent restarts, can apply the change again, so an append can land twice. Retry these promptly.
 - **File `mkdir`, `remove`, and change tracking:** they require the key but do not deduplicate.
 

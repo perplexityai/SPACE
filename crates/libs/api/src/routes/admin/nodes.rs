@@ -428,9 +428,25 @@ fn admin_node_status(row: &AdminNodeRow) -> Option<AdminNodeStatusSnapshot> {
             .execution_inventory_status
             .as_ref()
             .zip(row.execution_inventory_received_at)
-            .map(|(status, received_at)| AdminExecutionInventoryObservation {
-                status: status.clone(),
-                received_at: format_time(received_at),
+            .map(|(status, received_at)| {
+                let policy = row.execution_policy.as_ref().and_then(|value| {
+                    match serde_json::from_value(value.0.clone()) {
+                        Ok(policy) => Some(policy),
+                        Err(error) => {
+                            tracing::warn!(node_id = %row.id, %error, "invalid stored execution policy; withholding policy evidence");
+                            None
+                        }
+                    }
+                });
+                let policy_received_at = policy.as_ref()
+                    .and(row.execution_policy_received_at)
+                    .map(format_time);
+                AdminExecutionInventoryObservation {
+                    policy,
+                    policy_received_at,
+                    status: status.clone(),
+                    received_at: format_time(received_at),
+                }
             }),
         observed_at: format_time(observed_at),
         stale_after: format_time(stale_after),

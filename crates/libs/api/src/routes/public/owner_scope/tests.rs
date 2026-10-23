@@ -36,6 +36,9 @@ async fn fixture() -> TestDbResult<Fixture> {
     .execute(&db.pool)
     .await?;
     let mut state = AppState::from_pool(db.pool.clone()).await?;
+    // The sweeps below cover every mounted operation, hidden ones included.
+    state.native_hidden_operations =
+        crate::routes::public::hidden_operations::HiddenOperationsGate::all_orgs();
     state.federated_identity = crate::federated_identity::FederatedIdentityConfig {
         enabled: true,
         policy: crate::federated_identity::FederatedIdentityPolicy::parse(
@@ -883,7 +886,7 @@ fn concrete_path(template: &str, id_param: &str, id: &str) -> String {
 #[tokio::test]
 async fn every_path_id_route_rejects_a_malformed_id_and_hides_an_unknown_one() -> TestDbResult<()> {
     let fixture = fixture().await?;
-    let spec = crate::routes::public_docs::openapi_json().await.0;
+    let spec = crate::routes::public_docs::full_openapi_json().await.0;
     let mut swept = BTreeSet::new();
     for (operation, _) in super::super::mounted_operations() {
         let (id_param, malformed, unknown, invalid, not_found) =

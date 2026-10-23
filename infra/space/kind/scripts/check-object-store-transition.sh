@@ -7,7 +7,7 @@
 # suspend snapshots and published templates in SeaweedFS, and its database
 # records their storage locations as `http://seaweedfs:8333`. Applying the
 # new charts to such a cluster would leave every existing restore and template
-# pull depending on the old deployment, so every bring-up path stops here
+# pull depending on the old deployment, so the bring-up stops here
 # instead, and the operator recreates the cluster. See "Object store
 # transition" in infra/space/kind/README.md.
 #
@@ -65,9 +65,9 @@ env_prefix=""
   printf '       deletes its sandboxes, snapshots and templates, and keeps the image\n'
   printf '       caches:\n'
   printf '         %sbash infra/space/kind/scripts/teardown.sh\n' "$env_prefix"
-  printf '         %sbash infra/space/kind/scripts/bootstrap.sh\n' "$env_prefix"
-  printf '       (or re-run the smoke suite, which creates the cluster itself; Tilt\n'
-  printf '       users then run "tilt up"). Nothing was changed. See "Object store\n'
-  printf '       transition" in infra/space/kind/README.md.\n'
+  printf '         %sbash infra/space/kind/scripts/up.sh\n' "$env_prefix"
+  printf '       (or re-run the smoke suite, which creates the cluster itself).\n'
+  printf '       Nothing was changed. See "Object store transition" in\n'
+  printf '       infra/space/kind/README.md.\n'
 } >&2
 exit 1

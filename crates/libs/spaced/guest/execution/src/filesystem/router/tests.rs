@@ -712,7 +712,7 @@ async fn write_input_failure_preserves_the_routed_worker() {
                 }),
                 Err(Status::aborted("host write stream aborted")),
             ])),
-            None,
+            crate::payload::acquire(&router.payload_slots, 1, None).unwrap(),
         )
         .await
         .expect_err("input stream error is returned");
@@ -752,7 +752,7 @@ async fn dropped_write_relay_releases_input() {
             ),
         },
         Box::pin(input),
-        None,
+        crate::payload::acquire(&router.payload_slots, 1, None).unwrap(),
     ));
     assert!(futures_util::poll!(&mut relay).is_pending());
     drop(relay);
@@ -808,7 +808,11 @@ async fn partial_append_retry_survives_worker_replacement() {
         },
     ));
     router
-        .write_stream(open.clone(), Box::pin(input), None)
+        .write_stream(
+            open.clone(),
+            Box::pin(input),
+            crate::payload::acquire(&router.payload_slots, 1, None).unwrap(),
+        )
         .await
         .expect_err("interrupted upload");
     router.record_worker_failure(&worker).await;
@@ -816,7 +820,11 @@ async fn partial_append_retry_survives_worker_replacement() {
     let (_channel, proxy, server) = connected_worker(&router).await;
     router.worker(None).await.expect("replacement worker");
     let retry = router
-        .write_stream(open, Box::pin(futures_util::stream::iter([Ok(data)])), None)
+        .write_stream(
+            open,
+            Box::pin(futures_util::stream::iter([Ok(data)])),
+            crate::payload::acquire(&router.payload_slots, 1, None).unwrap(),
+        )
         .await;
     let bytes = tokio::fs::read(path).await.expect("file");
     stop_worker(proxy, server).await;

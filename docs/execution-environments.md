@@ -16,8 +16,7 @@ Firecracker and jailer binaries, not their download archive.
 
 The implementation includes domain types, protobuf messages, a versioned JSON
 codec, and explicit seed/build binding. E0 remains the default. Designated nodes
-can select other approved compiled bindings through the regular APIs in
-non-production deployments;
+can select other approved compiled bindings through the regular APIs when the node execution policy allows them;
 installation alone never authorizes selection. Cluster policy tables and fleet
 selection are separate operations.
 
@@ -547,26 +546,25 @@ The 1.17.0 / 6.1.155 binding has reference:
 sha256:6e97c03b2523af6cc7b8e67bcde3fd89cf756c1958b10c24472aeadd68a32e0a
 ```
 
-Installation does not select an environment. Node-manager uses the existing
-`SPACE_ENV` deployment identity for its production restriction: explicit
-`dev`, `development`, `local`, `kind-local`, `test`, `testing`, `staging` and
-well-formed `local-*` identities may select any compiled binding; production, missing, malformed and
-unrecognized identities restrict explicit selection to E0. This adds no
-experiment-specific configuration, API, or stored policy.
+Installation does not select an environment. Node-manager loads an explicit
+allowed/default policy at startup. Absent settings retain E0 and historical
+unbound contracts; `SPACE_ENV` is not an admission signal. Compiled names resolve
+to complete references, while `legacy` separately permits historical contracts.
+The policy is rechecked on exact prepare and launch admission.
 
 Artifacts belonging to compiled bindings are removal-protected independently of
 deployment mode, installation state and service restarts. Retiring a binding will
 require reference-aware fleet and node guards. Keep compatible readers while
-bound templates and sandbox records remain. Changing deployment identity is not
-a workload retirement operation.
+bound templates and sandbox records remain. Removing execution permission is not
+a workload retirement or artifact deletion operation.
 
 Node-manager verifies each environment's release and kernel from the managed
 store and stages its kernel into the execution cache. Cache loss triggers
 reconstruction. Missing or corrupt non-default artifacts cannot replace or
 withdraw E0. Each compiled binding records its qualified lifecycle support; the
 1.17.0 / 6.18.44 and 1.17.0 / 6.1.155 bindings support cold execution and
-same-environment memory snapshots. Restoring across environment identities is
-not an upgrade path: each snapshot retains its original VMM and kernel binding.
+same-environment memory snapshots. Cross-environment restore requires a
+qualified compatible loader; each snapshot retains its original producer binding.
 The 6.1.155 kernel keeps its existing artifact identity when paired with 1.17.0.
 Non-default snapshot capture carries an environment-bound sandbox identity on
 `CreateSnapshot`, with the legacy sandbox ID omitted. Old node-managers reject
@@ -594,20 +592,30 @@ the returned job/sandbox identity if available before retrying.
 Roll out readers first: node-manager, template-manager, sandbox-manager, then
 builder and operator clients. Ordinary unselected E0 traffic continues during
 mixed versions. Submit non-default work only after compatible readers are
-deployed on the target non-production nodes. Work sent early fails explicitly; it does
+deployed on the target nodes with the requested policy. Work sent early fails explicitly; it does
 not require a cluster-wide outage. A queued selected build retains its reference
 in a versioned job payload. A downgraded worker cannot decode that payload as an
 ordinary build and silently substitute E0; such work must be inspected/resubmitted
 after upgrading, not treated as successful.
 
-An explicit selection must match the template's recorded environment. An unbound
-legacy template may acquire a binding for this creation only after its recorded
-runtime, guest, state format and kernel digest match the node-verified definition;
-its stored template metadata is not rewritten. Create commits the verified execution
-binding with the sandbox and cleanup intent before acknowledging success. First
-Start, service restarts, and later starts preserve it; conflicting or missing
-artifact evidence fails closed. Without a selection, a bound template retains
-that environment, including its exact runtime on new cold boot and stop/start.
+A selected cold-boot consumer must match the template's guest, runtime family
+and kernel digest. Its runtime version may differ from the template producer.
+The template's stored metadata is never relabelled. Create saves the selected
+execution with the sandbox and cleanup intent before acknowledging success.
+First Start, service restarts and later cold starts retain that exact consumer.
+Disk metadata records its producer; it cannot override the saved selection, and
+conflicting guest or kernel inputs fail. Snapshot producer evidence stays in the
+snapshot manifest, independently of the sandbox's current consumer.
+
+Unpinned scratch builds use the configured default, refusing when it is unusable.
+Derived builds and new node-local cold sandboxes prefer the bound source when
+allowed and usable. Only a revoked or unavailable source permits fallback to the
+newest allowed qualified consumer with the same kernel. Adding an allowed binding
+therefore does not upgrade a usable source or contaminate an exact benchmark arm.
+Explicit requests never fall back. Existing sandbox stop/start retains its saved
+consumer. After a failed restore that saved consumer may be the newly selected
+loader; its kernel identity is unchanged and cold admission rechecks policy.
+Cluster-directed work and pools still require their placement-bound identities.
 
 Retained instance directories grant sandbox-manager traversal without group write.
 Normal Start repairs old traversal permissions through node-manager before choosing
@@ -645,15 +653,19 @@ error before restarting. It repairs permissions on a valid directory, not a
 regular-file instance, symlink loop, or storage I/O fault; those conditions need
 filesystem repair without discarding the retained disk or rewriting its binding.
 
-Unbound derived builds keep the legacy request path regardless of runtime version.
-Ordinary builds inheriting the immutable E0 binding also retain that compatible
-path; explicit E0 requests and every inherited non-default binding require exact
-protocol acknowledgement. The distinction uses complete environment identity,
-never the runtime version alone. No kernel-only or runtime-only substitution is
-allowed. Local selected creation is cold-only, without pool adoption, snapshots,
-or cluster-owned identities. This creation restriction also covers explicit E0
-requests; later snapshot and suspend operations independently check memory-state
-qualification. Unqualified memory-state operations are refused.
+Unbound derived builds and custom kernel recipes retain their legacy contracts
+while the default-enabled `legacy` permission remains present.
+Every resolved build, including E0, sends its exact selected environment to Create
+so inventory changes cannot cause reselection. Local selected creation remains
+cold-only, without pool adoption, snapshots or cluster-owned identities; later
+snapshot and suspend operations independently check memory-state qualification.
+
+During mixed versions, an old resolver's missing selection acknowledgement keeps
+the pre-existing exact source contract. Scratch builds use ordinary default
+resolution, including during rollout. Other errors never cause fallback. A new
+non-default binding requires all its readers on the target node to be upgraded;
+older sandbox-managers reject cross-binding Create
+before execution. Roll out node-manager, then sandbox-manager, then builders.
 Managed non-default bindings are omitted from the legacy cluster placement
 projection. Historical external runtime and kernel installations remain available
 to legacy execution and placement. Fleet placement for complete environments,
@@ -662,3 +674,169 @@ integrations. Use the node-local clients for explicit non-default selection.
 
 See the [runtime benchmark procedure](../scripts/benchmarks/README.md#runtime-environment-benchmark)
 for building distinct templates and checking the identities that actually ran.
+
+### Restore inputs
+
+A memory snapshot retains the identity of its guest kernel, but restoring it does
+not read a boot kernel image. Node-manager verifies the runtime independently of
+boot-component availability. A missing or damaged local kernel therefore blocks
+cold boots using that kernel, without preventing restore through an otherwise
+usable, approved runtime. Restore never substitutes a local default kernel into
+the snapshot's execution evidence. Pause/resume also keeps the resident kernel.
+
+### Execution policy and compatible resolution
+
+Scratch builds call `ResolveExecutionEnvironment` without a reference to resolve
+the configured default, then validate the verified runtime and guest locally.
+Cold boots from recorded execution and snapshot restores use compatible-selection
+requests. The resolver acknowledges the intent and returns a complete verified
+consumer. Callers persist the exact result before effects; prepare and launch
+recheck eligibility. Old resolvers
+without the acknowledgement retain the previous exact contract during rollout,
+never authorize an unacknowledged upgrade.
+
+Node-manager reads two startup settings:
+
+```text
+SPACE_ALLOWED_EXECUTION_ENVIRONMENTS=e0,legacy
+SPACE_DEFAULT_EXECUTION_ENVIRONMENT=e0
+```
+
+On x86_64, absent settings mean `e0,legacy` and default `e0`. Compiled names
+are `e0`, `fc-1.17.0-linux-6.1.155`, and `fc-1.17.0-linux-6.18.44`.
+`legacy` is a separate permission for unbound historical contracts, not an
+environment reference or a selectable default on x86_64. The default must be
+allowed. Surrounding whitespace is ignored. Empty, duplicate or unknown names
+fail startup. Compiled names resolve to immutable references and cannot approve arbitrary downloads or unqualified
+pairs. On aarch64, where no environment descriptor is qualified, absent settings
+mean `legacy` for both settings: builders and activations retain the existing
+unbound initial contract. The report has no compiled references or default but
+has `legacy_unbound_allowed=true`. Explicit compiled names fail startup on that
+architecture; existing artifact pins do not establish environment qualification.
+
+The configured default is used only for work without source or exact selection.
+A bound source prefers its exact environment, then compatible fallback if it is
+revoked, absent or permanently unavailable. A transient exact-source failure
+returns the existing retryable inventory error (`Internal`) without choosing or
+persisting a new consumer.
+Cold fallback preserves the guest kernel; restore fallback
+also requires the same compiled state-format profile and qualified memory-state
+support. CPU, memory and device checks remain in the restore path. Firecracker
+1.17 cannot load E0 format 9 snapshots. Ordering of fallback candidates belongs
+to the runtime adapter, and never assembles unqualified runtime/kernel pairs.
+
+Bound activations always require an allowed compiled environment. Unbound
+metadata that exactly identifies a compiled contract also obeys its eligibility;
+other historical contracts require `legacy`. Existing inventory validation,
+custom-kernel matching and the ban on unbound managed non-default runtimes still
+apply. A historical restore retains its kernel provenance without requiring a
+boot image. Removing `legacy` deliberately disables custom unbound contracts;
+audit templates, sandboxes and stored snapshots before doing so. Removing a
+compiled environment can strand its bound work without a compatible consumer.
+A runtime/kernel incident affecting unbound work also requires removing `legacy`;
+revoking a compiled pair alone cannot classify every historical custom contract.
+Neither permission affects artifact retention or rewrites producer metadata.
+
+Successful fallback decisions emit a warning with source and consumer references
+and increment `node_mgr.execution.consumer_fallback`. This counts resolver
+attempts, including retries, rather than completed launches. Transient exact-source
+errors follow the existing inventory refresh backoff and the caller's activation
+retry/deadline; selection itself does not wait or write a consumer.
+
+The temporary node settings will yield authority to cluster desired policy.
+Until placement consumes environment eligibility and fresh usability evidence,
+keep allowed/default policy uniform within each role/host-platform cohort and
+verify that builder outputs work on every worker cohort that may receive them.
+Keep shared fleet defaults at E0: cluster-owned non-default Create remains refused.
+Additional bindings can be exercised through designated node-local paths without
+publishing their templates for shared fleet consumption.
+
+`GetExecutionInventory` reports resolved references and the separate legacy permission.
+Node-ctl forwards it through periodic publication; the cluster records it with
+its own database receipt time in node status, and the admin node response exposes
+both. Older cluster writers can refresh inventory without refreshing policy; use
+`policy_received_at` to assess policy freshness independently.
+Missing, invalid, future-schema or failed policy observations withhold policy
+evidence. An unrelated publication does not renew it. Policy is not proof of
+installation or usability, and reporting does not implement placement gating.
+Deploy the additive migration and cluster readers before node publishers. Inspect
+cohort drift and collection freshness before enabling workloads. Upgrades no longer
+infer permission from `SPACE_ENV`: absent settings revoke non-E0 bindings even on
+Kind and development nodes. Before upgrading a deployment that needs those existing
+bindings, configure its explicit allowlist while keeping the default at E0. Do not
+expand every development deployment's policy merely because of its name.
+
+### Selecting a restore consumer
+
+The snapshot manifest retains original runtime, kernel and state-format identity.
+After claiming activation ownership, sandbox-manager saves the selected loader in
+the sandbox row before preparing files or allocating a slot. Prepare and Launch
+receive that exact consumer. A failed attempt can leave it recorded; cleanup
+retains the checkpoint and a later restore attempt resolves again from producer
+evidence. A subsequent snapshot describes the runtime that actually ran.
+
+Pause/resume keeps the resident VM. This policy change does not kill running VMs
+or add isolated resume refusal: incident-driven stopping, resource reclamation and
+resume revocation must ship together. Stop and delete remain available. Operators
+must stop affected resident VMs when revoking execution during an incident.
+
+A future kernel or incompatible-state upgrade requires explicit memory-loss
+consent, activation fencing and a preserved matching disk/checkpoint pair. Keep
+the old pair until the new cold boot is verified; a failed cold boot must not
+mutate the only rollback disk. Retention is not permission to restore a revoked
+runtime. Retire the checkpoint through a durable lifecycle operation before later
+object garbage collection, never by deleting S3 vmstate and editing lifecycle rows.
+
+### Node runtime provisioning
+
+The whole-node `runtime-provisioning` facet reads
+`ClusterApi.GetNodeRuntimeDesiredState` on each periodic inbound tick, even with
+no installed artifacts or templates. The response optionally carries a
+`RuntimeProvisioningRecipe` of immutable compiled environment references. It
+contains neither execution permissions/defaults nor arbitrary download URLs,
+paths or artifact hashes. The cluster authenticates the registered node by the
+existing origin check before answering.
+
+The current cluster handler returns no recipe. A policy store and producer must
+be connected before deployment can request installations; this endpoint does not
+implicitly commission E0. Older cluster services return `Unimplemented`, which
+node-ctl also treats as no recipe. Other fetch errors remain visible failures.
+Neither absence nor an empty recipe uninstalls anything.
+
+Node-ctl validates the entire recipe against its compiled host-specific catalog,
+expands the environments into distinct artifact identities, and reads rtmgr's
+local inventory. Only valid, digest-matching managed copies satisfy installation
+intent; baked/external files remain externally owned. Incomplete inventory stops
+the pass without submissions. Missing identities go through the existing
+`InstallArtifact` API with at most four simultaneous submissions. The entire
+pass has a 30-second deadline, including connections and discovery. It does not
+wait for downloads: accepted jobs are durable in rtmgr, active repeats deduplicate
+by artifact identity, and the next tick observes completion. Transfer attempts
+are bounded by rtmgr; later ticks can submit another attempt after a terminal job
+failure. Persistent failures remain visible until the source, node or recipe is
+repaired. Replacing a recipe does not cancel already accepted jobs; their extra
+artifacts are retained.
+
+The facet's existing reconciliation status reports pending installation counts
+and submission failures. A successful pass is not an environment-readiness or
+recipe-revision attestation: it can also mean no recipe was assigned. Runtime
+inventory and execution-policy observations continue through `PublishNodeState`;
+node-manager remains the independent publication and execution authority. The
+cluster must compare desired identities against fresh observations, not use the
+facet's last-success time as proof that an environment can run. Recipe changes
+never change the allowlist, default, placement or running sandboxes.
+
+Node-ctl is authorized to read rtmgr and install approved artifacts, but not to
+uninstall or cancel operations. Deploy the rtmgr peer authorization and node-ctl's
+`space-rtmgrclients` supplementary group before assigning a recipe. Existing
+node processes must restart after direct-host group membership changes. New
+node-ctl against old rtmgr reports permission failures without claiming success.
+New cluster endpoints and old node-ctl coexist because provisioning is not
+mandatory until the policy producer explicitly requires it.
+
+The control-plane integration owns recipe storage and admin mutations, cohort
+selection, rollout/convergence tracking, and fresh environment-aware placement.
+It must keep required installations separate from allowed/default execution
+policy and retain compatibility checks at node admission. Retirement and garbage
+collection require a separate reference-aware operation; recipe omission alone
+never grants deletion authority.

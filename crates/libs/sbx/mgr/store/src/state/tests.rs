@@ -21,14 +21,14 @@ fn pause_admission_retries_in_flight_lifecycle_but_rejects_invalid_stable_states
 #[test]
 fn every_local_lifecycle_round_trips_through_typed_observations() {
     for state in super::SandboxState::all() {
-        let wire = pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::from(state);
+        let wire = pplx_space_sbx_mgr_protocol::proto::SandboxLifecycleState::from(state);
         assert_eq!(wire.label(), state.as_str());
         assert_eq!(
             state.as_str().parse::<super::SandboxState>().unwrap(),
             state
         );
         assert_eq!(
-            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::from_label(state.as_str())
+            pplx_space_sbx_mgr_protocol::proto::SandboxLifecycleState::from_label(state.as_str())
                 .unwrap(),
             wire
         );

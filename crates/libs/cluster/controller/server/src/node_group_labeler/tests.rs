@@ -2212,7 +2212,7 @@ async fn t47_a_group_or_taint_acquired_mid_tick_is_never_overwritten() {
 #[test]
 fn t48_log_budget_grants_exactly_its_cap_then_denies() {
     // Zero is included: it is what every caller sees once the budget is spent,
-    // and `fetch_update`'s `checked_sub` is the only thing keeping it from
+    // and `try_update`'s `checked_sub` is the only thing keeping it from
     // wrapping to `usize::MAX` and re-opening the tap.
     for cap in [0usize, 1, 3, LABEL_FAILURE_LOGGED_NODES] {
         let budget = std::sync::atomic::AtomicUsize::new(cap);

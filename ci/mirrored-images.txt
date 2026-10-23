@@ -51,7 +51,7 @@ public.ecr.aws/aws-cli/aws-cli:2.27.41              sha256:7637f1a9537dd19b1f74f
 moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 sha256:040d34121c27906c4ff9ac152a30d52bf2c5d328d3bb748916bb3d2743c02528 ghcr.io/perplexityai/space-ci-mirror:buildkit-v0.32.2
 
 # Base of ci/Dockerfile.ci.
-public.ecr.aws/docker/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 sha256:4e4a7e7939c17991ab35f2b8c2e67593980f771d28f6b1254b1850f860fd0c7f ghcr.io/perplexityai/space-ci-mirror:rust-1.98.0-bookworm docker.io/library/rust
+docker.io/library/rust:1.99.1-bookworm@sha256:edaa2a8cc254d5936207af267114814c61cceea40b46eaa4e976068af55e20e7 sha256:8bf7188ae46ad73b801c8d405eedc13ce63a7852b562885743a56890723549a8 ghcr.io/perplexityai/space-ci-mirror:rust-1.99.1-bookworm public.ecr.aws/docker/library/rust
 
 # Base of the guest kernel build, templates/firecracker/kernel/Dockerfile
 # (Main CI's guest_kernel job).

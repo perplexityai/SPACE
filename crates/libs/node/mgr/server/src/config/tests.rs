@@ -1,53 +1,72 @@
 use super::*;
 
 #[test]
-fn deployment_admission_defaults_to_production() {
-    use std::ffi::OsStr;
-    assert!(deployment_is_production(None));
-    for value in [
-        "prod",
-        "production",
-        "",
-        " ",
-        "unknown",
-        "dev-typo",
-        "local-",
-        "local-../",
-        "local-💥",
-    ] {
-        assert!(deployment_is_production(Some(OsStr::new(value))), "{value}");
+fn deployment_name_does_not_authorize_execution() {
+    if !pplx_space_test_env::enter_test_process(&[
+        ("SPACE_ENV", Some(std::ffi::OsStr::new("staging"))),
+        ("SPACE_ALLOWED_EXECUTION_ENVIRONMENTS", None),
+        ("SPACE_DEFAULT_EXECUTION_ENVIRONMENT", None),
+    ]) {
+        return;
     }
-    for value in [
-        "dev",
-        "development",
-        "local",
-        "kind-local",
-        "test",
-        "testing",
-        "staging",
-        " TESTING ",
-        "local-devbox",
-        "local-kind-owner-devbox",
-    ] {
-        assert!(
-            !deployment_is_production(Some(OsStr::new(value))),
-            "{value}"
+    let settings = ServiceSettings::from_env().unwrap();
+    let catalog = settings.execution_policy.catalog();
+    if let Some(initial) = catalog.iter().find(|entry| entry.name() == "e0") {
+        assert_eq!(
+            settings
+                .execution_policy
+                .allowed_references()
+                .collect::<Vec<_>>(),
+            vec![initial.definition().reference()]
         );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        assert!(deployment_is_production(Some(OsStr::from_bytes(&[0xff]))));
+    } else {
+        assert_eq!(settings.execution_policy.default_reference(), None);
     }
 }
 
 #[test]
-fn startup_uses_deployment_identity_for_admission() {
+fn malformed_policy_prevents_startup() {
     if !pplx_space_test_env::enter_test_process(&[
-        ("SPACE_ENV", Some(std::ffi::OsStr::new("testing"))),
-        ("DD_ENV", Some(std::ffi::OsStr::new("prod"))),
+        (
+            "SPACE_ALLOWED_EXECUTION_ENVIRONMENTS",
+            Some(std::ffi::OsStr::new("unknown")),
+        ),
+        ("SPACE_DEFAULT_EXECUTION_ENVIRONMENT", None),
     ]) {
         return;
     }
-    assert!(!ServiceSettings::from_env().production);
+    ServiceSettings::from_env().unwrap_err();
+}
+
+#[test]
+fn candidate_catalog_failure_preserves_all_spellings_of_initial_policy() {
+    use pplx_space_common_core::types::Arch;
+    use pplx_space_node_runtime_core::catalog::CatalogError;
+    let resolve = |allowed, default| {
+        execution_policy_with_catalog(
+            allowed,
+            default,
+            Arch::X86_64,
+            Err(CatalogError::MissingEnvironmentPins {
+                runtime: "1.17.0",
+                kernel: "6.18.44",
+            }),
+        )
+    };
+    let implicit = resolve(None, None).unwrap();
+    for allowed in ["e0,legacy", "legacy,e0"] {
+        for default in [None, Some("e0")] {
+            let explicit = resolve(Some(allowed), default).unwrap();
+            assert_eq!(
+                explicit.allowed_references().collect::<Vec<_>>(),
+                implicit.allowed_references().collect::<Vec<_>>()
+            );
+            assert_eq!(explicit.default_reference(), implicit.default_reference());
+            assert!(explicit.legacy_unbound_allowed());
+        }
+    }
+    assert!(!resolve(Some("e0"), None).unwrap().legacy_unbound_allowed());
+    for allowed in ["e0,fc-1.17.0-linux-6.1.155", "e0,legacy,legacy", "e0,"] {
+        resolve(Some(allowed), None).unwrap_err();
+    }
 }

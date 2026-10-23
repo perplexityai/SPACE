@@ -4,8 +4,7 @@
 node:
   # worker or builder. Selects the node pool the DaemonSet runs on and the
   # role the services report. A builder release is the same chart rendered
-  # with role=builder (see the `space-builder` releases in bootstrap.sh and the
-  # Tiltfile).
+  # with role=builder (see the `space-builder` releases in the Tiltfile).
   role: worker
   # Node pool label each role's DaemonSets select, from kind-cluster.yaml.tmpl.
   # The builder pool is deliberately not space-enabled, so user sandbox pods

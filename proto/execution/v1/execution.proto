@@ -95,6 +95,18 @@ message ArtifactComponentInstallation {
 message NodeExecutionInventory {
   repeated RuntimeInstallation runtimes = 1;
   repeated ArtifactComponentInstallation components = 2;
+  // Effective startup policy, independent of installed/usable artifacts. Absence
+  // means unknown support, never implicit E0 approval.
+  ExecutionPolicyObservation policy = 3;
+}
+
+message ExecutionPolicyObservation {
+  uint32 schema_version = 1;
+  repeated string allowed_environment_references = 2;
+  // Absent with an empty list on architectures using the legacy default.
+  optional string default_environment_reference = 3;
+  // Permission for unbound historical contracts, not an environment identity.
+  bool legacy_unbound_allowed = 4;
 }
 
 // Environment definitions are additive data contracts. Sending one to a peer

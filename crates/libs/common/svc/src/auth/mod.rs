@@ -12,8 +12,10 @@ use tower::{Layer, Service};
 use crate::space_api_route::SPACE_API_BRIDGE_CALLER_POLICY_METADATA_KEY;
 
 pub mod build;
+mod node_identity;
 pub mod template;
 pub mod template_transfer;
+pub use node_identity::{AuthenticatedKubernetesNode, AuthenticatedNodeIdentity};
 
 #[cfg(all(feature = "k8s", any(test, feature = "test-support")))]
 pub mod test_support;
@@ -288,6 +290,7 @@ struct NodeApiAuthenticator {
 /// without re-parsing or trusting caller-controlled metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeApiAuthenticatedCaller {
+    node_identity: AuthenticatedNodeIdentity,
     wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority,
     network_policy_authority: NetworkPolicyMutationAuthority,
     data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
@@ -389,6 +392,7 @@ impl NodeApiAuthenticatedCaller {
             ),
         };
         Self {
+            node_identity: AuthenticatedNodeIdentity::RemoteAddress,
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
@@ -412,6 +416,7 @@ impl NodeApiAuthenticatedCaller {
         data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
     ) -> Self {
         Self {
+            node_identity: AuthenticatedNodeIdentity::MissingKubernetesClaims,
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
@@ -425,6 +430,7 @@ impl NodeApiAuthenticatedCaller {
     #[cfg(any(test, feature = "test-support"))]
     pub const fn data_plane_edge_for_test() -> Self {
         Self {
+            node_identity: AuthenticatedNodeIdentity::RemoteAddress,
             wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority::Denied,
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Granted,
@@ -437,12 +443,17 @@ impl NodeApiAuthenticatedCaller {
     #[cfg(any(test, feature = "test-support"))]
     pub const fn unprivileged_workload_for_test() -> Self {
         Self {
+            node_identity: AuthenticatedNodeIdentity::RemoteAddress,
             wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority::Denied,
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Denied,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
         }
+    }
+
+    pub const fn node_identity(&self) -> &AuthenticatedNodeIdentity {
+        &self.node_identity
     }
 
     pub const fn wait_ready_lifecycle_authority(&self) -> WaitReadyLifecycleAuthority {

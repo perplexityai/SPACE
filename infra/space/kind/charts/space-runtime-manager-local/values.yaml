@@ -17,7 +17,7 @@ node: {}
 # runtime-manager has no service mutex and no drain budget of its own; its
 # gRPC server shuts down gracefully on SIGTERM
 # (crates/libs/node/runtime/manager/server/src/run.rs). The shared lifecycle
-# default grace (crates/libs/common/svc/src/lifecycle.rs).
+# default grace (crates/libs/service-lifecycle/src/lib.rs).
 terminationGracePeriodSeconds: 60
 
 # Installs (no --list-only, /space/cache writable for its staging). Set with

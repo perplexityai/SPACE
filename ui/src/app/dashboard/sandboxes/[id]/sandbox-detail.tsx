@@ -47,6 +47,11 @@ import {
   type TerminalSessionEvent,
 } from '@/lib/data-plane-terminal';
 import {
+  ROLLBACK_NOT_ENABLED,
+  SNAPSHOTS_NOT_ENABLED,
+  isHiddenOperationError,
+} from '@/lib/hidden-operations';
+import {
   forceConsoleSandboxAction,
   forceDeleteConsoleSandbox,
   getConsoleSandbox,
@@ -387,12 +392,20 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
   const { token } = theme.useToken();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [snapshotsOff, setSnapshotsOff] = useState(false);
+  const [rollbackOff, setRollbackOff] = useState(false);
 
   const refresh = () => {
     setLoading(true);
     getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
       .then((items) => setSnapshots(items.map(publicSnapshotToConsoleSnapshot)))
-      .catch((err: any) => message.error(err.message || 'failed to load snapshots'))
+      .catch((err: any) => {
+        if (isHiddenOperationError(err)) {
+          setSnapshotsOff(true);
+          return;
+        }
+        message.error(err.message || 'failed to load snapshots');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -406,6 +419,11 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
       });
       message.success('Snapshot rollback queued');
     } catch (err: any) {
+      if (isHiddenOperationError(err)) {
+        setRollbackOff(true);
+        message.info(ROLLBACK_NOT_ENABLED);
+        return;
+      }
       message.error(err.message || 'failed to queue rollback');
     }
   };
@@ -423,6 +441,8 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
     },
     { title: 'Timestamp', dataIndex: 'timestamp', width: 200, render: (v: string | null) => v ?? '—' },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => formatBytes(v) },
+  ];
+  const rollbackColumns: ColumnsType<SnapshotInfo> = rollbackOff ? [] : [
     {
       title: 'Action', width: 130,
       render: (_, record) => (
@@ -438,6 +458,14 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
     },
   ];
 
+  if (snapshotsOff) {
+    return (
+      <Card size="small" title={<Space><CameraOutlined /> Snapshots</Space>}>
+        <Text type="secondary">{SNAPSHOTS_NOT_ENABLED}</Text>
+      </Card>
+    );
+  }
+
   return (
     <Card
       size="small"
@@ -445,7 +473,7 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
       extra={<Button size="small" icon={<ReloadOutlined />} onClick={refresh}>Refresh</Button>}
     >
       <Table
-        columns={columns}
+        columns={[...columns, ...rollbackColumns]}
         dataSource={snapshots}
         rowKey="id"
         loading={loading}

@@ -489,6 +489,7 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
     service.peer_authorizer = UdsPeerAuthorizer::new(
         "runtime-manager-test",
         [
+            UdsPeerAccount::with_linux_user(users::SPACE_NODECTL),
             pplx_space_common_svc::UdsPeerAccount::role_with_fallback_uid(
                 "rtmgr-test-observer",
                 LocalRole::Observer,
@@ -502,8 +503,8 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
             version: "6.1.158".parse().unwrap(),
             digest: Digest::sha256([7; 32]),
         });
-    for uid in [0, 40_001] {
-        let expected = if uid == 0 {
+    for uid in [0, 40_001, users::SPACE_NODECTL.uid] {
+        let expected = if uid == 0 || uid == users::SPACE_NODECTL.uid {
             tonic::Code::FailedPrecondition
         } else {
             tonic::Code::PermissionDenied
@@ -518,6 +519,11 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
             .await
             .unwrap_err();
         assert_eq!(error.code(), expected);
+        let expected = if uid == 0 {
+            tonic::Code::FailedPrecondition
+        } else {
+            tonic::Code::PermissionDenied
+        };
         let error = service
             .uninstall_artifact(peer_request(
                 UninstallArtifactRequest {
@@ -528,7 +534,21 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
             .await
             .unwrap_err();
         assert_eq!(error.code(), expected);
+        let error = service
+            .cancel_operation(peer_request(
+                CancelOperationRequest {
+                    operation_id: "019e6370-cfc9-7a43-9337-399c7b51a1d9".into(),
+                },
+                uid,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected);
     }
+    service
+        .list_execution_artifacts(request(Vec::new(), users::SPACE_NODECTL.uid))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

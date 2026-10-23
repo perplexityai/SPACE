@@ -5,13 +5,13 @@
 # that deployments serialize migration runs per database, because a competing
 # runner can turn a retried lock race into a failed run
 # (crates/libs/db/migrator/src/migration_retry.rs). Tilt makes space-api wait
-# for this Job, and bootstrap.sh waits for it before applying the API.
+# for this Job.
 #
 # It fails fast, as a deployment's migration Job does: one attempt, no pod
 # restarts, inside a deadline the migrator sizes its lock-retry window against
 # (--job-deadline-seconds, crates/libs/db/migrator/src/lib.rs). A failed run
 # stays Failed for an operator to read rather than being retried into a
-# different state; bootstrap.sh and Tilt replace the Job to run it again.
+# different state; Tilt replaces the Job to run it again.
 apiVersion: batch/v1
 kind: Job
 metadata:

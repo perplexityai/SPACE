@@ -268,3 +268,10 @@ pub fn btrfs_send_stream_rejected(reason: BtrfsSendStreamRejection) {
         &[tag("reason", reason)],
     );
 }
+
+/// Successful resolver decisions selecting a consumer other than the recorded
+/// source. Counts attempts (including retries), not completed launches; no
+/// sandbox or environment identifiers are metric tags.
+pub fn execution_consumer_fallback() {
+    counter("node_mgr.execution.consumer_fallback", 1, &[]);
+}

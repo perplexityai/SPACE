@@ -44,7 +44,7 @@ impl MetricsService for RecordingReceiver {
             .push(request.into_inner());
         if self
             .failures_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

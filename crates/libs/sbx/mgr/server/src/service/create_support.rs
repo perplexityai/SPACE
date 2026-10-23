@@ -9,6 +9,7 @@ use super::validation::{
 };
 use super::*;
 use pplx_space_common_core::types::{EnvMap, EnvSanitizationIssue};
+use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, SandboxRestoreProvenance,
     emit_sandbox_event,
@@ -652,20 +653,42 @@ pub(super) fn checkpoint_start_response_for_existing_started_sandbox(
     }
 }
 
+pub(crate) fn template_lookup_scope(
+    owner: &SandboxOwner,
+    sandbox_id: Option<&str>,
+) -> Result<TemplateLookupScope, Status> {
+    if matches!(owner.kind(), SandboxOwnerKind::PlatformUser(_)) {
+        let Some(sandbox_id) = sandbox_id else {
+            return Ok(TemplateLookupScope::Cluster);
+        };
+        let id = sandbox_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid template sandbox identity"))?;
+        Ok(TemplateLookupScope::Sandbox {
+            id,
+            caller_node: None,
+        })
+    } else {
+        Ok(TemplateLookupScope::LocalExecution)
+    }
+}
+
 pub(super) async fn resolve_template_paths(
     templates: &dyn crate::template_resolver::TemplateResolver,
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
+    scope: TemplateLookupScope,
 ) -> Result<ResolvedTemplatePaths, tonic::Status> {
     use crate::template_resolver::TemplateLookupError;
-    let inner = templates
-        .get_template(tonic::Request::new(
-            pplx_space_template_mgr_client::proto::GetTemplateRequest {
-                caller_org_id: None,
-                template: Some(template_ref),
-                vcpu: None,
-                memory_mib: None,
-            },
-        ))
+    let mut request =
+        tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+            caller_org_id: None,
+            template: Some(template_ref),
+            vcpu: None,
+            memory_mib: None,
+        });
+    scope.attach(&mut request);
+    let response = templates
+        .get_template(request)
         .await
         .map_err(|error| match error {
             TemplateLookupError::Connect(e) => {
@@ -674,8 +697,9 @@ pub(super) async fn resolve_template_paths(
             TemplateLookupError::Rpc(e) => {
                 tonic::Status::new(e.code(), format!("GetTemplate failed: {e}"))
             }
-        })?
-        .into_inner();
+        })?;
+    scope.observe_response(&response)?;
+    let inner = response.into_inner();
     let tmpl = inner.template.unwrap_or_default();
     let arch = template_metadata_arch(&inner.template_dir).unwrap_or(inner.arch);
     let spaced_compatibility = template_metadata_spaced_compatibility(&inner.template_dir);
@@ -769,6 +793,7 @@ pub(super) fn stage_base_snapshot_runtime_metadata(
 pub(super) async fn resolve_template_paths_for_start(
     templates: &dyn crate::template_resolver::TemplateResolver,
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
+    sandbox: &crate::db::SandboxRow,
 ) -> Result<ResolvedTemplatePaths, Status> {
     // Start restores an existing sandbox's identity. A name-only lookup could
     // silently pick a new image after an alias moves; only create may do that.
@@ -781,9 +806,13 @@ pub(super) async fn resolve_template_paths_for_start(
             "cannot recover sandbox artifact without its saved template hash",
         ));
     }
-    resolve_template_paths(templates, template_ref)
-        .await
-        .map_err(start_template_resolution_failed_status)
+    resolve_template_paths(
+        templates,
+        template_ref,
+        template_lookup_scope(&sandbox.user, Some(&sandbox.id))?,
+    )
+    .await
+    .map_err(start_template_resolution_failed_status)
 }
 
 fn start_template_resolution_failed_status(error: Status) -> Status {
@@ -813,6 +842,13 @@ pub(super) async fn template_runtime_defaults_for_sandbox_start(
             name: sandbox.template.clone(),
             content_hash: sandbox.template_hash.clone(),
             tag: None,
+        },
+        match template_lookup_scope(&sandbox.user, Some(&sandbox.id)) {
+            Ok(scope) => scope,
+            Err(error) => {
+                tracing::warn!(%error, "invalid sandbox template scope");
+                return TemplateRuntimeDefaults::default();
+            }
         },
     )
     .await
@@ -909,6 +945,7 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
             content_hash: sandbox.template_hash.clone(),
             tag: None,
         },
+        sandbox,
     )
     .await?;
     reject_incompatible_template_arch(
@@ -932,44 +969,58 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
     Ok(SandboxPrepareSource {
         template: Some(sandbox.template.clone()),
         template_dir: Some(resolved_template.template_dir),
-        execution: bind_saved_execution(sandbox, resolved_template.execution)?,
+        execution: bind_disk_execution(
+            sandbox.execution_metadata.as_ref(),
+            resolved_template.execution,
+        )?,
         existing_artifact: false,
     })
 }
 
-/// Saved selection wins over absent legacy annotations, never over conflicting
-/// artifact evidence. Kernel directory labels do not change byte identity.
+/// The saved sandbox binding owns execution selection. Disk metadata records
+/// the runtime that last prepared the disk; it is not a second selection pin.
+/// Raw disks can cross qualified consumers while their guest and kernel inputs
+/// remain fixed. Snapshot producer evidence is read separately from its manifest.
 fn bind_saved_execution(
     sandbox: &crate::db::SandboxRow,
     observed: pplx_space_common_core::types::ExecutionMetadata,
 ) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
-    let Some((saved, reference)) = sandbox
-        .execution_metadata
-        .as_ref()
-        .and_then(|saved| saved.environment().map(|reference| (saved, reference)))
-    else {
+    bind_disk_execution(sandbox.execution_metadata.as_ref(), observed)
+}
+
+fn bind_disk_execution(
+    saved: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    observed: pplx_space_common_core::types::ExecutionMetadata,
+) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+    let Some(saved) = saved.filter(|saved| saved.environment().is_some()) else {
         return Ok(observed);
     };
-    if observed
-        .environment()
-        .is_some_and(|actual| actual != reference)
+    // Only the Firecracker adapter currently declares cross-consumer raw-disk
+    // compatibility. Other adapters must supply their own disk contract.
+    if saved.runtime().kind != pplx_space_common_core::types::RuntimeKind::Firecracker
+        && saved != &observed
     {
         return Err(Status::failed_precondition(
-            "artifact environment differs from the sandbox's saved binding",
+            "runtime adapter requires the exact disk execution contract",
         ));
     }
-    if observed.runtime() != saved.runtime() || observed.guest() != saved.guest() {
+    if saved.runtime().kind != observed.runtime().kind
+        || saved.guest() != observed.guest()
+        || !matching_execution_components(saved, &observed)
+    {
         return Err(Status::failed_precondition(
-            "artifact runtime or guest differs from the sandbox's saved binding",
+            "disk boot inputs differ from the sandbox's saved execution",
         ));
     }
-    if observed.state_format() != saved.state_format() {
-        return Err(Status::failed_precondition(
-            "artifact state format differs from the sandbox's saved binding",
-        ));
-    }
-    if observed.components().len() != saved.components().len()
-        || !saved.components().iter().all(|expected| {
+    Ok(saved.clone())
+}
+
+fn matching_execution_components(
+    saved: &pplx_space_common_core::types::ExecutionMetadata,
+    observed: &pplx_space_common_core::types::ExecutionMetadata,
+) -> bool {
+    observed.components().len() == saved.components().len()
+        && saved.components().iter().all(|expected| {
             observed.components().iter().any(|actual| {
                 expected.kind == actual.kind
                     && expected.role == actual.role
@@ -983,12 +1034,6 @@ fn bind_saved_execution(
                     }
             })
         })
-    {
-        return Err(Status::failed_precondition(
-            "artifact components differ from the sandbox's saved binding",
-        ));
-    }
-    Ok(observed.with_environment(reference))
 }
 
 pub(super) fn guest_console_logs_enabled() -> bool {

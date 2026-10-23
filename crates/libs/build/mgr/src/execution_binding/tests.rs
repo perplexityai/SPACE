@@ -29,6 +29,7 @@ fn fixture() -> ResolveExecutionEnvironmentResponse {
         )
         .unwrap();
     ResolveExecutionEnvironmentResponse {
+        accepted_selection: 0,
         definition: Some((&definition).into()),
         execution: Some((&execution).into()),
     }
@@ -65,6 +66,18 @@ fn resolution_requires_complete_matching_support_evidence() {
         mutate(&mut response);
         BuildExecutionBinding::from_response(None, response).unwrap_err();
     }
+}
+
+#[test]
+fn scratch_default_must_match_the_builder_guest_requirements() {
+    // Default resolution needs no compatible-selection acknowledgement, including
+    // from an older node. Its verified binding must still fit this builder.
+    let binding = BuildExecutionBinding::from_response(None, fixture()).unwrap();
+    binding.check_scratch_requirements(Arch::X86_64).unwrap();
+    assert!(matches!(
+        binding.check_scratch_requirements(Arch::Aarch64),
+        Err(BuildExecutionBindingError::ScratchRequirements { .. })
+    ));
 }
 
 #[test]
@@ -227,19 +240,19 @@ async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
         "seed".into(),
         "sha256:bound-base".into(),
         None,
-        binding.create_environment(false),
+        Some(binding.create_environment()),
         &pplx_space_net_common::NetworkPolicyV1::allow_all(),
     );
-    assert!(
-        inherited_e0.environment.is_none(),
-        "ordinary inherited E0 builds remain rolling-compatible"
+    assert_eq!(
+        inherited_e0.environment.unwrap().reference,
+        binding.reference().to_string()
     );
-    assert_eq!(inherited_e0.runtime, "fc");
+    assert!(inherited_e0.runtime.is_empty());
     let explicit_e0 = super::super::build_vm_create_request(
         "seed".into(),
         "sha256:bound-base".into(),
         None,
-        binding.create_environment(true),
+        Some(binding.create_environment()),
         &pplx_space_net_common::NetworkPolicyV1::allow_all(),
     );
     assert_eq!(
@@ -257,13 +270,11 @@ async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
     let other = BuildExecutionBinding::from_response(
         None,
         ResolveExecutionEnvironmentResponse {
+            accepted_selection: 0,
             definition: Some((&definition).into()),
             execution: Some((&requirements).into()),
         },
     )
     .unwrap();
-    assert_eq!(
-        other.create_environment(false),
-        Some(definition.reference())
-    );
+    assert_eq!(other.create_environment(), definition.reference());
 }

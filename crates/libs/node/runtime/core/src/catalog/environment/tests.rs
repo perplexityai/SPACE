@@ -108,3 +108,26 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
             .is_empty()
     );
 }
+
+#[test]
+fn initial_identity_and_legacy_restore_do_not_depend_on_display_name() {
+    use crate::runtime_inventory::ExecutionSelectionMode;
+    use crate::selection::ExecutionPolicy;
+    let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let mut entry = initial.compiled_environment().unwrap();
+    entry.name = "renamed-initial";
+    let bound = entry.definition().execution_requirements().unwrap();
+    let historical = ExecutionMetadata::new(
+        bound.runtime().clone(),
+        bound.guest(),
+        bound.state_format().cloned(),
+        vec![],
+    )
+    .unwrap();
+    let policy = ExecutionPolicy::parse(Some("renamed-initial"), None, &[entry]).unwrap();
+    assert!(!policy.legacy_unbound_allowed());
+    assert_eq!(policy.default_reference(), bound.environment());
+    policy
+        .check_execution(&historical, ExecutionSelectionMode::PersistedStateRestore)
+        .unwrap();
+}

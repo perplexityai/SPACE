@@ -4,8 +4,8 @@ use pplx_space_common_svc::auth::{
     self,
     build::BuildAuthLayer,
     test_support::{
-        TokenReviewStatus, kubeconfig_for_endpoint, projected_token, serve_token_reviews,
-        service_account_status,
+        TokenReviewStatus, kubeconfig_for_endpoint, pod_bound_service_account_status,
+        projected_token, serve_token_reviews,
     },
 };
 use tokio::net::TcpListener;
@@ -1053,32 +1053,12 @@ fn tenant_publication_rollback_preserves_grant_and_concurrent_release_consumes_o
 }
 
 fn reviewed_publisher(account: &str) -> TokenReviewStatus {
-    let mut status = service_account_status(
+    pod_bound_service_account_status(
         "space-cluster-api",
         &format!("system:serviceaccount:space:{account}"),
-    );
-    status.user.as_mut().unwrap().extra = Some(
-        [
-            (
-                "authentication.kubernetes.io/pod-name".into(),
-                vec!["builder-pod".into()],
-            ),
-            (
-                "authentication.kubernetes.io/pod-uid".into(),
-                vec!["builder-pod-uid".into()],
-            ),
-            (
-                "authentication.kubernetes.io/node-name".into(),
-                vec!["publication-builder".into()],
-            ),
-            (
-                "authentication.kubernetes.io/node-uid".into(),
-                vec!["publication-node-uid".into()],
-            ),
-        ]
-        .into(),
-    );
-    status
+        "publication-builder",
+        "publication-node-uid",
+    )
 }
 
 async fn insert_publishing_builder(pool: &sqlx::PgPool) -> TestResult<Uuid> {

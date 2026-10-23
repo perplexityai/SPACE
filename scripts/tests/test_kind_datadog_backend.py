@@ -23,7 +23,7 @@ def vendored_datadog_chart():
     """Vendor the upstream subchart so `helm template` can run.
 
     `charts/` is gitignored, and neither CI nor a fresh clone has run
-    bootstrap.sh or `tilt up`, so the dependency is absent exactly where these
+    `tilt up`, so the dependency is absent exactly where these
     render tests matter most. Skipping instead would make the only guard that
     proves the fail-closed site and dummy-Secret wiring vacuous in CI.
     """
@@ -328,13 +328,13 @@ def test_session_restores_local_on_timeout_or_interrupt(
 
 
 def test_cli_rejects_saas_without_watched_config_before_mutations(tmp_path):
-    # Invalid bootstrap configurations fail before Docker, Kubernetes or builds.
+    # Invalid bring-up configurations fail before Docker, Kubernetes or builds.
     env = {
         **bootstrap_guard_environment(tmp_path),
         "SPACE_KIND_DATADOG_MODE": "saas",
     }
     result = subprocess.run(
-        ["bash", str(KIND_DIR / "scripts/bootstrap.sh"), "--skip-images"],
+        ["bash", str(KIND_DIR / "scripts/up.sh")],
         env=env,
         capture_output=True,
         text=True,

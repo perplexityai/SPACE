@@ -5,8 +5,7 @@
 # kubectl port-forward dies on its own when the target pod restarts (e.g.,
 # during a chart redeploy) or when node-side gRPC keepalives time out, and a
 # forward that has silently gone away fails whatever later reads its port.
-# bootstrap.sh runs this under `setsid` for every forward it opens. The
-# Tiltfile runs it as the serve_cmd of the forwards to the local observability
+# The Tiltfile runs it as the serve_cmd of the forwards to the local observability
 # backends: install-observability.sh installs those with Helm, not k8s_yaml,
 # so Tilt tracks no pods for them and its own port_forwards cannot reach them.
 #

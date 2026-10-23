@@ -28,22 +28,20 @@
 # pod whose pause container is hijacked by containerd-shim-space-v2 into a
 # Firecracker microVM — the production topology.
 #
-# Prereqs (do once on a fresh machine):
-#   bash infra/space/kind/scripts/install-prereqs.sh
-#   bash infra/space/kind/scripts/install-fc-vendor.sh
-#   # two steps, because inline as `--config "$(...)"` the renderer's failure
-#   # is unchecked and `kind create --config ""` does not error — it builds a
-#   # DEFAULT cluster: one node, no extraMounts, no labels. An assignment
-#   # keeps the exit status, so `&&` stops before kind runs at all.
-#   config="$(bash infra/space/kind/scripts/render-cluster-config.sh)" \
-#     && kind create cluster --config "$config"
-#
-# Then:
-#   tilt up
+# Bring-up, after docs/installation.md's prerequisites:
+#   bash infra/space/kind/scripts/up.sh
+# It creates the cluster, starts `tilt up` on this file detached, and returns
+# once the stack is ready; rerun on a live stack, it reuses that Tilt.
 
 KIND_CLUSTER = os.getenv("SPACE_KIND_CLUSTER", "space-local")
 NAMESPACE = "space"
 allow_k8s_contexts("kind-" + KIND_CLUSTER)
+# allow_k8s_contexts only permits a context; Tilt applies to whichever one the
+# kubeconfig currently names. The bring-up passes `--context`, and anything
+# else is refused before a single command runs against it.
+if k8s_context() != "kind-" + KIND_CLUSTER:
+    fail("Tilt is pointed at context '{}', not kind-{}; start it with `tilt up --context kind-{}` (up.sh does)".format(
+        k8s_context(), KIND_CLUSTER, KIND_CLUSTER))
 
 # A cluster from before the versitygw object store keeps its objects in
 # SeaweedFS; refuse it rather than apply the new charts over it. See "Object
@@ -130,10 +128,10 @@ if config.tilt_subcommand != "down":
     local(["bash", "infra/space/kind/scripts/install-observability.sh"])
 
 if TELEMETRY_MODE == "otel":
-    # Each backend on the port its own `local.sh ui` helper uses; bootstrap.sh
-    # forwards the same. Tilt does not deploy these releases, so it tracks no
-    # pods for port_forwards to follow: port-forward.sh holds each forward
-    # instead, restarting it whenever its pod does.
+    # Each backend on the port its own `local.sh ui` helper uses. Tilt does not
+    # deploy these releases, so it tracks no pods for port_forwards to follow:
+    # port-forward.sh holds each forward instead, restarting it whenever its
+    # pod does.
     for name, namespace, mapping, signal in [
         ("prometheus", "space-metrics", "19090:9090", "metrics"),
         ("tempo", "space-traces", "13200:3200", "traces"),
@@ -345,16 +343,21 @@ custom_build(
 # publisher that uploads it to the object store and registers the release through
 # the real ClusterApi RPCs. build-seed.sh skips the privileged rootfs build
 # when its inputs (guest binaries, builder script, recipe, pubkey) are
-# unchanged, so watch-mode rebuilds are cheap unless spaced changed.
+# unchanged, so watch-mode rebuilds are cheap unless spaced changed. One
+# directory for both steps, resolved once: build-seed.sh writes
+# SPACE_SEED_OUTPUT_DIR (default below), and the image is built from what it
+# wrote.
 custom_build(
     ref = "space-seed-publish:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.seed-publish"),
         RUST_ARTIFACT_BUILD,
-        "SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh".format(RUST_ARTIFACT_IMAGE),
+        'seed_dir="${SPACE_SEED_OUTPUT_DIR:-$HOME/.space-devbox/kind/seed/build}"',
+        'SPACE_SEED_OUTPUT_DIR="$seed_dir" SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh'.format(
+            RUST_ARTIFACT_IMAGE),
         (image_build("space-seed-publish", revision_label = True) + " -t $EXPECTED_REF " +
-         "--build-context seed=$HOME/.space-devbox/kind/seed/build ."),
+         '--build-context seed="$seed_dir" .'),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
             "templates/firecracker/seed",
@@ -392,17 +395,20 @@ custom_build(
     skips_local_docker = False,
 )
 
-# UI: no rust, single Dockerfile. NEXT_PUBLIC_API_URL must be passed at
-# BUILD time — Next.js evaluates rewrites in next.config.js once at build
-# and freezes the result in .next/required-server-files.json. Runtime env
-# overrides are ignored.
+# UI: no rust, single Dockerfile. NEXT_PUBLIC_API_URL and
+# NEXT_PUBLIC_DATA_PLANE_URL must be passed at BUILD time — Next.js evaluates
+# rewrites in next.config.js once at build and freezes the result in
+# .next/required-server-files.json. Runtime env overrides are ignored. Both
+# name the in-cluster Services: the Dockerfile's localhost defaults would point
+# the UI pod's session proxy at itself.
 custom_build(
     ref = "space-ui:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.ui"),
         (image_build("space-ui", revision_label = True) + " -t $EXPECTED_REF " +
-         "--build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 ."),
+         "--build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 " +
+         "--build-arg NEXT_PUBLIC_DATA_PLANE_URL=http://space-data-plane:8090 ."),
     ]),
     deps = ["docker/Dockerfile.ui", "ui"],
     skips_local_docker = False,
@@ -418,10 +424,10 @@ custom_build(
 # installed that binary on each sandbox worker (the `install-space-shim`
 # bootstrap resource below, full harness only).
 
-# Namespace + RuntimeClass live in infra/space/kind/manifests/ so the scripted
-# bootstrap (infra/space/kind/scripts/bootstrap.sh) and tilt up share one
-# source of truth. NAMESPACE above must stay "space" — the manifest file
-# hardcodes that name and the charts default to it. The same file creates
+# Namespace + RuntimeClass live in infra/space/kind/manifests/, which the
+# resources below also apply before they need the namespace. NAMESPACE above
+# must stay "space" — the manifest file hardcodes that name and the charts
+# default to it. The same file creates
 # `sandboxes`, the charts' k8s.sandboxNamespace, where the API creates the
 # per-sandbox pods.
 k8s_yaml("infra/space/kind/manifests/namespace.yaml")
@@ -564,10 +570,13 @@ local_resource(
 def helm_release(name, chart, values = []):
     return helm(chart, name = name, namespace = NAMESPACE, values = values, set = CHART_SET)
 
-# Both entry points use a fresh, shared render for backend transitions.
-# Fake mode never consumes SaaS credentials; SaaS uses an existing Secret only.
+# A fresh render on every evaluation, so a backend transition never reuses the
+# other backend's values. Fake mode never consumes SaaS credentials; SaaS uses
+# an existing Secret only.
 if DATADOG_MODE != "off":
     DATADOG_CHART = "infra/space/kind/charts/datadog-agent-local"
+    # install-observability.sh, above, has already refused an Agent this
+    # harness did not deploy (its guard-owner step runs in every profile).
     local("helm repo add datadog https://helm.datadoghq.com --force-update", quiet = True)
     local("helm dependency build {}".format(DATADOG_CHART), quiet = True)
     # Helm rewrites charts/ and tmpcharts-* during dependency builds. Watching
@@ -601,7 +610,7 @@ SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
 # space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
 # across the autoscaled replicas as a deployment's load balancer does.
 # values-kind.yaml carries the bench's non-test-hook overrides, which the
-# caller-provided-cluster chart must not inherit; bootstrap.sh passes it too.
+# caller-provided-cluster chart must not inherit.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local",
                       values = ["infra/space/kind/charts/space-api-local/values-kind.yaml"]))
 k8s_resource(
@@ -634,8 +643,7 @@ k8s_resource(
 )
 
 # The Kind user stays locked in shared migrations. Provision only after the
-# API pod finishes migrations; this also covers clusters brought up by Tilt
-# without running the scripted bootstrap first.
+# API pod finishes migrations.
 local_resource(
     "provision-local-console",
     cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/provision-local-console.sh".format(KIND_CLUSTER),
@@ -667,8 +675,38 @@ k8s_yaml(helm_release("space", "infra/space/kind/charts/space-credmgr-authority-
 k8s_resource(
     "space-credmgr-authority",
     labels = ["control-plane"],
-    resource_deps = ["space-api", "label-kind-infra"],
+    resource_deps = ["space-api", "label-kind-infra"] + (["space-aws-creds"] if STORAGE_CREDENTIALS == "static" else []),
 )
+# Optional credentials for the authority's own AWS integrations, such as AWS
+# Secrets Manager network-credential references: the `space-aws-creds` Secret,
+# from the AWS_* variables and SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN in Tilt's
+# environment, when AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set. Only
+# with static storage credentials: the chart reads the Secret in that mode
+# alone (see "Object-store credentials" in infra/space/kind/README.md), so in
+# exchange mode nothing is copied into the cluster. Sandbox-account,
+# short-lived credentials only. The chart reads it at pod start, and Tilt reads
+# its environment once, so rotating them means restarting Tilt (up.sh does when
+# they changed) and then the authority. Fed to kubectl on stdin so the values
+# stay off every command line.
+if STORAGE_CREDENTIALS == "static":
+    local_resource(
+        "space-aws-creds",
+        cmd = """
+set -eu
+if [ -z "${{AWS_ACCESS_KEY_ID:-}}" ] || [ -z "${{AWS_SECRET_ACCESS_KEY:-}}" ]; then
+  echo "AWS credentials unset; the authority's optional AWS integrations stay disabled"
+  exit 0
+fi
+kubectl --context kind-{cluster} apply -f infra/space/kind/manifests/namespace.yaml >/dev/null
+printf 'AWS_ACCESS_KEY_ID=%s\\nAWS_SECRET_ACCESS_KEY=%s\\nAWS_SESSION_TOKEN=%s\\nSPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN=%s\\n' \\
+  "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "${{AWS_SESSION_TOKEN:-}}" "${{SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN:-}}" \\
+  | kubectl --context kind-{cluster} -n {ns} create secret generic space-aws-creds --from-env-file=/dev/stdin \\
+      --dry-run=client -o yaml \\
+  | kubectl --context kind-{cluster} apply -f -
+""".format(cluster = KIND_CLUSTER, ns = NAMESPACE),
+        allow_parallel = True,
+        labels = ["bootstrap"],
+    )
 # The authority's external key provider: the Kind-only intermediate-key broker
 # fixture, whose derived keys survive restarts of either side.
 k8s_yaml(helm("infra/space/kind/charts/space-kind-key-broker", name = "space", namespace = NAMESPACE,
@@ -777,7 +815,7 @@ k8s_resource(
 # that. Inherited from the environment so `SPACE_LOOP_DEVICE_TARGET=128 tilt up`
 # reaches the pod; unset renders nothing and the default applies.
 LOOP_DEVICE_TARGET = os.getenv("SPACE_LOOP_DEVICE_TARGET", "")
-# The release list is shared with bootstrap.sh and the smoke bring-up.
+# The release list is shared with the bring-up's DaemonSet waits.
 NODE_RELEASES = str(local(["bash", "infra/space/kind/lib/node-services.sh", "releases"], quiet = True)).strip().split("\n")
 watch_file("infra/space/kind/lib/node-services.sh")
 watch_file("infra/space/kind/charts/space-node-service")

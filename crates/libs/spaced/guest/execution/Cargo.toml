@@ -40,6 +40,7 @@ pplx-space-common-grpc = { workspace = true }
 pplx-space-common-svc = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 
 [dev-dependencies]

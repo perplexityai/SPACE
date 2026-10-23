@@ -22,7 +22,7 @@ node: {}
 # for tracked tasks while it holds its service mutex
 # (crates/libs/node/mgr/server/src/run.rs); the kubelet's SIGKILL ends that
 # wait. 60 s is the grace the shared lifecycle defaults are sized against
-# (crates/libs/common/svc/src/lifecycle.rs) and stays inside the successor's
+# (crates/libs/service-lifecycle/src/lib.rs) and stays inside the successor's
 # 180 s mutex wait (--service-mutex-timeout-secs default).
 terminationGracePeriodSeconds: 60
 
@@ -38,8 +38,8 @@ artifactInstalls:
 # The loop-device pool node-manager raises its node to at startup
 # (crates/libs/node/mgr/server/src/loop_devices.rs). Empty means that
 # module's floor of 64, which the node image's space-loop-nodes.service also
-# stages before kubelet. Both bring-up paths map SPACE_LOOP_DEVICE_TARGET onto
-# this value. node-manager reads it only as a test hook
+# stages before kubelet. The Tiltfile maps SPACE_LOOP_DEVICE_TARGET onto this
+# value. node-manager reads it only as a test hook
 # (`loop_devices::override_from_env`), so the release lane (`rustBuild: release`)
 # renders nothing, and its node-managers size the pool from the slot budget; the
 # node image's staging reads its own /etc/space/kind-node.env, not this value.

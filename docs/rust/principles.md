@@ -33,7 +33,7 @@ fn use_sandbox(id: SandboxId) {
 }
 ```
 
-Concretely in SPACE: every domain noun at a wire boundary (HTTP query, JSON body, proto message, CLI arg, env var) is parsed **once** into a type from `crates/libs/common/core/src/types/` (`SandboxId`, `GuestPath`, `IdempotencyKey`, `TemplateName`, `MemorySize`, …) and travels as that type for the rest of the call graph. Strings reappear only when we re-serialize onto another wire.
+Concretely in SPACE: every domain noun at a wire boundary (HTTP query, JSON body, proto message, CLI arg, env var) is parsed **once** into the type its owning crate defines (`SandboxId`, `GuestPath`, `IdempotencyKey`, `TemplateName`, `MemorySize`, …) and travels as that type for the rest of the call graph. Strings reappear only when we re-serialize onto another wire.
 
 The two failure modes this prevents:
 

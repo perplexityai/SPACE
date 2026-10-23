@@ -159,7 +159,7 @@ snapshotReaper:
 # On SIGTERM sandbox-manager drains for up to 25 s before handing its mutex to
 # the successor, then spends up to another 25 s on in-flight RPCs
 # (crates/libs/sbx/mgr/server/src/run.rs): about 50 s, inside the shared
-# lifecycle default grace (crates/libs/common/svc/src/lifecycle.rs).
+# lifecycle default grace (crates/libs/service-lifecycle/src/lib.rs).
 terminationGracePeriodSeconds: 60
 
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).

@@ -220,7 +220,7 @@ impl FilesystemRouter {
         reservation: operations::Reservation,
         command: Command,
         cancelled: CancellationToken,
-        permits: (tokio::sync::OwnedSemaphorePermit, Option<RequestPermit>),
+        permits: (tokio::sync::OwnedSemaphorePermit, RequestPermit),
     ) -> tokio::task::JoinHandle<Result<worker::MutationResult, Status>> {
         #[cfg(target_os = "linux")]
         let router = self.clone();
@@ -292,7 +292,7 @@ impl FilesystemRouter {
         key: Option<pplx_space_common_core::types::IdempotencyKey>,
         kind: Kind,
         command: Command,
-        admission: Option<RequestPermit>,
+        admission: RequestPermit,
     ) -> Result<worker::MutationResult, Status> {
         let reservation = match self.operations.reserve(user.clone(), key, kind).await? {
             Lookup::Replay(result) => return result,
@@ -317,9 +317,10 @@ impl FilesystemRouter {
         &self,
         first: WriteRequest,
         mut incoming: Pin<Box<dyn Stream<Item = Result<WriteRequest, Status>> + Send>>,
-        admission: Option<RequestPermit>,
+        admission: RequestPermit,
     ) -> Result<Response<WriteResponse>, Status> {
         use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
+        crate::payload::check_message(&first, filesystem_limits::MAX_MESSAGE_BYTES)?;
         let Some(Message::Open(open)) = first.message else {
             return Err(Status::invalid_argument("first write message must be open"));
         };
@@ -377,6 +378,7 @@ impl FilesystemRouter {
         let pump = async move {
             while let Some(message) = incoming.next().await {
                 let message = message?;
+                crate::payload::check_message(&message, filesystem_limits::MAX_MESSAGE_BYTES)?;
                 let Some(Message::Data(data)) = message.message else {
                     return Err(Status::invalid_argument("write expects data"));
                 };
@@ -1007,6 +1009,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<StatRequest>,
     ) -> Result<Response<StatResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.stat(request).await,
             #[cfg(target_os = "linux")]
@@ -1024,6 +1027,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<ListRequest>,
     ) -> Result<Response<Self::ListInfoStream>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.list(request).await,
             #[cfg(target_os = "linux")]
@@ -1039,6 +1043,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.read(request).await,
             #[cfg(target_os = "linux")]
@@ -1060,7 +1065,11 @@ impl Filesystem for FilesystemRouter {
         &self,
         mut request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
-        let admission = request.extensions_mut().remove::<RequestPermit>();
+        let admission = crate::payload::acquire(
+            &self.payload_slots,
+            1,
+            request.extensions_mut().remove::<RequestPermit>(),
+        )?;
         let mut incoming = request.into_inner();
         let first = incoming
             .message()
@@ -1074,7 +1083,12 @@ impl Filesystem for FilesystemRouter {
         &self,
         mut request: Request<WriteBatchRequest>,
     ) -> Result<Response<WriteBatchResponse>, Status> {
-        let admission = request.extensions_mut().remove::<RequestPermit>();
+        let admission = crate::payload::admit(
+            &mut request,
+            &self.payload_slots,
+            filesystem_limits::BATCH_REQUEST_WEIGHT,
+            filesystem_limits::MAX_MESSAGE_BYTES,
+        )?;
         let request = request.into_inner();
         if request.entries.len() > pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES {
             return Err(Status::invalid_argument("too many write_batch entries"));
@@ -1105,6 +1119,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<MkdirRequest>,
     ) -> Result<Response<MkdirResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.mkdir(request).await,
             #[cfg(target_os = "linux")]
@@ -1122,6 +1137,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<RemoveRequest>,
     ) -> Result<Response<RemoveResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.remove(request).await,
             #[cfg(target_os = "linux")]
@@ -1139,7 +1155,12 @@ impl Filesystem for FilesystemRouter {
         &self,
         mut request: Request<RenameRequest>,
     ) -> Result<Response<RenameResponse>, Status> {
-        let admission = request.extensions_mut().remove::<RequestPermit>();
+        let admission = crate::payload::admit(
+            &mut request,
+            &self.payload_slots,
+            1,
+            filesystem_limits::MAX_MESSAGE_BYTES,
+        )?;
         let request = request.into_inner();
         let user = self.effective_user(request.user)?;
         let key = Some(require_idempotency_key(request.idempotency_key, "rename")?);
@@ -1161,6 +1182,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<NormalizeWatchRootRequest>,
     ) -> Result<Response<NormalizeWatchRootResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.normalize_watch_root(request).await,
             #[cfg(target_os = "linux")]
@@ -1178,6 +1200,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.watch(request).await,
             #[cfg(target_os = "linux")]
@@ -1193,6 +1216,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<CreateWatcherRequest>,
     ) -> Result<Response<CreateWatcherResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.create_watcher(request).await,
             #[cfg(target_os = "linux")]
@@ -1229,6 +1253,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<GetWatcherEventsRequest>,
     ) -> Result<Response<GetWatcherEventsResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.get_watcher_events(request).await,
             #[cfg(target_os = "linux")]
@@ -1253,6 +1278,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<RemoveWatcherRequest>,
     ) -> Result<Response<RemoveWatcherResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.remove_watcher(request).await,
             #[cfg(target_os = "linux")]
@@ -1296,6 +1322,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<EnableFileChangesRequest>,
     ) -> Result<Response<EnableFileChangesResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.enable_file_changes(request).await,
             #[cfg(target_os = "linux")]
@@ -1316,6 +1343,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<DisableFileChangesRequest>,
     ) -> Result<Response<DisableFileChangesResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.disable_file_changes(request).await,
             #[cfg(target_os = "linux")]
@@ -1335,6 +1363,7 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<GetModifiedFilesRequest>,
     ) -> Result<Response<GetModifiedFilesResponse>, Status> {
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.get_modified_files(request).await,
             #[cfg(target_os = "linux")]

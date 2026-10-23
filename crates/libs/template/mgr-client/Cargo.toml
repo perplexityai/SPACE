@@ -29,7 +29,7 @@ pplx-space-common-grpc = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
-pplx-space-sbx-mgr-client = { workspace = true }
+pplx-space-sbx-mgr-protocol = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

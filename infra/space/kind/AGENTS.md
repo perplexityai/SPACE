@@ -41,9 +41,12 @@ or suites.
 ## Harness invariants
 
 - Every `kubectl` command includes `--context kind-space-local`.
-- Keep `bootstrap.sh` and `build-seed.sh` idempotent. Follow
+- `scripts/up.sh` is the one bring-up: it creates the cluster and starts Tilt
+  on the `Tiltfile`, which owns every build and deploy. Follow
   `docs/installation.md` to provision the harness, then keep the live Tilt
-  cluster for iteration instead of rebuilding it for each change.
+  cluster for iteration instead of rebuilding it for each change; rerun
+  `up.sh` rather than starting a second `tilt up`. Keep `up.sh` and
+  `build-seed.sh` idempotent.
 - Keep the builder node outside `node.kubernetes.io/space-enabled=true`.
 - Do not add Postgres access to node services. Credential state belongs to the
   control-plane `space-credmgr-authority` Deployment; each node's
@@ -54,7 +57,7 @@ or suites.
   authority) is authenticated TLS, as deployed: do not set
   `SPACE_INTERNAL_RPC_INSECURE_DEV` or plaintext flags in Kind charts.
   `scripts/internal-rpc-tls.sh` owns the cluster's CA and listener Secrets;
-  keep it run before workloads in both bring-up paths. The one plaintext hop is
+  keep Tilt running it before workloads. The one plaintext hop is
   the authority's call to the Kind-only `space-kind-key-broker` fixture, which
   has no TLS listener. The authority reaches the Kind-only STS bridge
   (`space-kind-sts-bridge`), and the bridge the object store's IAM service,
@@ -62,7 +65,7 @@ or suites.
   EC2 endpoint (`space-kind-fake-ec2`). Never ship these fixtures outside Kind.
 - Node services run one DaemonSet per service and role from
   `charts/space-<service>-local` on the `space-node-service` library, listed in
-  `lib/node-services.sh` for every bring-up path. Each pod runs the unmodified
+  `lib/node-services.sh`, which the Tiltfile and the bring-up read. Each pod runs the unmodified
   production worker image and launch path under its `node-identities.sh`
   identity, with only the privileges, host namespaces, propagation and
   capabilities its service's code needs, each commented with the code that
@@ -107,7 +110,7 @@ or suites.
 ## Operational boundary
 
 Use teardown only for a task-owned cluster. Deleting `.kind-data` invalidates
-cluster state; delete the Kind cluster first. Both bring-up paths prune
+cluster state; delete the Kind cluster first. Tilt prunes
 superseded SPACE builds from the node stores (`scripts/prune-superseded-images.py`);
 do not run `crictl rmi --prune` inside a node, which also removes SPACE images
 Kind cannot pull back. `docker builder prune` is host-global and requires

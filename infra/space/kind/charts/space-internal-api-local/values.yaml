@@ -144,11 +144,10 @@ visibilityCache:
   # Left EMPTY on purpose, which renders no env var and leaves the binary's own
   # default in force — and that default is OFF.
   #
-  # Note what "set these" means for kind specifically: `infra/space/kind/scripts/
-  # bootstrap.sh` renders this chart with `helm template … | kubectl apply` rather
-  # than `helm install`, so there is no Helm release for it. It passes no `-f`,
-  # and its only `--set` values come from `DD_HELM_ARGS` (Datadog wiring, never
-  # this block), so the only way
+  # Note what "set these" means for kind specifically: the Tiltfile renders this
+  # chart with `helm template` rather than `helm install`, so there is no Helm
+  # release for it. It passes no values file, and its only `--set` values are
+  # the telemetry settings (never this block), so the only way
   # to turn the cache on locally is editing this file. The workload this chart deploys is
   # `<release>-internal-api`, not `cluster-api`.
   #

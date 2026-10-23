@@ -21,14 +21,15 @@ For every wire-boundary parameter, ask: what does this value *mean*? If the answ
 
 ### 2. Reuse, don't fork
 
-Before defining a new type, check:
+Before defining a new type, search the workspace for the crate that owns the concept:
 
-- `crates/libs/common/core/src/types/` — `SandboxId`, `GuestPath`, `IdempotencyKey`, `ProcessUserName`, `TemplateName`, `MemorySize`, …
-- `crates/libs/common/svc/src/types/`
+- the value-type crates — `pplx-space-byte-size` (`MemorySize`, `DiskSize`), `pplx-space-semver`, `pplx-space-durations`, `pplx-space-content-digest`, `pplx-space-cpu-arch`, `pplx-space-k8s-ids`, `pplx-space-cluster-id`, `pplx-space-unix-socket-path`
+- the protocol crates, for wire types (for example `pplx-space-sbx-mgr-protocol`, `pplx-space-node-mgr-protocol`, `pplx-space-net-gateway-protocol`)
+- the service's own crates, for its domain types
 
-Reuse the existing noun. `pplx-space-common-svc` re-exports `pplx-space-common-core` as `core::*`, so one import covers both.
+Reuse the existing noun, imported from the crate that owns it.
 
-If the existing type is *almost* right but needs a field or constructor, **extend it in the common crate** (with tests). Do not fork a parallel local type next to your handler. Forking fragments the vocabulary and forces lossy conversions at every boundary.
+If the existing type is *almost* right but needs a field or constructor, **extend it in the crate that defines it** (with tests). Do not fork a parallel local type next to your handler. Forking fragments the vocabulary and forces lossy conversions at every boundary.
 
 ### 3. If genuinely new, define the newtype canonically
 
@@ -66,7 +67,7 @@ Rules:
 
 - Implement `FromStr`, `TryFrom<&str>`, `Serialize`/`Deserialize` via `try_from`/`into`. This is what makes serde, query parsing, env, and CLI all parse-don't-validate at the boundary.
 - Do **not** implement `Deref<Target = str>`. That re-erases the distinction.
-- Put the type in `common-core` if any second crate could plausibly need it.
+- Put a type a second crate could plausibly need in the existing crate that owns its concept; if none fits, create a small single-responsibility crate named for its responsibility (archcheck's `crate_names` rule bans `common`, `shared`, `util(s)`, `helper(s)`, `misc` and `core`). Do not add it to `common-core` or `common-svc`.
 
 ### 4. Strings → enums
 
@@ -136,7 +137,7 @@ Heuristic: count the `Option<T>` fields on a struct. If two or more are "Some if
 
 For sandbox/template/build lifecycle:
 
-- Define **one** enum in `common-core` (e.g., `SandboxLifecycle`). Do not let a `lifecycle: String` shadow appear in any other crate.
+- Define **one** enum, in the crate that owns that lifecycle (e.g., `SandboxLifecycle`). Do not let a `lifecycle: String` shadow appear in any other crate.
 - Transitions are methods on the enum that consume `self`:
 
 ```rust
@@ -181,7 +182,7 @@ Re-read your diff and check:
 - [ ] No `Option<T>` field is conditional on another field's value (lift to enum).
 - [ ] No `match` over string literals (use an enum).
 - [ ] No new "kind" or "state" stored as `String`.
-- [ ] No parallel local type for a concept that exists in `common-core`/`common-svc`.
+- [ ] No parallel local type for a concept an existing crate already owns.
 - [ ] Every public type has `Debug`.
 - [ ] No `#[serde(other)] Unknown` fallback variants — unknown wire values fail deserialization rather than silently fold into a catch-all.
 - [ ] Public struct fields are private; accessors are provided.

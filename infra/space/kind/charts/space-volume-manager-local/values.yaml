@@ -12,7 +12,7 @@ clusterId: kind-local
 telemetry: {}
 node: {}
 
-# How this service gets object-store credentials, set by every bring-up path
+# How this service gets object-store credentials, set by the Tiltfile
 # from SPACE_KIND_STORAGE_CREDENTIALS (infra/space/kind/lib/storage-credentials.sh):
 # `exchange` through the node's credential-manager agent, or `static` keys.
 storageCredentials: exchange

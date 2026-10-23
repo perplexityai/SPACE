@@ -56,6 +56,9 @@ pub struct AppState {
     /// caller accepts `text/event-stream`; `None` keeps the JSON-only answer.
     pub command_stream: Option<crate::command_stream::CommandStreamProxy>,
     pub feature_flags: pplx_space_feature_flags::FeatureFlagClient,
+    /// Orgs the environment enables for hidden native operations; see
+    /// [`public::hidden_operations`].
+    pub native_hidden_operations: public::hidden_operations::HiddenOperationsGate,
     pub ecw_credential_keyring:
         std::sync::Arc<pplx_space_common_svc::ecw_credential::EcwCredentialKeyring>,
 }
@@ -82,6 +85,8 @@ pub enum AppStateError {
     ClientClassification(#[from] crate::client_classification::ClientClassificationError),
     #[error(transparent)]
     CommandStream(#[from] crate::command_stream::CommandStreamConfigError),
+    #[error(transparent)]
+    NativeHiddenOperations(#[from] public::hidden_operations::HiddenOperationsConfigError),
 }
 
 impl AppState {
@@ -118,6 +123,7 @@ impl AppState {
         let tls_interception_exemptions =
             crate::tls_interception_exemptions::TlsInterceptionExemptions::from_env()?;
         let feature_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
+        let native_hidden_operations = public::hidden_operations::HiddenOperationsGate::from_env()?;
         let client_classification = crate::client_classification::ClientClassification::from_env()?;
         // Cloned into the substrate, which consumes both, so the limiter
         // heartbeats below can still be spawned from the originals.
@@ -178,6 +184,7 @@ impl AppState {
             data_plane_base_url,
             command_stream,
             feature_flags,
+            native_hidden_operations,
             ecw_credential_keyring,
         })
     }
@@ -243,6 +250,13 @@ fn public_api_router(state: AppState) -> Router<AppState> {
             "/openapi-m1.json",
             axum::routing::get(public_docs::m1_openapi_json),
         )
+        .route(
+            "/openapi-full.json",
+            public::with_native_auth(
+                state.clone(),
+                axum::routing::get(public_docs::full_openapi_json),
+            ),
+        )
         .route("/llms.txt", axum::routing::get(public_docs::llms_txt))
         .route(
             "/api/openapi.json",
@@ -251,6 +265,13 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         .route(
             "/api/openapi-m1.json",
             axum::routing::get(public_docs::m1_openapi_json),
+        )
+        .route(
+            "/api/openapi-full.json",
+            public::with_native_auth(
+                state.clone(),
+                axum::routing::get(public_docs::full_openapi_json),
+            ),
         )
         .route("/api/llms.txt", axum::routing::get(public_docs::llms_txt))
         .nest("/v1", public_v1_router(state.clone()))

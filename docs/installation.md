@@ -10,11 +10,11 @@ This guide covers the Kubernetes-based local setup, not a Kubernetes-free deploy
 
 ## Prepare your environment
 
-Use an apt-based **Linux x86_64 host with KVM**. The host needs `/dev/kvm`, `/dev/net/tun`, loop devices, btrfs support, and a local Docker daemon that permits privileged containers. A VM must expose the required devices and support nested virtualization; these instructions do not run directly on macOS.
+Use an apt-based **Linux x86_64 host with KVM**. The host needs `/dev/kvm`, `/dev/net/tun`, loop devices, btrfs support, and a local Docker daemon that permits privileged containers. A VM must expose the required devices and support nested virtualization; these instructions do not run directly on macOS. Keep at least 30 GiB free on the filesystem holding Docker's data root and on the one holding your home directory, where each Kind node keeps its images under `~/.kind-data`; the bring-up warns below that, and image builds can fail part-way.
 
 Start with Bash, Git, curl, tar, OpenSSL, Python 3.8 or newer, and `ssh-keygen`. The prerequisite installer needs root or non-interactive sudo to install system packages.
 
-Setup uses the existing [prerequisite installer](../infra/space/kind/scripts/install-prereqs.sh), [Firecracker installer](../infra/space/kind/scripts/install-fc-vendor.sh), and [bootstrap script](../infra/space/kind/scripts/bootstrap.sh). The steps below configure and run them in order.
+Setup uses the existing [prerequisite installer](../infra/space/kind/scripts/install-prereqs.sh), [Firecracker installer](../infra/space/kind/scripts/install-fc-vendor.sh), and [bring-up command](../infra/space/kind/scripts/up.sh). The steps below configure and run them in order.
 
 ### Use Bash and keep the session alive
 
@@ -111,7 +111,7 @@ This deployment uses development passwords and signing keys. Keep it private and
 
 ## Install and verify tools
 
-Run the prerequisite installer before bootstrap. It supplies Kind, kubectl, Helm, grpcurl, Tilt, Go, and Linux support tools including jq; bootstrap does not install missing host tools.
+Run the prerequisite installer before bringing the stack up. It supplies Kind, kubectl, Helm, grpcurl, Tilt, Go, and Linux support tools including jq, lsof, and the AWS CLI; the bring-up does not install missing host tools.
 
 The following also adds the installation directory to your Bash startup files. It preserves existing configuration and avoids adding the same PATH entry repeatedly.
 
@@ -186,15 +186,15 @@ env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 
 ## Build and deploy
 
-The first build compiles the Rust workspace and builds the seed template.
+The bring-up creates the Kind cluster, then starts [Tilt](https://tilt.dev/) in the background on the repository's `Tiltfile`. Tilt builds every image, deploys every chart, and publishes the seed template. The command returns once Tilt has nothing left to build, every workload has rolled out, `seed:latest` is published, and every node is registered and schedulable. The first build compiles the Rust workspace and builds the seed template.
 
 Continue in the same shell, checkout, and Docker environment.
 
-Do not configure cloud or telemetry credentials for this setup. Clear any inherited values below: bootstrap otherwise copies AWS and Datadog credentials from the shell into cluster secrets.
+Do not configure cloud credentials for this setup. Clear any inherited AWS credentials below: with `SPACE_KIND_STORAGE_CREDENTIALS=static` the bring-up copies them from the shell into a cluster Secret, for optional integrations this guide does not use. The default mode does not copy them.
 
 A fresh setup has three users in the Local organization: `root@local` and `deploy@local` have the `organization_admin` role, and `dev@local` has the `member` role. `root@local` can sign in to both the API and Admin Console. `deploy@local` and `dev@local` cannot sign in by default; an admin must [set their passwords](#activate-the-other-local-users-optional) to enable login.
 
-Bootstrap sets the initial `root@local` password to `password` unless `SPACE_CONSOLE_PASSWORD` is set. To choose one without putting it in shell history, run this optional command in the same shell before the deployment block:
+The bring-up sets the initial `root@local` password to `password` unless `SPACE_CONSOLE_PASSWORD` is set. To choose one without putting it in shell history, run this optional command in the same shell before the deployment block:
 
 ```bash
 read -rsp 'Initial root@local password: ' SPACE_CONSOLE_PASSWORD
@@ -202,11 +202,10 @@ printf '\n'
 export SPACE_CONSOLE_PASSWORD
 ```
 
-Bootstrap does not print or retain the password in a Kubernetes Secret. It sets the password only while the account is locked; rerunning bootstrap does not change an existing password.
+The bring-up does not print or retain the password in a Kubernetes Secret. It sets the password only while the account is locked; rerunning the bring-up does not change an existing password.
 
 ```bash
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-unset DD_API_KEY EPPO_SDK_KEY
 
 export SPACE_VENDOR_ROOT="$HOME/.local/share/space/vendor"
 export SPACE_KIND_CLUSTER=space-local
@@ -215,22 +214,26 @@ export SPACE_KIND_CLUSTER=space-local
   set -euo pipefail
 
   time bash infra/space/kind/scripts/install-fc-vendor.sh
-  time bash infra/space/kind/scripts/bootstrap.sh
+  time bash infra/space/kind/scripts/up.sh
 )
 ```
 
-Each timed command prints its elapsed duration as `real`. Bootstrap builds and publishes the seed template and deploys the cluster workloads. The API and data plane are reachable on loopback through the cluster's own port mappings, which spread connections across their replicas as a load balancer does; the UI and object storage get loopback-only port forwards:
+Each timed command prints its elapsed duration as `real`. While the bring-up runs, the Tilt UI at `http://localhost:10350` shows each build and rollout; `~/.space-devbox/kind/tilt-space-local.log` has Tilt's full log. When it finishes, the command prints a summary of the endpoints below.
+
+Tilt keeps running after the command returns, and redeploys whatever changes in the checkout. Running the command again on a live stack reuses that Tilt and returns once the stack has settled; it restarts Tilt only when Tilt was started with other settings. [Remove the local deployment](#remove-the-local-deployment) stops it.
+
+The API and data plane are reachable on loopback through the cluster's own port mappings, which spread connections across their replicas as a load balancer does; Tilt holds loopback-only port forwards to the UI and object storage:
 
 | Service | Local port | Reached through |
 |---|---|---|
 | API | `8080` | cluster port mapping |
 | Data plane | `8090` | cluster port mapping |
-| UI | `3000` | port forward |
-| Object storage | `8333` | port forward |
+| UI | `3000` | Tilt port forward |
+| Object storage | `8333` | Tilt port forward |
 
-If either API or data-plane port refuses connections, confirm bootstrap reached its final summary; the [local installation troubleshooting steps](troubleshooting.md#local-installation) cover what to check.
+If either API or data-plane port refuses connections, confirm the bring-up reached its final summary; the [local installation troubleshooting steps](troubleshooting.md#local-installation) cover what to check.
 
-Tilt is optional for this API walkthrough, but some smoke tests start it automatically in the background. Starting Tilt can replace pods and briefly interrupt the UI and object-storage port forwards; see [Troubleshoot setup](#troubleshoot-setup) before interpreting an empty reply as an authentication problem.
+When Tilt redeploys a workload, it replaces pods, which can briefly interrupt the UI and object-storage port forwards; see [Troubleshoot setup](#troubleshoot-setup) before interpreting an empty reply as an authentication problem.
 
 <a id="configuration"></a>
 
@@ -245,7 +248,7 @@ Keep installation settings consistent across steps. The guide explicitly sets th
 | `SPACE_KIND_CLUSTER` | Explicitly set to `space-local` | Kind cluster name; context is `kind-space-local`. |
 | `SPACE_CONSOLE_PASSWORD` | Defaults to `password` when unset | Initial `root@local` login password for a locked account. |
 | `SPACE_KIND_DATA_ROOT` | Defaults to `$HOME/.kind-data` when not already set | Host-side backing storage for node containerd data. This guide does not override it. |
-| `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `600` seconds when not already set | Bootstrap's per-release wait, not a sandbox or command timeout. |
+| `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `1800` seconds when not already set | The longest each wait of the bring-up may take: Tilt's start, the first build and the API, each Job, each rollout (the Datadog Agent's included), and node publication. A positive number of seconds. Not a sandbox or command timeout. |
 
 The examples use the following client settings. Changing a client URL does not change the server listener or the port that reaches it.
 
@@ -256,16 +259,20 @@ The examples use the following client settings. Changing a client URL does not c
 | `SPACE_TEMPLATE` | `seed:latest` | Template selected when creating a sandbox. |
 | `SPACE_API_TOKEN` | Returned by login | Authorization for management requests. |
 
-If you change the cluster name, update the explicit Kubernetes contexts in these examples. Keep management requests and event-stream requests on their respective ports.
-
-## Verify the installation
-
-Running pods alone do not mean that `seed:latest` is available. Wait for the seed publication job and the rollout of every node-service DaemonSet before creating a sandbox. Each node service (node-manager, sandbox-manager, template-manager and the rest) runs as its own DaemonSet, as in production; `infra/space/kind/lib/node-services.sh` lists them.
+Set the two URLs in this shell; the steps below and the next guide read them:
 
 ```bash
 export SPACE_API_URL=http://127.0.0.1:8080
 export SPACE_DATA_PLANE_URL=http://127.0.0.1:8090
+```
 
+If you change the cluster name, update the explicit Kubernetes contexts in these examples. Keep management requests and event-stream requests on their respective ports.
+
+## Verify the installation
+
+Running pods alone do not mean that `seed:latest` is available. The bring-up returned only after the seed publication job completed and every node-service DaemonSet rolled out; this block confirms both and checks the API. Each node service (node-manager, sandbox-manager, template-manager and the rest) runs as its own DaemonSet, as in production; `infra/space/kind/lib/node-services.sh` lists them.
+
+```bash
 (
   set -euo pipefail
 
@@ -291,14 +298,19 @@ Proceed when the seed job reports `condition met`, the rollout succeeds, and the
 
 ## Authenticate
 
-A fresh Kind deployment uses `root@local` and the bootstrap-selected password (`password` by default). If the password has changed since bootstrap, use the current value; redeploying does not reset an existing password.
+A fresh Kind deployment uses `root@local` and the password selected before the bring-up (`password` by default). If the password has changed since then, use the current value; redeploying does not reset an existing password.
 
-The helper obtains a bearer token and verifies it by listing sandboxes. A failed login clears any previous token rather than silently reusing it.
+The helper obtains a bearer token and verifies it by listing sandboxes. A failed login clears any previous token rather than silently reusing it. It uses `SPACE_API_URL` from [Configure your environment](#configuration).
 
 ```bash
 set +x
 
 authenticate() {
+  if [[ -z "${SPACE_API_URL:-}" ]]; then
+    printf 'Set SPACE_API_URL first; see Configure your environment.\n' >&2
+    return 1
+  fi
+
   SPACE_API_TOKEN="$(
     SPACE_CONSOLE_PASSWORD="${SPACE_CONSOLE_PASSWORD:-password}" \
       jq -nc '{email:"root@local",password:env.SPACE_CONSOLE_PASSWORD}' |
@@ -443,7 +455,7 @@ An empty reply can mean a replica was replaced mid-request or a port forward is 
 
 ## Remove the local deployment
 
-Teardown stops the Tilt watcher for this cluster automatically, including one started in the background by a smoke test. If you started `tilt up` yourself in the foreground, stop that session with Ctrl-C first.
+Teardown stops the Tilt watcher for this cluster automatically, whether the bring-up or a smoke test started it. If you started `tilt up` yourself in the foreground, stop that session with Ctrl-C first.
 
 The script removes the cluster and its workloads while preserving host-side image caches, vendor files, seed artifacts, and the generated SSH keypair. Run it from the checkout and confirm that `space-local` no longer appears in the cluster list.
 

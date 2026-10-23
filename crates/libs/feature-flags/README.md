@@ -131,7 +131,7 @@ their last known values across a daemon restart.
 
 ## The flags SPACE reads
 
-Six keys. The **subject** is what a percentage rollout hashes, so it decides
+Eight keys. The **subject** is what a percentage rollout hashes, so it decides
 what a fractional rule splits on; the **attributes** are what a targeting rule
 can match on beyond the subject.
 
@@ -143,6 +143,7 @@ can match on beyond the subject.
 | `space-net-gateway-known-egress-domains` | JSON object | sandbox id | none | the deployment's local list |
 | `space-cluster-api-client-side-balancing` | boolean | `sandbox:`/`session:`/`org:` prefixed id | `cluster_id` | off |
 | `space-native-create-pool-claim` | boolean | constant `space-cluster` | none | off |
+| `space-native-hidden-operations` | boolean | SPACE org id | `operation_id` | off |
 | `space-snapshot-retention-config` | JSON object | cluster id | none | env-configured limits |
 
 Each fallback is chosen so that losing the flag backend cannot turn a
@@ -151,6 +152,13 @@ that would enable new behavior fall back **off**. All three JSON keys fall back
 to whatever their deployment configured locally rather than to a value chosen
 here, because an override that resolves nothing should leave local
 configuration standing — see `policy::override_allowed`.
+
+`space-native-hidden-operations` opens hidden native operations to an org, so
+its env master, `SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED` (on by default),
+is how a deployment closes every org the flag opened without touching the flag
+source. Orgs listed in `SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS` stay open either
+way. Its subject is SPACE's own org id: for a federated owner, the org SPACE
+materialized for it, not the upstream org id the integrator sends.
 
 Sandbox-fork admission is controlled solely by `SPACE_SANDBOX_FORK_ENABLED`,
 which defaults to `true`. Set it to `false` on the API service and redeploy to
@@ -174,6 +182,7 @@ rather than an accident:
   lands in the same bucket every time, so a ramp never re-rolls a sandbox it
   already admitted.
 - **A cluster id** lets one cluster be retuned without touching the others.
+- **An org id** opens a feature to one tenant at a time.
 - **`<cluster_id>/<node_name>`** qualifies the host, so identical private DNS
   names in different clusters do not collide into one bucket. No sandbox,
   guest, or manager-pod identity enters the decision.

@@ -318,7 +318,7 @@ class GuideTests(unittest.TestCase):
                 self.assertTrue((build.ROOT / path).is_file(), link)
                 found.add(path)
         self.assertIn("examples/first_sandbox.py", found)
-        self.assertIn("infra/space/kind/scripts/bootstrap.sh", found)
+        self.assertIn("infra/space/kind/scripts/up.sh", found)
         self.assertIn("crates/libs/api/src/controllers/substrate/direct.rs", found)
 
     def test_search_index_targets(self):

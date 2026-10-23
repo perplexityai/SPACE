@@ -732,7 +732,9 @@ pub async fn apply_custom_sandbox_action(
             .await
             .map(IntoResponse::into_response);
     }
-    let (sandbox_id, action) = parse_action_segment(&sandbox_id_and_action)?;
+    let (sandbox_id, action) = parse_action_segment(&sandbox_id_and_action, |operation| {
+        super::hidden_operations::visible(&state, org.id, operation)
+    })?;
     let rollback = rollback_request(action, &body)?;
     enqueue_lifecycle_operation(
         &state.pool,
@@ -912,7 +914,12 @@ async fn enqueue_lifecycle_operation(
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
-fn parse_action_segment(value: &str) -> Result<(&str, SandboxLifecycleAction), PublicApiError> {
+/// `visible` decides whether the caller may use an action's operation; a
+/// hidden one answers exactly as an unknown action does.
+fn parse_action_segment(
+    value: &str,
+    visible: impl FnOnce(native_routes::NativeOperation) -> bool,
+) -> Result<(&str, SandboxLifecycleAction), PublicApiError> {
     let Some((sandbox_id, action)) = value.rsplit_once(':') else {
         return Err(PublicApiError::bad_request(
             "sandbox action path must use /v1/sandboxes/{sandbox_id}:action",
@@ -929,6 +936,9 @@ fn parse_action_segment(value: &str) -> Result<(&str, SandboxLifecycleAction), P
         return Err(PublicApiError::bad_request(
             "delete uses DELETE /v1/sandboxes/{sandbox_id}",
         ));
+    }
+    if !visible(lifecycle_operation(action)) {
+        return Err(PublicApiError::bad_request("invalid sandbox action"));
     }
     Ok((sandbox_id, action))
 }
@@ -1241,21 +1251,27 @@ fn lifecycle_method(action: SandboxLifecycleAction) -> HttpOperationMethod {
 }
 
 fn lifecycle_path_template(action: SandboxLifecycleAction) -> OperationPathTemplate {
-    OperationPathTemplate::new(match action {
-        SandboxLifecycleAction::Start => native_routes::START_SANDBOX.path(),
-        SandboxLifecycleAction::Stop => native_routes::STOP_SANDBOX.path(),
-        SandboxLifecycleAction::Pause => native_routes::PAUSE_SANDBOX.path(),
-        SandboxLifecycleAction::Resume => native_routes::RESUME_SANDBOX.path(),
-        SandboxLifecycleAction::Suspend => native_routes::SUSPEND_SANDBOX.path(),
-        SandboxLifecycleAction::Restore => native_routes::RESTORE_SANDBOX.path(),
-        SandboxLifecycleAction::Wake => native_routes::WAKE_SANDBOX.path(),
-        SandboxLifecycleAction::Kill => native_routes::KILL_SANDBOX.path(),
-        SandboxLifecycleAction::Checkpoint => native_routes::CHECKPOINT_SANDBOX.path(),
-        SandboxLifecycleAction::EnableSnapshots => native_routes::ENABLE_SANDBOX_SNAPSHOTS.path(),
-        SandboxLifecycleAction::DisableSnapshots => native_routes::DISABLE_SANDBOX_SNAPSHOTS.path(),
-        SandboxLifecycleAction::Rollback => native_routes::ROLLBACK_SANDBOX.path(),
-        SandboxLifecycleAction::Delete => native_routes::DELETE_SANDBOX.path(),
-    })
+    OperationPathTemplate::new(lifecycle_operation(action).path())
+}
+
+pub(super) fn lifecycle_operation(
+    action: SandboxLifecycleAction,
+) -> native_routes::NativeOperation {
+    match action {
+        SandboxLifecycleAction::Start => native_routes::START_SANDBOX,
+        SandboxLifecycleAction::Stop => native_routes::STOP_SANDBOX,
+        SandboxLifecycleAction::Pause => native_routes::PAUSE_SANDBOX,
+        SandboxLifecycleAction::Resume => native_routes::RESUME_SANDBOX,
+        SandboxLifecycleAction::Suspend => native_routes::SUSPEND_SANDBOX,
+        SandboxLifecycleAction::Restore => native_routes::RESTORE_SANDBOX,
+        SandboxLifecycleAction::Wake => native_routes::WAKE_SANDBOX,
+        SandboxLifecycleAction::Kill => native_routes::KILL_SANDBOX,
+        SandboxLifecycleAction::Checkpoint => native_routes::CHECKPOINT_SANDBOX,
+        SandboxLifecycleAction::EnableSnapshots => native_routes::ENABLE_SANDBOX_SNAPSHOTS,
+        SandboxLifecycleAction::DisableSnapshots => native_routes::DISABLE_SANDBOX_SNAPSHOTS,
+        SandboxLifecycleAction::Rollback => native_routes::ROLLBACK_SANDBOX,
+        SandboxLifecycleAction::Delete => native_routes::DELETE_SANDBOX,
+    }
 }
 
 /// The one `{sandbox_id}` parser for the native API: `owner_scope` and every

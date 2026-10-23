@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # rust-build.sh — which Rust binaries the Kind harness builds and deploys,
 # selected by SPACE_KIND_RUST_BUILD for every bring-up path (the Tiltfile,
-# bootstrap.sh, build-rust-artifacts.sh and the smoke bring-up):
+# build-rust-artifacts.sh and the bring-up up.sh and the smoke suites share):
 #
 #   test-hooks  (default) every crate's `test-hooks` feature is compiled in, so
 #               the hooks the charts set (`pplx_space_common_core::env::test_hook`)

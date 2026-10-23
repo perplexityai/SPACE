@@ -96,6 +96,6 @@ def bootstrap_guard_environment(tmp_path: Path) -> dict[str, str]:
     commands = tmp_path / "bin"
     commands.mkdir()
     marker = shlex.quote(str(tmp_path / "unexpected-operation"))
-    for name in ("docker", "kind", "kubectl", "helm", "openssl"):
+    for name in ("docker", "kind", "kubectl", "helm", "openssl", "tilt"):
         stub_command(commands, name, f"printf '%s\\n' {name} >> {marker}\nexit 99")
     return {"HOME": str(home), "PATH": f"{commands}:{os.environ['PATH']}"}

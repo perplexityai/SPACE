@@ -429,7 +429,7 @@ async fn an_endpoint_without_a_dial_bound_is_redialed_at_the_default_one() {
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}")).unwrap();
     assert_eq!(endpoint.get_connect_timeout(), None);
 
-    let retries = pplx_space_metrics::test_capture::capture_counters_guard();
+    let retries = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         super::connect_tcp_channel_with_retry(
@@ -717,6 +717,7 @@ fn is_marked(status: &tonic::Status) -> bool {
     status_chain(status).any(|error| error.is::<crate::ConnectPhaseError>())
 }
 
+#[cfg(target_os = "linux")]
 fn has_io_error(status: &tonic::Status, kind: std::io::ErrorKind) -> bool {
     status_chain(status).any(|error| {
         error

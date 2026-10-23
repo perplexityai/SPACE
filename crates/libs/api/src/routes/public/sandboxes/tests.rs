@@ -1093,12 +1093,12 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
 fn action_segment_parses_colon_custom_method_suffix() {
     let sandbox_id = PublicSandboxId::new().to_string();
     let segment = format!("{sandbox_id}:pause");
-    let (parsed_id, action) = parse_action_segment(&segment).unwrap();
+    let (parsed_id, action) = parse_action_segment(&segment, |_| true).unwrap();
 
     assert_eq!(parsed_id, sandbox_id);
     assert_eq!(action, SandboxLifecycleAction::Pause);
-    parse_action_segment(&sandbox_id).unwrap_err();
-    parse_action_segment(&format!("{sandbox_id}:delete")).unwrap_err();
+    parse_action_segment(&sandbox_id, |_| true).unwrap_err();
+    parse_action_segment(&format!("{sandbox_id}:delete"), |_| true).unwrap_err();
 }
 
 #[test]

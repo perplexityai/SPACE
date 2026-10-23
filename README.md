@@ -61,7 +61,7 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory target/docs/site
 
 Open <http://127.0.0.1:8000>. The build also requires Git and Python 3.11+. The standalone commands remain `bash scripts/build-guide-docs.sh` and `bash scripts/build-api-docs.sh`; they also support local uncommitted edits.
 
-The API serves its generated reference at `/openapi-m1.json`, with request fields, response schemas, and errors.
+The API serves its generated reference at `/openapi-m1.json`, with request fields, response schemas, and errors. `/openapi.json` adds the incubating operations that are not hidden. Some incubating operations, including snapshots, checkpoint, and rollback, are hidden: unless the deployment enables them for your organization, they answer as if they did not exist. Neither document lists them for any caller; `/openapi-full.json` documents every operation and requires API credentials.
 
 ## SPACE API
 
@@ -73,7 +73,7 @@ SPACE is implemented in Rust, but applications interact with it over HTTP and se
 
 See [DEPENDENCIES.md](DEPENDENCIES.md) when adding or updating third-party code.
 
-After [local installation](docs/installation.md), run `tilt up` from the repository root to rebuild affected images and roll their workloads as files change. The [Kind runbook](infra/space/kind/README.md) covers this development loop, local topology, and template builds.
+After [local installation](docs/installation.md), the Tilt watcher that `up.sh` started keeps running: it rebuilds affected images and rolls their workloads as files change. Rerun `up.sh` to wait for the stack to settle again; do not start a second `tilt up`. The [Kind runbook](infra/space/kind/README.md) covers this development loop, local topology, and template builds.
 
 Use focused unit tests for component logic and the [Kind smoke suites](infra/space/kind/README.md#smoke-test) for runtime behavior. For setup-specific diagnostics, see [host-path troubleshooting](infra/space/kind/README.md#host-paths-and-running-as-a-user-other-than-dev) and [template-build debugging](infra/space/kind/README.md#debugging-a-template-build).
 

@@ -657,14 +657,18 @@ impl SandboxManagerService {
         let id = &sandbox.id;
         let original_state = sandbox.state;
         let mut uuid8 = sandbox.uuid8.clone();
+        let cache_root = std::path::Path::new(CACHE_DIR);
+        #[cfg(test)]
+        let cache_root = self.create_cache_dir.as_deref().unwrap_or(cache_root);
         let prepare_source = start_stage_timeout(
             "restore.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             id,
-            template_source_for_sandbox_prepare(
+            template_source_for_sandbox_prepare_in(
                 &self.node_manager,
                 self.template_resolver.as_ref(),
                 sandbox,
+                cache_root,
             ),
         )
         .await?;
@@ -709,12 +713,27 @@ impl SandboxManagerService {
             Self::node_sandbox_memory_policy(&mut node_client),
         )
         .await?;
-        let snapshot_dir = format!("{CACHE_DIR}/{id}/snapshot");
+        let snapshot_dir = cache_root
+            .join(id)
+            .join("snapshot")
+            .to_string_lossy()
+            .into_owned();
         let snapshot_execution = checkpoint_execution_metadata(&snapshot_dir)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let cpu_budget = restore_cpu_budget(vcpu, snapshot_execution.cpu_budget())?;
         let metadata_json = activation_metadata_json(sandbox, cpu_budget)?;
-        let requested_execution = snapshot_execution.into_execution();
+        let producer_execution = snapshot_execution.into_execution();
+        let requested_execution = start_stage_timeout(
+            "restore.select_consumer",
+            START_NODE_METADATA_TIMEOUT,
+            id,
+            super::environment_selection::select_with_client(
+                &mut node_client,
+                &producer_execution,
+                pplx_space_node_mgr_client::proto::ExecutionEnvironmentSelection::Restore,
+            ),
+        )
+        .await?;
         let snapshot_memory_mib = ensure_snapshot_memory_allowed(
             snapshot_memory_file_mib(&snapshot_dir)?,
             node_memory_policy.guest_memory_max_mib,
@@ -807,6 +826,16 @@ impl SandboxManagerService {
                 interrupted_reason: "restore activation did not complete",
             },
         )?;
+
+        // Commit the consumer before Prepare can rewrite disk metadata. The
+        // checkpoint manifest remains producer evidence; a cancelled attempt
+        // retains the consumer for a later cold start. Another restore attempt
+        // selects again from the unchanged checkpoint producer.
+        {
+            let db = self.db_conn()?;
+            crate::db::upsert_sandbox_execution_metadata(&db, id, &requested_execution)
+                .map_err(|error| Status::internal(format!("persist restore consumer: {error}")))?;
+        }
 
         // Allocate network slot
         let execution_fence = read_node_execution_fence(&self.db, id)?.ok_or_else(|| {

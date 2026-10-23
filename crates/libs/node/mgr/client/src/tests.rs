@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn snapshot_pages_retry_admission_without_losing_the_cursor_or_treating_errors_as_eof() {
-    pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
+    pplx_space_tokio_runtime::build_multi_thread_runtime()
         .unwrap()
         .block_on(async {
             let mut pages = SnapshotPages::new(SandboxId::new(), false);

@@ -350,3 +350,25 @@ async fn unhandled_429_keeps_its_retry_after_when_normalized() {
     assert!(envelope.retryable);
     assert_eq!(envelope.request_id.as_deref(), Some(REQUEST_ID));
 }
+
+/// Replaying the create of a session that has ended answers the existing
+/// `conflict` code, distinguished by its detail rather than a new code.
+#[tokio::test]
+async fn ended_session_replay_is_a_non_retryable_conflict_with_a_reason() {
+    use axum::response::IntoResponse;
+
+    let error = PublicApiError::from(crate::public_sessions::PublicSessionStoreError::SessionEnded);
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let envelope: PublicErrorEnvelope =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(envelope.code, PublicErrorCode::Conflict);
+    assert!(!envelope.retryable);
+    assert_eq!(
+        envelope.details,
+        vec![pplx_space_public_api::PublicErrorDetail {
+            key: "reason".to_string(),
+            value: "session_ended".to_string(),
+        }]
+    );
+}

@@ -22,7 +22,7 @@ uuid = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-net-common = { workspace = true }
-pplx-space-net-gateway-client = { workspace = true }
+pplx-space-net-gateway-protocol = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
 
 [build-dependencies]

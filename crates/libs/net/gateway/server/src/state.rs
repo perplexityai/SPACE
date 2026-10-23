@@ -185,7 +185,7 @@ struct TcpPendingWaiterGuard {
 impl TcpPendingWaiterGuard {
     fn finish(&mut self) {
         if self.active {
-            let update_result = self.pending_tcp_connections.fetch_update(
+            let update_result = self.pending_tcp_connections.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |current| Some(current.saturating_sub(1)),

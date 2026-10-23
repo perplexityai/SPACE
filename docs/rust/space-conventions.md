@@ -41,7 +41,8 @@ including `aws_lc_rs` for rustls and rcgen, `tls-aws-lc` for tonic, and
 `verify-aws` for x509-parser.
 
 Services install the process-wide rustls provider through
-`pplx_space_common_svc::install_default_rustls_crypto_provider`; downstream
+`pplx_space_rustls_provider::install_default_rustls_crypto_provider`
+(re-exported from `pplx-space-common-svc`); downstream
 crates must not attempt to install a competing provider. A transitive dependency
 that offers no provider choice may retain ring temporarily, but record that
 constraint rather than adding SPACE-owned ring usage around it. Changing the
@@ -179,7 +180,7 @@ The statement stays syntactically whole, as the store rules require: new code
 writes whole statements with bound values, not fragments around the value.
 The started- and failed-restorable repair `row_state_guards` helpers and the
 shared `routable_execution_or_non_k8s` routability fragment
-(`crates/libs/common/svc/src/sql/sandbox_routability.rs`) take their
+(`crates/libs/sandbox/routability/src/lib.rs`) take their
 placeholder as an argument only because they are existing fragments; they are
 not a pattern for new code. Read a `managed_by` column back as `SubstrateKind`
 rather than comparing strings. Where one bad row must not fail the batch, read
@@ -278,7 +279,7 @@ tree shows at a glance which modules have tests.
 | `foo.rs` | `mod proto_wire_tests` **and** `mod tests` | `foo/proto_wire_tests.rs` **and** `foo/tests.rs` |
 | `foo/mod.rs` | `mod tests` | `foo/tests.rs` |
 | `lib.rs` / `main.rs` | `mod tests` | `tests.rs` beside it, in the crate's `src/` |
-| `emit.rs` → inline `mod test_capture` → `mod tests` | nested | `emit/test_capture/tests.rs` |
+| `metrics-emit/src/lib.rs` → inline `mod test_capture` → `mod tests` | nested | `metrics-emit/src/test_capture/tests.rs` |
 | host itself declared with `#[path]` | `mod tests` | `<host-stem>/tests.rs`, via explicit `#[path]` (below) |
 
 One wrinkle: when the host file is *itself* loaded through a `#[path]`
@@ -295,9 +296,8 @@ flat variant at the end of this section, which exists to dodge it.
 One module, one file. A src file with two named test modules gets two sibling
 files, not one file with two `mod` blocks inside it. Nesting follows Rust's
 ordinary module resolution, so a test module inside an inline production module
-lands one directory deeper — `crates/libs/metrics/src/emit.rs` declares
-`pub(crate) mod test_capture`, whose own tests belong at
-`emit/test_capture/tests.rs`.
+lands one directory deeper — `crates/libs/metrics-emit/src/lib.rs` declares
+`pub mod test_capture`, whose own tests belong at `test_capture/tests.rs`.
 
 ### Why module-path preservation is the point
 
@@ -381,10 +381,12 @@ in every CI run.
 
 When test support has to cross a crate boundary, gate it behind a named
 `test-capture`-style feature rather than exporting it unconditionally or
-duplicating it. `pplx-space-metrics` is the pattern: `test-capture = []` in its
-`[features]`, the helper gated `#[cfg(any(test, feature = "test-capture"))]`
-(`crates/libs/metrics/src/emit.rs`, `src/lib.rs`), so the crate's own tests get
-it for free and downstream crates opt in explicitly.
+duplicating it. `pplx-space-metrics-emit` is the pattern: `test-capture = []`
+in its `[features]`, the helper gated `#[cfg(any(test, feature = "test-capture"))]`
+(`crates/libs/metrics-emit/src/lib.rs`), so the crate's own tests get it for
+free and downstream crates opt in explicitly. `cfg(test)` does not reach a
+dependency, so a crate that re-exports such a helper forwards the feature and
+enables it on its own dev-dependency, as `pplx-space-metrics` does.
 
 ### Watch items when moving or writing test files
 
