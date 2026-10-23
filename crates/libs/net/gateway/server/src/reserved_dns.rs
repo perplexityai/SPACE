@@ -57,7 +57,7 @@ pub enum ReservedResolver {
 }
 
 impl ReservedResolver {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Cloudflare => "cloudflare",
             Self::Google => "google",
@@ -73,6 +73,37 @@ impl ReservedResolver {
     }
 }
 
+/// Independent admission slots for each reserved resolver. A stalled upstream
+/// (for example, one that serializes pipelined queries) can only exhaust its
+/// own slots, so guests can still fall back to the other resolver.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolverSlots {
+    capacity_per_resolver: usize,
+    cloudflare: Arc<Semaphore>,
+    google: Arc<Semaphore>,
+}
+
+impl ResolverSlots {
+    pub(crate) fn new(capacity_per_resolver: usize) -> Self {
+        Self {
+            capacity_per_resolver,
+            cloudflare: Arc::new(Semaphore::new(capacity_per_resolver)),
+            google: Arc::new(Semaphore::new(capacity_per_resolver)),
+        }
+    }
+
+    pub(crate) fn get(&self, resolver: ReservedResolver) -> &Arc<Semaphore> {
+        match resolver {
+            ReservedResolver::Cloudflare => &self.cloudflare,
+            ReservedResolver::Google => &self.google,
+        }
+    }
+
+    pub(crate) fn in_flight(&self, resolver: ReservedResolver) -> usize {
+        self.capacity_per_resolver - self.get(resolver).available_permits()
+    }
+}
+
 #[derive(Debug)]
 pub enum ResolveOutcome {
     Reply(Vec<u8>),
@@ -83,7 +114,7 @@ pub enum ResolveOutcome {
 #[derive(Clone)]
 pub struct ReservedDnsCore {
     resolver: Arc<dyn ResolverBackend>,
-    lookup_slots: Arc<Semaphore>,
+    lookup_slots: ResolverSlots,
 }
 
 impl fmt::Debug for ReservedDnsCore {
@@ -94,9 +125,9 @@ impl fmt::Debug for ReservedDnsCore {
 
 impl ReservedDnsCore {
     pub fn new() -> Result<Self, BuildReservedDnsCoreError> {
-        let lookup_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_LOOKUPS));
+        let lookup_slots = ResolverSlots::new(MAX_CONCURRENT_LOOKUPS);
         Ok(Self {
-            resolver: Arc::new(HickoryResolverSet::new(lookup_slots.clone())?),
+            resolver: Arc::new(HickoryResolverSet::new(&lookup_slots)?),
             lookup_slots,
         })
     }
@@ -105,7 +136,7 @@ impl ReservedDnsCore {
     fn with_resolver(resolver: Arc<dyn ResolverBackend>, lookup_capacity: usize) -> Self {
         Self {
             resolver,
-            lookup_slots: Arc::new(Semaphore::new(lookup_capacity)),
+            lookup_slots: ResolverSlots::new(lookup_capacity),
         }
     }
 
@@ -118,6 +149,7 @@ impl ReservedDnsCore {
     ) -> Result<SanitizedAnswer, ResolverFailure> {
         let _permit = self
             .lookup_slots
+            .get(resolver)
             .try_acquire()
             .map_err(|_| ResolverFailure::Capacity)?;
         let answer = self
@@ -414,10 +446,11 @@ struct HickoryResolverSet {
 }
 
 impl HickoryResolverSet {
-    fn new(lookup_slots: Arc<Semaphore>) -> Result<Self, BuildReservedDnsCoreError> {
+    fn new(lookup_slots: &ResolverSlots) -> Result<Self, BuildReservedDnsCoreError> {
+        let build = |resolver| build_hickory_resolver(resolver, lookup_slots.get(resolver).clone());
         Ok(Self {
-            cloudflare: build_hickory_resolver(ReservedResolver::Cloudflare, lookup_slots.clone())?,
-            google: build_hickory_resolver(ReservedResolver::Google, lookup_slots)?,
+            cloudflare: build(ReservedResolver::Cloudflare)?,
+            google: build(ReservedResolver::Google)?,
         })
     }
 
