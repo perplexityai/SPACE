@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use futures_util::stream::{self, BoxStream};
@@ -19,6 +19,7 @@ use hickory_resolver::proto::op::{DnsRequest, DnsResponse};
 use hickory_resolver::{ConnectionProvider, PoolContext, TlsConfig};
 use parking_lot::Mutex;
 use pplx_space_metrics::gateway::ReservedDnsUpstreamClosedOutcome as ClosedOutcome;
+use pplx_space_metrics::gateway::ReservedDnsUpstreamResponseOutcome as ResponseOutcome;
 use tokio::sync::{Semaphore, oneshot};
 
 use super::{GatewayRuntimeProvider, MAX_CONCURRENT_LOOKUPS, ReservedResolver};
@@ -285,8 +286,13 @@ impl DnsHandle for LoggingDnsHandle {
         let upstream_addr = self.0.upstream.connector.upstream_addr;
         let query_type = request.queries.first().map(|query| query.query_type);
         let lookup_slots = self.0.upstream.connector.runtime.lookup_slots.clone();
+        let mut timing = UpstreamTiming {
+            resolver: self.0.upstream.resolver,
+            started_at: Instant::now(),
+            recorded: false,
+        };
         let exchange = self.0.exchange.lock().clone();
-        let responses = if exchange.is_usable() {
+        let mut responses = if exchange.is_usable() {
             exchange.send(request)
         } else {
             // Upstreams close idle DNS-over-TLS connections routinely. Hickory
@@ -309,27 +315,64 @@ impl DnsHandle for LoggingDnsHandle {
             .flatten()
             .boxed()
         };
-        responses
-            .inspect_err(move |error| {
-                if matches!(error, NetError::Busy) {
-                    let space_lookups_in_flight = record_busy(&lookup_slots);
-                    tracing::warn!(
-                        %upstream_addr,
-                        ?query_type,
-                        ?error,
-                        space_lookups_in_flight,
-                        "reserved DNS upstream request failed"
-                    );
-                    return;
-                }
+        stream::poll_fn(move |cx| {
+            let response = ready!(responses.poll_next_unpin(cx));
+            timing.record(match &response {
+                Some(Ok(_)) => ResponseOutcome::Answered,
+                Some(Err(NetError::Timeout)) => ResponseOutcome::Timeout,
+                Some(Err(NetError::Busy)) => ResponseOutcome::Busy,
+                Some(Err(_)) => ResponseOutcome::Error,
+                None => ResponseOutcome::NoResponse,
+            });
+            Poll::Ready(response)
+        })
+        .inspect_err(move |error| {
+            if matches!(error, NetError::Busy) {
+                let space_lookups_in_flight = record_busy(&lookup_slots);
                 tracing::warn!(
                     %upstream_addr,
                     ?query_type,
                     ?error,
+                    space_lookups_in_flight,
                     "reserved DNS upstream request failed"
                 );
-            })
-            .boxed()
+                return;
+            }
+            tracing::warn!(
+                %upstream_addr,
+                ?query_type,
+                ?error,
+                "reserved DNS upstream request failed"
+            );
+        })
+        .boxed()
+    }
+}
+
+/// Records one upstream request/response time on the send's first response or
+/// failure, or as cancelled if the send is dropped before either.
+struct UpstreamTiming {
+    resolver: ReservedResolver,
+    started_at: Instant,
+    recorded: bool,
+}
+
+impl UpstreamTiming {
+    fn record(&mut self, outcome: ResponseOutcome) {
+        if std::mem::replace(&mut self.recorded, true) {
+            return;
+        }
+        pplx_space_metrics::gateway::reserved_dns_upstream_request(
+            self.resolver.as_str(),
+            outcome,
+            self.started_at.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+impl Drop for UpstreamTiming {
+    fn drop(&mut self) {
+        self.record(ResponseOutcome::Cancelled);
     }
 }
 
