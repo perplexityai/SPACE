@@ -28,6 +28,7 @@ use pplx_space_common_core::{
     },
 };
 use pplx_space_common_svc::types::k8s::space_k8s_node_id;
+use pplx_space_net_common::NetworkPolicyAnnotation;
 use pplx_space_node_api_client::{
     NodeApiClient, WorkerApiClient as RetryingWorkerApiClient,
     WorkerApiInternalClient as RetryingWorkerApiInternalClient,
@@ -534,10 +535,16 @@ fn duration_millis_to_u64(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn ensure_network_policy_annotation_size(network_policy_json: &str) -> Result<(), SubstrateError> {
-    let bytes = network_policy_json.len();
+fn encode_network_policy_annotation(
+    policy: &pplx_space_net_common::NetworkPolicyV1,
+) -> Result<NetworkPolicyAnnotation, SubstrateError> {
+    let annotation =
+        NetworkPolicyAnnotation::encode(policy).map_err(|err| SubstrateError::Failed {
+            message: format!("failed to encode network policy annotation: {err}"),
+        })?;
+    let bytes = annotation.as_str().len();
     if bytes <= MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES {
-        return Ok(());
+        return Ok(annotation);
     }
 
     Err(SubstrateError::Failed {

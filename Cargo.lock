@@ -5324,6 +5324,7 @@ dependencies = [
  "pplx-space-events",
  "pplx-space-feature-flags",
  "pplx-space-metrics",
+ "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
  "pplx-space-observability",

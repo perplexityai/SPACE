@@ -384,7 +384,7 @@ fn domain_evidence_relevant(policy: &NetworkPolicyV1, name: &str) -> bool {
             || policy
                 .tls_interception_exemptions
                 .iter()
-                .any(|rule| rule.matches_domain_name(&domain)))
+                .any(|exemption| exemption.destination.matches_domain_name(&domain)))
 }
 
 fn entry_still_relevant(policy: &NetworkPolicyV1, ip: IpAddr, domain: &str) -> bool {

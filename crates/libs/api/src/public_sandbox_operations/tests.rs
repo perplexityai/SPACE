@@ -263,8 +263,10 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
                     assert!(!effective.allows_domain("retired.example.test"));
                     assert!(!effective.allows_domain("unlisted.example.test"));
                     assert!(!effective.tls_interception_exemptions.contains(
-                        &pplx_space_net_common::EgressDestinationV1::Domain(
-                            "sensor.example.test".parse()?,
+                        &pplx_space_net_common::TlsInterceptionExemptionV1::all_ports(
+                            pplx_space_net_common::EgressDestinationV1::Domain(
+                                "sensor.example.test".parse()?,
+                            ),
                         ),
                     ));
                     let sandbox = fetch_sandbox(&db.pool, sandbox_id).await?.unwrap();

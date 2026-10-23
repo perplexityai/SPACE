@@ -151,3 +151,31 @@ fn setup_captures_owner_and_effective_policy() {
         NodeFilesystemSetup::EnsureArtifactDirPermissions
     );
 }
+
+#[test]
+fn annotation_size_limit_counts_the_final_split_encoding() {
+    use pplx_space_net_common::{EgressDestinationV1, TlsInterception, TlsInterceptionExemptionV1};
+
+    let mut policy = NetworkPolicyV1::allow_all();
+    policy.tls_interception = TlsInterception::On;
+    let destination = EgressDestinationV1::Domain("sensor.example.test".parse().unwrap());
+    policy.tls_interception_exemptions =
+        vec![TlsInterceptionExemptionV1::all_ports(destination.clone()); 3000];
+    policy
+        .tls_interception_exemptions
+        .push(TlsInterceptionExemptionV1::new(destination, Some(5228)).unwrap());
+    let limit = super::super::MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES;
+    assert!(serde_json::to_string(&policy).unwrap().len() < limit);
+    assert!(
+        NetworkPolicyAnnotation::encode(&policy)
+            .unwrap()
+            .as_str()
+            .len()
+            > limit
+    );
+    let error = encode_network_policy_annotation(&policy).unwrap_err();
+    assert!(error.to_string().contains("byte limit"), "{error}");
+
+    policy.tls_interception_exemptions.truncate(1);
+    encode_network_policy_annotation(&policy).unwrap();
+}

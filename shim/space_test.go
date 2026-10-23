@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1075,25 +1076,38 @@ func TestSandboxNetworkPolicyTLSInterception(t *testing.T) {
 }
 
 func TestSandboxNetworkPolicyTLSInterceptionExemptions(t *testing.T) {
+	// The legacy key rejects every port, so port checks use the full list.
+	const legacy = "tls_interception_exemptions"
+	const withPorts = "tls_interception_exemptions_with_ports"
 	for _, test := range []struct {
 		name       string
+		key        string
 		exemptions string
 		valid      bool
 	}{
-		{"all destinations", `[{"ip":"192.0.2.10"},{"cidr":"198.51.100.0/24"},{"domain":"sensor.example.test"},{"wildcard_domain":"*.example.test"}]`, true},
-		{"empty destination", `[{}]`, false},
-		{"ambiguous destination", `[{"ip":"192.0.2.10","domain":"sensor.example.test"}]`, false},
-		{"wrong shape", `"sensor.example.test"`, false},
+		{"all destinations", legacy, `[{"ip":"192.0.2.10"},{"cidr":"198.51.100.0/24"},{"domain":"sensor.example.test"},{"wildcard_domain":"*.example.test"}]`, true},
+		{"empty destination", legacy, `[{}]`, false},
+		{"ambiguous destination", legacy, `[{"ip":"192.0.2.10","domain":"sensor.example.test"}]`, false},
+		{"wrong shape", legacy, `"sensor.example.test"`, false},
+		{"not an object", legacy, `[["domain","sensor.example.test"]]`, false},
+		{"null destination", legacy, `[{"domain":null,"ip":"192.0.2.10"}]`, false},
+		{"unknown key", legacy, `[{"domain":"push.example.test","ports":[5228]}]`, false},
+		{"port without destination", withPorts, `[{"port":5228}]`, false},
+		{"port zero", withPorts, `[{"domain":"push.example.test","port":0}]`, false},
+		{"port too large", withPorts, `[{"domain":"push.example.test","port":65536}]`, false},
+		{"string port", withPorts, `[{"domain":"push.example.test","port":"5228"}]`, false},
+		{"null port", withPorts, `[{"domain":"push.example.test","port":null}]`, false},
+		{"repeated key", withPorts, `[{"domain":"push.example.test","port":5228,"port":443}]`, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			spec := &ociSpec{Annotations: map[string]string{
-				sandboxNetworkPolicyAnnotation:           `{"version":"v1","egress":{"default_action":"deny","allow":[{"domain":"sensor.example.test"}],"deny":[{"ip":"192.0.2.20"}]},"tls_interception":"on","tls_interception_exemptions":` + test.exemptions + `}`,
+				sandboxNetworkPolicyAnnotation:           `{"version":"v1","egress":{"default_action":"deny","allow":[{"domain":"sensor.example.test"}],"deny":[{"ip":"192.0.2.20"}]},"tls_interception":"on","` + test.key + `":` + test.exemptions + `}`,
 				sandboxNetworkPolicyGenerationAnnotation: "1",
 			}}
 			config, err := spec.sandboxNetworkPolicy()
 			if !test.valid {
-				if err == nil || !strings.Contains(err.Error(), "tls_interception_exemptions") {
-					t.Fatalf("error = %v, want invalid tls_interception_exemptions", err)
+				if err == nil || !strings.Contains(err.Error(), test.key) {
+					t.Fatalf("error = %v, want invalid %s", err, test.key)
 				}
 				return
 			}
@@ -1123,6 +1137,38 @@ func TestSandboxNetworkPolicyTLSInterceptionExemptions(t *testing.T) {
 			}
 			if !proto.Equal(&received, want) {
 				t.Fatalf("received policy = %v, want %v", &received, want)
+			}
+		})
+	}
+}
+
+func TestSandboxNetworkPolicyRejectsInconsistentAnnotationExemptions(t *testing.T) {
+	const sensor = `{"domain":"sensor.example.test"}`
+	const other = `{"ip":"192.0.2.10"}`
+	const scoped = `{"domain":"push.example.test","port":5228}`
+	for _, test := range []struct {
+		name   string
+		legacy string
+		full   string
+	}{
+		{"missing projection", `[]`, `[` + sensor + `,` + scoped + `]`},
+		{"different projection", `[` + other + `]`, `[` + sensor + `,` + scoped + `]`},
+		{"reordered projection", `[` + other + `,` + sensor + `]`, `[` + sensor + `,` + scoped + `,` + other + `]`},
+		{"port in legacy", `[` + scoped + `]`, `[` + scoped + `]`},
+		{"null legacy", `null`, `[` + scoped + `]`},
+		{"object legacy", `{}`, `[` + scoped + `]`},
+		{"null full", `[]`, `null`},
+		{"object full", `[]`, `{}`},
+		{"empty full", `[]`, `[]`},
+		{"portless full", `[` + sensor + `]`, `[` + sensor + `]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: map[string]string{
+				sandboxNetworkPolicyAnnotation:           `{"version":"v1","egress":{"default_action":"allow"},"tls_interception":"on","tls_interception_exemptions":` + test.legacy + `,"tls_interception_exemptions_with_ports":` + test.full + `}`,
+				sandboxNetworkPolicyGenerationAnnotation: "1",
+			}}
+			if _, err := spec.sandboxNetworkPolicy(); err == nil {
+				t.Fatal("inconsistent annotation was accepted")
 			}
 		})
 	}
@@ -1239,6 +1285,45 @@ func TestParseNetworkPolicyJSONDecodesRustFixture(t *testing.T) {
 	}
 	if destination := rules[1].GetDestination(); destination.Port != nil || destination.PathPrefix != nil {
 		t.Fatalf("default destination = %v, want port and path omitted", destination)
+	}
+}
+
+// The Rust policy test checks the same fixture, so the shim forwards exactly
+// the bytes the Rust encoder produces, including port-scoped exemptions.
+func TestSandboxNetworkPolicyMatchesRustEncoding(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/network-policy-tls-exemptions.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Name        string          `json:"name"`
+		Policy      json.RawMessage `json:"policy"`
+		ProtobufHex string          `json:"protobuf_hex"`
+	}
+	if err := json.Unmarshal(fixture, &cases); err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("fixture has no cases")
+	}
+	for _, test := range cases {
+		t.Run(test.Name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: map[string]string{
+				sandboxNetworkPolicyAnnotation:           string(test.Policy),
+				sandboxNetworkPolicyGenerationAnnotation: "1",
+			}}
+			config, err := spec.sandboxNetworkPolicy()
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, err := proto.Marshal(config.Policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hex.EncodeToString(wire); got != test.ProtobufHex {
+				t.Fatalf("protobuf = %s, want %s", got, test.ProtobufHex)
+			}
+		})
 	}
 }
 

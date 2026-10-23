@@ -126,7 +126,7 @@ pub(super) enum RestoreContext<'a> {
 pub(super) struct SandboxPodRequestInputs<'a> {
     pub(super) sandbox_owner: &'a SandboxOwner,
     pub(super) auto_lifecycle_json: &'a str,
-    pub(super) network_policy_json: &'a str,
+    pub(super) network_policy_json: &'a NetworkPolicyAnnotation,
     /// `None` renders no node-group constraints: the gate is off, or the
     /// cluster has no generic node group.
     pub(super) node_group_placement: Option<&'a NodeGroupPlacement>,

@@ -34,10 +34,10 @@ use pplx_space_common_core::kubernetes::SandboxRuntimePodMetadata;
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, DiskIoLimits, EnvMap, PolicyAuthority, SandboxOwner,
 };
-use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_net_common::{NetworkPolicyAnnotation, NetworkPolicyV1};
 
 use super::SubstrateError;
-use super::ensure_network_policy_annotation_size;
+use super::encode_network_policy_annotation;
 use crate::controllers::substrate::{
     ActorRef, CreateExecutionRequest, PooledExecutionClaimRequest, SandboxResources,
 };
@@ -200,11 +200,7 @@ impl PerSandboxSetup {
             serde_json::to_string(&auto_lifecycle).map_err(|err| SubstrateError::Failed {
                 message: format!("failed to serialize auto lifecycle policy: {err}"),
             })?;
-        let network_policy_json =
-            serde_json::to_string(&effective_policy).map_err(|err| SubstrateError::Failed {
-                message: format!("failed to serialize network policy: {err}"),
-            })?;
-        ensure_network_policy_annotation_size(&network_policy_json)?;
+        let network_policy_json = encode_network_policy_annotation(&effective_policy)?;
 
         Ok(ColdPodMetadata {
             sandbox_owner,
@@ -228,7 +224,7 @@ pub(super) struct ColdPodMetadata {
     user_id: UserId,
     org_id: OrgId,
     auto_lifecycle_json: String,
-    network_policy_json: String,
+    network_policy_json: NetworkPolicyAnnotation,
     network_policy_generation: u64,
     authority: PolicyAuthority,
     volume_encryption: bool,

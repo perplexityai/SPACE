@@ -308,6 +308,10 @@ SNI hostnames or destination IPs without terminating TLS, even when
 a live observed DNS binding from that hostname to the destination IP, including
 under default-allow or independent IP allowances. Without that binding, normal
 interception applies.
+An exemption may name one destination `port`, such as
+`{"domain":"push.example.test","port":5228}`; it then applies only to
+connections to that port, and other ports keep the policy's interception mode.
+Without `port` it applies to every port.
 IP exemptions also support TLS without SNI and apply regardless of the hostname
 served at that IP. Domain-only egress allowances still require the guest's DNS
 attribution and matching SNI.
@@ -332,6 +336,26 @@ Before configuring nonempty profile exemptions, upgrade every policy reader and
 running gateway to support TLS exemptions. Native sandbox and template policy
 writers must observe the same reader compatibility requirement. Upgrade queued
 operation executors before APIs begin admitting profile selections.
+
+Port-scoped exemptions follow the same order: upgrade every reader, including
+the SPACE runtime shim, and every running gateway before any policy carries a
+`port`. Older Rust JSON readers reject a policy with a port-scoped exemption.
+The pod annotation and protobuf both list only all-port exemptions in
+`tls_interception_exemptions`; when any exemption has a port, the complete
+ordered list is in `tls_interception_exemptions_with_ports`. New shims validate
+that the legacy list is exactly the all-port projection before forwarding the
+policy. Older lenient shims ignore the new key and keep intercepting scoped
+destinations; strict older shims reject it and fail the cold create (see
+[Adding policy fields](ecw-network-policy.md#adding-policy-fields)).
+Upgrade the shim and node-ctl first: a sandbox created or updated through an
+older one keeps intercepting its port-scoped destinations until its policy next
+changes. Older gateways also keep intercepting port-scoped destinations. Public
+and stored JSON retain the single inline list, and policy hashes use that
+canonical form, never the annotation.
+
+Once a `port` is persisted, do not roll the API, internal API, cluster
+controller, credential store, template manager, or sandbox manager back to a
+version that cannot read it.
 
 Before downgrading a reader, remove exemptions from stored policies and operator
 profile selections using compatible binaries, or retire the affected resources.
