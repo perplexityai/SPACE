@@ -14,6 +14,8 @@ use super::*;
 #[derive(Clone, Debug)]
 pub struct ExecutionServiceConfig {
     pub default_operation_user: GuestUserName,
+    /// Image WORKDIR for commands without an explicit cwd; None uses the account home.
+    pub default_working_dir: Option<std::path::PathBuf>,
     pub filesystem_execution: FilesystemExecutionMode,
     pub identity_policy: IdentityPolicy,
     /// Required on Linux when using identity workers. Never inferred from the host.
@@ -26,6 +28,7 @@ pub struct ExecutionServiceConfig {
 impl Default for ExecutionServiceConfig {
     fn default() -> Self {
         Self {
+            default_working_dir: None,
             default_operation_user: GuestUserName::parse(DEFAULT_GUEST_USER)
                 .expect("default guest user constant is valid"),
             filesystem_execution: if cfg!(target_os = "linux") {
@@ -72,6 +75,7 @@ pub(super) struct ExecutionServiceInner {
     pub(super) start_gate: std::sync::Mutex<()>,
     pub(super) process_payload_slots: Arc<Semaphore>,
     pub(super) default_operation_user: GuestUserName,
+    pub(super) default_working_dir: Option<std::path::PathBuf>,
     pub(super) identity_policy: IdentityPolicy,
     pub(super) process_env: RwLock<EnvMap>,
     pub(super) processes: ProcessRegistry,
@@ -131,6 +135,7 @@ impl ExecutionService {
                     pplx_space_spaced_guest_protocol::process_limits::PAYLOAD_SLOTS,
                 )),
                 default_operation_user: config.default_operation_user,
+                default_working_dir: config.default_working_dir,
                 identity_policy: config.identity_policy,
                 process_env: RwLock::new(EnvMap::empty()),
                 processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(

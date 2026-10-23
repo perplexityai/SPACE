@@ -248,8 +248,12 @@ async fn verified_manifest_graph_is_pinned_to_its_root_digest() {
         .expect("safe graph should resolve");
 
     assert_eq!(
-        resolved,
+        resolved.reference,
         reference.clone_with_digest(root_digest.to_string())
+    );
+    assert_eq!(
+        resolved.config_digest.to_string(),
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     );
     assert_eq!(
         *source.fetched.lock().unwrap(),

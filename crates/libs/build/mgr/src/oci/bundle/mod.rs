@@ -7,6 +7,7 @@ use std::process::Command;
 
 pub use archive::GuestBundle;
 pub use install::install_current_guest;
+pub(crate) use install::install_working_directory;
 
 use crate::command_as_root;
 

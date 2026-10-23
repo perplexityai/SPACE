@@ -16,6 +16,8 @@ const DOCKER_HUB_REGISTRY: &str = "docker.io";
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RegistryError {
+    #[error("OCI image configuration exceeds the 4 MiB limit")]
+    ImageConfigTooLarge,
     #[error("OCI manifest contains alternate download URLs")]
     AlternateDownloadUrls,
     #[cfg(not(feature = "aws-ecr"))]
@@ -168,11 +170,17 @@ pub(super) fn validate_configuration() -> Result<(), EcrConfigurationError> {
     ecr::validate_configuration()
 }
 
+#[derive(Debug)]
+pub(super) struct ResolvedImage {
+    pub reference: OciReference,
+    pub config_digest: Digest,
+}
+
 pub(super) async fn resolve_with_source(
     reference: &OciReference,
     arch: Arch,
     source: &dyn ManifestSource,
-) -> Result<OciReference, RegistryError> {
+) -> Result<ResolvedImage, RegistryError> {
     manifest::resolve(reference, arch, source).await
 }
 

@@ -4,7 +4,9 @@ use std::process::{Command, Stdio};
 
 use oci_spec::distribution::Reference as OciReference;
 
-use super::bundle::{GuestBundle, GuestBundleError, install_current_guest};
+use super::bundle::{
+    GuestBundle, GuestBundleError, install_current_guest, install_working_directory,
+};
 use super::containerd::{OciBuildError, OciMountRequest, mount};
 use crate::command_as_root;
 
@@ -97,6 +99,7 @@ struct RootfsAssemblyRequest<'a> {
     pub target_rootfs: &'a Path,
     pub target_rootfs_size_mib: u32,
     pub oci_rootfs: &'a Path,
+    pub working_dir: &'a Path,
     pub cache_dir: &'a Path,
     pub guest_bin_dir: &'a Path,
     pub bundle_version: &'a str,
@@ -145,6 +148,8 @@ fn assemble(request: RootfsAssemblyRequest<'_>) -> Result<(), RootfsAssemblyErro
             copy_tree(request.oci_rootfs, root)?;
             bundle.extract(root)?;
             install_current_guest(root, request.guest_bin_dir, request.bundle_version)?;
+            // WORKDIR lives in the OCI config, not in the unpacked filesystem.
+            install_working_directory(root, request.working_dir, true)?;
             Ok(())
         },
     )?;
@@ -160,12 +165,14 @@ pub async fn assemble_from_image(
     })
     .await?;
     let oci_rootfs_path = oci_rootfs.path().to_path_buf();
+    let working_dir = oci_rootfs.working_dir.clone();
     let assembly_result = tokio::task::spawn_blocking(move || {
         assemble(RootfsAssemblyRequest {
             seed_rootfs: &request.seed_rootfs,
             target_rootfs: &request.target_rootfs,
             target_rootfs_size_mib: request.target_rootfs_size_mib,
             oci_rootfs: &oci_rootfs_path,
+            working_dir: &working_dir,
             cache_dir: &request.cache_dir,
             guest_bin_dir: &request.guest_bin_dir,
             bundle_version: &request.bundle_version,

@@ -1965,16 +1965,22 @@ impl Process for ExecutionService {
         let listed_command = process_command.argv().to_vec();
         let env = parse_env(requested_env);
         let listed_env = proto_env(&env);
+        let default_cwd = self
+            .inner
+            .default_working_dir
+            .as_deref()
+            .map(|path| {
+                path.to_str()
+                    .ok_or_else(|| Status::internal("image working directory is not UTF-8"))
+            })
+            .transpose()?;
+        // A command's explicit cwd wins over the image's WORKDIR.
         let cwd = requested_cwd
             .as_deref()
+            .or(default_cwd)
             .map(|cwd| guest_path::normalize_for_account(cwd, &account))
             .transpose()?;
-        let listed_cwd = requested_cwd.map(|_| {
-            cwd.as_ref()
-                .expect("requested cwd produced normalized cwd")
-                .expose()
-                .to_string()
-        });
+        let listed_cwd = cwd.as_ref().map(|cwd| cwd.expose().to_string());
         let timeout = validate_optional_timeout(request.timeout)?;
         let background = request.background;
         let stdin_enabled = request.stdin;

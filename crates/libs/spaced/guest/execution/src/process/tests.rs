@@ -1505,3 +1505,63 @@ async fn native_process_payloads_obey_message_limits_before_lookup_or_spawn() {
     }
     assert!(service.inner.processes.records.is_empty());
 }
+
+#[tokio::test]
+async fn image_working_directory_is_used_unless_command_overrides_it() {
+    let image_directory = tempfile::tempdir().unwrap();
+    let override_directory = tempfile::tempdir().unwrap();
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .unwrap()
+        .unwrap();
+    for (default, requested, expected) in [
+        (Some(image_directory.path()), None, image_directory.path()),
+        (
+            Some(image_directory.path()),
+            Some(override_directory.path()),
+            override_directory.path(),
+        ),
+        (None, None, user.dir.as_path()),
+    ] {
+        let service = ExecutionService::with_config(
+            CancellationToken::new(),
+            ExecutionServiceConfig {
+                default_operation_user: GuestUserName::parse(user.name.clone()).unwrap(),
+                default_working_dir: default.map(std::path::Path::to_path_buf),
+                filesystem_execution: FilesystemExecutionMode::Direct,
+                identity_policy: IdentityPolicy::Guest,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let response = Process::start(
+            &service,
+            Request::new(StartRequest {
+                command: vec!["/bin/pwd".into()],
+                cwd: requested.map(|path| path.to_str().unwrap().to_string()),
+                idempotency_key: Some("image-workdir".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+        let mut stdout = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let Some(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Stdout(
+                    output,
+                ),
+            ) = event.unwrap().event
+            {
+                stdout.extend(output.data);
+            }
+        }
+        service.inner.shutdown.cancel();
+        service.inner.process_tasks.close();
+        service.inner.process_tasks.wait().await;
+        assert_eq!(
+            String::from_utf8(stdout).unwrap().trim(),
+            expected.canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+}

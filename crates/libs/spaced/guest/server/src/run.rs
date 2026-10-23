@@ -49,6 +49,8 @@ pub enum RunSpacedGuestError {
     Runtime(#[source] std::io::Error),
     #[error(transparent)]
     Serve(#[from] RunGuestServerError),
+    #[error("failed to read image working directory: {0}")]
+    WorkingDirectory(#[source] std::io::Error),
     #[error(transparent)]
     CreateService(#[from] crate::CreateSpacedGuestServiceError),
 }
@@ -137,9 +139,17 @@ pub async fn serve(
     config: SpacedGuestRunConfig,
     shutdown: CancellationToken,
 ) -> Result<(), RunSpacedGuestError> {
-    let service_config = config
-        .service_config
-        .unwrap_or_else(service_config_from_environment);
+    let service_config = match config.service_config {
+        Some(config) => config,
+        None => {
+            let mut config = service_config_from_environment();
+            config.default_working_dir =
+                read_image_working_directory(std::path::Path::new("/etc/spaced/working-directory"))
+                    .await
+                    .map_err(RunSpacedGuestError::WorkingDirectory)?;
+            config
+        }
+    };
     let service = SpacedGuestService::with_config(shutdown.clone(), service_config)?;
     // systemd already ordered spaced.service after local-fs.target. The remaining
     // required readiness edge is binding the bridge-guest command listener; the
@@ -188,6 +198,25 @@ fn service_config_from_environment() -> SpacedGuestServiceConfig {
         config.host_connector_type = HostConnectorType::Uds(std::path::PathBuf::from(path));
     }
     config
+}
+
+async fn read_image_working_directory(
+    path: &std::path::Path,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(value) => {
+            let path = std::path::PathBuf::from(value);
+            if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "image working directory must be absolute and contain no NUL bytes",
+                ));
+            }
+            Ok(Some(path))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn notify_systemd_ready() -> bool {

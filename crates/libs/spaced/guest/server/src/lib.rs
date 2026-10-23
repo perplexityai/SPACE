@@ -241,6 +241,8 @@ pub struct SpacedGuestServiceConfig {
     pub bridge_socket_path: Option<PathBuf>,
     pub guest_uptime_source: fn() -> Option<prost_types::Duration>,
     pub default_operation_user: GuestUserName,
+    /// Image WORKDIR; explicit process cwd takes precedence.
+    pub default_working_dir: Option<PathBuf>,
     pub filesystem_execution: FilesystemExecutionMode,
     /// Grace before escalating cancellation of filesystem work. Configurable so
     /// a test can observe the escalation without waiting out the deployed
@@ -265,6 +267,7 @@ impl Default for SpacedGuestServiceConfig {
             bridge_socket_path: Some(pplx_space_spaced_common::default_bridge_guest_uds_path()),
             guest_uptime_source: read_guest_uptime,
             default_operation_user: execution.default_operation_user,
+            default_working_dir: execution.default_working_dir,
             filesystem_execution: execution.filesystem_execution,
             cancellation_grace: execution.cancellation_grace,
             http2_preface_timeout: DEFAULT_GUEST_HTTP2_PREFACE_TIMEOUT,
@@ -362,6 +365,7 @@ impl SpacedGuestService {
             shutdown.clone(),
             ExecutionServiceConfig {
                 default_operation_user: config.default_operation_user.clone(),
+                default_working_dir: config.default_working_dir.clone(),
                 filesystem_execution: config.filesystem_execution,
                 cancellation_grace: config.cancellation_grace,
                 guest_memory_bytes: meta::guest_mem_total_bytes(),
