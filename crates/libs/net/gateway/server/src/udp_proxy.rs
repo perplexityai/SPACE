@@ -436,7 +436,9 @@ impl UdpProxy {
             shutdown_token,
             reserved_dns_tasks,
             reserved_dns_task_slots: Arc::new(Semaphore::new(MAX_ACTIVE_RESERVED_DNS_DATAGRAMS)),
-            listener_ready: AsyncFd::new(listener)?,
+            // SAFETY: AsyncFd owns this open socket. The proxy only borrows it
+            // for I/O and never replaces or closes its registered descriptor.
+            listener_ready: unsafe { AsyncFd::register(listener)? },
             sessions: LruCache::new(session_capacity),
             response_sockets: HashMap::new(),
             next_session_id: 1,
