@@ -9,6 +9,7 @@ import public "spaced/bridge/guest/v1/legacy.proto";
 
 // Host→guest bridge hosted by spaced-guest-svc.
 service Meta {
+  rpc InstallSandboxTrust(InstallSandboxTrustRequest) returns (InstallSandboxTrustResponse);
   rpc Ping(PingRequest) returns (PingResponse);
   rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
   rpc ConfigureProcessEnv(ConfigureProcessEnvRequest) returns (ConfigureProcessEnvResponse);
@@ -63,6 +64,12 @@ message PingRequest {
   // sandbox manager's health probe, drains; other callers leave it unset.
   bool drain_diagnostics = 1;
 }
+
+message InstallSandboxTrustRequest {
+  bytes certificate_der = 1;
+  string sandbox_id = 2;
+}
+message InstallSandboxTrustResponse {}
 message PingResponse {
   // spaced's own WARN and ERROR callsites since the previous draining Ping, by
   // identity only. Never message text or field values, which can carry a

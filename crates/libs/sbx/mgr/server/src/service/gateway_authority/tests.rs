@@ -192,6 +192,7 @@ fn issued_response() -> NodeResponse {
     NodeResponse {
         certificate_der: vec![4, 5],
         issuer_certificate_der: vec![6, 7],
+        issuer: pplx_space_credmgr_client::proto::GatewayCaIssuer::Shared as i32,
     }
 }
 
@@ -540,6 +541,7 @@ async fn gateway_authority_bounds_issuer_response() {
                 Ok(NodeResponse {
                     certificate_der: vec![0; size],
                     issuer_certificate_der: vec![0; node_size],
+                    issuer: pplx_space_credmgr_client::proto::GatewayCaIssuer::Shared as i32,
                 })
             })
         }));

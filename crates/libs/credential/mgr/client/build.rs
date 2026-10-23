@@ -5,6 +5,10 @@ fn main() -> anyhow::Result<()> {
     let cred_file = proto_root.join("credential/manager/v1/credential_manager.proto");
     let builder = tonic_prost_build::configure()
         .type_attribute(
+            ".space.credential.manager.v1.ReleaseSandboxAnchorResponse",
+            "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
+        )
+        .type_attribute(
             ".space.credential.manager.v1.ExchangeTokenRequest",
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )
@@ -41,6 +45,7 @@ fn main() -> anyhow::Result<()> {
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )
         .skip_debug([
+            ".space.credential.manager.v1.ReleaseSandboxAnchorResponse",
             ".space.credential.manager.v1.ExchangeTokenRequest",
             ".space.credential.manager.v1.ExchangeTokenResponse",
             ".space.credential.manager.v1.AwsCredentials",

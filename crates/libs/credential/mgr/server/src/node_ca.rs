@@ -558,6 +558,7 @@ impl NodeCa {
         Ok(IssueIntermediateCertificateResponse {
             certificate_der: intermediate.sign_gateway(&public_key)?,
             issuer_certificate_der: intermediate.certificate_der.clone(),
+            issuer: crate::proto::GatewayCaIssuer::Shared as i32,
         })
     }
 
@@ -568,6 +569,7 @@ impl NodeCa {
                 upstream
                     .issue_intermediate_certificate(IssueIntermediateCertificateRequest {
                         csr: csr_der,
+                        ..Default::default()
                     })
                     .await
                     .map(|response| response.into_inner().certificate_der)

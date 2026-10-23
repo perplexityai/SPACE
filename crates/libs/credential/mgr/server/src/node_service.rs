@@ -317,6 +317,22 @@ fn forwarded_exchange_request(
 
 #[tonic::async_trait]
 impl CredentialManager for NodeCredentialManager {
+    async fn release_sandbox_anchor(
+        &self,
+        _request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+    ) -> Result<Response<crate::proto::ReleaseSandboxAnchorResponse>, Status> {
+        Err(Status::unimplemented("sandbox anchors are not enabled"))
+    }
+
+    async fn forget_sandbox_anchor(
+        &self,
+        _request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+    ) -> Result<Response<crate::proto::ForgetSandboxAnchorResponse>, Status> {
+        Err(Status::unimplemented(
+            "sandbox anchor caching is not enabled",
+        ))
+    }
+
     async fn resolve_network_credentials(
         &self,
         request: Request<ResolveNetworkCredentialsRequest>,

@@ -4,6 +4,15 @@ use crate::protocol::*;
 
 #[tonic::async_trait]
 impl Meta for SpacedHostService {
+    async fn install_sandbox_trust(
+        &self,
+        _request: Request<proto::InstallSandboxTrustRequest>,
+    ) -> Result<Response<proto::InstallSandboxTrustResponse>, Status> {
+        Err(Status::unimplemented(
+            "sandbox trust installation is not enabled",
+        ))
+    }
+
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         tracing::debug!(command = "ping", "spaced host grpc command succeeded");
         Ok(Response::new(PingResponse {}))

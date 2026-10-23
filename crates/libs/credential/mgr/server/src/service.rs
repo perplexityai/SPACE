@@ -362,6 +362,22 @@ impl CredentialManagerService {
 
 #[tonic::async_trait]
 impl CredentialManager for CredentialManagerService {
+    async fn release_sandbox_anchor(
+        &self,
+        _request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+    ) -> Result<Response<crate::proto::ReleaseSandboxAnchorResponse>, Status> {
+        Err(Status::unimplemented("sandbox anchors are not enabled"))
+    }
+
+    async fn forget_sandbox_anchor(
+        &self,
+        _request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+    ) -> Result<Response<crate::proto::ForgetSandboxAnchorResponse>, Status> {
+        Err(Status::unimplemented(
+            "sandbox anchor caching is not enabled",
+        ))
+    }
+
     async fn resolve_network_credentials(
         &self,
         request: Request<ResolveNetworkCredentialsRequest>,
@@ -819,6 +835,7 @@ impl CredentialManager for CredentialManagerService {
         Ok(Response::new(IssueIntermediateCertificateResponse {
             certificate_der: issued.map_err(intermediate_error_to_status)?,
             issuer_certificate_der: Vec::new(),
+            issuer: crate::proto::GatewayCaIssuer::Shared as i32,
         }))
     }
 }

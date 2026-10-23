@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_spaced_common::proto::bridge_guest;
 
 #[cfg(target_os = "linux")]
 fn flush_filesystem_at_path_with_syncfs(
@@ -208,6 +209,15 @@ fn require_activity_state(state: LocalActivityState) -> Result<LocalActivityStat
 
 #[tonic::async_trait]
 impl BridgeGuestMeta for SpacedGuestService {
+    async fn install_sandbox_trust(
+        &self,
+        _request: Request<bridge_guest::InstallSandboxTrustRequest>,
+    ) -> Result<Response<bridge_guest::InstallSandboxTrustResponse>, Status> {
+        Err(Status::unimplemented(
+            "sandbox trust installation is not enabled",
+        ))
+    }
+
     async fn ping(
         &self,
         request: Request<BridgeGuestPingRequest>,

@@ -194,6 +194,7 @@ impl SandboxManagerService {
             .await?;
             let issued = issuer(NodeRequest {
                 csr: request.get_ref().csr.clone(),
+                ..Default::default()
             })
             .await?;
             self.authorize_gateway_launch(
