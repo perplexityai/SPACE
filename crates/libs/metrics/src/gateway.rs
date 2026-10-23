@@ -155,6 +155,21 @@ pub fn reserved_dns_udp_in_flight(active: usize) {
     );
 }
 
+/// One reserved-DNS A lookup admitted past policy, tagged by whether it
+/// started an upstream lookup (`leader`) or joined one already in flight for
+/// the same resolver and question (`follower`).
+pub fn reserved_dns_lookup_coalesce(resolver: &str, role: &str) {
+    counter(
+        "gateway.reserved_dns.lookup.coalesce",
+        1,
+        &[
+            tag("resolver", resolver),
+            tag("role", role),
+            tag("git_sha", pplx_space_observability::git_sha()),
+        ],
+    );
+}
+
 /// SPACE lookup occupancy sampled when Hickory reports Busy. A send that finds
 /// its pooled connection closed by the upstream, or failed, does not reach
 /// Hickory as Busy and is counted by [`reserved_dns_upstream_closed`] instead.
