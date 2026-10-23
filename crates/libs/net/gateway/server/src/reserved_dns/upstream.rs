@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use futures_util::stream::{self, BoxStream};
@@ -67,6 +67,7 @@ impl ConnectionProvider for LoggingConnectionProvider {
                     connector: Connector {
                         runtime: self.runtime.clone(),
                         upstream_addr,
+                        first_established: Arc::new(AtomicBool::new(false)),
                         config: config.clone(),
                         cx: PoolContext::new(
                             cx.options.clone(),
@@ -102,6 +103,9 @@ impl ConnectionProvider for LoggingConnectionProvider {
 struct Connector {
     runtime: GatewayRuntimeProvider,
     upstream_addr: SocketAddr,
+    // Set once the first connection to this upstream is established, so that
+    // event logs once per gateway process rather than on every idle reconnect.
+    first_established: Arc<AtomicBool>,
     config: ConnectionConfig,
     cx: PoolContext,
 }
@@ -109,9 +113,22 @@ struct Connector {
 impl Connector {
     fn connect(&self) -> Result<BoxFuture<'static, Result<Exchange, NetError>>, NetError> {
         let upstream_addr = self.upstream_addr;
+        // Connect timing places the gateway's first upstream dial against the
+        // node's egress policy timeline: a dial that starts while the pod's
+        // egress is isolated fails as a timeout with no RST or ICMP.
+        let started = Instant::now();
+        let established_before = self.first_established.load(Ordering::Acquire);
         let log_error = move |error: &NetError| {
-            tracing::warn!(%upstream_addr, ?error, "reserved DNS upstream connection failed");
+            let connect_ms = started.elapsed().as_secs_f64() * 1000.0;
+            tracing::warn!(
+                %upstream_addr,
+                ?error,
+                connect_ms,
+                established_before,
+                "reserved DNS upstream connection failed"
+            );
         };
+        let first_established = self.first_established.clone();
         let exited = Arc::new(AtomicBool::new(false));
         let connection = TrackedRuntime {
             runtime: self.runtime.clone(),
@@ -121,6 +138,14 @@ impl Connector {
         .inspect_err(log_error)?;
         Ok(Box::pin(async move {
             let exchange = connection.await.inspect_err(log_error)?;
+            if !first_established.swap(true, Ordering::AcqRel) {
+                let connect_ms = started.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(
+                    %upstream_addr,
+                    connect_ms,
+                    "reserved DNS upstream first connection established"
+                );
+            }
             Ok(Exchange {
                 exchange,
                 exited,
