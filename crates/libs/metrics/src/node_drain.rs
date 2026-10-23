@@ -157,6 +157,13 @@ pub fn clear_node_gauges(node_id: &str) {
     pinned_suspended(node_id, 0);
     residents_discounted(node_id, 0);
     termination_blocking_residents(node_id, 0);
+    // Cleared with the rest, and it matters more than the others: this gauge
+    // is read as an *average over nodes* (gate coverage), so a terminated node
+    // left at its last value does not merely linger, it biases the fleet-wide
+    // number each environment's flag flip is gated on. `false` is the
+    // correct resting value — a node that no longer exists is not reading from
+    // the queue.
+    backup_queue_gated(node_id, false);
 }
 
 /// Per-sandbox suspend latency. `pre_lifecycle` is the user-visible
@@ -529,6 +536,9 @@ pub fn redrive_stranded_suspended(count: u64) {
 /// - `"node_gone_lost"` — same node-gone trigger, but no ready remote
 ///   snapshot exists; the local artifact died with the instance, so the
 ///   row was marked `lifecycle = 'failed'` (terminal, data already lost).
+/// - `"unnamed_withheld"` — nothing was sent: the row names no artifact
+///   and a gentle drain forbids the unnamed current-instance backup.
+///   Re-evaluated next tick.
 /// - `"node_gone_retry"` — same node-gone trigger, but neither the adopt
 ///   nor the mark-lost guard fired this tick (in-flight upload row, stale
 ///   ready snapshot, or drift); re-evaluated next tick.
@@ -550,6 +560,32 @@ pub fn pinned_suspended(node_id: &str, count: u64) {
     gauge(
         "node_drain.pinned_suspended",
         count as f64,
+        &[tag("node", node_id)],
+    );
+}
+
+/// 1 when this node's pinned-local enumeration read the per-node backup queue
+/// behind a fresh inventory gate (queued rows interleaved with any history rows the
+/// queue did not name), 0 when it answered from `target_node_id` history alone.
+///
+/// This is the gate-coverage signal: averaged over draining nodes it is the
+/// fraction reading the queue, which is what each environment's flip is gated
+/// on. It is deliberately a **separate series** rather than a `source` tag on
+/// [`pinned_suspended`], because a backend that allowlists tags per metric
+/// (Datadog's Metrics without Limits, for one) hides a new tag on an existing
+/// metric until the allowlist names it, and the allowlist is not retroactive,
+/// so the tag would read as absent for every point emitted before it changed —
+/// during exactly the rollout it exists to measure. A distinct gauge is queryable the moment it is emitted.
+///
+/// Read it beside `pinned_suspended`, never instead of it. Zero here is not a
+/// fault: with the flag off it is the expected value everywhere, and with the
+/// flag on it means that node has not reported a backup inventory inside the
+/// freshness window and is being enumerated from history — which is the
+/// designed fallback, not a degradation.
+pub fn backup_queue_gated(node_id: &str, gated: bool) {
+    gauge(
+        "node_drain.backup_queue_gated",
+        if gated { 1.0 } else { 0.0 },
         &[tag("node", node_id)],
     );
 }

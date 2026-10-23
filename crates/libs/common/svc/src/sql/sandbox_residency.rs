@@ -610,6 +610,55 @@ pub fn node_census_fresh(node_expr: &str) -> String {
     )
 }
 
+/// Boolean SQL fragment: TRUE iff the node named by `node_expr` has reported
+/// its set of local artifacts still awaiting a durable backup recently enough
+/// for an **empty** set to mean "nothing is pending" rather than "nobody
+/// asked".
+///
+/// Sibling of [`node_census_fresh`] in every respect — same table, the column
+/// beside it, the same [`CENSUS_INVENTORY_MAX_AGE`] window, the same
+/// uncorrelated `node_expr`-only key so Postgres hoists it into a
+/// once-per-execution InitPlan instead of a per-row SubPlan. It is a separate
+/// fragment rather than a second term on that one because the two stamps
+/// answer different questions and advance on different conditions: a census
+/// can be complete for placement purposes while carrying no backup inventory
+/// at all, which is the state of every node until it runs a build that reports
+/// one.
+///
+/// # What this gate is for, and what it is not for
+///
+/// It guards **absence, not presence**. The drain's queue read never widens
+/// its candidate set — every row it yields is re-checked against
+/// `snapshot_durable_for_source_release` and `inflight_suspend_upload_exists`,
+/// so a stale row costs a probe and can never release a node. The dangerous
+/// reading is the other one: an empty queue taken as "this node holds no
+/// un-backed-up artifact" when the node simply never reported. That is the
+/// only inference this gate licenses, and it is why FALSE must route the
+/// caller to the history predicate rather than to a smaller answer.
+///
+/// It follows that a caller consuming only rows that *exist* would need no
+/// gate.
+///
+/// FALSE when the node has no `node_status_snapshots` row, when
+/// `local_backup_inventory_reported_at` is NULL (no inventory has ever been
+/// accepted from it — the state of every row when the column shipped), and
+/// when that timestamp is older than the window. The explicit `IS NOT NULL` is
+/// redundant against the comparison for the same reason it is in
+/// [`node_census_fresh`]: the fail-closed reading of a never-reported
+/// inventory should be intentional, not a by-product of three-valued logic.
+pub fn node_backup_inventory_fresh(node_expr: &str) -> String {
+    format!(
+        "EXISTS (\n\
+             SELECT 1\n\
+               FROM node_status_snapshots bnss\n\
+              WHERE bnss.node_id = {node_expr}\n\
+                AND bnss.local_backup_inventory_reported_at IS NOT NULL\n\
+                AND bnss.local_backup_inventory_reported_at > NOW() - make_interval(secs => {})\n\
+         )",
+        CENSUS_INVENTORY_MAX_AGE.as_secs()
+    )
+}
+
 /// Boolean SQL fragment: TRUE iff the node named by `node_expr` still reports
 /// the sandbox aliased `sandbox_alias` in its published census.
 ///
