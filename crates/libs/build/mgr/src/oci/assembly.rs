@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use oci_spec::distribution::Reference as OciReference;
 
 use super::bundle::{GuestBundle, GuestBundleError, install_current_guest};
-use super::containerd::{OciBuildError, OciMountRequest, mount};
+use super::containerd::{OciBuildError, OciMountRequest, OciRootfs, mount};
 use crate::command_as_root;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,9 +156,16 @@ pub async fn assemble_from_image(
 ) -> Result<(), OciImageAssemblyError> {
     let oci_rootfs = mount(OciMountRequest {
         cache_dir: request.cache_dir.clone(),
-        reference: request.reference,
+        reference: request.reference.clone(),
     })
     .await?;
+    assemble_from_mounted_image(request, oci_rootfs).await
+}
+
+pub(crate) async fn assemble_from_mounted_image(
+    request: OciImageAssemblyRequest,
+    oci_rootfs: OciRootfs,
+) -> Result<(), OciImageAssemblyError> {
     let oci_rootfs_path = oci_rootfs.path().to_path_buf();
     let assembly_result = tokio::task::spawn_blocking(move || {
         assemble(RootfsAssemblyRequest {

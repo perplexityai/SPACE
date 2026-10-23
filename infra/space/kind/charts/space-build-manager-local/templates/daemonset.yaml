@@ -116,6 +116,10 @@ spec:
           securityContext:
             privileged: true
           env:
+            {{- with .Values.ociGuestSeeds }}
+            - name: SPACE_OCI_GUEST_SEEDS
+              value: {{ . | toJson | quote }}
+            {{- end }}
             {{- include "space-node-service.env.identity" $envCtx | nindent 12 }}
             {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
             # The BuildManager listener's TLS identity
