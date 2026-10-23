@@ -1,0 +1,149 @@
+use super::*;
+
+fn configured() -> GuestSeeds {
+    GuestSeeds::parse(Some(r#"{"ubuntu":{"24.04":"seed-noble:validated"}}"#)).unwrap()
+}
+
+#[test]
+fn selects_only_the_configured_os_and_release() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("etc")).unwrap();
+    let base = "seed".parse().unwrap();
+    for (contents, expected) in [
+        ("ID=ubuntu\nVERSION_ID=24.04\n", "seed-noble:validated"),
+        ("ID=ubuntu\nVERSION_ID=\"24.04\"\n", "seed-noble:validated"),
+        ("ID='ubuntu'\nVERSION_ID='24.04'\n", "seed-noble:validated"),
+        ("ID=ubuntu\nVERSION_ID=26.04\n", "seed:latest"),
+        ("ID=ubuntu\nVERSION_ID=22.04\n", "seed:latest"),
+        ("ID=debian\nVERSION_ID=12\n", "seed:latest"),
+        (
+            "ID=custom\nID_LIKE=ubuntu\nVERSION_ID=24.04\n",
+            "seed:latest",
+        ),
+        ("ID=ubuntu\nVERSION_ID=24.04.3\n", "seed:latest"),
+        ("ID=ubuntu\n", "seed:latest"),
+        ("ID=$(echo ubuntu)\nVERSION_ID=24.04\n", "seed:latest"),
+        ("ID=ubuntu\nVERSION_ID=\"24.04\n", "seed:latest"),
+        (
+            "ID=ubuntu\nVERSION_ID=24.04\nVERSION_ID=26.04\n",
+            "seed:latest",
+        ),
+    ] {
+        fs::write(root.path().join("etc/os-release"), contents).unwrap();
+        assert_eq!(
+            configured().select(root.path(), &base).unwrap().to_string(),
+            expected,
+            "{contents}"
+        );
+    }
+    fs::write(
+        root.path().join("etc/os-release"),
+        "ID=ubuntu\nVERSION_ID=24.04\n",
+    )
+    .unwrap();
+    let pinned = "seed@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        .parse()
+        .unwrap();
+    assert_eq!(
+        configured()
+            .select(root.path(), &pinned)
+            .unwrap()
+            .to_string(),
+        "seed-noble:validated"
+    );
+}
+
+#[test]
+fn disabled_configuration_and_explicit_bases_do_not_inspect_the_image() {
+    let missing = Path::new("/nonexistent-guest-seed-test-root");
+    let base = "seed".parse().unwrap();
+    for config in [None, Some("{}")] {
+        let seeds = GuestSeeds::parse(config).unwrap();
+        assert_eq!(seeds.select(missing, &base).unwrap(), base);
+    }
+    for raw in [
+        "custom-seed",
+        "custom-seed:stable",
+        "custom-seed@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let explicit = raw.parse().unwrap();
+        assert_eq!(configured().select(missing, &explicit).unwrap(), explicit);
+    }
+}
+
+#[test]
+fn os_release_precedence_and_missing_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let base = "seed".parse().unwrap();
+    assert_eq!(configured().select(root.path(), &base).unwrap(), base);
+    fs::create_dir_all(root.path().join("usr/lib")).unwrap();
+    fs::write(
+        root.path().join("usr/lib/os-release"),
+        "ID=ubuntu\nVERSION_ID=24.04\n",
+    )
+    .unwrap();
+    assert_eq!(
+        configured().select(root.path(), &base).unwrap().to_string(),
+        "seed-noble:validated"
+    );
+    fs::create_dir(root.path().join("etc")).unwrap();
+    fs::write(
+        root.path().join("etc/os-release"),
+        "ID=debian\nVERSION_ID=12\n",
+    )
+    .unwrap();
+    assert_eq!(configured().select(root.path(), &base).unwrap(), base);
+}
+
+#[cfg(unix)]
+#[test]
+fn reads_relative_image_symlinks_but_rejects_host_paths_and_nonfiles() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("etc")).unwrap();
+    fs::create_dir_all(root.path().join("usr/lib")).unwrap();
+    let contents = "ID=ubuntu\nVERSION_ID=24.04\n";
+    fs::write(root.path().join("usr/lib/os-release"), contents).unwrap();
+    fs::write(outside.path().join("os-release"), contents).unwrap();
+    let link = root.path().join("etc/os-release");
+    let base = "seed".parse().unwrap();
+    symlink("../usr/lib/os-release", &link).unwrap();
+    assert_eq!(
+        configured().select(root.path(), &base).unwrap().to_string(),
+        "seed-noble:validated"
+    );
+    fs::remove_file(&link).unwrap();
+    symlink(outside.path().join("os-release"), &link).unwrap();
+    assert!(matches!(
+        configured().select(root.path(), &base),
+        Err(GuestSeedError::InvalidFile)
+    ));
+    fs::remove_file(&link).unwrap();
+    fs::create_dir(&link).unwrap();
+    assert!(matches!(
+        configured().select(root.path(), &base),
+        Err(GuestSeedError::InvalidFile)
+    ));
+}
+
+#[test]
+fn rejects_invalid_config_and_oversized_identity_files() {
+    for value in ["", "[]", r#"{"ubuntu":{"24.04":"../seed"}}"#] {
+        assert!(matches!(
+            GuestSeeds::parse(Some(value)),
+            Err(GuestSeedError::Configuration(_))
+        ));
+    }
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("etc")).unwrap();
+    fs::write(
+        root.path().join("etc/os-release"),
+        vec![b'x'; MAX_OS_RELEASE_BYTES as usize + 1],
+    )
+    .unwrap();
+    assert!(matches!(
+        configured().select(root.path(), &"seed".parse().unwrap()),
+        Err(GuestSeedError::InvalidFile)
+    ));
+}
