@@ -53,6 +53,31 @@ pub fn set_upload_failure_scope(conn: &Connection, job_id: &JobId, scope: &str) 
     )
 }
 
+/// How many snapshot-upload jobs under `dedup_key` failed permanently with a
+/// recorded failure scope other than `excluded_scope`. A payload that
+/// recorded no scope, or isn't JSON, counts; `CASE` keeps `json_extract`
+/// off a payload that isn't, since SQLite needn't short-circuit `AND`.
+pub fn count_permanent_upload_failures_outside_scope(
+    conn: &Connection,
+    dedup_key: &str,
+    excluded_scope: &str,
+) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM jobs
+         WHERE kind = ?1 AND dedup_key = ?2 AND status = 'failed' AND error_kind = ?3
+           AND CASE WHEN json_valid(payload)
+                    THEN json_extract(payload, '$.failure_scope') END IS NOT ?4",
+        params![
+            SNAPSHOT_UPLOAD_JOB_KIND,
+            dedup_key,
+            pplx_space_common_jobs::JobFailureKind::Permanent.as_str(),
+            excluded_scope
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or_default())
+}
+
 /// The highest job rowid, `None` for an empty table.
 pub fn max_job_rowid(conn: &Connection) -> Result<Option<i64>> {
     conn.query_row("SELECT MAX(rowid) FROM jobs", [], |r| r.get(0))

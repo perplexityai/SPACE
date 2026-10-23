@@ -169,4 +169,5 @@ pub(super) async fn drain(service: &SandboxManagerService) {
 mod cluster_api_stub_tests;
 mod registration_tests;
 mod release_tests;
+mod retried_activation_tests;
 mod verdict_tests;

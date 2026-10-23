@@ -1973,6 +1973,22 @@ impl SandboxManagerService {
             activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
             return Err(error);
         }
+        let open_route_activation = start_ctx
+            .open_activation_claim_eligible
+            .then(|| {
+                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                    &start_ctx.space_api_route_identity,
+                    start_ctx.route_identity_provenance,
+                )
+            })
+            .flatten();
+        if let Err(error) = self
+            .refuse_retired_activation_retry(id, open_route_activation.as_ref())
+            .await
+        {
+            activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
+            return Err(error);
+        }
 
         // Serialize the whole activation boundary with cleanup. A cleanup
         // admitted for the previous execution must either finish before this
@@ -1986,15 +2002,6 @@ impl SandboxManagerService {
         );
         let activation_fence =
             wait_for_activation_admission(id, activation_lock_owner.lock()).await?;
-        let open_route_activation = start_ctx
-            .open_activation_claim_eligible
-            .then(|| {
-                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
-                    &start_ctx.space_api_route_identity,
-                    start_ctx.route_identity_provenance,
-                )
-            })
-            .flatten();
 
         let cleanup_episode = {
             let db = self.db_conn()?;
