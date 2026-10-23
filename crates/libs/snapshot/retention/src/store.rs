@@ -18,8 +18,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    CandidatePage, ClaimOutcome, ClaimRefusalReason, ClaimedScanEpoch, PruneCandidate,
-    PruneFinalize, RetentionSink, SnapshotStorageLocation,
+    CandidatePage, ClaimOutcome, ClaimRefusalReason, ClaimedScanEpoch, DiscoveryCheckpoint,
+    PruneCandidate, PruneFinalize, RetentionSink, SnapshotStorageLocation,
 };
 
 type PruneCandidateRow = (
@@ -175,6 +175,32 @@ impl SnapshotRetentionDbStore {
 }
 
 impl RetentionSink for SnapshotRetentionDbStore {
+    async fn load_discovery_checkpoint(&self) -> Result<DiscoveryCheckpoint, sqlx::Error> {
+        let (after, revision) = sqlx::query_as(sql!(
+            "SELECT scan_after, revision FROM snapshot_retention_checkpoint WHERE singleton"
+        ))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(DiscoveryCheckpoint { after, revision })
+    }
+
+    async fn save_discovery_checkpoint(
+        &self,
+        expected_revision: i64,
+        after: Option<SnapshotId>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(sql!(
+            "UPDATE snapshot_retention_checkpoint
+                SET scan_after = $1, revision = revision + 1
+              WHERE singleton AND revision = $2"
+        ))
+        .bind(after)
+        .bind(expected_revision)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn list_candidates(
         &self,
         keep_n: i64,

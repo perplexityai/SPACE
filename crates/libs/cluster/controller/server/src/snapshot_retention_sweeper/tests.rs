@@ -81,6 +81,18 @@ struct RecordingSink {
 }
 
 impl RetentionSink for RecordingSink {
+    async fn load_discovery_checkpoint(&self) -> Result<DiscoveryCheckpoint, sqlx::Error> {
+        Ok(DiscoveryCheckpoint::default())
+    }
+
+    async fn save_discovery_checkpoint(
+        &self,
+        _revision: i64,
+        _after: Option<SnapshotId>,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(true)
+    }
+
     async fn list_candidates(
         &self,
         _keep_n: i64,
