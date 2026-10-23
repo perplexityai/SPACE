@@ -246,7 +246,7 @@ columns cannot support a conclusion, while its CPU spread stays near 5% and its
 
 ## Listen backlogs bound the concurrency workloads
 
-`connection-limit` opens more connections than the proxy's 1776-permit admission
+`connection-limit` opens more connections than the proxy's 1680-permit admission
 semaphore allows, which is the one branch of the accept loop no other workload
 reaches. Three things make it a measurement rather than a coin flip:
 
