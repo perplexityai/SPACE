@@ -164,6 +164,22 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
         ),
         ("exempt IP without SNI", true, None, true, false, true),
         (
+            "exempt host on its port",
+            false,
+            Some("sensor.example.test"),
+            true,
+            false,
+            true,
+        ),
+        (
+            "exempt host on another port",
+            false,
+            Some("sensor.example.test"),
+            true,
+            false,
+            false,
+        ),
+        (
             "other host intercepted",
             false,
             Some("other.example.test"),
@@ -279,11 +295,22 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
             NetworkPolicyV1::deny_all()
         };
         policy.tls_interception = pplx_space_net_common::TlsInterception::On;
-        policy.tls_interception_exemptions.push(if exempt_ip {
-            EgressDestinationV1::Ip(dst.ip())
-        } else {
-            EgressDestinationV1::Domain("sensor.example.test".parse().unwrap())
-        });
+        let exempt_port = match name {
+            "exempt host on its port" => Some(dst.port()),
+            "exempt host on another port" => Some(dst.port().wrapping_add(1).max(1)),
+            _ => None,
+        };
+        policy.tls_interception_exemptions.push(
+            pplx_space_net_common::TlsInterceptionExemptionV1::new(
+                if exempt_ip {
+                    EgressDestinationV1::Ip(dst.ip())
+                } else {
+                    EgressDestinationV1::Domain("sensor.example.test".parse().unwrap())
+                },
+                exempt_port.map(u32::from),
+            )
+            .unwrap(),
+        );
         if denied_host {
             policy.egress.deny.push(EgressDestinationV1::Domain(
                 "sensor.example.test".parse().unwrap(),
@@ -318,7 +345,11 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
         let dns_allow_cache = network_state.dns_allow_cache();
         if matches!(
             name,
-            "exempt host" | "DNS-bound host" | "bound host with IP allow"
+            "exempt host"
+                | "exempt host on its port"
+                | "exempt host on another port"
+                | "DNS-bound host"
+                | "bound host with IP allow"
         ) {
             assert!(dns_allow_cache.observe_response(
                 &dns_a_response("sensor.example.test", [0, 0, 0, 0], 60),
@@ -407,6 +438,7 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
             usize::from(matches!(
                 name,
                 "other host intercepted"
+                    | "exempt host on another port"
                     | "unbound host on open policy"
                     | "wrong address on open policy"
                     | "wrong host on open policy"

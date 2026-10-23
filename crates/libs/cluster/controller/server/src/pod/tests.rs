@@ -477,7 +477,14 @@ fn content_hash() -> ContentHash {
 
 const EVAC_TEST_TEMPLATE: &str = "seed";
 const EVAC_TEST_AUTO_LIFECYCLE: &str = "{}";
-const EVAC_TEST_NETWORK_POLICY: &str = "{}";
+static EVAC_TEST_NETWORK_POLICY: std::sync::LazyLock<
+    pplx_space_net_common::NetworkPolicyAnnotation,
+> = std::sync::LazyLock::new(|| {
+    pplx_space_net_common::NetworkPolicyAnnotation::encode(
+        &pplx_space_net_common::NetworkPolicyV1::allow_all(),
+    )
+    .unwrap()
+});
 const EVAC_TEST_CONTENT_HASH: &str =
     "sha256:969f3d03c5e44174169acb4fc5a8019590338e04aa48e5c11f0fd2e10716e254";
 static EVAC_TEST_SANDBOX_OWNER: SandboxOwner = SandboxOwner::new_static("evacuation@local");
@@ -493,7 +500,7 @@ fn evacuation_runtime(_sandbox_owner: &SandboxOwner) -> SandboxRuntimePodMetadat
         org_id: OrgId::from_uuid(Uuid::from_u128(0x02)),
         auto_lifecycle_json: EVAC_TEST_AUTO_LIFECYCLE,
         auto_lifecycle_authority: PolicyAuthority::Cluster,
-        network_policy_json: EVAC_TEST_NETWORK_POLICY,
+        network_policy_json: &EVAC_TEST_NETWORK_POLICY,
         network_policy_generation: 1,
         network_policy_authority: PolicyAuthority::Cluster,
         volume_encryption: false,

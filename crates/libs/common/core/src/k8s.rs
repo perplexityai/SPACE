@@ -11,6 +11,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use pplx_space_net_common::NetworkPolicyAnnotation;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -491,7 +492,7 @@ pub struct SandboxRuntimePodMetadata<'a> {
     pub org_id: crate::types::OrgId,
     pub auto_lifecycle_json: &'a str,
     pub auto_lifecycle_authority: PolicyAuthority,
-    pub network_policy_json: &'a str,
+    pub network_policy_json: &'a NetworkPolicyAnnotation,
     pub network_policy_generation: u64,
     pub network_policy_authority: PolicyAuthority,
     pub vcpu: Option<u32>,
@@ -925,7 +926,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
         );
         annotations.insert(
             SANDBOX_NETWORK_POLICY_ANNOTATION.to_string(),
-            runtime.network_policy_json.to_string(),
+            runtime.network_policy_json.as_str().to_string(),
         );
         annotations.insert(
             SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION.to_string(),

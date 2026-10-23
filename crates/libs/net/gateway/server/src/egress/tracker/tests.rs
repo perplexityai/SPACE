@@ -339,7 +339,7 @@ fn exempt_tls_survives_dns_expiry_but_rechecks_current_policy() {
             policy.egress.default_action = default_action;
             policy
                 .tls_interception_exemptions
-                .push(EgressDestinationV1::Domain(host.parse().unwrap()));
+                .push(EgressDestinationV1::Domain(host.parse().unwrap()).into());
             let cache = DnsAllowCache::default();
             assert!(cache.observe_response(&dns_a_response(host, [192, 0, 2, 10], 60), &policy,));
             let tracker = DnsAttributedTcpTracker::default();
@@ -363,7 +363,7 @@ fn exempt_tls_survives_dns_expiry_but_rechecks_current_policy() {
             assert!(!token.is_cancelled());
             assert_eq!(
                 policy.tls_interception_for(
-                    destination.ip(),
+                    destination,
                     dns_attributed_host(destination, &scan, &cache)
                 ),
                 TlsInterception::On,
@@ -416,4 +416,34 @@ fn exempt_tls_survives_dns_expiry_but_rechecks_current_policy() {
             );
         }
     }
+}
+
+#[test]
+fn policy_resweep_rechecks_a_port_scoped_exemption_against_the_connection_port() {
+    use pplx_space_net_common::{EgressDestinationV1, TlsInterceptionExemptionV1};
+
+    let destination: SocketAddr = "192.0.2.10:5228".parse().unwrap();
+    let scan = ClientHelloScan::ServerName("push.example.test".parse().unwrap());
+    let exempt_on = |port| {
+        let mut policy = v1_allow_all();
+        policy.tls_interception = TlsInterception::On;
+        policy.tls_interception_exemptions.push(
+            TlsInterceptionExemptionV1::new(EgressDestinationV1::Ip(destination.ip()), Some(port))
+                .unwrap(),
+        );
+        policy
+    };
+    let policy = exempt_on(5228);
+    let cache = DnsAllowCache::default();
+    let tracker = DnsAttributedTcpTracker::default();
+    let token = CancellationToken::new();
+    let guard = tracker.register(destination, scan, &policy, &cache, token.clone());
+    assert_eq!(guard.interception_mode, TlsInterception::Off);
+    assert_eq!(tracker.cancel_denied(&policy, &cache), 0);
+    assert!(!token.is_cancelled());
+
+    // Moving the exemption to another port would put the opaque flow under
+    // interception, which it cannot join mid-stream.
+    assert_eq!(tracker.cancel_denied(&exempt_on(5229), &cache), 1);
+    assert!(token.is_cancelled());
 }

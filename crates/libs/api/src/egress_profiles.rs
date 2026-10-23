@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pplx_space_metrics::sandbox::admission::{EgressProfileOutcome, egress_profile};
-use pplx_space_net_common::{EgressDefaultAction, EgressDestinationV1, NetworkPolicyV1};
+use pplx_space_net_common::{
+    EgressDefaultAction, EgressDestinationV1, NetworkPolicyV1, TlsInterceptionExemptionV1,
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 const ENV: &str = "SPACE_EGRESS_PROFILES";
@@ -220,8 +222,9 @@ impl EgressProfiles {
                 }
             }
             for destination in &profile.tls_interception_exemptions {
-                if !policy.tls_interception_exemptions.contains(destination) {
-                    policy.tls_interception_exemptions.push(destination.clone());
+                let exemption = TlsInterceptionExemptionV1::all_ports(destination.clone());
+                if !policy.tls_interception_exemptions.contains(&exemption) {
+                    policy.tls_interception_exemptions.push(exemption);
                 }
             }
         }

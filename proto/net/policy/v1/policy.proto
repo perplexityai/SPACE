@@ -50,7 +50,21 @@ message NetworkPolicyV1 {
   // of network policy and are delivered to a capable gateway separately.
   repeated NetworkCredentialRuleV1 network_credential_rules = 6;
   // Skip TLS termination after egress admission; this grants no network access.
+  // Holds only the exemptions that apply on every port, so a reader that does
+  // not know tls_interception_exemptions_with_ports intercepts a port-scoped
+  // destination instead of exempting all of its ports.
   repeated EgressDestinationV1 tls_interception_exemptions = 7;
+  // Set only when at least one exemption is scoped to a port. It then holds
+  // every exemption in order, readers that know it ignore
+  // tls_interception_exemptions, and tls_interception_exemptions must equal its
+  // entries without a port.
+  repeated TlsInterceptionExemptionV1 tls_interception_exemptions_with_ports = 8;
+}
+
+message TlsInterceptionExemptionV1 {
+  EgressDestinationV1 destination = 1;
+  // Omitted exempts every destination port.
+  optional uint32 port = 2;
 }
 
 message NetworkCredentialRuleV1 {

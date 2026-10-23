@@ -60,8 +60,7 @@ impl DnsAttributedTcpTracker {
         shutdown_token: CancellationToken,
     ) -> TcpConnectionGuard {
         let attributed_host = dns_attributed_host(destination, &scan, dns_allow_cache);
-        let admitted_tls_interception =
-            policy.tls_interception_for(destination.ip(), attributed_host);
+        let admitted_tls_interception = policy.tls_interception_for(destination, attributed_host);
         let admitted_exempt_host =
             if !policy.tls_interception.is_off() && admitted_tls_interception.is_off() {
                 attributed_host.cloned()
