@@ -252,9 +252,10 @@ resource "helm_release" "cluster_autoscaler" {
       # Only with several groups, so a single-group cluster's values don't
       # change. Similar groups need identical labels apart from an ignore list
       # (zone, hostname and eks.amazonaws.com/nodegroup among them). The groups
-      # share a launch template, but each one rolls to a new AMI or template
-      # version on its own, and during that roll its nodes carry a different
-      # nodegroup-image or sourceLaunchTemplateVersion than the other groups'.
+      # share a launch template, but each one moves to a new AMI or template
+      # version on its own, and stays on its version until it's moved, so its
+      # nodes can carry a different nodegroup-image or
+      # sourceLaunchTemplateVersion than the other groups'.
       # The chart drops everything from the first `_` in a key, which is how
       # one flag is passed twice. Two maps, so the flag keeps its bool rather
       # than being unified with the labels into strings.

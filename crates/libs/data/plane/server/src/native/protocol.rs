@@ -63,6 +63,14 @@ pub(crate) fn process_start_request(
     }
 }
 
+/// Whether a process session asks for a pty, whose input an SSE stream cannot
+/// carry or close. An unreadable adapter state answers `false` and is reported
+/// by the start itself.
+pub(crate) fn process_session_needs_pty(attached: &AttachedSession) -> bool {
+    serde_json::from_str::<CreateProcessRequest>(&attached.adapter_state_json)
+        .is_ok_and(|request| request.pty.is_some())
+}
+
 fn duration_to_proto(timeout: Option<SimpleDuration>) -> Option<prost_types::Duration> {
     let timeout = timeout?.as_duration();
     Some(prost_types::Duration {

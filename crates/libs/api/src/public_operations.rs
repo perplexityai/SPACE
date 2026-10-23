@@ -638,6 +638,8 @@ impl PublicOperationStore {
             &mut tx,
             CreatePublicOperation {
                 org_id,
+                // The lifecycle executor tells an ECW delete apart by this
+                // missing actor; it keeps the snapshot-upload 409 for them.
                 actor_user_id: None,
                 api_product: ApiProduct::Native,
                 kind: OperationKind::DeleteSandbox,

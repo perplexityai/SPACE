@@ -333,6 +333,99 @@ mod delete {
         Ok(())
     }
 
+    /// An ECW DELETE that lands while a native delete waits on a snapshot
+    /// upload joins that delete instead of answering the upload's 409, and is
+    /// accepted while the delete waits. The native delete is driven through
+    /// the real executor, which requeues it behind the upload.
+    #[tokio::test]
+    async fn ecw_delete_joins_a_native_delete_waiting_on_an_upload() -> TestResult {
+        use crate::controllers::sandbox::SandboxController;
+        use crate::controllers::substrate::{Substrate, direct::DirectSubstrate};
+        use crate::public_operation_driver::{
+            OperationExecutionConfig, OperationExecutor, drive_claimed_operation,
+        };
+        use crate::public_operations::{ApiProduct, CreatePublicOperation};
+        use crate::public_sandbox_operations::SandboxLifecycleOperationExecutor;
+        use pplx_space_common_core::types::UserId;
+        use pplx_space_db_test_fixtures::{
+            SEED_USER_ID, insert_suspended_sandbox, insert_uploading_snapshot,
+        };
+        use pplx_space_public_api::OperationTargetType;
+
+        let db = pg_test_db().await?;
+        let store = PublicOperationStore::new(db.pool.clone());
+        let org_id = OrgId::from_uuid(SEED_ORG_ID);
+        let user_id = UserId::from_uuid(SEED_USER_ID);
+        let sandbox = insert_suspended_sandbox(&db.pool, org_id, user_id).await?;
+        insert_uploading_snapshot(&db.pool, sandbox, 0, None).await?;
+        let sandbox_id = PublicSandboxId::from(sandbox);
+        let target_id = sandbox_id.to_string();
+        let payload = SandboxLifecycleOperationPayload {
+            sandbox_id,
+            action: PublicSandboxLifecycleAction::Delete,
+            rollback: None,
+        }
+        .into_json();
+        let native = match store
+            .create_operation(CreatePublicOperation {
+                org_id,
+                actor_user_id: Some(user_id),
+                api_product: ApiProduct::Native,
+                kind: OperationKind::DeleteSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(&target_id),
+                payload_json: payload.clone(),
+                idempotency: None,
+                traceparent: None,
+            })
+            .await?
+        {
+            CreatePublicOperationResult::Created(id) => id,
+            other => return Err(format!("native delete was not admitted: {other:?}").into()),
+        };
+        let mut claimed = store
+            .claim_operations(ClaimPublicOperations {
+                limit: 1,
+                claim_stale_after: Duration::from_secs(60),
+                claimable_kinds: &[OperationKind::DeleteSandbox],
+            })
+            .await?;
+        let operation = claimed
+            .operations
+            .pop()
+            .ok_or("the native delete is claimable")?;
+        let executor = SandboxLifecycleOperationExecutor::new(
+            db.pool.clone(),
+            SandboxController::new(Substrate::from_direct(DirectSubstrate::new(
+                db.pool.clone(),
+            ))),
+        );
+        let report = drive_claimed_operation(
+            store.clone(),
+            claimed.claim_token,
+            OperationExecutionConfig::default(),
+            operation.clone(),
+            OperationExecutor::Dispatcher,
+            async move { executor.execute(&operation).await.into() },
+        )
+        .await?;
+        assert_eq!(report.retried, 1, "the native delete waits on the upload");
+
+        let joined = store
+            .create_or_join_active_sandbox_delete(org_id, &target_id, payload, None)
+            .await?;
+        assert!(
+            matches!(joined, CreatePublicOperationResult::Existing(id) if id == native),
+            "the ECW delete joins the waiting native delete: {joined:?}"
+        );
+        let observed = wait_for_delete_operation(&store, org_id, native, sandbox_id, OBSERVE).await;
+        assert_eq!(
+            observed.map_err(|error| error.status),
+            Ok(StatusCode::ACCEPTED)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn lost_observation_of_a_durable_delete_is_still_accepted() -> TestResult {
         let db = pg_test_db().await?;

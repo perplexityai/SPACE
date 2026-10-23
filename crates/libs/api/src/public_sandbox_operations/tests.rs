@@ -2,10 +2,12 @@ use std::{collections::BTreeMap, fmt};
 use uuid::Uuid;
 
 use pplx_space_common_core::types::{
-    NodeId, OrgId, RuntimeKind, TemplateReference, UpstreamIssuer, UpstreamOrgId,
+    NodeId, OrgId, RuntimeKind, SnapshotId, TemplateReference, UpstreamIssuer, UpstreamOrgId,
     UpstreamSubjectId, UserId,
 };
-use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_db_test_fixtures::{
+    insert_suspended_sandbox, insert_uploading_snapshot, pg_test_db,
+};
 use pplx_space_public_api::{
     OperationId, OperationTargetType, PublicSandboxMetadataValue,
     SandboxResources as PublicSandboxResources,
@@ -62,9 +64,10 @@ fn claimed_create_operation_for(
     }
 }
 
-// Direct is only a placeholder for the existing-row tests, which never reach the
-// substrate. The admitted re-execution test differs on Kubernetes; its twin in the
-// `kubernetes` submodule pins how.
+// Direct is a placeholder for the existing-row tests, which never reach the
+// substrate, and for the delete tests, whose seeded sandboxes have no runtime for
+// it to tear down. The admitted re-execution test differs on Kubernetes; its twin
+// in the `kubernetes` submodule pins how.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
@@ -1217,5 +1220,363 @@ async fn admitted_create_re_execution_after_success_does_not_create_again() -> T
         executions, 0,
         "re-execution must not start another execution"
     );
+    Ok(())
+}
+
+fn claimed_delete_operation(
+    sandbox_id: SandboxId,
+    org_id: OrgId,
+    actor_user_id: Option<UserId>,
+    api_product: ApiProduct,
+) -> ClaimedPublicOperation {
+    let public_sandbox_id = PublicSandboxId::from(sandbox_id);
+    ClaimedPublicOperation {
+        id: OperationId::new(),
+        org_id,
+        actor_user_id,
+        api_product,
+        kind: OperationKind::DeleteSandbox,
+        target_type: Some(OperationTargetType::Sandbox),
+        target_id: Some(public_sandbox_id.to_string()),
+        payload: serde_json::to_value(SandboxLifecycleOperationPayload {
+            sandbox_id: public_sandbox_id,
+            action: SandboxLifecycleAction::Delete,
+            rollback: None,
+        })
+        .expect("delete payload serializes"),
+        attempts: 1,
+        claim_generation: 1,
+        traceparent: None,
+    }
+}
+
+const UPLOAD_CONFLICT_MESSAGE: &str = "sandbox has a suspend-snapshot upload in flight; retry the DELETE after the snapshot finalizes";
+
+async fn finalize_snapshot(pool: &PgPool, snapshot_id: SnapshotId) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+        .bind(snapshot_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn assert_waits_for_the_upload(name: &str, result: &PublicOperationExecutionResult) {
+    assert_eq!(result.state, OperationState::Queued, "{name}");
+    assert_eq!(
+        result.requeue_reason,
+        PublicOperationRequeueReason::WorkflowProgress,
+        "{name}: the wait spends no attempt"
+    );
+    assert!(
+        result
+            .retry_after
+            .is_some_and(|retry_after| retry_after >= SNAPSHOT_UPLOAD_RETRY_AFTER),
+        "{name}: {:?}",
+        result.retry_after
+    );
+    // The conflict rides along as the error to record if the wait runs out.
+    assert_eq!(
+        result.terminal_error_code,
+        Some(PublicErrorCode::Conflict),
+        "{name}"
+    );
+    assert_eq!(
+        result
+            .terminal_error_json
+            .as_ref()
+            .map(|json| &json["message"]),
+        Some(&serde_json::json!(UPLOAD_CONFLICT_MESSAGE)),
+        "{name}"
+    );
+}
+
+/// A native delete that arrives while a snapshot upload is in flight requeues
+/// as workflow progress without touching the sandbox, then deletes it once the
+/// upload finalizes. The dispatcher's retry deferral does not change the wait.
+#[tokio::test]
+async fn native_delete_waits_behind_an_in_flight_snapshot_upload_then_succeeds() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = insert_suspended_sandbox(&db.pool, org_id, user_id).await?;
+    let snapshot_id = insert_uploading_snapshot(&db.pool, sandbox_id, 0, None).await?;
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    let operation = claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native);
+
+    let deferral = crate::retry_deferral::RetryDeferral::new();
+    let deferring =
+        crate::retry_deferral::scope(Some(deferral.clone()), executor.execute(&operation)).await;
+    assert_waits_for_the_upload("under a deferral scope", &deferring);
+    assert!(
+        !deferral.deferred(),
+        "the wait is not handed back as a deferred retry"
+    );
+
+    let waiting = executor.execute(&operation).await;
+    assert_waits_for_the_upload("without a deferral scope", &waiting);
+    let sandbox = fetch_sandbox(&db.pool, sandbox_id)
+        .await?
+        .expect("the sandbox survives while its upload is in flight");
+    assert_eq!(sandbox.lifecycle, "suspended");
+
+    finalize_snapshot(&db.pool, snapshot_id).await?;
+    let finished = executor.execute(&operation).await;
+    assert_eq!(finished.state, OperationState::Succeeded);
+    assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_none());
+    Ok(())
+}
+
+/// A native delete waits on an upload whose worker is active, however old its
+/// row. It keeps main's terminal conflict wherever it cannot wait: an ECW
+/// delete (no actor), an admin delete, an upload whose worker has gone quiet
+/// past the wait limit, a delete that has itself waited past it on a run of
+/// uploads (each a fresh row), and any other conflict on a native delete.
+#[tokio::test]
+async fn a_delete_that_cannot_wait_fails_with_its_conflict() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    /// A blocking upload: how long ago its row was created, and how long ago
+    /// its worker last started an attempt, if it has.
+    #[derive(Clone, Copy)]
+    struct Upload {
+        created_secs_ago: u64,
+        last_attempt_secs_ago: Option<u64>,
+    }
+    struct Case {
+        name: &'static str,
+        actor: Option<UserId>,
+        api_product: ApiProduct,
+        upload: Option<Upload>,
+        /// How long ago the delete was first claimed, if it was.
+        waited_secs: Option<u64>,
+        fork_active: bool,
+        /// The conflict it fails with, or `None` when it waits.
+        conflict: Option<&'static str>,
+    }
+    let past_limit = SNAPSHOT_UPLOAD_WAIT_LIMIT.as_secs() + 60;
+    let native = Case {
+        name: "native",
+        actor: Some(user_id),
+        api_product: ApiProduct::Native,
+        upload: Some(Upload {
+            created_secs_ago: 0,
+            last_attempt_secs_ago: None,
+        }),
+        waited_secs: None,
+        fork_active: false,
+        conflict: None,
+    };
+    let upload_conflict = Some(UPLOAD_CONFLICT_MESSAGE);
+    let cases = [
+        Case {
+            name: "native that has waited a while",
+            waited_secs: Some(60),
+            ..native
+        },
+        Case {
+            name: "upload retrying past the limit with a recent attempt",
+            upload: Some(Upload {
+                created_secs_ago: past_limit,
+                last_attempt_secs_ago: Some(30),
+            }),
+            ..native
+        },
+        Case {
+            name: "ecw",
+            actor: None,
+            conflict: upload_conflict,
+            ..native
+        },
+        Case {
+            name: "admin",
+            api_product: ApiProduct::Admin,
+            conflict: upload_conflict,
+            ..native
+        },
+        Case {
+            name: "upload never heartbeated, past the limit",
+            upload: Some(Upload {
+                created_secs_ago: past_limit,
+                last_attempt_secs_ago: None,
+            }),
+            conflict: upload_conflict,
+            ..native
+        },
+        Case {
+            name: "upload whose last attempt is past the limit",
+            upload: Some(Upload {
+                created_secs_ago: past_limit + 600,
+                last_attempt_secs_ago: Some(past_limit),
+            }),
+            conflict: upload_conflict,
+            ..native
+        },
+        Case {
+            name: "run of uploads",
+            waited_secs: Some(past_limit),
+            conflict: upload_conflict,
+            ..native
+        },
+        Case {
+            name: "fork in progress",
+            upload: None,
+            fork_active: true,
+            conflict: Some(
+                "sandbox has a fork operation in progress; retry the DELETE after the fork completes",
+            ),
+            ..native
+        },
+        native,
+    ];
+    for Case {
+        name,
+        actor,
+        api_product,
+        upload,
+        waited_secs,
+        fork_active,
+        conflict,
+    } in cases
+    {
+        let sandbox_id = insert_suspended_sandbox(&db.pool, org_id, user_id).await?;
+        if let Some(upload) = upload {
+            insert_uploading_snapshot(
+                &db.pool,
+                sandbox_id,
+                upload.created_secs_ago,
+                upload.last_attempt_secs_ago,
+            )
+            .await?;
+        }
+        if fork_active {
+            sqlx::query(sql!(
+                "INSERT INTO public_operations (operation_id, org_id, kind, target_type, target_id)
+                 VALUES ($1, $2, 'fork_sandbox', 'sandbox', $3)"
+            ))
+            .bind(Uuid::now_v7())
+            .bind(org_id)
+            .bind(sandbox_id.to_string())
+            .execute(&db.pool)
+            .await?;
+        }
+        let operation = claimed_delete_operation(sandbox_id, org_id, actor, api_product);
+        if let Some(waited_secs) = waited_secs {
+            // The operation's row, first claimed `waited_secs` ago.
+            sqlx::query(sql!(
+                "INSERT INTO public_operations (
+                     operation_id, org_id, kind, target_type, target_id, state, started_at
+                 )
+                 VALUES (
+                     $1, $2, 'delete_sandbox', 'sandbox', $3, 'running',
+                     NOW() - make_interval(secs => $4::BIGINT)
+                 )"
+            ))
+            .bind(operation.id.as_uuid())
+            .bind(org_id)
+            .bind(operation.target_id.as_deref())
+            .bind(i64::try_from(waited_secs)?)
+            .execute(&db.pool)
+            .await?;
+        }
+
+        let result = executor.execute(&operation).await;
+
+        match conflict {
+            None => assert_waits_for_the_upload(name, &result),
+            Some(message) => {
+                assert_eq!(result.state, OperationState::Failed, "{name}");
+                assert_eq!(
+                    result.terminal_error_code,
+                    Some(PublicErrorCode::Conflict),
+                    "{name}"
+                );
+                assert_eq!(
+                    result
+                        .terminal_error_json
+                        .as_ref()
+                        .map(|json| &json["message"]),
+                    Some(&serde_json::json!(message)),
+                    "{name}"
+                );
+            }
+        }
+        assert!(
+            fetch_sandbox(&db.pool, sandbox_id).await?.is_some(),
+            "{name}: a refused delete leaves the sandbox"
+        );
+    }
+    Ok(())
+}
+
+/// An upload that begins after the pre-flight check is caught by the locked
+/// check at finalize, after the runtime was torn down. The delete restores the
+/// sandbox's lifecycle, waits like a pre-flight refusal, and finishes once the
+/// upload finalizes.
+#[tokio::test]
+async fn an_upload_caught_at_the_locked_check_requeues_the_delete() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = insert_suspended_sandbox(&db.pool, org_id, user_id).await?;
+    // The upload's snapshot row lands as the delete publishes its intent:
+    // after the pre-flight check, before the locked one.
+    sqlx::query(sql!(
+        "CREATE FUNCTION begin_upload_mid_delete_for_test()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             IF NOT EXISTS (SELECT 1 FROM snapshots WHERE sandbox_id = NEW.id) THEN
+                 INSERT INTO snapshots (sandbox_id, type, state)
+                 VALUES (NEW.id, 'full', 'creating');
+             END IF;
+             RETURN NEW;
+         END;
+         $$"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER begin_upload_mid_delete_for_test
+         AFTER UPDATE OF lifecycle ON sandboxes
+         FOR EACH ROW WHEN (NEW.lifecycle = 'deleting')
+         EXECUTE FUNCTION begin_upload_mid_delete_for_test()"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    let operation = claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native);
+
+    let waiting = executor.execute(&operation).await;
+    assert_waits_for_the_upload("caught at the locked check", &waiting);
+    let sandbox = fetch_sandbox(&db.pool, sandbox_id)
+        .await?
+        .expect("the locked check leaves the sandbox row");
+    assert_eq!(
+        sandbox.lifecycle, "suspended",
+        "the prior lifecycle is restored"
+    );
+
+    let snapshot_id: SnapshotId = sqlx::query_scalar(sql!(
+        "SELECT id FROM snapshots WHERE sandbox_id = $1 AND state = 'creating'"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    finalize_snapshot(&db.pool, snapshot_id).await?;
+    let finished = executor.execute(&operation).await;
+    assert_eq!(finished.state, OperationState::Succeeded);
+    assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_none());
     Ok(())
 }
