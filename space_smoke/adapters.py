@@ -61,6 +61,8 @@ from space_smoke.capabilities import (
     SandboxPodView,
     ColdCreatePod,
     ColdCreateSelection,
+    DrainGateBlocker,
+    TerminateAttempt,
     EcwCommandResult,
     EcwCreateAttempt,
     EcwCreateNotDelivered,
@@ -366,6 +368,12 @@ def _lease_parts(
     return metadata, spec
 
 
+# psql prints a DML command tag after the returned rows even under `-tA`.
+# Anchored and case-sensitive: these are psql's own tags, and a returned
+# *value* that happened to start with the word would be lower-case data.
+_PSQL_COMMAND_TAG = re.compile(r"^(INSERT|UPDATE|DELETE|SELECT|MERGE)\b")
+
+
 def _sql_uuid(value: str) -> str:
     """Refuse anything that is not a bare UUID before it reaches SQL."""
 
@@ -579,6 +587,82 @@ KIND_WORKER_NODE_SELECTOR = f"!{CONTROL_PLANE_LABEL}"
 SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
 """
+# The drain-gate Lease records the node it moved to `drained` and the row it
+# seeded, for the same reason the cordon Lease records its node: SPACE never
+# undoes either, so a takeover of an expired Lease has to.
+DRAIN_GATE_NODE_ANNOTATION = "space.pplx.net/smoke-drain-gate-node"
+DRAIN_GATE_SANDBOX_ANNOTATION = "space.pplx.net/smoke-drain-gate-sandbox"
+# Seeded rows carry the smoke's own org and user, the same pair the ECW key
+# seeding above uses.
+SMOKE_ORG_ID = "00000000-0000-0000-0000-000000000001"
+SMOKE_USER_ID = "00000000-0000-0000-0000-000000000010"
+# A node the guard's resident half cannot see and its drain half has nothing
+# to count yet: that pairing is what makes the scenario's 409 attributable.
+# The drain half also counts an upload still `creating` from the node for a
+# sandbox pinned elsewhere (`drain_gate_blocker_pairs`, by
+# `snapshots.source_node_id`), so a node with any `creating` full upload from
+# it is skipped too, wherever that upload's sandbox is pinned.
+# A sandbox worker only: a builder holds no sandbox rows, so it would always
+# look idle, and draining one would take it out of template builds.
+IDLE_UNPINNED_NODE_SQL = """\
+SELECT n.id
+  FROM nodes n
+ WHERE n.state IN ('ready', 'registered')
+   AND n.role = 'worker'
+   AND n.drain_phase IS NULL
+   AND NOT EXISTS (SELECT 1 FROM sandboxes s WHERE s.active_node_id = n.id)
+   AND NOT EXISTS (SELECT 1 FROM sandboxes s WHERE s.target_node_id = n.id)
+   AND NOT EXISTS (
+       SELECT 1 FROM snapshots sn
+        WHERE sn.source_node_id = n.id
+          AND sn.type = 'full'
+          AND sn.state = 'creating'
+   )
+ ORDER BY n.address
+ LIMIT 1;
+"""
+# `active_node_id` is deliberately left NULL: the row is pinned by
+# `target_node_id` alone, which is exactly the shape the earlier
+# `:terminate` guard was blind to.
+# The id is minted before the row exists so it can be recorded on the Lease
+# first. `space_uuid_v7()` rather than a client-side UUID: `sandboxes.id` is
+# time-ordered by convention across this schema, and a v4 would sort into the
+# distant past among real rows.
+MINT_SANDBOX_ID_SQL = "SELECT space_uuid_v7();\n"
+SEED_DRAIN_GATE_BLOCKER_SQL = """\
+INSERT INTO sandboxes (id, user_id, org_id, lifecycle, placement, managed_by,
+                       target_node_id, placement_changed_at,
+                       lifecycle_changed_at, network_policy_generation)
+VALUES ('{sandbox_id}', '{user_id}', '{org_id}', 'suspending', 'unplaced',
+        'k8s', '{node_id}', NOW(), NOW(), 1)
+RETURNING id;
+"""
+DELETE_DRAIN_GATE_BLOCKER_SQL = """\
+DELETE FROM sandboxes WHERE id = '{sandbox_id}';
+"""
+SET_NODE_DRAINED_SQL = """\
+UPDATE nodes SET drain_phase = 'drained'
+ WHERE id = '{node_id}' AND drain_phase IS NULL
+RETURNING id;
+"""
+# One statement, so the phase it reports is the one the reset saw: `reset`
+# when it cleared `drained`, otherwise the node's phase now (`none` for no
+# phase, `gone` for no row).
+CLEAR_NODE_DRAIN_PHASE_SQL = """\
+WITH reset AS (
+    UPDATE nodes SET drain_phase = NULL
+     WHERE id = '{node_id}' AND drain_phase = 'drained'
+    RETURNING id
+)
+SELECT COALESCE(
+    (SELECT 'reset' FROM reset),
+    (SELECT COALESCE(drain_phase, 'none') FROM nodes WHERE id = '{node_id}'),
+    'gone'
+);
+"""
+# What the reset may have found and still let the row go: the node is no longer
+# `drained`, so deleting its blocker can't hand the terminator a node to act on.
+DRAIN_PHASE_RESET_DONE = frozenset({"reset", "none", "gone"})
 POD_CAP_QUOTA_NAME = "space-smoke-pod-cap"
 # The sandbox-isolation smoke's pod that no allow rule selects: the sandbox
 # pods' own image (k8s.sandboxPodImage), already on every sandbox node, run by
@@ -1023,6 +1107,7 @@ class KindHarness:
         self._liveness_budget_target: tuple[str, str] | None = None
         self._cordon_lease_ownership: _LeaseOwnership | None = None
         self._public_api_lease_ownership: _LeaseOwnership | None = None
+        self._drain_gate_lease_ownership: _LeaseOwnership | None = None
         # The public API autoscaler's bounds before `scale_public_api` pinned
         # them: (name, uid, minReplicas, maxReplicas).
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
@@ -1304,6 +1389,30 @@ class KindHarness:
     @staticmethod
     def api_key_hash(api_key: str) -> str:
         return hashlib.sha256(api_key.encode()).hexdigest()
+
+    @staticmethod
+    def _returned_value(output: str) -> str:
+        """The first row of a `RETURNING` result, or `""` if it returned none.
+
+        `-t` suppresses the row-count footer for a SELECT but **not** the
+        command tag of a DML statement, so `INSERT … RETURNING id` writes two
+        lines: the id, then `INSERT 0 1`. Comparing the whole stripped output
+        to the id therefore never matches. The shell suite this replaced hid
+        that behind a `| head -1`; carrying the helper over without it is what
+        reintroduced the bug, and only a real database showed it — a fake that
+        answers one clean line cannot.
+
+        Taking the first line is not enough either. A statement that matched
+        **no** row emits the tag alone (`UPDATE 0`), and "first line" would
+        hand that back as if it were a value — turning "the node was already
+        drained by someone else" into a successful read. So a leading command
+        tag reads as no rows, which is what it means.
+        """
+
+        lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
+        if not lines or _PSQL_COMMAND_TAG.match(lines[0]):
+            return ""
+        return lines[0]
 
     def _psql(self, sql: str, *, action: str) -> str:
         """Run one statement on the stack's Postgres; tuples-only output."""
@@ -6101,11 +6210,234 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return values
 
+    # ----- DrainGateControl -----------------------------------------------------
+    #
+    # The admin `:terminate` occupancy guard is the only consumer of
+    # `drain_gate_blockers_for_node` that answers over HTTP, and the store-level
+    # tests cannot see the response. Driving it needs two real writes — one
+    # `nodes` row to `drained`, one pinned `suspending` row — so both are fenced
+    # on their own mutation Lease and recorded on it for orphan repair.
+
+    def _admin_bearer_token(self) -> str:
+        token = self.environment.get("SPACE_API_TOKEN", "").strip()
+        if not token:
+            token_file = self.environment.get("SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
+            if token_file:
+                token = Path(token_file).read_text().strip()
+        if not token:
+            raise SmokeConfigurationError(
+                "admin routes need SPACE_API_TOKEN or SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE"
+            )
+        return token
+
+    def acquire_drain_gate_mutation(self) -> Callable[[], None]:
+        context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
+        name = f"space-smoke-drain-gate-{context_hash}"
+
+        def repair_orphaned_seed(
+            previous: Mapping[str, object], ownership: _LeaseOwnership
+        ) -> None:
+            self._undo_recorded_drain_gate_writes(
+                ownership, _lease_annotations(previous), "an orphaned drain-gate repair"
+            )
+
+        ownership = self._acquire_named_mutation_lease(
+            name, "drain gate mutation", repair=repair_orphaned_seed
+        )
+        self._drain_gate_lease_ownership = ownership
+
+        def release() -> None:
+            self._release_lease(ownership)
+            if self._drain_gate_lease_ownership is ownership:
+                self._drain_gate_lease_ownership = None
+
+        return release
+
+    def _owned_drain_gate_lease(self, action: str) -> _LeaseOwnership:
+        ownership = self._drain_gate_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                f"refusing {action} without the caller's live mutation Lease "
+                "(drain gate mutation)"
+            )
+        self._assert_lease_owned(ownership, action)
+        return ownership
+
+    def seed_drain_gate_blocker(self) -> DrainGateBlocker:
+        self._require_isolated_kind("seeding a drain-gate blocker")
+        ownership = self._owned_drain_gate_lease("seeding a drain-gate blocker")
+        node_id = self._returned_value(
+            self._psql(IDLE_UNPINNED_NODE_SQL, action="select an idle registered node")
+        )
+        if not node_id:
+            raise SmokeConfigurationError(
+                "no node is free of a drain phase and of every "
+                "sandbox pin; the drain-gate refusal would not be attributable"
+            )
+        node_id = _sql_uuid(node_id)
+        # Row first, then the drain. A node that is `drained` with no blocker is
+        # the shape `drained_node_terminator` acts on, and on this bench it runs
+        # with the kube-delete backend, so that shape must never exist — not
+        # between two statements and not after a death between them. Pinned to
+        # an undrained node, the row only matters to a drain someone else starts
+        # in that window, which it would hold, never release.
+        #
+        # Record before each write: dying between a write and its annotation
+        # must leave the next holder over-cleaning, never under-cleaning.
+        #
+        # Mint the row's id before inserting it, so the annotation can precede
+        # the write. Letting the INSERT allocate it leaves a window where the
+        # row is committed and the Lease cannot name it, and a `suspending` row
+        # nobody can name is a permanent drain blocker for every later run on
+        # this bench. Minting is a read, so dying right after it leaves nothing
+        # behind.
+        sandbox_id = _sql_uuid(
+            self._returned_value(
+                self._psql(
+                    MINT_SANDBOX_ID_SQL, action="mint the drain-gate blocker's id"
+                )
+            )
+        )
+        self._annotate_lease(ownership.name, DRAIN_GATE_SANDBOX_ANNOTATION, sandbox_id)
+        inserted = self._returned_value(
+            self._psql(
+                SEED_DRAIN_GATE_BLOCKER_SQL.format(
+                    sandbox_id=sandbox_id,
+                    node_id=node_id,
+                    org_id=SMOKE_ORG_ID,
+                    user_id=SMOKE_USER_ID,
+                ),
+                action="seed a suspending sandbox pinned to the idle node",
+            )
+        )
+        if inserted != sandbox_id:
+            raise SmokeConfigurationError("the drain-gate blocker row was not seeded")
+        self._annotate_lease(ownership.name, DRAIN_GATE_NODE_ANNOTATION, node_id)
+        drained = self._returned_value(
+            self._psql(
+                SET_NODE_DRAINED_SQL.format(node_id=node_id),
+                action="move the pinned node to drained",
+            )
+        )
+        if not drained:
+            # Someone else gave the node a drain phase between the read and
+            # this write, so it is not ours to undo: drop the record before
+            # failing, or the cleanup would undrain a node this run never
+            # drained.
+            self._assert_lease_owned(ownership, "dropping an unearned drain record")
+            self._annotate_lease(ownership.name, DRAIN_GATE_NODE_ANNOTATION, None)
+            raise SmokeConfigurationError(
+                "the selected node acquired a drain phase between the read and "
+                "the write"
+            )
+        return DrainGateBlocker(node_id=node_id, sandbox_id=sandbox_id)
+
+    def _undo_recorded_drain_gate_writes(
+        self,
+        ownership: _LeaseOwnership,
+        annotations: Mapping[str, object],
+        action: str,
+    ) -> None:
+        """Undo what the Lease records: the drain phase first, then the row.
+
+        That order is not cosmetic. An undrained node still holding a blocker
+        is a live cluster's ordinary state; a node left `drained` whose
+        blocker has already gone is the shape `drained_node_terminator` acts
+        on. Each write is re-fenced on the Lease immediately before it, and
+        the annotation is cleared only after its write commits, so a death
+        anywhere in here leaves the next holder over-cleaning.
+
+        The row goes only once the node is out of `drained` by this undo or
+        already was. A node in another phase, `terminating` after an accepted
+        `:terminate` above all, keeps its row and both records, and the undo
+        raises.
+        """
+
+        recorded_node = annotations.get(DRAIN_GATE_NODE_ANNOTATION)
+        if isinstance(recorded_node, str) and recorded_node:
+            self._assert_lease_owned(ownership, action)
+            found = self._returned_value(
+                self._psql(
+                    CLEAR_NODE_DRAIN_PHASE_SQL.format(
+                        node_id=_sql_uuid(recorded_node)
+                    ),
+                    action="return the seeded node to no drain phase",
+                )
+            )
+            if found not in DRAIN_PHASE_RESET_DONE:
+                # Most likely `terminating`: `:terminate` accepted the node, the
+                # regression this scenario exists to catch. The row is then the
+                # only thing the terminator's gate still sees, so keep it and the
+                # Lease's record of both writes, and fail loudly instead.
+                raise RuntimeError(
+                    f"the seeded node is {found or 'unreadable'}, not drained; "
+                    "keeping its blocker row and the Lease record so the node "
+                    "stays held and a later run can repair it"
+                )
+            self._annotate_lease(ownership.name, DRAIN_GATE_NODE_ANNOTATION, None)
+        recorded_sandbox = annotations.get(DRAIN_GATE_SANDBOX_ANNOTATION)
+        if isinstance(recorded_sandbox, str) and recorded_sandbox:
+            self._assert_lease_owned(ownership, action)
+            self._psql(
+                DELETE_DRAIN_GATE_BLOCKER_SQL.format(
+                    sandbox_id=_sql_uuid(recorded_sandbox)
+                ),
+                action="delete the seeded drain-gate row",
+            )
+            self._annotate_lease(
+                ownership.name, DRAIN_GATE_SANDBOX_ANNOTATION, None
+            )
+
+    def clear_drain_gate_residue(self) -> None:
+        ownership = self._owned_drain_gate_lease("clearing drain-gate residue")
+        current = self.kubectl("get", "lease", ownership.name, "-o", "json")
+        _require_ok(current, "read the drain-gate Lease before clearing residue")
+        self._undo_recorded_drain_gate_writes(
+            ownership,
+            _lease_annotations(_lease_document(current.stdout)),
+            "clearing drain-gate residue",
+        )
+
+    def attempt_terminate(self, node_id: str) -> TerminateAttempt:
+        self._require_isolated_kind("an admin :terminate")
+        self._owned_drain_gate_lease("an admin :terminate")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/nodes/{_sql_uuid(node_id)}:terminate",
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + self._admin_bearer_token(),
+                "Content-Type": "application/json",
+            },
+            data=b"{}",
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                return TerminateAttempt(response.status, _json_object(response.read()))
+        except HTTPError as error:
+            # A refusal is the expected answer, so the error carries the body.
+            return TerminateAttempt(error.code, _json_object(error.read()))
+        except (OSError, ValueError, HTTPException):
+            # Authentication and transport failures may quote the token.
+            raise SmokeConfigurationError("the admin :terminate request failed") from None
+
 
 def _node_service_selector(component: str, *, role: str = KIND_WORKER_ROLE) -> str:
     """Label selector for one node service's pods of one role."""
 
     return f"app.kubernetes.io/name={role},app.kubernetes.io/component={component}"
+
+
+def _json_object(payload: bytes) -> dict[str, object]:
+    """A JSON object body, or a typed failure — never a silently empty dict."""
+
+    try:
+        decoded = json.loads(payload.decode() or "null")
+    except ValueError:
+        raise SmokeConfigurationError("admin response body was not JSON") from None
+    if not isinstance(decoded, dict):
+        raise SmokeConfigurationError("admin response body was not a JSON object")
+    return decoded
 
 
 def _ready_pod_names(pod_list_json: str, *, excluding: str) -> list[str]:
