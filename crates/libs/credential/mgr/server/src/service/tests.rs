@@ -13,6 +13,40 @@ use crate::kek_store::KekRecord;
 
 mod assume_role;
 
+#[tokio::test]
+async fn sandbox_anchor_release_reuses_rpc_auth_and_stays_disabled_without_a_keyring() {
+    let service = CredentialManagerService::new(
+        Arc::new(InMemoryKeyWrapper::new()),
+        PeerProcessCheckMode::Off,
+    );
+    let disabled = if cfg!(feature = "split-trust-prototype") {
+        tonic::Code::FailedPrecondition
+    } else {
+        tonic::Code::Unimplemented
+    };
+    for (caller, expected) in [
+        (ClientService::NodeCredentialAgent, disabled),
+        (ClientService::ApiSvc, tonic::Code::PermissionDenied),
+        (ClientService::SandboxManager, tonic::Code::PermissionDenied),
+    ] {
+        let mut request = Request::new(crate::proto::ReleaseSandboxAnchorRequest::default());
+        request
+            .extensions_mut()
+            .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
+                test_k8s_identity(caller),
+            ));
+        let error = service.release_sandbox_anchor(request).await.unwrap_err();
+        assert_eq!(error.code(), expected, "{caller:?}");
+    }
+    let error = service
+        .release_sandbox_anchor(plaintext_request(
+            crate::proto::ReleaseSandboxAnchorRequest::default(),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), disabled);
+}
+
 /// In-memory KEK-row map standing in for Postgres.
 struct TestKekStore {
     rows: HashMap<(Uuid, OrgId), KekRecord>,

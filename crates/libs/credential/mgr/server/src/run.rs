@@ -158,6 +158,11 @@ pub enum RunCredmgrError {
     PlaintextTcpRefused { addr: SocketAddr },
     #[error("failed to initialize the credential-manager space_creds pool: {0}")]
     DatabasePool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    #[error("split-trust runtime flag requires the split-trust-prototype Cargo feature")]
+    SplitTrustNotCompiled,
+    #[cfg(feature = "split-trust-prototype")]
+    #[error("sandbox anchor authority: {0}")]
+    SandboxAnchor(#[from] crate::split_trust::authority::AuthorityError),
     #[error("invalid intermediate-key broker URL {url:?}: {source}")]
     IntermediateKeyBrokerUrl {
         url: String,
@@ -472,6 +477,11 @@ pub async fn run(
             return Err(RunCredmgrError::NoUdsWithoutTcpListen);
         };
         let service = initialize_authority_service(peer_process_check_mode).await?;
+        #[cfg(feature = "split-trust-prototype")]
+        let _anchor_reconciler = service
+            .sandbox_anchor_authority
+            .as_ref()
+            .map(|authority| authority.start_reconciler(shutdown_token.clone()));
         tracing::info!(
             tcp_listen = %addr,
             "credential manager active; listening on TCP"
@@ -491,6 +501,11 @@ pub async fn run(
         return Ok(());
     };
     let listener = CredentialListeners::bind(&config)?;
+    #[cfg(feature = "split-trust-prototype")]
+    let _anchor_reconciler = service
+        .sandbox_anchor_authority
+        .as_ref()
+        .map(|authority| authority.start_reconciler(shutdown_token.clone()));
 
     tracing::info!(
         socket_path = %config.socket_path.display(),
@@ -745,6 +760,18 @@ async fn initialize_authority_service(
         }
     }
 
+    if matches!(
+        std::env::var("SPACE_SPLIT_TRUST_PROTOTYPE").as_deref(),
+        Ok("1" | "true")
+    ) && !cfg!(feature = "split-trust-prototype")
+    {
+        return Err(RunCredmgrError::SplitTrustNotCompiled);
+    }
+    #[cfg(feature = "split-trust-prototype")]
+    if crate::split_trust::enabled() {
+        service.sandbox_anchor_authority =
+            Some(crate::split_trust::authority::Authority::load().await?);
+    }
     Ok(service)
 }
 

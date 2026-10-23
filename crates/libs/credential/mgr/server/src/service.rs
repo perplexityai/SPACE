@@ -175,6 +175,8 @@ pub struct CredentialManagerService {
     /// Reference-based resolution endpoint. Present only on instances with
     /// access to durable credential-injection state.
     credential_injection_rpc: Option<CredentialInjectionRpc>,
+    #[cfg(feature = "split-trust-prototype")]
+    pub(crate) sandbox_anchor_authority: Option<crate::split_trust::authority::Authority>,
 }
 
 impl CredentialManagerService {
@@ -241,6 +243,8 @@ impl CredentialManagerService {
             kek_provisioner: None,
             intermediate_ca_issuer: None,
             credential_injection_rpc: None,
+            #[cfg(feature = "split-trust-prototype")]
+            sandbox_anchor_authority: None,
         }
     }
 
@@ -364,9 +368,24 @@ impl CredentialManagerService {
 impl CredentialManager for CredentialManagerService {
     async fn release_sandbox_anchor(
         &self,
-        _request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
+        request: Request<crate::proto::ReleaseSandboxAnchorRequest>,
     ) -> Result<Response<crate::proto::ReleaseSandboxAnchorResponse>, Status> {
-        Err(Status::unimplemented("sandbox anchors are not enabled"))
+        self.authorize_caller(
+            &request,
+            "ReleaseSandboxAnchor",
+            ALLOW_ISSUE_INTERMEDIATE,
+            ALLOW_ISSUE_INTERMEDIATE_SERVICES,
+        )?;
+        #[cfg(feature = "split-trust-prototype")]
+        {
+            let authority = self
+                .sandbox_anchor_authority
+                .as_ref()
+                .ok_or_else(|| Status::failed_precondition("sandbox anchors are not enabled"))?;
+            Ok(Response::new(authority.release(request.get_ref()).await?))
+        }
+        #[cfg(not(feature = "split-trust-prototype"))]
+        Err(Status::unimplemented("sandbox anchors are not compiled"))
     }
 
     async fn forget_sandbox_anchor(
@@ -822,6 +841,14 @@ impl CredentialManager for CredentialManagerService {
             ALLOW_ISSUE_INTERMEDIATE,
             ALLOW_ISSUE_INTERMEDIATE_SERVICES,
         )?;
+        if !matches!(
+            crate::proto::GatewayCaIssuer::try_from(request.get_ref().issuer),
+            Ok(crate::proto::GatewayCaIssuer::Unspecified | crate::proto::GatewayCaIssuer::Shared)
+        ) {
+            return Err(Status::invalid_argument(
+                "authority issues only shared node intermediates",
+            ));
+        }
 
         // The gRPC layer already logs and traces the call; this adds the
         // failure class and the latency of an issuance that polls for seconds.
