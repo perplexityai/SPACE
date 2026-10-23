@@ -68,7 +68,8 @@ async fn poll_suspend_responses(
         Instant::now() + budget,
         budget,
     )
-    .await;
+    .await
+    .map_err(|failure| failure.error);
     let summaries: Vec<_> = capture
         .0
         .lock()
@@ -235,7 +236,8 @@ async fn generation_suspend_timeout_message_names_the_budget() {
             Instant::now() + budget,
             budget,
         )
-        .await;
+        .await
+        .map_err(|failure| failure.error);
         match result {
             Err(SubstrateError::Timeout {
                 message,
@@ -249,6 +251,71 @@ async fn generation_suspend_timeout_message_names_the_budget() {
         "300s",
         "the production suspend budget's rendering"
     );
+}
+
+/// Only a refusal the node's handler returns before it records the suspend,
+/// and only as the first reply of the poll, lets the caller undo its claim.
+#[tokio::test(start_paused = true)]
+async fn generation_suspend_failure_is_unbegun_only_for_a_first_pre_begin_refusal() {
+    for (responses, node_not_begun) in [
+        (vec![Err(tonic::Status::permission_denied("peer"))], true),
+        (vec![Err(tonic::Status::unauthenticated("peer"))], true),
+        (vec![Err(tonic::Status::invalid_argument("request"))], true),
+        // Statuses the handler also returns after it recorded the suspend.
+        (vec![Err(tonic::Status::not_found("row"))], false),
+        (vec![Err(tonic::Status::internal("db"))], false),
+        (
+            vec![Err(tonic::Status::failed_precondition("failed"))],
+            false,
+        ),
+        // A refusal after a call the poll retried or the node answered.
+        (
+            vec![
+                Err(tonic::Status::unavailable("node restarting")),
+                Err(tonic::Status::permission_denied("peer")),
+            ],
+            false,
+        ),
+        (
+            vec![
+                Err(tonic::Status::deadline_exceeded("slow")),
+                Err(tonic::Status::permission_denied("peer")),
+            ],
+            false,
+        ),
+        (
+            vec![
+                pending_suspend(None),
+                Err(tonic::Status::permission_denied("peer")),
+            ],
+            false,
+        ),
+    ] {
+        let mut queue = std::collections::VecDeque::from(responses.clone());
+        let failure = poll_generation_suspend(
+            move |_request| {
+                let response = queue.pop_front();
+                async move {
+                    match response {
+                        Some(response) => response.map(tonic::Response::new),
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            SandboxId::new(),
+            ExecutionGeneration::new(1).unwrap(),
+            "http://node-api",
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("every scripted sequence ends in a terminal refusal");
+        assert!(
+            matches!(failure.error, SubstrateError::Unavailable { .. }),
+            "{responses:?}: {failure:?}"
+        );
+        assert_eq!(failure.node_not_begun, node_not_begun, "{responses:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -377,7 +444,8 @@ async fn generation_suspend_reason_change_logs_are_rate_limited_and_capped() {
             Instant::now() + Duration::from_secs(120),
             Duration::from_secs(120),
         )
-        .await;
+        .await
+        .map_err(|failure| failure.error);
         assert!(matches!(result, Err(SubstrateError::Timeout { .. })));
         let events = capture.0.lock().unwrap();
         let changes: Vec<_> = events

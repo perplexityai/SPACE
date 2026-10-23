@@ -48,6 +48,16 @@ pub(super) enum GenerationSuspendOutcome {
     NodeDeleted,
 }
 
+/// A failed generation suspend, and whether the node provably never began it.
+#[derive(Debug)]
+pub(super) struct GenerationSuspendFailure {
+    pub(super) error: SubstrateError,
+    /// True only for a refusal the node's handler returns before it records
+    /// the suspend, and only when no earlier call in this poll could have
+    /// reached it. Every other failure may have happened after the node began.
+    pub(super) node_not_begun: bool,
+}
+
 pub(super) async fn await_generation_suspend(
     client: &mut RuntimeClient,
     sandbox_id: SandboxId,
@@ -55,7 +65,7 @@ pub(super) async fn await_generation_suspend(
     endpoint_addr: &str,
     deadline: Instant,
     durability_budget: Duration,
-) -> Result<GenerationSuspendOutcome, SubstrateError> {
+) -> Result<GenerationSuspendOutcome, GenerationSuspendFailure> {
     poll_generation_suspend(
         |request| {
             let mut client = client.clone();
@@ -78,7 +88,7 @@ pub(super) async fn poll_generation_suspend<F, Fut>(
     deadline: Instant,
     // The budget `deadline` was derived from, named in the timeout error.
     durability_budget: Duration,
-) -> Result<GenerationSuspendOutcome, SubstrateError>
+) -> Result<GenerationSuspendOutcome, GenerationSuspendFailure>
 where
     F: FnMut(
         tonic::Request<pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendRequest>,
@@ -101,6 +111,7 @@ where
     let mut pending_reason_logs = 0_u8;
     let mut last_logged_pending_reason = None;
     let mut next_pending_reason_log_at = poll_started_at;
+    let mut refused_before_begin = false;
     let result = async {
         loop {
             let mut request = tonic::Request::new(
@@ -144,6 +155,13 @@ where
                     continue;
                 }
                 Err(error) => {
+                    // Each call in this poll that could have reached the node
+                    // is counted above, so with none counted this is the first
+                    // reply. The node-api forwards the call once, replaying it
+                    // only after a failure that never reached the handler.
+                    refused_before_begin = pending_responses == 0
+                        && retryable_errors == 0
+                        && generation_suspend_rpc_refused_before_begin(&error);
                     return Err(SubstrateError::Unavailable {
                         message: format!(
                             "node-api generation-bound suspend at {endpoint_addr} failed: {error}"
@@ -242,7 +260,23 @@ where
             "generation-bound suspend polling failed"
         );
     }
-    result
+    result.map_err(|error| GenerationSuspendFailure {
+        error,
+        node_not_begun: refused_before_begin,
+    })
+}
+
+/// Statuses the node's `PrepareTeardownSuspend` handler returns only before
+/// it records the suspend: request validation and peer authorization. The
+/// handler's later failures (`Internal`, `NotFound`, `FailedPrecondition`)
+/// can follow a suspend that already began, so they are not listed.
+pub(in crate::controllers::substrate::kubernetes) fn generation_suspend_rpc_refused_before_begin(
+    error: &tonic::Status,
+) -> bool {
+    matches!(
+        error.code(),
+        tonic::Code::InvalidArgument | tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+    )
 }
 
 pub(in crate::controllers::substrate::kubernetes) fn generation_suspend_rpc_should_retry(
@@ -302,6 +336,268 @@ pub(in crate::controllers::substrate::kubernetes) fn suspend_pod_deletion_confir
         K8sBlockingDeleteOutcome::PreconditionFailed => Err(SubstrateError::Unavailable {
             message: format!("Kubernetes sandbox pod {pod_name} changed before suspend retirement"),
         }),
+    }
+}
+
+impl KubernetesSubstrate {
+    /// Everything `suspend_execution` does once it holds the suspend claim.
+    ///
+    /// A claim this call just made is undone when the suspend fails before
+    /// the node was asked to begin: nothing node-side exists to finish, and
+    /// leaving the sandbox `suspending` would make every retry join the same
+    /// refusal. A failure after the node may have begun leaves the claim for
+    /// a retry to join or the transient-lifecycle sweeper to settle.
+    pub(in crate::controllers::substrate::kubernetes) async fn suspend_claimed_execution(
+        &self,
+        sandbox_id: SandboxId,
+        execution: ActiveExecutionStatusRow,
+        expected_generation: ExecutionGeneration,
+        expected_pod_uid: PodUid,
+        suspend_claim: SuspendExecutionClaim,
+        suspend_deadline: Instant,
+    ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
+        let pod_uid = expected_pod_uid.clone();
+        let mut node_may_have_begun = false;
+        let outcome = self
+            .contact_node_and_finish_suspend(
+                sandbox_id,
+                execution,
+                expected_generation,
+                expected_pod_uid,
+                suspend_claim,
+                suspend_deadline,
+                &mut node_may_have_begun,
+            )
+            .await;
+        if outcome.is_err()
+            && !node_may_have_begun
+            && let SuspendExecutionClaim::Claimed(restore) = suspend_claim
+        {
+            match self
+                .store
+                .revert_suspend_claim(sandbox_id, expected_generation, &pod_uid, restore)
+                .await
+            {
+                Ok(reverted) => tracing::info!(
+                    %sandbox_id,
+                    generation = %expected_generation,
+                    reverted,
+                    "reverted the Kubernetes suspend claim after a refusal before the node began"
+                ),
+                Err(error) => tracing::warn!(
+                    %sandbox_id,
+                    generation = %expected_generation,
+                    %error,
+                    "failed to revert the Kubernetes suspend claim after a refusal before the node began"
+                ),
+            }
+        }
+        outcome
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the suspend steps share one claimed execution and the begun flag"
+    )]
+    async fn contact_node_and_finish_suspend(
+        &self,
+        sandbox_id: SandboxId,
+        execution: ActiveExecutionStatusRow,
+        expected_generation: ExecutionGeneration,
+        expected_pod_uid: PodUid,
+        suspend_claim: SuspendExecutionClaim,
+        suspend_deadline: Instant,
+        node_may_have_begun: &mut bool,
+    ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
+        let committed_suspend_artifact = match suspend_claim {
+            SuspendExecutionClaim::Completed(artifact) => Some(artifact),
+            SuspendExecutionClaim::Claimed(_) | SuspendExecutionClaim::Existing => {
+                self.store
+                    .committed_suspend_artifact(sandbox_id, expected_generation, &expected_pod_uid)
+                    .await?
+            }
+        };
+        let node_suspend_artifact = if committed_suspend_artifact.is_some() {
+            // A committed artifact means a suspend already reached the node, so
+            // a failure while retiring the pod must keep the claim.
+            *node_may_have_begun = true;
+            tracing::info!(
+                sandbox_id = %sandbox_id,
+                generation = %expected_generation,
+                "resuming pod retirement for a committed Kubernetes suspend"
+            );
+            None
+        } else {
+            let k8s_node_name =
+                execution
+                    .k8s_node_name
+                    .as_deref()
+                    .ok_or_else(|| SubstrateError::Unavailable {
+                        message: "sandbox pod is not assigned to a Kubernetes node".to_string(),
+                    })?;
+            let target = NodeApiTarget {
+                managed_by: SpaceNodeManagedBy::Kubernetes,
+                role: SpaceNodeRole::Worker,
+                direct_endpoint: None,
+                substrate_node_id: Some(k8s_node_name),
+            };
+            let suspend_path_started_at = Instant::now();
+            let endpoint_addr = match tokio::time::timeout_at(
+                suspend_deadline,
+                self.resolve_node_api_endpoint(&target),
+            )
+            .await
+            {
+                Err(_) => {
+                    return Err(SubstrateError::Timeout {
+                        message: format!(
+                            "timed out resolving node-api for generation-bound suspend of sandbox {sandbox_id}"
+                        ),
+                        phase: None,
+                    });
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        k8s_node_name,
+                        elapsed_ms = duration_millis_to_u64(suspend_path_started_at.elapsed()),
+                        error = %err,
+                        "failed to resolve node-api endpoint for Kubernetes sandbox suspend"
+                    );
+                    return Err(err);
+                }
+                Ok(Ok(endpoint_addr)) => endpoint_addr,
+            };
+            let endpoint = match node_api_endpoint(
+                &endpoint_addr,
+                POD_WORKER_CONNECT_TIMEOUT,
+                NODE_RPC_TIMEOUT,
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        k8s_node_name,
+                        node_api_endpoint = %endpoint_addr,
+                        elapsed_ms = duration_millis_to_u64(suspend_path_started_at.elapsed()),
+                        error = %err,
+                        "invalid node-api endpoint for Kubernetes sandbox suspend"
+                    );
+                    return Err(err);
+                }
+            };
+            let mut client = match tokio::time::timeout_at(
+                suspend_deadline,
+                connect_worker(endpoint),
+            )
+            .await
+            {
+                Err(_) => {
+                    return Err(SubstrateError::Timeout {
+                        message: format!(
+                            "timed out connecting node-api for generation-bound suspend of sandbox {sandbox_id}"
+                        ),
+                        phase: None,
+                    });
+                }
+                Ok(Ok(client)) => client,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        k8s_node_name,
+                        node_api_endpoint = %endpoint_addr,
+                        elapsed_ms = duration_millis_to_u64(suspend_path_started_at.elapsed()),
+                        error = %err,
+                        "failed to connect node-api for Kubernetes sandbox suspend"
+                    );
+                    return Err(SubstrateError::Unavailable {
+                        message: format!("node-api not reachable at {endpoint_addr}: {err}"),
+                    });
+                }
+            };
+
+            let suspend_rpc_started_at = Instant::now();
+            *node_may_have_begun = true;
+            let published_artifact = match await_generation_suspend(
+                &mut client,
+                sandbox_id,
+                expected_generation,
+                &endpoint_addr,
+                suspend_deadline,
+                self.budgets.suspend_durability,
+            )
+            .await
+            {
+                Ok(GenerationSuspendOutcome::Durable(published_artifact)) => Ok(published_artifact),
+                // The node can delete the sandbox after its suspend backup
+                // finalized (a failed post-suspend cleanup takes the delete
+                // path), and then has no artifact to publish. The ready
+                // snapshot still proves the suspend durable; without it the
+                // suspend did not complete and the caller may retry.
+                Ok(GenerationSuspendOutcome::NodeDeleted) => self
+                    .store
+                    .durable_suspend_snapshot_artifact(
+                        sandbox_id,
+                        expected_generation,
+                        &expected_pod_uid,
+                    )
+                    .await?
+                    .ok_or_else(|| SubstrateError::Unavailable {
+                        message: format!(
+                            "sandbox {sandbox_id} was deleted on its node before suspend completed"
+                        ),
+                    }),
+                Err(failure) => {
+                    *node_may_have_begun = !failure.node_not_begun;
+                    Err(failure.error)
+                }
+            };
+            let published_artifact = match published_artifact {
+                Ok(published_artifact) => published_artifact,
+                Err(error) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        generation = %expected_generation,
+                        k8s_node_name,
+                        node_api_endpoint = %endpoint_addr,
+                        elapsed_ms = duration_millis_to_u64(suspend_rpc_started_at.elapsed()),
+                        error = %error,
+                        "generation-bound Kubernetes sandbox suspend did not become durable"
+                    );
+                    SandboxEvent::new(
+                        sandbox_id,
+                        SandboxEventType::SuspendFailed,
+                        SandboxEventSource::Substrate,
+                    )
+                    .emit_with(
+                        SandboxEventDetails::default()
+                            .error(error.to_string())
+                            .logged_by_caller(),
+                    );
+                    return Err(error);
+                }
+            };
+            tracing::info!(
+                sandbox_id = %sandbox_id,
+                generation = %expected_generation,
+                k8s_node_name,
+                node_api_endpoint = %endpoint_addr,
+                local_artifact_id = %published_artifact.id,
+                elapsed_ms = duration_millis_to_u64(suspend_rpc_started_at.elapsed()),
+                "generation-bound Kubernetes sandbox suspend became durable"
+            );
+            Some(published_artifact)
+        };
+
+        self.finish_suspend_handoff(
+            sandbox_id,
+            expected_generation,
+            expected_pod_uid,
+            execution.pod_name,
+            node_suspend_artifact,
+        )
+        .await
+        .map(Some)
     }
 }
 

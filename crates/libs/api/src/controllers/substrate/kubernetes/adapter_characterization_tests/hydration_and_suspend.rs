@@ -22,7 +22,7 @@ use crate::controllers::substrate::{ExecutionRoutabilityCheck, PublishedLocalArt
 
 /// Long enough that a correct suspend retirement never misses it on a slow
 /// runner; the doubles answer the DELETE and the absence check immediately.
-const BLOCKING_DELETE_TIMEOUT: Duration = Duration::from_millis(500);
+pub(super) const BLOCKING_DELETE_TIMEOUT: Duration = Duration::from_millis(500);
 
 // ── hydrate_restored_execution ──────────────────────────────────────────────
 
@@ -402,7 +402,7 @@ fn node_api_pod(port: u16) -> Pod {
 /// pod advertises. The configured fallback port is closed on loopback, so a
 /// regression that ignores the advertised port fails to connect instead of
 /// reaching whatever listens on this host's default node-api port.
-fn substrate_with_node_api_on(
+pub(super) fn substrate_with_node_api_on(
     pool: &PgPool,
     client: Client,
     worker_port: u16,
@@ -717,9 +717,11 @@ async fn suspend_execution_commits_the_durable_artifact_before_retiring_the_pod(
 }
 
 /// A node that refuses the generation-bound suspend RPC fails the suspend as
-/// retryable and leaves the pod and the claimed execution in place. The
-/// mapping of each `PrepareTeardownSuspend` outcome is pinned one layer down
-/// by `adapter::tests::generation_suspend_polling_preserves_success_and_terminal_failure`.
+/// retryable and leaves the pod and the claimed execution in place. `NotFound`
+/// is a status the node also returns after it recorded the suspend, so the
+/// claim stays for a retry. The mapping of each `PrepareTeardownSuspend`
+/// outcome is pinned one layer down by
+/// `adapter::tests::generation_suspend_polling_preserves_success_and_terminal_failure`.
 #[tokio::test(flavor = "current_thread")]
 async fn suspend_execution_keeps_the_pod_when_the_node_refuses() -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
@@ -758,6 +760,11 @@ async fn suspend_execution_keeps_the_pod_when_the_node_refuses() -> TestResult {
     );
     assert!(log.lock().unwrap().is_empty(), "no pod may be retired");
     assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+    assert_eq!(
+        sandbox_lifecycle(&db.pool, sandbox_id).await?,
+        "suspending",
+        "the node may have begun the suspend, so the claim is kept"
+    );
     Ok(())
 }
 
@@ -776,9 +783,10 @@ enum SuspendDurability {
 /// `suspend_execution` polls a Pending generation suspend through transient
 /// node-api failures until it is durable, within the substrate's durability
 /// budget. When the budget expires first, while the node is still Pending or
-/// before a node-api pod is found, the suspend times out and keeps its claim:
-/// the sandbox stays `suspending`, the execution tracked and the pod in place,
-/// for a retry to join.
+/// before a node-api pod is found, the suspend times out and keeps its pod and
+/// execution in place. While the node is still Pending it may have begun, so
+/// the sandbox stays `suspending` for a retry to join; before a node-api pod
+/// is found nothing asked the node, so the claim is reverted.
 #[rstest::rstest]
 #[case::pending_then_durable(SuspendDurability::PendingThenDurable)]
 #[case::pending_past_the_budget(SuspendDurability::PendingPastTheBudget)]
@@ -889,10 +897,14 @@ async fn suspend_execution_polls_the_node_within_its_durability_budget(
                 log.lock().unwrap().is_empty(),
                 "{durability:?}: the pod must not be retired"
             );
+            let lifecycle = match durability {
+                SuspendDurability::PendingPastTheBudget => "suspending",
+                _ => "started",
+            };
             assert_eq!(
                 sandbox_lifecycle(&db.pool, sandbox_id).await?,
-                "suspending",
-                "{durability:?}: the suspend keeps its claim for a retry"
+                lifecycle,
+                "{durability:?}: the claim is kept only once the node may have begun"
             );
             assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
         }

@@ -108,7 +108,7 @@ async fn suspend_claim_and_commit_move_only_their_stored_lifecycles() -> TestRes
                 .store
                 .claim_suspend_execution(sandbox_id, generation, &pod_uid)
                 .await,
-            Ok(SuspendExecutionClaim::Claimed)
+            Ok(SuspendExecutionClaim::Claimed(_))
         );
         let (lifecycle, _) = lifecycle_and_artifact(pool, sandbox_id).await?;
         let expected = if claims { "suspending" } else { stored };
