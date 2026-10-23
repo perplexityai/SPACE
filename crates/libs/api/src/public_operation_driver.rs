@@ -14,9 +14,9 @@ use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicEr
 use tokio::time::MissedTickBehavior;
 
 use crate::public_operations::{
-    ApiProduct, ClaimedPublicOperation, CompleteClaimedPublicOperation, FailClaimedPublicOperation,
-    PublicOperationRequeueReason, PublicOperationStore, PublicOperationStoreError,
-    ReleaseClaimedPublicOperation,
+    ApiProduct, ClaimedPublicOperation, CompleteClaimedPublicOperation, ExpirePublicOperation,
+    FailClaimedPublicOperation, OverdueQueuedPublicOperations, PublicOperationRequeueReason,
+    PublicOperationStore, PublicOperationStoreError, ReleaseClaimedPublicOperation,
 };
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
 
@@ -27,6 +27,19 @@ pub const DEFAULT_CLAIM_STALE_AFTER: Duration = Duration::from_secs(60);
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_RETRY_ATTEMPTS: i32 = 16;
 pub const DEFAULT_M1_MAX_AGE: Duration = Duration::from_secs(1_800);
+/// The Native kinds that expire instead of starting once older than the M1
+/// deadline. One that already started keeps the deadline it had: it gets
+/// its attempt and fails if it requeues past the deadline, so a half-applied
+/// change is driven to an end rather than abandoned. A delete is bound by the
+/// deadline too, but only while it retries: it still runs however late it
+/// starts, because expiring it would leave running a sandbox its owner asked
+/// to remove.
+pub const NATIVE_M1_EXPIRING_KINDS: &[OperationKind] = &[
+    OperationKind::CreateSandbox,
+    OperationKind::PauseSandbox,
+    OperationKind::SuspendSandbox,
+    OperationKind::WakeSandbox,
+];
 /// How long an operation may keep deferring its retry waits, from its first
 /// claim. Deferred retries spend no attempts, so this matches the longest a
 /// fenced restore can retry in its slot on the attempt budget: 16 attempts of
@@ -41,6 +54,33 @@ fn m1_deadline_message(max_age_seconds: u64) -> String {
         "Operation did not reach a terminal result within {max_age}; \
          inspect the target state before retrying."
     )
+}
+
+/// The terminal record of a Native M1 operation that passed its deadline
+/// before it ran, with the reason a deadline failure carries.
+fn m1_expiry(
+    operation_id: OperationId,
+    kind: OperationKind,
+    attempts: i32,
+    max_age: Duration,
+) -> ExpirePublicOperation {
+    let max_age_seconds = max_age.as_secs();
+    ExpirePublicOperation {
+        operation_id,
+        progress_message: m1_deadline_message(max_age_seconds),
+        terminal_error_code: PublicErrorCode::OperationFailed,
+        terminal_error_json: serde_json::json!({
+            "operation_id": operation_id.to_string(),
+            "kind": kind.as_str(),
+            "reason": "operation_deadline_exceeded",
+            "max_age_seconds": max_age_seconds,
+            "attempts": attempts,
+        }),
+    }
+}
+
+fn expires_unrun(api_product: ApiProduct, kind: OperationKind) -> bool {
+    api_product == ApiProduct::Native && NATIVE_M1_EXPIRING_KINDS.contains(&kind)
 }
 
 /// The root span of one claimed attempt of an operation, linked to the
@@ -137,6 +177,7 @@ pub struct TickReport {
     pub failed: usize,
     pub retried: usize,
     pub stale_claims: usize,
+    pub expired: usize,
 }
 
 impl TickReport {
@@ -146,6 +187,7 @@ impl TickReport {
         self.failed += other.failed;
         self.retried += other.retried;
         self.stale_claims += other.stale_claims;
+        self.expired += other.expired;
     }
 }
 
@@ -156,6 +198,9 @@ impl TickReport {
 /// operation. A caller that stops polling the returned future (a crash, a
 /// panic, a cancelled task) leaves the claim to go stale, and the
 /// dispatcher reclaims and re-drives the same idempotent operation.
+///
+/// A Native M1 operation of [`NATIVE_M1_EXPIRING_KINDS`] first claimed when
+/// already older than the deadline is recorded `expired` without running.
 pub async fn drive_claimed_operation<F>(
     store: PublicOperationStore,
     claim_token: String,
@@ -173,6 +218,42 @@ where
     let kind = operation.kind;
     let attempts = operation.attempts;
     let executor_label = executor.as_str();
+    if let Some(max_age) = config.m1_max_age
+        && expires_unrun(api_product, kind)
+        && let Some(age_secs) = operation.age_at_first_claim_secs
+        && Duration::from_secs(age_secs.into()) >= max_age
+    {
+        let mut report = TickReport::default();
+        // The expiry undoes this claim's attempt, as the operation never ran.
+        let attempts = (attempts - 1).max(0);
+        if store
+            .expire_claimed_operation(
+                m1_expiry(operation_id, kind, attempts, max_age),
+                &claim_token,
+            )
+            .await?
+        {
+            report.expired += 1;
+            // Not an execution, so counted as the sweep counts an expiry:
+            // no claim by this executor, and a completion with no executor.
+            pplx_space_metrics::operations::completed(
+                api_product_label,
+                kind.as_str(),
+                OperationState::Expired.as_str(),
+            );
+            tracing::warn!(
+                operation_id = %operation_id,
+                api_product = api_product_label,
+                kind = kind.as_str(),
+                age_secs,
+                max_age_seconds = max_age.as_secs(),
+                "public operation expired at claim: older than the M1 terminalization deadline"
+            );
+        } else {
+            record_lost_claim(&mut report, api_product_label, kind, operation_id);
+        }
+        return Ok(report);
+    }
     pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor_label);
     let renew_every = claim_renewal_interval(config.claim_stale_after);
     let mut renewal = tokio::time::interval(renew_every);
@@ -482,15 +563,65 @@ where
     };
 
     if !updated {
-        report.stale_claims += 1;
-        pplx_space_metrics::operations::stale_claim(api_product_label, kind.as_str());
-        tracing::warn!(
-            operation_id = %operation_id,
-            "public operation claim was lost before completion update"
-        );
+        record_lost_claim(&mut report, api_product_label, kind, operation_id);
     }
 
     Ok(report)
+}
+
+fn record_lost_claim(
+    report: &mut TickReport,
+    api_product_label: &str,
+    kind: OperationKind,
+    operation_id: OperationId,
+) {
+    report.stale_claims += 1;
+    pplx_space_metrics::operations::stale_claim(api_product_label, kind.as_str());
+    tracing::warn!(
+        operation_id = %operation_id,
+        "public operation claim was lost before completion update"
+    );
+}
+
+/// Expire up to `limit` queued Native M1 operations of
+/// [`NATIVE_M1_EXPIRING_KINDS`] that passed the deadline without ever
+/// starting: held back behind earlier work on their sandbox, or waiting for
+/// a free slot. One first claimed past the deadline expires in
+/// [`drive_claimed_operation`] instead. Returns how many expired.
+pub async fn expire_overdue_queued_operations(
+    store: &PublicOperationStore,
+    config: OperationExecutionConfig,
+    limit: u32,
+) -> Result<usize, PublicOperationStoreError> {
+    let Some(max_age) = config.m1_max_age else {
+        return Ok(0);
+    };
+    let expired = store
+        .expire_overdue_queued_operations(
+            OverdueQueuedPublicOperations {
+                api_product: ApiProduct::Native,
+                kinds: NATIVE_M1_EXPIRING_KINDS,
+                max_age,
+                limit,
+            },
+            |operation| m1_expiry(operation.id, operation.kind, operation.attempts, max_age),
+        )
+        .await?;
+    for operation in &expired {
+        pplx_space_metrics::operations::completed(
+            ApiProduct::Native.as_str(),
+            operation.kind.as_str(),
+            OperationState::Expired.as_str(),
+        );
+        tracing::warn!(
+            operation_id = %operation.id,
+            kind = operation.kind.as_str(),
+            max_age_seconds = max_age.as_secs(),
+            last_progress_message = operation.progress_message,
+            "queued public operation expired: older than the M1 terminalization deadline"
+        );
+    }
+    Ok(expired.len())
 }
 
 /// How often a running execution renews its claim: a third of

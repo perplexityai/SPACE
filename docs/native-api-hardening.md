@@ -60,7 +60,7 @@ the ordinary smoke job logs.
 | Proposed contract | Overlapping replay credential validity | Ignored; explicit invocation only |
 | Admission | Zero-vCPU rejection before accepting an operation | Included on Kind with bounded cleanup |
 | Concurrency | Same-key create and command fanout, independent commands, pause/wake contention, slow-reader output integrity | Included |
-| Recovery | Queued create across controller outage/API restart; original command session across data-plane restart | Included on Kind only |
+| Recovery | Queued create across controller outage/API restart; original command session across data-plane restart; work queued through an outage longer than its deadline expires, and a delete queued with it still runs | Included on Kind only |
 | Dispatcher fairness | Independent work completes while an earlier valid suspend is blocked | Included on Kind only |
 | Lifecycle | Stopped sandbox restarts with its retained rootfs | Included |
 
