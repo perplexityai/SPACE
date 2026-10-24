@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_sbx_mgr_client::proto;
 #[test]
 fn wait_ready_policy_requires_authenticated_authority_and_lifecycle_purpose() {
     for (authority, purpose, expected) in [
@@ -163,4 +164,126 @@ fn policy_mutation_requires_control_plane_authority() {
     let denied = check_policy_mutation_authority(Some(NetworkPolicyMutationAuthority::Denied))
         .expect_err("denied caller is refused");
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+}
+
+/// A sandbox-manager that answers every call with `Unimplemented`, so a call
+/// node-api forwarded is told apart from one it refused at admission.
+async fn unimplemented_sandbox_manager() -> crate::clients::BackendClients {
+    let backend = axum::Router::new().fallback(|| async {
+        http::Response::builder()
+            .header("content-type", "application/grpc")
+            .header(
+                "grpc-status",
+                (tonic::Code::Unimplemented as i32).to_string(),
+            )
+            .body(axum::body::Body::empty())
+            .unwrap()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    crate::clients::BackendClients::with_channel(channel)
+}
+
+async fn service_with_limiter(limiter: UdsPerSandboxLimiter) -> WorkerApiService {
+    WorkerApiService {
+        clients: unimplemented_sandbox_manager().await,
+        uds_per_sandbox_limiter: limiter,
+        service_port_ingress_limiter: shared_service_port_ingress_limiter(),
+        resource_status_reader: NodeResourceStatusReader::new(),
+        shutdown_token: CancellationToken::new(),
+    }
+}
+
+#[tokio::test]
+async fn process_control_is_admitted_while_streams_hold_every_shared_permit() {
+    let limiter = UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8);
+    let service = service_with_limiter(limiter.clone()).await;
+    let sandbox_id = SandboxId::new().to_string();
+    let _stream = limiter
+        .acquire("SpacedConnectProcess", &sandbox_id)
+        .await
+        .unwrap();
+
+    let list = service
+        .spaced_list_processes(Request::new(proto::SpacedListProcessesRequest {
+            sandbox_id: sandbox_id.clone(),
+            ..Default::default()
+        }))
+        .await;
+    let signal = service
+        .spaced_send_signal(Request::new(proto::SpacedSendSignalRequest {
+            sandbox_id: sandbox_id.clone(),
+            ..Default::default()
+        }))
+        .await;
+    let kill = service
+        .spaced_kill_process(Request::new(proto::SpacedKillProcessRequest {
+            sandbox_id: sandbox_id.clone(),
+            ..Default::default()
+        }))
+        .await;
+    for (method, code) in [
+        ("SpacedListProcesses", list.unwrap_err().code()),
+        ("SpacedSendSignal", signal.unwrap_err().code()),
+        ("SpacedKillProcess", kill.unwrap_err().code()),
+    ] {
+        assert_eq!(
+            code,
+            tonic::Code::Unimplemented,
+            "{method} was not forwarded"
+        );
+    }
+
+    let stat = service
+        .spaced_stat(Request::new(proto::SpacedStatRequest {
+            sandbox_id,
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(stat.unwrap_err().code(), tonic::Code::ResourceExhausted);
+}
+
+// Sandbox kill stops the VM from the host and never waits on the guest, so it
+// must not queue behind process calls a hung guest holds.
+#[tokio::test]
+async fn sandbox_kill_is_admitted_while_every_sandbox_permit_is_held() {
+    let limiter = UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8);
+    let service = service_with_limiter(limiter.clone()).await;
+    let sandbox_id = SandboxId::new().to_string();
+    let _held = [
+        limiter
+            .acquire("SpacedConnectProcess", &sandbox_id)
+            .await
+            .unwrap(),
+        limiter
+            .acquire_in(SandboxBudget::Reserved, "SpacedListProcesses", &sandbox_id)
+            .await
+            .unwrap(),
+    ];
+
+    let process_kill = service
+        .spaced_kill_process(Request::new(proto::SpacedKillProcessRequest {
+            sandbox_id: sandbox_id.clone(),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(
+        process_kill.unwrap_err().code(),
+        tonic::Code::ResourceExhausted
+    );
+
+    let sandbox_kill = service
+        .kill_sandbox(Request::new(proto::KillRequest {
+            sandbox_id,
+            signal: 9,
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(sandbox_kill.unwrap_err().code(), tonic::Code::Unimplemented);
 }
