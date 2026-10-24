@@ -453,11 +453,11 @@ mod postgres_backed {
             (Lease::Live, false),
             (Lease::NoExpiry, false),
         ] {
-            let id = insert_row(pool, "starting", lease).await?;
+            let id = insert_row(pool, "stopping", lease).await?;
             assert_eq!(
-                listed(&sink, SandboxLifecycle::Starting, id).await?,
+                listed(&sink, SandboxLifecycle::Stopping, id).await?,
                 Some(expected),
-                "starting row, {lease:?}"
+                "stopping row, {lease:?}"
             );
         }
         Ok(())

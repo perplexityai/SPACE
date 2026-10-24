@@ -2577,6 +2577,7 @@ fn f5_only_an_observed_pod_yields_a_verifiable_fence() {
 // R — Postgres-backed sink (drift safety + trigger semantics)
 // -----------------------------------------------------------------
 
+mod activation_owner;
 mod crashed_create;
 
 mod postgres_backed {

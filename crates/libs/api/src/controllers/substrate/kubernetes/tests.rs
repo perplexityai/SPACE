@@ -4902,6 +4902,125 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// An owner that gives up an activation it never dispatched (a start that
+    /// adopted a crashed create's `creating` row and failed before its wake,
+    /// say) leaves no attempt behind, so the next activation claims the
+    /// execution at once, but it does leave the time it gave up as the lease
+    /// expiry: the transient-lifecycle sweeper reads that to tell an owner
+    /// that just left from one that may still be running. An owner that
+    /// finished, by contrast, leaves no expiry at all, as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn giving_up_an_activation_leaves_when_it_ended() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let substrate = substrate_with_store_and_client(db.pool.clone(), inert_kubernetes_client());
+        for gives_up in [true, false] {
+            let sandbox_id = SandboxId::new();
+            insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+            let attempt_id = SandboxActivationAttemptId::new();
+            let execution = substrate
+                .store
+                .begin_activation_execution_row(
+                    sandbox_id,
+                    attempt_id,
+                    SandboxTransitionTargetState::Started,
+                )
+                .await?;
+
+            if gives_up {
+                substrate
+                    .store
+                    .give_up_activation_attempt_best_effort(
+                        sandbox_id,
+                        execution.generation,
+                        attempt_id,
+                    )
+                    .await;
+            } else {
+                substrate
+                    .store
+                    .release_finished_activation_attempt_best_effort(
+                        sandbox_id,
+                        execution.generation,
+                        attempt_id,
+                    )
+                    .await;
+            }
+
+            let (held, ended, target): (Option<Uuid>, Option<bool>, Option<String>) =
+                sqlx::query_as(sql!(
+                    "SELECT activation_attempt_id,
+                            activation_attempt_expires_at <= NOW(),
+                            activation_attempt_target_state
+                       FROM sandbox_k8s_executions
+                      WHERE sandbox_id = $1 AND active"
+                ))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+            let case = format!("gives up: {gives_up}");
+            assert_eq!(held, None, "{case}");
+            assert_eq!(target, None, "{case}");
+            assert_eq!(ended, gives_up.then_some(true), "{case}");
+
+            // Either way the next owner gets the execution straight away
+            // instead of being told another activation is in flight.
+            substrate
+                .store
+                .assign_activation_attempt(
+                    sandbox_id,
+                    execution.generation,
+                    SandboxActivationAttemptId::new(),
+                    SandboxTransitionTargetState::Started,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// An owner that gives up an attempt whose lease had already expired
+    /// leaves that earlier expiry rather than the give-up time: ownership
+    /// ended when the lease did, so the sweeper's window runs from then.
+    #[tokio::test(flavor = "current_thread")]
+    async fn giving_up_an_expired_activation_keeps_its_expiry() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let substrate = substrate_with_store_and_client(db.pool.clone(), inert_kubernetes_client());
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+        let attempt_id = SandboxActivationAttemptId::new();
+        let execution = substrate
+            .store
+            .begin_activation_execution_row(
+                sandbox_id,
+                attempt_id,
+                SandboxTransitionTargetState::Started,
+            )
+            .await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_expires_at = NOW() - INTERVAL '1 hour'
+              WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+
+        substrate
+            .store
+            .give_up_activation_attempt_best_effort(sandbox_id, execution.generation, attempt_id)
+            .await;
+
+        let ended_an_hour_ago: bool = sqlx::query_scalar(sql!(
+            "SELECT activation_attempt_expires_at < NOW() - INTERVAL '59 minutes'
+               FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(ended_an_hour_ago);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn start_failure_before_wake_releases_its_activation_lease() -> Result<(), BoxError> {
         for source_pending in [true, false] {
@@ -4980,16 +5099,25 @@ mod kubernetes_tests {
                     "{error:?}"
                 );
             }
-            let lease_live: bool = sqlx::query_scalar(sql!(
-                "SELECT COALESCE(activation_attempt_expires_at > NOW(), FALSE)
-                 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
-            ))
-            .bind(sandbox_id)
-            .fetch_one(&db.pool)
-            .await?;
+            let (lease_live, attempt_held, end_recorded): (bool, bool, bool) =
+                sqlx::query_as(sql!(
+                    "SELECT COALESCE(activation_attempt_expires_at > NOW(), FALSE),
+                            activation_attempt_id IS NOT NULL,
+                            activation_attempt_expires_at IS NOT NULL
+                     FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+                ))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
             assert!(
-                !lease_live,
+                !lease_live && !attempt_held,
                 "a retry must recover the pod, not join an abandoned activation (source_pending={source_pending})"
+            );
+            // The failed start leaves when it gave up, which is what the
+            // transient-lifecycle sweeper reads to tell it is gone.
+            assert!(
+                end_recorded,
+                "the give-up time is kept (source_pending={source_pending})"
             );
             assert!(pod_creates.lock().unwrap().is_empty());
             let replacement = substrate
