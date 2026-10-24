@@ -212,6 +212,10 @@ impl FilesystemHandle {
             .await
     }
 
+    fn require_running(&self) -> Result<(), Status> {
+        crate::execution::require_running(&self.shutdown)
+    }
+
     pub(crate) fn grpc_service(
         &self,
     ) -> RequestAdmission<PreserveInputErrors<PublicFilesystemServer<Self>>> {
@@ -253,9 +257,7 @@ impl FilesystemHandle {
     }
 
     async fn executor(&self, user: GuestUserName) -> Result<Executor, Status> {
-        if self.shutdown.is_cancelled() {
-            return Err(crate::refused(Status::unavailable("guest shutting down")));
-        }
+        self.require_running()?;
         match &self.backend {
             Backend::Direct(service) => {
                 let mut service = service.clone();
@@ -373,6 +375,7 @@ impl FilesystemHandle {
     where
         S: Stream<Item = Result<WriteRequest, Status>> + Send,
     {
+        self.require_running()?;
         let admission = crate::payload::acquire(
             &self.payload_slots,
             1,
@@ -389,11 +392,15 @@ impl FilesystemHandle {
         admission: RequestPermit,
     ) -> Result<Response<WriteResponse>, Status> {
         use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
-        let first = incoming
-            .next()
-            .await
-            .transpose()?
-            .ok_or_else(|| Status::invalid_argument("write requires open"))?;
+        let first = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => {
+                return Err(crate::refused(Status::unavailable("guest shutting down")));
+            }
+            first = incoming.next() => first,
+        }
+        .transpose()?
+        .ok_or_else(|| Status::invalid_argument("write requires open"))?;
         crate::payload::check_message(&first, filesystem_limits::MAX_MESSAGE_BYTES)?;
         let Some(Message::Open(open)) = first.message else {
             return Err(Status::invalid_argument("first write message must be open"));
@@ -1084,6 +1091,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<StatRequest>,
     ) -> Result<Response<StatResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.stat(request).await,
@@ -1102,6 +1110,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<ListRequest>,
     ) -> Result<Response<Self::ListInfoStream>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.list(request).await,
@@ -1118,6 +1127,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.read(request).await,
@@ -1147,6 +1157,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         mut request: Request<WriteBatchRequest>,
     ) -> Result<Response<WriteBatchResponse>, Status> {
+        self.require_running()?;
         let admission = crate::payload::admit(
             &mut request,
             &self.payload_slots,
@@ -1183,6 +1194,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<MkdirRequest>,
     ) -> Result<Response<MkdirResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.mkdir(request).await,
@@ -1201,6 +1213,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<RemoveRequest>,
     ) -> Result<Response<RemoveResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.remove(request).await,
@@ -1219,6 +1232,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         mut request: Request<RenameRequest>,
     ) -> Result<Response<RenameResponse>, Status> {
+        self.require_running()?;
         let admission = crate::payload::admit(
             &mut request,
             &self.payload_slots,
@@ -1246,6 +1260,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<NormalizeWatchRootRequest>,
     ) -> Result<Response<NormalizeWatchRootResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.normalize_watch_root(request).await,
@@ -1264,6 +1279,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.watch(request).await,
@@ -1280,6 +1296,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<CreateWatcherRequest>,
     ) -> Result<Response<CreateWatcherResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.create_watcher(request).await,
@@ -1317,6 +1334,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<GetWatcherEventsRequest>,
     ) -> Result<Response<GetWatcherEventsResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.get_watcher_events(request).await,
@@ -1342,6 +1360,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<RemoveWatcherRequest>,
     ) -> Result<Response<RemoveWatcherResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.remove_watcher(request).await,
@@ -1386,6 +1405,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<EnableFileChangesRequest>,
     ) -> Result<Response<EnableFileChangesResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.enable_file_changes(request).await,
@@ -1407,6 +1427,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<DisableFileChangesRequest>,
     ) -> Result<Response<DisableFileChangesResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.disable_file_changes(request).await,
@@ -1427,6 +1448,7 @@ impl Filesystem for FilesystemHandle {
         &self,
         request: Request<GetModifiedFilesRequest>,
     ) -> Result<Response<GetModifiedFilesResponse>, Status> {
+        self.require_running()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
             Backend::Direct(service) => service.get_modified_files(request).await,

@@ -700,3 +700,54 @@ async fn native_upload_idle_budget_resets_and_transport_path_has_no_new_timeout(
         router.drain().await;
     }
 }
+
+#[tokio::test]
+async fn cancelled_router_refuses_new_filesystem_work() {
+    let router = router();
+    let (mut client, server) = connect(&router).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("after-close");
+    router.shutdown.cancel();
+    let error = router
+        .mkdir(Request::new(MkdirRequest {
+            path: path.display().to_string(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("closed router must reject mkdir");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+    let error = client
+        .mkdir(MkdirRequest {
+            path: path.display().to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("gRPC must share admission closure");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+    assert!(!path.exists(), "rejected mkdir must have no effect");
+    router.drain().await;
+    server.abort();
+    assert!(server.await.expect_err("server stopped").is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_interrupts_upload_before_open() {
+    let router = router();
+    let mut upload =
+        Box::pin(router.write_from_stream(Request::new(futures_util::stream::pending())));
+    assert!(futures_util::poll!(&mut upload).is_pending());
+    router.shutdown.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), upload)
+        .await
+        .expect("shutdown must wake an upload waiting for Open")
+        .expect_err("unstarted upload is refused");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+    assert_eq!(
+        router.payload_slots.available_permits(),
+        filesystem_limits::PAYLOAD_SLOTS
+    );
+    router.drain().await;
+}

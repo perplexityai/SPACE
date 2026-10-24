@@ -4,6 +4,14 @@ use pplx_space_spaced_guest_protocol::proto::bridge_guest::{WriteRequest, WriteR
 
 pub(crate) const DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Shared admission check for process, filesystem and environment operations.
+pub(crate) fn require_running(shutdown: &CancellationToken) -> Result<(), Status> {
+    if shutdown.is_cancelled() {
+        return Err(crate::refused(Status::unavailable("guest shutting down")));
+    }
+    Ok(())
+}
+
 /// Configuration for process execution and the filesystem backend.
 ///
 /// # Defaults
@@ -23,6 +31,8 @@ pub struct ExecutionServiceConfig {
     pub identity_policy: IdentityPolicy,
     /// Required on Linux when using identity workers. Never inferred from the host.
     pub worker_executable: Option<crate::WorkerExecutable>,
+    /// Grace for supervised filesystem work after request cancellation. Service
+    /// cancellation can terminate identity workers immediately, without this grace.
     pub cancellation_grace: Duration,
     /// Maximum wait for each native upload message, including the initial `Open`.
     /// Defaults to 30 seconds. Applies only to native `write_file`; the gRPC
@@ -97,6 +107,9 @@ pub(super) struct ExecutionServiceInner {
 impl ExecutionService {
     /// Construct a service with the caller's filesystem execution configuration.
     ///
+    /// Caller cancellation closes the service. Closing or draining the service
+    /// does not cancel the caller's token.
+    ///
     /// # Errors
     ///
     /// Identity workers require an explicit executable on Linux. Selecting them
@@ -116,6 +129,8 @@ impl ExecutionService {
 
     /// Construct a service with optional caller-provided workload placement.
     ///
+    /// Cancellation has the same scope as [`Self::with_config`].
+    ///
     /// # Errors
     ///
     /// Returns the same configuration errors as [`Self::with_config`].
@@ -124,6 +139,7 @@ impl ExecutionService {
         config: ExecutionServiceConfig,
         guest_cgroups: Option<Arc<ExecutionCgroups>>,
     ) -> Result<Self, CreateExecutionServiceError> {
+        let shutdown = shutdown.child_token();
         let filesystem = filesystem::FilesystemHandle::new(
             config.filesystem_execution,
             config.worker_executable,
@@ -160,25 +176,34 @@ impl ExecutionService {
     }
 
     pub(super) fn require_running(&self) -> Result<(), Status> {
-        if self.inner.shutdown.is_cancelled() {
-            return Err(crate::refused(Status::unavailable("guest shutting down")));
-        }
-        Ok(())
+        require_running(&self.inner.shutdown)
     }
 
-    pub(super) fn close_process_admission(&self) {
+    /// Close operation admission and signal cancellation of owned work.
+    ///
+    /// Calls through every service clone and previously obtained filesystem handle
+    /// are refused once admission is closed. Repeated calls are harmless. Work
+    /// admitted earlier is signalled to cancel immediately. Service or caller-token
+    /// cancellation can terminate identity workers immediately, leaving outcomes
+    /// unknown. [`ExecutionServiceConfig::cancellation_grace`] applies to request
+    /// cancellation, not service shutdown. Direct execution still waits for its
+    /// outstanding I/O. This is abortive shutdown, not graceful admission-only
+    /// closure. It neither waits
+    /// for cleanup nor cancels the caller's token, and cannot roll back effects.
+    pub fn close(&self) {
         let _start_gate = self
             .inner
             .start_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.shutdown.cancel();
         self.inner.process_tasks.close();
     }
 
     /// Drain guest-owned work during the daemon's cancellation and listener
     /// shutdown. The daemon owns the overall shutdown deadline.
     pub async fn drain(&self) {
-        self.close_process_admission();
+        self.close();
         tokio::join!(
             self.inner.filesystem.drain(),
             self.inner.process_tasks.wait()
@@ -190,8 +215,14 @@ impl ExecutionService {
     /// [`EnvMap`] enforces the shared entry-count, key, value and aggregate byte
     /// limits at construction. Request environment entries override these defaults;
     /// `clean_env` skips them. Already-started processes keep their environment.
-    pub async fn configure_process_env(&self, env: EnvMap) {
+    /// Returns a refused `Unavailable` status when operation admission is closed.
+    /// Uses `Status` deliberately to share the generated operation methods' error
+    /// codes and `is_refused_before_start` classification, including in the daemon
+    /// adapter; callers do not need a second shutdown-error representation.
+    pub async fn configure_process_env(&self, env: EnvMap) -> Result<(), Status> {
+        self.require_running()?;
         *self.inner.process_env.write().await = env;
+        Ok(())
     }
 
     /// Owned, nameable filesystem handle for both native and generated-trait calls.
