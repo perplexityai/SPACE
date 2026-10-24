@@ -2,6 +2,7 @@ use clap::Parser;
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 use pplx_space_common_core::ids::sandbox_label_or_id;
 use pplx_space_common_core::types::{OneOrMany, SandboxId, SandboxSelector};
+use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION as DEFINITION_SCHEMA;
 use pplx_space_node_api_client::proto::GetControllerStateRequest;
 use pplx_space_node_mgr_client::proto::{
     AllocateRequest, AllowPortRequest, CleanupSandboxRequest, DenyPortRequest, ExposePortRequest,
@@ -314,6 +315,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let response = client
                 .resolve_execution_environment(
                     pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentRequest {
+                        definition_schema_version: DEFINITION_SCHEMA,
                         compatible: None,
                         reference: reference.map(|value| value.to_string()),
                     },

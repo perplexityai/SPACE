@@ -1880,10 +1880,14 @@ type EnvironmentDefinition struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SchemaVersion uint32                 `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
 	// SHA-256 over versioned canonical semantic fields, not protobuf wire bytes.
-	Reference     string                 `protobuf:"bytes,2,opt,name=reference,proto3" json:"reference,omitempty"`
-	Descriptor_   *EnvironmentDescriptor `protobuf:"bytes,3,opt,name=descriptor,proto3" json:"descriptor,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Reference   string                 `protobuf:"bytes,2,opt,name=reference,proto3" json:"reference,omitempty"`
+	Descriptor_ *EnvironmentDescriptor `protobuf:"bytes,3,opt,name=descriptor,proto3" json:"descriptor,omitempty"`
+	// Canonical identity encoding, independent of the transport schema. Zero
+	// retains the historical rule: use schema_version. A schema-2 representation
+	// may carry identity 1 only when it exactly represents the legacy contract.
+	IdentitySchemaVersion uint32 `protobuf:"varint,4,opt,name=identity_schema_version,json=identitySchemaVersion,proto3" json:"identity_schema_version,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *EnvironmentDefinition) Reset() {
@@ -1935,6 +1939,13 @@ func (x *EnvironmentDefinition) GetDescriptor_() *EnvironmentDescriptor {
 		return x.Descriptor_
 	}
 	return nil
+}
+
+func (x *EnvironmentDefinition) GetIdentitySchemaVersion() uint32 {
+	if x != nil {
+		return x.IdentitySchemaVersion
+	}
+	return 0
 }
 
 var File_execution_v1_execution_proto protoreflect.FileDescriptor
@@ -2043,13 +2054,14 @@ const file_execution_v1_execution_proto_rawDesc = "" +
 	"\abackend\x18\x04 \x01(\x0e2%.space.execution.v1.HypervisorBackendR\abackend\x123\n" +
 	"\x04boot\x18\x05 \x01(\v2\x1f.space.execution.v1.BootProfileR\x04boot\x12@\n" +
 	"\tisolation\x18\x06 \x01(\x0e2\".space.execution.v1.IsolationClassR\tisolation\x12W\n" +
-	"\rcompatibility\x18\a \x01(\v21.space.execution.v1.ExecutionCompatibilityProfileR\rcompatibility\"\xa7\x01\n" +
+	"\rcompatibility\x18\a \x01(\v21.space.execution.v1.ExecutionCompatibilityProfileR\rcompatibility\"\xdf\x01\n" +
 	"\x15EnvironmentDefinition\x12%\n" +
 	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12\x1c\n" +
 	"\treference\x18\x02 \x01(\tR\treference\x12I\n" +
 	"\n" +
 	"descriptor\x18\x03 \x01(\v2).space.execution.v1.EnvironmentDescriptorR\n" +
-	"descriptor*\x85\x01\n" +
+	"descriptor\x126\n" +
+	"\x17identity_schema_version\x18\x04 \x01(\rR\x15identitySchemaVersion*\x85\x01\n" +
 	"\vRuntimeKind\x12\x1c\n" +
 	"\x18RUNTIME_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18RUNTIME_KIND_FIRECRACKER\x10\x01\x12!\n" +
