@@ -2,14 +2,15 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_common_core::types::{EnvMap, GuestUserName};
 use pplx_space_spaced_guest_execution::{
     ExecutionService, ExecutionServiceConfig, WorkerExecutable,
 };
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
-    StartRequest, StatRequest, WriteBatchEntry, WriteBatchRequest,
-    filesystem_client::FilesystemClient, filesystem_server::Filesystem, process_event::Event,
-    process_exit::Outcome, process_server::Process,
+    SendInputRequest, StartRequest, StatRequest, WriteBatchEntry, WriteBatchRequest, WriteOpen,
+    WriteRequest, filesystem_client::FilesystemClient, filesystem_server::Filesystem,
+    process_event::Event, process_exit::Outcome, process_server::Process,
+    write_request::Message as WriteMessage,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Server};
@@ -136,6 +137,38 @@ pub(super) async fn run() {
         .expect("native write");
     client.write_batch(write).await.expect("transport replay");
     assert_eq!(std::fs::read(&path).expect("file"), b"once");
+    let upload_path = directory.path().join("upload");
+    let upload = [
+        WriteRequest {
+            message: Some(WriteMessage::Open(WriteOpen {
+                path: upload_path.display().to_string(),
+                append: true,
+                idempotency_key: Some("embedding-upload".into()),
+                user: None,
+            })),
+        },
+        WriteRequest {
+            message: Some(WriteMessage::Data(b"streamed".to_vec())),
+        },
+    ];
+    // Borrowed, !Unpin input exercises the native adapter without a transport stream.
+    let input = futures_util::stream::iter(upload.iter())
+        .then(|message| async move { Ok(message.clone()) });
+    let filesystem: pplx_space_spaced_guest_execution::FilesystemHandle =
+        service.filesystem_service();
+    let upload_future = filesystem.write_file(tonic::Request::new(input));
+    fn assert_send(_: &impl Send) {}
+    assert_send(&upload_future);
+    upload_future.await.expect("native upload");
+    client
+        .write(futures_util::stream::iter(upload))
+        .await
+        .expect("transport upload replay");
+    assert_eq!(std::fs::read(&upload_path).expect("upload"), b"streamed");
+    assert_eq!(
+        std::fs::metadata(&upload_path).expect("upload owner").uid(),
+        account.uid.as_raw()
+    );
     let metadata = std::fs::metadata(&path).expect("metadata");
     assert_eq!(metadata.uid(), account.uid.as_raw());
     assert_eq!(metadata.gid(), account.gid.as_raw());
@@ -191,39 +224,75 @@ pub(super) async fn run() {
             );
         }
     }
-    // Native process calls and filesystem workers share the selected account.
-    let mut events = Process::start(
-        &service,
-        tonic::Request::new(StartRequest {
-            command: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "/usr/bin/id -u; exec /bin/cat \"$1\"".into(),
-                "embedding".into(),
-                path.display().to_string(),
-            ],
-            cwd: Some(directory.path().display().to_string()),
-            idempotency_key: Some("embedding-process".into()),
-            ..Default::default()
-        }),
-    )
-    .await
-    .expect("start process")
-    .into_inner();
-    let mut output = Vec::new();
-    let mut exited = false;
-    while let Some(event) = events.next().await {
-        match event.expect("process event").event {
-            Some(Event::Stdout(chunk)) => output.extend(chunk.data),
-            Some(Event::Exit(exit)) => {
-                assert!(matches!(exit.outcome, Some(Outcome::Exited(exit)) if exit.exit_code == 0));
-                exited = true;
+    // EnvMap owns the size/count limits; this integration checks replacement and
+    // snapshot semantics through native starts, including per-request precedence.
+    let environment = |value: &str| {
+        EnvMap::try_from(std::collections::HashMap::from([
+            ("EMBEDDING_ENV".to_owned(), value.to_owned()),
+            ("OVERRIDE".to_owned(), "configured".to_owned()),
+        ]))
+        .expect("bounded environment")
+    };
+    service.configure_process_env(environment("first")).await;
+    let command = concat!(
+        "read marker; printf '%s/%s\\n' \"$EMBEDDING_ENV\" \"$OVERRIDE\"; ",
+        "/usr/bin/id -u; exec /bin/cat \"$1\"",
+    );
+    for (case, expected) in ["first", "second", ""].into_iter().enumerate() {
+        let mut events = Process::start(
+            &service,
+            tonic::Request::new(StartRequest {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    command.into(),
+                    "embedding".into(),
+                    path.display().to_string(),
+                ],
+                cwd: Some(directory.path().display().to_string()),
+                idempotency_key: Some(format!("embedding-process-{case}")),
+                stdin: true,
+                clean_env: case == 2,
+                env: std::collections::HashMap::from([("OVERRIDE".into(), "request".into())]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("start process")
+        .into_inner();
+        let started = events
+            .next()
+            .await
+            .expect("started event")
+            .expect("started response");
+        service.configure_process_env(environment("second")).await;
+        service
+            .send_input(tonic::Request::new(SendInputRequest {
+                process_id: started.process_id,
+                data: b"continue\n".to_vec(),
+            }))
+            .await
+            .expect("release environment probe");
+        let mut output = Vec::new();
+        let mut exited = false;
+        while let Some(event) = events.next().await {
+            match event.expect("process event").event {
+                Some(Event::Stdout(chunk)) => output.extend(chunk.data),
+                Some(Event::Exit(exit)) => {
+                    assert!(
+                        matches!(exit.outcome, Some(Outcome::Exited(exit)) if exit.exit_code == 0)
+                    );
+                    exited = true;
+                }
+                _ => {}
             }
-            _ => {}
         }
+        assert!(exited);
+        assert_eq!(
+            output,
+            format!("{expected}/request\n{}\nonce", account.uid).as_bytes()
+        );
     }
-    assert!(exited);
-    assert_eq!(output, format!("{}\nonce", account.uid).as_bytes());
     super::identity::check_processes(&service, &account).await;
     drop(client);
     stop(service, shutdown, server).await;

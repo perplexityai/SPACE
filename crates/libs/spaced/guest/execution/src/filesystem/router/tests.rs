@@ -19,8 +19,8 @@ fn current_user() -> GuestUserName {
     .expect("current user is valid")
 }
 
-fn identity_router() -> FilesystemRouter {
-    FilesystemRouter::new(
+fn identity_router() -> FilesystemHandle {
+    FilesystemHandle::new(
         FilesystemExecutionMode::IdentityWorkers,
         Some(crate::WorkerExecutable::open("/proc/self/exe").expect("test executable")),
         crate::IdentityPolicy::Guest,
@@ -33,7 +33,7 @@ fn identity_router() -> FilesystemRouter {
 }
 
 async fn connected_worker(
-    router: &FilesystemRouter,
+    router: &FilesystemHandle,
 ) -> (
     Channel,
     tokio::task::JoinHandle<io::Result<(u64, u64)>>,
@@ -45,7 +45,7 @@ async fn connected_worker(
 
 /// A worker behind a proxy that counts the bytes the worker sends.
 async fn connected_counted_worker(
-    router: &FilesystemRouter,
+    router: &FilesystemHandle,
 ) -> (
     Channel,
     tokio::task::JoinHandle<io::Result<(u64, u64)>>,
@@ -233,7 +233,7 @@ async fn a_read_through_a_workers_descriptor_ends_with_the_worker() {
     assert_eq!(read[..], data[..read.len()]);
 }
 
-async fn read_file(router: &FilesystemRouter, path: &std::path::Path) -> GuestFileChunkStream {
+async fn read_file(router: &FilesystemHandle, path: &std::path::Path) -> GuestFileChunkStream {
     Filesystem::read(
         router,
         Request::new(ReadRequest {
@@ -700,9 +700,8 @@ async fn write_input_failure_preserves_the_routed_worker() {
         ),
     };
     let error = router
-        .write_stream(
-            first,
-            Box::pin(tokio_stream::iter(vec![
+        .write_from_stream(Request::new(tokio_stream::iter(vec![
+                Ok(first),
                 Ok(WriteRequest {
                     message: Some(
                         pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Data(
@@ -711,9 +710,7 @@ async fn write_input_failure_preserves_the_routed_worker() {
                     ),
                 }),
                 Err(Status::aborted("host write stream aborted")),
-            ])),
-            crate::payload::acquire(&router.payload_slots, 1, None).unwrap(),
-        )
+            ])))
         .await
         .expect_err("input stream error is returned");
     assert_eq!(error.code(), tonic::Code::Aborted);
@@ -738,8 +735,8 @@ async fn dropped_write_relay_releases_input() {
         let _keep_until_stream_drop = &dropped;
         message
     });
-    let mut relay = Box::pin(router.write_stream(
-        WriteRequest {
+    let mut relay = Box::pin(router.write_from_stream(Request::new(
+        futures_util::stream::iter([Ok(WriteRequest {
             message: Some(
                 pplx_space_spaced_guest_protocol::proto::operations::write_request::Message::Open(
                     pplx_space_spaced_guest_protocol::proto::operations::WriteOpen {
@@ -750,10 +747,8 @@ async fn dropped_write_relay_releases_input() {
                     },
                 ),
             ),
-        },
-        Box::pin(input),
-        crate::payload::acquire(&router.payload_slots, 1, None).unwrap(),
-    ));
+        })]).chain(input),
+    )));
     assert!(futures_util::poll!(&mut relay).is_pending());
     drop(relay);
     let released = tokio::time::timeout(Duration::from_secs(1), observed)
@@ -808,11 +803,9 @@ async fn partial_append_retry_survives_worker_replacement() {
         },
     ));
     router
-        .write_stream(
-            open.clone(),
-            Box::pin(input),
-            crate::payload::acquire(&router.payload_slots, 1, None).unwrap(),
-        )
+        .write_from_stream(Request::new(
+            futures_util::stream::iter([Ok(open.clone())]).chain(input),
+        ))
         .await
         .expect_err("interrupted upload");
     router.record_worker_failure(&worker).await;
@@ -820,11 +813,10 @@ async fn partial_append_retry_survives_worker_replacement() {
     let (_channel, proxy, server) = connected_worker(&router).await;
     router.worker(None).await.expect("replacement worker");
     let retry = router
-        .write_stream(
-            open,
-            Box::pin(futures_util::stream::iter([Ok(data)])),
-            crate::payload::acquire(&router.payload_slots, 1, None).unwrap(),
-        )
+        .write_from_stream(Request::new(futures_util::stream::iter([
+            Ok(open),
+            Ok(data),
+        ])))
         .await;
     let bytes = tokio::fs::read(path).await.expect("file");
     stop_worker(proxy, server).await;
