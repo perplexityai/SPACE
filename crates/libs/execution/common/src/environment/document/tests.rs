@@ -142,7 +142,7 @@ fn unsupported_profiles_versions_and_changed_identities_fail_closed() {
 #[test]
 fn schema_dispatch_precedes_descriptor_decoding() {
     let base: serde_json::Value = serde_json::from_str(E0_DOCUMENT).unwrap();
-    for schema in [0, 2, u32::MAX] {
+    for schema in [0, 3, u32::MAX] {
         for descriptor in [
             base["descriptor"].clone(),
             serde_json::json!({"future_semantics": true}),

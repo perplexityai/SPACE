@@ -34,18 +34,20 @@ mod transfer;
 
 pub(crate) use executor::ExecutorParts;
 #[cfg(feature = "github")]
-pub(crate) use github::GitHubReleaseSource;
-#[cfg(feature = "github")]
 pub use github::GitHubReleaseSourceError;
+#[cfg(feature = "github")]
+pub(crate) use github::{GitHubReleaseSource, GitHubRuntime};
 pub(crate) use operations::{
     CancelOperationError, InstallOperation, Installer, LookupOperationError, Operation,
     OperationState, SubmitOperationError,
 };
 pub use operations::{InstallLimits, OpenInstallerError};
 pub(crate) use publisher::{DirectoryCatalog, NodeManagerPublisher, PinSource};
-pub(crate) use release::ReleaseContext;
+pub use release::ReleaseConfigurationError;
+pub(crate) use release::{ReleaseContext, ReleaseSources};
 pub use release_source::{
-    FIRECRACKER_RELEASE_SOURCE, ReleaseChunks, ReleaseSource, ReleaseSourceError, ReleaseUrl,
+    CLOUD_HYPERVISOR_RELEASE_SOURCE, FIRECRACKER_RELEASE_SOURCE, ReleaseArchiveMember,
+    ReleaseChunks, ReleasePayload, ReleaseSource, ReleaseSourceError, ReleaseUrl,
     ReleaseUrlParseError, VerifiableRelease,
 };
 #[cfg(feature = "s3")]

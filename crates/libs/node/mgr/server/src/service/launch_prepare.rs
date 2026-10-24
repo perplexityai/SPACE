@@ -19,15 +19,15 @@ impl NodeManagerService {
     async fn launch_admitted_runtime(
         &self,
         sandbox_id: &str,
-        request: pplx_space_node_runtime_core::proto::LaunchFirecrackerRequest,
-    ) -> Result<pplx_space_node_runtime_core::proto::LaunchFirecrackerResponse, Status> {
+        request: pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch,
+    ) -> Result<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse, Status> {
         let expected_environment = request
             .verified_runtime
             .as_ref()
             .map(|verified| verified.environment_reference.clone());
         let launched = self
             .runtime_supervisor
-            .launch_firecracker(request)
+            .launch_runtime(request.into())
             .await
             .map_err(pplx_space_node_runtime_core::launch_admission::supervisor_launch_status)?
             .into_inner();
@@ -305,7 +305,7 @@ impl NodeManagerService {
             .await?;
         let firecracker_bin = resolved_execution
             .runtime_files
-            .path(RuntimeFileRole::FirecrackerBinary)
+            .path(RuntimeFileRole::RuntimeExecutable)
             .ok_or_else(|| {
                 Status::failed_precondition("resolved Firecracker runtime is missing firecracker")
             })?
@@ -313,7 +313,7 @@ impl NodeManagerService {
             .to_string();
         let jailer_bin = resolved_execution
             .runtime_files
-            .path(RuntimeFileRole::JailerBinary)
+            .path(RuntimeFileRole::LauncherExecutable)
             .ok_or_else(|| {
                 Status::failed_precondition("resolved Firecracker runtime is missing jailer")
             })?
@@ -568,7 +568,7 @@ impl NodeManagerService {
         let launched = self
             .launch_admitted_runtime(
                 sandbox_id,
-                pplx_space_node_runtime_core::proto::LaunchFirecrackerRequest {
+                pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch {
                     execution_id: req
                         .execution_fence
                         .as_ref()

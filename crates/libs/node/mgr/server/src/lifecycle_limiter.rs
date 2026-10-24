@@ -64,7 +64,7 @@ impl LifecycleMethod {
             LifecycleMethod::PrepareSandbox => "PrepareSandbox",
             LifecycleMethod::Launch => "Launch",
             LifecycleMethod::LaunchSandbox => "LaunchSandbox",
-            LifecycleMethod::LoadSnapshot => "LoadSnapshot",
+            LifecycleMethod::LoadSnapshot => "RestoreVmState",
             LifecycleMethod::CleanupSandbox => "CleanupSandbox",
             LifecycleMethod::Release => "Release",
             LifecycleMethod::Filesystem => "Filesystem",

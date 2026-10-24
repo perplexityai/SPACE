@@ -2241,7 +2241,7 @@ pub struct NodeReportedArtifact {
     /// and then destroy a rootfs that a running guest is still writing to.
     ///
     /// **Two node-side signals feed it, and either one is enough.** The node
-    /// reports `firecracker_alive` from the watchdog's cached health record,
+    /// reports `runtime_alive` from the watchdog's cached health record,
     /// falling back to a live `is_sandbox_running(id)` probe only when the
     /// watchdog has no record, and it sets `namespace` only when that same
     /// live probe succeeds (`live_sandbox_namespace` in
@@ -2459,7 +2459,7 @@ fn node_reported_artifact_from_info(
         // `namespace`, not `pid`: the node sets `namespace` from its live
         // process probe alone, while `pid` also needs the row's persisted pid,
         // which every write into `stopped` clears.
-        vm_alive: info.firecracker_alive || info.namespace.is_some(),
+        vm_alive: info.runtime_alive || info.namespace.is_some(),
         state_degraded: info.state_degraded,
         stopped_since: info.state_changed_at,
         pin_captured_at,

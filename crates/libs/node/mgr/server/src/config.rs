@@ -34,7 +34,7 @@ pub(crate) struct RuntimePaths {
 /// where publications come from.
 #[derive(Clone, Debug)]
 pub(crate) struct ArtifactStorePaths {
-    pub releases: PathBuf,
+    pub releases: std::collections::BTreeMap<pplx_space_common_core::types::RuntimeKind, PathBuf>,
     pub kernels: PathBuf,
     /// The runtime manager's staging directory, read and never written.
     pub staging: PathBuf,
@@ -45,7 +45,17 @@ pub(crate) struct ArtifactStorePaths {
 impl Default for ArtifactStorePaths {
     fn default() -> Self {
         Self {
-            releases: paths::NODE_FIRECRACKER_DIR.into(),
+            releases: [
+                (
+                    pplx_space_common_core::types::RuntimeKind::Firecracker,
+                    paths::NODE_FIRECRACKER_DIR.into(),
+                ),
+                (
+                    pplx_space_common_core::types::RuntimeKind::CloudHypervisor,
+                    paths::NODE_CLOUD_HYPERVISOR_DIR.into(),
+                ),
+            ]
+            .into(),
             kernels: paths::NODE_KERNELS_DIR.into(),
             staging: paths::RUNTIME_MANAGER_STAGING_DIR.into(),
             catalog: paths::RUNTIME_MANAGER_CATALOG_DIR.into(),
