@@ -1237,7 +1237,7 @@ impl ProcessEventJournal {
     }
 
     /// Moves the completion time back, as if `by` had passed since.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     fn backdate_completion(&self, by: Duration) {
         let mut state = self
             .state
