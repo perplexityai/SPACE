@@ -1114,14 +1114,26 @@ pub(super) async fn cleanup_runtime_artifacts_blocking(
 pub(super) struct RuntimeArtifactCleanupError(Vec<String>);
 
 fn cleanup_runtime_artifacts(sandbox_id: &str) -> Result<Vec<String>, JailCleanupError> {
-    cleanup_runtime_artifacts_at(
+    // All adapter roots must release their binds before shared device teardown.
+    // Inspect by sandbox identity even if artifact metadata is missing or corrupt.
+    let alternate = format!("{JAIL_DIR}/cloud-hypervisor/{sandbox_id}");
+    let mut actions = cleanup_jail_root(
+        &format!("{alternate}/root"),
+        |path| unmount_if_present(path),
+        || Ok(Vec::new()),
+    )?;
+    if remove_dir_all_if_exists(&alternate).map_err(JailCleanupError::Remove)? {
+        actions.push(format!("Removed {alternate}"));
+    }
+    actions.extend(cleanup_runtime_artifacts_at(
         &paths::isolated_net_gateway_run_dir(sandbox_id),
         &format!("{RUN_DIR}/{sandbox_id}"),
         &format!("{JAIL_DIR}/firecracker/{sandbox_id}"),
         &PathBuf::from(format!("{CACHE_DIR}/{sandbox_id}/instance")),
         |path| unmount_if_present(path),
         || teardown_encrypted_volumes_blocking(sandbox_id),
-    )
+    )?);
+    Ok(actions)
 }
 
 pub(super) const JAIL_BIND_NAMES: [&str; 3] = [

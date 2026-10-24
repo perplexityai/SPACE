@@ -966,7 +966,8 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
                                 .into(),
                     }),
                     ..Default::default()
-                },
+                }
+                .into(),
             )
             .await;
         if matches {
