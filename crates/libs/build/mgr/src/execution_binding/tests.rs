@@ -9,8 +9,13 @@ fn fixture() -> ResolveExecutionEnvironmentResponse {
     .unwrap();
     let spec = definition.descriptor().spec();
     let RuntimeBinding::ManagedRelease(runtime) = &spec.runtime;
-    let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
-    let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } = &spec.compatibility;
+    let BootProfile::LinuxDirectV1 { kernel } = &spec.boot else {
+        panic!("expected schema-1 fixture")
+    };
+    let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } = &spec.compatibility
+    else {
+        panic!("expected schema-1 fixture")
+    };
     let execution = definition
         .bind_execution(
             ExecutionMetadata::new(
@@ -106,7 +111,9 @@ fn scratch_inputs_replace_inherited_selectors_and_reject_conflicting_recipe_pins
             Some(std::ffi::OsStr::new(expected))
         );
     }
-    let BootProfile::LinuxDirectV1 { kernel } = &binding.definition.descriptor().spec().boot;
+    let BootProfile::LinuxDirectV1 { kernel } = &binding.definition.descriptor().spec().boot else {
+        panic!("expected schema-1 fixture")
+    };
     let mut pin = super::super::GuestKernelPin {
         version: kernel.version.clone(),
         digest: kernel.digest,
@@ -263,7 +270,9 @@ async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
     assert!(explicit_e0.template.is_empty());
     // A different boot kernel is a different binding, even with the same VMM.
     let mut spec = binding.definition.descriptor().spec().clone();
-    let BootProfile::LinuxDirectV1 { kernel } = &mut spec.boot;
+    let BootProfile::LinuxDirectV1 { kernel } = &mut spec.boot else {
+        panic!("expected schema-1 fixture")
+    };
     kernel.digest = Digest::sha256([7; 32]);
     let definition = EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap());
     let requirements = definition.execution_requirements().unwrap();

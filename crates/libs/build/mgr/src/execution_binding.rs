@@ -21,6 +21,8 @@ pub enum BuildExecutionBindingError {
     Resolve(#[from] tonic::Status),
     #[error("environment resolution timed out: {0}")]
     Timeout(#[from] tokio::time::error::Elapsed),
+    #[error("scratch builder does not implement this boot/compatibility profile")]
+    ScratchProfile,
     #[error("execution binding lacks required {0}")]
     Missing(&'static str),
     #[error("invalid environment definition: {0}")]
@@ -228,12 +230,18 @@ impl BuildExecutionBinding {
         pin: Option<&super::GuestKernelPin>,
     ) -> Result<(), BuildExecutionBindingError> {
         use pplx_space_common_core::types::{BootProfile, ExecutionCompatibilityProfile};
-        let BootProfile::LinuxDirectV1 { kernel } = &self.definition.descriptor().spec().boot;
+        let BootProfile::LinuxDirectV1 { kernel } = &self.definition.descriptor().spec().boot
+        else {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        };
         if pin.is_some_and(|pin| pin.version != kernel.version || pin.digest != kernel.digest) {
             return Err(BuildExecutionBindingError::KernelPin);
         }
         let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-            &self.definition.descriptor().spec().compatibility;
+            &self.definition.descriptor().spec().compatibility
+        else {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        };
         // Values are resolved observations, never inherited selector ENV values.
         command.env("SPACE_SEED_RUNTIME", self.execution.runtime().kind.as_str());
         command.env(
