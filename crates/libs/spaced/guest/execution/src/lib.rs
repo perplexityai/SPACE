@@ -34,6 +34,7 @@ const MAX_PROCESS_TAG_BYTES: usize = 4 * 1024;
 
 mod execution;
 mod filesystem;
+pub use filesystem::router::FilesystemHandle;
 mod guest_path;
 mod idempotency;
 mod identity;

@@ -7,11 +7,11 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tonic::transport::{Channel, Server};
 
-fn router() -> FilesystemRouter {
+fn router() -> FilesystemHandle {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
         .expect("user lookup")
         .expect("current user");
-    FilesystemRouter::new(
+    FilesystemHandle::new(
         FilesystemExecutionMode::Direct,
         None,
         crate::IdentityPolicy::Guest,
@@ -29,7 +29,7 @@ fn router() -> FilesystemRouter {
     target_os = "linux",
     allow(clippy::panic, reason = "the test router is always direct")
 )]
-fn router_without_file_operation_queue() -> FilesystemRouter {
+fn router_without_file_operation_queue() -> FilesystemHandle {
     let mut router = router();
     #[cfg(not(target_os = "linux"))]
     let Backend::Direct(service) = &mut router.backend;
@@ -78,7 +78,7 @@ async fn parent_cancellation_stops_direct_watches_before_drain() {
 }
 
 async fn connect(
-    router: &FilesystemRouter,
+    router: &FilesystemHandle,
 ) -> (FilesystemClient<Channel>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
@@ -450,7 +450,32 @@ async fn native_mutations_share_the_transport_payload_budget() {
         .expect_err("native batch requires payload capacity");
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+    let mut polled = false;
+    let input = futures_util::stream::poll_fn(|_| {
+        polled = true;
+        std::task::Poll::Ready(None)
+    });
+    let error = router
+        .write_from_stream(Request::new(input))
+        .await
+        .expect_err("native upload requires payload capacity");
+    assert!(!polled, "an upload without capacity must not poll input");
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
     drop(occupied);
+    let mut upload =
+        Box::pin(router.write_from_stream(Request::new(futures_util::stream::pending())));
+    assert!(futures_util::poll!(&mut upload).is_pending());
+    assert_eq!(
+        router.payload_slots.available_permits(),
+        filesystem_limits::PAYLOAD_SLOTS - 1,
+        "waiting for Open retains capacity"
+    );
+    drop(upload);
+    assert_eq!(
+        router.payload_slots.available_permits(),
+        filesystem_limits::PAYLOAD_SLOTS
+    );
     router
         .write_batch(Request::new(WriteBatchRequest::default()))
         .await
@@ -460,6 +485,9 @@ async fn native_mutations_share_the_transport_payload_budget() {
 
 #[tokio::test]
 async fn native_messages_allow_exactly_the_size_limit() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        WriteOpen, write_request::Message as WriteMessage,
+    };
     use prost::Message;
     let router = router();
     let directory = tempfile::tempdir().unwrap();
@@ -498,5 +526,177 @@ async fn native_messages_allow_exactly_the_size_limit() {
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::OutOfRange);
     assert!(!pplx_space_common_grpc::is_refused_before_start(&error));
+    let oversized_open = WriteRequest {
+        message: Some(WriteMessage::Open(WriteOpen {
+            path: "x".repeat(filesystem_limits::MAX_MESSAGE_BYTES),
+            ..Default::default()
+        })),
+    };
+    let error = router
+        .write_from_stream(Request::new(futures_util::stream::iter([Ok(
+            oversized_open,
+        )])))
+        .await
+        .expect_err("oversized Open");
+    assert_eq!(error.code(), tonic::Code::OutOfRange);
+    let mut committed = Vec::new();
+    for excess in [0, 1] {
+        let open = WriteRequest {
+            message: Some(WriteMessage::Open(WriteOpen {
+                path: path.display().to_string(),
+                ..Default::default()
+            })),
+        };
+        let mut data = WriteRequest {
+            message: Some(WriteMessage::Data(vec![
+                42;
+                filesystem_limits::MAX_MESSAGE_BYTES
+            ])),
+        };
+        let overhead = data.encoded_len() - filesystem_limits::MAX_MESSAGE_BYTES;
+        let Some(WriteMessage::Data(bytes)) = &mut data.message else {
+            unreachable!()
+        };
+        bytes.truncate(filesystem_limits::MAX_MESSAGE_BYTES - overhead + excess);
+        let expected_bytes = bytes.len();
+        assert_eq!(
+            data.encoded_len(),
+            filesystem_limits::MAX_MESSAGE_BYTES + excess
+        );
+        let mut messages = vec![Ok(open)];
+        if excess != 0 {
+            messages.push(Ok(WriteRequest {
+                message: Some(WriteMessage::Data(b"must not commit".to_vec())),
+            }));
+        }
+        messages.push(Ok(data));
+        let result = router
+            .write_from_stream(Request::new(futures_util::stream::iter(messages)))
+            .await;
+        if excess == 0 {
+            result.expect("exact upload message limit is allowed");
+            committed = vec![42; expected_bytes];
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), committed);
+        } else {
+            let error = result.expect_err("oversized Data");
+            assert_eq!(error.code(), tonic::Code::OutOfRange);
+            assert!(!pplx_space_common_grpc::is_refused_before_start(&error));
+        }
+    }
     router.drain().await;
+    assert_eq!(
+        tokio::fs::read(&path).await.unwrap(),
+        committed,
+        "rejected replacement must preserve the exact-limit upload after cleanup"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_upload_idle_timeout_cancels_before_open_and_between_data() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        WriteOpen, write_request::Message,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for after_open in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unchanged");
+        std::fs::write(&path, b"original").unwrap();
+        let service = crate::ExecutionService::with_config(
+            CancellationToken::new(),
+            crate::ExecutionServiceConfig {
+                filesystem_execution: FilesystemExecutionMode::Direct,
+                identity_policy: crate::IdentityPolicy::Guest,
+                default_operation_user: router().default_user,
+                native_upload_idle_timeout: std::time::Duration::from_secs(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let router: crate::FilesystemHandle = service.filesystem_service();
+        let waiting = Arc::new(AtomicBool::new(false));
+        let observed = waiting.clone();
+        let stalled = futures_util::stream::poll_fn(move |_| {
+            observed.store(true, Ordering::SeqCst);
+            std::task::Poll::Pending
+        });
+        let messages = if after_open {
+            vec![
+                Ok(WriteRequest {
+                    message: Some(Message::Open(WriteOpen {
+                        path: path.display().to_string(),
+                        idempotency_key: Some("idle-upload".into()),
+                        ..Default::default()
+                    })),
+                }),
+                Ok(WriteRequest {
+                    message: Some(Message::Data(b"partial".to_vec())),
+                }),
+            ]
+        } else {
+            vec![]
+        };
+        let mut upload = Box::pin(router.write_file(Request::new(
+            futures_util::stream::iter(messages).chain(stalled),
+        )));
+        while !waiting.load(Ordering::SeqCst) {
+            assert!(futures_util::poll!(&mut upload).is_pending());
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut upload)
+            .await
+            .expect("native input idle time is bounded")
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(!pplx_space_common_grpc::is_refused_before_start(&error));
+        drop(upload);
+        tokio::time::resume();
+        router.drain().await;
+        assert_eq!(
+            router.payload_slots.available_permits(),
+            filesystem_limits::PAYLOAD_SLOTS
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        tokio::time::pause();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_upload_idle_budget_resets_and_transport_path_has_no_new_timeout() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        WriteOpen, write_request::Message,
+    };
+    for native in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("upload");
+        let router = router().with_native_upload_idle_timeout(std::time::Duration::from_secs(3));
+        let delay = std::time::Duration::from_secs(if native { 2 } else { 4 });
+        let input = futures_util::stream::iter([
+            WriteRequest {
+                message: Some(Message::Open(WriteOpen {
+                    path: path.display().to_string(),
+                    ..Default::default()
+                })),
+            },
+            WriteRequest {
+                message: Some(Message::Data(b"first".to_vec())),
+            },
+            WriteRequest {
+                message: Some(Message::Data(b"second".to_vec())),
+            },
+        ])
+        .then(|message| async move {
+            tokio::time::sleep(delay).await;
+            Ok(message)
+        });
+        if native {
+            router.write_file(Request::new(input)).await.unwrap();
+        } else {
+            // The generated Filesystem::write adapter delegates here, without
+            // the native-only idle policy.
+            router.write_from_stream(Request::new(input)).await.unwrap();
+        }
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"firstsecond");
+        router.drain().await;
+    }
 }

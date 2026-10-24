@@ -140,8 +140,13 @@ enum LedgerEvidence {
     Lost,
 }
 
+/// Owned filesystem operations sharing the service's admission and worker state.
+///
+/// Obtain this handle from [`crate::ExecutionService::filesystem_service`]. It
+/// implements the generated `Filesystem` trait and accepts native uploads via
+/// [`Self::write_file`]. Clones share all capacity and lifecycle state.
 #[derive(Clone)]
-pub(crate) struct FilesystemRouter {
+pub struct FilesystemHandle {
     default_user: GuestUserName,
     operations: Operations,
     tasks: TaskTracker,
@@ -156,9 +161,57 @@ pub(crate) struct FilesystemRouter {
     #[cfg(target_os = "linux")]
     ledger_evidence: Arc<Mutex<HashMap<GuestUserName, LedgerEvidence>>>,
     cancellation_grace: std::time::Duration,
+    native_upload_idle_timeout: std::time::Duration,
 }
 
-impl FilesystemRouter {
+impl std::fmt::Debug for FilesystemHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilesystemHandle").finish_non_exhaustive()
+    }
+}
+
+impl FilesystemHandle {
+    pub(crate) fn with_native_upload_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.native_upload_idle_timeout = timeout;
+        self
+    }
+
+    /// Upload from a native stream, including borrowed and non-`Unpin` streams.
+    ///
+    /// Uses the same message limits, admission and supervised write path as gRPC.
+    /// Waiting for each input message (including `Open`) is bounded by
+    /// [`crate::ExecutionServiceConfig::native_upload_idle_timeout`]. Expiry
+    /// returns `DeadlineExceeded` and cancels the upload; it does not roll back
+    /// append effects or establish that a fresh-key retry is safe. Cleanup can
+    /// retain capacity after the response. Service backpressure is not input idle
+    /// time. Callers can separately bound the whole upload with a deadline.
+    pub async fn write_file<S>(
+        &self,
+        request: Request<S>,
+    ) -> Result<Response<WriteResponse>, Status>
+    where
+        S: Stream<Item = Result<WriteRequest, Status>> + Send,
+    {
+        let (metadata, extensions, incoming) = request.into_parts();
+        tokio::pin!(incoming);
+        let idle_timeout = self.native_upload_idle_timeout;
+        let bounded = futures_util::stream::unfold(Some(incoming.as_mut()), |input| async move {
+            let mut input = input?;
+            match tokio::time::timeout(idle_timeout, input.next()).await {
+                Ok(Some(message)) => Some((message, Some(input))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(Status::deadline_exceeded(
+                        "native upload input idle timeout",
+                    )),
+                    None,
+                )),
+            }
+        });
+        self.write_from_stream(Request::from_parts(metadata, extensions, bounded))
+            .await
+    }
+
     pub(crate) fn grpc_service(
         &self,
     ) -> RequestAdmission<PreserveInputErrors<PublicFilesystemServer<Self>>> {
@@ -313,13 +366,34 @@ impl FilesystemRouter {
         .map_err(|_| operations::unknown_outcome())?
     }
 
+    pub(crate) async fn write_from_stream<S>(
+        &self,
+        mut request: Request<S>,
+    ) -> Result<Response<WriteResponse>, Status>
+    where
+        S: Stream<Item = Result<WriteRequest, Status>> + Send,
+    {
+        let admission = crate::payload::acquire(
+            &self.payload_slots,
+            1,
+            request.extensions_mut().remove::<RequestPermit>(),
+        )?;
+        let incoming = request.into_inner();
+        tokio::pin!(incoming);
+        self.write_stream(incoming.as_mut(), admission).await
+    }
+
     async fn write_stream(
         &self,
-        first: WriteRequest,
-        mut incoming: Pin<Box<dyn Stream<Item = Result<WriteRequest, Status>> + Send>>,
+        mut incoming: Pin<&mut (dyn Stream<Item = Result<WriteRequest, Status>> + Send)>,
         admission: RequestPermit,
     ) -> Result<Response<WriteResponse>, Status> {
         use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
+        let first = incoming
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| Status::invalid_argument("write requires open"))?;
         crate::payload::check_message(&first, filesystem_limits::MAX_MESSAGE_BYTES)?;
         let Some(Message::Open(open)) = first.message else {
             return Err(Status::invalid_argument("first write message must be open"));
@@ -502,6 +576,7 @@ impl FilesystemRouter {
             #[cfg(target_os = "linux")]
             ledger_evidence: Arc::new(Mutex::new(HashMap::new())),
             cancellation_grace,
+            native_upload_idle_timeout: crate::execution::DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT,
         })
     }
 
@@ -940,7 +1015,7 @@ type RoutedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 #[cfg(target_os = "linux")]
 struct FailureAwareStream<T> {
     inner: RoutedStream<T>,
-    router: FilesystemRouter,
+    router: FilesystemHandle,
     worker: super::worker::WorkerClient,
     runtime_handle: tokio::runtime::Handle,
     failure_recorded: bool,
@@ -969,7 +1044,7 @@ impl<T> Stream for FailureAwareStream<T> {
 }
 
 #[tonic::async_trait]
-impl Filesystem for FilesystemRouter {
+impl Filesystem for FilesystemHandle {
     type ListInfoStream = GuestFileInfoStream;
     // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4.
     type ListStream = Pin<
@@ -1063,20 +1138,9 @@ impl Filesystem for FilesystemRouter {
 
     async fn write(
         &self,
-        mut request: Request<tonic::Streaming<WriteRequest>>,
+        request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
-        let admission = crate::payload::acquire(
-            &self.payload_slots,
-            1,
-            request.extensions_mut().remove::<RequestPermit>(),
-        )?;
-        let mut incoming = request.into_inner();
-        let first = incoming
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("write requires open"))?;
-        self.write_stream(first, Box::pin(incoming), admission)
-            .await
+        self.write_from_stream(request).await
     }
 
     async fn write_batch(
