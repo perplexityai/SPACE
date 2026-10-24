@@ -7,8 +7,8 @@ use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_node_runtime_core::{
     artifact_store::{VerifyError, managed_release_directory},
     catalog::{CompiledEnvironment, compiled_verity_digest},
-    proto::LaunchFirecrackerRequest,
     runtime_inventory::host_arch,
+    runtime_launch::FirecrackerLaunch,
     verity::{SealedFile, VerityDigest, VerityError},
 };
 use tonic::Status;
@@ -24,7 +24,7 @@ pub(crate) struct VerifiedLaunch {
 /// catalog or executable paths. Resident adoption does not authenticate a new
 /// launch, but still requires an unambiguous, supported request envelope.
 pub(crate) fn decode_environment_reference(
-    request: &mut LaunchFirecrackerRequest,
+    request: &mut FirecrackerLaunch,
 ) -> Result<Option<EnvironmentReference>, Status> {
     let Some(input) = request.verified_runtime.take() else {
         return Ok(None);
@@ -49,7 +49,7 @@ pub(crate) fn decode_environment_reference(
 impl VerifiedLaunch {
     pub(crate) fn resolve(
         reference: EnvironmentReference,
-        request: &LaunchFirecrackerRequest,
+        request: &FirecrackerLaunch,
     ) -> Result<Self, Status> {
         let architecture =
             host_arch().map_err(|error| Status::failed_precondition(error.to_string()))?;
