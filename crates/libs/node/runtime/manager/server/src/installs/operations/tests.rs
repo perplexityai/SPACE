@@ -124,7 +124,7 @@ impl Fixture {
             staging: base.join("staging"),
             limits: LIMITS,
             host_arch: crate::installs::host_arch().unwrap(),
-            source,
+            source: crate::installs::test_support::kernel_sources(source),
             releases: super::super::release::ReleaseSources::new(vec![ReleaseContext {
                 root: base.join("node/firecracker"),
                 source: releases,

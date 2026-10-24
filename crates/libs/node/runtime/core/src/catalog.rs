@@ -216,6 +216,16 @@ const COMPILED_RELEASES: &[CompiledRelease] = &[
     CompiledRelease {
         runtime: RuntimeKind::CloudHypervisor,
         version: CLOUD_HYPERVISOR_INSTALL_VERSION,
+        architecture: "x86_64",
+        archive_sha256: "4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b",
+        binaries: &[(
+            "bin/cloud-hypervisor",
+            "4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b",
+        )],
+    },
+    CompiledRelease {
+        runtime: RuntimeKind::CloudHypervisor,
+        version: CLOUD_HYPERVISOR_INSTALL_VERSION,
         architecture: "aarch64",
         archive_sha256: "e8a6d9786ea678e739f1a386682846e93742dcb9c7b6e3e0c62e3bda6cff0ef3",
         binaries: &[(
@@ -232,6 +242,25 @@ struct CompiledKernel {
     size: u64,
     sha256: &'static str,
 }
+
+/// Reviewed upstream direct-boot images; download transport is independent
+/// of the node-manager content pins.
+const CLOUD_HYPERVISOR_KERNELS: &[CompiledKernel] = &[
+    CompiledKernel {
+        version: "7.2.8+",
+        runtime_line: "54.0",
+        architecture: "x86_64",
+        size: 48_205_848,
+        sha256: "edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a853",
+    },
+    CompiledKernel {
+        version: "7.2.8+",
+        runtime_line: "54.0",
+        architecture: "aarch64",
+        size: 24_177_152,
+        sha256: "8f8f3d5a983809f87a4e1e9a13053a3361fda47ef04e09c771a41c5e037cb6c2",
+    },
+];
 
 /// Reviewed Firecracker CI guest kernels. The bucket publishes no SHA-256;
 /// these pins identify inspected downloads. Source snapshots and verification
@@ -603,7 +632,15 @@ impl RuntimeCatalog {
             }
             catalog.releases.push(pinned);
         }
-        for compiled in FIRECRACKER_KERNELS {
+        for (runtime, compiled) in FIRECRACKER_KERNELS
+            .iter()
+            .map(|pin| (RuntimeKind::Firecracker, pin))
+            .chain(
+                CLOUD_HYPERVISOR_KERNELS
+                    .iter()
+                    .map(|pin| (RuntimeKind::CloudHypervisor, pin)),
+            )
+        {
             let entry = || format!("kernel {} {}", compiled.version, compiled.architecture);
             let field = |field, value| CatalogError::Compiled {
                 entry: entry(),
@@ -613,7 +650,7 @@ impl RuntimeCatalog {
             catalog.kernels.push(PinnedKernel {
                 version: ArtifactVersion::parse(compiled.version)
                     .map_err(|_| field("version", compiled.version))?,
-                runtime: RuntimeKind::Firecracker,
+                runtime,
                 runtime_line: RuntimeVersion::parse(compiled.runtime_line)
                     .map_err(|_| field("runtime_line", compiled.runtime_line))?,
                 architecture: compiled
