@@ -52,7 +52,11 @@ async fn unfenced_claim_kinds_are_rejected_without_touching_the_database() {
     // differently than the typed rejection asserted here.
     let pool = PgPool::connect_lazy("postgres://localhost:1/unreachable")
         .expect("lazy pool construction does not connect");
-    let store = PostgresPlacementStore::new(pool, "sandboxes".to_string());
+    let store = PostgresPlacementStore::new(
+        pool,
+        "sandboxes".to_string(),
+        pplx_space_common_core::types::PodMaterializationMode::Compatibility,
+    );
     for kind in [ClaimKind::OnDemandCreate, ClaimKind::PooledClaim] {
         let err = store
             .claim_placement(SandboxId::new(), kind)
