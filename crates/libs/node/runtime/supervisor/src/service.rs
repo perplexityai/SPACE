@@ -10,9 +10,9 @@ use pplx_space_node_runtime_core::cgroup::{self, CgroupLimits};
 use pplx_space_node_runtime_core::launch;
 use pplx_space_node_runtime_core::proto::runtime_supervisor_server::RuntimeSupervisor;
 use pplx_space_node_runtime_core::proto::{
-    LaunchFirecrackerRequest, LaunchFirecrackerResponse, LaunchSidecarRequest,
-    LaunchSidecarResponse, StopProcessRequest, StopProcessResponse, StopSandboxRuntimeRequest,
-    StopSandboxRuntimeResponse, UpdateCgroupRequest, UpdateCgroupResponse,
+    LaunchRuntimeResponse, LaunchSidecarRequest, LaunchSidecarResponse, StopProcessRequest,
+    StopProcessResponse, StopSandboxRuntimeRequest, StopSandboxRuntimeResponse,
+    UpdateCgroupRequest, UpdateCgroupResponse,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -437,17 +437,30 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
         .await
     }
 
-    async fn launch_firecracker(
+    async fn launch_runtime(
         &self,
-        request: Request<LaunchFirecrackerRequest>,
-    ) -> Result<Response<LaunchFirecrackerResponse>, Status> {
-        self.authorize_peer(&request, "LaunchFirecracker")?;
+        request: Request<pplx_space_node_runtime_core::proto::LaunchRuntimeRequest>,
+    ) -> Result<Response<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse>, Status> {
+        self.authorize_peer(&request, "LaunchRuntime")?;
         let caller = Some(execution::pin_caller(&request)?);
-        let request = request.into_inner();
+        let request = FirecrackerLaunch::try_from(request.into_inner()).map_err(|error| {
+            pplx_space_node_runtime_core::launch_admission::admission_refusal(
+                Status::failed_precondition(error.to_string()),
+            )
+        })?;
         let service = self.clone();
-        self.run_owned_operation(
-            async move { service.launch_firecracker_owned(request, caller).await },
-        )
+        self.run_owned_operation(async move {
+            let response = service
+                .launch_firecracker_owned(request, caller)
+                .await?
+                .into_inner();
+            Ok(Response::new(
+                pplx_space_node_runtime_core::proto::LaunchRuntimeResponse {
+                    pid: response.pid,
+                    accepted_environment_reference: response.accepted_environment_reference,
+                },
+            ))
+        })
         .await
     }
 
@@ -620,9 +633,9 @@ impl RuntimeSupervisorService {
 
     async fn launch_firecracker_owned(
         &self,
-        req: LaunchFirecrackerRequest,
+        req: FirecrackerLaunch,
         caller: Option<launch::ProcessHandle>,
-    ) -> Result<Response<LaunchFirecrackerResponse>, Status> {
+    ) -> Result<Response<LaunchRuntimeResponse>, Status> {
         self.launch_firecracker_with(req, caller, |id, root| async move {
             self.adopt_firecracker(id, &root).await
         })
@@ -631,10 +644,10 @@ impl RuntimeSupervisorService {
 
     async fn launch_firecracker_with<F>(
         &self,
-        mut req: LaunchFirecrackerRequest,
+        mut req: FirecrackerLaunch,
         caller: Option<launch::ProcessHandle>,
         adopt: impl FnOnce(SandboxId, String) -> F,
-    ) -> Result<Response<LaunchFirecrackerResponse>, Status>
+    ) -> Result<Response<LaunchRuntimeResponse>, Status>
     where
         F: std::future::Future<Output = Result<Option<u32>, Status>>,
     {
@@ -661,7 +674,7 @@ impl RuntimeSupervisorService {
                     .map_err(cgroup_update_error_to_status)?;
             }
             if let Some(pid) = adopt(sandbox_id, req.chroot_base_dir.clone()).await? {
-                return Ok(Response::new(LaunchFirecrackerResponse {
+                return Ok(Response::new(LaunchRuntimeResponse {
                     pid,
                     accepted_environment_reference: accepted_environment_reference.clone(),
                 }));
@@ -747,7 +760,7 @@ impl RuntimeSupervisorService {
                 "runtime supervisor launched firecracker"
             );
 
-            Ok(Response::new(LaunchFirecrackerResponse {
+            Ok(Response::new(LaunchRuntimeResponse {
                 pid,
                 accepted_environment_reference: accepted_environment_reference.clone(),
             }))
@@ -1162,3 +1175,5 @@ fn require_sidecar_identity(pid: u32, program: &str, uid: u32, gid: u32) -> Resu
         )),
     }
 }
+
+use pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch;

@@ -939,7 +939,7 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
                     request.verified_runtime.unwrap().environment_reference,
                     reference.to_string()
                 );
-                Ok(proto::LaunchFirecrackerResponse {
+                Ok(proto::LaunchRuntimeResponse {
                     pid: 0,
                     accepted_environment_reference: accepted.clone(),
                 })
@@ -956,7 +956,7 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
         let result = service
             .launch_admitted_runtime(
                 &lease.sandbox_id,
-                proto::LaunchFirecrackerRequest {
+                pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch {
                     execution_id: fence.execution_id,
                     verified_runtime: Some(proto::VerifiedRuntimeLaunch {
                         sandbox_id: lease.sandbox_id.clone(),

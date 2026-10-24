@@ -454,20 +454,20 @@ impl SnapshotFixture {
 // whose capture would otherwise bind into the jail.
 #[tokio::test]
 async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
-    use crate::proto::CreateSnapshotRequest;
     use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
+    use crate::snapshot_request::FirecrackerCapture;
     use tonic::Code;
 
     let fixture = SnapshotFixture::new().await;
     let id = fixture.lease.sandbox_id.clone();
-    let valid = CreateSnapshotRequest {
+    let valid = FirecrackerCapture {
         sandbox_id: id.clone(),
         snapshot_path: "/vmstate".into(),
         mem_file_path: "/memory".into(),
         execution_fence: Some(fixture.fence.clone()),
         ..Default::default()
     };
-    let unallocated = CreateSnapshotRequest {
+    let unallocated = FirecrackerCapture {
         sandbox_id: fixture.unallocated_id.clone(),
         execution_fence: Some(fixture.unallocated_fence.clone()),
         ..valid.clone()
@@ -475,7 +475,7 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
     let cases = [
         (
             "superseded execution",
-            CreateSnapshotRequest {
+            FirecrackerCapture {
                 execution_fence: Some(stale_test_fence()),
                 ..unallocated.clone()
             },
@@ -484,7 +484,7 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
         ),
         (
             "vmstate path names another artifact",
-            CreateSnapshotRequest {
+            FirecrackerCapture {
                 snapshot_path: "/memory".into(),
                 ..valid.clone()
             },
@@ -493,7 +493,7 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
         ),
         (
             "memory path names another artifact",
-            CreateSnapshotRequest {
+            FirecrackerCapture {
                 mem_file_path: "/vmstate".into(),
                 ..valid.clone()
             },
@@ -502,7 +502,7 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
         ),
         (
             "destination outside the sandbox roots",
-            CreateSnapshotRequest {
+            FirecrackerCapture {
                 dest_dir: Some(format!(
                     "{}/{}/snapshot",
                     super::CACHE_DIR,
@@ -521,7 +521,7 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
         ),
         (
             "encrypted volume of another sandbox",
-            CreateSnapshotRequest {
+            FirecrackerCapture {
                 snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
                 ..unallocated.clone()
             },
@@ -530,7 +530,7 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
         ),
         (
             "encrypted capture without a lease",
-            CreateSnapshotRequest {
+            FirecrackerCapture {
                 snapshot_volume_mount_dir: Some(snapshot_volume(&fixture.unallocated_id)),
                 ..unallocated.clone()
             },
@@ -540,7 +540,10 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
     ];
     let mut mismatches = Vec::new();
     for (case, request, code, message) in cases {
-        let outcome = fixture.service.create_snapshot(root_request(request)).await;
+        let outcome = fixture
+            .service
+            .capture_firecracker_state(root_request(request))
+            .await;
         mismatches.extend(refusal_mismatch(case, outcome, code, message));
         mismatches.extend(fixture.lease_disturbed(case));
     }
@@ -562,20 +565,21 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
 #[tokio::test]
 async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
     use crate::lifecycle_limiter::LifecycleMethod;
-    use crate::proto::{DriveRateLimit, LoadSnapshotRequest, TokenBucket};
+    use crate::proto::{DriveRateLimit, TokenBucket};
     use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
+    use crate::snapshot_request::FirecrackerRestore;
     use tonic::Code;
 
     let fixture = SnapshotFixture::new().await;
     let id = fixture.lease.sandbox_id.clone();
-    let valid = LoadSnapshotRequest {
+    let valid = FirecrackerRestore {
         sandbox_id: id.clone(),
         snapshot_path: "/vmstate".into(),
         mem_file_path: "/memory".into(),
         execution_fence: Some(fixture.fence.clone()),
         ..Default::default()
     };
-    let unallocated = LoadSnapshotRequest {
+    let unallocated = FirecrackerRestore {
         sandbox_id: fixture.unallocated_id.clone(),
         execution_fence: Some(fixture.unallocated_fence.clone()),
         ..valid.clone()
@@ -587,7 +591,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
     let cases = [
         (
             "superseded execution",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 execution_fence: Some(stale_test_fence()),
                 ..unallocated.clone()
             },
@@ -602,7 +606,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "encrypted volume of another sandbox",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 snapshot_volume_mount_dir: Some(snapshot_volume(&fixture.unallocated_id)),
                 ..valid.clone()
             },
@@ -611,7 +615,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "vmstate path names another artifact",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 snapshot_path: "/memory".into(),
                 ..valid.clone()
             },
@@ -620,7 +624,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "memory path names another artifact",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 mem_file_path: "/vmstate".into(),
                 ..valid.clone()
             },
@@ -629,7 +633,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "source other than the sandbox checkpoint",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 source_dir: Some(format!(
                     "{}/{}/snapshot",
                     super::CACHE_DIR,
@@ -642,7 +646,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "rate limit without bandwidth",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 rootfs_rate_limit: Some(DriveRateLimit {
                     bandwidth: None,
                     operations: bucket,
@@ -654,7 +658,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "rate limit without operations",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 rootfs_rate_limit: Some(DriveRateLimit {
                     bandwidth: bucket,
                     operations: None,
@@ -666,7 +670,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "checkpoint load with a rate limit without bandwidth",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 source_dir: Some(format!("{}/{id}/snapshot", super::CACHE_DIR)),
                 rootfs_rate_limit: Some(DriveRateLimit {
                     bandwidth: None,
@@ -679,7 +683,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "encrypted load with a rate limit without operations",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
                 rootfs_rate_limit: Some(DriveRateLimit {
                     bandwidth: bucket,
@@ -692,7 +696,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "valid encrypted load",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
                 ..valid.clone()
             },
@@ -701,7 +705,7 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         ),
         (
             "valid encrypted load with a rate limit",
-            LoadSnapshotRequest {
+            FirecrackerRestore {
                 snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
                 rootfs_rate_limit: Some(DriveRateLimit {
                     bandwidth: bucket,
@@ -715,7 +719,10 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
     ];
     let mut mismatches = Vec::new();
     for (case, request, code, message) in cases {
-        let outcome = fixture.service.load_snapshot(root_request(request)).await;
+        let outcome = fixture
+            .service
+            .restore_firecracker_state(root_request(request))
+            .await;
         mismatches.extend(refusal_mismatch(case, outcome, code, message));
         mismatches.extend(fixture.lease_disturbed(case));
         if fixture

@@ -24,8 +24,12 @@ fn archives_are_addressed_as_firecracker_publishes_them() {
         "https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.1/firecracker-v1.15.1-x86_64.tgz"
     );
     assert!(source.holds(&archive));
+    let ReleasePayload::TarGz { members } = source.payload(&release("1.15.1"), Arch::X86_64) else {
+        panic!("Firecracker uses tar.gz")
+    };
+    assert_eq!(members[1].binary, "bin/jailer");
     assert_eq!(
-        source.archive_member(&release("1.15.1"), Arch::X86_64, "jailer"),
+        members[1].member,
         "release-v1.15.1-x86_64/jailer-v1.15.1-x86_64"
     );
     assert!(!source.holds(&"https://example.test/firecracker.tgz".parse().unwrap()));
