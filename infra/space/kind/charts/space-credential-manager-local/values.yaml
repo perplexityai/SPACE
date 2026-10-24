@@ -11,6 +11,9 @@ clusterId: kind-local
 telemetry: {}
 node: {}
 
+splitTrust:
+  enabled: false
+
 # The agent drains for the shared 25 s lifecycle default, then releases its
 # service mutex (crates/libs/credential/mgr/server/src/run.rs,
 # crates/libs/service-lifecycle/src/lib.rs).

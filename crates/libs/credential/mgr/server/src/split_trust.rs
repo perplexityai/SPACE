@@ -2,6 +2,9 @@
 
 pub(crate) mod authority;
 mod kms;
+mod node;
+
+pub(crate) use node::NodeAnchors;
 
 pub(crate) fn enabled() -> bool {
     matches!(
