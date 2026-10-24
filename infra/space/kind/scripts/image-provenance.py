@@ -59,10 +59,13 @@ those records: the image ID the kubelet reports it running (the config
 digest), and the revision label of that image in its node's containerd store
 (`crictl inspecti`, as the superseded-image prune reads labels). Pods being
 deleted, and Failed pods (evicted or rejected, which their ReplicaSet keeps
-but does not count), run nothing and are listed instead. It writes the
-comparison to the given JSON file and exits 1, naming each stale workload and
-the remedy, when any container runs something other than the latest build of
-its image.
+but does not count), run nothing and are listed instead. A container still
+being created in a replica its autoscaler just added is listed as starting,
+not refused, when a started sibling from the same pod template already runs
+the latest build (`starting_replicas`); the next check sees it started. It
+writes the comparison to the given JSON file and exits 1, naming each stale
+workload and the remedy, when any container runs something other than the
+latest build of its image.
 
 Usage:
   image-provenance.py snapshot
@@ -364,6 +367,40 @@ class Labels:
         return self.cache[key]
 
 
+# Waiting reasons of a container the kubelet is still setting up, as opposed
+# to one that cannot start (ErrImagePull, CreateContainerConfigError, ...).
+STARTING_REASONS = frozenset({"ContainerCreating", "PodInitializing"})
+
+
+def pod_template(pod: dict) -> str | None:
+    """The revision of its controller's pod template the pod was created from."""
+    labels = pod["metadata"].get("labels", {})
+    return labels.get("pod-template-hash") or labels.get("controller-revision-hash")
+
+
+def starting_replicas(containers: list[dict]) -> list[dict]:
+    """Not-started containers that are a fresh replica of a proven template.
+
+    A HorizontalPodAutoscaler scales SPACE Deployments while a bench runs, so a
+    check can land in the seconds between a scale-up and the new pod's start.
+    Such a container is waived when its kubelet is only setting it up and a
+    started pod of the same workload, template revision and image reference
+    already runs the latest build. Anything else that has not started (no
+    sibling to vouch for it, an image pull or config error) is still refused.
+    """
+    proven = {
+        (c["workload"], c["template"], c["container"], c["image_ref"])
+        for c in containers
+        if c["verdict"] == "latest" and c["template"]
+    }
+    return [
+        c for c in containers
+        if c["verdict"] == "not started"
+        and (c["waiting_reason"] in STARTING_REASONS or c["waiting_reason"] is None)
+        and (c["workload"], c["template"], c["container"], c["image_ref"]) in proven
+    ]
+
+
 def revision_text(revision: str | None) -> str:
     if revision is None:
         return "unknown revision"
@@ -425,6 +462,7 @@ def check(args: argparse.Namespace) -> int:
                 "pod": meta["name"],
                 "container": container["name"],
                 "workload": workload_of(pod),
+                "template": pod_template(pod),
                 "node": spec.get("nodeName"),
                 "image": image,
                 "image_ref": container["image"],
@@ -443,7 +481,10 @@ def check(args: argparse.Namespace) -> int:
                 "waiting_reason": waiting.get("reason") if not running else None,
                 "waiting_message": waiting.get("message") if not running else None,
             })
-    stale = [c for c in containers if c["verdict"] != "latest"]
+    starting = starting_replicas(containers)
+    for c in starting:
+        c["verdict"] = "starting"
+    stale = [c for c in containers if c["verdict"] not in ("latest", "starting")]
     commit = checkout_commit() or "unknown"
     report = {
         "cluster": args.cluster,
@@ -464,6 +505,9 @@ def check(args: argparse.Namespace) -> int:
         counts[key] = counts.get(key, 0) + 1
     for (image, revision), count in sorted(counts.items()):
         log(f"{image}: {count} container(s) at {revision}")
+    for c in starting:
+        log(f"starting {c['pod']} ({c['workload']}, container {c['container']}): "
+            "a new replica of a template whose started pods run the latest build")
     for pod in failed:
         log(f"skipped Failed pod {pod['pod']} ({pod['workload']}, {pod['reason'] or 'no reason'})")
     if not containers:
