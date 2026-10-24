@@ -361,12 +361,22 @@ async fn expired_worker_shutdown_does_not_block_another_resident() {
         tokio::time::timeout(Duration::from_millis(100), pool.contains(&resident))
             .await
             .is_ok();
+    let mut draining = Box::pin(pool.drain());
+    let drained_early = futures_util::poll!(&mut draining).is_ready();
+    drop(draining);
     release_expired_stop.notify_one();
     lookup
         .await
         .expect("resident lookup task completes")
         .expect("resident lookup succeeds");
 
+    tokio::time::timeout(Duration::from_secs(5), pool.drain())
+        .await
+        .expect("drain observes retired worker completion");
+    assert!(
+        !drained_early,
+        "drain must include workers removed from the resident map"
+    );
     assert!(
         pool_accessible,
         "shutting down an expired identity worker held the global pool lock"

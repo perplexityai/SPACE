@@ -345,6 +345,45 @@ async fn reset_routes_release_admission_on_removal_or_expiry() {
     stop_worker(proxy, server).await;
 }
 
+#[tokio::test]
+async fn worker_watches_report_recoverable_closure() {
+    for mode in 0..3 {
+        let directory = tempfile::tempdir().unwrap();
+        let router = identity_router();
+        let (_channel, proxy, server) = connected_worker(&router).await;
+        let mut stream = router
+            .watch(Request::new(WatchRequest {
+                path: directory.path().display().to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        if mode != 1 {
+            router.lifecycle.close();
+        }
+        if mode != 0 {
+            router.shutdown.cancel();
+        }
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("watch retires without drain");
+        // SSE and WebSocket consumers reconnect on Unavailable; successful
+        // EOF instead closes their sessions permanently.
+        let status = terminal
+            .expect("closure must remain recoverable")
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(!pplx_space_common_grpc::is_refused_before_start(&status));
+        assert!(stream.next().await.is_none());
+        tokio::time::timeout(Duration::from_secs(5), router.drain())
+            .await
+            .unwrap();
+        assert!(router.tasks.is_empty());
+        stop_worker(proxy, server).await;
+    }
+}
+
 #[test]
 fn dropping_watch_stream_outside_runtime_does_not_panic() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -366,13 +405,11 @@ fn dropping_watch_stream_outside_runtime_does_not_panic() {
             .await
             .expect("worker routed");
         (
-            FailureAwareStream {
-                inner: Box::pin(tokio_stream::empty::<Result<(), Status>>()),
-                router: router.clone(),
+            router.forward_stream(
+                tokio_stream::pending::<Result<(), Status>>(),
                 worker,
-                runtime_handle: tokio::runtime::Handle::current(),
-                failure_recorded: false,
-            },
+                router.lifecycle.closed(),
+            ),
             router.worker_pool().expect("worker backend").clone(),
             user,
         )
@@ -384,10 +421,13 @@ fn dropping_watch_stream_outside_runtime_does_not_panic() {
     );
     drop(stream);
     runtime.block_on(async {
-        assert!(
-            pool.is_idle_test(&user).await,
-            "dropping a watch stream releases worker accounting"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.is_idle_test(&user).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping a watch stream releases worker accounting");
     });
 }
 
@@ -1036,4 +1076,196 @@ async fn ledger_identity_capacity_preserves_loss_and_heals_through_reenable_disa
         MAX_LEDGER_IDENTITIES - 1
     );
     stop_worker(proxy, server).await;
+}
+
+#[tokio::test]
+async fn drain_settles_stream_failure_before_the_caller_polls_it() {
+    let router = identity_router();
+    let pool = router.worker_pool().unwrap();
+    let user = current_user();
+    pool.insert_test_client(
+        user.clone(),
+        Endpoint::from_static("http://[::]:50051").connect_lazy(),
+    )
+    .await
+    .unwrap();
+    let worker = pool.client_for(user.clone()).await.unwrap();
+    pool.set_ledger_enabled(&worker, true).await;
+    router
+        .ledger_evidence
+        .lock()
+        .await
+        .insert(user.clone(), LedgerEvidence::Tracking);
+    let mut stream = router.forward_stream(
+        futures_util::stream::iter([Err::<(), _>(Status::unavailable("worker connection lost"))]),
+        worker,
+        router.shutdown.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), router.drain())
+        .await
+        .expect("stream failure cleanup must not depend on the consumer polling");
+    assert!(router.ledger_evidence.lock().await.get(&user) == Some(&LedgerEvidence::Lost));
+    assert!(router.tasks.is_empty());
+    assert_eq!(
+        stream.next().await.unwrap().unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
+    assert!(stream.next().await.is_none());
+    assert!(
+        router.tasks.is_empty(),
+        "reading a buffered error after drain cannot dispatch cleanup"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_worker_streams_report_failure_after_partial_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("file");
+    std::fs::write(&file, vec![b'x'; 1024 * 1024]).unwrap();
+    for index in 0..64 {
+        std::fs::write(directory.path().join(format!("entry-{index}")), b"x").unwrap();
+    }
+    for read in [false, true] {
+        let router = identity_router();
+        let (_channel, proxy, server) = connected_worker(&router).await;
+        // Exercise the worker RPC relay even on hosts supporting descriptor reads.
+        let mut stream: RoutedStream<()> = if read {
+            Box::pin(
+                router
+                    .stream(
+                        None,
+                        ReadRequest {
+                            path: file.display().to_string(),
+                            ..Default::default()
+                        },
+                        router.shutdown.clone(),
+                        FilesystemClient::read,
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .map(|item| item.map(|_| ())),
+            )
+        } else {
+            Box::pin(
+                router
+                    .list_info(Request::new(ListRequest {
+                        path: directory.path().display().to_string(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .map(|item| item.map(|_| ())),
+            )
+        };
+        stream.next().await.unwrap().unwrap();
+        router.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), router.drain())
+            .await
+            .expect("shutdown settles with the reader stalled");
+        loop {
+            match stream
+                .next()
+                .await
+                .expect("partial worker result must not end successfully")
+            {
+                Ok(()) => {}
+                Err(status) => {
+                    assert_eq!(status.code(), tonic::Code::Unavailable);
+                    assert!(!pplx_space_common_grpc::is_refused_before_start(&status));
+                    break;
+                }
+            }
+        }
+        assert!(stream.next().await.is_none());
+        assert!(router.tasks.is_empty());
+        stop_worker(proxy, server).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_relay_reports_failure_with_empty_or_full_output_queue() {
+    for full in [false, true] {
+        let router = identity_router();
+        let pool = router.worker_pool().unwrap();
+        pool.insert_test_client(
+            current_user(),
+            Endpoint::from_static("http://[::]:50051").connect_lazy(),
+        )
+        .await
+        .unwrap();
+        let worker = pool.client_for(current_user()).await.unwrap();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        // Polling the second message means one is queued and the next send
+        // will be backpressured. The empty case waits on the worker instead.
+        let incoming =
+            futures_util::stream::iter([Ok(())]).chain(futures_util::stream::once(async move {
+                ready.send(()).unwrap();
+                if full {
+                    Ok(())
+                } else {
+                    std::future::pending().await
+                }
+            }));
+        let mut stream = router.forward_stream(incoming, worker, router.shutdown.clone());
+        if full {
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            stream.next().await.unwrap().unwrap();
+        }
+        router.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), router.drain())
+            .await
+            .unwrap();
+        loop {
+            match stream
+                .next()
+                .await
+                .expect("cancellation must not become EOF")
+            {
+                Ok(()) => {}
+                Err(status) => {
+                    assert_eq!(status.code(), tonic::Code::Unavailable);
+                    break;
+                }
+            }
+        }
+        assert!(stream.next().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn worker_relay_panic_reports_failure_after_buffered_output() {
+    let router = identity_router();
+    let pool = router.worker_pool().unwrap();
+    pool.insert_test_client(
+        current_user(),
+        Endpoint::from_static("http://[::]:50051").connect_lazy(),
+    )
+    .await
+    .unwrap();
+    let worker = pool.client_for(current_user()).await.unwrap();
+    let incoming = futures_util::stream::iter([Ok(())]).chain(futures_util::stream::once(async {
+        panic!("injected relay producer failure");
+    }));
+    let mut stream = router.forward_stream(incoming, worker, router.shutdown.clone());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream.next().await.unwrap().unwrap();
+        let status = stream
+            .next()
+            .await
+            .expect("panic must not become EOF")
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(!pplx_space_common_grpc::is_refused_before_start(&status));
+        assert!(stream.next().await.is_none());
+        router.drain().await;
+    })
+    .await
+    .unwrap();
+    assert!(router.tasks.is_empty());
 }

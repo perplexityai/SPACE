@@ -89,9 +89,11 @@ pub struct ExecutionService {
 
 pub(super) struct ExecutionServiceInner {
     pub(super) shutdown: CancellationToken,
+    pub(super) lifecycle: crate::lifecycle::Lifecycle,
+    drain_gate: Mutex<()>,
     pub(super) process_tasks: tokio_util::task::TaskTracker,
-    // Orders process-start admission with shutdown, without holding the gate
-    // across a spawn that could stall unrelated starts.
+    // Serializes process identity reservations without holding the gate across
+    // a spawn that could stall unrelated starts. Lifecycle guards own admission.
     pub(super) start_gate: std::sync::Mutex<()>,
     pub(super) process_payload_slots: Arc<Semaphore>,
     pub(super) default_operation_user: GuestUserName,
@@ -155,6 +157,8 @@ impl ExecutionService {
             .validate(config.filesystem_execution)?;
         Ok(Self {
             inner: Arc::new(ExecutionServiceInner {
+                lifecycle: filesystem.lifecycle.clone(),
+                drain_gate: Mutex::new(()),
                 shutdown,
                 process_tasks: tokio_util::task::TaskTracker::new(),
                 start_gate: std::sync::Mutex::new(()),
@@ -175,39 +179,57 @@ impl ExecutionService {
         })
     }
 
-    pub(super) fn require_running(&self) -> Result<(), Status> {
-        require_running(&self.inner.shutdown)
-    }
-
-    /// Close operation admission and signal cancellation of owned work.
-    ///
-    /// Calls through every service clone and previously obtained filesystem handle
-    /// are refused once admission is closed. Repeated calls are harmless. Work
-    /// admitted earlier is signalled to cancel immediately. Service or caller-token
-    /// cancellation can terminate identity workers immediately, leaving outcomes
-    /// unknown. [`ExecutionServiceConfig::cancellation_grace`] applies to request
-    /// cancellation, not service shutdown. Direct execution still waits for its
-    /// outstanding I/O. This is abortive shutdown, not graceful admission-only
-    /// closure. It neither waits
-    /// for cleanup nor cancels the caller's token, and cannot roll back effects.
+    /// Close admission through every existing handle without cancelling admitted
+    /// work. This is idempotent; admitted operations other than worker watches
+    /// can finish, including uploads and filesystem mutations.
+    /// Worker watches retire with recoverable `Unavailable` at close; Direct
+    /// watches retire during drain or cancellation. Send required process input,
+    /// close stdin and send signals before closing admission: control calls are
+    /// refused afterward. Use [`Self::cancel`] to request abortive shutdown.
     pub fn close(&self) {
-        let _start_gate = self
-            .inner
-            .start_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.inner.shutdown.cancel();
-        self.inner.process_tasks.close();
+        self.inner.lifecycle.close();
     }
 
-    /// Drain guest-owned work during the daemon's cancellation and listener
-    /// shutdown. The daemon owns the overall shutdown deadline.
-    pub async fn drain(&self) {
+    /// Close admission and request cancellation of owned work. This does not wait,
+    /// cancel the caller's token or roll back effects. Identity workers can be
+    /// terminated immediately; the request cancellation grace does not apply.
+    /// Cleanup can outlast this call.
+    pub fn cancel(&self) {
+        self.inner.lifecycle.cancel();
+    }
+
+    /// Close admission and wait up to ten seconds for owned work and cleanup.
+    /// See [`Self::drain_with_timeout`] for deadline and runtime requirements.
+    pub async fn drain(&self) -> Result<(), crate::IncompleteExecutionDrain> {
+        self.drain_with_timeout(Duration::from_secs(10)).await
+    }
+
+    /// Close admission and wait for admitted operations, process supervisors,
+    /// filesystem I/O and worker cleanup. The deadline includes concurrent drain
+    /// waiters. On expiry, request cancellation and report incomplete cleanup;
+    /// keep the runtime alive and call again to observe completion. Dropping this
+    /// future leaves admission closed and retains ownership of outstanding work.
+    /// Success does not imply persistence or termination of detached descendants;
+    /// the caller still owns teardown of the surrounding isolation boundary.
+    pub async fn drain_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), crate::IncompleteExecutionDrain> {
         self.close();
-        tokio::join!(
-            self.inner.filesystem.drain(),
-            self.inner.process_tasks.wait()
-        );
+        let settle = async {
+            let _drain = self.inner.drain_gate.lock().await;
+            self.inner.lifecycle.wait().await;
+            self.inner.process_tasks.close();
+            tokio::join!(
+                self.inner.filesystem.drain(),
+                self.inner.process_tasks.wait()
+            );
+        };
+        if tokio::time::timeout(timeout, settle).await.is_err() {
+            self.cancel();
+            return Err(crate::IncompleteExecutionDrain);
+        }
+        Ok(())
     }
 
     /// Replace the environment defaults used by future process starts.
@@ -220,7 +242,7 @@ impl ExecutionService {
     /// codes and `is_refused_before_start` classification, including in the daemon
     /// adapter; callers do not need a second shutdown-error representation.
     pub async fn configure_process_env(&self, env: EnvMap) -> Result<(), Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         *self.inner.process_env.write().await = env;
         Ok(())
     }

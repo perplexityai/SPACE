@@ -119,6 +119,7 @@ pub(super) async fn plan_watch_registration(
     recursive: bool,
     filter: &WatchFilter,
     scan_slots: &Arc<Semaphore>,
+    tasks: &tokio_util::task::TaskTracker,
 ) -> Result<WatchRegistrationPlan, Status> {
     if !recursive {
         return Ok(WatchRegistrationPlan {
@@ -129,23 +130,24 @@ pub(super) async fn plan_watch_registration(
     let scan_slot = try_acquire_watch_directory_scan_slot(scan_slots)?;
     let root = root.to_path_buf();
     let filter = filter.clone();
-    tokio::task::spawn_blocking(move || {
-        let _scan_slot = scan_slot;
-        let mut directories = collect_watch_directories(&root, &root, &filter)?;
-        // Required-root traversal always puts the root first.
-        debug_assert_eq!(directories.first(), Some(&root));
-        directories.remove(0);
-        Ok(WatchRegistrationPlan {
-            root,
-            descendants: directories,
+    tasks
+        .spawn_blocking(move || {
+            let _scan_slot = scan_slot;
+            let mut directories = collect_watch_directories(&root, &root, &filter)?;
+            // Required-root traversal always puts the root first.
+            debug_assert_eq!(directories.first(), Some(&root));
+            directories.remove(0);
+            Ok(WatchRegistrationPlan {
+                root,
+                descendants: directories,
+            })
         })
-    })
-    .await
-    .map_err(|error| {
-        Status::internal(format!(
-            "file watcher registration planning panicked: {error}"
-        ))
-    })?
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "file watcher registration planning panicked: {error}"
+            ))
+        })?
 }
 
 pub(super) fn collect_watch_directories(
