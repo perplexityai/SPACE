@@ -2598,8 +2598,13 @@ type ConnectProcessRequest struct {
 	// its reader position, so output written meanwhile cannot evict it, and
 	// reports it in `ProcessConnected.output_cursor`. Older guests ignore it.
 	ResumeFromOldestRetained bool `protobuf:"varint,4,opt,name=resume_from_oldest_retained,json=resumeFromOldestRetained,proto3" json:"resume_from_oldest_retained,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	// Emit ProcessOutputGap and continue when unread output is evicted, including
+	// after the connection starts. Unlike resume_from_oldest_retained, this also
+	// reports the initial gap instead of silently moving the starting cursor.
+	// Takes precedence when both options are set.
+	ResumeAfterOutputGap *bool `protobuf:"varint,5,opt,name=resume_after_output_gap,json=resumeAfterOutputGap,proto3,oneof" json:"resume_after_output_gap,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ConnectProcessRequest) Reset() {
@@ -2656,6 +2661,13 @@ func (x *ConnectProcessRequest) GetOutputCursor() uint64 {
 func (x *ConnectProcessRequest) GetResumeFromOldestRetained() bool {
 	if x != nil {
 		return x.ResumeFromOldestRetained
+	}
+	return false
+}
+
+func (x *ConnectProcessRequest) GetResumeAfterOutputGap() bool {
+	if x != nil && x.ResumeAfterOutputGap != nil {
+		return *x.ResumeAfterOutputGap
 	}
 	return false
 }
@@ -3271,6 +3283,7 @@ type ProcessEvent struct {
 	//	*ProcessEvent_Stdout
 	//	*ProcessEvent_Stderr
 	//	*ProcessEvent_Exit
+	//	*ProcessEvent_OutputGap
 	Event         isProcessEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3372,6 +3385,15 @@ func (x *ProcessEvent) GetExit() *ProcessExit {
 	return nil
 }
 
+func (x *ProcessEvent) GetOutputGap() *ProcessOutputGap {
+	if x != nil {
+		if x, ok := x.Event.(*ProcessEvent_OutputGap); ok {
+			return x.OutputGap
+		}
+	}
+	return nil
+}
+
 type isProcessEvent_Event interface {
 	isProcessEvent_Event()
 }
@@ -3396,6 +3418,11 @@ type ProcessEvent_Exit struct {
 	Exit *ProcessExit `protobuf:"bytes,7,opt,name=exit,proto3,oneof"`
 }
 
+type ProcessEvent_OutputGap struct {
+	// Sent only to a ConnectProcess caller that set resume_after_output_gap.
+	OutputGap *ProcessOutputGap `protobuf:"bytes,8,opt,name=output_gap,json=outputGap,proto3,oneof"`
+}
+
 func (*ProcessEvent_Started) isProcessEvent_Event() {}
 
 func (*ProcessEvent_Connected) isProcessEvent_Event() {}
@@ -3405,6 +3432,8 @@ func (*ProcessEvent_Stdout) isProcessEvent_Event() {}
 func (*ProcessEvent_Stderr) isProcessEvent_Event() {}
 
 func (*ProcessEvent_Exit) isProcessEvent_Event() {}
+
+func (*ProcessEvent_OutputGap) isProcessEvent_Event() {}
 
 type ProcessStarted struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -3452,13 +3481,19 @@ func (x *ProcessStarted) GetStartTime() *timestamppb.Timestamp {
 
 type ProcessConnected struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The journal cursor of the first output this stream sends, when the
-	// request set `output_cursor`: that cursor, or a later one when
+	// The initial journal cursor when the request set `output_cursor`: that
+	// cursor, or a later one when
 	// `resume_from_oldest_retained` moved the start past evicted output.
+	// An opted-in ProcessOutputGap may subsequently advance this cursor.
 	// Unset by older guests.
-	OutputCursor  *uint64 `protobuf:"varint,1,opt,name=output_cursor,json=outputCursor,proto3,oneof" json:"output_cursor,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	OutputCursor *uint64 `protobuf:"varint,1,opt,name=output_cursor,json=outputCursor,proto3,oneof" json:"output_cursor,omitempty"`
+	// Set when the request asked for resume_after_output_gap and this guest
+	// honors it. A guest that predates the field ignores the request and keeps
+	// failing a lagged reader; spaced-host then refuses the opted-in stream with
+	// a guest-capability-unsupported status.
+	ResumeAfterOutputGap bool `protobuf:"varint,2,opt,name=resume_after_output_gap,json=resumeAfterOutputGap,proto3" json:"resume_after_output_gap,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ProcessConnected) Reset() {
@@ -3496,6 +3531,13 @@ func (x *ProcessConnected) GetOutputCursor() uint64 {
 		return *x.OutputCursor
 	}
 	return 0
+}
+
+func (x *ProcessConnected) GetResumeAfterOutputGap() bool {
+	if x != nil {
+		return x.ResumeAfterOutputGap
+	}
+	return false
 }
 
 type ProcessOutput struct {
@@ -3542,6 +3584,71 @@ func (x *ProcessOutput) GetData() []byte {
 	return nil
 }
 
+type ProcessOutputGap struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Output events evicted before this stream delivered them.
+	SkippedEvents uint64 `protobuf:"varint,1,opt,name=skipped_events,json=skippedEvents,proto3" json:"skipped_events,omitempty"`
+	// The output_cursor of the next output event this stream delivers.
+	OutputCursor uint64 `protobuf:"varint,2,opt,name=output_cursor,json=outputCursor,proto3" json:"output_cursor,omitempty"`
+	// Total stdout and stderr data bytes the process emitted before
+	// output_cursor. A caller that counted the bytes it received from cursor 0
+	// subtracts that count to learn how many bytes it missed.
+	OutputBytesBefore uint64 `protobuf:"varint,3,opt,name=output_bytes_before,json=outputBytesBefore,proto3" json:"output_bytes_before,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *ProcessOutputGap) Reset() {
+	*x = ProcessOutputGap{}
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[55]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProcessOutputGap) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProcessOutputGap) ProtoMessage() {}
+
+func (x *ProcessOutputGap) ProtoReflect() protoreflect.Message {
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[55]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProcessOutputGap.ProtoReflect.Descriptor instead.
+func (*ProcessOutputGap) Descriptor() ([]byte, []int) {
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{55}
+}
+
+func (x *ProcessOutputGap) GetSkippedEvents() uint64 {
+	if x != nil {
+		return x.SkippedEvents
+	}
+	return 0
+}
+
+func (x *ProcessOutputGap) GetOutputCursor() uint64 {
+	if x != nil {
+		return x.OutputCursor
+	}
+	return 0
+}
+
+func (x *ProcessOutputGap) GetOutputBytesBefore() uint64 {
+	if x != nil {
+		return x.OutputBytesBefore
+	}
+	return 0
+}
+
 type ProcessExit struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Outcome:
@@ -3557,7 +3664,7 @@ type ProcessExit struct {
 
 func (x *ProcessExit) Reset() {
 	*x = ProcessExit{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[55]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3569,7 +3676,7 @@ func (x *ProcessExit) String() string {
 func (*ProcessExit) ProtoMessage() {}
 
 func (x *ProcessExit) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[55]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3582,7 +3689,7 @@ func (x *ProcessExit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessExit.ProtoReflect.Descriptor instead.
 func (*ProcessExit) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{55}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *ProcessExit) GetOutcome() isProcessExit_Outcome {
@@ -3665,7 +3772,7 @@ type ProcessExited struct {
 
 func (x *ProcessExited) Reset() {
 	*x = ProcessExited{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[56]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3677,7 +3784,7 @@ func (x *ProcessExited) String() string {
 func (*ProcessExited) ProtoMessage() {}
 
 func (x *ProcessExited) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[56]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3690,7 +3797,7 @@ func (x *ProcessExited) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessExited.ProtoReflect.Descriptor instead.
 func (*ProcessExited) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{56}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *ProcessExited) GetExitCode() int32 {
@@ -3709,7 +3816,7 @@ type ProcessSignaled struct {
 
 func (x *ProcessSignaled) Reset() {
 	*x = ProcessSignaled{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[57]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3721,7 +3828,7 @@ func (x *ProcessSignaled) String() string {
 func (*ProcessSignaled) ProtoMessage() {}
 
 func (x *ProcessSignaled) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[57]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3734,7 +3841,7 @@ func (x *ProcessSignaled) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessSignaled.ProtoReflect.Descriptor instead.
 func (*ProcessSignaled) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{57}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *ProcessSignaled) GetSignal() int32 {
@@ -3753,7 +3860,7 @@ type ProcessTimedOut struct {
 
 func (x *ProcessTimedOut) Reset() {
 	*x = ProcessTimedOut{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[58]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3765,7 +3872,7 @@ func (x *ProcessTimedOut) String() string {
 func (*ProcessTimedOut) ProtoMessage() {}
 
 func (x *ProcessTimedOut) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[58]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3778,7 +3885,7 @@ func (x *ProcessTimedOut) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessTimedOut.ProtoReflect.Descriptor instead.
 func (*ProcessTimedOut) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{58}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *ProcessTimedOut) GetSignal() int32 {
@@ -3796,7 +3903,7 @@ type ProcessUnknown struct {
 
 func (x *ProcessUnknown) Reset() {
 	*x = ProcessUnknown{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[59]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3808,7 +3915,7 @@ func (x *ProcessUnknown) String() string {
 func (*ProcessUnknown) ProtoMessage() {}
 
 func (x *ProcessUnknown) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[59]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3821,7 +3928,7 @@ func (x *ProcessUnknown) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessUnknown.ProtoReflect.Descriptor instead.
 func (*ProcessUnknown) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{59}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{60}
 }
 
 type OpenLoopbackBridgeRequest struct {
@@ -3834,7 +3941,7 @@ type OpenLoopbackBridgeRequest struct {
 
 func (x *OpenLoopbackBridgeRequest) Reset() {
 	*x = OpenLoopbackBridgeRequest{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[60]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3846,7 +3953,7 @@ func (x *OpenLoopbackBridgeRequest) String() string {
 func (*OpenLoopbackBridgeRequest) ProtoMessage() {}
 
 func (x *OpenLoopbackBridgeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[60]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3859,7 +3966,7 @@ func (x *OpenLoopbackBridgeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OpenLoopbackBridgeRequest.ProtoReflect.Descriptor instead.
 func (*OpenLoopbackBridgeRequest) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{60}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *OpenLoopbackBridgeRequest) GetPort() uint32 {
@@ -3887,7 +3994,7 @@ type OpenLoopbackBridgeResponse struct {
 
 func (x *OpenLoopbackBridgeResponse) Reset() {
 	*x = OpenLoopbackBridgeResponse{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[61]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3899,7 +4006,7 @@ func (x *OpenLoopbackBridgeResponse) String() string {
 func (*OpenLoopbackBridgeResponse) ProtoMessage() {}
 
 func (x *OpenLoopbackBridgeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[61]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3912,7 +4019,7 @@ func (x *OpenLoopbackBridgeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OpenLoopbackBridgeResponse.ProtoReflect.Descriptor instead.
 func (*OpenLoopbackBridgeResponse) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{61}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *OpenLoopbackBridgeResponse) GetStatus() LoopbackBridgeStatus {
@@ -3945,7 +4052,7 @@ type CloseLoopbackBridgeRequest struct {
 
 func (x *CloseLoopbackBridgeRequest) Reset() {
 	*x = CloseLoopbackBridgeRequest{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[62]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3957,7 +4064,7 @@ func (x *CloseLoopbackBridgeRequest) String() string {
 func (*CloseLoopbackBridgeRequest) ProtoMessage() {}
 
 func (x *CloseLoopbackBridgeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[62]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3970,7 +4077,7 @@ func (x *CloseLoopbackBridgeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseLoopbackBridgeRequest.ProtoReflect.Descriptor instead.
 func (*CloseLoopbackBridgeRequest) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{62}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *CloseLoopbackBridgeRequest) GetPort() uint32 {
@@ -3988,7 +4095,7 @@ type CloseLoopbackBridgeResponse struct {
 
 func (x *CloseLoopbackBridgeResponse) Reset() {
 	*x = CloseLoopbackBridgeResponse{}
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[63]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4000,7 +4107,7 @@ func (x *CloseLoopbackBridgeResponse) String() string {
 func (*CloseLoopbackBridgeResponse) ProtoMessage() {}
 
 func (x *CloseLoopbackBridgeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_spaced_operations_v1_operations_proto_msgTypes[63]
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4013,7 +4120,7 @@ func (x *CloseLoopbackBridgeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseLoopbackBridgeResponse.ProtoReflect.Descriptor instead.
 func (*CloseLoopbackBridgeResponse) Descriptor() ([]byte, []int) {
-	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{63}
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{64}
 }
 
 var File_spaced_operations_v1_operations_proto protoreflect.FileDescriptor
@@ -4228,16 +4335,18 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x04rows\x18\x01 \x01(\rR\x04rows\x12\x12\n" +
 	"\x04cols\x18\x02 \x01(\rR\x04cols\"D\n" +
 	"\tPtyConfig\x127\n" +
-	"\x04size\x18\x01 \x01(\v2#.space.spaced.operations.v1.PtySizeR\x04size\"\xf7\x01\n" +
+	"\x04size\x18\x01 \x01(\v2#.space.spaced.operations.v1.PtySizeR\x04size\"\xcf\x02\n" +
 	"\x15ConnectProcessRequest\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\x128\n" +
 	"\atimeout\x18\x02 \x01(\v2\x19.google.protobuf.DurationH\x00R\atimeout\x88\x01\x01\x12(\n" +
 	"\routput_cursor\x18\x03 \x01(\x04H\x01R\foutputCursor\x88\x01\x01\x12=\n" +
-	"\x1bresume_from_oldest_retained\x18\x04 \x01(\bR\x18resumeFromOldestRetainedB\n" +
+	"\x1bresume_from_oldest_retained\x18\x04 \x01(\bR\x18resumeFromOldestRetained\x12:\n" +
+	"\x17resume_after_output_gap\x18\x05 \x01(\bH\x02R\x14resumeAfterOutputGap\x88\x01\x01B\n" +
 	"\n" +
 	"\b_timeoutB\x10\n" +
-	"\x0e_output_cursor\"p\n" +
+	"\x0e_output_cursorB\x1a\n" +
+	"\x18_resume_after_output_gap\"p\n" +
 	"\x14ListProcessesRequest\x12%\n" +
 	"\x0einclude_exited\x18\x01 \x01(\bR\rincludeExited\x12\"\n" +
 	"\n" +
@@ -4287,7 +4396,7 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\vKillRequest\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\"\x0e\n" +
-	"\fKillResponse\"\xb4\x03\n" +
+	"\fKillResponse\"\x83\x04\n" +
 	"\fProcessEvent\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\x12\x15\n" +
@@ -4296,18 +4405,25 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\tconnected\x18\x04 \x01(\v2,.space.spaced.operations.v1.ProcessConnectedH\x00R\tconnected\x12C\n" +
 	"\x06stdout\x18\x05 \x01(\v2).space.spaced.operations.v1.ProcessOutputH\x00R\x06stdout\x12C\n" +
 	"\x06stderr\x18\x06 \x01(\v2).space.spaced.operations.v1.ProcessOutputH\x00R\x06stderr\x12=\n" +
-	"\x04exit\x18\a \x01(\v2'.space.spaced.operations.v1.ProcessExitH\x00R\x04exitB\a\n" +
+	"\x04exit\x18\a \x01(\v2'.space.spaced.operations.v1.ProcessExitH\x00R\x04exit\x12M\n" +
+	"\n" +
+	"output_gap\x18\b \x01(\v2,.space.spaced.operations.v1.ProcessOutputGapH\x00R\toutputGapB\a\n" +
 	"\x05eventB\x06\n" +
 	"\x04_pid\"_\n" +
 	"\x0eProcessStarted\x12>\n" +
 	"\n" +
 	"start_time\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampH\x00R\tstartTime\x88\x01\x01B\r\n" +
-	"\v_start_time\"N\n" +
+	"\v_start_time\"\x85\x01\n" +
 	"\x10ProcessConnected\x12(\n" +
-	"\routput_cursor\x18\x01 \x01(\x04H\x00R\foutputCursor\x88\x01\x01B\x10\n" +
+	"\routput_cursor\x18\x01 \x01(\x04H\x00R\foutputCursor\x88\x01\x01\x125\n" +
+	"\x17resume_after_output_gap\x18\x02 \x01(\bR\x14resumeAfterOutputGapB\x10\n" +
 	"\x0e_output_cursor\"#\n" +
 	"\rProcessOutput\x12\x12\n" +
-	"\x04data\x18\x01 \x01(\fR\x04data\"\xbc\x02\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"\x8e\x01\n" +
+	"\x10ProcessOutputGap\x12%\n" +
+	"\x0eskipped_events\x18\x01 \x01(\x04R\rskippedEvents\x12#\n" +
+	"\routput_cursor\x18\x02 \x01(\x04R\foutputCursor\x12.\n" +
+	"\x13output_bytes_before\x18\x03 \x01(\x04R\x11outputBytesBefore\"\xbc\x02\n" +
 	"\vProcessExit\x12C\n" +
 	"\x06exited\x18\x01 \x01(\v2).space.spaced.operations.v1.ProcessExitedH\x00R\x06exited\x12I\n" +
 	"\bsignaled\x18\x02 \x01(\v2+.space.spaced.operations.v1.ProcessSignaledH\x00R\bsignaled\x12J\n" +
@@ -4375,7 +4491,7 @@ func file_spaced_operations_v1_operations_proto_rawDescGZIP() []byte {
 }
 
 var file_spaced_operations_v1_operations_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_spaced_operations_v1_operations_proto_msgTypes = make([]protoimpl.MessageInfo, 66)
+var file_spaced_operations_v1_operations_proto_msgTypes = make([]protoimpl.MessageInfo, 67)
 var file_spaced_operations_v1_operations_proto_goTypes = []any{
 	(FileType)(0),                       // 0: space.spaced.operations.v1.FileType
 	(FileEventKind)(0),                  // 1: space.spaced.operations.v1.FileEventKind
@@ -4437,63 +4553,65 @@ var file_spaced_operations_v1_operations_proto_goTypes = []any{
 	(*ProcessStarted)(nil),              // 57: space.spaced.operations.v1.ProcessStarted
 	(*ProcessConnected)(nil),            // 58: space.spaced.operations.v1.ProcessConnected
 	(*ProcessOutput)(nil),               // 59: space.spaced.operations.v1.ProcessOutput
-	(*ProcessExit)(nil),                 // 60: space.spaced.operations.v1.ProcessExit
-	(*ProcessExited)(nil),               // 61: space.spaced.operations.v1.ProcessExited
-	(*ProcessSignaled)(nil),             // 62: space.spaced.operations.v1.ProcessSignaled
-	(*ProcessTimedOut)(nil),             // 63: space.spaced.operations.v1.ProcessTimedOut
-	(*ProcessUnknown)(nil),              // 64: space.spaced.operations.v1.ProcessUnknown
-	(*OpenLoopbackBridgeRequest)(nil),   // 65: space.spaced.operations.v1.OpenLoopbackBridgeRequest
-	(*OpenLoopbackBridgeResponse)(nil),  // 66: space.spaced.operations.v1.OpenLoopbackBridgeResponse
-	(*CloseLoopbackBridgeRequest)(nil),  // 67: space.spaced.operations.v1.CloseLoopbackBridgeRequest
-	(*CloseLoopbackBridgeResponse)(nil), // 68: space.spaced.operations.v1.CloseLoopbackBridgeResponse
-	nil,                                 // 69: space.spaced.operations.v1.StartRequest.EnvEntry
-	nil,                                 // 70: space.spaced.operations.v1.ProcessInfo.EnvEntry
-	(*timestamppb.Timestamp)(nil),       // 71: google.protobuf.Timestamp
-	(*durationpb.Duration)(nil),         // 72: google.protobuf.Duration
+	(*ProcessOutputGap)(nil),            // 60: space.spaced.operations.v1.ProcessOutputGap
+	(*ProcessExit)(nil),                 // 61: space.spaced.operations.v1.ProcessExit
+	(*ProcessExited)(nil),               // 62: space.spaced.operations.v1.ProcessExited
+	(*ProcessSignaled)(nil),             // 63: space.spaced.operations.v1.ProcessSignaled
+	(*ProcessTimedOut)(nil),             // 64: space.spaced.operations.v1.ProcessTimedOut
+	(*ProcessUnknown)(nil),              // 65: space.spaced.operations.v1.ProcessUnknown
+	(*OpenLoopbackBridgeRequest)(nil),   // 66: space.spaced.operations.v1.OpenLoopbackBridgeRequest
+	(*OpenLoopbackBridgeResponse)(nil),  // 67: space.spaced.operations.v1.OpenLoopbackBridgeResponse
+	(*CloseLoopbackBridgeRequest)(nil),  // 68: space.spaced.operations.v1.CloseLoopbackBridgeRequest
+	(*CloseLoopbackBridgeResponse)(nil), // 69: space.spaced.operations.v1.CloseLoopbackBridgeResponse
+	nil,                                 // 70: space.spaced.operations.v1.StartRequest.EnvEntry
+	nil,                                 // 71: space.spaced.operations.v1.ProcessInfo.EnvEntry
+	(*timestamppb.Timestamp)(nil),       // 72: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),         // 73: google.protobuf.Duration
 }
 var file_spaced_operations_v1_operations_proto_depIdxs = []int32{
 	7,  // 0: space.spaced.operations.v1.StatResponse.info:type_name -> space.spaced.operations.v1.FileInfo
 	0,  // 1: space.spaced.operations.v1.FileInfo.file_type:type_name -> space.spaced.operations.v1.FileType
-	71, // 2: space.spaced.operations.v1.FileInfo.modified_at:type_name -> google.protobuf.Timestamp
+	72, // 2: space.spaced.operations.v1.FileInfo.modified_at:type_name -> google.protobuf.Timestamp
 	12, // 3: space.spaced.operations.v1.WriteRequest.open:type_name -> space.spaced.operations.v1.WriteOpen
 	14, // 4: space.spaced.operations.v1.WriteBatchRequest.entries:type_name -> space.spaced.operations.v1.WriteBatchEntry
 	1,  // 5: space.spaced.operations.v1.FileEvent.kind:type_name -> space.spaced.operations.v1.FileEventKind
-	71, // 6: space.spaced.operations.v1.FileEvent.observed_at:type_name -> google.protobuf.Timestamp
+	72, // 6: space.spaced.operations.v1.FileEvent.observed_at:type_name -> google.protobuf.Timestamp
 	26, // 7: space.spaced.operations.v1.GetWatcherEventsResponse.events:type_name -> space.spaced.operations.v1.FileEvent
-	71, // 8: space.spaced.operations.v1.EnableFileChangesResponse.observed_since:type_name -> google.protobuf.Timestamp
-	72, // 9: space.spaced.operations.v1.GetModifiedFilesRequest.window:type_name -> google.protobuf.Duration
-	71, // 10: space.spaced.operations.v1.GetModifiedFilesRequest.since:type_name -> google.protobuf.Timestamp
-	71, // 11: space.spaced.operations.v1.ModifiedFile.last_modified_at:type_name -> google.protobuf.Timestamp
+	72, // 8: space.spaced.operations.v1.EnableFileChangesResponse.observed_since:type_name -> google.protobuf.Timestamp
+	73, // 9: space.spaced.operations.v1.GetModifiedFilesRequest.window:type_name -> google.protobuf.Duration
+	72, // 10: space.spaced.operations.v1.GetModifiedFilesRequest.since:type_name -> google.protobuf.Timestamp
+	72, // 11: space.spaced.operations.v1.ModifiedFile.last_modified_at:type_name -> google.protobuf.Timestamp
 	1,  // 12: space.spaced.operations.v1.ModifiedFile.kinds:type_name -> space.spaced.operations.v1.FileEventKind
 	38, // 13: space.spaced.operations.v1.GetModifiedFilesResponse.files:type_name -> space.spaced.operations.v1.ModifiedFile
-	71, // 14: space.spaced.operations.v1.GetModifiedFilesResponse.observed_since:type_name -> google.protobuf.Timestamp
-	71, // 15: space.spaced.operations.v1.GetModifiedFilesResponse.retained_since:type_name -> google.protobuf.Timestamp
-	69, // 16: space.spaced.operations.v1.StartRequest.env:type_name -> space.spaced.operations.v1.StartRequest.EnvEntry
-	72, // 17: space.spaced.operations.v1.StartRequest.timeout:type_name -> google.protobuf.Duration
+	72, // 14: space.spaced.operations.v1.GetModifiedFilesResponse.observed_since:type_name -> google.protobuf.Timestamp
+	72, // 15: space.spaced.operations.v1.GetModifiedFilesResponse.retained_since:type_name -> google.protobuf.Timestamp
+	70, // 16: space.spaced.operations.v1.StartRequest.env:type_name -> space.spaced.operations.v1.StartRequest.EnvEntry
+	73, // 17: space.spaced.operations.v1.StartRequest.timeout:type_name -> google.protobuf.Duration
 	42, // 18: space.spaced.operations.v1.StartRequest.pty:type_name -> space.spaced.operations.v1.PtyConfig
 	41, // 19: space.spaced.operations.v1.PtyConfig.size:type_name -> space.spaced.operations.v1.PtySize
-	72, // 20: space.spaced.operations.v1.ConnectProcessRequest.timeout:type_name -> google.protobuf.Duration
-	70, // 21: space.spaced.operations.v1.ProcessInfo.env:type_name -> space.spaced.operations.v1.ProcessInfo.EnvEntry
-	60, // 22: space.spaced.operations.v1.ProcessInfo.exit:type_name -> space.spaced.operations.v1.ProcessExit
-	71, // 23: space.spaced.operations.v1.ProcessInfo.ended_at:type_name -> google.protobuf.Timestamp
+	73, // 20: space.spaced.operations.v1.ConnectProcessRequest.timeout:type_name -> google.protobuf.Duration
+	71, // 21: space.spaced.operations.v1.ProcessInfo.env:type_name -> space.spaced.operations.v1.ProcessInfo.EnvEntry
+	61, // 22: space.spaced.operations.v1.ProcessInfo.exit:type_name -> space.spaced.operations.v1.ProcessExit
+	72, // 23: space.spaced.operations.v1.ProcessInfo.ended_at:type_name -> google.protobuf.Timestamp
 	41, // 24: space.spaced.operations.v1.ResizePtyRequest.size:type_name -> space.spaced.operations.v1.PtySize
 	57, // 25: space.spaced.operations.v1.ProcessEvent.started:type_name -> space.spaced.operations.v1.ProcessStarted
 	58, // 26: space.spaced.operations.v1.ProcessEvent.connected:type_name -> space.spaced.operations.v1.ProcessConnected
 	59, // 27: space.spaced.operations.v1.ProcessEvent.stdout:type_name -> space.spaced.operations.v1.ProcessOutput
 	59, // 28: space.spaced.operations.v1.ProcessEvent.stderr:type_name -> space.spaced.operations.v1.ProcessOutput
-	60, // 29: space.spaced.operations.v1.ProcessEvent.exit:type_name -> space.spaced.operations.v1.ProcessExit
-	71, // 30: space.spaced.operations.v1.ProcessStarted.start_time:type_name -> google.protobuf.Timestamp
-	61, // 31: space.spaced.operations.v1.ProcessExit.exited:type_name -> space.spaced.operations.v1.ProcessExited
-	62, // 32: space.spaced.operations.v1.ProcessExit.signaled:type_name -> space.spaced.operations.v1.ProcessSignaled
-	63, // 33: space.spaced.operations.v1.ProcessExit.timed_out:type_name -> space.spaced.operations.v1.ProcessTimedOut
-	64, // 34: space.spaced.operations.v1.ProcessExit.unknown:type_name -> space.spaced.operations.v1.ProcessUnknown
-	72, // 35: space.spaced.operations.v1.OpenLoopbackBridgeRequest.wait_timeout:type_name -> google.protobuf.Duration
-	2,  // 36: space.spaced.operations.v1.OpenLoopbackBridgeResponse.status:type_name -> space.spaced.operations.v1.LoopbackBridgeStatus
-	37, // [37:37] is the sub-list for method output_type
-	37, // [37:37] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	61, // 29: space.spaced.operations.v1.ProcessEvent.exit:type_name -> space.spaced.operations.v1.ProcessExit
+	60, // 30: space.spaced.operations.v1.ProcessEvent.output_gap:type_name -> space.spaced.operations.v1.ProcessOutputGap
+	72, // 31: space.spaced.operations.v1.ProcessStarted.start_time:type_name -> google.protobuf.Timestamp
+	62, // 32: space.spaced.operations.v1.ProcessExit.exited:type_name -> space.spaced.operations.v1.ProcessExited
+	63, // 33: space.spaced.operations.v1.ProcessExit.signaled:type_name -> space.spaced.operations.v1.ProcessSignaled
+	64, // 34: space.spaced.operations.v1.ProcessExit.timed_out:type_name -> space.spaced.operations.v1.ProcessTimedOut
+	65, // 35: space.spaced.operations.v1.ProcessExit.unknown:type_name -> space.spaced.operations.v1.ProcessUnknown
+	73, // 36: space.spaced.operations.v1.OpenLoopbackBridgeRequest.wait_timeout:type_name -> google.protobuf.Duration
+	2,  // 37: space.spaced.operations.v1.OpenLoopbackBridgeResponse.status:type_name -> space.spaced.operations.v1.LoopbackBridgeStatus
+	38, // [38:38] is the sub-list for method output_type
+	38, // [38:38] is the sub-list for method input_type
+	38, // [38:38] is the sub-list for extension type_name
+	38, // [38:38] is the sub-list for extension extendee
+	0,  // [0:38] is the sub-list for field type_name
 }
 
 func init() { file_spaced_operations_v1_operations_proto_init() }
@@ -4534,24 +4652,25 @@ func file_spaced_operations_v1_operations_proto_init() {
 		(*ProcessEvent_Stdout)(nil),
 		(*ProcessEvent_Stderr)(nil),
 		(*ProcessEvent_Exit)(nil),
+		(*ProcessEvent_OutputGap)(nil),
 	}
 	file_spaced_operations_v1_operations_proto_msgTypes[52].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[53].OneofWrappers = []any{}
-	file_spaced_operations_v1_operations_proto_msgTypes[55].OneofWrappers = []any{
+	file_spaced_operations_v1_operations_proto_msgTypes[56].OneofWrappers = []any{
 		(*ProcessExit_Exited)(nil),
 		(*ProcessExit_Signaled)(nil),
 		(*ProcessExit_TimedOut)(nil),
 		(*ProcessExit_Unknown)(nil),
 	}
-	file_spaced_operations_v1_operations_proto_msgTypes[57].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[58].OneofWrappers = []any{}
+	file_spaced_operations_v1_operations_proto_msgTypes[59].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_spaced_operations_v1_operations_proto_rawDesc), len(file_spaced_operations_v1_operations_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   66,
+			NumMessages:   67,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

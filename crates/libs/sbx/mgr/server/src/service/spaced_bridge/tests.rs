@@ -306,6 +306,7 @@ fn process_event_to_spaced_keeps_the_connected_output_cursor() {
         pid: Some(123),
         event: Some(host_proto::process_event::Event::Connected(
             host_proto::ProcessConnected {
+                resume_after_output_gap: false,
                 output_cursor: Some(9),
             },
         )),
@@ -317,6 +318,7 @@ fn process_event_to_spaced_keeps_the_connected_output_cursor() {
         spaced.event,
         Some(crate::proto::spaced_process_event::Event::Connected(
             SpacedProcessConnected {
+                resume_after_output_gap: false,
                 output_cursor: Some(9)
             }
         ))

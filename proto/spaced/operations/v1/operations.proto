@@ -251,6 +251,7 @@ message ConnectProcessRequest {
   // Emit ProcessOutputGap and continue when unread output is evicted, including
   // after the connection starts. Unlike resume_from_oldest_retained, this also
   // reports the initial gap instead of silently moving the starting cursor.
+  // Takes precedence when both options are set.
   optional bool resume_after_output_gap = 5;
 }
 message ListProcessesRequest {
@@ -312,9 +313,10 @@ message ProcessEvent {
 }
 message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
 message ProcessConnected {
-  // The journal cursor of the first output this stream sends, when the
-  // request set `output_cursor`: that cursor, or a later one when
+  // The initial journal cursor when the request set `output_cursor`: that
+  // cursor, or a later one when
   // `resume_from_oldest_retained` moved the start past evicted output.
+  // An opted-in ProcessOutputGap may subsequently advance this cursor.
   // Unset by older guests.
   optional uint64 output_cursor = 1;
   // Set when the request asked for resume_after_output_gap and this guest

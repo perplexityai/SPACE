@@ -45,10 +45,17 @@ async fn connect_replays_the_journal_from_the_cursor_only() {
         .unwrap();
 
     // Everything already delivered: nothing to replay.
-    let at_tail = collect(table.connect("sbx", &process_id, Some(1), false).await.unwrap()).await;
+    let at_tail = collect(
+        table
+            .connect("sbx", &process_id, Some(1), false)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(
         at_tail[0],
         sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {
+            resume_after_output_gap: false,
             output_cursor: Some(1)
         }),
         "reports where it starts"
@@ -82,6 +89,7 @@ async fn connect_replays_the_journal_from_the_cursor_only() {
         resumed[0],
         sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {
             resume_after_output_gap: true,
+            output_cursor: Some(0),
         })
     );
     assert_eq!(stdout_count(&resumed), 1);

@@ -1202,6 +1202,12 @@ impl ProcessEventJournal {
         {
             return false;
         }
+        let cleared: u64 = state
+            .output
+            .iter()
+            .map(|event| output_data_bytes(&event.event))
+            .sum();
+        state.dropped_output_bytes += cleared;
         state.output.clear();
         state.retained_bytes = 0;
         state.guaranteed_bytes = 0;
@@ -1269,7 +1275,9 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned");
         let next_sequence = match requested {
-            Some(cursor) if from_oldest_retained => cursor.max(state.first_sequence),
+            Some(cursor) if from_oldest_retained && gap_resume.is_none() => {
+                cursor.max(state.first_sequence)
+            }
             Some(cursor) => cursor,
             None => state.next_sequence,
         };
@@ -1350,7 +1358,11 @@ impl ProcessEventJournal {
                     .state
                     .lock()
                     .expect("process output journal lock poisoned");
-                let cleared: u64 = state.output.iter().map(|event| event.data_bytes).sum();
+                let cleared: u64 = state
+                    .output
+                    .iter()
+                    .map(|event| output_data_bytes(&event.event))
+                    .sum();
                 state.dropped_output_bytes += cleared + data_bytes;
                 state.output.clear();
                 state.retained_bytes = 0;
@@ -1422,7 +1434,6 @@ impl ProcessEventJournal {
                 sequence,
                 event,
                 output_bytes,
-                data_bytes,
                 guaranteed_bytes,
                 _shared_output_slot: shared_output_slot,
             });
@@ -1441,7 +1452,11 @@ impl ProcessEventJournal {
             state.exit = Some(exit.clone());
             state.completed_at = Some(tokio::time::Instant::now());
             state.ended_at = Some(SystemTime::now());
-            let retained: u64 = state.output.iter().map(|event| event.data_bytes).sum();
+            let retained: u64 = state
+                .output
+                .iter()
+                .map(|event| output_data_bytes(&event.event))
+                .sum();
             (state.next_sequence, state.dropped_output_bytes + retained)
         };
         self.changed.send_replace(ProcessJournalChange::Exit {
@@ -1509,7 +1524,6 @@ struct SequencedProcessEvent {
     sequence: u64,
     event: ProcessEvent,
     output_bytes: usize,
-    data_bytes: u64,
     guaranteed_bytes: usize,
     _shared_output_slot: Option<OwnedSemaphorePermit>,
 }
@@ -1521,6 +1535,14 @@ fn can_evict_process_output(state: &ProcessJournalState) -> bool {
         .is_none_or(|position| position.load(Ordering::Acquire) > state.first_sequence)
 }
 
+fn output_data_bytes(event: &ProcessEvent) -> u64 {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+    match event.event.as_ref() {
+        Some(Event::Stdout(output) | Event::Stderr(output)) => output.data.len() as u64,
+        _ => unreachable!("process journal only retains output events"),
+    }
+}
+
 fn evict_oldest_process_output(state: &mut ProcessJournalState) {
     let removed = state
         .output
@@ -1528,7 +1550,7 @@ fn evict_oldest_process_output(state: &mut ProcessJournalState) {
         .expect("retained byte count requires a process output event");
     state.retained_bytes -= removed.output_bytes;
     state.guaranteed_bytes -= removed.guaranteed_bytes;
-    state.dropped_output_bytes += removed.data_bytes;
+    state.dropped_output_bytes += output_data_bytes(&removed.event);
     state.first_sequence = removed.sequence + 1;
 }
 
@@ -1547,7 +1569,10 @@ enum ProcessJournalRead {
     Event(ProcessEvent),
     Exit(ProcessEvent),
     Pending,
-    Lagged { first_sequence: u64, output_bytes_before: u64 },
+    Lagged {
+        first_sequence: u64,
+        output_bytes_before: u64,
+    },
     Ahead,
 }
 
@@ -2654,7 +2679,12 @@ impl Process for ExecutionService {
             ProcessReplay::Running { cursor, .. } => {
                 let output_cursor = request.output_cursor.map(|_| cursor.next_sequence);
                 process_event_stream_with_prefix(
-                    vec![process_connected_event(&process_id, pid, output_cursor, resume_after_output_gap)],
+                    vec![process_connected_event(
+                        &process_id,
+                        pid,
+                        output_cursor,
+                        resume_after_output_gap,
+                    )],
                     Some(cursor),
                 )
             }
