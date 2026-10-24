@@ -101,7 +101,7 @@ async fn old_reservation_cannot_complete_a_reused_key() {
         state.records.insert(
             key.clone(),
             StoredIdempotencyRecord::Expired {
-                expired_at: Instant::now() - DEFAULT_RETENTION - Duration::from_secs(1),
+                expired_at: Instant::now() - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1),
                 in_progress_generation: None,
             },
         );
@@ -176,7 +176,7 @@ async fn capacity_pressure_reclaims_an_expired_operation_after_its_reservation_i
         else {
             panic!("reservation disappeared");
         };
-        *created_at = now - DEFAULT_RETENTION - Duration::from_secs(1);
+        *created_at = now - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1);
         state.prune(now);
         assert!(matches!(
             state.records.get(&abandoned_key),
@@ -296,7 +296,7 @@ async fn expired_reservations_cannot_begin_an_effect() {
             else {
                 panic!("reservation disappeared");
             };
-            *created_at = Instant::now() - DEFAULT_RETENTION - Duration::from_secs(1);
+            *created_at = Instant::now() - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1);
             if prune {
                 state.prune(Instant::now());
             }
@@ -329,7 +329,7 @@ async fn capacity_pressure_cannot_reuse_an_expired_operation_that_is_still_runni
         else {
             panic!("reservation disappeared");
         };
-        *created_at = now - DEFAULT_RETENTION - Duration::from_secs(1);
+        *created_at = now - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1);
         state.prune(now);
         for index in 0..(MAX_IDEMPOTENCY_RECORDS - 1) {
             state.insert(
@@ -454,7 +454,7 @@ async fn idempotency_store_honors_its_configured_window() {
         state.last_pruned_at = None;
     };
 
-    backdate(DEFAULT_RETENTION + Duration::from_secs(1));
+    backdate(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
     match store.reserve_or_get(key.clone()).await.unwrap() {
         IdempotencyLookup::Completed(Ok(IdempotencyRecord::ProcessStarted {
             process_id: replayed,

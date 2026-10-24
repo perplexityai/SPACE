@@ -2218,6 +2218,7 @@ async fn completed_process_replay_follows_configured_retention() {
     };
 
     let retention = Duration::from_secs(600);
+    let output_retention = Duration::from_secs(120);
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
         .expect("current user lookup")
         .expect("process tests require a passwd entry for the current uid");
@@ -2229,8 +2230,8 @@ async fn completed_process_replay_follows_configured_retention() {
             identity_policy: IdentityPolicy::Guest,
             process_retention: ProcessRetention {
                 completed: retention,
-                output: retention,
-                idempotency: DEFAULT_RETENTION,
+                output: output_retention,
+                idempotency: IDEMPOTENCY_RECORD_TTL,
             },
             ..ExecutionServiceConfig::default()
         },
@@ -2263,7 +2264,7 @@ async fn completed_process_replay_follows_configured_retention() {
         }
     };
 
-    backdate(DEFAULT_RETENTION + Duration::from_secs(1));
+    backdate(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
     registry.remove_expired();
     let mut replay = Process::connect_process(
         &service,
@@ -2293,6 +2294,39 @@ async fn completed_process_replay_follows_configured_retention() {
     assert_eq!(stdout, b"done");
     assert_eq!(exit_code, Some(3));
 
+    // Output expires independently; a cursorless reconnect still sees the exit.
+    backdate(output_retention);
+    registry.remove_expired();
+    let mut replay = Process::connect_process(
+        &service,
+        Request::new(ConnectProcessRequest {
+            process_id: process_id.as_str().to_string(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("exit outlives output")
+    .into_inner();
+    let mut exited = false;
+    while let Some(event) = replay.next().await {
+        match event.expect("retained exit").event {
+            Some(Event::Stdout(_) | Event::Stderr(_)) => panic!("expired output was retained"),
+            Some(Event::Exit(exit)) => {
+                assert!(
+                    matches!(exit.outcome, Some(process_exit::Outcome::Exited(exited)) if exited.exit_code == 3)
+                );
+                exited = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(exited);
+    let record = registry
+        .get_record(&process_id)
+        .expect("exit still retained");
+    assert!(record.journal.state.lock().unwrap().output.is_empty());
+    drop(record);
+
     backdate(retention);
     registry.remove_expired();
     assert_eq!(registry.records.len(), 0);
@@ -2310,5 +2344,5 @@ async fn completed_process_replay_follows_configured_retention() {
         Err(error) => error,
     };
     assert_eq!(error.code(), tonic::Code::NotFound);
+    shut_down(&service).await;
 }
-

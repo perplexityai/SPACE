@@ -47,7 +47,7 @@ pub struct ExecutionServiceConfig {
 }
 
 /// How long this service lifetime keeps what a retrying or reconnecting caller
-/// needs. A restart loses both.
+/// needs. A restart loses the retained records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessRetention {
     /// How long a completed process's exit stays replayable. When every record
@@ -67,7 +67,7 @@ impl Default for ProcessRetention {
         Self {
             completed: process::COMPLETED_PROCESS_RETENTION,
             output: process::COMPLETED_PROCESS_OUTPUT_RETENTION,
-            idempotency: DEFAULT_RETENTION,
+            idempotency: IDEMPOTENCY_RECORD_TTL,
         }
     }
 }
