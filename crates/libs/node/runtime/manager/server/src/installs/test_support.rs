@@ -1,5 +1,7 @@
 //! In-memory kernel and release sources, and their fixtures, for tests.
 
+use super::release_source::{ReleaseArchiveMember, ReleasePayload};
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -321,14 +323,19 @@ impl ReleaseSource for FakeReleaseSource {
             .join(&format!("firecracker-v{version}-{architecture}.tgz"))
     }
 
-    fn archive_member(
-        &self,
-        release: &RuntimeIdentity,
-        architecture: Arch,
-        binary: &str,
-    ) -> String {
+    fn payload(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleasePayload {
         let version = release.version.as_str();
-        format!("release-v{version}-{architecture}/{binary}-v{version}-{architecture}")
+        ReleasePayload::TarGz {
+            members: ["firecracker", "jailer"]
+                .into_iter()
+                .map(|binary| ReleaseArchiveMember {
+                    binary: format!("bin/{binary}"),
+                    member: format!(
+                        "release-v{version}-{architecture}/{binary}-v{version}-{architecture}"
+                    ),
+                })
+                .collect(),
+        }
     }
 
     async fn open(&self, archive: &ReleaseUrl) -> Result<ReleaseChunks, ReleaseSourceError> {
