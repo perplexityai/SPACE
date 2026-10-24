@@ -2,6 +2,7 @@
 //! from immutable checkpoint provenance; retained cold starts use the saved consumer.
 use super::{SandboxManagerService, tail_support::connect_node};
 use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
+use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION as DEFINITION_SCHEMA;
 use pplx_space_node_mgr_client::{
     NodeManagerGrpcClient,
     environment_selection::{SelectedEnvironment, SelectionResponseError, decode},
@@ -52,6 +53,7 @@ pub(super) async fn select_with_client(
     };
     let response = node
         .resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+            definition_schema_version: DEFINITION_SCHEMA,
             reference: None,
             compatible: Some(request.clone()),
         })
@@ -82,6 +84,7 @@ pub(super) async fn resolve_exact(
 ) -> Result<SelectedEnvironment, Status> {
     let response = node
         .resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+            definition_schema_version: DEFINITION_SCHEMA,
             compatible: None,
             reference: Some(reference.to_string()),
         })

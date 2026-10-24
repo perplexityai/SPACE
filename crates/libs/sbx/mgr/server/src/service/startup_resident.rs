@@ -3,7 +3,7 @@ use super::recovery::{STARTUP_RECOVERY_CONCURRENCY, StartupRecoveryError};
 use super::spaced_bridge::SpacedEndpointProofPolicy;
 use super::*;
 use crate::db::{SandboxRow, StartupRecoveryOutcome, StartupRecoveryRecord};
-use crate::runtime_reconciliation::{FirecrackerVmStateObservation, observe_firecracker_vm_state};
+use crate::runtime_reconciliation::{VmStateObservation, observe_vm_state};
 use futures_util::{StreamExt, stream};
 use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 
@@ -37,12 +37,8 @@ impl SandboxManagerService {
                         row,
                         Path::new(RUN_DIR),
                         |id| async move {
-                            observe_firecracker_vm_state(
-                                &id,
-                                "startup resident recovery",
-                                &self.node_manager,
-                            )
-                            .await
+                            observe_vm_state(&id, "startup resident recovery", &self.node_manager)
+                                .await
                         },
                         |target| self.prepare_startup_resident(&prepare_row, target),
                     )
@@ -94,7 +90,7 @@ impl SandboxManagerService {
                     row,
                     Path::new(RUN_DIR),
                     |id| async move {
-                        observe_firecracker_vm_state(
+                        observe_vm_state(
                             &id,
                             "periodic resident recovery",
                             &self.node_manager,
@@ -122,7 +118,7 @@ impl SandboxManagerService {
     ) -> Result<StartupRecoveryRecord, StartupRecoveryError>
     where
         Probe: FnMut(SandboxId) -> ProbeFuture,
-        ProbeFuture: std::future::Future<Output = FirecrackerVmStateObservation>,
+        ProbeFuture: std::future::Future<Output = VmStateObservation>,
         Prepare: FnOnce(SandboxState) -> PrepareFuture,
         PrepareFuture: std::future::Future<Output = Result<(), Status>>,
     {
@@ -171,28 +167,28 @@ impl SandboxManagerService {
             }
             Ok(id) if row.has_runtime_fields() => {
                 use crate::runtime_reconciliation::observe_stable_resident_state;
-                use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+                use pplx_space_node_runtime_core::vm_state::VmState;
                 match observe_stable_resident_state(id, probe).await {
                     // A stable pause needs no replay. Failure to reach the node
                     // is not proof of lost memory while its PID witness exists.
-                    Ok(FirecrackerVmState::Paused) if row.state == SandboxState::Paused => {
+                    Ok(VmState::Paused) if row.state == SandboxState::Paused => {
                         return Ok(StartupRecoveryRecord {
                             id: row.id,
                             previous_state: row.state,
                             outcome: StartupRecoveryOutcome::Deferred,
                         });
                     }
-                    Ok(FirecrackerVmState::Running) if row.state == SandboxState::Paused => {
+                    Ok(VmState::Running) if row.state == SandboxState::Paused => {
                         detail = "paused lifecycle contradicts the running resident VM".into();
                     }
-                    Ok(FirecrackerVmState::Running) => target = SandboxState::Started,
-                    Ok(FirecrackerVmState::Paused) if row.state != SandboxState::Checkpointing => {
+                    Ok(VmState::Running) => target = SandboxState::Started,
+                    Ok(VmState::Paused) if row.state != SandboxState::Checkpointing => {
                         target = SandboxState::Paused
                     }
-                    Ok(FirecrackerVmState::Paused) => {
+                    Ok(VmState::Paused) => {
                         detail = "startup checkpoint pause has no durable lifecycle origin".into();
                     }
-                    Ok(FirecrackerVmState::NotStarted) => {
+                    Ok(VmState::NotStarted) => {
                         detail = "Firecracker reported NotStarted; resident memory is unavailable"
                             .into();
                     }
