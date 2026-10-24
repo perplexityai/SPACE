@@ -1500,14 +1500,23 @@ async fn run_agent(
     // already made.
     let node_ca = Arc::new(NodeCa::new(upstream.clone()).map_err(RunCredmgrError::NodeCaKeypair)?);
 
+    let node_service = NodeCredentialManager::new(
+        upstream,
+        node_ca,
+        peer_process_check_mode,
+        shutdown_token.clone(),
+    );
+    #[cfg(feature = "split-trust-prototype")]
+    let node_service = if crate::split_trust::enabled() {
+        node_service.with_sandbox_anchors()
+    } else {
+        node_service
+    };
+    #[cfg(feature = "split-trust-prototype")]
+    let _anchor_sweeper = node_service.start_anchor_sweeper(shutdown_token.clone());
     serve_node_local_uds(
         listener,
-        NodeCredentialManager::new(
-            upstream,
-            node_ca,
-            peer_process_check_mode,
-            shutdown_token.clone(),
-        ),
+        node_service,
         config.socket_path,
         node_local,
         shutdown_token,

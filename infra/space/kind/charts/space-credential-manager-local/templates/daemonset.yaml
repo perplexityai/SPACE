@@ -63,6 +63,8 @@ spec:
             - --volume-socket=/space/run/volume-credentials/credmgr.sock
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
+            - name: SPACE_SPLIT_TRUST_PROTOTYPE
+              value: {{ .Values.splitTrust.enabled | quote }}
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.credmgrAuthority" . | nindent 12 }}
             # A node credential-manager started without --role=agent would be
