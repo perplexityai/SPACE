@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/libs/credential/anchor",
     "crates/apps/api/svc",
     "crates/apps/builder/cli",
     "crates/apps/internal/api/svc",
