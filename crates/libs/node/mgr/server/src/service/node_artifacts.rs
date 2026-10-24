@@ -64,8 +64,15 @@ impl NodeManagerService {
             "ResolveExecutionEnvironment",
             super::ALLOW_NODE_STATUS,
         )?;
-        self.require_verified_environment_layout().await?;
         let request = request.into_inner();
+        if request.definition_schema_version
+            < pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION
+        {
+            return Err(Status::failed_precondition(
+                "generic environment schema 2 is required",
+            ));
+        }
+        self.require_verified_environment_layout().await?;
         if let Some(compatible) = request.compatible {
             if request.reference.is_some() {
                 return Err(Status::invalid_argument(

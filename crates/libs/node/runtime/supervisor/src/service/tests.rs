@@ -777,7 +777,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
         #[cfg(target_arch = "x86_64")]
         Invalid::Layout,
     ] {
-        let mut request = LaunchFirecrackerRequest {
+        let mut request = FirecrackerLaunch {
             execution_id: execution.to_string(),
             verified_runtime: Some(VerifiedRuntimeLaunch {
                 sandbox_id: sandbox.to_string(),
@@ -861,7 +861,7 @@ async fn resident_execution_adoption_does_not_require_current_catalog_or_sources
             let inspected = AtomicBool::new(false);
             let result = service
                 .launch_firecracker_with(
-                    LaunchFirecrackerRequest {
+                    FirecrackerLaunch {
                         execution_id: if current {
                             execution
                         } else {
