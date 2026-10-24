@@ -240,7 +240,9 @@ done
 
 : "${SPACE_SEED_RUNTIME:?builder-provided runtime is required}"
 : "${SPACE_SEED_RUNTIME_VERSION:?builder-provided runtime version is required}"
-: "${SPACE_SEED_STATE_FORMAT_VERSION:?builder-provided state format is required}"
+if [[ "$SPACE_SEED_RUNTIME" == "firecracker" ]]; then
+  : "${SPACE_SEED_STATE_FORMAT_VERSION:?builder-provided state format is required}"
+fi
 if [[ -n "${SPACE_SEED_KERNEL_VERSION:-}" && -z "${SPACE_SEED_KERNEL_DIGEST:-}" ]] ||
    [[ -z "${SPACE_SEED_KERNEL_VERSION:-}" && -n "${SPACE_SEED_KERNEL_DIGEST:-}" ]]; then
   echo "ERROR: seed execution metadata requires both SPACE_SEED_KERNEL_VERSION and SPACE_SEED_KERNEL_DIGEST" >&2
@@ -267,7 +269,9 @@ stage_env \
   SPACE_SEED_UBUNTU_DATE \
   SPACE_SEED_RUNTIME \
   SPACE_SEED_RUNTIME_VERSION \
+  SPACE_SEED_STATE_FORMAT \
   SPACE_SEED_STATE_FORMAT_VERSION \
+  SPACE_SEED_KERNEL_FORMAT \
   SPACE_SEED_KERNEL_VERSION \
   SPACE_SEED_KERNEL_DIGEST
 

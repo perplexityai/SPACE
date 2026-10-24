@@ -1,0 +1,12 @@
+# Select an exact compiled Cloud Hypervisor environment with --environment.
+# The selected environment supplies the kernel; the recipe supplies guest userspace.
+[metadata]
+name = "ch-seed"
+description = "Minimal Ubuntu Cloud Hypervisor seed"
+from = "scratch"
+
+[source]
+type = "ubuntu-minimal-cloud-squashfs"
+release = "resolute"
+version = "26.04"
+date = "release-20260908"

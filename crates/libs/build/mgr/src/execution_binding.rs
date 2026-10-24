@@ -36,7 +36,9 @@ pub enum BuildExecutionBindingError {
     Reference,
     #[error("compatible environment resolution: {0}")]
     Selection(#[from] pplx_space_node_mgr_client::environment_selection::SelectionResponseError),
-    #[error("scratch build requires Firecracker/Linux/{architecture}, got {runtime:?}/{guest:?}")]
+    #[error(
+        "scratch build requires a supported Linux/{architecture} boot adapter, got {runtime:?}/{guest:?}"
+    )]
     ScratchRequirements {
         architecture: pplx_space_common_core::types::Arch,
         runtime: pplx_space_common_core::types::RuntimeKind,
@@ -117,8 +119,10 @@ impl BuildExecutionBinding {
             os: GuestOperatingSystem::Linux,
             architecture,
         };
-        if self.execution.runtime().kind != RuntimeKind::Firecracker
-            || self.execution.guest() != guest
+        if !matches!(
+            self.execution.runtime().kind,
+            RuntimeKind::Firecracker | RuntimeKind::CloudHypervisor
+        ) || self.execution.guest() != guest
         {
             return Err(BuildExecutionBindingError::ScratchRequirements {
                 architecture,
@@ -250,15 +254,32 @@ impl BuildExecutionBinding {
         };
         let ExecutionCompatibilityProfile::RuntimeV1 {
             contract: machine,
-            state_format: Some(state_format),
+            state_format,
         } = &spec.compatibility
         else {
             return Err(BuildExecutionBindingError::ScratchProfile);
         };
-        if contract.as_str() != FIRECRACKER_BOOT_CONTRACT
-            || machine.as_str() != FIRECRACKER_MACHINE_CONTRACT
+        let (expected_boot, expected_machine, expected_format) = match self.execution.runtime().kind
+        {
+            pplx_space_common_core::types::RuntimeKind::Firecracker => (
+                FIRECRACKER_BOOT_CONTRACT,
+                FIRECRACKER_MACHINE_CONTRACT,
+                "vmlinux",
+            ),
+            pplx_space_common_core::types::RuntimeKind::CloudHypervisor => (
+                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_BOOT_CONTRACT,
+                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_MACHINE_CONTRACT,
+                match self.execution.guest().architecture {
+                    pplx_space_common_core::types::Arch::Aarch64 => "linux-image",
+                    pplx_space_common_core::types::Arch::X86_64 => "vmlinux",
+                },
+            ),
+            _ => return Err(BuildExecutionBindingError::ScratchProfile),
+        };
+        if contract.as_str() != expected_boot
+            || machine.as_str() != expected_machine
             || boot.role().as_str() != "boot"
-            || boot.format().as_str() != "vmlinux"
+            || boot.format().as_str() != expected_format
             || boot.component().kind != pplx_space_common_core::types::ArtifactComponentKind::Kernel
         {
             return Err(BuildExecutionBindingError::ScratchProfile);
@@ -274,9 +295,14 @@ impl BuildExecutionBinding {
             self.execution.runtime().version.as_str(),
         );
         command.env(
-            "SPACE_SEED_STATE_FORMAT_VERSION",
-            state_format.version.as_str(),
+            "SPACE_SEED_STATE_FORMAT",
+            state_format.as_ref().map_or("", |s| s.format.as_str()),
         );
+        command.env(
+            "SPACE_SEED_STATE_FORMAT_VERSION",
+            state_format.as_ref().map_or("", |s| s.version.as_str()),
+        );
+        command.env("SPACE_SEED_KERNEL_FORMAT", boot.format().as_str());
         command.env("SPACE_SEED_KERNEL_VERSION", kernel.version.as_str());
         command.env("SPACE_SEED_KERNEL_DIGEST", kernel.digest.to_string());
         Ok(())
@@ -327,6 +353,8 @@ pub(super) fn configure_legacy_scratch(
         INITIAL_FIRECRACKER_RUNTIME_VERSION, INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
     };
     command.env("SPACE_SEED_RUNTIME", "firecracker");
+    command.env("SPACE_SEED_STATE_FORMAT", "firecracker-snapshot");
+    command.env("SPACE_SEED_KERNEL_FORMAT", "vmlinux");
     command.env(
         "SPACE_SEED_RUNTIME_VERSION",
         INITIAL_FIRECRACKER_RUNTIME_VERSION,
