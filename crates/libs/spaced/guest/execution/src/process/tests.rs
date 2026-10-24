@@ -1264,8 +1264,7 @@ async fn wait_for_start_owner(service: &ExecutionService) {
 
 #[cfg(target_os = "linux")]
 async fn shut_down(service: &ExecutionService) {
-    service.inner.shutdown.cancel();
-    service.close_process_admission();
+    service.close();
     service.inner.process_tasks.wait().await;
 }
 
@@ -1491,8 +1490,7 @@ async fn shutdown_waits_for_a_start_stalled_in_its_spawn() {
         }
     });
     wait_for_start_owner(&service).await;
-    service.inner.shutdown.cancel();
-    service.close_process_admission();
+    service.close();
     assert!(
         tokio::time::timeout(
             Duration::from_millis(200),

@@ -57,6 +57,16 @@ async fn host(
 }
 
 async fn stop(service: ExecutionService, shutdown: CancellationToken, server: ServerTask) {
+    service.close();
+    let error = service
+        .filesystem_service()
+        .stat_info(tonic::Request::new(StatRequest {
+            path: "/".into(),
+            user: None,
+        }))
+        .await
+        .expect_err("closed identity service must reject new work");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(3), service.drain())
         .await
@@ -233,7 +243,10 @@ pub(super) async fn run() {
         ]))
         .expect("bounded environment")
     };
-    service.configure_process_env(environment("first")).await;
+    service
+        .configure_process_env(environment("first"))
+        .await
+        .expect("configure environment");
     let command = concat!(
         "read marker; printf '%s/%s\\n' \"$EMBEDDING_ENV\" \"$OVERRIDE\"; ",
         "/usr/bin/id -u; exec /bin/cat \"$1\"",
@@ -265,7 +278,10 @@ pub(super) async fn run() {
             .await
             .expect("started event")
             .expect("started response");
-        service.configure_process_env(environment("second")).await;
+        service
+            .configure_process_env(environment("second"))
+            .await
+            .expect("replace environment");
         service
             .send_input(tonic::Request::new(SendInputRequest {
                 process_id: started.process_id,

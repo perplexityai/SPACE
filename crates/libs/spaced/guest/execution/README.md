@@ -124,9 +124,27 @@ and error evolution, requires a separate crate-level policy before stabilization
   selection does not change environment semantics. Callers requiring rejection
   should validate with `EnvMap::try_from` before constructing `StartRequest.env`
   (use `pplx_space_spaced_guest_protocol::proto_env` to convert the validated map).
-- The daemon cancels the shared token and coordinates listener shutdown with draining work.
-  `drain()` joins tracked work; it is not a reusable shutdown-and-reject contract
-  for subsequent direct calls. Direct filesystem calls can still have effects.
+- `close()` closes operation admission and signals cancellation across existing
+  clones and filesystem handles. Execution entrypoints refuse new process,
+  filesystem and environment-update calls with `Unavailable`; transport admission
+  retains its earlier rejections. Uploads waiting for their first message wake
+  on cancellation. The service owns a child of the supplied token: caller
+  cancellation closes admission, but `close()` and `drain()` do not cancel the
+  caller's token. Closure signals cancellation of admitted work immediately;
+  service or parent-token cancellation can terminate identity workers immediately,
+  leaving outcomes unknown. `cancellation_grace` applies to supervised work after
+  request cancellation, not service shutdown. Direct execution still waits for
+  outstanding I/O. This is abortive shutdown, not graceful
+  admission-only closure; it neither waits nor rolls back effects. Already-admitted
+  same-key retries can still wait for the owner or the retry retention deadline;
+  closure does not directly wake them.
+- The daemon coordinates listener shutdown with `drain()`, which first closes
+  admission and then joins its tracked work. The filesystem drain still logs an
+  internal timeout rather than reporting incomplete cleanup, and some detached
+  or blocking work is not covered by its trackers. A complete embedding drain
+  contract, including graceful admission-only closure and explicit deadline-driven
+  cancellation, remains follow-up work. Returning from `drain()` is not yet proof
+  that every previously admitted effect has settled.
 - Linux PTY descriptors are created with close-on-exec atomically. Other Unix
   targets serialize PTY allocation and workload spawning through a private lock;
   unrelated spawners do not participate in that coordination.
@@ -147,7 +165,7 @@ and error evolution, requires a separate crate-level policy before stabilization
   when it returns. A caller-assigned process id stays in use for the whole
   window. Records live in daemon memory and do not survive a daemon restart.
 
-This crate retains the daemon contract. Consistent shutdown semantics and complete
+This crate retains the running daemon contract. Complete drain semantics and
 operation acceptance remain follow-up work. General application embedding also
 requires stronger descendant ownership. Explicit launching alone does not
 establish those guarantees or advertise general embedding support.
