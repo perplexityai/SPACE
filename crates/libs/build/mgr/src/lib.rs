@@ -1710,7 +1710,7 @@ fn scratch_guest_bin_dir() -> Result<PathBuf, BuildError> {
     }
 
     Err(BuildError::message(
-        "could not locate spaced/spaced-svc in the sibling data/spaced artifact directory",
+        "could not locate spaced/spaced-svc in the packaged or node data/spaced artifact directory",
     ))
 }
 
@@ -1722,6 +1722,9 @@ fn scratch_guest_bin_candidates(exe_path: &Path) -> Vec<PathBuf> {
                 .map(|parent| parent.join(SCRATCH_GUEST_ARTIFACT_SUBDIR))
         })
         .into_iter()
+        // Packaged artifacts take precedence. Direct deployments keep guest
+        // assets outside the content-addressed service executable directory.
+        .chain([PathBuf::from("/space/data/spaced")])
         .collect()
 }
 
