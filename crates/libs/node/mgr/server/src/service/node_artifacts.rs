@@ -66,6 +66,7 @@ impl NodeManagerService {
         )?;
         self.require_verified_environment_layout().await?;
         let request = request.into_inner();
+        let definition_schema = request.definition_schema_version;
         if let Some(compatible) = request.compatible {
             if request.reference.is_some() {
                 return Err(Status::invalid_argument(
@@ -73,7 +74,7 @@ impl NodeManagerService {
                 ));
             }
             return self
-                .resolve_compatible_environment(compatible)
+                .resolve_compatible_environment(compatible, definition_schema)
                 .await
                 .map(Response::new);
         }
@@ -105,7 +106,11 @@ impl NodeManagerService {
         Ok(Response::new(
             crate::proto::ResolveExecutionEnvironmentResponse {
                 accepted_selection: 0,
-                definition: Some((&definition).into()),
+                definition: Some(
+                    definition
+                        .for_peer(definition_schema)
+                        .map_err(|error| Status::failed_precondition(error.to_string()))?,
+                ),
                 execution: Some((&execution).into()),
             },
         ))

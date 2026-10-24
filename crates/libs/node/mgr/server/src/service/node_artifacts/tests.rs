@@ -294,6 +294,7 @@ async fn environment_resolution_requires_authorization_and_verified_inventory() 
     use crate::service::tests::service_tests::{root_request, service_for_unit_tests};
     let service = service_for_unit_tests().await;
     let request = || crate::proto::ResolveExecutionEnvironmentRequest {
+        definition_schema_version: 0,
         reference: None,
         compatible: None,
     };
