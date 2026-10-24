@@ -94,20 +94,24 @@ for canonical hashing and stored schema-1 JSON. Consumers see generic profiles.
 Historical records that omitted component formats keep their original binding
 checks; native schema-2 identities require the declared formats.
 
-During rollout, ResolveExecutionEnvironment callers advertise the definition
-schema they understand. New nodes return generic profiles to new callers and
-an exact schema-1 representation to older callers. New callers also accept and
-normalize old-node responses. Native schema-2 definitions have no downgrade:
-an old peer receives an explicit refusal, never an unbound/default environment.
+The environment gRPC protocol accepts and emits only generic schema 2. Removed
+schema-1 profile fields and enum values have reserved names and numbers.
+ResolveExecutionEnvironment callers continue advertising schema 2: transitional
+nodes use that capability to return generic definitions during a rolling
+upgrade. Nodes reject clients advertising less than 2. No legacy environment
+response, reader, or Firecracker-specific environment protobuf message remains.
 Selection acknowledgements and persist-before-activation rules are unchanged.
 
-Remove legacy environment protobuf messages and the temporary response-format
-negotiation only after node-manager, builder, sandbox-manager and operator CLI
-readers have this migration deployed, including rollback images. Reserve removed
-field numbers and names. A later rollback to a pre-migration reader requires
-restoring the transitional server first. This removal does not remove the
-historical canonical/JSON reader: persisted references still need it. Existing
-Firecracker-specific lifecycle RPCs are separate adapter integration work.
+Deployment prerequisite: node-manager, builder, sandbox-manager and operator CLI
+readers must first run the transitional migration that understands generic
+transport with historical identities. Include rollback images in this gate.
+Both deployment orders between that transitional version and this removal are
+supported; jumping from a pre-migration version is not. A later rollback to a
+pre-migration reader requires restoring the transitional server first.
+
+The historical canonical/JSON reader remains because persisted references still
+need it; it is not a legacy gRPC API. Existing Firecracker-specific lifecycle
+RPCs are separate adapter integration work.
 
 Schema-2 artifacts are canonicalized by unique role. Every artifact's kind,
 version, digest and format, both contract identifiers, and the presence/value of
