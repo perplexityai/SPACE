@@ -9,7 +9,7 @@ import shutil
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from threading import Lock
 from typing import Any, Protocol, TypeVar, cast
@@ -371,6 +371,7 @@ class SmokeServices:
             fixture._leader_election_control = cast(Any, kind)
             fixture._sandbox_network_isolation_control = cast(Any, kind)
             fixture._storage_exchange_control = cast(Any, kind)
+            fixture._sandbox_anchor_control = cast(Any, kind)
             fixture._template_selector = template
             fixture._warm_pool_observer = cast(Any, kind)
             fixture._warm_pool_candidate = warm_pool_candidate
@@ -396,6 +397,22 @@ class SmokeServices:
             raise SmokeConfigurationError("Native client is unavailable")
         native = self.native
         kind = self.kind
+        before_create = None
+        if sandbox_config.kind_cold_create is not None:
+            if kind is None or not isinstance(native, NativeSandboxFactory):
+                raise SmokeConfigurationError("native cold create requires Kind and a native client")
+            with context.phase("establish owned disabled native cold-create config"):
+                kind.bootstrap()
+                release = kind.acquire_cold_create_setup()
+                context.scope.defer("release Kind cold-create setup Lease", release, critical=True)
+                selection = kind.prepare_cold_create(
+                    native.config.template, sandbox_config.kind_cold_create,
+                )
+                native = NativeSandboxFactory(replace(native.config, template=selection.template))
+                before_create = selection.verify
+                context.record("cold_config_id", selection.config_id)
+                context.record("cold_config_ownership_receipt", selection.ownership_receipt)
+                context.record("cold_template_pin", selection.template)
         if sandbox_config.kind_byok:
             if kind is None or not isinstance(native, NativeSandboxFactory):
                 raise SmokeConfigurationError(
@@ -414,6 +431,8 @@ class SmokeServices:
         phase = "create sandbox" if sandbox_count == 1 else "create sandbox collection"
         with context.phase(phase):
             for _ in range(sandbox_count):
+                if before_create is not None:
+                    before_create()
                 sandbox = cast(
                     DurableLifecycleSandbox,
                     native.create(

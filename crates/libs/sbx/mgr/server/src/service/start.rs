@@ -1565,6 +1565,11 @@ impl SandboxManagerService {
                 route_identity_provenance: ctx.route_identity_provenance,
                 open_activation_claim_eligible: ctx.open_activation_claim_eligible,
                 restored_snapshot,
+                trust_preparation: if ctx.restore_artifact_as_new.is_some() || ctx.from_warm {
+                    crate::split_trust::Preparation::Initialize
+                } else {
+                    crate::split_trust::Preparation::Preserve
+                },
             })
             .instrument(resume_span.clone())
             .await;
@@ -1709,6 +1714,7 @@ impl SandboxManagerService {
                     storage_uri: ctx.suspend_restore_storage_uri.clone(),
                     local_artifact_id: None,
                 },
+                trust_preparation: crate::split_trust::Preparation::Initialize,
             })
             .await?;
         Ok(Some(response))

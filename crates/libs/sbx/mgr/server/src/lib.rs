@@ -31,6 +31,7 @@ pub mod snapshot_restore;
 pub mod snapshot_scheduler;
 pub mod snapshot_upload;
 pub mod snapshot_upload_jobs;
+mod split_trust;
 pub mod template_resolver;
 mod transfer_directory;
 mod vm_diagnostics;

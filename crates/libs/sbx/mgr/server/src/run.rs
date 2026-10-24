@@ -557,6 +557,8 @@ pub struct SbxMgrRunConfig {
 /// the process: the drain paths the service only logs stay inside [`run`].
 #[derive(Debug, thiserror::Error)]
 pub enum RunSbxMgrError {
+    #[error("split-trust runtime flag requires the split-trust-prototype Cargo feature")]
+    SplitTrustNotCompiled,
     #[error("invalid sandbox-manager configuration: {0}")]
     Config(#[source] crate::config::ConfigLoadError),
     #[error("invalid or missing SPACE API route verification configuration: {0}")]
@@ -756,6 +758,9 @@ pub async fn run(
     config: SbxMgrRunConfig,
     shutdown_token: CancellationToken,
 ) -> Result<(), RunSbxMgrError> {
+    if crate::split_trust::requested() && !cfg!(feature = "split-trust-prototype") {
+        return Err(RunSbxMgrError::SplitTrustNotCompiled);
+    }
     let service_config = crate::config::load().map_err(RunSbxMgrError::Config)?;
     let node_managed_by = parse_node_managed_by(std::env::var(SPACE_NODE_MANAGED_BY_ENV))?;
     let route_ed25519_verification_bundle = Some(std::sync::Arc::new(

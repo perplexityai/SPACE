@@ -996,8 +996,10 @@ pub(super) async fn configure_process_env_for_activation(
     process_env: &BTreeMap<String, String>,
     phase: &'static str,
     cleanup_id: Option<SandboxCleanupEpisodeId>,
+    _trust_preparation: crate::split_trust::Preparation,
 ) -> Result<(), Status> {
-    if process_env.is_empty() {
+    let anchor_enabled = crate::split_trust::enabled();
+    if process_env.is_empty() && !anchor_enabled {
         return Ok(());
     }
     let read = || {
@@ -1028,6 +1030,52 @@ pub(super) async fn configure_process_env_for_activation(
         Ok(sandbox)
     };
     let initial = read()?;
+    #[cfg(feature = "split-trust-prototype")]
+    if anchor_enabled {
+        let prepare = async {
+            let endpoint = pplx_space_credmgr_client::CredmgrEndpoint::default();
+            let mut credentials = endpoint
+                .connect()
+                .await
+                .map_err(|_| Status::unavailable("node credential agent is unavailable"))?;
+            let identity = sandbox_id
+                .parse::<pplx_space_common_core::types::SandboxId>()
+                .map_err(|_| Status::invalid_argument("invalid sandbox identity"))?;
+            let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default()
+                .with_socket_path(spaced_host_socket_path(sandbox_id));
+            let client = pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+            if _trust_preparation == crate::split_trust::Preparation::Initialize {
+                let certificate =
+                    crate::split_trust::public_anchor(&mut credentials, identity).await?;
+                crate::split_trust::install(&client, identity, certificate).await?;
+            } else if let Some(installed) =
+                crate::split_trust::installed_anchor(&client, identity).await?
+            {
+                let expected =
+                    crate::split_trust::public_anchor(&mut credentials, identity).await?;
+                if installed != expected {
+                    return Err(Status::failed_precondition(
+                        "restored sandbox trust does not match its identity",
+                    ));
+                }
+            } else {
+                return Err(Status::failed_precondition(
+                    "split-trust restore requires an already anchored guest",
+                ));
+            }
+            Ok::<_, Status>(())
+        };
+        tokio::time::timeout(Duration::from_secs(90), prepare)
+            .await
+            .map_err(|_| Status::deadline_exceeded("sandbox trust preparation timed out"))??;
+        if !activation_env_matches(&initial, &read()?, process_env) {
+            return Err(Status::aborted(
+                "activation changed while installing sandbox trust",
+            ));
+        }
+    }
     // Activation owns the wake lock and rejects live metadata replacement while
     // Starting/Restoring/Resuming. Replaying this fixed map is safe even if a
     // guest applied it before losing the reply. Do not generalize this to the
@@ -1275,6 +1323,7 @@ where
                 process_env,
                 phase,
                 cleanup_id,
+                crate::split_trust::Preparation::Initialize,
             )
             .await
             {
@@ -1405,6 +1454,12 @@ fn emit_guest_observed_specs(
     );
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct RestoreFinalization {
+    pub(super) state: SandboxState,
+    pub(super) trust: crate::split_trust::Preparation,
+}
+
 /// Check the restored guest against this host before publishing Started, with a
 /// 30s readiness budget followed by the existing 60s network budget. A paused
 /// restore cannot answer guest RPCs; its guest check runs on resident resume.
@@ -1412,9 +1467,13 @@ pub(super) async fn complete_restore_and_mark_final(
     db: crate::db::SharedConnection,
     sandbox_id: &str,
     process_env: &BTreeMap<String, String>,
-    final_state: SandboxState,
+    finalization: RestoreFinalization,
     cleanup_id: Option<SandboxCleanupEpisodeId>,
 ) -> Result<(), Status> {
+    let RestoreFinalization {
+        state: final_state,
+        trust,
+    } = finalization;
     tracing::info!(
         sandbox_id,
         final_state = final_state.as_str(),
@@ -1438,9 +1497,16 @@ pub(super) async fn complete_restore_and_mark_final(
         ));
     }
 
-    if let Err(status) =
-        configure_process_env_for_activation(&db, sandbox_id, process_env, "restore", cleanup_id)
-            .await
+    if final_state == SandboxState::Started
+        && let Err(status) = configure_process_env_for_activation(
+            &db,
+            sandbox_id,
+            process_env,
+            "restore",
+            cleanup_id,
+            trust,
+        )
+        .await
     {
         return Err(activation_failure_status_if_current(
             &db,
@@ -1641,7 +1707,7 @@ pub(super) fn spawn_restore_state_transition(
     service: &SandboxManagerService,
     sandbox_id: String,
     process_env: BTreeMap<String, String>,
-    final_state: SandboxState,
+    finalization: RestoreFinalization,
     snapshot_dir: Option<String>,
     mut cleanup_guard: ActivationCleanupGuard,
     cleanup_id: SandboxCleanupEpisodeId,
@@ -1654,7 +1720,7 @@ pub(super) fn spawn_restore_state_transition(
             db.clone(),
             &sandbox_id,
             &process_env,
-            final_state,
+            finalization,
             Some(cleanup_id),
         )
         .await
@@ -1666,7 +1732,7 @@ pub(super) fn spawn_restore_state_transition(
                 cleanup_guard.complete_success();
             }
             Err(error) => {
-                tracing::warn!(sandbox_id, state = %final_state, %error, "restore final-state transition failed");
+                tracing::warn!(sandbox_id, state = %finalization.state, %error, "restore final-state transition failed");
                 super::drain::record_detached_failure(error.message());
                 cleanup_guard.record_failure(&error);
             }

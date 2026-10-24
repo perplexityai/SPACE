@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -2519,6 +2520,30 @@ class StorageRequestResult:
     succeeded: bool
     refused: bool
     detail: str
+
+
+class SandboxAnchorHardwareOps(Protocol):
+    """Owned hardware operations; evidence contains only metadata and public keys."""
+
+    def benchmark(self) -> Mapping[str, object]: ...
+
+    def expected_public_key(self, sandbox_id: str) -> str: ...
+
+    def primary_unavailable(self) -> AbstractContextManager[None]: ...
+
+    def rotate(self) -> Mapping[str, object]: ...
+
+    def catalog(self) -> Mapping[str, object]: ...
+
+
+class SandboxAnchorControl(Protocol):
+    """Isolated-Kind fault injection; never exposes master or private-key bytes."""
+
+    def recover_anchor_keyring(self) -> Mapping[str, str]: ...
+
+    def probe_anchor_access(self, sandbox_id: str) -> Mapping[str, str]: ...
+
+    def hardware(self) -> AbstractContextManager[SandboxAnchorHardwareOps]: ...
 
 
 class StorageExchangeControl(Protocol):

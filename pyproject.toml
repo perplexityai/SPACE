@@ -25,6 +25,7 @@ default = true
 [dependency-groups]
 test = [
     "boto3==1.43.113",
+    "cryptography==50.0.2",
     "cel-python==0.5.0",
     "pglast==7.21",
     "psycopg[binary]==3.3.6",
