@@ -1,14 +1,57 @@
-# Credential Manager storage token exchange
+# Credential Manager token exchange
 
-Status: implemented contract
+Status: implemented storage contract; default-off X.509 prototype
 
 `CredentialManager.ExchangeToken` is the storage-lease boundary for SPACE
 host-side consumers. It implements the RFC 8693 request/response shape with
-one deliberately narrow profile: short-lived AWS credentials for one S3 object
+one deliberately narrow storage profile: short-lived AWS credentials for one S3 object
 or one canonical SPACE artifact prefix. It never returns the authority's
 ambient or statically configured AWS credentials.
 
-## Request contract
+## Prototype sandbox X.509 profile
+
+This separately authorized profile is default-off behind `split-trust-prototype`
+and `SPACE_SPLIT_TRUST_PROTOTYPE=true`. It does not relax the storage contract
+below. It reuses `ExchangeToken`; no anchor-release, cache-eviction or
+guest-installation RPC is introduced.
+
+- **Resource:** `urn:space:credential:sandbox-tls-anchor`.
+- **Subject:** canonical `sandbox:<UUIDv7>` with
+  `subject_token_type=urn:space:token-type:subject-id`.
+- **Grant:** `urn:ietf:params:oauth:grant-type:token-exchange`.
+- **Public type:** `urn:space:token-type:x509-certificate`, accepted only from
+  the node-local sandbox-manager identity. Its response uses
+  `x509_certificate_der`.
+- **Private type:** `urn:space:token-type:x509-signing-credentials`, accepted
+  by the authority only from an authenticated Kubernetes node credential-agent
+  identity. Its response uses `X509SigningCredentials` with public certificate
+  DER and sensitive PKCS#8 private-key DER.
+
+Audience, scope, actor, requested expiry and copy-source fields must be absent.
+The response echoes the requested type, uses `token_type=N_A`, and contains no
+expiry, refresh token or scope. Certificate validity is encoded in the
+certificate; a local cache TTL is not key revocation.
+
+The agent originates the upstream exchange as itself, caches signing credentials
+only in bounded, zeroizing memory, and constructs a distinct public-only response
+for sandbox manager. Local requests for signing credentials are denied.
+Storage consumers gain no X.509 privileges, and sandbox manager gains no
+storage privileges through the shared RPC method.
+
+Gateway signing continues through `IssueIntermediateCertificate`. Omitted
+`sandbox_id` retains shared signing; present `sandbox_id` requests a
+sandbox-scoped issuer at the node and fails when disabled or unsupported.
+The response's existing issuer certificate identifies the signing anchor, which
+sandbox manager checks against the expected public certificate. No issuer enum,
+execution generation or seed version is added to this wire contract.
+
+Sandbox manager installs public trust through existing filesystem and process
+APIs before activation. The node uses TTL expiry instead of a teardown RPC.
+No placement/lifecycle database checks or grants are added: authenticated nodes
+remain trusted to request other sandbox anchors. Production hardware-key governance,
+rollout/rollback, dependency vetting and security review remain separate gates.
+
+## Storage request contract
 
 Every request must provide all of the following. Missing, malformed,
 unknown, or duplicated values are rejected; an authorization or validation

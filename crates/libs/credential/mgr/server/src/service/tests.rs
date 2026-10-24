@@ -1489,6 +1489,7 @@ async fn a_valid_request_reaches_the_backend_and_its_certificate_is_returned() {
     let response = service_with_issuer(Ok(Vec::new()))
         .issue_intermediate_certificate(agent_request(IssueIntermediateCertificateRequest {
             csr: csr.clone(),
+            ..Default::default()
         }))
         .await
         .expect("issuance succeeds")
@@ -1510,6 +1511,7 @@ async fn instance_without_an_issuer_refuses_intermediate_issuance() {
     )
     .issue_intermediate_certificate(agent_request(IssueIntermediateCertificateRequest {
         csr: node_csr(),
+        ..Default::default()
     }))
     .await
     .expect_err("no backend configured");
@@ -1531,7 +1533,10 @@ async fn only_the_node_agent_may_request_an_intermediate() {
         ClientService::ApiSvc,
     ] {
         for csr in [node_csr(), b"not a csr".to_vec()] {
-            let mut request = Request::new(IssueIntermediateCertificateRequest { csr });
+            let mut request = Request::new(IssueIntermediateCertificateRequest {
+                csr,
+                ..Default::default()
+            });
             request
                 .extensions_mut()
                 .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
@@ -1559,13 +1564,17 @@ async fn precondition_and_validation_failures_are_metered() {
         Arc::new(InMemoryKeyWrapper::new()),
         PeerProcessCheckMode::Off,
     )
-    .issue_intermediate(IssueIntermediateCertificateRequest { csr: node_csr() })
+    .issue_intermediate(IssueIntermediateCertificateRequest {
+        csr: node_csr(),
+        ..Default::default()
+    })
     .await;
     assert_eq!(intermediate_result_tag(&no_backend), "not_configured");
 
     let rejected = service_with_issuer(Ok(Vec::new()))
         .issue_intermediate(IssueIntermediateCertificateRequest {
             csr: b"not der".to_vec(),
+            ..Default::default()
         })
         .await;
     assert_eq!(intermediate_result_tag(&rejected), "invalid_csr");
