@@ -1,7 +1,7 @@
-//! Transitional transport conversion; runtime dispatch rejects unknown adapters
+//! Firecracker host-adapter input. Runtime dispatch rejects unknown adapters
 //! before acquiring execution ownership or creating a process.
 
-use crate::proto::{LaunchFirecrackerRequest, LaunchRuntimeRequest};
+use crate::proto::LaunchRuntimeRequest;
 use pplx_space_execution_common::proto::RuntimeKind;
 
 #[derive(Debug, thiserror::Error)]
@@ -14,7 +14,7 @@ pub enum LaunchContractError {
     IdentityMismatch,
 }
 
-impl TryFrom<LaunchRuntimeRequest> for LaunchFirecrackerRequest {
+impl TryFrom<LaunchRuntimeRequest> for FirecrackerLaunch {
     type Error = LaunchContractError;
 
     fn try_from(request: LaunchRuntimeRequest) -> Result<Self, Self::Error> {
@@ -55,8 +55,8 @@ impl TryFrom<LaunchRuntimeRequest> for LaunchFirecrackerRequest {
     }
 }
 
-impl From<LaunchFirecrackerRequest> for LaunchRuntimeRequest {
-    fn from(request: LaunchFirecrackerRequest) -> Self {
+impl From<FirecrackerLaunch> for LaunchRuntimeRequest {
+    fn from(request: FirecrackerLaunch) -> Self {
         Self {
             sandbox_id: request.verified_runtime.as_ref().map_or_else(
                 || request.sandbox_id.clone(),
@@ -82,3 +82,23 @@ impl From<LaunchFirecrackerRequest> for LaunchRuntimeRequest {
 
 #[cfg(test)]
 mod tests;
+
+/// Validated by the FC adapter before process ownership is acquired. This is
+/// host implementation data, not a second wire contract.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FirecrackerLaunch {
+    pub sandbox_id: String,
+    pub execution_id: String,
+    pub jailer_bin: String,
+    pub firecracker_bin: String,
+    pub chroot_base_dir: String,
+    pub ns_path: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub fc_config_path: String,
+    pub fc_log_path: String,
+    pub fc_console_path: String,
+    pub fc_metrics_path: String,
+    pub cgroup_limits: Option<crate::proto::CgroupLimits>,
+    pub verified_runtime: Option<crate::proto::VerifiedRuntimeLaunch>,
+}

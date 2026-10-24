@@ -1,6 +1,6 @@
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_mgr_client::proto::{GetVmStateRequest, VmState as WireVmState};
-use pplx_space_node_mgr_client::runtime_control::RuntimeControl;
+
 use pplx_space_node_runtime_core::vm_state::VmState;
 use std::time::Duration;
 
@@ -27,12 +27,9 @@ async fn get_vm_state_inner(
     // channel readiness after a node-manager restart.
     let mut client = node_manager.lazy();
     let response = client
-        .runtime_vm_state(
-            pplx_space_execution_common::proto::RuntimeKind::Firecracker,
-            GetVmStateRequest {
-                sandbox_id: sandbox_id.to_string(),
-            },
-        )
+        .get_vm_state(GetVmStateRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
         .await?
         .into_inner();
     match response.state() {
