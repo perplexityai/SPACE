@@ -370,7 +370,7 @@ fn checkpoint_pause_error_restores_started_only_after_resume_succeeds() {
         SandboxState::Started,
         "snapshot failed".to_string(),
         Err("resume response lost".to_string()),
-        Some(FirecrackerVmState::Paused),
+        Some(VmState::Paused),
     );
     let db = ctx.db.lock().unwrap();
     assert_eq!(
@@ -414,7 +414,7 @@ fn completed_checkpoint_only_succeeds_when_started_state_is_restored() {
         &ctx,
         &sandbox_id,
         "resume response lost".to_string(),
-        Some(FirecrackerVmState::Running),
+        Some(VmState::Running),
     );
     running_result.unwrap();
     assert_eq!(
@@ -430,7 +430,7 @@ fn completed_checkpoint_only_succeeds_when_started_state_is_restored() {
         &ctx,
         &sandbox_id,
         "resume failed".to_string(),
-        Some(FirecrackerVmState::Paused),
+        Some(VmState::Paused),
     );
     assert_eq!(paused_result, Err("resume failed".to_string()));
     assert_eq!(

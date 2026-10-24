@@ -8,7 +8,9 @@ use crate::{ExecutionProtoError, proto};
 
 mod binding;
 mod profiles;
+mod transport;
 pub use binding::{EnvironmentBindingError, EnvironmentRequirementsError};
+pub use transport::{FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT};
 
 /// Original encoding; existing definitions retain these bytes and references.
 pub const ENVIRONMENT_SCHEMA_VERSION: u32 = 1;
@@ -18,6 +20,8 @@ pub const RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION: u32 = 2;
 pub struct EnvironmentDefinition {
     reference: EnvironmentReference,
     descriptor: EnvironmentDescriptor,
+    // Immutable historical representation used only for identity and old peers.
+    legacy_descriptor: Option<EnvironmentDescriptor>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +34,10 @@ pub enum EnvironmentDecodeError {
     UnsupportedValue { field: &'static str, value: i32 },
     #[error("schema {claimed} does not describe these environment profiles (expected {expected})")]
     SchemaMismatch { claimed: u32, expected: u32 },
+    #[error("generic profile cannot represent the requested historical identity")]
+    IdentityEncoding,
+    #[error("peer cannot decode this environment definition")]
+    UnsupportedPeer,
     #[error("invalid execution contract: {0}")]
     Contract(#[from] ExecutionContractIdParseError),
     #[error("invalid boot artifact role: {0}")]
@@ -57,6 +65,7 @@ impl EnvironmentDefinition {
         Self {
             reference: EnvironmentReference::new(Digest::sha256(bytes)),
             descriptor,
+            legacy_descriptor: None,
         }
     }
 
@@ -100,7 +109,7 @@ impl EnvironmentDefinition {
 /// Fixed field order, ASCII keys and canonical scalar spellings, final newline.
 /// Identifiers cannot contain newlines or '='. No wire/JSON bytes, observations,
 /// labels, source URLs, or node-local paths participate. See docs/execution-environments.md.
-pub fn canonical_descriptor(descriptor: &EnvironmentDescriptor) -> String {
+fn canonical_descriptor(descriptor: &EnvironmentDescriptor) -> String {
     let spec = descriptor.spec();
     let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
     let (
@@ -183,6 +192,11 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
         let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
         Self {
             schema_version: value.schema_version(),
+            identity_schema_version: if value.identity_schema_version() == value.schema_version() {
+                0
+            } else {
+                value.identity_schema_version()
+            },
             reference: value.reference.to_string(),
             descriptor: Some(proto::EnvironmentDescriptor {
                 host: Some(spec.host.into()),
@@ -264,10 +278,14 @@ impl TryFrom<&proto::EnvironmentDefinition> for EnvironmentDefinition {
             compatibility: required(spec.compatibility.as_ref(), "compatibility")?.try_into()?,
         }
         .try_into()?;
-        let definition = Self::new(descriptor);
-        definition
-            .check_schema(value.schema_version)?
-            .check_reference(value.reference.parse()?)
+        let identity = if value.identity_schema_version == 0 {
+            value.schema_version
+        } else {
+            value.identity_schema_version
+        };
+        Self::from_representation(descriptor, value.schema_version, identity)?
+            .check_reference(value.reference.parse()?)?
+            .into_runtime_neutral()
     }
 }
 

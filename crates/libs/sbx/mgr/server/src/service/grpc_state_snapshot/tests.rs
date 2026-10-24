@@ -27,11 +27,7 @@ fn cached_runtime_state_only_refines_resident_lifecycle() {
                     state
                 };
             assert_eq!(
-                sandbox_status_from_runtime_observation(
-                    state,
-                    pid_alive,
-                    Some(FirecrackerVmState::Paused),
-                ),
+                sandbox_status_from_runtime_observation(state, pid_alive, Some(VmState::Paused),),
                 expected,
                 "{state}, pid_alive={pid_alive}"
             );
