@@ -7194,6 +7194,7 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "opentelemetry-proto",
+ "pem 4.0.0",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-jobs",
@@ -7242,6 +7243,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

@@ -17,7 +17,6 @@ import sys
 import tempfile
 import threading
 import socket
-import sys
 import time
 import uuid
 from collections import deque
@@ -88,6 +87,7 @@ from space_smoke.capabilities import (
     ColdEvictionConfig,
     SnapshotReaperConfig,
     SandboxPodPlacement,
+    SandboxAnchorHardwareOps,
     SnapshotRecord,
     StorageExchangeOutcome,
     StorageObject,
@@ -1108,12 +1108,7 @@ class KindHarness:
             self._assert_retention_lease_owned()
 
         assert_lease()
-        if self.config.context != "kind-space-local" or urlsplit(
-            self.config.api_url
-        ).hostname not in {"localhost", "127.0.0.1"}:
-            raise SmokeConfigurationError(
-                "cold setup requires the isolated local Kind API"
-            )
+        self._require_isolated_kind("cold setup")
         token_file = self.environment.get("SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
         receipts = self.environment.get("SPACE_SMOKE_KIND_COLD_RECEIPTS")
         if not token_file or not receipts:
@@ -2607,6 +2602,140 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
             cleared.append(name)
         return tuple(cleared)
+
+    def probe_anchor_access(self, sandbox_id: str) -> Mapping[str, str]:
+        import hashlib
+        from space_smoke.credmgr_socket import RELAY, sandbox_anchor
+
+        self._require_isolated_kind("sandbox anchor authentication and delivery probes")
+        placement = self.sandbox_pod_placement(sandbox_id)
+        if placement is None:
+            raise SmokeConfigurationError("anchor probe needs one active sandbox execution")
+        other = next((node for node in self.sandbox_worker_nodes() if node != placement.node_name), None)
+        if other is None:
+            raise SmokeConfigurationError("anchor authentication proof requires a second worker")
+
+        def probe(node: str, user: str = "space-sbxmgr", *, private: bool = False) -> tuple[bytes, str]:
+            argv = relay_argv(
+                ["kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE],
+                self._node_shell_pod(node), KIND_NODE_SHELL_CONTAINER,
+                "/space/run/credential-manager/credmgr.sock",
+                user=user, groups=("space-sbxclients",),
+            )
+            return sandbox_anchor(argv, sandbox_id=_sql_uuid(sandbox_id), private=private)
+
+        certificate, assigned = probe(placement.node_name)
+        foreign_certificate, foreign = probe(other)
+        _, signing_refused = probe(placement.node_name, private=True)
+        _, unprivileged = probe(placement.node_name, "nobody")
+        # Read only the public TLS certificate, never the private key. This
+        # direct authority call has server authentication but no caller token.
+        public_tls = _require_ok(
+            self.kubectl(
+                "get", "secret", "space-credmgr-authority-tls",
+                "-o", r"jsonpath={.data.tls\.crt}", timeout=15,
+            ),
+            "read authority public TLS certificate",
+        )
+        authority_port = _require_ok(
+            self.kubectl(
+                "get", "service", "space-credmgr-authority",
+                "-o", 'jsonpath={.spec.ports[?(@.name=="grpc")].port}', timeout=15,
+            ),
+            "read authority gRPC service port",
+        ).strip()
+        if not authority_port.isdecimal() or not 0 < int(authority_port) < 65536:
+            raise SmokeConfigurationError("authority Service has no valid gRPC port")
+        tcp_relay = [
+            "kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE,
+            "exec", "-i", self._node_shell_pod(placement.node_name),
+            "-c", KIND_NODE_SHELL_CONTAINER, "--", "perl", "-e", RELAY,
+            f"space-credmgr-authority.{KIND_NAMESPACE}.svc.cluster.local", authority_port,
+        ]
+        _, unauthenticated = sandbox_anchor(
+            tcp_relay, sandbox_id=_sql_uuid(sandbox_id), private=True,
+            tls_root=base64.b64decode(public_tls, validate=True),
+            authority="space-credmgr-authority",
+        )
+        return {
+            "assigned_node": placement.node_name,
+            "foreign_node": other,
+            "assigned_status": assigned,
+            "foreign_node_status": foreign,
+            "local_signing_profile_status": signing_refused,
+            "unprivileged_peer_status": unprivileged,
+            "unauthenticated_authority_status": unauthenticated,
+            "public_certificate_sha256": hashlib.sha256(certificate).hexdigest(),
+            "foreign_certificate_sha256": hashlib.sha256(foreign_certificate).hexdigest(),
+        }
+
+    def recover_anchor_keyring(self) -> Mapping[str, str]:
+        from space_smoke.anchor_recovery import AnchorRecoveryDriver
+
+        self._require_isolated_kind("sandbox anchor keyring recovery")
+
+        def driver(ownership: _LeaseOwnership) -> AnchorRecoveryDriver:
+            return AnchorRecoveryDriver(
+                self.kubectl,
+                lambda action, annotations: self._renew_lease(ownership, action, annotations),
+            )
+
+        def repair(previous: Mapping[str, object], ownership: _LeaseOwnership) -> None:
+            driver(ownership).repair(_lease_annotations(previous))
+
+        ownership = self._acquire_named_mutation_lease(
+            "space-smoke-sandbox-anchor-recovery",
+            "sandbox anchor recovery",
+            repair=repair,
+        )
+        try:
+            return driver(ownership).run()
+        finally:
+            self._release_lease(ownership)
+
+    @contextlib.contextmanager
+    def hardware(self) -> Iterator[SandboxAnchorHardwareOps]:
+        from space_smoke.anchor_hardware import HardwareControl, HardwareFixture
+        from space_smoke.anchor_recovery import AnchorRecoveryDriver
+
+        self._require_isolated_kind("sandbox anchor hardware proof")
+        required = (
+            "SPACE_SMOKE_ANCHOR_HARDWARE_JOURNAL",
+            "SPACE_SMOKE_ANCHOR_AWS_PROFILE",
+            "SPACE_SMOKE_ANCHOR_AWS_ACCOUNT",
+        )
+        if any(not self.environment.get(name) for name in required):
+            raise SmokeConfigurationError("hardware proof requires an explicit journal/profile/account")
+        fixture = HardwareFixture(
+            Path(self.environment[required[0]]),
+            self.environment[required[1]],
+            self.environment[required[2]],
+        )
+
+        def repair(previous: Mapping[str, object], ownership: _LeaseOwnership) -> None:
+            driver = AnchorRecoveryDriver(
+                self.kubectl,
+                lambda action, annotations: self._renew_lease(ownership, action, annotations),
+            )
+            driver.repair(_lease_annotations(previous))
+            if fixture.state.get("primary_disable_intent"):
+                fixture.set_primary_enabled(True)
+
+        ownership = self._acquire_named_mutation_lease(
+            "space-smoke-sandbox-anchor-recovery", "sandbox anchor hardware", repair=repair,
+        )
+        control = HardwareControl(
+            fixture, self.kubectl,
+            lambda action, annotations: self._renew_lease(ownership, action, annotations),
+        )
+        try:
+            if fixture.state.get("primary_disable_intent"):
+                fixture.set_primary_enabled(True)
+            yield control
+        finally:
+            if fixture.state.get("primary_disable_intent"):
+                fixture.set_primary_enabled(True)
+            self._release_lease(ownership)
 
     def _require_isolated_kind(self, action: str) -> None:
         if urlsplit(self.config.api_url).hostname not in {"localhost", "127.0.0.1"}:

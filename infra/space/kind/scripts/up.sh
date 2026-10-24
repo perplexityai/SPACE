@@ -49,6 +49,10 @@
 #   SPACE_VENDOR_ROOT, SPACE_KIND_DATA_ROOT
 #                            host paths the cluster bind-mounts; see
 #                            infra/space/kind/scripts/lib/kind-host-paths.sh
+#   SPACE_SPLIT_TRUST_PROTOTYPE, SPACE_ANCHOR_KMS_REPLICA_REGION,
+#   SPACE_ANCHOR_CREDENTIALS_SECRET_NAME
+#                            default-off sandbox anchor prototype; changing
+#                            these settings restarts Tilt to reload its inputs
 set -euo pipefail
 set +x
 
@@ -117,6 +121,9 @@ KIND_STACK_DETACH=0
 TILT_SETTINGS=(
   SPACE_KIND_STORAGE_CREDENTIALS=exchange
   SPACE_KIND_RUST_BUILD=test-hooks
+  SPACE_SPLIT_TRUST_PROTOTYPE=false
+  SPACE_ANCHOR_KMS_REPLICA_REGION=
+  SPACE_ANCHOR_CREDENTIALS_SECRET_NAME=
   SPACE_KIND_OBSERVABILITY_CONFIG=
   SPACE_TILT_MAX_PARALLEL_UPDATES=8
   SPACE_LOOP_DEVICE_TARGET=

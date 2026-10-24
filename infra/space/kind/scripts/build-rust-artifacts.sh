@@ -232,6 +232,15 @@ build_health_probe_image() {
 
 # The Dockerfile's build arguments for this build: the release lane empties
 # both test-hook feature lists and narrows the package selection.
+split_trust_requested() {
+  [[ "${SPACE_SPLIT_TRUST_PROTOTYPE:-false}" == true || "${SPACE_SPLIT_TRUST_PROTOTYPE:-false}" == 1 ]]
+}
+
+split_trust_main_features() {
+  printf '%s\n' pplx-space-credmgr/split-trust-prototype \
+    pplx-space-sbx-mgr/split-trust-prototype
+}
+
 rust_build_args() {
   BUILD_ARGS=(--build-arg "SPACE_KIND_RUST_BUILD=$RUST_BUILD"
     --build-arg "SPACE_CARGO_RELEASE_LTO=$RELEASE_LTO")
@@ -239,6 +248,12 @@ rust_build_args() {
     BUILD_ARGS+=(--build-arg SPACE_KIND_TEST_HOOK_FEATURES=
       --build-arg SPACE_KIND_GUEST_TEST_HOOK_FEATURES=
       --build-arg "SPACE_KIND_CARGO_EXCLUDE=$CARGO_EXCLUDE")
+  fi
+  if split_trust_requested; then
+    [[ "$RUST_BUILD" != release ]] || die "split-trust prototype is forbidden in the release lane"
+    local prototype_features
+    prototype_features="$( { test_hook_features SPACE_KIND_TEST_HOOK_FEATURES; split_trust_main_features; } | paste -sd,)"
+    BUILD_ARGS+=(--build-arg "SPACE_KIND_TEST_HOOK_FEATURES=$prototype_features")
   fi
 }
 
@@ -372,6 +387,11 @@ uncovered_context_reads() {
 # committed inputs: it fails when any input is modified or untracked, or when
 # a Dockerfile reads the context in a way it cannot list.
 rust_input_key() {
+  # Prototype feature overrides are not part of the standard CI artifact key.
+  # Never label/reuse one as the ordinary build of the same source revision.
+  if split_trust_requested; then
+    return 1
+  fi
   local paths=() optional=() path dir base pin changes listing uncovered
   local pins="${SPACE_MIRRORED_IMAGES:-$REPO_ROOT/ci/mirrored-images.txt}"
   uncovered="$(uncovered_context_reads)"
@@ -492,6 +512,10 @@ assert_glibc_compatible() {
 build_incremental() {
   local release_dir host_release_dir features bins sup_features stamp
   mapfile -t features < <(main_build_features; test_hook_features SPACE_KIND_TEST_HOOK_FEATURES)
+  if split_trust_requested; then
+    [[ "$RUST_BUILD" != release ]] || die "split-trust prototype is forbidden in the release lane"
+    while read -r feature; do features+=("$feature"); done < <(split_trust_main_features)
+  fi
   mapfile -t bins < <(main_build_bins)
   mapfile -t sup_features < <(supervisor_features)
   (( ${#features[@]} > 0 && ${#bins[@]} > 0 && ${#sup_features[@]} > 0 )) \
@@ -604,7 +628,7 @@ build_incremental() {
 # supervisor helper rewrites its compatibility file on every run.
 assembly_key() {
   {
-    echo "$PROFILE $RUST_BUILD $RUNTIME_LIBC_IMAGE"
+    echo "$PROFILE $RUST_BUILD $RUNTIME_LIBC_IMAGE split-trust=${SPACE_SPLIT_TRUST_PROTOTYPE:-false}"
     sha256sum "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" "$HOST_DOCKERFILE" \
       docker/run-cargo-with-sccache.sh infra/space/kind/scripts/build-rust-artifacts.sh \
       infra/space/kind/scripts/sync-rust-sources.py
@@ -648,6 +672,9 @@ else
 fi
 case "$MODE" in
   prebuilt)
+    if split_trust_requested; then
+      die "split-trust prototype requires a local build, not the standard prebuilt handoff"
+    fi
     [[ -n "${SPACE_KIND_PREBUILT_RUST_IMAGE_ID:-}" && -n "${SPACE_KIND_PREBUILT_RUST_SHA:-}" ]] \
       || die "prebuilt mode requires an image ID and source SHA from the CI artifact handoff"
     [[ "$(docker image inspect -f '{{.Id}}' "$ARTIFACT_IMAGE")" == "$SPACE_KIND_PREBUILT_RUST_IMAGE_ID" ]] \

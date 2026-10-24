@@ -146,12 +146,14 @@ keys belong in evidence or Git.
 
 Run typed scenarios, not a second shell smoke:
 
-- `native.split_trust_disabled`: default-off shared-TLS compatibility.
+- `native.split_trust_disabled`: default-off no-anchor/direct-HTTPS compatibility.
+  Kind does not configure the legacy AWS Private CA; this is not a proof of
+  shared-CA interception or production rollout readiness.
 - `native.split_trust_tls`: fresh cold sandbox, live in-memory nonce/counter,
   own-anchor TLS and foreign-anchor rejection, resident pause/resume, durable
   suspend/restore, preserved certificate/public key and process identity.
-- `local.split_trust_lifecycle`: cold create, fork isolation, same-node and
-  cross-node durable restores.
+- `local.split_trust_lifecycle`: cold create, inherited shared-root removal,
+  fork isolation, same-node and cross-node durable restores.
 - `local.split_trust_rpc_auth`: authenticated exchange and negative callers.
 - `local.split_trust_warm_pool`: claimed warm-slot activation.
 - `local.split_trust_authority_recovery`: missing public catalog fails startup;

@@ -101,6 +101,13 @@ CHART_SET = TELEMETRY_SET + [
     "storageExchange.secretChecksum=" + STS_BRIDGE_SECRET_CHECKSUM,
     "rustBuild=" + RUST_BUILD,
 ]
+SPLIT_TRUST_PROTOTYPE = os.getenv("SPACE_SPLIT_TRUST_PROTOTYPE", "false")
+if SPLIT_TRUST_PROTOTYPE in ["true", "1"]:
+    CHART_SET += [
+        "splitTrust.enabled=true",
+        "splitTrust.kmsReplicaRegion=" + os.getenv("SPACE_ANCHOR_KMS_REPLICA_REGION", ""),
+        "splitTrust.credentialsSecretName=" + os.getenv("SPACE_ANCHOR_CREDENTIALS_SECRET_NAME", ""),
+    ]
 watch_file("infra/space/kind/charts/space-kind-telemetry")
 # Reconcile before returning any changed producer manifests, including on a
 # watched profile transition. Resource startup dependencies alone do not gate

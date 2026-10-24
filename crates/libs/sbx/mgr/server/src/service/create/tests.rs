@@ -259,6 +259,7 @@ async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoi
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
                 open_activation_claim_eligible: false,
                 restored_snapshot: RestoredSnapshotProvenance::default(),
+                trust_preparation: crate::split_trust::Preparation::Preserve,
             }),
         )
         .await

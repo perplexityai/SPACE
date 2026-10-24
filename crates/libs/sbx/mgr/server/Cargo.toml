@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [features]
+split-trust-prototype = ["dep:pem", "dep:x509-parser"]
 default = []
 otel = [
     "pplx-space-observability/otel",
@@ -27,6 +28,8 @@ datadog-otel = ["otel", "datadog"]
 test-hooks = ["pplx-space-common-core/test-hooks"]
 
 [dependencies]
+pem = { version = "4", optional = true }
+x509-parser = { workspace = true, features = ["verify-aws"], optional = true }
 rustix = { workspace = true, features = ["fs"] }
 nix = { workspace = true, features = ["dir", "fs", "user"] }
 arc-swap = { workspace = true }

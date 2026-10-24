@@ -38,6 +38,7 @@ pub(super) struct StartFromCheckpointLaunch<'a> {
         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     pub(super) open_activation_claim_eligible: bool,
     pub(super) restored_snapshot: RestoredSnapshotProvenance,
+    pub(super) trust_preparation: crate::split_trust::Preparation,
 }
 
 /// BYOK restore: rebuild the encrypted rootfs from the suspended `cow.luks` and
@@ -641,6 +642,7 @@ impl SandboxManagerService {
             route_identity_provenance,
             open_activation_claim_eligible,
             restored_snapshot,
+            trust_preparation,
         } = launch;
         // A stopped target is a data placement that must end before
         // Firecracker. The `Start` boundaries answer it before reaching here;
@@ -1388,12 +1390,16 @@ impl SandboxManagerService {
         // the proto-to-state mapping only emits these two — but the
         // FSM transition below will reject anything invalid.
         let final_state = target_state;
+        let finalization = super::activation_support::RestoreFinalization {
+            state: final_state,
+            trust: trust_preparation,
+        };
         if blocking {
             if let Err(error) = complete_restore_and_mark_final(
                 self.db.clone(),
                 id,
                 &sandbox.process_env,
-                final_state,
+                finalization,
                 Some(cleanup_id),
             )
             .await
@@ -1409,7 +1415,7 @@ impl SandboxManagerService {
                 self,
                 id.clone(),
                 sandbox.process_env.clone(),
-                final_state,
+                finalization,
                 sandbox.pool_template.is_none().then_some(snapshot_dir),
                 activation_cleanup,
                 cleanup_id,

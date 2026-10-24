@@ -1721,6 +1721,7 @@ impl SandboxManagerService {
                         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
                     open_activation_claim_eligible: false,
                     restored_snapshot: RestoredSnapshotProvenance::default(),
+                    trust_preparation: crate::split_trust::Preparation::Preserve,
                 })
                 .await?;
             } else {
