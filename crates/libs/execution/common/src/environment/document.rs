@@ -1,4 +1,4 @@
-//! Stored schema-v1 documents. Database migrations remain owned by the first
+//! Stored versioned environment documents. Database migrations remain owned by the first
 //! policy store; this codec does not reinterpret legacy execution JSON.
 use super::*;
 
@@ -33,7 +33,7 @@ pub enum EnvironmentDocumentError {
 impl EnvironmentDefinition {
     pub fn to_document(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&Document {
-            schema_version: ENVIRONMENT_SCHEMA_VERSION,
+            schema_version: self.schema_version(),
             reference: self.reference,
             descriptor: self.descriptor.spec().clone(),
         })
@@ -41,7 +41,10 @@ impl EnvironmentDefinition {
 
     pub fn from_document(text: &str) -> Result<Self, EnvironmentDocumentError> {
         let envelope: SchemaEnvelope = serde_json::from_str(text)?;
-        if envelope.schema_version != ENVIRONMENT_SCHEMA_VERSION {
+        if !matches!(
+            envelope.schema_version,
+            ENVIRONMENT_SCHEMA_VERSION | RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION
+        ) {
             return Err(EnvironmentDecodeError::UnsupportedSchema(envelope.schema_version).into());
         }
         // Decode the supported schema directly to reject duplicate keys, including
@@ -54,6 +57,8 @@ impl EnvironmentDefinition {
         }
         let descriptor = EnvironmentDescriptor::try_from(document.descriptor)
             .map_err(EnvironmentDecodeError::from)?;
-        Ok(Self::new(descriptor).check_reference(document.reference)?)
+        Ok(Self::new(descriptor)
+            .check_schema(document.schema_version)?
+            .check_reference(document.reference)?)
     }
 }

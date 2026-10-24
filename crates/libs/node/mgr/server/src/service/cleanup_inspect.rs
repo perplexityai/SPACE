@@ -802,8 +802,8 @@ impl NodeManagerService {
             sandbox_id: sandbox_id.to_string(),
             slot,
             uid,
-            fc_pid,
-            fc_alive: fc_pid.is_some_and(launch::is_pid_alive),
+            runtime_pid: fc_pid,
+            runtime_alive: fc_pid.is_some_and(launch::is_pid_alive),
             spaced_host_pid,
             spaced_host_alive: spaced_host_pid.is_some_and(launch::is_pid_alive),
             netgtw_pid,
@@ -864,9 +864,9 @@ impl NodeManagerService {
             },
             cache_dir_exists: std::path::Path::new(&format!("{CACHE_DIR}/{sandbox_id}")).exists(),
             run_dir_exists: std::path::Path::new(&run_dir).exists(),
-            jailer_chroot_exists: std::path::Path::new(&jail_root).exists(),
+            isolation_root_exists: std::path::Path::new(&jail_root).exists(),
             vm_config_exists: std::path::Path::new(&format!("{run_dir}/vm-config.json")).exists(),
-            fc_log_exists: std::path::Path::new(&format!("{jail_root}/fc.log")).exists()
+            runtime_log_exists: std::path::Path::new(&format!("{jail_root}/fc.log")).exists()
                 || std::path::Path::new(&format!("{run_dir}/fc.log")).exists(),
             vsock_sock_exists: std::path::Path::new(&format!("{jail_root}/v.sock")).exists(),
             spaced_sock_exists: std::path::Path::new(&format!("{run_dir}/spaced-host.sock"))
@@ -875,7 +875,7 @@ impl NodeManagerService {
                 "{CACHE_DIR}/{sandbox_id}/instance/rootfs.ext4"
             ))
             .exists(),
-            fc_pid_symlink_exists: std::fs::symlink_metadata(format!(
+            runtime_pid_link_exists: std::fs::symlink_metadata(format!(
                 "{RUN_DIR}/{sandbox_id}/fc.pid"
             ))
             .is_ok(),
@@ -883,7 +883,7 @@ impl NodeManagerService {
                 "{RUN_DIR}/{sandbox_id}/space-spaced-host-svc.pid"
             ))
             .is_ok(),
-            firecracker_pidfile_exists: std::path::Path::new(&format!(
+            runtime_pidfile_exists: std::path::Path::new(&format!(
                 "{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.pid"
             ))
             .exists(),
