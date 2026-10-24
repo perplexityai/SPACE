@@ -523,6 +523,32 @@ pub async fn set_auto_lifecycle_policy(
         == 1)
 }
 
+/// Compare-and-set form of [`set_auto_lifecycle_policy`] for callers that read
+/// the row without locking it. `expected` is the stored document exactly as
+/// read, not a re-serialized policy, so a non-canonical stored shape still
+/// matches. Terminal rows are never written: clearing `next_auto_event_at`
+/// there could cancel the event that finishes their teardown.
+pub async fn replace_auto_lifecycle_policy(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: SandboxId,
+    expected: &JsonValue,
+    policy: &pplx_space_common_core::types::AutoLifecyclePolicy,
+) -> Result<bool, SandboxStoreError> {
+    Ok(sqlx::query(sql!(
+        "UPDATE sandboxes SET auto_lifecycle_json = $1,
+            auto_lifecycle_state_json = '{}'::jsonb, next_auto_event_at = NULL
+         WHERE id = $2 AND auto_lifecycle_json = $3
+           AND lifecycle NOT IN ('stopping', 'stopped', 'deleting', 'quarantined', 'failed')"
+    ))
+    .bind(sqlx::types::Json(policy))
+    .bind(id)
+    .bind(expected)
+    .execute(executor)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
 /// Desired policy for an execution whose ownership has already been acquired.
 /// Read after the claim, so a policy-only update accepted before that claim is
 /// included even when the caller's original sandbox snapshot predates it.
@@ -543,8 +569,9 @@ pub async fn auto_lifecycle_policy(
 }
 
 /// Ownership evidence for deciding whether a timeout needs a live mutation.
-/// The caller must lock the sandbox row before reading this record and keep
-/// that lock through policy persistence. A missing route alone is not absence.
+/// A policy writer must read this after its write commits, because activation
+/// publishes its claim before reading the policy. A missing route alone is not
+/// absence.
 #[derive(Debug, sqlx::FromRow)]
 pub struct AutoLifecycleExecution {
     pub managed_by: String,
@@ -556,6 +583,8 @@ pub struct AutoLifecycleExecution {
     pub has_direct_route: bool,
     pub has_activation_lease: bool,
     pub policy: sqlx::types::Json<pplx_space_common_core::types::AutoLifecyclePolicy>,
+    /// `policy` as stored, the expected value for [`replace_auto_lifecycle_policy`].
+    pub policy_raw: JsonValue,
 }
 
 impl AutoLifecycleExecution {
@@ -588,7 +617,7 @@ pub async fn auto_lifecycle_execution(
                 COALESCE(e.generation, r.execution_generation) AS execution_generation,
                 r.sandbox_id IS NOT NULL AS has_direct_route,
                 s.restore_lease_token IS NOT NULL AS has_activation_lease,
-                s.auto_lifecycle_json AS policy
+                s.auto_lifecycle_json AS policy, s.auto_lifecycle_json AS policy_raw
          FROM sandboxes s
          LEFT JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
          LEFT JOIN sandbox_direct_route_identities r ON r.sandbox_id = s.id
