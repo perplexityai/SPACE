@@ -421,7 +421,7 @@ impl SandboxManagerService {
             async move {
                 let result = self
                     .recover_interrupted_pause_with_probe(row, |sandbox_id| async move {
-                        crate::runtime_reconciliation::observe_firecracker_vm_state(
+                        crate::runtime_reconciliation::observe_vm_state(
                             &sandbox_id,
                             "startup pause recovery",
                             &self.node_manager,
@@ -450,9 +450,8 @@ impl SandboxManagerService {
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError>
     where
         Probe: FnMut(SandboxId) -> ProbeFuture,
-        ProbeFuture: std::future::Future<
-                Output = crate::runtime_reconciliation::FirecrackerVmStateObservation,
-            >,
+        ProbeFuture:
+            std::future::Future<Output = crate::runtime_reconciliation::VmStateObservation>,
     {
         if !row.has_runtime_fields() {
             return self
@@ -465,11 +464,11 @@ impl SandboxManagerService {
                 .await;
         };
         use crate::runtime_reconciliation::observe_stable_resident_state;
-        use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+        use pplx_space_node_runtime_core::vm_state::VmState;
         let target = match observe_stable_resident_state(sandbox_id, probe).await {
-            Ok(FirecrackerVmState::Running) => crate::db::PauseFailedRecoveryTarget::Started,
-            Ok(FirecrackerVmState::Paused) => crate::db::PauseFailedRecoveryTarget::Paused,
-            Ok(FirecrackerVmState::NotStarted) => {
+            Ok(VmState::Running) => crate::db::PauseFailedRecoveryTarget::Started,
+            Ok(VmState::Paused) => crate::db::PauseFailedRecoveryTarget::Paused,
+            Ok(VmState::NotStarted) => {
                 return self
                     .quarantine_interrupted_pause(row, "Firecracker reported NotStarted")
                     .await;

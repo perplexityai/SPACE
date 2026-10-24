@@ -27,7 +27,7 @@ impl NodeManagerService {
             .map(|verified| verified.environment_reference.clone());
         let launched = self
             .runtime_supervisor
-            .launch_firecracker(request)
+            .launch_runtime(request.into())
             .await
             .map_err(pplx_space_node_runtime_core::launch_admission::supervisor_launch_status)?
             .into_inner();
@@ -39,7 +39,12 @@ impl NodeManagerService {
                 "supervisor did not acknowledge the verified execution environment",
             ));
         }
-        Ok(launched)
+        Ok(
+            pplx_space_node_runtime_core::proto::LaunchFirecrackerResponse {
+                pid: launched.pid,
+                accepted_environment_reference: launched.accepted_environment_reference,
+            },
+        )
     }
 
     async fn acquire_preparation_ownership(

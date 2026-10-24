@@ -25,7 +25,7 @@ use pplx_space_common_core::types::{LinuxPid, SandboxId, SemVer};
 use pplx_space_metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
 };
-use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+use pplx_space_node_runtime_core::vm_state::VmState;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::db::guest_health_scan::SandboxGuestHealthRow;
@@ -177,7 +177,7 @@ where
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GuestHealthProbe {
-    firecracker_alive: bool,
+    runtime_alive: bool,
     guest_healthy: bool,
     spaced_host_alive: bool,
     consecutive_guest_probe_failures: u32,
@@ -186,7 +186,7 @@ struct GuestHealthProbe {
 impl From<&SandboxHealth> for GuestHealthProbe {
     fn from(health: &SandboxHealth) -> Self {
         Self {
-            firecracker_alive: health.firecracker_alive,
+            runtime_alive: health.runtime_alive,
             guest_healthy: health.guest_healthy,
             spaced_host_alive: health.spaced_host_alive,
             consecutive_guest_probe_failures: health.consecutive_guest_probe_failures,
@@ -318,7 +318,7 @@ impl SidecarRestartRequest {
     }
 
     fn still_needs_restart(&self, current: &SidecarInfo) -> bool {
-        if !self.still_has_authority(current) || !firecracker_alive(self.sandbox_id()) {
+        if !self.still_has_authority(current) || !runtime_alive(self.sandbox_id()) {
             return false;
         }
         match self {
@@ -394,7 +394,7 @@ pub struct SandboxHealth {
     pub guest_healthy: bool,
     pub guest_ready: bool,
     pub consecutive_guest_probe_failures: u32,
-    pub firecracker_alive: bool,
+    pub runtime_alive: bool,
     pub vsock_raw_ping_ok: bool,
     pub spaced_host_alive: bool,
     pub netgtw_alive: bool,
@@ -518,7 +518,7 @@ impl HealthComponent {
 
     fn as_proto(self) -> i32 {
         match self {
-            Self::Firecracker => crate::proto::SandboxHealthComponent::Firecracker as i32,
+            Self::Firecracker => crate::proto::SandboxHealthComponent::Runtime as i32,
             Self::SpacedHost => crate::proto::SandboxHealthComponent::SpacedHost as i32,
             Self::SpacedGuest => crate::proto::SandboxHealthComponent::SpacedGuest as i32,
             Self::NetGateway => crate::proto::SandboxHealthComponent::NetGateway as i32,
@@ -596,7 +596,7 @@ struct HealthObservation {
     latency_micros: u64,
     outcome: HealthProbeOutcome,
     detail: String,
-    firecracker_state: Option<FirecrackerVmState>,
+    firecracker_state: Option<VmState>,
     lifecycle_epoch: u64,
 }
 
@@ -843,7 +843,7 @@ impl SandboxWatchdog {
             guest_healthy: true,
             guest_ready: false,
             consecutive_guest_probe_failures: 0,
-            firecracker_alive: firecracker_alive(&id),
+            runtime_alive: runtime_alive(&id),
             vsock_raw_ping_ok: false,
             spaced_host_alive: sidecar_alive(&id, "space-spaced-host-svc"),
             netgtw_alive: sidecar_alive(&id, "space-netgtw-svc"),
@@ -1206,7 +1206,7 @@ impl SandboxHealth {
         self.health_components.get_mut(component).degraded = degraded;
     }
 
-    pub(crate) fn cached_firecracker_state(&self) -> Option<FirecrackerVmState> {
+    pub(crate) fn cached_firecracker_state(&self) -> Option<VmState> {
         if self
             .health_observed_at
             .and_then(|observed| observed.elapsed().ok())
@@ -1245,7 +1245,7 @@ async fn observe_authoritative_net_gateway_process(
     let Some(health) = health.get_mut(sandbox_id) else {
         return false;
     };
-    health.netgtw_alive = health.firecracker_alive && observed_live_pid.is_some();
+    health.netgtw_alive = health.runtime_alive && observed_live_pid.is_some();
     health.observe_net_gateway_process(observed_live_pid);
     true
 }
@@ -1323,7 +1323,7 @@ async fn sidecar_loop(
         for info in &sidecar_snapshot {
             let id = &info.sandbox_id;
 
-            let firecracker_alive = firecracker_alive(id);
+            let runtime_alive = runtime_alive(id);
 
             // Check sidecar PID symlinks. These only count as alive while the VM
             // itself is still alive; otherwise the sidecars are not useful even
@@ -1334,17 +1334,17 @@ async fn sidecar_loop(
             // watchdog/DB authority. A launch that succeeded before a later
             // configure or persist failure is retried and adopted instead of
             // being mistaken for a healthy completed restart forever.
-            let spaced_alive = firecracker_alive
-                && sidecar_pid_is_committed(info.spaced_host_pid, spaced_live_pid);
+            let spaced_alive =
+                runtime_alive && sidecar_pid_is_committed(info.spaced_host_pid, spaced_live_pid);
             let netgtw_alive =
-                firecracker_alive && sidecar_pid_is_committed(info.netgtw_pid, netgtw_live_pid);
+                runtime_alive && sidecar_pid_is_committed(info.netgtw_pid, netgtw_live_pid);
 
             let observed_netgtw_pid = if netgtw_alive { netgtw_live_pid } else { None };
             {
                 let mut map = state.lock().await;
                 if let Some(health) = map.get_mut(id.as_str()) {
-                    health.firecracker_alive = firecracker_alive;
-                    if !firecracker_alive {
+                    health.runtime_alive = runtime_alive;
+                    if !runtime_alive {
                         // The composed health loop owns normal updates for this
                         // observability-only bit.
                         health.vsock_raw_ping_ok = false;
@@ -1362,7 +1362,7 @@ async fn sidecar_loop(
             .await;
 
             // If FC is not alive, no point checking sidecars or the guest bridge.
-            if !firecracker_alive {
+            if !runtime_alive {
                 continue;
             }
 
@@ -1964,17 +1964,17 @@ fn lifecycle_has_guest_health_metric(state: crate::state::SandboxState) -> bool 
 }
 
 fn guest_health_probe_from_processes(sandbox_id: &str) -> GuestHealthProbe {
-    let firecracker_alive = firecracker_alive(sandbox_id);
+    let runtime_alive = runtime_alive(sandbox_id);
     GuestHealthProbe {
-        firecracker_alive,
+        runtime_alive,
         guest_healthy: false,
-        spaced_host_alive: firecracker_alive && sidecar_alive(sandbox_id, "space-spaced-host-svc"),
+        spaced_host_alive: runtime_alive && sidecar_alive(sandbox_id, "space-spaced-host-svc"),
         consecutive_guest_probe_failures: GUEST_HEALTH_FAILURE_THRESHOLD,
     }
 }
 
 fn classify_guest_health(probe: GuestHealthProbe) -> GuestHealthCategory {
-    if !probe.firecracker_alive {
+    if !probe.runtime_alive {
         return GuestHealthCategory::Unreachable;
     }
     if !probe.guest_healthy
@@ -2340,7 +2340,7 @@ async fn probe_firecracker_health(
     node_manager: &NodeManagerConnector,
 ) -> HealthObservation {
     let started = Instant::now();
-    if !firecracker_alive(sandbox_id) {
+    if !runtime_alive(sandbox_id) {
         return health_observation(
             started,
             HealthProbeOutcome::Unavailable,
@@ -2353,8 +2353,8 @@ async fn probe_firecracker_health(
             return health_observation(started, HealthProbeOutcome::Unavailable, error.to_string());
         }
     };
-    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(sandbox_id, node_manager).await {
-        Err(crate::firecracker_via_nodemgr::FirecrackerStateReadError::Timeout { .. }) => {
+    match crate::runtime_via_nodemgr::get_vm_state(sandbox_id, node_manager).await {
+        Err(crate::runtime_via_nodemgr::RuntimeStateReadError::Timeout { .. }) => {
             health_observation(
                 started,
                 HealthProbeOutcome::Timeout,
@@ -2368,8 +2368,8 @@ async fn probe_firecracker_health(
         ),
         Ok(vm_state) => {
             let expected = match lifecycle {
-                Some(crate::state::SandboxState::Started) => Some(FirecrackerVmState::Running),
-                Some(crate::state::SandboxState::Paused) => Some(FirecrackerVmState::Paused),
+                Some(crate::state::SandboxState::Started) => Some(VmState::Running),
+                Some(crate::state::SandboxState::Paused) => Some(VmState::Paused),
                 _ => None,
             };
             match expected {
@@ -2526,7 +2526,7 @@ fn firecracker_health_observation(
     started: Instant,
     outcome: HealthProbeOutcome,
     detail: impl Into<String>,
-    state: FirecrackerVmState,
+    state: VmState,
 ) -> HealthObservation {
     HealthObservation {
         firecracker_state: Some(state),
@@ -2789,9 +2789,9 @@ fn pause_failed_recovery_target(
         return None;
     }
     match firecracker_state {
-        FirecrackerVmState::Running => Some(crate::db::PauseFailedRecoveryTarget::Started),
-        FirecrackerVmState::Paused => Some(crate::db::PauseFailedRecoveryTarget::Paused),
-        FirecrackerVmState::NotStarted => None,
+        VmState::Running => Some(crate::db::PauseFailedRecoveryTarget::Started),
+        VmState::Paused => Some(crate::db::PauseFailedRecoveryTarget::Paused),
+        VmState::NotStarted => None,
     }
 }
 
@@ -3129,7 +3129,7 @@ fn spaced_host_socket_path(sandbox_id: &str) -> String {
     )
 }
 
-fn firecracker_alive(sandbox_id: &str) -> bool {
+fn runtime_alive(sandbox_id: &str) -> bool {
     Path::new(&format!("{RUN_DIR}/{sandbox_id}/fc.pid")).exists()
 }
 

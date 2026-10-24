@@ -1,4 +1,4 @@
-//! Schema-v1 environment codec and content identity. This is not an execution
+//! Versioned environment codec and content identity. This is not an execution
 //! allowlist: consumers must resolve the reference against their approved catalog.
 
 use aws_lc_rs::digest::{SHA256, digest};
@@ -7,14 +7,21 @@ use pplx_space_common_core::types::*;
 use crate::{ExecutionProtoError, proto};
 
 mod binding;
+mod profiles;
+mod transport;
 pub use binding::{EnvironmentBindingError, EnvironmentRequirementsError};
+pub use transport::{FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT};
 
+/// Original encoding; existing definitions retain these bytes and references.
 pub const ENVIRONMENT_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvironmentDefinition {
     reference: EnvironmentReference,
     descriptor: EnvironmentDescriptor,
+    // Immutable historical representation used only for identity and old peers.
+    legacy_descriptor: Option<EnvironmentDescriptor>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +32,18 @@ pub enum EnvironmentDecodeError {
     Missing(&'static str),
     #[error("unsupported execution environment {field} value {value}")]
     UnsupportedValue { field: &'static str, value: i32 },
+    #[error("schema {claimed} does not describe these environment profiles (expected {expected})")]
+    SchemaMismatch { claimed: u32, expected: u32 },
+    #[error("generic profile cannot represent the requested historical identity")]
+    IdentityEncoding,
+    #[error("peer cannot decode this environment definition")]
+    UnsupportedPeer,
+    #[error("invalid execution contract: {0}")]
+    Contract(#[from] ExecutionContractIdParseError),
+    #[error("invalid boot artifact role: {0}")]
+    Role(#[from] ArtifactComponentRoleParseError),
+    #[error("invalid boot artifact format: {0}")]
+    Format(#[from] ArtifactFormatParseError),
     #[error("invalid execution environment field: {0}")]
     Field(#[from] ExecutionProtoError),
     #[error("invalid execution environment: {0}")]
@@ -46,6 +65,15 @@ impl EnvironmentDefinition {
         Self {
             reference: EnvironmentReference::new(Digest::sha256(bytes)),
             descriptor,
+            legacy_descriptor: None,
+        }
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        let RuntimeBinding::ManagedRelease(release) = &self.descriptor.spec().runtime;
+        match release.layout {
+            RuntimePayloadLayout::FirecrackerReleaseV1 => ENVIRONMENT_SCHEMA_VERSION,
+            RuntimePayloadLayout::CatalogReleaseV1 => RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION,
         }
     }
 
@@ -54,6 +82,14 @@ impl EnvironmentDefinition {
     }
     pub fn descriptor(&self) -> &EnvironmentDescriptor {
         &self.descriptor
+    }
+
+    fn check_schema(self, claimed: u32) -> Result<Self, EnvironmentDecodeError> {
+        let expected = self.schema_version();
+        if claimed != expected {
+            return Err(EnvironmentDecodeError::SchemaMismatch { claimed, expected });
+        }
+        Ok(self)
     }
 
     fn check_reference(
@@ -73,11 +109,16 @@ impl EnvironmentDefinition {
 /// Fixed field order, ASCII keys and canonical scalar spellings, final newline.
 /// Identifiers cannot contain newlines or '='. No wire/JSON bytes, observations,
 /// labels, source URLs, or node-local paths participate. See docs/execution-environments.md.
-pub fn canonical_descriptor(descriptor: &EnvironmentDescriptor) -> String {
+fn canonical_descriptor(descriptor: &EnvironmentDescriptor) -> String {
     let spec = descriptor.spec();
     let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
-    let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
-    let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } = &spec.compatibility;
+    let (
+        BootProfile::LinuxDirectV1 { kernel },
+        ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format },
+    ) = (&spec.boot, &spec.compatibility)
+    else {
+        return profiles::canonical_descriptor(descriptor);
+    };
     format!(
         concat!(
             "space.execution.environment\nschema={}\n",
@@ -149,11 +190,13 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
     fn from(value: &EnvironmentDefinition) -> Self {
         let spec = value.descriptor.spec();
         let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
-        let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
-        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-            &spec.compatibility;
         Self {
-            schema_version: ENVIRONMENT_SCHEMA_VERSION,
+            schema_version: value.schema_version(),
+            identity_schema_version: if value.identity_schema_version() == value.schema_version() {
+                0
+            } else {
+                value.identity_schema_version()
+            },
             reference: value.reference.to_string(),
             descriptor: Some(proto::EnvironmentDescriptor {
                 host: Some(spec.host.into()),
@@ -168,6 +211,9 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
                                 RuntimePayloadLayout::FirecrackerReleaseV1 => {
                                     proto::RuntimePayloadLayout::FirecrackerReleaseV1
                                 }
+                                RuntimePayloadLayout::CatalogReleaseV1 => {
+                                    proto::RuntimePayloadLayout::CatalogReleaseV1
+                                }
                             } as i32,
                         },
                     )),
@@ -178,26 +224,8 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
                 isolation: match spec.isolation {
                     IsolationClass::HardwareVm => proto::IsolationClass::HardwareVm,
                 } as i32,
-                boot: Some(proto::BootProfile {
-                    profile: Some(proto::boot_profile::Profile::LinuxDirectV1(
-                        proto::LinuxDirectBootV1 {
-                            kernel: Some(proto::EnvironmentComponent {
-                                kind: proto::ArtifactComponentKind::from(kernel.kind) as i32,
-                                version: kernel.version.to_string(),
-                                digest: kernel.digest.to_string(),
-                            }),
-                        },
-                    )),
-                }),
-                compatibility: Some(proto::ExecutionCompatibilityProfile {
-                    profile: Some(
-                        proto::execution_compatibility_profile::Profile::FirecrackerSnapshotV1(
-                            proto::FirecrackerSnapshotCompatibilityV1 {
-                                state_format: Some(state_format.into()),
-                            },
-                        ),
-                    ),
-                }),
+                boot: Some((&spec.boot).into()),
+                compatibility: Some((&spec.compatibility).into()),
             }),
         }
     }
@@ -206,7 +234,10 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
 impl TryFrom<&proto::EnvironmentDefinition> for EnvironmentDefinition {
     type Error = EnvironmentDecodeError;
     fn try_from(value: &proto::EnvironmentDefinition) -> Result<Self, Self::Error> {
-        if value.schema_version != ENVIRONMENT_SCHEMA_VERSION {
+        if !matches!(
+            value.schema_version,
+            ENVIRONMENT_SCHEMA_VERSION | RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION
+        ) {
             return Err(EnvironmentDecodeError::UnsupportedSchema(
                 value.schema_version,
             ));
@@ -218,18 +249,6 @@ impl TryFrom<&proto::EnvironmentDefinition> for EnvironmentDefinition {
                 .as_ref(),
             "runtime provider",
         )?;
-        let proto::boot_profile::Profile::LinuxDirectV1(boot) = required(
-            required(spec.boot.as_ref(), "boot")?.profile.as_ref(),
-            "boot profile",
-        )?;
-        let kernel = required(boot.kernel.as_ref(), "boot kernel")?;
-        let proto::execution_compatibility_profile::Profile::FirecrackerSnapshotV1(compatibility) =
-            required(
-                required(spec.compatibility.as_ref(), "compatibility")?
-                    .profile
-                    .as_ref(),
-                "compatibility profile",
-            )?;
         let descriptor = EnvironmentSpec {
             host: required(spec.host.as_ref(), "host")?.try_into()?,
             guest: required(spec.guest.as_ref(), "guest")?.try_into()?,
@@ -249,25 +268,24 @@ impl TryFrom<&proto::EnvironmentDefinition> for EnvironmentDefinition {
                     Ok(proto::RuntimePayloadLayout::FirecrackerReleaseV1) => {
                         RuntimePayloadLayout::FirecrackerReleaseV1
                     }
+                    Ok(proto::RuntimePayloadLayout::CatalogReleaseV1) => {
+                        RuntimePayloadLayout::CatalogReleaseV1
+                    }
                     _ => return Err(unsupported("release layout", release.layout)),
                 },
             }),
-            boot: BootProfile::LinuxDirectV1 {
-                kernel: ComponentIdentity {
-                    kind: proto::ArtifactComponentKind::try_from(kernel.kind)
-                        .map_err(|_| unsupported("component kind", kernel.kind))?
-                        .try_into()?,
-                    version: kernel.version.parse().map_err(ExecutionProtoError::from)?,
-                    digest: kernel.digest.parse()?,
-                },
-            },
-            compatibility: ExecutionCompatibilityProfile::FirecrackerSnapshotV1 {
-                state_format: required(compatibility.state_format.as_ref(), "state format")?
-                    .try_into()?,
-            },
+            boot: required(spec.boot.as_ref(), "boot")?.try_into()?,
+            compatibility: required(spec.compatibility.as_ref(), "compatibility")?.try_into()?,
         }
         .try_into()?;
-        Self::new(descriptor).check_reference(value.reference.parse()?)
+        let identity = if value.identity_schema_version == 0 {
+            value.schema_version
+        } else {
+            value.identity_schema_version
+        };
+        Self::from_representation(descriptor, value.schema_version, identity)?
+            .check_reference(value.reference.parse()?)?
+            .into_runtime_neutral()
     }
 }
 

@@ -74,12 +74,12 @@ pub(super) enum PauseReconciliationOutcome {
 }
 
 pub(super) fn pause_reconciliation_outcome(
-    observation: &crate::runtime_reconciliation::FirecrackerVmStateObservation,
+    observation: &crate::runtime_reconciliation::VmStateObservation,
 ) -> PauseReconciliationOutcome {
     match observation.state() {
-        Some(FirecrackerVmState::Paused) => PauseReconciliationOutcome::Paused,
-        Some(FirecrackerVmState::Running) => PauseReconciliationOutcome::Running,
-        Some(FirecrackerVmState::NotStarted) => {
+        Some(VmState::Paused) => PauseReconciliationOutcome::Paused,
+        Some(VmState::Running) => PauseReconciliationOutcome::Running,
+        Some(VmState::NotStarted) => {
             PauseReconciliationOutcome::Unknown("Firecracker reported NotStarted".to_string())
         }
         None => PauseReconciliationOutcome::Unknown(
@@ -97,8 +97,7 @@ async fn reconcile_state_after_unconfirmed_pause(
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> PauseReconciliationOutcome {
     let observation =
-        observe_firecracker_vm_state(sandbox_id, "pause response reconciliation", node_manager)
-            .await;
+        observe_vm_state(sandbox_id, "pause response reconciliation", node_manager).await;
     let outcome = pause_reconciliation_outcome(&observation);
     tracing::warn!(
         sandbox_id = %sandbox_id,
