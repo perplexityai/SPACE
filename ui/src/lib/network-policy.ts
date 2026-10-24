@@ -31,6 +31,9 @@ export function networkPolicyFromMode(
       deny: [],
     },
     tls_interception: tlsInterceptionMode(loadedPolicy),
+    ...(loadedPolicy?.network_credential_rules?.length
+      ? { network_credential_rules: loadedPolicy.network_credential_rules }
+      : {}),
     ...(loadedPolicy?.tls_interception_exemptions?.length
       ? { tls_interception_exemptions: loadedPolicy.tls_interception_exemptions }
       : {}),
@@ -50,6 +53,9 @@ export function networkPolicyFromDetailed(
       deny: rules.filter((rule) => rule.decision === 'deny').map(destinationFromRule),
     },
     tls_interception: tlsInterceptionMode(loadedPolicy),
+    ...(loadedPolicy?.network_credential_rules?.length
+      ? { network_credential_rules: loadedPolicy.network_credential_rules }
+      : {}),
     ...(loadedPolicy?.tls_interception_exemptions?.length
       ? { tls_interception_exemptions: loadedPolicy.tls_interception_exemptions }
       : {}),
@@ -73,6 +79,7 @@ function normalizedNetworkPolicy(policy?: NetworkPolicyV1 | null): NetworkPolicy
       deny: policy.egress.deny ?? [],
     },
     tls_interception: tlsInterceptionMode(policy),
+    network_credential_rules: policy.network_credential_rules ?? [],
     tls_interception_exemptions: policy.tls_interception_exemptions ?? [],
   };
 }
