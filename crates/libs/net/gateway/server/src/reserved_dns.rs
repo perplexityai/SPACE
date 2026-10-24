@@ -64,6 +64,13 @@ impl ReservedResolver {
         }
     }
 
+    fn other(self) -> Self {
+        match self {
+            Self::Cloudflare => Self::Google,
+            Self::Google => Self::Cloudflare,
+        }
+    }
+
     fn from_ip(destination: IpAddr) -> Option<Self> {
         match destination {
             IpAddr::V4(CLOUDFLARE_DNS) => Some(Self::Cloudflare),
@@ -71,6 +78,42 @@ impl ReservedResolver {
             IpAddr::V4(_) | IpAddr::V6(_) => None,
         }
     }
+}
+
+/// Chooses the upstream provider for a query the guest sent to `addressed`.
+///
+/// Guest images list 8.8.8.8 before 1.1.1.1, and glibc keeps sending to the
+/// first nameserver until it fails, so nearly all reserved DNS went to Google
+/// and Cloudflare only saw timeouts' retries. A stable hash of the sandbox id
+/// now puts half of the sandboxes on each provider: those sandboxes are served
+/// by the addressed provider, the other half by the other one. Within one
+/// sandbox the mapping is fixed, so the guest's retry to its second nameserver
+/// still reaches the other provider, and each sandbox's lookups stay on one
+/// provider's cache and connection.
+fn upstream_for(sandbox_id: &str, addressed: ReservedResolver) -> ReservedResolver {
+    if sandbox_swaps_resolvers(sandbox_id) {
+        addressed.other()
+    } else {
+        addressed
+    }
+}
+
+/// FNV-1a over the sandbox id, then the SplitMix64 finalizer so ids that
+/// differ only in their last characters still split evenly; the top bit is
+/// the swap decision. This is a fixed function (unlike `DefaultHasher`), so a
+/// sandbox keeps its provider across gateway restarts and releases.
+fn sandbox_swaps_resolvers(sandbox_id: &str) -> bool {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in sandbox_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    hash >> 63 == 1
 }
 
 #[derive(Debug)]
@@ -142,6 +185,7 @@ impl ReservedDnsCore {
         resolver: ReservedResolver,
         wire: &[u8],
     ) -> Vec<u8> {
+        let resolver = upstream_for(sandbox_id, resolver);
         let request = parse_guest_request(wire);
         let started_at = Instant::now();
         let result = Err(match &request {
@@ -169,6 +213,7 @@ impl ReservedDnsCore {
         admitted_policy: &NetworkPolicyV1,
         shutdown: &CancellationToken,
     ) -> ResolveOutcome {
+        let resolver = upstream_for(sandbox_id, resolver);
         let request = parse_guest_request(wire);
         let started_at = Instant::now();
         let result = async {
