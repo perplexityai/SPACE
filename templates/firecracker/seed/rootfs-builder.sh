@@ -284,9 +284,20 @@ spaced_compatibility_family() {
 SPACED_COMPATIBILITY_FAMILY="$(spaced_compatibility_family "$SPACED_VERSION")"
 RUNTIME="${SPACE_SEED_RUNTIME:-firecracker}"
 : "${SPACE_SEED_RUNTIME_VERSION:?SPACE_SEED_RUNTIME_VERSION is required for seed execution metadata}"
-: "${SPACE_SEED_STATE_FORMAT_VERSION:?SPACE_SEED_STATE_FORMAT_VERSION is required for seed execution metadata}"
 RUNTIME_VERSION="${SPACE_SEED_RUNTIME_VERSION}"
-STATE_FORMAT_VERSION="${SPACE_SEED_STATE_FORMAT_VERSION}"
+STATE_FORMAT_VERSION="${SPACE_SEED_STATE_FORMAT_VERSION:-}"
+STATE_FORMAT_NAME="${SPACE_SEED_STATE_FORMAT:-}"
+if [[ "$RUNTIME" == "firecracker" ]]; then
+  STATE_FORMAT_NAME="${STATE_FORMAT_NAME:-firecracker-snapshot}"
+  : "${STATE_FORMAT_VERSION:?Firecracker requires a state format version}"
+fi
+STATE_FORMAT_JSON=null
+if [[ -n "$STATE_FORMAT_NAME" || -n "$STATE_FORMAT_VERSION" ]]; then
+  : "${STATE_FORMAT_NAME:?state format name and version must be supplied together}"
+  : "${STATE_FORMAT_VERSION:?state format name and version must be supplied together}"
+  STATE_FORMAT_JSON="{\"format\":\"${STATE_FORMAT_NAME}\",\"version\":\"${STATE_FORMAT_VERSION}\"}"
+fi
+KERNEL_FORMAT="${SPACE_SEED_KERNEL_FORMAT:-vmlinux}"
 KERNEL_VERSION="${SPACE_SEED_KERNEL_VERSION:-}"
 KERNEL_DIGEST="${SPACE_SEED_KERNEL_DIGEST:-}"
 KERNEL_COMPONENT=""
@@ -302,7 +313,7 @@ if [[ -n "$KERNEL_VERSION" ]]; then
     "role": "boot",
     "version": "${KERNEL_VERSION}",
     "digest": "${KERNEL_DIGEST}",
-    "format": "vmlinux"
+    "format": "${KERNEL_FORMAT}"
   }
 EOF
 )
@@ -913,10 +924,7 @@ cat > "${OUTPUT}/metadata.json" <<EOF
       "os": "linux",
       "architecture": "${ARCH}"
     },
-    "state_format": {
-      "format": "firecracker-snapshot",
-      "version": "${STATE_FORMAT_VERSION}"
-    },
+    "state_format": ${STATE_FORMAT_JSON},
     "components": [${KERNEL_COMPONENT}]
   },
   "id": "${ID}",
