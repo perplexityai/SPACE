@@ -98,7 +98,7 @@ fn incomplete_or_unknown_wire_values_never_default_to_e0() {
         mutate(wire.descriptor.as_mut().unwrap());
         assert!(EnvironmentDefinition::try_from(&wire).is_err(), "{name}");
     }
-    for schema in [0, 2, u32::MAX] {
+    for schema in [0, 3, u32::MAX] {
         let mut wire = proto::EnvironmentDefinition::from(&e0());
         wire.schema_version = schema;
         assert!(
@@ -160,16 +160,23 @@ fn semantic_changes_cannot_retain_the_old_reference() {
             r.digest = Digest::sha256([1; 32]);
         }),
         ("kernel version", |s| {
-            let BootProfile::LinuxDirectV1 { kernel } = &mut s.boot;
+            let BootProfile::LinuxDirectV1 { kernel } = &mut s.boot else {
+                panic!("expected schema-1 fixture")
+            };
             kernel.version = "6.18.44".parse().unwrap();
         }),
         ("kernel digest", |s| {
-            let BootProfile::LinuxDirectV1 { kernel } = &mut s.boot;
+            let BootProfile::LinuxDirectV1 { kernel } = &mut s.boot else {
+                panic!("expected schema-1 fixture")
+            };
             kernel.digest = Digest::sha256([2; 32]);
         }),
         ("state version", |s| {
             let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-                &mut s.compatibility;
+                &mut s.compatibility
+            else {
+                panic!("expected schema-1 fixture")
+            };
             state_format.version = "10.0.0".parse().unwrap();
         }),
         ("architecture", |s| {
