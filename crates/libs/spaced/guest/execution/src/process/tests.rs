@@ -459,7 +459,7 @@ async fn failed_start_retains_admission_until_the_child_is_reaped() {
             child.wait().await.expect("child exits");
             assert!(child.id().is_none());
         }
-        terminate_and_reap_failed_start(child, reservation);
+        terminate_and_reap_failed_start(child, reservation, &tokio_util::task::TaskTracker::new());
         assert_eq!(
             registry.record_slots.available_permits(),
             PROCESS_RECORD_LIMIT - 1
@@ -1117,24 +1117,50 @@ async fn login_tty_pty_supports_output_input_and_resize() {
 
 #[tokio::test]
 async fn cancelled_account_lookup_retains_admission_until_nss_returns() {
+    let service = cancellation_service();
     let slots = Arc::new(Semaphore::new(
         pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS as usize,
     ));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let lookup = tokio::spawn(resolve_process_account(slots.clone(), None, move || {
-        let _ = started_tx.send(());
-        release_rx.recv().unwrap();
-        Err(Status::unavailable("lookup fixture finished"))
-    }));
+    let lookup = tokio::spawn(resolve_process_account(
+        service.inner.process_tasks.clone(),
+        slots.clone(),
+        None,
+        move || {
+            let _ = started_tx.send(());
+            release_rx.recv().unwrap();
+            Err(Status::unavailable("lookup fixture finished"))
+        },
+    ));
     started_rx.await.unwrap();
     lookup.abort();
     let _ = lookup.await;
-    let retry = resolve_process_account(slots.clone(), None, || {
-        Err(Status::unavailable("lookup ran"))
-    })
+    let retry = resolve_process_account(
+        service.inner.process_tasks.clone(),
+        slots.clone(),
+        None,
+        || Err(Status::unavailable("lookup ran")),
+    )
     .await;
+    let mut draining = Box::pin(service.drain());
+    assert!(futures_util::poll!(&mut draining).is_pending());
+    drop(draining);
+    assert!(
+        !service.inner.shutdown.is_cancelled(),
+        "dropping a graceful drain must not cancel work"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            service.drain_with_timeout(Duration::ZERO).await,
+            Err(crate::IncompleteExecutionDrain)
+        );
+    }
+    assert!(service.inner.shutdown.is_cancelled());
     release_tx.send(()).unwrap();
+    let (first, second) = tokio::join!(service.drain(), service.drain());
+    first.expect("first drain observes lookup completion");
+    second.expect("concurrent drain observes lookup completion");
     let retry = retry.unwrap_err();
     assert_eq!(retry.code(), tonic::Code::ResourceExhausted);
     assert!(pplx_space_common_grpc::is_refused_before_start(&retry));
@@ -1254,7 +1280,7 @@ fn stalled_placement_service() -> (ExecutionService, StalledPlacement) {
 #[cfg(target_os = "linux")]
 async fn wait_for_start_owner(service: &ExecutionService) {
     tokio::time::timeout(Duration::from_secs(10), async {
-        while service.inner.process_tasks.is_empty() {
+        while service.inner.processes.records.is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -1264,8 +1290,8 @@ async fn wait_for_start_owner(service: &ExecutionService) {
 
 #[cfg(target_os = "linux")]
 async fn shut_down(service: &ExecutionService) {
-    service.close();
-    service.inner.process_tasks.wait().await;
+    service.cancel();
+    service.drain().await.expect("complete shutdown");
 }
 
 // A spawn can stall for seconds under memory or I/O pressure. It must hold up
@@ -1322,7 +1348,7 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
                         .map(drop)
                     }
                 });
-                while service.inner.process_tasks.len() < 2 {
+                while service.inner.processes.records.len() < 2 {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 let _ = admitted_tx.send(());
@@ -1431,7 +1457,7 @@ async fn a_start_dropped_during_its_spawn_still_runs_once() {
     let (service, placement) = stalled_placement_service();
     let mut start = Box::pin(Process::start(&service, cancellation_start_request()));
     tokio::time::timeout(Duration::from_secs(1), async {
-        while service.inner.process_tasks.is_empty() {
+        while service.inner.processes.records.is_empty() {
             assert!(futures_util::poll!(start.as_mut()).is_pending());
             tokio::task::yield_now().await;
         }
@@ -1468,8 +1494,8 @@ async fn a_start_dropped_during_its_spawn_still_runs_once() {
     shut_down(&service).await;
 }
 
-// Shutdown closes `process_tasks` under the start gate, so it must also wait
-// for a start whose spawn is still in progress, then stop that process.
+// Cancellation must retain a start whose spawn is still in progress, then
+// stop and reap that process before reporting a complete drain.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn shutdown_waits_for_a_start_stalled_in_its_spawn() {
@@ -1490,20 +1516,18 @@ async fn shutdown_waits_for_a_start_stalled_in_its_spawn() {
         }
     });
     wait_for_start_owner(&service).await;
-    service.close();
+    service.cancel();
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            service.inner.process_tasks.wait()
-        )
-        .await
-        .is_err(),
+        tokio::time::timeout(Duration::from_millis(200), service.drain())
+            .await
+            .is_err(),
         "the drain must wait for a start still in its spawn"
     );
     placement.release();
-    tokio::time::timeout(Duration::from_secs(5), service.inner.process_tasks.wait())
+    tokio::time::timeout(Duration::from_secs(5), service.drain())
         .await
-        .expect("the drain completes once the spawn returns");
+        .expect("the drain completes once the spawn returns")
+        .expect("cleanup completed");
     start.await.unwrap().expect("the admitted start completes");
     let record = service
         .inner
@@ -1551,12 +1575,18 @@ async fn an_exited_process_task_does_not_wait_out_its_record_retention() {
         event.expect("process stream remains successful");
     }
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !service.inner.process_tasks.is_empty() {
+        while service.inner.process_tasks.len() != 1
+            || !service
+                .inner
+                .processes
+                .reaper_running
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the exited process's task ends without waiting out the retention");
+    .expect("only the shared retention reaper remains");
     let registry = &service.inner.processes;
     assert_eq!(registry.records.len(), 1, "the record is still retained");
     assert!(registry.next_expiry().is_some());
@@ -2145,4 +2175,37 @@ async fn image_working_directory_is_used_unless_command_overrides_it() {
             expected.canonicalize().unwrap().to_str().unwrap()
         );
     }
+}
+
+// Closing admission must not cancel an admitted spawn, including after it
+// crosses the asynchronous spawn boundary. The process itself completes normally.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn graceful_drain_waits_for_an_admitted_start_without_killing_it() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{process_event, process_exit};
+
+    let (service, placement) = stalled_placement_service();
+    let start = tokio::spawn({
+        let service = service.clone();
+        async move { Process::start(&service, cancellation_start_request()).await }
+    });
+    wait_for_start_owner(&service).await;
+    service.close();
+    let mut draining = Box::pin(service.drain());
+    assert!(futures_util::poll!(&mut draining).is_pending());
+    assert!(!service.inner.shutdown.is_cancelled());
+    placement.release();
+    let mut events = start.await.unwrap().unwrap().into_inner();
+    let mut success = false;
+    while let Some(event) = events.next().await {
+        if let Some(process_event::Event::Exit(exit)) = event.unwrap().event {
+            success = matches!(exit.outcome, Some(process_exit::Outcome::Exited(exit)) if exit.exit_code == 0);
+        }
+    }
+    assert!(
+        success,
+        "graceful closure must preserve normal process completion"
+    );
+    draining.await.expect("complete drain");
+    assert!(!service.inner.shutdown.is_cancelled());
 }

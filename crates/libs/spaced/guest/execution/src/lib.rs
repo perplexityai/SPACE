@@ -37,6 +37,8 @@ mod filesystem;
 pub use filesystem::router::FilesystemHandle;
 mod guest_path;
 mod idempotency;
+mod lifecycle;
+pub use lifecycle::IncompleteExecutionDrain;
 mod identity;
 mod identity_policy;
 mod payload;

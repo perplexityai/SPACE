@@ -4,6 +4,7 @@ mod list;
 mod metadata;
 mod ownership;
 mod read;
+mod terminal;
 pub(super) mod watch;
 mod write;
 
@@ -54,6 +55,7 @@ pub(super) struct FilesystemWorkerService {
     default_user: GuestUserName,
     account: Option<Arc<GuestAccount>>,
     tasks: tokio_util::task::TaskTracker,
+    shutdown: CancellationToken,
     watch_manager: watch::WatchManager,
     /// Admits file operations into a budget of slots, queueing a burst briefly.
     operation_admission: pplx_space_common_grpc::QueuedSlots,
@@ -76,10 +78,28 @@ impl FilesystemWorkerService {
             default_user,
             account: None,
             tasks: tokio_util::task::TaskTracker::new(),
-            watch_manager: watch::WatchManager::new(shutdown),
+            watch_manager: watch::WatchManager::new(shutdown.clone()),
+            shutdown,
             operation_admission,
             upload_buffers: Arc::new(write::UploadBufferPool::new()),
         }
+    }
+
+    /// Own Direct I/O across caller cancellation. Await the entire operation so
+    /// Tokio's underlying blocking jobs cannot escape the drain boundary.
+    async fn owned<T, F, Fut>(&self, work: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, Status>> + Send + 'static,
+    {
+        let service = self.clone();
+        self.tasks
+            .spawn(async move { work(service).await })
+            .await
+            .map_err(|error| {
+                Status::internal(format!("filesystem operation task failed: {error}"))
+            })?
     }
 
     async fn execute<Fut>(
@@ -129,9 +149,10 @@ impl FilesystemWorkerService {
         let cancelled = tokio_util::sync::CancellationToken::new();
         let _cancel_on_drop = cancelled.clone().drop_guard();
         let upload_buffers = Arc::clone(&self.upload_buffers);
+        let tasks = self.tasks.clone();
         self.execute(async move |account| {
             let owner = direct_owner.map(|_| account.ownership()).transpose()?;
-            match write::write(stream, &account, owner, cancelled, upload_buffers).await {
+            match write::write(stream, &account, owner, cancelled, upload_buffers, tasks).await {
                 Ok(response) => Ok(mutation_result::Outcome::Write(response)),
                 Err(write::WriteError::Interrupted) => {
                     Ok(mutation_result::Outcome::Interrupted(protocol::Abort {}))
@@ -168,12 +189,13 @@ impl FilesystemWorkerService {
             }
             return Ok((account.clone(), slot));
         }
-        tokio::task::spawn_blocking(move || {
-            let account = GuestAccount::resolve(user).map_err(|error| error.into_status())?;
-            Ok((Arc::new(account), slot))
-        })
-        .await
-        .map_err(|error| Status::internal(format!("account resolution failed: {error}")))?
+        self.tasks
+            .spawn_blocking(move || {
+                let account = GuestAccount::resolve(user).map_err(|error| error.into_status())?;
+                Ok((Arc::new(account), slot))
+            })
+            .await
+            .map_err(|error| Status::internal(format!("account resolution failed: {error}")))?
     }
 
     async fn normalize_path(
@@ -250,7 +272,14 @@ impl WorkerFilesystem for FilesystemWorkerService {
         let path = self.normalize_path(request.path, request.user).await?;
 
         let stream_slot = self.acquire_file_operation_slot().await?;
-        let stream = list::list_stream(path.clone(), request.depth, stream_slot).await?;
+        let stream = list::list_stream(
+            path.clone(),
+            request.depth,
+            stream_slot,
+            self.tasks.clone(),
+            self.shutdown.clone(),
+        )
+        .await?;
         tracing::debug!(
             command = "bridge_guest_list",
             ?path,
@@ -268,7 +297,15 @@ impl WorkerFilesystem for FilesystemWorkerService {
         let offset = request.offset;
         let length = request.length;
         let stream_slot = self.acquire_file_operation_slot().await?;
-        let stream = read::read_stream(path.clone(), offset, length, stream_slot).await?;
+        let stream = read::read_stream(
+            path.clone(),
+            offset,
+            length,
+            stream_slot,
+            self.tasks.clone(),
+            self.shutdown.clone(),
+        )
+        .await?;
         tracing::debug!(
             command = "bridge_guest_read",
             ?path,
@@ -408,6 +445,7 @@ impl WorkerFilesystem for FilesystemWorkerService {
         &self,
         request: Request<protocol::BatchCommand>,
     ) -> Result<Response<MutationResult>, Status> {
+        let tasks = self.tasks.clone();
         let request = request.into_inner();
         self.execute(async move |account| {
             uuid::Uuid::parse_str(&request.execution_id)
@@ -417,7 +455,7 @@ impl WorkerFilesystem for FilesystemWorkerService {
                 idempotency_key: None,
                 user: None,
             };
-            write::write_batch(request, &account)
+            write::write_batch(request, &account, tasks)
                 .await
                 .map(mutation_result::Outcome::Batch)
         })

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::GuestFileInfoStream;
+use futures_util::StreamExt;
 use pplx_space_common_core::types::GuestPath;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::FileType;
 use tokio::sync::OwnedSemaphorePermit;
@@ -31,6 +32,8 @@ pub(super) async fn list_stream(
     path: GuestPath,
     depth: Option<u32>,
     stream_slot: OwnedSemaphorePermit,
+    tasks: tokio_util::task::TaskTracker,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<GuestFileInfoStream, Status> {
     let root = PathBuf::from(path.expose());
     tokio::fs::symlink_metadata(&root)
@@ -44,53 +47,54 @@ pub(super) async fn list_stream(
     let mut pending = vec![(root, 1_u32)];
     let mut directories_enqueued = 1_usize;
     let (tx, rx) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(async move {
+    // A separate terminal status cannot be lost behind a full entry queue.
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    tasks.spawn(async move {
         let _stream_slot = stream_slot;
-        while let Some((directory, depth)) = pending.pop() {
-            let mut read_dir = match tokio::fs::read_dir(&directory).await {
-                Ok(read_dir) => read_dir,
-                Err(error) => {
-                    let _ = tx.send(Err(map_io_error(error))).await;
-                    return;
+        let result: Result<(), Status> = async {
+            while let Some((directory, depth)) = pending.pop() {
+                if shutdown.is_cancelled() {
+                    return Err(Status::unavailable("file list cancelled"));
                 }
-            };
-            loop {
-                match read_dir.next_entry().await {
-                    Ok(Some(entry)) => {
-                        let entry_path = entry.path();
-                        let entry = match file_info_from_path(&entry_path).await {
-                            Ok(entry) => entry,
-                            Err(error) => {
-                                let _ = tx.send(Err(error)).await;
-                                return;
-                            }
-                        };
-                        if depth < max_depth
-                            && entry.file_type() == FileType::Directory
-                            && let Err(status) = push_pending_directory(
-                                &mut pending,
-                                &mut directories_enqueued,
-                                entry_path,
-                                depth + 1,
-                            )
-                        {
-                            let _ = tx.send(Err(status)).await;
-                            return;
-                        }
-                        if tx.send(Ok(entry)).await.is_err() {
-                            return;
-                        }
+                if tx.is_closed() {
+                    return Ok(());
+                }
+                let mut read_dir = tokio::fs::read_dir(&directory).await.map_err(map_io_error)?;
+                loop {
+                    if shutdown.is_cancelled() {
+                        return Err(Status::unavailable("file list cancelled"));
                     }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = tx.send(Err(map_io_error(error))).await;
-                        return;
+                    if tx.is_closed() {
+                        return Ok(());
+                    }
+                    let Some(entry) = read_dir.next_entry().await.map_err(map_io_error)? else {
+                        break;
+                    };
+                    let entry_path = entry.path();
+                    let entry = file_info_from_path(&entry_path).await?;
+                    if depth < max_depth && entry.file_type() == FileType::Directory {
+                        push_pending_directory(
+                            &mut pending,
+                            &mut directories_enqueued,
+                            entry_path,
+                            depth + 1,
+                        )?;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return Err(Status::unavailable("file list cancelled")),
+                        result = tx.send(entry) => if result.is_err() { return Ok(()); },
                     }
                 }
             }
-        }
+            Ok(())
+        }.await;
+        let _ = completion_tx.send(result);
     });
-    Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)) as GuestFileInfoStream)
+    Ok(Box::pin(super::terminal::with_completion(
+        tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok),
+        completion_rx,
+    )) as GuestFileInfoStream)
 }
 
 #[cfg(test)]

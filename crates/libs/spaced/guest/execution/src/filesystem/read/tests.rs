@@ -20,6 +20,8 @@ async fn fifo_read_rejects_without_a_writer_and_returns_admission() {
             0,
             None,
             slots.clone().try_acquire_owned().expect("admission"),
+            tokio_util::task::TaskTracker::new(),
+            tokio_util::sync::CancellationToken::new(),
         ),
     )
     .await;
@@ -47,6 +49,8 @@ async fn fifo_read_rejects_without_a_writer_and_returns_admission() {
             .clone()
             .try_acquire_owned()
             .expect("recovered admission"),
+        tokio_util::task::TaskTracker::new(),
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect("normal read");
@@ -79,6 +83,8 @@ async fn a_stalled_read_releases_its_guard_when_it_ends() {
             let _ = ended.await;
             Status::unavailable("worker ended")
         },
+        tokio_util::task::TaskTracker::new(),
+        tokio_util::sync::CancellationToken::new(),
     );
     // Take nothing, so the queue fills and the read waits for room in it.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -104,4 +110,43 @@ async fn a_stalled_read_releases_its_guard_when_it_ends() {
     assert_eq!(failure.code(), tonic::Code::Unavailable);
     assert!(read.len() < data.len(), "the read stopped before the end");
     assert!(data.starts_with(&read), "the queued chunks arrive in order");
+}
+
+#[tokio::test]
+async fn read_producer_panic_reports_failure_after_partial_output() {
+    use futures_util::StreamExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("file");
+    std::fs::write(&path, vec![b'x'; 1 << 20]).unwrap();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let tasks = tokio_util::task::TaskTracker::new();
+    let (fail, failure) = tokio::sync::oneshot::channel::<()>();
+    let mut stream = stream_file(
+        std::fs::File::open(path).unwrap(),
+        None,
+        slots.clone().try_acquire_owned().unwrap(),
+        async move {
+            failure.await.unwrap();
+            panic!("injected read producer failure");
+        },
+        tasks.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        assert!(!stream.next().await.unwrap().unwrap().data.is_empty());
+        fail.send(()).unwrap();
+        tasks.close();
+        tasks.wait().await;
+        assert_eq!(slots.available_permits(), 1);
+        loop {
+            if let Err(status) = stream.next().await.expect("panic must not become EOF") {
+                assert_eq!(status.code(), tonic::Code::Internal);
+                assert!(!pplx_space_common_grpc::is_refused_before_start(&status));
+                break;
+            }
+        }
+        assert!(stream.next().await.is_none());
+    })
+    .await
+    .unwrap();
 }

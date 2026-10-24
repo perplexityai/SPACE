@@ -48,9 +48,15 @@ async fn closed_services_refuse_every_operation_through_existing_handles() {
     enum Close {
         Explicit,
         CallerCancellation,
+        Cancel,
         Drain,
     }
-    for close in [Close::Explicit, Close::CallerCancellation, Close::Drain] {
+    for close in [
+        Close::Explicit,
+        Close::CallerCancellation,
+        Close::Cancel,
+        Close::Drain,
+    ] {
         let shutdown = CancellationToken::new();
         let service = ExecutionService::with_config(
             shutdown.clone(),
@@ -78,7 +84,8 @@ async fn closed_services_refuse_every_operation_through_existing_handles() {
                 service.close();
             }
             Close::CallerCancellation => shutdown.cancel(),
-            Close::Drain => service.drain().await,
+            Close::Cancel => service.cancel(),
+            Close::Drain => service.drain().await.expect("complete drain"),
         }
         let caller_cancelled = matches!(close, Close::CallerCancellation);
         assert_eq!(
@@ -140,11 +147,160 @@ async fn closed_services_refuse_every_operation_through_existing_handles() {
         }
         assert_eq!(*service.inner.process_env.read().await, environment);
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
-        service.drain().await;
+        service.drain().await.expect("complete drain");
         assert_eq!(
             shutdown.is_cancelled(),
             caller_cancelled,
             "draining a closed service must not cancel the caller's token"
         );
     }
+}
+
+#[tokio::test]
+async fn close_allows_an_admitted_upload_to_finish() {
+    use futures_util::StreamExt;
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        WriteOpen, WriteRequest, write_request::Message,
+    };
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .unwrap()
+        .unwrap();
+    let service = ExecutionService::with_config(
+        CancellationToken::new(),
+        ExecutionServiceConfig {
+            filesystem_execution: FilesystemExecutionMode::Direct,
+            identity_policy: IdentityPolicy::Guest,
+            default_operation_user: GuestUserName::parse(user.name).unwrap(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("graceful");
+    let (finish, end) = tokio::sync::oneshot::channel::<()>();
+    let input = futures_util::stream::iter([
+        Ok(WriteRequest {
+            message: Some(Message::Open(WriteOpen {
+                path: path.display().to_string(),
+                ..Default::default()
+            })),
+        }),
+        Ok(WriteRequest {
+            message: Some(Message::Data(b"complete".to_vec())),
+        }),
+    ])
+    .chain(
+        futures_util::stream::once(async {
+            end.await.unwrap();
+            None
+        })
+        .filter_map(std::future::ready),
+    );
+    let mut upload = Box::pin(service.write_file(Request::new(input)));
+    assert!(futures_util::poll!(&mut upload).is_pending());
+    service.close();
+    assert!(
+        futures_util::poll!(&mut upload).is_pending(),
+        "close must not cancel admitted input"
+    );
+    finish.send(()).unwrap();
+    upload.await.unwrap();
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), b"complete");
+    service.drain().await.expect("complete drain");
+}
+
+// A FIFO makes the physical syscall outlive cancellation without depending on
+// slow disks. Drain must retain the syscall and observe completion after release.
+#[tokio::test]
+async fn drain_retains_cancelled_direct_io_and_temporary_file_cleanup() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        WriteBatchEntry, WriteBatchRequest, filesystem_server::Filesystem,
+    };
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .unwrap()
+        .unwrap();
+    let service = ExecutionService::with_config(
+        CancellationToken::new(),
+        ExecutionServiceConfig {
+            filesystem_execution: FilesystemExecutionMode::Direct,
+            identity_policy: IdentityPolicy::Guest,
+            default_operation_user: GuestUserName::parse(user.name).unwrap(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("started");
+    let fifo = directory.path().join("blocked");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let mut reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    let files = service.filesystem_service();
+    let request = Request::new(WriteBatchRequest {
+        entries: vec![
+            WriteBatchEntry {
+                path: marker.display().to_string(),
+                data: b"first effect".to_vec(),
+                append: false,
+            },
+            WriteBatchEntry {
+                path: fifo.display().to_string(),
+                data: vec![b'x'; 1024 * 1024],
+                append: true,
+            },
+        ],
+        idempotency_key: Some("drain-blocked-io".into()),
+        ..Default::default()
+    });
+    let caller = tokio::spawn(async move { files.write_batch(request).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match reader.read(&mut [0; 1]) {
+                Ok(1) => break,
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("FIFO probe: {other:?}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        service.drain_with_timeout(Duration::ZERO).await,
+        Err(crate::IncompleteExecutionDrain)
+    );
+    // Consume the remaining bytes only after proving that drain cannot finish.
+    let release = async {
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("FIFO release: {error}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let (drained, ()) = tokio::join!(service.drain(), release);
+    drained.expect("drain observes physical I/O and replacement cleanup");
+    drop(reader);
+    let mut names = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["blocked", "started"]);
+    assert_eq!(tokio::fs::read(&marker).await.unwrap(), b"first effect");
 }

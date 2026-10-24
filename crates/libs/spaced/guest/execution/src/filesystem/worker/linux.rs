@@ -178,6 +178,7 @@ pub(crate) struct WorkerPool {
     identity_policy: crate::IdentityPolicy,
     guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
     shutdown: CancellationToken,
+    tasks: tokio_util::task::TaskTracker,
     workers: Arc<Mutex<HashMap<GuestUserName, WorkerEntry>>>,
     process_slots: Arc<tokio::sync::Semaphore>,
     /// Whether the idle reaper task is running. It runs only while a worker
@@ -240,6 +241,8 @@ fn next_worker_expiry(
 impl WorkerPool {
     pub(crate) async fn drain(&self) {
         self.shutdown.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
         let workers: Vec<_> = self
             .workers
             .lock()
@@ -276,6 +279,7 @@ impl WorkerPool {
             identity_policy,
             guest_cgroups,
             shutdown,
+            tasks: tokio_util::task::TaskTracker::new(),
             workers: Arc::new(Mutex::new(HashMap::new())),
             process_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IDENTITY_WORKERS)),
             reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -293,14 +297,14 @@ impl WorkerPool {
             return;
         }
         let pool = self.clone();
-        drop(tokio::spawn(async move {
+        drop(self.tasks.spawn(async move {
             loop {
                 let next = {
                     let mut workers = pool.workers.lock().await;
                     let expired = take_expired_workers(&mut workers, Instant::now());
                     let next = next_worker_expiry(&workers, Instant::now());
                     drop(workers);
-                    Self::stop_workers(expired);
+                    pool.stop_workers(expired);
                     next
                 };
                 let Some(deadline) = next else {
@@ -351,7 +355,7 @@ impl WorkerPool {
                             .map(|(user, _)| user);
                         let Some(evict) = evict else {
                             drop(workers);
-                            Self::stop_workers(workers_to_stop);
+                            self.stop_workers(workers_to_stop);
                             return Err(crate::refused(Status::resource_exhausted(
                                 "too many active filesystem identity workers",
                             )));
@@ -381,11 +385,11 @@ impl WorkerPool {
 
         match acquisition {
             ClientAcquisition::Ready(worker) => {
-                Self::stop_workers(workers_to_stop);
+                self.stop_workers(workers_to_stop);
                 Ok(*worker)
             }
             ClientAcquisition::Waiting(result) => {
-                Self::stop_workers(workers_to_stop);
+                self.stop_workers(workers_to_stop);
                 Self::wait_for_start(result).await
             }
             ClientAcquisition::Start {
@@ -395,7 +399,7 @@ impl WorkerPool {
             } => {
                 let pool = self.clone();
                 let worker_user = user.clone();
-                drop(tokio::spawn(async move {
+                drop(self.tasks.spawn(async move {
                     for worker in workers_to_stop.drain(..) {
                         worker.stop().await;
                     }
@@ -552,11 +556,11 @@ impl WorkerPool {
         .ok()
     }
 
-    fn stop_workers(workers: Vec<WorkerClient>) {
+    fn stop_workers(&self, workers: Vec<WorkerClient>) {
         if workers.is_empty() {
             return;
         }
-        drop(tokio::spawn(async move {
+        drop(self.tasks.spawn(async move {
             for worker in workers {
                 worker.stop().await;
             }
@@ -620,16 +624,18 @@ impl WorkerPool {
             })?;
         let lookup_user = user.clone();
         let policy = self.identity_policy;
-        let process_slot = tokio::task::spawn_blocking(move || {
-            GuestAccount::resolve(lookup_user)
-                .map_err(|error| error.into_status())?
-                .validate_policy(policy)?;
-            Ok::<_, Status>(process_slot)
-        })
-        .await
-        .map_err(|error| {
-            Status::internal(format!("worker account resolution failed: {error}"))
-        })??;
+        let process_slot = self
+            .tasks
+            .spawn_blocking(move || {
+                GuestAccount::resolve(lookup_user)
+                    .map_err(|error| error.into_status())?
+                    .validate_policy(policy)?;
+                Ok::<_, Status>(process_slot)
+            })
+            .await
+            .map_err(|error| {
+                Status::internal(format!("worker account resolution failed: {error}"))
+            })??;
         let (router_fd, worker_fd) = socketpair(
             AddressFamily::Unix,
             SockType::Stream,
@@ -671,17 +677,21 @@ impl WorkerPool {
         // against concurrent forks. `spawn` blocks until the worker execs, so
         // it runs off the runtime threads. A caller cancelled meanwhile drops
         // the spawned child, which `kill_on_drop` terminates.
-        let child = tokio::task::spawn_blocking(move || {
-            let child = command.spawn();
-            // Closes this process's copy of the worker's socket.
-            drop(command);
-            // Keep the selected inode alive through exec, even if the service is dropped.
-            drop(executable);
-            child
-        })
-        .await
-        .map_err(|error| Status::internal(format!("filesystem worker spawn task failed: {error}")))?
-        .map_err(worker_io_status)?;
+        let child = self
+            .tasks
+            .spawn_blocking(move || {
+                let child = command.spawn();
+                // Closes this process's copy of the worker's socket.
+                drop(command);
+                // Keep the selected inode alive through exec, even if the service is dropped.
+                drop(executable);
+                child
+            })
+            .await
+            .map_err(|error| {
+                Status::internal(format!("filesystem worker spawn task failed: {error}"))
+            })?
+            .map_err(worker_io_status)?;
 
         // Taken while the child is ours and unreaped, so its pid is its own.
         let pidfd = child
