@@ -276,37 +276,53 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::resume_sandbox(self, request).await
     }
 
-    async fn get_firecracker_vm_state(
+    async fn get_vm_state(
         &self,
-        request: Request<GetFirecrackerVmStateRequest>,
-    ) -> Result<Response<GetFirecrackerVmStateResponse>, Status> {
-        NodeManagerService::get_firecracker_vm_state(self, request).await
+        request: Request<crate::proto::GetVmStateRequest>,
+    ) -> Result<Response<crate::proto::GetVmStateResponse>, Status> {
+        NodeManagerService::get_vm_state(self, request).await
     }
 
-    async fn create_snapshot(
+    async fn capture_vm_state(
         &self,
-        request: Request<CreateSnapshotRequest>,
-    ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        let sandbox_id = request.get_ref().sandbox_id.clone();
+        request: Request<crate::proto::CaptureVmStateRequest>,
+    ) -> Result<Response<crate::proto::CaptureVmStateResponse>, Status> {
+        self.authorize_peer(&request, "CaptureVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+        let (metadata, extensions, input) = request.into_parts();
+        let sandbox_id = input.sandbox_id.clone();
+        let input = crate::snapshot_request::FirecrackerCapture::try_from(input)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         observe_rpc(
-            "CreateSnapshot",
+            "CaptureVmState",
             sandbox_id,
-            NodeManagerService::create_snapshot(self, request),
+            NodeManagerService::capture_firecracker_state(
+                self,
+                Request::from_parts(metadata, extensions, input),
+            ),
         )
-        .await
+        .await?;
+        Ok(Response::new(crate::proto::CaptureVmStateResponse {}))
     }
 
-    async fn load_snapshot(
+    async fn restore_vm_state(
         &self,
-        request: Request<LoadSnapshotRequest>,
-    ) -> Result<Response<LoadSnapshotResponse>, Status> {
-        let sandbox_id = request.get_ref().sandbox_id.clone();
+        request: Request<crate::proto::RestoreVmStateRequest>,
+    ) -> Result<Response<crate::proto::RestoreVmStateResponse>, Status> {
+        self.authorize_peer(&request, "RestoreVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+        let (metadata, extensions, input) = request.into_parts();
+        let sandbox_id = input.sandbox_id.clone();
+        let input = crate::snapshot_request::FirecrackerRestore::try_from(input)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         observe_rpc(
-            "LoadSnapshot",
+            "RestoreVmState",
             sandbox_id,
-            NodeManagerService::load_snapshot(self, request),
+            NodeManagerService::restore_firecracker_state(
+                self,
+                Request::from_parts(metadata, extensions, input),
+            ),
         )
-        .await
+        .await?;
+        Ok(Response::new(crate::proto::RestoreVmStateResponse {}))
     }
 
     async fn create_btrfs_snapshot(

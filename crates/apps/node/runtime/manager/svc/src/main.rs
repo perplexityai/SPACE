@@ -108,6 +108,10 @@ struct Cli {
     #[arg(long, default_value = FIRECRACKER_RELEASE_SOURCE)]
     release_source: ReleaseUrl,
 
+    /// Where Cloud Hypervisor static executables are downloaded from.
+    #[arg(long, default_value = pplx_space_node_runtime_manager::CLOUD_HYPERVISOR_RELEASE_SOURCE)]
+    cloud_hypervisor_release_source: ReleaseUrl,
+
     /// Largest kernel or release archive one install downloads, in bytes.
     #[arg(long, default_value_t = DEFAULT_INSTALL_LIMITS.max_bytes)]
     max_install_bytes: u64,
@@ -180,7 +184,7 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
                     .collect(),
                 vendor_kernels: cli.vendor_kernels_dir,
                 managed_kernels: Some(cli.node_kernels_dir),
-                managed_releases: None,
+                managed_releases: Vec::new(),
                 cache_kernels: cli.cache_kernels_dir,
                 cache_legacy_assets: cli.cache_legacy_assets_dir,
                 runtime_aliases: cli.runtime_aliases,
@@ -194,10 +198,18 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
             list_admission_timeout: Duration::from_secs(cli.list_admission_timeout_secs),
             kernel_source: Some(KernelSourceConfig::S3(cli.kernel_source)),
             catalog_dir: cli.catalog_dir,
-            releases: Some(RuntimeManagerReleaseConfig {
-                root: cli.node_releases_dir,
-                source: ReleaseSourceConfig::GitHub(cli.release_source),
-            }),
+            releases: vec![
+                RuntimeManagerReleaseConfig {
+                    root: cli.node_releases_dir,
+                    source: ReleaseSourceConfig::GitHub(cli.release_source),
+                },
+                RuntimeManagerReleaseConfig {
+                    root: paths::NODE_CLOUD_HYPERVISOR_DIR.into(),
+                    source: ReleaseSourceConfig::CloudHypervisorGitHub(
+                        cli.cloud_hypervisor_release_source,
+                    ),
+                },
+            ],
             install,
         })
     }
