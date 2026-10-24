@@ -251,8 +251,8 @@ impl LocalArtifacts {
     /// an unpinned row is not durable and holds the node. The exposure is
     /// the opposite one — a node held by rows no queue-driven pass
     /// enumerates for backup, so the drain parks. The controller side owns
-    /// that; it falls back to the history statement when the queue is empty
-    /// and the gate disagrees that the node is finished.
+    /// that: with the queue in use it still reads the history statement and
+    /// enumerates the rows the queue does not name.
     ///
     /// Three cases produce a row, and only the first is the ordinary one:
     ///

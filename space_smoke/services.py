@@ -367,6 +367,7 @@ class SmokeServices:
             fixture._cold_eviction_control = cast(Any, kind)
             fixture._snapshot_reaper_control = cast(Any, kind)
             fixture._startup_recovery_control = cast(Any, kind)
+            fixture._drain_gate_control = cast(Any, kind)
             fixture._suspend_codec_control = cast(Any, kind)
             fixture._telemetry_control = cast(Any, kind)
             fixture._leader_election_control = cast(Any, kind)

@@ -166,6 +166,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.telemetry_reaches_local_backends",
                 "local.template_cache_lru_eviction_reclaims",
                 "local.template_startup_recovery_decision_table",
+                "local.terminate_gate_refuses_a_held_node",
                 "native.aws_secret_network_credential_injection",
                 "native.encrypted_double_restore_retires_prior_pods",
                 "native.m1_generated_sdk_conformance",

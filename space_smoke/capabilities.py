@@ -2577,3 +2577,64 @@ class StorageExchangeControl(Protocol):
     ) -> StorageRequestResult:
         """One S3 request (head, get, list, put) signed with the session."""
         ...
+
+
+@dataclass(frozen=True)
+class TerminateAttempt:
+    """What admin `:terminate` answered, verbatim.
+
+    A refusal is the expected outcome, so the status is data rather than an
+    exception — and the body is carried whole because which 409 this is can
+    only be told apart by the keys it contains.
+    """
+
+    status_code: int
+    body: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class DrainGateBlocker:
+    """The seeded row that must make `:terminate` refuse, and its node."""
+
+    node_id: str
+    sandbox_id: str
+
+
+class DrainGateControl(Protocol):
+    """Privileged operations behind the admin `:terminate` occupancy guard.
+
+    Kind-only, and every write is fenced on a cluster-visible mutation Lease:
+    the scenario moves a real `nodes` row to `drained` and seeds a real
+    `sandboxes` row, so two concurrent smokes must not interleave. The Lease
+    records both so an expired holder's residue is repaired on takeover.
+    """
+
+    def acquire_drain_gate_mutation(self) -> Callable[[], None]:
+        """Take the drain-gate mutation Lease; the returned callable releases it."""
+        ...
+
+    def seed_drain_gate_blocker(self) -> DrainGateBlocker:
+        """Pin one `suspending` sandbox to an idle node and move it to `drained`.
+
+        The node is registered, carries no drain phase, and holds no sandbox
+        by `active_node_id`; the seeded row sets `target_node_id` only. That
+        pairing is what makes a refusal attributable: the resident half of the
+        guard cannot see this row, so only the drain-gate half can produce it.
+        Raises rather than improvising when no such node exists.
+        """
+        ...
+
+    def clear_drain_gate_residue(self) -> None:
+        """Undo whatever this holder's Lease records, in repair order.
+
+        Takes no argument on purpose. The Lease is the record of what was
+        written, updated before each write, so this is callable the moment
+        the Lease is held — before any seeding — and a caller that dies
+        between two of the seeding's writes still has its compensation
+        armed. Idempotent: nothing recorded is nothing to undo.
+        """
+        ...
+
+    def attempt_terminate(self, node_id: str) -> TerminateAttempt:
+        """POST `:terminate` for that node as an administrator."""
+        ...
