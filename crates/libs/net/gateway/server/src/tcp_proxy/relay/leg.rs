@@ -46,6 +46,15 @@ pub(crate) struct RelayFault {
 }
 
 impl RelayFault {
+    /// A write to the guest before the relay starts, such as forwarding a
+    /// greeting the destination sent first.
+    pub(crate) const fn guest_write() -> Self {
+        Self {
+            side: Side::Guest,
+            operation: Operation::Write,
+        }
+    }
+
     pub(crate) const fn side(self) -> Side {
         self.side
     }
