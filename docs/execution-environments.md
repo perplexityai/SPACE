@@ -210,11 +210,16 @@ requests. Failed publications remain reconciliation errors and the next
 periodic tick retries with a new sample. A persistent protocol defect needs a
 publisher fix, not a successful acknowledgement of the rejected report.
 
-The inventory polling period (60 seconds by default) is not a heartbeat
-freshness guarantee. It must not be used to justify the separate 30-second
-node-status freshness window. First-boot artifact staging may exceed the
-five-second collection budget and legitimately report unavailable until a
-later sample succeeds; the previous artifact rows remain in place.
+The inventory polling period (60 seconds by default) isn't itself a heartbeat
+freshness guarantee. The node-status freshness window is derived from the
+node's reported poll interval with margin: two intervals plus 30 seconds,
+150 seconds by default and never more than 10 minutes, so a node that publishes
+only on its tick doesn't read stale between ticks. node-ctl caps its poll
+interval at 285 seconds, the longest whose two ticks plus slack fit in the
+10-minute cap. A publication that reports no interval keeps the node's stored
+window. First-boot artifact staging may exceed the five-second collection
+budget and legitimately report unavailable until a later sample succeeds; the
+previous artifact rows remain in place.
 
 Repeated complete samples advance the collection receipt without replacing
 unchanged runtime, guest, state-format or component rows. Reconciliation deletes

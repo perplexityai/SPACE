@@ -1509,13 +1509,14 @@ and upserts `nodes` / `node_k8s` / `node_status_snapshots` /
 `node_template_inventory`. The cluster-controller's `kube_node_sync`
 reconciler covers kube-Node inventory. **Nothing on the node touches
 Postgres**: credential state belongs to the control-plane credential-manager
-authority (below). Node status uses the normal 30-second freshness window. The bring-up ends by waiting until
+authority (below). Node status uses the normal freshness window, derived from
+node-ctl's poll interval. The bring-up ends by waiting until
 the admin node list (`GET /admin/api/v1/nodes`) reports every sandbox and
 builder node reachable, with scheduling status `ready`, and observed within the
 five node-ctl ticks the API trusts a census for
 (`scripts/wait-node-publication.sh`): ready pods alone are not a registered
-node. The wait does not require `stale: false`: node-ctl publishes every 60
-seconds, so an idle healthy node reads stale about half the time.
+node. The wait doesn't key on `stale: false`, which says only that the node
+published something recently, not that it sent a census.
 
 ## Node services
 

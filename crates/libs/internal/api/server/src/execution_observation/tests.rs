@@ -109,7 +109,7 @@ async fn publish_with_status(
     crate::status::upsert_node_status_from_publish(
         tx,
         node_id,
-        crate::NODE_STATUS_STALE_AFTER_SECS,
+        None,
         None,
         crate::status::SandboxInventoryPrune::Skipped,
         crate::status::LocalBackupInventoryReport::Absent,
@@ -223,7 +223,7 @@ async fn empty_publications_serialize_until_status_receipt_commits() -> TestResu
     crate::status::upsert_node_status_from_publish(
         &mut first,
         node_id,
-        crate::NODE_STATUS_STALE_AFTER_SECS,
+        None,
         None,
         crate::status::SandboxInventoryPrune::Skipped,
         crate::status::LocalBackupInventoryReport::Absent,

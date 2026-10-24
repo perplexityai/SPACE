@@ -544,9 +544,11 @@ pub fn node_heartbeat_fresh(node_expr: &str) -> String {
 /// publishes a full census every time. Enough slack for a retried publish, a
 /// node-ctl restart, or a few rejected inventories without a healthy node
 /// flickering out of the discount; short enough that a publisher which has
-/// genuinely stopped is distrusted within minutes. `NODE_STATUS_STALE_AFTER_SECS`
-/// (30 s) is deliberately **not** reused: it is half a poll interval, so a
-/// healthy node would read as "no census evidence" about half the time.
+/// genuinely stopped is distrusted within minutes. The heartbeat's window
+/// (`node_status_freshness` in `pplx-space-node-api-client`, two poll
+/// intervals plus slack) is deliberately **not** reused: it says the node
+/// published something recently, not when it last sent a census the server
+/// accepted.
 ///
 /// # Why this must not exceed [`CENSUS_PLACEMENT_SETTLE`]
 ///

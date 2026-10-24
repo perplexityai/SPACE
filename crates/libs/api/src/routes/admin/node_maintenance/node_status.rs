@@ -2,8 +2,6 @@
 
 use super::*;
 
-pub(super) const DEFAULT_NODE_STATUS_CACHE_TTL_SECS: u64 = 30;
-
 #[derive(Debug, Clone, FromRow)]
 pub(super) struct NodeStatusRow {
     pub(super) node_id: NodeId,
@@ -298,7 +296,10 @@ pub async fn refresh_node_status(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    let cache_ttl_secs = DEFAULT_NODE_STATUS_CACHE_TTL_SECS;
+    // A node's status window at node-ctl's default poll interval. A refresh is a
+    // no-op while every node's status is still fresh.
+    let cache_ttl_secs =
+        pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS.as_secs();
     let nodes = match fetch_inventory_nodes(&state, req.role).await {
         Ok(nodes) => nodes
             .into_iter()

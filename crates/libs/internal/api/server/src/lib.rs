@@ -157,7 +157,6 @@ const SUPPORTED_TEMPLATE_RUNTIMES: &[RuntimeKind] = &[RuntimeKind::Firecracker];
 const NODE_RECONCILE_CLAIM_DEFAULT_LIMIT: i64 = 256;
 const NODE_RECONCILE_MAX_ATTEMPTS: i32 = 16;
 const NODE_RECONCILE_MAX_RETRY_DELAY_SECS: i64 = 300;
-const NODE_STATUS_STALE_AFTER_SECS: i64 = 30;
 
 fn db_guest_port_to_proto(value: i32) -> u32 {
     u16::try_from(value).map(u32::from).unwrap_or(0)

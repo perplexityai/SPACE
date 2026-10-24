@@ -12,12 +12,12 @@
 # reachable status observed within the last five minutes, and scheduling
 # status `ready`.
 #
-# The status's `stale` flag is not the test: it flips 30 s after each publish
-# (NODE_STATUS_STALE_AFTER_SECS) while node-ctl publishes on its poll, 60 s by
-# default and unset by the Kind chart, so a healthy idle node reads stale about
-# half the time, and four nodes on different phases may never all read fresh
-# at once. Freshness here is the window the API itself trusts a node's census
-# for (CENSUS_INVENTORY_MAX_AGE, five minutes, which is five default polls;
+# The status's `stale` flag is not the test. It says only that the node
+# published something recently, within a window derived from node-ctl's poll
+# interval (crates/libs/node/api/client/src/node_status_freshness.rs), not that
+# it sent a census. Freshness here is
+# the window the API itself trusts a node's census for
+# (CENSUS_INVENTORY_MAX_AGE, five minutes, which is five default polls;
 # crates/libs/common/svc/src/sql/sandbox_residency.rs).
 #
 # Usage:

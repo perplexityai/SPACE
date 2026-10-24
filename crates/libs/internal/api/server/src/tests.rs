@@ -3354,10 +3354,11 @@ async fn seed_unplaced_sandbox(pool: &sqlx::PgPool) -> TestResult<SandboxId> {
 }
 
 /// The address `insert_ready_worker_node` registers nodes at.
-const TEST_WORKER_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+pub(crate) const TEST_WORKER_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// A request that arrived over TCP from `node_ip`.
-fn request_from_node<T>(message: T, node_ip: std::net::IpAddr) -> Request<T> {
+pub(crate) fn request_from_node<T>(message: T, node_ip: std::net::IpAddr) -> Request<T> {
     let mut request = Request::new(message);
     request
         .extensions_mut()
