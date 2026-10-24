@@ -67,9 +67,9 @@ pub struct ScanRoots {
     /// The runtime manager's own kernel install root, in the same layout.
     /// Scanned beside `vendor_kernels`, once when both name one directory.
     pub managed_kernels: Option<PathBuf>,
-    /// The runtime manager's own release install root. Scanned beside
-    /// `runtime_releases`, once when it is the same directory as one of them.
-    pub managed_releases: Option<RuntimeInstallationRoot>,
+    /// The runtime manager's per-runtime release stores. Each is scanned beside
+    /// external roots, once when both name the same runtime and directory.
+    pub managed_releases: Vec<RuntimeInstallationRoot>,
     /// Versioned cache kernels the execution inventory resolves boots from.
     pub cache_kernels: PathBuf,
     /// Legacy flat cache layout, `default/kernel/vmlinux.bin`.
@@ -87,7 +87,7 @@ impl Default for ScanRoots {
             )],
             vendor_kernels: paths::FIRECRACKER_KERNEL_VENDOR_DIR.into(),
             managed_kernels: None,
-            managed_releases: None,
+            managed_releases: Vec::new(),
             cache_kernels: paths::FIRECRACKER_KERNEL_ASSET_DIR.into(),
             cache_legacy_assets: paths::FIRECRACKER_ASSET_DIR.into(),
             runtime_aliases: vec![paths::FIRECRACKER_BIN.into(), paths::JAILER_BIN.into()],
@@ -567,26 +567,16 @@ fn vendor_kernel_roots(roots: &ScanRoots) -> Vec<&Path> {
 /// manager's is scanned once, under the runtime manager's path, which its
 /// install records name, as the kernel roots are.
 fn release_roots(roots: &ScanRoots) -> Vec<&RuntimeInstallationRoot> {
-    let Some(managed) = &roots.managed_releases else {
-        return roots.runtime_releases.iter().collect();
-    };
-    let mut replaced = false;
     let mut found: Vec<&RuntimeInstallationRoot> = roots
         .runtime_releases
         .iter()
-        .map(|root| {
-            if root.kind == managed.kind && same_directory(&root.path, &managed.path) {
-                replaced = true;
-                managed
-            } else {
-                root
-            }
+        .filter(|root| {
+            !roots.managed_releases.iter().any(|managed| {
+                root.kind == managed.kind && same_directory(&root.path, &managed.path)
+            })
         })
         .collect();
-    if !replaced {
-        found.push(managed);
-    }
-    found.dedup_by(|left, right| std::ptr::eq(*left, *right));
+    found.extend(&roots.managed_releases);
     found
 }
 
@@ -643,10 +633,7 @@ pub fn scan(
             scanner.scan_runtime_releases(
                 root,
                 kinds,
-                roots
-                    .managed_releases
-                    .as_ref()
-                    .is_some_and(|managed| managed == root),
+                roots.managed_releases.iter().any(|managed| managed == root),
             );
         }
     }
@@ -1301,17 +1288,19 @@ pub fn probe_elf_file(path: &Path) -> std::io::Result<ElfProbe> {
     probe_elf(&mut open_nonblocking(path)?)
 }
 
+/// Resolve a runtime release's qualified memory-state format.
+pub type StateFormatResolver = fn(&RuntimeVersion) -> Result<StateFormatIdentity, String>;
+
 /// What one runtime's release directory holds.
 pub struct ReleaseLayout {
     /// Binaries under the release directory, all required. The first is the
     /// runtime's own and names the release's architecture.
     pub binaries: &'static [&'static str],
-    /// The persisted-state format a release writes, or why it has none the
-    /// scan knows.
-    pub state_format: fn(&RuntimeVersion) -> Result<StateFormatIdentity, String>,
-    /// Every release this build has a state-format mapping for. The execution
-    /// inventory refuses a node carrying any other, so these are the only
-    /// releases that may be installed.
+    /// A qualified persisted-state format, when SPACE supports memory state
+    /// for this runtime. A valid installation need not support snapshots.
+    pub state_format: Option<StateFormatResolver>,
+    /// Releases that may be pinned by the catalog. Recognizing a directory's
+    /// layout alone does not qualify that release for installation or execution.
     pub known_releases: fn() -> Vec<&'static str>,
 }
 
@@ -1320,7 +1309,8 @@ impl ReleaseLayout {
     pub fn of(runtime: RuntimeKind) -> Option<&'static Self> {
         match runtime {
             RuntimeKind::Firecracker => Some(&FIRECRACKER_RELEASE_LAYOUT),
-            RuntimeKind::CloudHypervisor | RuntimeKind::Gvisor => None,
+            RuntimeKind::CloudHypervisor => Some(&CLOUD_HYPERVISOR_RELEASE_LAYOUT),
+            RuntimeKind::Gvisor => None,
         }
     }
 }
@@ -1329,8 +1319,15 @@ impl ReleaseLayout {
 /// known-release map gives.
 const FIRECRACKER_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
     binaries: &["bin/firecracker", "bin/jailer"],
-    state_format: firecracker_state_format,
+    state_format: Some(firecracker_state_format),
     known_releases: firecracker_known_releases,
+};
+
+const CLOUD_HYPERVISOR_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
+    binaries: &["bin/cloud-hypervisor"],
+    state_format: None,
+    // Install pins do not qualify this runtime for sandbox execution.
+    known_releases: || vec![crate::catalog::CLOUD_HYPERVISOR_INSTALL_VERSION],
 };
 
 fn firecracker_known_releases() -> Vec<&'static str> {
@@ -1411,8 +1408,12 @@ fn inspect_runtime_release(
         }
     }
 
-    match (layout.state_format)(&version) {
-        Ok(state_format) => artifact.state_format = Some(state_format),
+    match layout
+        .state_format
+        .map(|format| format(&version))
+        .transpose()
+    {
+        Ok(state_format) => artifact.state_format = state_format,
         Err(detail) => {
             artifact.status = ArtifactStatus::Unsupported;
             artifact.detail = Some(detail);

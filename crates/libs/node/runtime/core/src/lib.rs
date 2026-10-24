@@ -1,6 +1,8 @@
+pub mod boot;
 #[cfg(feature = "host-runtime")]
 pub mod cgroup;
 pub mod cgroup_paths;
+pub mod control;
 pub mod fc_api;
 #[cfg(feature = "host-runtime")]
 pub mod gateway_launch;
@@ -98,3 +100,7 @@ pub fn reflink_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Re
 
 #[cfg(test)]
 mod tests;
+
+pub mod runtime_launch;
+
+pub mod vm_state;

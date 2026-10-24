@@ -16,6 +16,10 @@ fn compiled_pins() -> Result<&'static BTreeMap<Digest, VerityDigest>, &'static s
 {
     const PINS: &[(&str, &str)] = &[
         (
+            "sha256:e8a6d9786ea678e739f1a386682846e93742dcb9c7b6e3e0c62e3bda6cff0ef3",
+            "sha256:083395c407a8e266798efa98f33f4ec259d2df93b2b3197456d1792f9f38e2cd",
+        ),
+        (
             "sha256:7e8b57e88c459396d4680d83dcdd8c7f72305447cb55b11f4ac98ad70a3f7825",
             "sha256:a5da051d29f43f6f9d0ceb1621157588b5178d140e989b82db25e09550482411",
         ),

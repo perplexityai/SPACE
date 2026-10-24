@@ -253,7 +253,7 @@ pub(super) mod service_tests {
             .authorize_identity(node_ctl.clone(), "Status", ALLOW_NODE_STATUS)
             .expect("node-ctl needs node status access to publish scheduling snapshots");
         authorizer
-            .authorize_identity(node_ctl.clone(), "GetFirecrackerVmState", ALLOW_NODE_STATUS)
+            .authorize_identity(node_ctl.clone(), "GetVmState", ALLOW_NODE_STATUS)
             .expect("node-ctl may inspect runtime state without gaining mutation access");
         authorizer
             .authorize_identity(node_ctl.clone(), "GetExecutionInventory", ALLOW_NODE_STATUS)
@@ -678,7 +678,11 @@ pub(super) mod service_tests {
                 assets: vacant.join("assets"),
                 kernels: vacant.join("kernels"),
                 store: crate::config::ArtifactStorePaths {
-                    releases: vacant.join("store/releases"),
+                    releases: [(
+                        pplx_space_common_core::types::RuntimeKind::Firecracker,
+                        vacant.join("store/releases"),
+                    )]
+                    .into(),
                     kernels: vacant.join("store/kernels"),
                     staging: vacant.join("staging"),
                     catalog: vacant.join("catalog"),
@@ -752,7 +756,11 @@ pub(super) mod service_tests {
         }
         std::fs::create_dir(&assets).unwrap();
         let store = crate::config::ArtifactStorePaths {
-            releases: root.path().join("store/releases"),
+            releases: [(
+                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                root.path().join("store/releases"),
+            )]
+            .into(),
             kernels: root.path().join("store/kernels"),
             staging: root.path().join("staging"),
             catalog: root.path().join("catalog"),
@@ -1024,7 +1032,7 @@ pub(super) mod service_tests {
             prepare
                 .extensions_mut()
                 .insert(PeerIdentity::new(0, 0, None));
-            let mut load = Request::new(LoadSnapshotRequest {
+            let mut load = Request::new(FirecrackerRestore {
                 execution_fence: Some(execution_fence.clone()),
                 sandbox_id: sandbox_id.clone(),
                 snapshot_path: "../vmstate".into(),
@@ -1033,7 +1041,7 @@ pub(super) mod service_tests {
             });
             load.extensions_mut().insert(PeerIdentity::new(0, 0, None));
             let mut prepare = Box::pin(service.prepare_sandbox(prepare));
-            let mut load = Box::pin(service.load_snapshot(load));
+            let mut load = Box::pin(service.restore_firecracker_state(load));
             if cleanup {
                 // A replacement lease can exist while the old slot's reset
                 // still owns the sandbox. Neither RPC may enter host work or

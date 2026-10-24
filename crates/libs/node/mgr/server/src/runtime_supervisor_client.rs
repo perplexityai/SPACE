@@ -7,7 +7,7 @@
 //! refusing connections provably never reached a server, so replaying it is
 //! safe for every supervisor RPC, idempotent or not. Statuses a server returned
 //! and mid-stream transport breaks are never replayed — those may have
-//! executed. (LaunchFirecracker/LaunchSidecar are additionally idempotent
+//! executed. (LaunchRuntime/LaunchSidecar are additionally idempotent
 //! through pidfile re-adoption, but the retry class must not be widened on
 //! that basis.)
 
@@ -319,7 +319,7 @@ impl RuntimeSupervisorLazyClient {
     }
 
     runtime_supervisor_lazy_unary_methods! {
-        launch_firecracker, proto::LaunchFirecrackerRequest, proto::LaunchFirecrackerResponse;
+        launch_runtime, proto::LaunchRuntimeRequest, proto::LaunchRuntimeResponse;
         launch_sidecar, proto::LaunchSidecarRequest, proto::LaunchSidecarResponse;
         stop_sandbox_runtime, proto::StopSandboxRuntimeRequest, proto::StopSandboxRuntimeResponse;
         bind_execution, proto::BindExecutionRequest, proto::BindExecutionResponse;
