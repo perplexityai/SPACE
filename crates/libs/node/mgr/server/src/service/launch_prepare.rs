@@ -19,7 +19,7 @@ impl NodeManagerService {
     async fn launch_admitted_runtime(
         &self,
         sandbox_id: &str,
-        request: pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch,
+        request: pplx_space_node_runtime_core::proto::LaunchRuntimeRequest,
     ) -> Result<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse, Status> {
         let expected_environment = request
             .verified_runtime
@@ -27,7 +27,7 @@ impl NodeManagerService {
             .map(|verified| verified.environment_reference.clone());
         let launched = self
             .runtime_supervisor
-            .launch_runtime(request.into())
+            .launch_runtime(request)
             .await
             .map_err(pplx_space_node_runtime_core::launch_admission::supervisor_launch_status)?
             .into_inner();
@@ -307,18 +307,20 @@ impl NodeManagerService {
             .runtime_files
             .path(RuntimeFileRole::RuntimeExecutable)
             .ok_or_else(|| {
-                Status::failed_precondition("resolved Firecracker runtime is missing firecracker")
+                Status::failed_precondition("resolved runtime is missing its executable")
             })?
             .display()
             .to_string();
         let jailer_bin = resolved_execution
             .runtime_files
             .path(RuntimeFileRole::LauncherExecutable)
-            .ok_or_else(|| {
-                Status::failed_precondition("resolved Firecracker runtime is missing jailer")
-            })?
-            .display()
-            .to_string();
+            .map(|path| path.display().to_string());
+        let standalone = runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor;
+        if standalone && (req.snapshot_restore || self.disk_io_ceiling.configured().is_some()) {
+            return Err(Status::failed_precondition(
+                "runtime does not support memory restore or a live node disk-I/O ceiling",
+            ));
+        }
         log_resolved_execution("launch", sandbox_id, &resolved_execution.execution);
         let _lifecycle_permit = self
             .lifecycle_limiter
@@ -344,9 +346,7 @@ impl NodeManagerService {
                         Some(&boot_component_role()),
                     )
                     .ok_or_else(|| {
-                        Status::failed_precondition(
-                            "resolved Firecracker runtime is missing boot kernel",
-                        )
+                        Status::failed_precondition("resolved runtime is missing its boot kernel")
                     })?,
             )
         };
@@ -359,7 +359,17 @@ impl NodeManagerService {
         // Place kernel + rootfs + config into the jailer's expected chroot root dir.
         // Clean any leftover from a previous launch (jailer fails with "Text file busy"
         // or "File exists" if artifacts remain from a prior attempt).
-        let jail_root = paths::jail_root(sandbox_id).display().to_string();
+        let jail_root = pplx_space_node_runtime_core::control::isolation_root(runtime, sandbox_id)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?
+            .display()
+            .to_string();
+        let control_socket = pplx_space_node_runtime_core::control::socket_path(
+            runtime,
+            sandbox_id
+                .parse()
+                .map_err(|e| Status::invalid_argument(format!("sandbox id: {e}")))?,
+        )
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
         let observed_id = sandbox_id.to_string();
         let existing_pid = self
             .off_runtime("observe jail ownership", move || {
@@ -375,13 +385,28 @@ impl NodeManagerService {
                 })?;
             // Reusing a pre-existing runtime bypasses cold-boot configuration.
             // Keep its PID discoverable by the sweep even if verification fails.
-            let client = crate::fc_api::FcApiClient::new(format!("{jail_root}/firecracker.sock"));
-            self.disk_io_ceiling
-                .enforce_launch_adoption(&client, req.snapshot_restore)
-                .await?;
+            if standalone {
+                let client =
+                    pplx_space_node_runtime_core::control::connect(runtime, control_socket.clone())
+                        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                let state = client
+                    .state()
+                    .await
+                    .map_err(|e| Status::unavailable(e.to_string()))?;
+                if state != pplx_space_node_runtime_core::control::VmState::Running {
+                    return Err(Status::failed_precondition(
+                        "resident runtime has not completed boot; stop before retrying",
+                    ));
+                }
+            } else {
+                let client = crate::fc_api::FcApiClient::new(control_socket.clone());
+                self.disk_io_ceiling
+                    .enforce_launch_adoption(&client, req.snapshot_restore)
+                    .await?;
+            }
             return Ok(Response::new(LaunchSandboxResponse {
                 pid: pid.get().get(),
-                api_socket_path: format!("{jail_root}/firecracker.sock"),
+                api_socket_path: control_socket.display().to_string(),
                 resolved_execution: Some((&resolved_execution.execution).into()),
             }));
         }
@@ -397,6 +422,11 @@ impl NodeManagerService {
                 .iter()
                 .map(|component| component.integrity),
         )?;
+        if standalone && verified_environment.is_none() {
+            return Err(Status::failed_precondition(
+                "standalone runtime requires sealed execution sources",
+            ));
+        }
         self.adopt_validated_lease(sandbox_id, &lease)?;
         let stale_root = jail_root.clone();
         spawn_lifecycle_blocking(&_lifecycle_permit, move || {
@@ -538,22 +568,41 @@ impl NodeManagerService {
         // the sandbox. Best effort: a launch without one has no Firecracker
         // metrics, and Firecracker is told about it only once it exists.
         let metrics_fifo = format!("{jail_root}/{FIRECRACKER_METRICS_FIFO}");
-        let fc_metrics = match spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-            create_firecracker_metrics_fifo(Path::new(&metrics_fifo), sandbox_uid)
-        })
-        .await
-        {
-            Ok(Ok(())) => format!("/{FIRECRACKER_METRICS_FIFO}"),
-            Ok(Err(error)) => {
-                tracing::warn!(sandbox_id, %error, "launching without Firecracker metrics");
-                String::new()
-            }
-            Err(error) => {
-                tracing::warn!(sandbox_id, %error, "launching without Firecracker metrics");
-                String::new()
+        let fc_metrics = if standalone {
+            String::new()
+        } else {
+            match spawn_lifecycle_blocking(&_lifecycle_permit, move || {
+                create_firecracker_metrics_fifo(Path::new(&metrics_fifo), sandbox_uid)
+            })
+            .await
+            {
+                Ok(Ok(())) => format!("/{FIRECRACKER_METRICS_FIFO}"),
+                Ok(Err(error)) => {
+                    tracing::warn!(sandbox_id, %error, "launching without Firecracker metrics");
+                    String::new()
+                }
+                Err(error) => {
+                    tracing::warn!(sandbox_id, %error, "launching without Firecracker metrics");
+                    String::new()
+                }
             }
         };
-        let fc_console = if self.guest_console_logs {
+        let fc_console = if standalone {
+            let output = PathBuf::from(format!("{jail_root}/console.log"));
+            let path = output.display().to_string();
+            spawn_lifecycle_blocking(&_lifecycle_permit, move || {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(output)
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(|e| Status::internal(format!("create runtime output: {e}")))?;
+            path
+        } else if self.guest_console_logs {
             format!("{RUN_DIR}/{sandbox_id}/guest-console.log")
         } else {
             String::new()
@@ -564,47 +613,59 @@ impl NodeManagerService {
             integrity_requirement: ArtifactIntegrityRequirement::AuthenticatedImmutableSources
                 .into(),
         });
-        let protected_launch = verified_runtime.is_some();
-        let launched = self
-            .launch_admitted_runtime(
-                sandbox_id,
-                pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch {
-                    execution_id: req
-                        .execution_fence
-                        .as_ref()
-                        .map_or_else(String::new, |fence| fence.execution_id.clone()),
-                    sandbox_id: if protected_launch {
-                        String::new()
-                    } else {
-                        sandbox_id.to_string()
-                    },
-                    jailer_bin,
-                    firecracker_bin,
-                    verified_runtime,
-                    chroot_base_dir: chroot_base.clone(),
-                    ns_path: ns_path.clone(),
-                    uid: sandbox_uid,
-                    gid: sandbox_uid,
-                    fc_config_path: fc_config.to_string(),
-                    fc_log_path: fc_log,
-                    fc_metrics_path: fc_metrics,
-                    fc_console_path: fc_console.clone(),
-                    cgroup_limits: Some(self.launch_cgroup_limits(req)),
-                },
+        let standalone_configuration = if standalone {
+            Some(
+                self.standalone_configuration(
+                    runtime,
+                    PathBuf::from(format!("{jail_root}/vm-config.json")),
+                )
+                .await?,
             )
-            .await?;
+        } else {
+            None
+        };
+        let request = pplx_space_node_runtime_core::proto::LaunchRuntimeRequest {
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: req
+                .execution_fence
+                .as_ref()
+                .map_or_else(String::new, |f| f.execution_id.clone()),
+            runtime: pplx_space_execution_common::proto::RuntimeKind::from(runtime) as i32,
+            runtime_binary: firecracker_bin,
+            launcher_binary: jailer_bin,
+            workspace_root: chroot_base,
+            network_namespace: ns_path,
+            uid: sandbox_uid,
+            gid: sandbox_uid,
+            configuration_path: fc_config.to_owned(),
+            log_path: fc_log,
+            metrics_path: fc_metrics,
+            console_path: fc_console,
+            resource_limits: Some(self.launch_cgroup_limits(req)),
+            verified_runtime,
+        };
+        let launched = self.launch_admitted_runtime(sandbox_id, request).await?;
         let fc_pid = launched.pid;
         if let Err(error) = self.pool.set_pid(sandbox_id, fc_pid) {
             tracing::error!(
                 sandbox_id,
                 pid = fc_pid,
                 error = %error,
-                "failed to persist firecracker pid"
+                "failed to persist runtime pid"
             );
             kill_launched_process_after_pid_persist_failure(self, sandbox_id, fc_pid).await;
             return Err(Status::internal(format!(
-                "failed to persist firecracker pid: {error}"
+                "failed to persist runtime pid: {error}"
             )));
+        }
+
+        if let Some(configuration) = standalone_configuration
+            && let Err(error) = self
+                .boot_standalone(runtime, control_socket.clone(), &configuration)
+                .await
+        {
+            kill_launched_process_after_pid_persist_failure(self, sandbox_id, fc_pid).await;
+            return Err(error);
         }
 
         // Make jail root traversable by sbx-manager so it can
@@ -634,7 +695,7 @@ impl NodeManagerService {
             kill_launched_process_after_pid_persist_failure(self, sandbox_id, fc_pid).await;
             return Err(status);
         }
-        let api_socket_path = format!("{jail_root}/firecracker.sock");
+        let api_socket_path = control_socket.display().to_string();
         if !req.snapshot_restore {
             // Make v.sock connectable by sbx-manager (for direct vsock health checks).
             // FC creates it owned by sandbox UID; set group to space-sbxmgr so

@@ -233,6 +233,16 @@ struct CompiledKernel {
     sha256: &'static str,
 }
 
+/// Reviewed upstream ARM64 direct-boot image; download transport is independent
+/// of the node-manager content pins.
+const CLOUD_HYPERVISOR_KERNELS: &[CompiledKernel] = &[CompiledKernel {
+    version: "7.2.8+",
+    runtime_line: "54.0",
+    architecture: "aarch64",
+    size: 24_177_152,
+    sha256: "8f8f3d5a983809f87a4e1e9a13053a3361fda47ef04e09c771a41c5e037cb6c2",
+}];
+
 /// Reviewed Firecracker CI guest kernels. The bucket publishes no SHA-256;
 /// these pins identify inspected downloads. Source snapshots and verification
 /// procedure are documented in `docs/runtime-manager-catalog.md`.
@@ -603,7 +613,15 @@ impl RuntimeCatalog {
             }
             catalog.releases.push(pinned);
         }
-        for compiled in FIRECRACKER_KERNELS {
+        for (runtime, compiled) in FIRECRACKER_KERNELS
+            .iter()
+            .map(|pin| (RuntimeKind::Firecracker, pin))
+            .chain(
+                CLOUD_HYPERVISOR_KERNELS
+                    .iter()
+                    .map(|pin| (RuntimeKind::CloudHypervisor, pin)),
+            )
+        {
             let entry = || format!("kernel {} {}", compiled.version, compiled.architecture);
             let field = |field, value| CatalogError::Compiled {
                 entry: entry(),
@@ -613,7 +631,7 @@ impl RuntimeCatalog {
             catalog.kernels.push(PinnedKernel {
                 version: ArtifactVersion::parse(compiled.version)
                     .map_err(|_| field("version", compiled.version))?,
-                runtime: RuntimeKind::Firecracker,
+                runtime,
                 runtime_line: RuntimeVersion::parse(compiled.runtime_line)
                     .map_err(|_| field("runtime_line", compiled.runtime_line))?,
                 architecture: compiled

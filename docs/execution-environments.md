@@ -977,7 +977,76 @@ implementation. Socket construction belongs to the standalone Linux adapters;
 node-manager owns those host-capable control endpoints. Guest communication is a
 separate channel.
 
-Installing a release does not qualify an execution environment. Cloud Hypervisor
-still needs a verified boot artifact, contained launch implementation and lifecycle
-qualification before it can be selected. New adapters must reject unsupported
-lifecycle and resource policies at admission, rather than silently ignoring them.
+Installing a release does not approve it for execution. The ARM64 compiled
+`ch-54.0-linux-7.2.8` environment pairs the static Cloud Hypervisor 54.0 executable
+with the upstream 7.2.8+ ARM64 Linux image. Its SHA-256 and fs-verity measurements
+are pinned independently. It has no memory-state format or cross-release
+replacement qualification. Existing ARM64 unbound Firecracker defaults stay
+unchanged; CH requires explicit policy permission and an exact environment.
+
+Node-manager owns the CH control API and validates the supported boot device
+model before sending configuration. Sandbox-manager receives only the separate
+guest communication endpoint. The supervisor opens and authenticates the runtime,
+then a fresh single-threaded launcher creates mount, network, IPC, UTS and PID
+isolation, enters the VM cgroup, drops privilege, and executes the same sealed
+descriptor. The namespace runner reports the actual VMM PID for guest transport
+peer authentication and reaps it on exit. An interrupted boot is cleaned through
+the existing fenced sandbox teardown path; boot mutations are never replayed.
+
+The initial path supports local cold creation, start, stop and delete. It refuses
+memory snapshots, restore, pools, pause/resume, automatic suspend/pause, ballooning,
+huge pages and live disk-I/O ceiling updates. GPU assignment is not implemented.
+Template finalization requires acknowledged Stop before copying the rootfs.
+Future runtime adapters own their boot and control implementation; the shared
+lifecycle retains selection, execution identity, resource fences and cleanup.
+
+### ARM64 local builder and worker exercise
+
+Use an isolated Linux ARM64 KVM builder/worker with the same SPACE revision across
+runtime-manager, supervisor, node-manager, sandbox-manager, template-manager and
+build-manager. Deploy the protocol migration before removing old RPCs as described
+above. The execution cache must support fs-verity; CH does not use the legacy
+unsealed launch fallback. Verify the host can boot the CH PCI device model before
+using it for workloads. Nested KVM availability alone does not prove working
+virtio block, network or vsock interrupts.
+
+Add `ch-54.0-linux-7.2.8` to the node-manager startup allowlist. On ARM64 the
+configuration `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS=legacy,ch-54.0-linux-7.2.8`
+keeps the existing unbound default. Leave `SPACE_DEFAULT_EXECUTION_ENVIRONMENT`
+unset. Restart node-manager through the normal deployment mechanism. Installing
+artifacts does not change either setting.
+
+On that node, install and resolve the exact sources:
+
+```sh
+space-rtmgr runtimes install cloud-hypervisor-54.0
+space-rtmgr kernels install '7.2.8+' --runtime cloud-hypervisor-54.0
+CH_ENV=sha256:8da931abea319e09b50563ab03d22cbde774ed88296e8723772be8ba75e5d1d0
+space-nodemgr environment --reference "$CH_ENV"
+```
+
+Use the normal node-local build API with the recipes from this checkout. Copy the
+recipes onto the builder when the checkout is on another machine. The builder
+requires its normal seed inputs: containerd, guest `spaced` binaries and builder
+SSH trust. Both recipes register their outputs through template-manager; no
+metadata editing or database writes are involved.
+
+```sh
+space-buildmgr build --recipe templates/cloud-hypervisor/recipes/seed.toml \
+  --id ch-seed --environment "$CH_ENV"
+space-buildmgr build --recipe templates/cloud-hypervisor/recipes/smoke.toml \
+  --id ch-smoke --base ch-seed --environment "$CH_ENV"
+space-sbxmgr create --template ch-smoke --environment "$CH_ENV" \
+  --autostart --blocking --auto-lifecycle-off
+```
+
+The derived build writes `/opt/space/ch-build-result` inside the guest. Verify that
+file through the normal guest command transport, then stop and start the returned
+sandbox UUID and verify it again. Delete the test sandbox through the CLI when
+finished. A successful seed build alone is insufficient evidence: it constructs
+the disk without booting a VM. Qualification requires the derived build and cold
+sandbox readiness, including guest command transport and stop/start persistence.
+
+Do not enable CH for fleet placement based on these local results. Environment
+placement, multi-node qualification and additional lifecycle capabilities remain
+separate admission requirements.

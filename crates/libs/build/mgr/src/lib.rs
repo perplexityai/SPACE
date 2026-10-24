@@ -1064,15 +1064,8 @@ impl TemplateBuilder {
         })
         .await
         {
-            if runtime_build.requires_durable_stop() {
-                delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime stop failed").await;
-                return Err(error);
-            }
-            tracing::warn!(
-                sandbox_id = %sandbox_id,
-                error = %error,
-                "sandbox stop failed before rootfs copy; continuing with best-effort copy"
-            );
+            delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime stop failed").await;
+            return Err(error);
         }
 
         // For runtime-bearing images, confirmed Stop proves the runtime cgroups

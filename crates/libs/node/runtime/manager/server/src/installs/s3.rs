@@ -112,7 +112,7 @@ impl S3KernelSource {
             .send();
         while let Some(page) = pages.next().await {
             let page = page.map_err(|error| SourceError::List {
-                location: Box::new(self.object(prefix)),
+                location: Box::new(self.object(prefix).into()),
                 source: Box::new(error),
             })?;
             // A release line holds dozens of kernels; a listing far past that
@@ -120,7 +120,7 @@ impl S3KernelSource {
             listed = listed.saturating_add(page.contents().len());
             if listed > MAX_LISTED_OBJECTS {
                 return Err(SourceError::ListingTooLarge {
-                    location: Box::new(self.object(prefix)),
+                    location: Box::new(self.object(prefix).into()),
                     limit: MAX_LISTED_OBJECTS,
                 });
             }
@@ -143,7 +143,7 @@ impl S3KernelSource {
                     version,
                     line,
                     architecture,
-                    location: self.object(key),
+                    location: self.object(key).into(),
                     size,
                     md5: object.e_tag().and_then(ContentMd5::from_etag),
                 });
@@ -156,8 +156,8 @@ impl S3KernelSource {
 
 #[async_trait::async_trait]
 impl KernelSource for S3KernelSource {
-    fn root(&self) -> &StorageUri {
-        &self.root
+    fn root(&self) -> super::source::KernelLocation {
+        self.root.clone().into()
     }
 
     /// The layout is Firecracker's CI bucket's.
@@ -177,13 +177,18 @@ impl KernelSource for S3KernelSource {
         )
         .await
         .map_err(|_| SourceError::TimedOut {
-            location: Box::new(self.object(&prefix)),
+            location: Box::new(self.object(&prefix).into()),
             after: REQUEST_TIMEOUT,
         })?
     }
 
     async fn open(&self, kernel: &VerifiableKernel) -> Result<ByteChunks, SourceError> {
-        if !self.holds(&kernel.location) {
+        let super::source::KernelLocation::S3(location) = &kernel.location else {
+            return Err(SourceError::Foreign {
+                location: Box::new(kernel.location.clone()),
+            });
+        };
+        if !self.holds(location) {
             return Err(SourceError::Foreign {
                 location: Box::new(kernel.location.clone()),
             });
@@ -191,8 +196,8 @@ impl KernelSource for S3KernelSource {
         let request = self
             .client
             .get_object()
-            .bucket(&kernel.location.bucket)
-            .key(&kernel.location.key_prefix)
+            .bucket(&location.bucket)
+            .key(&location.key_prefix)
             .send();
         let object = tokio::time::timeout(REQUEST_TIMEOUT, request)
             .await
