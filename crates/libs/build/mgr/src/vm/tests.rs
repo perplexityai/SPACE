@@ -10,13 +10,13 @@ async fn graceful_exit_requires_host_evidence_for_the_original_vm() {
         )),
         Ok(InspectSandboxResponse::default()),
         Ok(InspectSandboxResponse {
-            fc_pid: Some(42),
-            fc_alive: true,
+            runtime_pid: Some(42),
+            runtime_alive: true,
             ..Default::default()
         }),
         Ok(InspectSandboxResponse {
-            fc_pid: Some(42),
-            fc_alive: false,
+            runtime_pid: Some(42),
+            runtime_alive: false,
             ..Default::default()
         }),
     ])
@@ -28,8 +28,8 @@ async fn graceful_exit_requires_host_evidence_for_the_original_vm() {
     assert_eq!(started.elapsed(), Duration::from_millis(1500));
     let error = wait_for_exit_with(42, || {
         std::future::ready(Ok(InspectSandboxResponse {
-            fc_pid: Some(43),
-            fc_alive: false,
+            runtime_pid: Some(43),
+            runtime_alive: false,
             ..Default::default()
         }))
     })
@@ -40,8 +40,8 @@ async fn graceful_exit_requires_host_evidence_for_the_original_vm() {
         Duration::from_secs(30),
         wait_for_exit_with(42, || {
             std::future::ready(Ok(InspectSandboxResponse {
-                fc_pid: Some(42),
-                fc_alive: true,
+                runtime_pid: Some(42),
+                runtime_alive: true,
                 ..Default::default()
             }))
         }),
