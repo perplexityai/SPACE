@@ -18,6 +18,8 @@
 mod executor;
 #[cfg(feature = "github")]
 mod github;
+#[cfg(feature = "github")]
+pub(crate) mod https_kernel;
 mod kernel;
 mod operations;
 mod publisher;
@@ -25,7 +27,7 @@ mod release;
 mod release_source;
 #[cfg(feature = "s3")]
 mod s3;
-mod source;
+pub(crate) mod source;
 mod staging;
 mod store;
 #[cfg(test)]
@@ -55,8 +57,8 @@ pub(crate) use s3::S3KernelSource;
 pub(crate) use source::host_arch;
 pub use source::{
     BoxError, ByteChunks, ContentMd5, ContentMd5ParseError, FIRECRACKER_CI_KERNEL_SOURCE,
-    KernelSource, KernelVersion, KernelVersionParseError, ReleaseLine, ReleaseLineParseError,
-    RuntimeLine, SourceError, SourceKernel, VerifiableKernel,
+    KernelLocation, KernelLocationError, KernelSource, KernelVersion, KernelVersionParseError,
+    ReleaseLine, ReleaseLineParseError, RuntimeLine, SourceError, SourceKernel, VerifiableKernel,
 };
 pub use staging::{PrepareStagingError, StagingError};
 pub(crate) use store::JobOutcome;
