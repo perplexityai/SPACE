@@ -831,7 +831,8 @@ async fn a_resumed_reader_reports_the_output_gap_and_continues() {
         ));
     }
     let ProcessJournalRead::Lagged {
-        resume_sequence, ..
+        first_sequence: resume_sequence,
+        ..
     } = journal.read(0)
     else {
         panic!("the journal evicted unread output");
@@ -944,7 +945,9 @@ async fn evicted_cursor_reports_lag_before_terminal_event() {
         ProcessOutputGap, process_event::Event,
     };
 
-    for resume_after_output_gap in [false, true] {
+    for (resume_after_output_gap, release_output_only) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let journal = Arc::new(ProcessEventJournal::new(output_slots()));
         let process_id = ProcessId::new();
         journal.append_output(process_stdout_event(
@@ -964,7 +967,14 @@ async fn evicted_cursor_reports_lag_before_terminal_event() {
             }),
         };
         journal.complete(exit.clone());
-        drop(journal);
+        let retained = if release_output_only {
+            journal.backdate_completion(Duration::from_secs(2));
+            assert!(journal.release_output_if_due(Duration::from_secs(1)));
+            Some(journal)
+        } else {
+            drop(journal);
+            None
+        };
 
         let events = process_event_stream_with_prefix(Vec::new(), Some(cursor))
             .collect::<Vec<_>>()
@@ -996,6 +1006,7 @@ async fn evicted_cursor_reports_lag_before_terminal_event() {
             }))
         );
         assert_eq!(events[1], exit);
+        drop(retained);
     }
 }
 
@@ -1017,8 +1028,10 @@ async fn cursor_past_the_output_fails_instead_of_waiting() {
             journal.complete(exit.clone());
         }
 
-        let mut ahead =
-            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(5), false)));
+        let mut ahead = process_event_stream_with_prefix(
+            Vec::new(),
+            Some(journal.cursor(Some(5), false, None)),
+        );
         let error = tokio::time::timeout(Duration::from_secs(1), ahead.next())
             .await
             .expect("a cursor past the output must not wait")
@@ -1038,8 +1051,10 @@ async fn cursor_past_the_output_fails_instead_of_waiting() {
         );
         assert!(ahead.next().await.is_none());
 
-        let mut at_end =
-            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(1), false)));
+        let mut at_end = process_event_stream_with_prefix(
+            Vec::new(),
+            Some(journal.cursor(Some(1), false, None)),
+        );
         let next = tokio::time::timeout(Duration::from_millis(100), at_end.next()).await;
         if completed {
             assert_eq!(next.unwrap().unwrap().unwrap(), exit);
@@ -1090,7 +1105,7 @@ async fn lagged_cursor_reports_the_oldest_retained_output() {
 
     let mut retained = process_event_stream_with_prefix(
         Vec::new(),
-        Some(journal.cursor(Some(first_sequence), false)),
+        Some(journal.cursor(Some(first_sequence), false, None)),
     );
     let event = retained.next().await.unwrap().unwrap();
     assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
@@ -1732,6 +1747,7 @@ async fn a_completed_process_exit_stays_connectable_until_its_retention_ends() {
         Process::connect_process(
             &service,
             Request::new(ConnectProcessRequest {
+                resume_after_output_gap: None,
                 process_id: process_id.into(),
                 timeout: None,
                 output_cursor: None,
@@ -1881,6 +1897,7 @@ async fn a_completed_process_releases_its_output_after_the_idempotency_window() 
     let events = Process::connect_process(
         &service,
         Request::new(ConnectProcessRequest {
+            resume_after_output_gap: None,
             process_id: process_id.into(),
             timeout: None,
             output_cursor: None,
@@ -2509,41 +2526,49 @@ async fn connect_resumes_after_an_output_gap_only_when_asked() {
     .await
     .expect("the process exits");
     drop(record);
-    let connect = |resume: bool| {
+    let connect = |resume: bool, from_oldest: bool| {
         Process::connect_process(
             &service,
             Request::new(ConnectProcessRequest {
                 process_id: process_id.as_str().to_string(),
                 output_cursor: Some(0),
                 resume_after_output_gap: resume.then_some(true),
+                resume_from_oldest_retained: from_oldest,
                 ..Default::default()
             }),
         )
     };
 
-    let mut resumed = connect(true).await.expect("connect").into_inner();
-    let (mut acknowledged, mut bytes_before, mut received, mut exited) =
-        (false, None, 0_u64, false);
-    while let Some(event) = resumed.next().await {
-        match event.expect("a resumed reader does not fail").event {
-            Some(Event::Connected(connected)) => acknowledged = connected.resume_after_output_gap,
-            Some(Event::OutputGap(gap)) => {
-                assert_eq!(bytes_before, None, "one gap for one eviction run");
-                assert_eq!(received, 0);
-                bytes_before = Some(gap.output_bytes_before);
+    for from_oldest in [false, true] {
+        let mut resumed = connect(true, from_oldest)
+            .await
+            .expect("connect")
+            .into_inner();
+        let (mut acknowledged, mut bytes_before, mut received, mut exited) =
+            (false, None, 0_u64, false);
+        while let Some(event) = resumed.next().await {
+            match event.expect("a resumed reader does not fail").event {
+                Some(Event::Connected(connected)) => {
+                    acknowledged = connected.resume_after_output_gap
+                }
+                Some(Event::OutputGap(gap)) => {
+                    assert_eq!(bytes_before, None, "one gap for one eviction run");
+                    assert_eq!(received, 0);
+                    bytes_before = Some(gap.output_bytes_before);
+                }
+                Some(Event::Stdout(output)) => received += output.data.len() as u64,
+                Some(Event::Exit(_)) => exited = true,
+                _ => {}
             }
-            Some(Event::Stdout(output)) => received += output.data.len() as u64,
-            Some(Event::Exit(_)) => exited = true,
-            _ => {}
         }
+        assert!(acknowledged, "spaced-host relies on the acknowledgement");
+        let bytes_before = bytes_before.expect("the reader was told about the gap");
+        assert!(bytes_before > 0);
+        assert_eq!(bytes_before + received, noise as u64 + 4);
+        assert!(exited);
     }
-    assert!(acknowledged, "spaced-host relies on the acknowledgement");
-    let bytes_before = bytes_before.expect("the reader was told about the gap");
-    assert!(bytes_before > 0);
-    assert_eq!(bytes_before + received, noise as u64 + 4);
-    assert!(exited);
 
-    let mut legacy = connect(false).await.expect("connect").into_inner();
+    let mut legacy = connect(false, false).await.expect("connect").into_inner();
     let mut error = None;
     while let Some(event) = legacy.next().await {
         match event {
@@ -2560,5 +2585,9 @@ async fn connect_resumes_after_an_output_gap_only_when_asked() {
     }
     let error = error.expect("a reader that did not opt in still fails");
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-    assert_eq!(error.message(), PROCESS_OUTPUT_LAGGED_MESSAGE);
+    assert_eq!(
+        error.message(),
+        pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE
+    );
+    shut_down(&service).await;
 }

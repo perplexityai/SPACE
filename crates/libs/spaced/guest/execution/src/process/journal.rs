@@ -146,6 +146,12 @@ impl ProcessEventJournal {
         {
             return false;
         }
+        let cleared: u64 = state
+            .output
+            .iter()
+            .map(|event| output_data_bytes(&event.event))
+            .sum();
+        state.dropped_output_bytes += cleared;
         state.output.clear();
         state.retained_bytes = 0;
         state.guaranteed_bytes = 0;
@@ -216,7 +222,9 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned");
         let next_sequence = match requested {
-            Some(cursor) if from_oldest_retained => cursor.max(state.first_sequence),
+            Some(cursor) if from_oldest_retained && gap_resume.is_none() => {
+                cursor.max(state.first_sequence)
+            }
             Some(cursor) => cursor,
             None => state.next_sequence,
         };
@@ -297,7 +305,11 @@ impl ProcessEventJournal {
                     .state
                     .lock()
                     .expect("process output journal lock poisoned");
-                let cleared: u64 = state.output.iter().map(|event| event.data_bytes).sum();
+                let cleared: u64 = state
+                    .output
+                    .iter()
+                    .map(|event| output_data_bytes(&event.event))
+                    .sum();
                 state.dropped_output_bytes += cleared + data_bytes;
                 state.output.clear();
                 state.retained_bytes = 0;
@@ -369,7 +381,6 @@ impl ProcessEventJournal {
                 sequence,
                 event,
                 output_bytes,
-                data_bytes,
                 guaranteed_bytes,
                 _shared_output_slot: shared_output_slot,
             });
@@ -388,7 +399,11 @@ impl ProcessEventJournal {
             state.exit = Some(exit.clone());
             state.completed_at = Some(tokio::time::Instant::now());
             state.ended_at = Some(SystemTime::now());
-            let retained: u64 = state.output.iter().map(|event| event.data_bytes).sum();
+            let retained: u64 = state
+                .output
+                .iter()
+                .map(|event| output_data_bytes(&event.event))
+                .sum();
             (state.next_sequence, state.dropped_output_bytes + retained)
         };
         self.changed.send_replace(ProcessJournalChange::Exit {
@@ -456,7 +471,6 @@ pub(super) struct SequencedProcessEvent {
     pub(super) sequence: u64,
     pub(super) event: ProcessEvent,
     pub(super) output_bytes: usize,
-    pub(super) data_bytes: u64,
     pub(super) guaranteed_bytes: usize,
     pub(super) _shared_output_slot: Option<OwnedSemaphorePermit>,
 }
@@ -475,7 +489,7 @@ pub(super) fn evict_oldest_process_output(state: &mut ProcessJournalState) {
         .expect("retained byte count requires a process output event");
     state.retained_bytes -= removed.output_bytes;
     state.guaranteed_bytes -= removed.guaranteed_bytes;
-    state.dropped_output_bytes += removed.data_bytes;
+    state.dropped_output_bytes += output_data_bytes(&removed.event);
     state.first_sequence = removed.sequence + 1;
 }
 

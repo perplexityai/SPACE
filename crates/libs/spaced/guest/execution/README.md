@@ -193,6 +193,13 @@ and error evolution, requires a separate crate-level policy before stabilization
   process groups while supervision is active. Background descendants that close
   or redirect inherited output can outlive a completed leader; draining this
   service does not establish that every descendant has exited.
+- `ConnectProcessRequest::resume_after_output_gap` opts into explicit loss
+  reports followed by retained output and the exit. `ProcessOutputGap` names the
+  next cursor, skipped events and cumulative bytes before that cursor. It also
+  applies to gaps that arise after connecting and takes precedence over
+  `resume_from_oldest_retained`. Callers that omit it keep existing reconnect
+  behavior. The host rejects an opted-in live connection when the guest does not
+  acknowledge support; ordinary connections remain available to older guests.
 - By default, a completed process stays connectable for 15 minutes after it exits, so a
   client that reattaches still reads its exit, and the process list includes it
   with its exit when asked to (`include_exited`); by default it lists running

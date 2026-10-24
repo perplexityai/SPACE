@@ -3657,7 +3657,8 @@ fn process_events_map_to_native_data_plane_frames() {
                 })),
             },
             &mut seq,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(exited.output_bytes, 0);
         assert_eq!(
             exited.frames,

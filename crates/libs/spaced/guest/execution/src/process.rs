@@ -88,6 +88,14 @@ async fn resolve_process_account(
         .map_err(|error| Status::internal(format!("guest account lookup task failed: {error}")))?
 }
 
+fn output_data_bytes(event: &ProcessEvent) -> u64 {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+    match event.event.as_ref() {
+        Some(Event::Stdout(output) | Event::Stderr(output)) => output.data.len() as u64,
+        _ => unreachable!("process journal only retains output events"),
+    }
+}
+
 /// What a resumed reader's `ProcessOutputGap` event is addressed with.
 struct OutputGapResume {
     process_id: String,

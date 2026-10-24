@@ -269,7 +269,10 @@ enum ConnectMode {
     /// Reattach: `Connected`, then the journal from `output_cursor`; `None`
     /// is the live tail, which replays nothing, and a cursor past the output
     /// fails.
-    Connect { output_cursor: Option<u64>, resume_after_output_gap: bool },
+    Connect {
+        output_cursor: Option<u64>,
+        resume_after_output_gap: bool,
+    },
 }
 
 fn event_stream(process: &SimProcess, mode: ConnectMode) -> SimProcessEventStream {
@@ -290,7 +293,10 @@ fn event_stream(process: &SimProcess, mode: ConnectMode) -> SimProcessEventStrea
             }
             (started, 0)
         }
-        ConnectMode::Connect { output_cursor, resume_after_output_gap } => {
+        ConnectMode::Connect {
+            output_cursor,
+            resume_after_output_gap,
+        } => {
             // Nothing is evicted, so the stream starts at the cursor.
             let connected =
                 sbx::spaced_process_event::Event::Connected(sbx::SpacedProcessConnected {

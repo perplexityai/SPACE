@@ -2267,6 +2267,7 @@ fn started() -> FakeReply {
 fn connected() -> FakeReply {
     FakeReply::Event(spaced_process_event::Event::Connected(
         pplx_space_sbx_mgr_client::operations::ProcessConnected {
+            resume_after_output_gap: false,
             output_cursor: None,
         },
     ))
@@ -2277,6 +2278,7 @@ fn connected() -> FakeReply {
 fn connected_at(start: u64) -> FakeReply {
     FakeReply::Event(spaced_process_event::Event::Connected(
         pplx_space_sbx_mgr_client::operations::ProcessConnected {
+            resume_after_output_gap: false,
             output_cursor: Some(start),
         },
     ))

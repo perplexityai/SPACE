@@ -260,6 +260,7 @@ async fn bridge_guest_process_connect_replays_from_output_cursor() {
     assert_eq!(
         first.event,
         Some(Event::Connected(bridge_guest::ProcessConnected {
+            resume_after_output_gap: false,
             output_cursor: Some(0)
         })),
         "the stream reports where it starts"
