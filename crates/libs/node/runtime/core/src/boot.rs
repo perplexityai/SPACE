@@ -38,6 +38,8 @@ pub enum BootConfigError {
     },
     #[error("guest memory size overflows the runtime's byte count")]
     MemoryOverflow,
+    #[error("invalid runtime boot configuration: {0}")]
+    Invalid(&'static str),
     #[error("serialize runtime boot configuration: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -102,4 +104,15 @@ fn object<const N: usize>(
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
         .collect()
+}
+
+/// Validate the standalone adapter's privileged boot input before process launch.
+pub fn validate_standalone(
+    runtime: RuntimeKind,
+    configuration: &str,
+) -> Result<(), BootConfigError> {
+    match runtime {
+        RuntimeKind::CloudHypervisor => cloud_hypervisor::validate(configuration),
+        _ => Err(BootConfigError::UnsupportedRuntime(runtime)),
+    }
 }

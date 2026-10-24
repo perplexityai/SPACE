@@ -28,6 +28,8 @@ pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlErr
 /// this interface without pretending to expose an HTTP socket or jailer.
 pub trait RuntimeControl: Send + Sync {
     fn state(&self) -> ControlFuture<'_, VmState>;
+    /// Configure and boot a newly launched idle runtime; never replay after uncertainty.
+    fn boot<'a>(&'a self, configuration: &'a str) -> ControlFuture<'a, ()>;
     fn pause(&self) -> ControlFuture<'_, ()>;
     fn resume(&self) -> ControlFuture<'_, ()>;
 }
@@ -56,6 +58,14 @@ impl RuntimeControl for crate::fc_api::FcApiClient {
             })
         })
     }
+    fn boot<'a>(&'a self, _configuration: &'a str) -> ControlFuture<'a, ()> {
+        Box::pin(async {
+            Err(ControlError::UnsupportedOperation {
+                runtime: RuntimeKind::Firecracker,
+                operation: "API cold boot",
+            })
+        })
+    }
     fn pause(&self) -> ControlFuture<'_, ()> {
         Box::pin(async move { Ok(crate::fc_api::FcApiClient::pause(self).await?) })
     }
@@ -75,11 +85,23 @@ pub fn socket_path(
         RuntimeKind::CloudHypervisor => "control.sock",
         RuntimeKind::Gvisor => return Err(ControlError::UnsupportedRuntime(runtime)),
     };
-    Ok(
-        std::path::Path::new(pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR)
-            .join(runtime.as_str())
-            .join(sandbox_id.to_string())
-            .join("root")
-            .join(filename),
-    )
+    Ok(isolation_root(runtime, &sandbox_id.to_string())?.join(filename))
+}
+
+/// Filesystem layout for the installed standalone VM adapters. Other runtime
+/// implementations need not expose a chroot or a Unix guest transport.
+pub fn isolation_root(runtime: RuntimeKind, sandbox_id: &str) -> Result<PathBuf, ControlError> {
+    match runtime {
+        RuntimeKind::Firecracker | RuntimeKind::CloudHypervisor => Ok(std::path::Path::new(
+            pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR,
+        )
+        .join(runtime.as_str())
+        .join(sandbox_id)
+        .join("root")),
+        RuntimeKind::Gvisor => Err(ControlError::UnsupportedRuntime(runtime)),
+    }
+}
+
+pub fn guest_socket_path(runtime: RuntimeKind, sandbox_id: &str) -> Result<PathBuf, ControlError> {
+    Ok(isolation_root(runtime, sandbox_id)?.join("v.sock"))
 }

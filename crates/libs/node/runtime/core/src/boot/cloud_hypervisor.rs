@@ -52,3 +52,88 @@ pub(super) fn configuration(input: &LinuxBoot<'_>) -> Result<Value, BootConfigEr
         "landlock_enable": true
     }))
 }
+
+/// Node-manager admits only the device model this adapter constructs. The
+/// control API accepts host paths and additional devices, so tenant-authored
+/// configuration must never expand this model or disable its confinement.
+pub(super) fn validate(configuration: &str) -> Result<(), BootConfigError> {
+    let value: Value = serde_json::from_str(configuration)?;
+    let fields = value
+        .as_object()
+        .ok_or(BootConfigError::Invalid("expected boot object"))?;
+    const ALLOWED: &[&str] = &[
+        "cpus",
+        "memory",
+        "payload",
+        "disks",
+        "net",
+        "vsock",
+        "serial",
+        "console",
+        "landlock_enable",
+    ];
+    if fields.keys().any(|key| !ALLOWED.contains(&key.as_str()))
+        || value.get("landlock_enable") != Some(&json!(true))
+        || value.pointer("/payload/kernel") != Some(&json!("/vmlinux.bin"))
+        || value.pointer("/disks/0/path") != Some(&json!("/rootfs.ext4"))
+        || value.pointer("/vsock/socket") != Some(&json!("/v.sock"))
+        || value.get("disks").and_then(Value::as_array).map(Vec::len) != Some(1)
+        || value.get("net").and_then(Value::as_array).map(Vec::len) != Some(1)
+    {
+        return Err(BootConfigError::Invalid(
+            "unsupported standalone device model",
+        ));
+    }
+    for (name, allowed) in [
+        ("payload", &["kernel", "cmdline"][..]),
+        ("cpus", &["boot_vcpus", "max_vcpus"][..]),
+        ("memory", &["size", "shared", "hugepages", "thp"][..]),
+        ("vsock", &["cid", "socket"][..]),
+        ("serial", &["mode"][..]),
+        ("console", &["mode"][..]),
+    ] {
+        let object = value
+            .get(name)
+            .and_then(Value::as_object)
+            .ok_or(BootConfigError::Invalid("missing device configuration"))?;
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(BootConfigError::Invalid("unqualified device option"));
+        }
+    }
+    for (name, allowed) in [
+        (
+            "disks",
+            &[
+                "id",
+                "path",
+                "readonly",
+                "image_type",
+                "backing_files",
+                "rate_limiter_config",
+            ][..],
+        ),
+        (
+            "net",
+            &["id", "tap", "mac", "num_queues", "rate_limiter_config"][..],
+        ),
+    ] {
+        let object = value
+            .get(name)
+            .and_then(Value::as_array)
+            .and_then(|v| v.first())
+            .and_then(Value::as_object)
+            .ok_or(BootConfigError::Invalid("missing boot device"))?;
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(BootConfigError::Invalid("unqualified boot device option"));
+        }
+    }
+    if value.pointer("/memory/shared") != Some(&json!(false))
+        || value.pointer("/memory/hugepages") != Some(&json!(false))
+        || value.pointer("/disks/0/backing_files") != Some(&json!(false))
+        || value.pointer("/disks/0/image_type") != Some(&json!("Raw"))
+        || value.pointer("/net/0/num_queues") != Some(&json!(2))
+    {
+        return Err(BootConfigError::Invalid("unqualified boot resource option"));
+    }
+    Ok(())
+}
