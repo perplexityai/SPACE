@@ -64,6 +64,7 @@ fn old_readers_ignore_selection_and_new_readers_refuse_missing_acknowledgement()
     let response = fixture();
     let compatible = Compatible::ColdBootSource(response.execution.clone().unwrap());
     let request = crate::proto::ResolveExecutionEnvironmentRequest {
+        definition_schema_version: 0,
         reference: None,
         compatible: Some(compatible.clone()),
     };
