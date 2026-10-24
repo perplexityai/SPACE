@@ -1616,6 +1616,7 @@ async fn a_completed_process_exit_stays_connectable_until_its_retention_ends() {
                 process_id: process_id.into(),
                 timeout: None,
                 output_cursor: None,
+                resume_from_oldest_retained: false,
             }),
         )
     };
@@ -1764,6 +1765,7 @@ async fn a_completed_process_releases_its_output_after_the_idempotency_window() 
             process_id: process_id.into(),
             timeout: None,
             output_cursor: None,
+            resume_from_oldest_retained: false,
         }),
     )
     .await
