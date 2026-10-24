@@ -48,7 +48,7 @@ use super::validation::{
     reject_incompatible_template_spaced_compatibility,
 };
 use super::{
-    CACHE_DIR, DEFAULT_BLOCKING_READY_TIMEOUT_SECS, JAIL_DIR, RUN_DIR, RouteStreamEpochIdentity,
+    CACHE_DIR, DEFAULT_BLOCKING_READY_TIMEOUT_SECS, RUN_DIR, RouteStreamEpochIdentity,
     SandboxManagerService,
 };
 use crate::{
@@ -2235,7 +2235,15 @@ impl SandboxManagerService {
         // Host-visible paths
         let run_dir = format!("{RUN_DIR}/{id}");
         let log_path = format!("{run_dir}/fc.log");
-        let vsock_uds_path = format!("{JAIL_DIR}/firecracker/{id}/root/v.sock");
+        let vsock_uds_path = pplx_space_node_runtime_core::control::guest_socket_path(
+            prepare_source.execution.runtime().kind,
+            id,
+        )
+        .map_err(|error| {
+            activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+        })?
+        .display()
+        .to_string();
 
         // Node-manager prepares filesystem after slot allocation so UID/GID
         // ownership is derived from the allocated slot. If Create only recorded
