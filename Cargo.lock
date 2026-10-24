@@ -465,6 +465,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-kms"
+version = "1.118.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c243864bc3754be9f0001414e0162fdf1370fa62c70b0cfbe1da6a6221d553c7"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.146.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5739,8 +5765,10 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "aws-lc-rs",
  "aws-runtime",
  "aws-sdk-acmpca",
+ "aws-sdk-kms",
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
  "aws-smithy-http-client",
@@ -5773,6 +5801,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-metrics",
  "pplx-space-net-common",
+ "pplx-space-sandbox-anchor",
  "pplx-space-test-env",
  "prost",
  "prost-types",
@@ -7078,6 +7107,24 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-sandbox-anchor"
+version = "0.8.0"
+dependencies = [
+ "aws-lc-rs",
+ "hex",
+ "p256",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "time",
+ "uuid",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

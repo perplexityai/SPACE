@@ -98,6 +98,15 @@ keyBroker:
 # volume_wrap_store.rs). Kind has one infra node, so both run there.
 replicas: 2
 
+# Prototype only; must also compile pplx-space-credmgr/split-trust-prototype.
+splitTrust:
+  enabled: false
+  # Provision the public space-anchor-epochs ConfigMap before enabling.
+  # A replica region requires related multi-region HMAC keys.
+  kmsReplicaRegion: ""
+  # Optional dedicated Kind identity; separate from the storage STS bridge.
+  credentialsSecretName: ""
+
 # The TCP-only authority has no service mutex or drain budget of its own: on
 # SIGTERM tonic's serve_with_shutdown stops accepting and finishes in-flight
 # unary RPCs (serve_tcp_until, crates/libs/credential/mgr/server/src/run.rs).

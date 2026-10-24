@@ -158,6 +158,11 @@ pub enum RunCredmgrError {
     PlaintextTcpRefused { addr: SocketAddr },
     #[error("failed to initialize the credential-manager space_creds pool: {0}")]
     DatabasePool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    #[error("split-trust runtime flag requires the split-trust-prototype Cargo feature")]
+    SplitTrustNotCompiled,
+    #[cfg(feature = "split-trust-prototype")]
+    #[error("sandbox anchor authority: {0}")]
+    SandboxAnchor(#[from] crate::split_trust::authority::AuthorityError),
     #[error("invalid intermediate-key broker URL {url:?}: {source}")]
     IntermediateKeyBrokerUrl {
         url: String,
@@ -745,6 +750,18 @@ async fn initialize_authority_service(
         }
     }
 
+    if matches!(
+        std::env::var("SPACE_SPLIT_TRUST_PROTOTYPE").as_deref(),
+        Ok("1" | "true")
+    ) && !cfg!(feature = "split-trust-prototype")
+    {
+        return Err(RunCredmgrError::SplitTrustNotCompiled);
+    }
+    #[cfg(feature = "split-trust-prototype")]
+    if crate::split_trust::enabled() {
+        service.sandbox_anchor_authority =
+            Some(crate::split_trust::authority::Authority::load().await?);
+    }
     Ok(service)
 }
 

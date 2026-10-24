@@ -13,6 +13,57 @@ use crate::kek_store::KekRecord;
 
 mod assume_role;
 
+#[tokio::test]
+async fn x509_exchange_requires_node_auth_and_stays_disabled_without_a_keyring() {
+    use pplx_space_credmgr_client::x509::CredentialKind;
+    let service = CredentialManagerService::new(
+        Arc::new(InMemoryKeyWrapper::new()),
+        PeerProcessCheckMode::Off,
+    );
+    let disabled = tonic::Code::FailedPrecondition;
+    let sandbox = SandboxId::from_uuid(Uuid::now_v7());
+    for (caller, expected) in [
+        (ClientService::NodeCredentialAgent, disabled),
+        (ClientService::ApiSvc, tonic::Code::PermissionDenied),
+        (ClientService::SandboxManager, tonic::Code::PermissionDenied),
+        (ClientService::VolumeManager, tonic::Code::PermissionDenied),
+    ] {
+        let mut request = Request::new(CredentialKind::SigningCredentials.request(sandbox));
+        request
+            .extensions_mut()
+            .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
+                test_k8s_identity(caller),
+            ));
+        let error = service.exchange_token(request).await.unwrap_err();
+        assert_eq!(error.code(), expected, "{caller:?}");
+    }
+    let error = service
+        .exchange_token(plaintext_request(
+            CredentialKind::SigningCredentials.request(sandbox),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    for mut invalid in [
+        CredentialKind::Certificate.request(sandbox),
+        CredentialKind::SigningCredentials.request(sandbox),
+    ] {
+        if invalid.requested_token_type == CredentialKind::SigningCredentials.as_str() {
+            invalid.actor_token = Some("sandbox:spoofed".into());
+        }
+        let mut request = Request::new(invalid);
+        request
+            .extensions_mut()
+            .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
+                test_k8s_identity(ClientService::NodeCredentialAgent),
+            ));
+        assert_eq!(
+            service.exchange_token(request).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+}
+
 /// In-memory KEK-row map standing in for Postgres.
 struct TestKekStore {
     rows: HashMap<(Uuid, OrgId), KekRecord>,

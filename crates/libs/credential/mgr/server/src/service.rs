@@ -175,6 +175,8 @@ pub struct CredentialManagerService {
     /// Reference-based resolution endpoint. Present only on instances with
     /// access to durable credential-injection state.
     credential_injection_rpc: Option<CredentialInjectionRpc>,
+    #[cfg(feature = "split-trust-prototype")]
+    pub(crate) sandbox_anchor_authority: Option<crate::split_trust::authority::Authority>,
 }
 
 impl CredentialManagerService {
@@ -241,6 +243,8 @@ impl CredentialManagerService {
             kek_provisioner: None,
             intermediate_ca_issuer: None,
             credential_injection_rpc: None,
+            #[cfg(feature = "split-trust-prototype")]
+            sandbox_anchor_authority: None,
         }
     }
 
@@ -386,6 +390,40 @@ impl CredentialManager for CredentialManagerService {
         &self,
         request: Request<ExchangeTokenRequest>,
     ) -> Result<Response<ExchangeTokenResponse>, Status> {
+        use pplx_space_credmgr_client::x509::{AnchorRequest, CredentialKind};
+        if AnchorRequest::recognizes(request.get_ref()) {
+            // Keep profile authorization separate: storage consumers do not
+            // acquire signing privileges by sharing this RPC method.
+            let caller = self.caller_resolver.resolve(&request)?;
+            if !matches!(&caller, ResolvedCaller::K8sJwt(identity)
+                if identity.service() == ClientService::NodeCredentialAgent)
+            {
+                return Err(Status::permission_denied(
+                    "X.509 signing credentials require an authenticated node credential agent",
+                ));
+            }
+            let anchor = AnchorRequest::parse(request.get_ref())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if anchor.kind != CredentialKind::SigningCredentials {
+                return Err(Status::invalid_argument(
+                    "authority requires the signing profile",
+                ));
+            }
+            #[cfg(feature = "split-trust-prototype")]
+            {
+                let authority = self.sandbox_anchor_authority.as_ref().ok_or_else(|| {
+                    Status::failed_precondition("sandbox anchors are not enabled")
+                })?;
+                let credentials = authority.credentials(anchor.sandbox_id).await?;
+                return Ok(Response::new(
+                    pplx_space_credmgr_client::x509::signing_response(credentials),
+                ));
+            }
+            #[cfg(not(feature = "split-trust-prototype"))]
+            return Err(Status::failed_precondition(
+                "sandbox anchors are not compiled",
+            ));
+        }
         let caller = match self.caller_resolver.resolve(&request) {
             Ok(caller) => caller,
             Err(status) => {
@@ -806,6 +844,11 @@ impl CredentialManager for CredentialManagerService {
             ALLOW_ISSUE_INTERMEDIATE,
             ALLOW_ISSUE_INTERMEDIATE_SERVICES,
         )?;
+        if request.get_ref().sandbox_id.is_some() {
+            return Err(Status::invalid_argument(
+                "authority issues only shared node intermediates",
+            ));
+        }
 
         // The gRPC layer already logs and traces the call; this adds the
         // failure class and the latency of an issuance that polls for seconds.
