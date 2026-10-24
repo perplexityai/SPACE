@@ -568,6 +568,7 @@ impl NodeCa {
                 upstream
                     .issue_intermediate_certificate(IssueIntermediateCertificateRequest {
                         csr: csr_der,
+                        ..Default::default()
                     })
                     .await
                     .map(|response| response.into_inner().certificate_der)

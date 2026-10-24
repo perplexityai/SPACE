@@ -20,6 +20,7 @@ pub mod proto {
     // that carries a raw credential or plaintext secret as one opaque value so
     // adding a new field cannot silently make it loggable.
     redacted_debug! {
+        X509SigningCredentials => "X509SigningCredentials",
         ExchangeTokenRequest => "ExchangeTokenRequest",
         ExchangeTokenResponse => "ExchangeTokenResponse",
         exchange_token_response::Payload => "Payload",
@@ -35,6 +36,7 @@ pub mod proto {
 
 mod endpoint;
 mod token;
+pub mod x509;
 
 /// Fixed subject and size limit for both hops of intermediate CA issuance.
 pub const INTERMEDIATE_CSR_COMMON_NAME: &str = "space-node-intermediate-ca";
