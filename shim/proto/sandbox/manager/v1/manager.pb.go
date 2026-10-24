@@ -833,7 +833,7 @@ const (
 	// Materialize an evacuated `stopped` sandbox on this node and leave it
 	// stopped. The request must carry the exact storage URI of a `stop`-origin
 	// DISK artifact belonging to this same sandbox id; the node stages the
-	// rootfs, pins the artifact on the local row, and returns. No Firecracker
+	// rootfs, pins the artifact on the local row, and returns. No runtime process
 	// process is created: booting a microVM only to stop it again would run the
 	// guest's init and mutate the rootfs a stopped sandbox is meant to keep
 	// inert.
@@ -2104,11 +2104,11 @@ type StartRequest struct {
 	// Target lifecycle for checkpoint-based starts (a `checkpoint` value
 	// is required for non-default behavior; ignored for fresh boots).
 	// Unspecified → STARTED. PAUSED skips the post-load resume so the
-	// restored VM stays in the firecracker-paused state. Used by the
+	// restored VM stays in the resident paused state. Used by the
 	// cluster-controller's lifecycle-preserving drain evacuation path.
 	// STOPPED materializes an evacuated stopped sandbox's disk artifact and
 	// stops there; it requires `checkpoint = "suspend"` plus an exact
-	// `suspend_restore_storage_uri`, and never launches Firecracker.
+	// `suspend_restore_storage_uri`, and never launches a VM.
 	TargetState WakeTargetState `protobuf:"varint,9,opt,name=target_state,json=targetState,proto3,enum=space.sandbox.manager.v1.WakeTargetState" json:"target_state,omitempty"`
 	// Internal-only exact S3 fallback for `checkpoint = "suspend"`.
 	SuspendRestoreStorageUri *string `protobuf:"bytes,10,opt,name=suspend_restore_storage_uri,json=suspendRestoreStorageUri,proto3,oneof" json:"suspend_restore_storage_uri,omitempty"`

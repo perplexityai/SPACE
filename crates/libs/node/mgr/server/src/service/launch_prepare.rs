@@ -19,8 +19,8 @@ impl NodeManagerService {
     async fn launch_admitted_runtime(
         &self,
         sandbox_id: &str,
-        request: pplx_space_node_runtime_core::proto::LaunchFirecrackerRequest,
-    ) -> Result<pplx_space_node_runtime_core::proto::LaunchFirecrackerResponse, Status> {
+        request: pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch,
+    ) -> Result<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse, Status> {
         let expected_environment = request
             .verified_runtime
             .as_ref()
@@ -39,12 +39,7 @@ impl NodeManagerService {
                 "supervisor did not acknowledge the verified execution environment",
             ));
         }
-        Ok(
-            pplx_space_node_runtime_core::proto::LaunchFirecrackerResponse {
-                pid: launched.pid,
-                accepted_environment_reference: launched.accepted_environment_reference,
-            },
-        )
+        Ok(launched)
     }
 
     async fn acquire_preparation_ownership(
@@ -573,7 +568,7 @@ impl NodeManagerService {
         let launched = self
             .launch_admitted_runtime(
                 sandbox_id,
-                pplx_space_node_runtime_core::proto::LaunchFirecrackerRequest {
+                pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch {
                     execution_id: req
                         .execution_fence
                         .as_ref()

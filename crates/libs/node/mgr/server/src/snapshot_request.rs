@@ -34,20 +34,7 @@ fn firecracker_files(
     ))
 }
 
-fn artifacts(state: String, memory: String) -> Vec<VmStateArtifact> {
-    vec![
-        VmStateArtifact {
-            name: "machine-state".into(),
-            relative_path: state,
-        },
-        VmStateArtifact {
-            name: "memory".into(),
-            relative_path: memory,
-        },
-    ]
-}
-
-impl TryFrom<CaptureVmStateRequest> for CreateSnapshotRequest {
+impl TryFrom<CaptureVmStateRequest> for FirecrackerCapture {
     type Error = StateContractError;
     fn try_from(request: CaptureVmStateRequest) -> Result<Self, Self::Error> {
         let (snapshot_path, mem_file_path) = firecracker_files(request.artifacts)?;
@@ -55,7 +42,7 @@ impl TryFrom<CaptureVmStateRequest> for CreateSnapshotRequest {
         let (sandbox_id, environment) = match request.environment_reference {
             Some(reference) => (
                 String::new(),
-                Some(EnvironmentSnapshotInput {
+                Some(SnapshotEnvironment {
                     sandbox_id: request.sandbox_id,
                     reference,
                 }),
@@ -73,25 +60,8 @@ impl TryFrom<CaptureVmStateRequest> for CreateSnapshotRequest {
         })
     }
 }
-impl From<CreateSnapshotRequest> for CaptureVmStateRequest {
-    fn from(request: CreateSnapshotRequest) -> Self {
-        let (sandbox_id, reference) = match request.environment {
-            Some(input) => (input.sandbox_id, Some(input.reference)),
-            None => (request.sandbox_id, None),
-        };
-        Self {
-            sandbox_id,
-            environment_reference: reference,
-            artifacts: artifacts(request.snapshot_path, request.mem_file_path),
-            storage: Some(VmStateStorage {
-                directory: request.dest_dir,
-                encrypted_volume_mount: request.snapshot_volume_mount_dir,
-            }),
-            execution_fence: request.execution_fence,
-        }
-    }
-}
-impl TryFrom<RestoreVmStateRequest> for LoadSnapshotRequest {
+
+impl TryFrom<RestoreVmStateRequest> for FirecrackerRestore {
     type Error = StateContractError;
     fn try_from(request: RestoreVmStateRequest) -> Result<Self, Self::Error> {
         let (snapshot_path, mem_file_path) = firecracker_files(request.artifacts)?;
@@ -107,20 +77,32 @@ impl TryFrom<RestoreVmStateRequest> for LoadSnapshotRequest {
         })
     }
 }
-impl From<LoadSnapshotRequest> for RestoreVmStateRequest {
-    fn from(request: LoadSnapshotRequest) -> Self {
-        Self {
-            sandbox_id: request.sandbox_id,
-            artifacts: artifacts(request.snapshot_path, request.mem_file_path),
-            storage: Some(VmStateStorage {
-                directory: request.source_dir,
-                encrypted_volume_mount: request.snapshot_volume_mount_dir,
-            }),
-            execution_fence: request.execution_fence,
-            rootfs_rate_limit: request.rootfs_rate_limit,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SnapshotEnvironment {
+    pub sandbox_id: String,
+    pub reference: String,
+}
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct FirecrackerCapture {
+    pub sandbox_id: String,
+    pub environment: Option<SnapshotEnvironment>,
+    pub snapshot_path: String,
+    pub mem_file_path: String,
+    pub dest_dir: Option<String>,
+    pub snapshot_volume_mount_dir: Option<String>,
+    pub execution_fence: Option<ExecutionFence>,
+}
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct FirecrackerRestore {
+    pub sandbox_id: String,
+    pub snapshot_path: String,
+    pub mem_file_path: String,
+    pub source_dir: Option<String>,
+    pub snapshot_volume_mount_dir: Option<String>,
+    pub execution_fence: Option<ExecutionFence>,
+    pub rootfs_rate_limit: Option<DriveRateLimit>,
+}
