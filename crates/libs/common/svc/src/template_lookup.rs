@@ -8,6 +8,8 @@ use pplx_space_common_core::types::SandboxId;
 use tonic::{Request, Response, Status};
 
 const SCOPE_HEADER: &str = "x-space-template-lookup-scope";
+const REQUIRED_SCOPE_HEADER: &str = "x-space-template-lookup-required-scope";
+const AUTHORIZED_SCOPE_HEADER: &str = "x-space-template-lookup-authorized-scope";
 const RECEIPT_HEADER: &str = "x-space-template-lookup-scope-received";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,9 +79,17 @@ impl std::str::FromStr for TemplateLookupScope {
 
 impl TemplateLookupScope {
     pub fn from_request<T>(request: &Request<T>) -> Result<Option<Self>, Status> {
+        Self::read_scope(request, SCOPE_HEADER)
+    }
+
+    pub fn authorization_from_request<T>(request: &Request<T>) -> Result<Option<Self>, Status> {
+        Self::read_scope(request, REQUIRED_SCOPE_HEADER)
+    }
+
+    fn read_scope<T>(request: &Request<T>, header: &'static str) -> Result<Option<Self>, Status> {
         request
             .metadata()
-            .get(SCOPE_HEADER)
+            .get(header)
             .map(|value| {
                 value
                     .to_str()
@@ -94,6 +104,37 @@ impl TemplateLookupScope {
             SCOPE_HEADER,
             self.to_string().parse().expect("scope is ASCII"),
         );
+    }
+
+    /// Request catalog authorization separately from compatibility metadata.
+    pub fn request_authorization<T>(self, request: &mut Request<T>) {
+        self.attach(request);
+        request.metadata_mut().insert(
+            REQUIRED_SCOPE_HEADER,
+            self.to_string().parse().expect("scope is ASCII"),
+        );
+    }
+
+    pub fn acknowledge_authorization<T>(self, response: &mut Response<T>) {
+        response.metadata_mut().insert(
+            AUTHORIZED_SCOPE_HEADER,
+            self.to_string().parse().expect("scope is ASCII"),
+        );
+    }
+
+    pub fn require_authorization<T>(self, response: &Response<T>) -> Result<(), Status> {
+        if response
+            .metadata()
+            .get(AUTHORIZED_SCOPE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            == Some(self.to_string().as_str())
+        {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(
+                "template lookup scope was not authorized",
+            ))
+        }
     }
 
     /// A receipt must not satisfy the authorization acknowledgement used by strict peers.
@@ -123,3 +164,6 @@ impl TemplateLookupScope {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
