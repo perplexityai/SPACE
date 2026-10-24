@@ -29,8 +29,7 @@ type GuestFileInfoStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileInfo, Status>> + Send>>;
 type GuestFileChunkStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileChunk, Status>> + Send>>;
-const DEFAULT_RETENTION: Duration = Duration::from_secs(60);
-const IDEMPOTENCY_RECORD_TTL: Duration = DEFAULT_RETENTION;
+const IDEMPOTENCY_RECORD_TTL: Duration = Duration::from_secs(60);
 // A window this long is an operator error, and bounding it keeps every
 // `Instant + window` representable.
 const MAX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);

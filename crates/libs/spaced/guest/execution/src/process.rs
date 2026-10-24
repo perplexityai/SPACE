@@ -32,14 +32,14 @@ const PROCESS_OUTPUT_RETENTION_MIN_BYTES: usize = 16 * 1024 * 1024;
 // cap them as well as the output bytes. Completed records are evicted first
 // under pressure; if every slot belongs to a running process, admission fails.
 const PROCESS_RECORD_LIMIT: usize = 128;
-// How long a completed record, and so its exit, stays connectable: a client
+// Default time a completed record, and so its exit, stays connectable: a client
 // that reattaches after the command ends still reads `process_exited`. Its
 // output is released `COMPLETED_PROCESS_OUTPUT_RETENTION` after the exit, so
 // finished processes do not hold the shared output budget. The record limit
 // above still bounds what is retained.
 pub(super) const COMPLETED_PROCESS_RETENTION: Duration = Duration::from_secs(15 * 60);
-// How long a completed record keeps its output. A retried start replays it,
-// so this is at least the start's idempotency window. A reconnect that resumes
+// Default time a completed record keeps its output. A retried start replays it,
+// so this matches the default start idempotency window. A reconnect that resumes
 // from an output cursor also replays it; after this it reads the lagged error.
 pub(super) const COMPLETED_PROCESS_OUTPUT_RETENTION: Duration = IDEMPOTENCY_RECORD_TTL;
 // One process retains at most a quarter of the smallest total.
@@ -690,7 +690,10 @@ impl ProcessRecord {
 impl Default for ProcessRegistry {
     /// The budget of a guest of unknown size: the full 64 MiB.
     fn default() -> Self {
-        Self::new(ProcessOutputBudget::for_guest_memory(None), ProcessRetention::default())
+        Self::new(
+            ProcessOutputBudget::for_guest_memory(None),
+            ProcessRetention::default(),
+        )
     }
 }
 
@@ -1193,9 +1196,9 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned");
         if state.output_released
-            || !state.completed_at.is_some_and(|completed_at| {
-                completed_at.elapsed() > retention
-            })
+            || !state
+                .completed_at
+                .is_some_and(|completed_at| completed_at.elapsed() > retention)
         {
             return false;
         }

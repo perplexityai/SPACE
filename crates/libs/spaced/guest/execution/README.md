@@ -47,14 +47,15 @@ and error evolution, requires a separate crate-level policy before stabilization
   executable during construction: an unreadable or invalid `/proc/self/exe`
   intentionally fails startup before readiness, rather than deferring that
   failure to the first filesystem request.
-- `ExecutionServiceConfig::process_retention` sets how long a completed process
-  stays replayable and how long a completed keyed start is remembered; both
-  default to 60 seconds and are lost on restart. An embedder whose callers poll
-  at their own pace can retain completed processes longer. Their retained output
-  keeps its share of the output budget meanwhile, leaving less shared budget to
-  running processes; at capacity, the record that completed first is evicted. A
-  long idempotency window lowers the sustained keyed-start rate the fixed key
-  store admits.
+- `ExecutionServiceConfig::process_retention` independently sets completed-exit,
+  completed-output and completed-start idempotency windows. Defaults preserve
+  guest behavior: 15 minutes for exits, 60 seconds for output and idempotency.
+  Records are lost on restart and the record that completed first is evicted at
+  capacity. Output/environment retention ends no later than record retention;
+  retaining output longer keeps its share of the shared output budget. A long
+  idempotency window lowers the sustained keyed-start rate the fixed key store
+  admits. In-progress starts keep their fixed 60-second bound regardless of these
+  windows. Each configured window must be nonzero and at most seven days.
 - Linux identity workers require the daemon's privilege to install the requested
   OS account's groups and IDs; an unprivileged worker host is unsupported. Direct mode
   runs filesystem syscalls with the daemon's credentials; its `user` selects path
@@ -187,7 +188,7 @@ and error evolution, requires a separate crate-level policy before stabilization
   process groups while supervision is active. Background descendants that close
   or redirect inherited output can outlive a completed leader; draining this
   service does not establish that every descendant has exited.
-- A completed process stays connectable for 15 minutes after it exits, so a
+- By default, a completed process stays connectable for 15 minutes after it exits, so a
   client that reattaches still reads its exit, and the process list includes it
   with its exit when asked to (`include_exited`); by default it lists running
   processes only. A list request can name one `process_id`. The window is

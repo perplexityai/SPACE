@@ -45,7 +45,7 @@ struct RejectionDiagnostics {
 impl IdempotencyStore {
     #[cfg(test)]
     pub(super) fn new(scope: &'static str) -> Self {
-        Self::with_window(scope, DEFAULT_RETENTION)
+        Self::with_window(scope, IDEMPOTENCY_RECORD_TTL)
     }
 
     pub(super) fn with_window(scope: &'static str, window: Duration) -> Self {
@@ -83,7 +83,7 @@ struct IdempotencyState {
 
 impl Default for IdempotencyState {
     fn default() -> Self {
-        Self::with_window(DEFAULT_RETENTION)
+        Self::with_window(IDEMPOTENCY_RECORD_TTL)
     }
 }
 
@@ -296,7 +296,7 @@ impl IdempotencyStore {
             key,
             StoredIdempotencyRecord::Completed {
                 result: Ok(record),
-                created_at: Instant::now() - DEFAULT_RETENTION - Duration::from_secs(1),
+                created_at: Instant::now() - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1),
             },
         );
     }

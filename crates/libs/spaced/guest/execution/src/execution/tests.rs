@@ -313,6 +313,18 @@ fn process_retention_is_bounded() {
             ..ProcessRetention::default()
         },
         ProcessRetention {
+            output: Duration::ZERO,
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
+            output: MAX_RETENTION + Duration::from_secs(1),
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
+            idempotency: MAX_RETENTION + Duration::from_secs(1),
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
             idempotency: Duration::ZERO,
             ..ProcessRetention::default()
         },
