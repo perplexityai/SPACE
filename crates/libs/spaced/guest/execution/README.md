@@ -205,7 +205,15 @@ cancelled callers, graceful/repeated drain and worker reaping. It checks child
 IDs/groups and capability sets with and without a PTY, set-ID/file-capability privilege suppression,
 root-account and launcher rejection, working-directory traversal, late worker
 entrypoint rejection, and unchanged authority on every surviving host thread.
-Run it as root in a disposable environment with a provisioned `nobody` account,
+It also checks real cgroup v2 placement for workloads and identity workers,
+PTY/placement/worker descriptors across an unrelated caller spawn, and caller
+ownership of unrelated children through drain. A redirected descendant survives
+drain, then exits when the caller tears down its workload cgroup.
+Run it as root in a disposable container with a private cgroup v2 namespace
+(`--privileged --cgroupns private`) and a writable `/sys/fs/cgroup`. Explicitly
+set `SPACE_TEST_EXECUTION_CGROUP_ROOT=/sys/fs/cgroup` to authorize creation and
+cleanup of a test-owned subtree; the test never moves the host or kills the root
+cgroup. The environment also needs a provisioned `nobody` account,
 `CAP_NET_RAW` and `CAP_SETFCAP`, and a writable filesystem that supports executable
 set-ID and file capabilities (not `nosuid`), using
 `cargo test -p pplx-space-spaced-guest-worker --test embedding`.
@@ -214,8 +222,9 @@ lookup and filesystem syscalls open across cancellation, assert incomplete drain
 and then release them to observe completion. They cover every closed entrypoint,
 borrowed uploads and output backpressure. Kind/Firecracker covers the daemon
 integration separately; privileged container tests do not replace it. Other Linux
-architectures, real caller cgroup placement and downstream packaging require their
-own acceptance evidence.
+architectures and downstream packaging require their own acceptance evidence.
+The cgroup probe verifies placement and caller teardown, not resource limits or
+a complete sandbox isolation policy.
 
 The proposed support profile, ownership contract, and implementation acceptance
 criteria are in the [embedding RFC](../../../../../docs/space/rfcs/2026-10-06-guest-execution-embedding.md).

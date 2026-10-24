@@ -2,6 +2,9 @@
 #![cfg(test)]
 
 #[cfg(target_os = "linux")]
+#[path = "embedding/boundary.rs"]
+mod boundary;
+#[cfg(target_os = "linux")]
 #[path = "embedding/identity.rs"]
 mod identity;
 #[cfg(target_os = "linux")]
@@ -13,7 +16,7 @@ mod linux;
 
 #[cfg(target_os = "linux")]
 fn main() {
-    if identity::probe() {
+    if boundary::probe() || identity::probe() {
         return;
     }
     // An intentionally wrong artifact used to test cancellation during startup.
@@ -51,13 +54,17 @@ fn main() {
         .status()
         .expect("threaded worker probe");
     assert!(threaded.success(), "late worker dispatch must fail closed");
+    let boundary = boundary::Boundary::new();
     identity::prepare_host();
     tokio::runtime::Runtime::new()
         .expect("runtime")
-        .block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(30), linux::run())
-                .await
-                .expect("embedding deadline");
+        .block_on(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                linux::run().await;
+                boundary.run().await;
+            })
+            .await
+            .expect("embedding deadline");
         });
 }
 
