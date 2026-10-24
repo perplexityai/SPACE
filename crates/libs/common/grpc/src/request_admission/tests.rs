@@ -15,6 +15,8 @@ fn request(method: &str) -> http::Request<Body> {
 
 #[tokio::test]
 async fn overload_never_enters_decoder_and_execution_retains_admission_after_cancellation() {
+    let slots = Arc::new(Semaphore::new(4));
+    let handler_slots = slots.clone();
     let entered = Arc::new(AtomicUsize::new(0));
     let execution = Arc::new(Mutex::new(None));
     let observed = entered.clone();
@@ -22,25 +24,40 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
     let inner = tower::service_fn(move |mut request: http::Request<Body>| {
         observed.fetch_add(1, Ordering::SeqCst);
         let blocked = request.uri().path().ends_with("/WriteBatch");
-        if blocked {
-            *retained.lock().expect("execution") =
-                request.extensions_mut().remove::<RequestPermit>();
-        }
+        let lifetime = if blocked {
+            let permit = RequestPermit::try_acquire_observed(
+                handler_slots.clone(),
+                4,
+                request.extensions_mut().remove(),
+                Budget::GuestFilesystem,
+            )
+            .expect("reuse transport admission");
+            let lifetime = permit.request_lifetime();
+            *retained.lock().expect("execution") = Some(permit);
+            Some(lifetime)
+        } else {
+            None
+        };
         async move {
-            if blocked {
-                std::future::pending::<()>().await;
+            if let Some(lifetime) = lifetime {
+                lifetime.observe(std::future::pending::<()>()).await;
             }
             Ok::<_, Infallible>(http::Response::new(Body::empty()))
         }
     });
-    let slots = Arc::new(Semaphore::new(4));
     let mut service = RequestAdmission::new(
         inner,
         QueuedSlots::new(slots.clone()),
         &[("Write", 1), ("WriteBatch", 4), ("Rename", 1)],
-    );
+    )
+    .with_observation(Budget::GuestFilesystem);
     let mut other_listener = service.clone();
-    let pending = service.call(request("WriteBatch"));
+    let mut pending = service.call(request("WriteBatch"));
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
     for method in ["Write", "WriteBatch", "Rename"] {
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -66,7 +83,15 @@ async fn overload_never_enters_decoder_and_execution_retains_admission_after_can
         0,
         "execution still owns the payload"
     );
-    execution.lock().expect("execution").take();
+    let permit = execution.lock().expect("execution").take().unwrap();
+    assert!(
+        permit.inner.cancelled_at.get().is_some(),
+        "dropping the request must record cancellation before the supervisor does"
+    );
+    let cancelled_at = *permit.inner.cancelled_at.get().unwrap();
+    permit.observe_cancellation();
+    assert_eq!(permit.inner.cancelled_at.get(), Some(&cancelled_at));
+    drop(permit);
     assert_eq!(slots.available_permits(), 4);
     let response = other_listener
         .call(request("Write"))
@@ -204,12 +229,20 @@ fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
         } else {
             Arc::new(Semaphore::new(2))
         };
-        let held = RequestPermit::try_acquire(origin.clone(), held_weight, None).unwrap();
+        let held = RequestPermit::try_acquire_observed(
+            origin.clone(),
+            held_weight,
+            None,
+            Budget::GuestProcess,
+        )
+        .unwrap();
+        let lifetime = held.request_lifetime();
         let observed = held.clone();
         if closed {
             slots.close();
         }
-        let result = RequestPermit::try_acquire(slots.clone(), 2, Some(held));
+        let result =
+            RequestPermit::try_acquire_observed(slots.clone(), 2, Some(held), Budget::GuestProcess);
         assert_eq!(result.is_ok(), admitted);
         if admitted {
             assert_eq!(
@@ -221,6 +254,11 @@ fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
         drop(result);
         assert_eq!(origin.available_permits(), 2 - held_weight as usize);
         drop(observed);
-        assert_eq!(origin.available_permits(), 2);
+        assert_eq!(
+            origin.available_permits(),
+            2,
+            "request observation must not retain admission"
+        );
+        drop(lifetime);
     }
 }

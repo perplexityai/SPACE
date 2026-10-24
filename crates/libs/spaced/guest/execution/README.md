@@ -89,6 +89,10 @@ and error evolution, requires a separate crate-level policy before stabilization
   `ResourceExhausted`. Use `pplx_space_common_grpc::is_refused_before_start`
   to identify refusal before execution rather than parsing error messages.
   An error without that marker does not establish that retrying is safe.
+  [Payload metrics](../../../grpc-metrics/src/payload.rs) distinguish transport and
+  handler admission decisions and measure slots retained after observed
+  cancellation until their final release. Handler acquisition includes normal
+  native calls; it must not be treated as evidence of a lost transport permit.
 - The daemon registers `filesystem_grpc_service()` and `process_grpc_service()`
   to retain predecode protection. Handlers reuse that admission without charging
   twice. Native calls cannot install predecode protection retroactively.
