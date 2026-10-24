@@ -575,7 +575,6 @@ impl TemplateManagerService {
             name: template_id.clone(),
             content_hash: content_hash.clone(),
             build_date: build_date.clone(),
-            runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
             arch: arch.clone(),
             ..pplx_space_common_core::types::TemplateManifest::default()
         };
@@ -630,6 +629,7 @@ impl TemplateManagerService {
         let name = template_id.clone();
         let hash = content_hash.clone();
         let date = build_date.clone();
+        let runtime = manifest.runtime.clone();
         let requested_network_policy_for_db = requested_network_policy.clone();
         tokio::task::spawn_blocking(move || {
             let conn = db
@@ -642,7 +642,7 @@ impl TemplateManagerService {
                     content_hash: &hash,
                     build_date: &date,
                     manifest_json: &manifest_str,
-                    runtime: RUNTIME_FIRECRACKER_ALIAS,
+                    runtime: &runtime,
                     arch: &arch,
                     artifact_size_bytes: expanded_size,
                     state: "ready",
