@@ -746,6 +746,17 @@ impl SandboxManagerService {
             .transition(SandboxState::Restoring)
             .map_err(Status::from)?;
 
+        let open_route_activation = open_activation_claim_eligible
+            .then(|| {
+                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                    &space_api_route_identity,
+                    route_identity_provenance,
+                )
+            })
+            .flatten();
+        self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
+            .await?;
+
         // Serialize the whole activation boundary with cleanup. A cleanup
         // admitted for the previous execution must either finish before this
         // restore claims the row, or observe the attached replacement
@@ -761,14 +772,6 @@ impl SandboxManagerService {
             activation_lock_owner.lock(),
         )
         .await?;
-        let open_route_activation = open_activation_claim_eligible
-            .then(|| {
-                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
-                    &space_api_route_identity,
-                    route_identity_provenance,
-                )
-            })
-            .flatten();
 
         let cleanup_episode = {
             let db = self.db_conn()?;

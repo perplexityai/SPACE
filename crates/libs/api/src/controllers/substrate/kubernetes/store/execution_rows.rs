@@ -684,6 +684,28 @@ impl K8sStore {
         Ok(claim)
     }
 
+    /// The generation a claim for `sandbox_id` would mint now, or `None` when
+    /// an active execution exists and a claim would reuse it. Read without a
+    /// lock: a concurrent claim can mint first, so a caller treats it as a
+    /// hint and keeps its post-claim checks.
+    pub(in crate::controllers::substrate::kubernetes) async fn unclaimed_execution_generation(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<i64>, SubstrateError> {
+        sqlx::query_scalar::<_, Option<i64>>(sql!(
+            "SELECT CASE
+                        WHEN BOOL_OR(active) THEN NULL
+                        ELSE COALESCE(MAX(generation), 0) + 1
+                    END
+             FROM sandbox_k8s_executions
+             WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&self.pool)
+        .await
+        .db_context("failed to read the next Kubernetes execution generation")
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn ensure_active_execution_claim_for_lifecycle(
         &self,
         sandbox_id: SandboxId,

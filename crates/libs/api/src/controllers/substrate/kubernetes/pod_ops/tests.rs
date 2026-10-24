@@ -708,6 +708,86 @@ mod stopped_restore_plan_tests {
     use sqlx::PgPool;
     use std::sync::Mutex;
 
+    /// A stopped start restores from its source node, so it sweeps its prior
+    /// generation's pods too. While one stays after its delete is accepted,
+    /// every retry defers without minting an execution.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_start_deferred_on_a_lingering_pod_mints_no_execution() -> TestResult {
+        use crate::controllers::substrate::kubernetes::tests::{
+            running_pod_kubernetes_client_with_create_barrier,
+            substrate_with_store_client_proxy_port_and_pod,
+        };
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox(&pool, sandbox_id).await?;
+        place_on_node(&pool, sandbox_id, "holder-node").await?;
+        let lingering_pod_name = format!("space-sbx-{sandbox_id}-g1");
+        sqlx::query(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active)
+             VALUES ($1, 1, $2, 'space', 'lingering-pod-uid', 'stopped', FALSE)",
+        )
+        .bind(sandbox_id)
+        .bind(&lingering_pod_name)
+        .execute(&pool)
+        .await?;
+        let lingering_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": lingering_pod_name,
+                "namespace": "space",
+                "uid": "lingering-pod-uid",
+                "annotations": {
+                    pplx_space_common_core::kubernetes::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
+                    SANDBOX_EXECUTION_GENERATION_ANNOTATION: "1"
+                }
+            },
+            "status": { "phase": "Running" }
+        });
+        let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
+        let mut substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            running_pod_kubernetes_client_with_create_barrier(
+                Arc::clone(&captured_pod_creates),
+                "127.0.0.1",
+                None,
+                true,
+                Some(lingering_pod.clone()),
+            ),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(serde_json::from_value(lingering_pod)?),
+        );
+        substrate.k8s.k8s_blocking_delete_timeout = std::time::Duration::from_millis(10);
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("stopped sandbox should exist");
+
+        for _ in 0..3 {
+            let error = substrate
+                .ensure_pod_exists(&sandbox, None, None, None, Default::default())
+                .await
+                .expect_err("an unconfirmed prior-generation pod must defer the start");
+            assert!(
+                matches!(error, SubstrateError::Unavailable { .. }),
+                "{error:?}"
+            );
+        }
+
+        assert!(captured_pod_creates.lock().unwrap().is_empty());
+        let executions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sandbox_k8s_executions WHERE sandbox_id = $1")
+                .bind(sandbox_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            executions, 1,
+            "a deferred start must not leave a replaced execution per retry"
+        );
+        Ok(())
+    }
+
     async fn insert_stopped_sandbox(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
         sqlx::query(
             "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, placement, managed_by,

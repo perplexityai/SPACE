@@ -10,7 +10,14 @@ use super::*;
 /// no storage override. It has a ready backup of every local artifact exactly
 /// when `artifact_backed`, and it shows the sandbox has a ready snapshot to
 /// restore from exactly when `backed_copy`. When `refuses_only_verdicts`, it
-/// refuses a generation-bound registration only when it's verdict-only.
+/// refuses a generation-bound registration only when it's verdict-only, and
+/// when `refuses_only_registrations`, only when it isn't. When
+/// `supersession_lapsed`, it admits every registration, as the cluster does
+/// once every newer execution has ended without running. It says its fence
+/// admitted a generation-bound registration it admits, unless
+/// `admits_unfenced`, as for a replay or for bytes another attempt
+/// registered. When `predates_verdicts`, it answers as a server that predates
+/// verdict-only requests and the fence's admission does: it echoes neither.
 #[derive(Clone, Copy)]
 pub(super) struct RetiringClusterApi {
     pub(super) unavailable: bool,
@@ -18,6 +25,10 @@ pub(super) struct RetiringClusterApi {
     pub(super) backed_copy: bool,
     pub(super) artifact_backed: bool,
     pub(super) refuses_only_verdicts: bool,
+    pub(super) refuses_only_registrations: bool,
+    pub(super) supersession_lapsed: bool,
+    pub(super) admits_unfenced: bool,
+    pub(super) predates_verdicts: bool,
 }
 
 pub(super) const RETIRING: RetiringClusterApi = RetiringClusterApi {
@@ -26,6 +37,10 @@ pub(super) const RETIRING: RetiringClusterApi = RetiringClusterApi {
     backed_copy: true,
     artifact_backed: false,
     refuses_only_verdicts: false,
+    refuses_only_registrations: false,
+    supersession_lapsed: false,
+    admits_unfenced: false,
+    predates_verdicts: false,
 };
 
 /// The stub's answer to a backup readiness query: whether the sandbox has a
@@ -116,7 +131,12 @@ impl tonic::server::UnaryService<pplx_space_node_api_client::proto::BeginArtifac
                 "cluster-api is restarting",
             )));
         }
-        let refusable = request.fence_verdict_only || !self.refuses_only_verdicts;
+        let refusable = !self.supersession_lapsed
+            && if request.fence_verdict_only {
+                !self.refuses_only_registrations
+            } else {
+                !self.refuses_only_verdicts
+            };
         std::future::ready(match request.execution_generation.filter(|_| refusable) {
             Some(generation) => Err(
                 pplx_space_node_api_client::cluster::backup_execution_superseded_status(
@@ -127,7 +147,10 @@ impl tonic::server::UnaryService<pplx_space_node_api_client::proto::BeginArtifac
             None => Ok(tonic::Response::new(Self::Response {
                 local_artifact_id: request.local_artifact_id,
                 backup_attempt_id: request.backup_attempt_id,
-                fence_verdict_only: request.fence_verdict_only,
+                fence_verdict_only: request.fence_verdict_only && !self.predates_verdicts,
+                generation_fence_admitted: request.execution_generation.is_some()
+                    && !self.admits_unfenced
+                    && !self.predates_verdicts,
             })),
         })
     }

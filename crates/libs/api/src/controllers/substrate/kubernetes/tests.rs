@@ -8774,9 +8774,9 @@ mod kubernetes_tests {
             .await
             .expect_err("a cold reflector must defer the restore create retryably");
 
-        // Assert: retryable deferral, no pod POSTed, and the freshly-created
-        // claim retired so the retry re-runs the sweep instead of no-oping on
-        // the create-in-flight early return.
+        // Assert: retryable deferral, no pod POSTed, and no active claim, so
+        // the retry re-runs the sweep instead of no-oping on the
+        // create-in-flight early return.
         assert!(matches!(error, SubstrateError::Unavailable { .. }));
         assert!(
             captured_pod_creates
@@ -8794,6 +8794,93 @@ mod kubernetes_tests {
         assert_eq!(
             active_executions, 0,
             "the deferred create's claim must be retired for a clean retry"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_deferred_on_a_lingering_pod_mints_no_execution() -> Result<(), BoxError> {
+        // Arrange: a restore whose prior generation's pod stays after its
+        // delete is accepted, as a pod does while its node holds the
+        // teardown. Every attempt must defer until the pod is gone.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "restoring").await?;
+        let lingering_pod_name = format!("space-sbx-{sandbox_id}-g1");
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active)
+             VALUES ($1, 1, $2, 'space', 'lingering-pod-uid', 'suspended', FALSE)"
+        ))
+        .bind(sandbox_id)
+        .bind(&lingering_pod_name)
+        .execute(&pool)
+        .await?;
+        let lingering_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": lingering_pod_name,
+                "namespace": "space",
+                "uid": "lingering-pod-uid",
+                "annotations": {
+                    pplx_space_common_core::kubernetes::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
+                    SANDBOX_EXECUTION_GENERATION_ANNOTATION: "1"
+                }
+            },
+            "status": { "phase": "Running" }
+        });
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
+        let mut substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            running_pod_kubernetes_client_with_create_barrier(
+                Arc::clone(&captured_pod_creates),
+                "127.0.0.1",
+                None,
+                true,
+                Some(lingering_pod.clone()),
+            ),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(serde_json::from_value(lingering_pod)?),
+        );
+        substrate.k8s.k8s_blocking_delete_timeout = Duration::from_millis(10);
+
+        // Act: the wake's retries.
+        for _ in 0..3 {
+            let error = substrate
+                .ensure_pod_exists(
+                    &sandbox,
+                    None,
+                    None,
+                    Some("s3://space-test/suspend-snapshots/lingering-pod?region=us-east-1"),
+                    PodMaterializationOwnership::default(),
+                )
+                .await
+                .expect_err("an unconfirmed prior-generation pod must defer the restore");
+            assert!(matches!(error, SubstrateError::Unavailable { .. }));
+        }
+
+        // Assert: no pod POSTed, and no execution minted for any attempt.
+        assert!(
+            captured_pod_creates
+                .lock()
+                .expect("capture mutex poisoned")
+                .is_empty()
+        );
+        let executions: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            executions, 1,
+            "a deferred restore must not leave a replaced execution per retry"
         );
 
         Ok(())

@@ -144,6 +144,20 @@ impl KubernetesSubstrate {
         Ok(true)
     }
 
+    /// Whether `sandbox`'s restore plan resolves, which names a source node or
+    /// storage URI, so its create sweeps lingering prior-generation pods: the
+    /// plan [`Self::ensure_pod_exists`] selects when its caller passes
+    /// neither. A plan that can't be resolved yet answers `false`, leaving
+    /// that answer to the selection after the claim.
+    async fn restore_plan_sweeps(&self, sandbox: &Sandbox, evacuation: bool) -> bool {
+        let plan = match normalize_lifecycle(&sandbox.lifecycle).as_str() {
+            "suspended" | "restoring" => self.suspend_restore_plan(sandbox, evacuation).await,
+            "stopped" => self.stopped_restore_plan(sandbox).await,
+            _ => return false,
+        };
+        plan.is_ok()
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn ensure_pod_exists(
         &self,
         sandbox: &Sandbox,
@@ -208,6 +222,30 @@ impl KubernetesSubstrate {
         } else {
             materialization_lifecycle
         };
+        // A restore that would mint its claim sweeps first, against the
+        // generation that claim would take. The sweep's deferral otherwise
+        // retires each freshly minted claim, so a pod that stays unconfirmed
+        // (one whose node holds its teardown) would add a pod-less `replaced`
+        // execution for every retry of the wake. The sweep after the claim
+        // still decides; this one only keeps a deferral from minting. It runs
+        // only for a create that sweeps anyway and selects only pods that sweep
+        // would, though it may delete them on a call the claim then refuses,
+        // and its deferral comes before the claim's own checks (the restore
+        // lease, the lifecycle) would answer.
+        if started_recovery.is_none()
+            && let Some(generation) = self
+                .store
+                .unclaimed_execution_generation(sandbox_id)
+                .await?
+            && (suspend_restore_source_node.is_some()
+                || suspend_restore_storage_uri.is_some()
+                || self
+                    .restore_plan_sweeps(&sandbox, evacuation_placement.is_some())
+                    .await)
+        {
+            self.sweep_lingering_prior_generation_pods(sandbox_id, generation)
+                .await?;
+        }
         let mut claim = self
             .store
             .ensure_active_execution_claim_for_lifecycle(
@@ -933,61 +971,18 @@ impl KubernetesSubstrate {
         // traffic on the reflector, but that indirect invariant does not cover
         // direct/internal callers or a readiness-routing mistake, so the create
         // itself refuses until the cache is warm.
-        if suspend_restore_source_node.is_some() || suspend_restore_storage_uri.is_some() {
-            if !self.pod_reflector_ready.is_ready() {
-                if claim.created && execution_pod_create_in_flight(claim.row.state) {
-                    let _ = self
-                        .store
-                        .abandon_created_unmaterialized_create_claim(sandbox.id, &claim)
-                        .await?;
-                }
-                return Err(SubstrateError::Unavailable {
-                    message: format!(
-                        "deferring restore: pod reflector cache not ready to verify \
-                         lingering prior-generation pods for sandbox {}; retry",
-                        sandbox.id
-                    ),
-                });
+        if (suspend_restore_source_node.is_some() || suspend_restore_storage_uri.is_some())
+            && let Err(error) = self
+                .sweep_lingering_prior_generation_pods(sandbox.id, claim.row.generation)
+                .await
+        {
+            if claim.created && execution_pod_create_in_flight(claim.row.state) {
+                let _ = self
+                    .store
+                    .abandon_created_unmaterialized_create_claim(sandbox.id, &claim)
+                    .await?;
             }
-            let lingering = lingering_sandbox_pod_names(
-                self.pod_store.state().iter().map(|pod| pod.as_ref()),
-                sandbox.id,
-                claim.row.generation,
-            );
-            for stale_pod in lingering {
-                match self.delete_lingering_prior_generation_pod(&stale_pod).await {
-                    Ok(K8sBlockingDeleteOutcome::Deleted | K8sBlockingDeleteOutcome::NotFound) => {
-                        tracing::info!(
-                            sandbox_id = %sandbox.id,
-                            stale_pod = %stale_pod,
-                            successor_pod = %pod_name,
-                            "confirmed lingering prior-generation restore pod gone before create"
-                        );
-                    }
-                    outcome => {
-                        tracing::warn!(
-                            sandbox_id = %sandbox.id,
-                            stale_pod = %stale_pod,
-                            ?outcome,
-                            "deferring restore: lingering prior-generation pod not confirmed \
-                             gone; retry"
-                        );
-                        if claim.created && execution_pod_create_in_flight(claim.row.state) {
-                            let _ = self
-                                .store
-                                .abandon_created_unmaterialized_create_claim(sandbox.id, &claim)
-                                .await?;
-                        }
-                        return Err(SubstrateError::Unavailable {
-                            message: format!(
-                                "deferring restore: lingering prior-generation pod {stale_pod} \
-                                 for sandbox {} not confirmed gone; retry",
-                                sandbox.id
-                            ),
-                        });
-                    }
-                }
-            }
+            return Err(error);
         }
 
         if !self
