@@ -52,12 +52,13 @@ use pooled::{pooled_wake_request, wait_for_pooled_split_receipt_capability};
 #[cfg(test)]
 use substrate_adapter::create_ready_timeout_error;
 use suspend::{GenerationSuspendOutcome, await_generation_suspend};
+pub use suspend::{GenerationTeardownEvidence, observe_generation_teardown_with_node_api};
 #[cfg(test)]
 use suspend::{await_suspend_continuation, poll_generation_suspend};
 #[cfg(test)]
 pub(super) use suspend::{
-    generation_suspend_rpc_should_retry, published_generation_suspend_artifact,
-    suspend_pod_deletion_confirmation,
+    failed_teardown_observation, generation_suspend_rpc_should_retry, generation_teardown_evidence,
+    published_generation_suspend_artifact, suspend_pod_deletion_confirmation,
 };
 use teardown::{FenceReadFreshness, PodFenceCheck};
 

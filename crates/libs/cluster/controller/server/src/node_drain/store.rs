@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_api::controllers::substrate::ActivationOptions;
-use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
+use pplx_space_api::controllers::substrate::kubernetes::{
+    GenerationTeardownEvidence, KubernetesSubstrate, observe_generation_teardown_with_node_api,
+};
 use pplx_space_api::controllers::substrate::{
     EnqueuedArtifactBackup, NodeApiTarget, NodeReportedArtifact, NodeSchedulability,
     NodeSchedulabilityRequest, OwnedNodeApiTarget, PublishedLocalArtifact, SubstrateAdapter,
@@ -21,8 +23,8 @@ use pplx_space_common_core::node_drain_signals::{
     SUSPEND_SANDBOX_FAILED_MARKER,
 };
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, BackupSource, LocalArtifactId, NodeDrainMode, NodeId,
-    NodeManagedBy, NodeRole, PositiveDuration, SandboxId, SubstrateKind,
+    ArtifactKind, ArtifactOrigin, BackupSource, ExecutionGeneration, LocalArtifactId,
+    NodeDrainMode, NodeId, NodeManagedBy, NodeRole, PositiveDuration, SandboxId, SubstrateKind,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -63,6 +65,24 @@ fn emit_node_drain_event(
         SandboxEventSource::ClusterController,
     )
     .emit_with(details.reason(reason).trigger(SandboxEventTrigger::System));
+}
+
+/// The event for a pod-less give-up that moved the row; none when it didn't.
+fn emit_pod_less_recovery_events(
+    candidate: pod_less_giveup::PodLessCandidate,
+    outcome: PodLessRecovery,
+) {
+    if outcome == PodLessRecovery::RevertedToSuspended {
+        emit_node_drain_event(
+            candidate.sandbox_id,
+            SandboxEventType::LifecycleRevertedToSuspended,
+            "drain_sandbox_no_bound_pod",
+            SandboxEventDetails::default()
+                .with_from_state(candidate.pre_lifecycle.as_str())
+                .with_to_state("suspended")
+                .source_node_id(candidate.source_node_id.to_string()),
+        );
+    }
 }
 
 fn emit_node_drain_sandbox_failed_event(
@@ -536,6 +556,38 @@ async fn record_stopped_evacuation_artifact(
     Ok(written.rows_affected() == 1)
 }
 
+/// The pod-less give-up's view of the source node's teardown records for one
+/// sandbox, read through the drain's cached node-api client.
+struct SourceNodeTeardown<'a> {
+    sink: &'a SubstrateSink,
+    sandbox_id: SandboxId,
+    source_node_id: NodeId,
+}
+
+impl pod_less_giveup::GenerationTeardownObserver for SourceNodeTeardown<'_> {
+    async fn observe(
+        &self,
+        generation: ExecutionGeneration,
+    ) -> Result<GenerationTeardownEvidence, SubstrateError> {
+        let evidence = self
+            .sink
+            .observe_generation_teardown(self.sandbox_id, self.source_node_id, generation)
+            .await;
+        if let Err(err) = &evidence {
+            // The reconciler WARNs once per node per pacing window; at debug
+            // here so a dead node doesn't log per resident per tick.
+            tracing::debug!(
+                sandbox_id = %self.sandbox_id,
+                source_node_id = %self.source_node_id,
+                generation = %generation,
+                error = %err,
+                "node_drain: could not read the node's teardown record for the pod-less give-up"
+            );
+        }
+        evidence
+    }
+}
+
 /// The inputs `connect_retrying_node_api_client_for_target` needs to reach one
 /// node's node-api, read from the `nodes` row and its substrate-specific
 /// sibling.
@@ -881,14 +933,14 @@ async fn list_evacuatable_sandbox_rows(
 /// two disjuncts attribute to different columns — one to the sandbox's
 /// `target_node_id`, one to a snapshot's `source_node_id` — so an `OR` over
 /// both leaves the planner no indexable driver and it seq-scans the table.
-/// That is documented on [`drain_gate_blocker_pairs`], which exists because of
+/// That is documented on [`drain_gate_blocker_pairs`](pplx_space_sandbox_portability::drain_gate_blocker_pairs), which exists because of
 /// it, giving each attribution its own indexable driver and an
 /// already-differential-tested equivalence with the single-node form. Even
 /// a single-node request must avoid scanning the whole cluster.
 ///
 /// **Deliberately uncapped, unlike [`pinned_local_only_sandboxes_query`].** An
 /// outer `LIMIT` is the lever there and is not one here, because
-/// [`drain_gate_blocker_pairs`] is a `UNION`: Postgres has to consume and
+/// [`drain_gate_blocker_pairs`](pplx_space_sandbox_portability::drain_gate_blocker_pairs) is a `UNION`: Postgres has to consume and
 /// deduplicate both branches before an outer limit can return anything, so the
 /// limit truncates the result without bounding the scan. The indexable driver
 /// and reshaped in-flight predicate bound the work; the uncapped result keeps
@@ -1271,7 +1323,7 @@ pub(crate) fn schedule_restore_retry_query() -> &'static str {
 /// then enqueue backup for that exact artifact. Nullable rollout-skew rows have
 /// no immutable local identity, so they retain the legacy ready-snapshot gate.
 ///
-/// TODO: [legacy] Remove the nullable-row ready-snapshot gate once every
+/// TODO(legacy): Remove the nullable-row ready-snapshot gate once every
 /// suspended/evacuating row is written with `current_local_artifact_id`.
 ///
 /// The `active_node_id IS NULL` guard is required for both branches: it proves
@@ -2086,6 +2138,14 @@ pub enum EvacuateError {
     /// CAS (and self-heals on the next tick if the mark-failed call is lost).
     #[error("sandbox failed on node: {0}")]
     SandboxFailedOnNode(String),
+    /// The suspend found no pod to suspend
+    /// ([`SubstrateError::SandboxNoPod`]). Retrying can't succeed, so the
+    /// reconciler routes the row to the pod-less give-up
+    /// ([`NodeDrainSink::recover_pod_less_sandbox`]). The claim has already
+    /// been reverted when this is returned, as for
+    /// [`Self::SandboxFailedOnNode`].
+    #[error("sandbox has no pod on node: {0}")]
+    SandboxNoPodOnNode(String),
     /// A `stopped` evacuation could not get its disk artifact published to S3:
     /// the source node's endpoint would not resolve, the node-api was
     /// unreachable, sbx-mgr refused the backup, or the pin write failed.
@@ -2110,6 +2170,9 @@ impl EvacuateError {
             EvacuateError::Restore(_) => "restore",
             EvacuateError::Lookup(_) => "lookup",
             EvacuateError::SandboxFailedOnNode(_) => "sandbox_failed_on_node",
+            // A suspend failure like any other when the give-up is off; when
+            // it's on, the give-up reports through its own metric.
+            EvacuateError::SandboxNoPodOnNode(_) => "suspend",
             EvacuateError::Publish(_) => "publish",
             EvacuateError::LocalTeardown(_) => "local_teardown",
         }
@@ -2710,6 +2773,30 @@ impl SubstrateSink {
             self.evict_promotion_node_api_client(source_node_id).await;
         }
         result
+    }
+
+    /// What the source node's own records say about `generation`'s local
+    /// state, through the same cached node-api client the drain's other
+    /// source-node reads use. Observe-only: it never starts a suspend.
+    async fn observe_generation_teardown(
+        &self,
+        sandbox_id: SandboxId,
+        source_node_id: NodeId,
+        generation: ExecutionGeneration,
+    ) -> Result<GenerationTeardownEvidence, SubstrateError> {
+        let node = node_api_row(&self.pool, source_node_id)
+            .await
+            .map_err(|err| SubstrateError::Unavailable {
+                message: format!("source node endpoint lookup failed: {err}"),
+            })?
+            .ok_or_else(|| SubstrateError::Unavailable {
+                message: format!("node {source_node_id} not found in nodes table"),
+            })?;
+        let target = node.as_target();
+        self.with_promotion_node_api_client(source_node_id, &target, async |client, addr| {
+            observe_generation_teardown_with_node_api(client, addr, sandbox_id, generation).await
+        })
+        .await
     }
 
     /// Ask the source node to publish the stopped sandbox's disk artifact to
@@ -3741,6 +3828,7 @@ impl NodeDrainSink for SubstrateSink {
             Err(SubstrateError::LockContention { message }) => Err(PromoteError::Db(message)),
             Err(
                 SubstrateError::Unavailable { message }
+                | SubstrateError::SandboxNoPod { message }
                 | SubstrateError::NotFound { message }
                 | SubstrateError::Conflict { message }
                 | SubstrateError::FailedPrecondition { message }
@@ -4265,6 +4353,49 @@ impl NodeDrainSink for SubstrateSink {
         Ok(1)
     }
 
+    /// The order is cheapest first: a lock-free guard read, then one uncached
+    /// apiserver read per pod name, then one node-api read of the newest
+    /// generation's local state, then the locked transaction. A row still inside its staleness window, or one nothing
+    /// can restore, costs one guard query per tick on top of the failed
+    /// suspend's own claim and revert. A row parked on a pod or on the node's
+    /// answer pays its pod reads, and its node reads, every tick.
+    async fn recover_pod_less_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        source_node_id: NodeId,
+        pre_lifecycle: SandboxLifecycle,
+        stale: PositiveDuration,
+    ) -> Result<PodLessRecovery, sqlx::Error> {
+        let candidate = pod_less_giveup::PodLessCandidate {
+            sandbox_id,
+            source_node_id,
+            pre_lifecycle,
+            stale,
+        };
+        let generation = match pod_less_giveup::precheck(&self.pool, candidate).await? {
+            Ok(generation) => generation,
+            Err(hold) => return Ok(PodLessRecovery::NotEligible(hold)),
+        };
+        let refs = pod_less_giveup::pod_refs(&self.pool, sandbox_id).await?;
+        if let Err(hold) =
+            pod_less_giveup::pods_proven_absent(self.substrate.kubernetes(), &refs).await
+        {
+            return Ok(PodLessRecovery::NotEligible(hold));
+        }
+        let observer = SourceNodeTeardown {
+            sink: self,
+            sandbox_id,
+            source_node_id,
+        };
+        if let Err(hold) = pod_less_giveup::node_vouches(&observer, generation).await {
+            return Ok(PodLessRecovery::NotEligible(hold));
+        }
+        let outcome =
+            pod_less_giveup::recover_pod_less_sandbox_tx(&self.pool, candidate, generation).await?;
+        emit_pod_less_recovery_events(candidate, outcome);
+        Ok(outcome)
+    }
+
     /// Give-up for a `suspended` sandbox whose local-snapshot reupload is
     /// permanently refused (not `Suspended` on the node). Adopts an existing
     /// ready remote snapshot as the canonical recovery source via the
@@ -4481,6 +4612,12 @@ impl NodeDrainSink for SubstrateSink {
                 let err_msg = err.to_string();
                 if is_sandbox_failed_on_node_rejection(&err_msg) {
                     return Err(EvacuateError::SandboxFailedOnNode(err_msg));
+                }
+                // No pod to suspend: typed by the substrate, so no message
+                // match. Terminal for the suspend, not for the sandbox; the
+                // give-up decides what the row becomes.
+                if matches!(err, SubstrateError::SandboxNoPod { .. }) {
+                    return Err(EvacuateError::SandboxNoPodOnNode(err_msg));
                 }
                 return Err(EvacuateError::Suspend(err_msg));
             }
@@ -5585,6 +5722,14 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
     tx.commit().await?;
     Ok(true)
 }
+
+mod pod_less_giveup;
+#[cfg(test)]
+pub(crate) use pod_less_giveup::PodLessHold;
+pub use pod_less_giveup::PodLessRecovery;
+
+#[cfg(test)]
+mod pod_less_giveup_tests;
 
 #[cfg(test)]
 mod lifecycle_writer_tests;

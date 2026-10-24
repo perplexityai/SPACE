@@ -1523,6 +1523,99 @@ fn commit_sandbox_delete(conn: &crate::db::Connection, id: &str) {
         .unwrap();
 }
 
+async fn observed_teardown_outcome(
+    service: &SandboxManagerService,
+    id: &str,
+    generation: i64,
+) -> crate::proto::TeardownSuspendOutcome {
+    use crate::service::tests::service_tests::prepare_teardown_suspend_request;
+    let response = service
+        .prepare_teardown_suspend(crate::service::activation_support::internal_request(
+            prepare_teardown_suspend_request(
+                id.to_owned(),
+                generation,
+                crate::proto::TeardownSuspendAction::ObserveOnly,
+            ),
+        ))
+        .await
+        .expect("observe-only answers")
+        .into_inner();
+    crate::proto::TeardownSuspendOutcome::try_from(response.outcome).unwrap()
+}
+
+/// Node drain's pod-less give-up asks this node about a sandbox's newest
+/// generation and releases only on a delete. A generation that never ran
+/// here (a started recovery that stalled before its pod) is pending, whether
+/// the row runs an older generation or its delete receipt names one; an
+/// older generation than the row's is superseded; and once the delete
+/// commits, it covers the generation that ran here and every older one, but
+/// not a newer one.
+#[tokio::test]
+async fn observe_only_answers_each_generation_from_the_nodes_own_record() {
+    use crate::proto::TeardownSuspendOutcome;
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Started);
+    crate::db::update_space_api_route_identity(
+        &conn,
+        sandbox_id,
+        &pplx_space_common_core::types::SpaceApiRouteIdentity {
+            execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
+            ..Default::default()
+        },
+        crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
+    )
+    .unwrap();
+    let service = SandboxManagerService::for_test(conn);
+
+    assert_eq!(
+        observed_teardown_outcome(&service, &id, 3).await,
+        TeardownSuspendOutcome::Pending
+    );
+    assert_eq!(
+        observed_teardown_outcome(&service, &id, 1).await,
+        TeardownSuspendOutcome::Superseded
+    );
+
+    {
+        // The production delete: admission moves the row to Deleting, then
+        // the cleanup commits the receipt and removes the row together.
+        let db = service.db.lock().unwrap();
+        crate::db::test_fixtures::state_write_fixtures::apply_edge(
+            &db,
+            &id,
+            &crate::db::edges::DELETE_ADMISSION,
+        );
+        commit_sandbox_delete(&db, &id);
+        assert!(crate::db::get_sandbox(&db, &id).unwrap().is_none());
+    }
+    assert_eq!(
+        observed_teardown_outcome(&service, &id, 3).await,
+        TeardownSuspendOutcome::Pending
+    );
+    for generation in [2, 1] {
+        assert_eq!(
+            observed_teardown_outcome(&service, &id, generation).await,
+            TeardownSuspendOutcome::Deleted,
+            "generation {generation}"
+        );
+    }
+
+    // A node with no row and no delete receipt, as after lost node state,
+    // vouches for no generation.
+    let unknown = SandboxId::new().to_string();
+    for generation in [2, 1] {
+        assert_eq!(
+            observed_teardown_outcome(&service, &unknown, generation).await,
+            TeardownSuspendOutcome::Pending,
+            "generation {generation}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_delete() {
     use crate::service::tests::service_tests::prepare_teardown_suspend_request;

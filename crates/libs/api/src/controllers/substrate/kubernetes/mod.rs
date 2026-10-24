@@ -778,7 +778,15 @@ async fn fetch_sandbox_pod_uncached(
     k8s: &KubernetesState,
     pod_name: &str,
 ) -> Result<Option<Arc<SandboxPodView>>, KubeError> {
-    let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), &k8s.sandbox_namespace);
+    fetch_sandbox_pod_uncached_in(k8s, &k8s.sandbox_namespace, pod_name).await
+}
+
+async fn fetch_sandbox_pod_uncached_in(
+    k8s: &KubernetesState,
+    namespace: &str,
+    pod_name: &str,
+) -> Result<Option<Arc<SandboxPodView>>, KubeError> {
+    let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), namespace);
     Ok(pods
         .get_opt(pod_name)
         .await?
@@ -1249,6 +1257,7 @@ mod test_substrate;
 pub(crate) mod tests;
 mod wait_ready;
 
+pub use adapter::{GenerationTeardownEvidence, observe_generation_teardown_with_node_api};
 pub use node_sync::SyncNodeInventoryError;
 use pod_ops::ExecutionHydrationOutcome;
 use pod_ops::{ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership};

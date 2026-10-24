@@ -43,6 +43,21 @@ impl EnvConfig<'_> {
         }
     }
 
+    /// An optional window in whole seconds: `0` turns it off (`None`), any
+    /// other number sets it, and an unset or unparseable value keeps
+    /// `default`.
+    pub(crate) fn optional_positive_duration_secs(
+        &self,
+        var: &str,
+        default: Option<PositiveDuration>,
+    ) -> Option<PositiveDuration> {
+        match self.0.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(secs) => PositiveDuration::new(Duration::from_secs(secs)),
+            None => default,
+        }
+    }
+
     pub(crate) fn truthy_default(&self, var: &str, default: bool) -> bool {
         match self.0.var(var).as_deref() {
             Ok("1" | "true" | "True" | "TRUE") => true,

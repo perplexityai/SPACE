@@ -424,8 +424,10 @@ enum SuspendRefusal {
     SandboxNotSuspendable,
 }
 
-/// A suspend refused before it claims ownership is retryable and leaves the
-/// pod, the active execution, and the sandbox lifecycle as they were.
+/// A suspend refused before it claims ownership leaves the pod, the active
+/// execution, and the sandbox lifecycle as they were. A refusal for want of a
+/// pod is typed `SandboxNoPod`, so node drain can stop retrying it; the
+/// lifecycle refusal stays a retryable `Unavailable`.
 #[rstest::rstest]
 #[case::no_active_execution(SuspendRefusal::NoExecution)]
 #[case::execution_without_pod_uid(SuspendRefusal::ExecutionWithoutPodUid)]
@@ -460,10 +462,16 @@ async fn suspend_execution_refuses_before_claiming_without_retiring_the_pod(
 
     let outcome = substrate.suspend_execution_tracked(sandbox_id).await;
 
-    assert!(
-        matches!(outcome, Err(SubstrateError::Unavailable { .. })),
-        "{refusal:?}: expected a retryable refusal, got {outcome:?}"
-    );
+    match refusal {
+        SuspendRefusal::NoExecution | SuspendRefusal::ExecutionWithoutPodUid => assert!(
+            matches!(outcome, Err(SubstrateError::SandboxNoPod { .. })),
+            "{refusal:?}: expected a no-pod refusal, got {outcome:?}"
+        ),
+        SuspendRefusal::SandboxNotSuspendable => assert!(
+            matches!(outcome, Err(SubstrateError::Unavailable { .. })),
+            "{refusal:?}: expected a retryable refusal, got {outcome:?}"
+        ),
+    }
     assert!(
         log.lock().unwrap().is_empty(),
         "{refusal:?}: no pod may be retired"

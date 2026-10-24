@@ -15,6 +15,15 @@
 //!   fourth term counts four lifecycles the resident include-list treats as
 //!   non-occupying, so "zero non-terminal sandboxes" is not the whole condition
 //!   — see [`NodeDrainSink::count_termination_blocking_residents_on_node`].
+//!   A resident whose suspend finds no pod can never be evacuated. Where the
+//!   pod-less give-up is enabled, once its pod and VM are proven gone, its
+//!   recovery has stalled, and the node's own delete receipt covers its
+//!   newest generation, it's reverted to `suspended` off the node if a
+//!   durable snapshot can restore it — see
+//!   [`NodeDrainSink::recover_pod_less_sandbox`]. Any other resident is
+//!   never failed: it parks the node for an operator. That includes a
+//!   started recovery whose newest generation never got a pod, which the
+//!   node never learned and so can't vouch for.
 //! - For each `terminating` node: call
 //!   `TerminateInstanceInAutoScalingGroup decrement=false`. On success the
 //!   row moves to `deleted`; on error the row stays in `terminating` with
@@ -130,8 +139,8 @@
 //! The explicit tradeoffs accepted by this design:
 //!
 //! - **No new vocabulary.** The control plane already has
-//!   [`SandboxLifecycle`] (canonical), [`SandboxState`] (sbx-mgr FSM),
-//!   and [`SandboxLifecycleStatus`] (API resting states). Adding a
+//!   [`SandboxLifecycle`] (canonical), `SandboxState` (sbx-mgr FSM),
+//!   and `SandboxLifecycleStatus` (API resting states). Adding a
 //!   4th "evacuable lifecycle" enum and conversion shims for each
 //!   layer (cluster-controller, substrate, sbx-mgr) inflates the
 //!   surface for marginal type-system gain.
@@ -162,7 +171,7 @@
 //!
 //! The same shape applies to the wake/restore `target_state` plumbed
 //! through the substrate and sbx-mgr: typed as [`SandboxLifecycle`] /
-//! [`SandboxState`] respectively, validated at the proto boundary, no
+//! `SandboxState` respectively, validated at the proto boundary, no
 //! new 2-variant enums introduced.
 
 use pplx_space_common_core::types::NodeId;
@@ -211,8 +220,8 @@ pub use kube_delete::KubeNodeDeleteTerminator;
 pub use noop::NoopInstanceTerminator;
 #[cfg(feature = "kubernetes")]
 pub use store::{
-    CordonError, CordonOutcome, EvacuateError, RestoreOutcome, StoppedEvacuationOutcome,
-    StoppedEvacuationStall, SubstrateSink,
+    CordonError, CordonOutcome, EvacuateError, PodLessRecovery, RestoreOutcome,
+    StoppedEvacuationOutcome, StoppedEvacuationStall, SubstrateSink,
 };
 
 pub(crate) const PHASE_DRAINING: &str = "draining";
@@ -373,7 +382,7 @@ pub(crate) fn is_suspend_evacuable_lifecycle(lifecycle: SandboxLifecycle) -> boo
 
 /// Resident lifecycles the suspend → restore pipeline cannot service —
 /// i.e. `RESIDENT_LIFECYCLES` minus
-/// [`EVACUATABLE_LIFECYCLES`]. Two roles:
+/// [`EVACUABLE_LIFECYCLES`]. Two roles:
 ///
 /// 1. Surfaced in the "stuck draining" warning so operators see every
 ///    lifecycle that can block a drain.
@@ -390,7 +399,7 @@ pub(crate) fn is_suspend_evacuable_lifecycle(lifecycle: SandboxLifecycle) -> boo
 ///
 /// `Paused` is intentionally **absent**: the pipeline now evacuates
 /// paused sandboxes by re-pausing them after restore (see
-/// [`EVACUATABLE_LIFECYCLES`]), so `paused` no longer blocks a drain.
+/// [`EVACUABLE_LIFECYCLES`]), so `paused` no longer blocks a drain.
 pub(crate) const NON_EVACUATABLE_RESIDENT_LIFECYCLES: &[SandboxLifecycle] = &[
     SandboxLifecycle::Creating,
     SandboxLifecycle::Starting,
@@ -507,6 +516,21 @@ pub(crate) const DEFAULT_STALE_ABANDON_SECS: u64 = 600;
 /// disable the give-up entirely (`None` — the reupload is retried forever, the
 /// prior behavior); the reconciler always uses this default.
 pub(crate) const DEFAULT_REUPLOAD_GIVEUP_SETTLE_SECS: u64 = 600;
+/// The shortest pod-less give-up window the environment may set; a smaller
+/// value clamps up to it. The window is how long a resident whose evacuation
+/// suspend found no pod (see [`EvacuateError::SandboxNoPodOnNode`]) must have
+/// shown no progress, on `sandbox_k8s_executions.updated_at`, before the
+/// drain gives up on it; the
+/// `store::pod_less_giveup` module doc says why that clock and not
+/// `lifecycle_changed_at`. The no-pod proof needs the
+/// window to outlast any pod create still in flight, and the restore-ownership
+/// window is how long the substrate itself lets a pod-less generation be
+/// materializing.
+pub(crate) const MIN_POD_LESS_GIVEUP_STALE: Duration =
+    pplx_space_common_core::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL;
+/// The longest window the environment may set; a larger value clamps down to
+/// it, so a typo can't overflow the SQL interval and fail every tick.
+pub(crate) const MAX_POD_LESS_GIVEUP_STALE: Duration = Duration::from_secs(24 * 60 * 60);
 /// First-failure delay for the cohort-restore retry backoff. A sandbox whose
 /// cohort restore fails is not re-selected by the restore sweep until
 /// `base * 2^(failures - 1)` has elapsed (capped at
@@ -649,7 +673,8 @@ pub struct ReconcilerConfig {
     /// drains with `"mode": "forced"`, so the parked node that slows it is a
     /// forced one. A gentle drain parked on a stopped resident
     /// still has its existing exits — the owner starting or deleting the
-    /// sandbox, or [`Self::gentle_escalate`] rewriting the mode.
+    /// sandbox, or an operator escalating it in place with a `:drain` that
+    /// sets `mode: forced`.
     pub evacuate_stopped_residents: bool,
     pub tick: Duration,
     pub max_per_node: usize,
@@ -699,6 +724,19 @@ pub struct ReconcilerConfig {
     /// present the value is guaranteed non-zero so the give-up SQL never sees a
     /// zero settle interval that would fire on a just-suspended row.
     pub reupload_giveup_settle: Option<PositiveDuration>,
+    /// Staleness window for the pod-less give-up (see
+    /// [`MIN_POD_LESS_GIVEUP_STALE`]), read from
+    /// `SPACE_NODE_DRAIN_POD_LESS_GIVEUP_STALE_SECS`. Off (`None`) by
+    /// default, so each environment opts in to moving user sandboxes off a
+    /// draining node without anyone asking. Off, a suspend that finds no pod is retried
+    /// every tick and counted as an ordinary suspend failure (the prior
+    /// behavior). Unset, `0` or an unparseable value leaves it off; a number
+    /// is clamped to [`MIN_POD_LESS_GIVEUP_STALE`] and
+    /// [`MAX_POD_LESS_GIVEUP_STALE`].
+    /// `Option<PositiveDuration>` for the same reasons as
+    /// [`Self::stale_abandon`]: a zero window would let the give-up fire on a
+    /// generation whose pod is being created right now.
+    pub pod_less_giveup_stale: Option<PositiveDuration>,
     /// First-failure delay for the cohort-restore retry backoff. A failed
     /// cohort restore schedules its next attempt
     /// `base * 2^(failures - 1)` out (capped at
@@ -743,6 +781,7 @@ impl Default for ReconcilerConfig {
             reupload_giveup_settle: PositiveDuration::new(Duration::from_secs(
                 DEFAULT_REUPLOAD_GIVEUP_SETTLE_SECS,
             )),
+            pod_less_giveup_stale: None,
             restore_backoff_base: PositiveDuration::new(Duration::from_secs(
                 DEFAULT_RESTORE_BACKOFF_BASE_SECS,
             )),
@@ -780,6 +819,19 @@ impl ReconcilerConfig {
             evacuate_timeout: default.evacuate_timeout,
             stale_abandon: default.stale_abandon,
             reupload_giveup_settle: default.reupload_giveup_settle,
+            pod_less_giveup_stale: config
+                .optional_positive_duration_secs(
+                    "SPACE_NODE_DRAIN_POD_LESS_GIVEUP_STALE_SECS",
+                    default.pod_less_giveup_stale,
+                )
+                .map(|stale| {
+                    PositiveDuration::new(
+                        stale
+                            .get()
+                            .clamp(MIN_POD_LESS_GIVEUP_STALE, MAX_POD_LESS_GIVEUP_STALE),
+                    )
+                    .unwrap_or(stale)
+                }),
             restore_backoff_base: default.restore_backoff_base,
             restore_backoff_cap: default.restore_backoff_cap,
             drain_evacuation_placement: env_evacuation_placement(
@@ -873,7 +925,7 @@ pub enum PromoteError {
 }
 
 /// Surface the reconciler depends on. Implementations: [`SubstrateSink`]
-/// for production (Postgres + KubernetesSubstrate); [`tests::FakeSink`] for
+/// for production (Postgres + KubernetesSubstrate); `tests::FakeSink` for
 /// unit tests.
 ///
 /// `evacuate_sandbox` returns an explicit `+ Send` future because it is
@@ -907,7 +959,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<ResidentSandboxCounts, sqlx::Error>> + Send;
     /// `(sandbox_id, pre_lifecycle)` pairs for sandboxes resident on
-    /// `node_id` whose lifecycle is in [`EVACUATABLE_LIFECYCLES`] — the
+    /// `node_id` whose lifecycle is in [`EVACUABLE_LIFECYCLES`] — the
     /// subset the reconciler will actually attempt to suspend + restore
     /// this tick. The IDs in the returned slice are always a subset of
     /// `list_sandboxes_on_node`. Splitting the two queries keeps the
@@ -1117,6 +1169,43 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         sandbox_id: SandboxId,
         source_node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;
+    /// Give-up for a sandbox whose evacuation suspend found no pod (see
+    /// [`EvacuateError::SandboxNoPodOnNode`]). The suspend claim has already
+    /// been reverted, so the row rests in `pre_lifecycle` on `source_node_id`.
+    ///
+    /// Implementations must leave the row alone unless all of these hold:
+    /// - Kubernetes, read uncached, has no live pod under any name the
+    ///   sandbox has had, each read in its recorded namespace. An unreadable
+    ///   name blocks;
+    /// - no node still publishes a live VM for the sandbox (a pod can be gone
+    ///   while its Firecracker VM runs on);
+    /// - no execution has advanced its `updated_at` within `stale`, no active
+    ///   one carries a pod UID, and none carries a pod IP, re-checked under
+    ///   the row locks;
+    /// - the source node's own records show a local delete covering the
+    ///   newest generation the database knows; an older generation's delete
+    ///   doesn't cover a newer one. Database
+    ///   state alone never suffices, since a rootfs written after the newest
+    ///   snapshot leaves no record there.
+    ///
+    /// When they hold and a durable suspend snapshot makes the row
+    /// recoverable, with no newer upload in flight and no non-durable marked
+    /// artifact, it's reverted to `suspended` off the node in one transaction
+    /// and its stale execution retired, so it stops counting as resident and
+    /// the node can finish draining. Implementations never fail a row: one
+    /// nothing can restore, or that the node doesn't vouch for, stays
+    /// resident, because the node may still hold its last bytes (see the
+    /// `store::pod_less_giveup` module doc).
+    ///
+    /// A sandbox with no execution row has no name to read and no generation
+    /// to ask the node about, so it always stays resident.
+    fn recover_pod_less_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        source_node_id: NodeId,
+        pre_lifecycle: SandboxLifecycle,
+        stale: PositiveDuration,
+    ) -> impl std::future::Future<Output = Result<PodLessRecovery, sqlx::Error>> + Send;
     /// Give-up for a `suspended` sandbox whose local-snapshot promotion is
     /// permanently refused because it is wedged in `restoring` on the node
     /// while the DB reads `suspended` (see
@@ -1526,7 +1615,9 @@ pub struct Reconciler<S: NodeDrainSink, T: InstanceTerminator> {
     /// [`HELD_WARN_INTERVAL`], keyed by `(node, reason)` so each condition keeps
     /// its own window. Pruned every tick down to the nodes still listed as
     /// `draining`, so a converged or undrained node can't leak its slots.
-    warn_pacer: PerNodeWarnPacer,
+    /// Shared with the evacuation tasks, whose pod-less give-up paces the
+    /// WARNs of holds that park the drain here.
+    warn_pacer: Arc<PerNodeWarnPacer>,
 }
 
 /// One `draining` node as the tick sees it: its id plus the mode that decides
@@ -1594,7 +1685,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             evacuations: Arc::new(Mutex::new(tokio::task::JoinSet::new())),
             restore_in_flight: Arc::new(Mutex::new(HashSet::new())),
             instance_lookup: None,
-            warn_pacer: PerNodeWarnPacer::new(HELD_WARN_INTERVAL),
+            warn_pacer: Arc::new(PerNodeWarnPacer::new(HELD_WARN_INTERVAL)),
         }
     }
 
@@ -3183,7 +3274,11 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         node_id: NodeId,
         sandboxes: &[(SandboxId, SandboxLifecycle)],
     ) -> usize {
-        self.spawn_bounded(node_id, sandboxes, move |sink, sandbox, pre_lifecycle| async move {
+        let pod_less_giveup_stale = self.config.pod_less_giveup_stale;
+        let warn_pacer = Arc::clone(&self.warn_pacer);
+        self.spawn_bounded(node_id, sandboxes, move |sink, sandbox, pre_lifecycle| {
+            let warn_pacer = Arc::clone(&warn_pacer);
+            async move {
             let started = Instant::now();
             // `Stopped` takes the sibling path, not a mode of the suspend one:
             // no VM to snapshot, no `suspending` claim, no `suspended` commit.
@@ -3262,6 +3357,22 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                         }
                     }
                 }
+                // No pod to suspend, so retrying can't help: hand the row to
+                // the pod-less give-up instead.
+                Err(EvacuateError::SandboxNoPodOnNode(detail))
+                    if let Some(stale) = pod_less_giveup_stale =>
+                {
+                    Self::give_up_pod_less(
+                        &sink,
+                        &warn_pacer,
+                        sandbox,
+                        node_id,
+                        pre_lifecycle,
+                        stale,
+                        &detail,
+                    )
+                    .await;
+                }
                 Err(err) => {
                     node_drain_metrics::failure(&node_id.to_string(), err.phase(), pre_lifecycle_tag);
                     tracing::warn!(
@@ -3274,8 +3385,93 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     );
                 }
             }
-        })
+        }})
         .await
+    }
+
+    /// Run the pod-less give-up for one sandbox and report what it did. An
+    /// ineligible row is counted and left for the next tick, which re-detects
+    /// it through the same failed suspend.
+    ///
+    /// A hold that doesn't clear on its own (`PodLessHold::clears_on_its_own`)
+    /// can keep the drain parked indefinitely, so it also WARNs, paced per
+    /// node and reason by [`HELD_WARN_INTERVAL`]. With the give-up off, the same wedge WARNs as a
+    /// suspend failure every tick, so turning it on mustn't leave the metric as
+    /// the only sign; pacing keeps a node parked for good from repeating per
+    /// resident per tick. Pod and node read errors are logged at debug where
+    /// they happen.
+    async fn give_up_pod_less(
+        sink: &Arc<S>,
+        warn_pacer: &PerNodeWarnPacer,
+        sandbox: SandboxId,
+        node_id: NodeId,
+        pre_lifecycle: SandboxLifecycle,
+        stale: PositiveDuration,
+        detail: &str,
+    ) {
+        let node_label = node_id.to_string();
+        let pre_lifecycle_tag = pre_lifecycle.as_str();
+        let result = sink
+            .recover_pod_less_sandbox(sandbox, node_id, pre_lifecycle, stale)
+            .await;
+        if let Ok(outcome) = result {
+            node_drain_metrics::sandbox_no_pod(
+                &node_label,
+                pre_lifecycle_tag,
+                outcome.metric_tag(),
+                outcome.reason_tag(),
+            );
+        }
+        match result {
+            Ok(PodLessRecovery::NotEligible(hold))
+                if !hold.clears_on_its_own() && warn_pacer.due(node_id, hold.tag()) =>
+            {
+                tracing::warn!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox,
+                    pre_lifecycle = pre_lifecycle_tag,
+                    reason = hold.tag(),
+                    detail = %detail,
+                    "node_drain: sandbox has no pod and the pod-less give-up can't \
+                     release it, so it stays and parks the drain; repeats at most \
+                     hourly per node and reason"
+                );
+            }
+            // Counted above. A hold that clears on its own, or a parked one
+            // whose WARN this window already logged, goes to debug.
+            Ok(PodLessRecovery::NotEligible(hold)) => {
+                tracing::debug!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox,
+                    pre_lifecycle = pre_lifecycle_tag,
+                    reason = hold.tag(),
+                    detail = %detail,
+                    "node_drain: sandbox has no pod but isn't eligible for the \
+                     pod-less give-up yet; will retry on next tick"
+                );
+            }
+            Ok(outcome) => {
+                tracing::warn!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox,
+                    pre_lifecycle = pre_lifecycle_tag,
+                    outcome = outcome.metric_tag(),
+                    detail = %detail,
+                    "node_drain: sandbox has no pod and recovery has stopped; \
+                     reverted it to suspended off the node so drain can proceed"
+                );
+            }
+            Err(db_err) => {
+                node_drain_metrics::failure(&node_label, "sandbox_no_pod", pre_lifecycle_tag);
+                tracing::warn!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox,
+                    pre_lifecycle = pre_lifecycle_tag,
+                    error = %db_err,
+                    "node_drain: pod-less give-up failed; will retry on next tick"
+                );
+            }
+        }
     }
 
     /// One tick's worth of work on a `stopped` resident's evacuation, plus the
