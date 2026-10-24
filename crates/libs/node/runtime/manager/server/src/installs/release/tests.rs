@@ -262,7 +262,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
                     ..crate::DEFAULT_INSTALL_LIMITS
                 },
                 host_arch: architecture,
-                source: kernels,
+                source: crate::installs::test_support::kernel_sources(kernels),
                 releases: ReleaseSources::new(vec![context.clone()]).unwrap(),
                 publisher,
                 pins,

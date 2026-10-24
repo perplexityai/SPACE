@@ -100,11 +100,27 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         environments[1].definition().reference().to_string(),
         "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4"
     );
-    assert!(
-        CompiledEnvironment::for_architecture(Arch::Aarch64)
-            .unwrap()
-            .is_empty()
-    );
+    let arm = CompiledEnvironment::for_architecture(Arch::Aarch64).unwrap();
+    assert_eq!(arm.len(), 1);
+    let ch = &arm[0];
+    assert_eq!(ch.release().release.kind, RuntimeKind::CloudHypervisor);
+    assert!(!ch.is_initial());
+    assert!(!ch.supports_memory_state());
+    let execution = ch.definition().execution_requirements().unwrap();
+    assert!(execution.state_format().is_none());
+    assert_eq!(execution.components()[0].digest, Some(ch.kernel().sha256));
+    let policy = crate::selection::ExecutionPolicy::parse(None, None, &arm).unwrap();
+    assert!(policy.default_reference().is_none());
+    assert!(policy.legacy_unbound_allowed());
+    assert!(!policy.allows(ch.definition().reference()));
+    let enabled =
+        crate::selection::ExecutionPolicy::parse(Some(ch.name()), Some(ch.name()), &arm).unwrap();
+    enabled
+        .check_execution(
+            &execution,
+            crate::runtime_inventory::ExecutionSelectionMode::NewColdBoot,
+        )
+        .unwrap();
 }
 
 #[test]
