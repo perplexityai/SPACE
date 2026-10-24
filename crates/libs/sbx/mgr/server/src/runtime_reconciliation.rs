@@ -30,14 +30,14 @@ impl VmStateObservation {
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 pub(crate) enum ResidentObservationError {
-    #[error("Firecracker state could not be observed")]
+    #[error("runtime state could not be observed")]
     Unobservable,
-    #[error("Firecracker observations did not establish a stable resident state")]
+    #[error("runtime observations did not establish a stable resident state")]
     Unstable,
 }
 
 /// At most three bounded probes, 100 ms apart; only two consecutive resident
-/// observations establish Running or Paused. NotStarted is affirmative evidence
+/// observations establish Running or Paused. NotStarted or Shutdown is affirmative evidence
 /// that resident memory is unavailable and returns immediately: a later probe
 /// failure must not erase that evidence. Interpretation of lifecycle intent
 /// belongs to the caller. Peer-controlled error text is never recovery evidence.
@@ -55,8 +55,8 @@ where
         let current = match probe(sandbox_id).await {
             VmStateObservation::Observed(VmState::Running) => Some(VmState::Running),
             VmStateObservation::Observed(VmState::Paused) => Some(VmState::Paused),
-            VmStateObservation::Observed(VmState::NotStarted) => {
-                return Ok(VmState::NotStarted);
+            VmStateObservation::Observed(state @ (VmState::NotStarted | VmState::Shutdown)) => {
+                return Ok(state);
             }
             VmStateObservation::Unobservable(_) => {
                 error = ResidentObservationError::Unobservable;
@@ -85,12 +85,12 @@ pub(crate) async fn observe_vm_state(
     match crate::runtime_via_nodemgr::get_vm_state(*sandbox_id, node_manager).await {
         Ok(state) => VmStateObservation::Observed(state),
         Err(error) => {
-            let reason = format!("Firecracker state probe failed: {error}");
+            let reason = format!("runtime state probe failed: {error}");
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 probe_context,
                 %error,
-                "failed to observe Firecracker VM state"
+                "failed to observe runtime VM state"
             );
             VmStateObservation::Unobservable(reason)
         }

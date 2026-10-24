@@ -274,13 +274,13 @@ impl RuntimeInventory {
             .kernels_root()
             .join(managed_kernel_directory(&kernel.version, kernel.sha256));
         let mut watched = vec![
-            release_root.join("bin/firecracker"),
-            release_root.join("bin/jailer"),
-            sealed_release_root.join("bin/firecracker"),
-            sealed_release_root.join("bin/jailer"),
             kernel_root.join(KERNEL_IMAGE),
             ArtifactStore::execution_kernel_path(cache_parent, kernel),
         ];
+        for binary in &release.binaries {
+            watched.push(release_root.join(binary.path));
+            watched.push(sealed_release_root.join(binary.path));
+        }
         let runtime = match shared_runtime {
             Some(runtime) => Ok(runtime),
             None => {
@@ -441,8 +441,9 @@ fn runtime_from_source(
     {
         match store.stage_release_at(pin, source.path(), cache_parent) {
             Ok(root) => {
-                let mut runtime =
-                    FirecrackerDriver.inspect_installation(root, pin.release.version.clone())?;
+                let mut runtime = DRIVERS
+                    .get(pin.release.kind)?
+                    .inspect_installation(root, pin.release.version.clone())?;
                 runtime.files.integrity = ExecutionSourceIntegrity::FsVerity;
                 return Ok(runtime);
             }
@@ -456,7 +457,9 @@ fn runtime_from_source(
         RuntimeSource::Store(_) => store.verify_release(pin)?,
         RuntimeSource::Baked(path) => store.verify_release_at(pin, path)?,
     };
-    FirecrackerDriver.inspect_installation(source.path().to_owned(), pin.release.version.clone())
+    DRIVERS
+        .get(pin.release.kind)?
+        .inspect_installation(source.path().to_owned(), pin.release.version.clone())
 }
 
 struct StagedKernel {

@@ -79,8 +79,8 @@ pub(super) fn pause_reconciliation_outcome(
     match observation.state() {
         Some(VmState::Paused) => PauseReconciliationOutcome::Paused,
         Some(VmState::Running) => PauseReconciliationOutcome::Running,
-        Some(VmState::NotStarted) => {
-            PauseReconciliationOutcome::Unknown("Firecracker reported NotStarted".to_string())
+        Some(state @ (VmState::NotStarted | VmState::Shutdown)) => {
+            PauseReconciliationOutcome::Unknown(format!("runtime reported {state}"))
         }
         None => PauseReconciliationOutcome::Unknown(
             observation
