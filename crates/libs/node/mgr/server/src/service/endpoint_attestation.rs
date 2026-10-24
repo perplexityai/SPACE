@@ -52,6 +52,7 @@ struct RegisteredEndpointRuntime {
     guest_cid: u32,
     spaced_host_pid: u32,
     runtime_pid: u32,
+    runtime_kind: pplx_space_common_core::types::RuntimeKind,
     vsock_path: PathBuf,
 }
 
@@ -114,7 +115,9 @@ impl NodeManagerService {
             "CaptureSandboxEndpointProof",
             ALLOW_NODE_ADMIN_OR_SBXMGR,
         )?;
-        let runtime = self.registered_endpoint_runtime(&request.get_ref().sandbox_id)?;
+        let runtime = self
+            .registered_endpoint_runtime(&request.get_ref().sandbox_id)
+            .await?;
         let proof = run_endpoint_attestation(EndpointAttestationPhase::Capture, move || {
             capture_endpoint_proof(&runtime)
         })
@@ -136,7 +139,7 @@ impl NodeManagerService {
             .proof
             .clone()
             .ok_or_else(|| Status::invalid_argument("endpoint proof is missing"))?;
-        let runtime = self.registered_endpoint_runtime(&proof.sandbox_id)?;
+        let runtime = self.registered_endpoint_runtime(&proof.sandbox_id).await?;
         run_endpoint_attestation(EndpointAttestationPhase::Validate, move || {
             validate_endpoint_proof(&proof, &runtime)
         })
@@ -144,11 +147,21 @@ impl NodeManagerService {
         Ok(Response::new(ValidateSandboxEndpointProofResponse {}))
     }
 
-    fn registered_endpoint_runtime(
+    async fn registered_endpoint_runtime(
         &self,
         sandbox_id: &str,
     ) -> Result<RegisteredEndpointRuntime, Status> {
         validate_sandbox_id(sandbox_id)?;
+        let runtime_kind = self
+            .recorded_execution(sandbox_id.to_owned())
+            .await?
+            .map_or(
+                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                |execution| execution.runtime().kind,
+            );
+        let vsock_path =
+            pplx_space_node_runtime_core::control::guest_socket_path(runtime_kind, sandbox_id)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let slot = self
             .pool
             .get(sandbox_id)
@@ -167,7 +180,8 @@ impl NodeManagerService {
             })?,
             spaced_host_pid,
             runtime_pid,
-            vsock_path: PathBuf::from(format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/v.sock")),
+            runtime_kind,
+            vsock_path,
         })
     }
 }
@@ -230,11 +244,14 @@ fn capture_endpoint_proof(
     runtime: &RegisteredEndpointRuntime,
 ) -> Result<SandboxEndpointProof, EndpointProofError> {
     validate_registered_processes(runtime)?;
+    let (runtime_executable, runtime_vsock_path) =
+        pplx_space_node_runtime_core::control::guest_endpoint_identity(runtime.runtime_kind)
+            .map_err(|error| EndpointProofError::Mismatch(error.to_string()))?;
     capture_endpoint_proof_host_state(
         runtime,
         "space-spaced-host-svc",
-        "firecracker",
-        firecracker_proc_vsock_path(),
+        runtime_executable,
+        runtime_vsock_path,
     )
 }
 
@@ -283,12 +300,15 @@ fn validate_endpoint_proof(
     runtime: &RegisteredEndpointRuntime,
 ) -> Result<(), EndpointProofError> {
     validate_registered_processes(runtime)?;
+    let (runtime_executable, runtime_vsock_path) =
+        pplx_space_node_runtime_core::control::guest_endpoint_identity(runtime.runtime_kind)
+            .map_err(|error| EndpointProofError::Mismatch(error.to_string()))?;
     validate_endpoint_proof_host_state(
         proof,
         runtime,
         "space-spaced-host-svc",
-        "firecracker",
-        firecracker_proc_vsock_path(),
+        runtime_executable,
+        runtime_vsock_path,
     )
 }
 
@@ -407,7 +427,7 @@ fn validate_spaced_host_arguments(
     })?;
     if !spaced_host_arguments_match(&bytes, runtime) {
         return Err(EndpointProofError::Mismatch(format!(
-            "process {pid} is not configured for the registered Firecracker runtime"
+            "process {pid} is not configured for the registered sandbox runtime"
         )));
     }
     Ok(())
@@ -417,10 +437,6 @@ fn spaced_host_arguments_match(bytes: &[u8], runtime: &RegisteredEndpointRuntime
     process_arguments_include(bytes, "--vsock-uds", &runtime.vsock_path.to_string_lossy())
         && process_arguments_include(bytes, "--firecracker-pid", &runtime.runtime_pid.to_string())
         && process_arguments_include(bytes, "--firecracker-uid", &runtime.sandbox_uid.to_string())
-}
-
-fn firecracker_proc_vsock_path() -> &'static Path {
-    Path::new("/v.sock")
 }
 
 fn process_arguments_include(bytes: &[u8], flag: &str, expected_value: &str) -> bool {

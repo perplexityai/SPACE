@@ -48,3 +48,71 @@ impl NodeManagerService {
         .await
     }
 }
+
+impl NodeManagerService {
+    pub(super) async fn standalone_configuration(
+        &self,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+        path: PathBuf,
+    ) -> Result<String, Status> {
+        self.off_runtime("read runtime boot configuration", move || {
+            let (parent, name) = super::artifact_fs::parent(&path)?;
+            let file = trusted_paths::open_regular_file(&parent, name)?;
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            if bytes.len() > 1024 * 1024 {
+                return Err(Status::invalid_argument(
+                    "runtime configuration exceeds 1 MiB",
+                ));
+            }
+            let text =
+                String::from_utf8(bytes).map_err(|e| Status::invalid_argument(e.to_string()))?;
+            pplx_space_node_runtime_core::boot::validate_standalone(runtime, &text)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            Ok(text)
+        })
+        .await
+    }
+
+    pub(super) async fn boot_standalone(
+        &self,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+        socket: PathBuf,
+        configuration: &str,
+    ) -> Result<(), Status> {
+        // Socket creation is readiness, not a replayable boot mutation.
+        let start = Instant::now();
+        loop {
+            match tokio::fs::symlink_metadata(&socket).await {
+                Ok(metadata) => {
+                    use std::os::unix::fs::FileTypeExt;
+                    if !metadata.file_type().is_socket() {
+                        return Err(Status::failed_precondition(
+                            "runtime control endpoint is not a socket",
+                        ));
+                    }
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && start.elapsed() < Duration::from_secs(5) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => {
+                    return Err(Status::unavailable(format!(
+                        "runtime control endpoint: {error}"
+                    )));
+                }
+            }
+        }
+        let client = pplx_space_node_runtime_core::control::connect(runtime, socket)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        client
+            .boot(configuration)
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))
+    }
+}
