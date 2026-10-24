@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { AdminUser, Organization, UserRole } from '@/lib/types';
-import { Table, Button, Form, Input, Select, Typography, Popconfirm, App, Card, Space, Tag } from 'antd';
+import { Table, Button, Form, Input, Select, Typography, Popconfirm, App, Modal, Space, Tag } from 'antd';
 import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleColors, roleLabels } from '@/lib/userRoles';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
 import Link from 'next/link';
@@ -19,10 +19,16 @@ export default function UsersPage() {
   const [selectedOrgId, setSelectedOrgId] = useState('');
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(false);
+  const [usersRevision, setUsersRevision] = useState(0);
+  const [createOrg, setCreateOrg] = useState<Organization | null>(null);
+  const [creating, setCreating] = useState(false);
+  const createPending = useRef(false);
   const [updatingRoleId, setUpdatingRoleId] = useState<string | null>(null);
   const [form] = Form.useForm();
+  const createFormId = useId();
   const createRoleOptions = assignableRoleOptions(currentUser, cluster);
   const visibleOrgIds = orgs.map((org) => org.id);
+  const selectedOrg = orgs.find((org) => org.id === selectedOrgId);
 
   useEffect(() => {
     adminApi.get<Organization[]>('/v1/orgs').then((orgs) => {
@@ -34,28 +40,47 @@ export default function UsersPage() {
   }, []);
 
   useEffect(() => {
+    let active = true;
     if (selectedOrgId) {
       setLoading(true);
       adminApi
         .get<AdminUser[]>(`/v1/orgs/${selectedOrgId}/users`)
-        .then(setUsers)
-        .catch((err: any) => {
-          setUsers([]);
-          message.error(err.message);
+        .then((updated) => {
+          if (active) setUsers(updated);
         })
-        .finally(() => setLoading(false));
+        .catch((err: any) => {
+          if (!active) return;
+          setUsers([]);
+          message.error(`Failed to load users: ${err.message}`);
+        })
+        .finally(() => {
+          if (active) setLoading(false);
+        });
     }
-  }, [selectedOrgId]);
+    return () => { active = false; };
+  }, [selectedOrgId, usersRevision]);
+
+  const closeCreate = () => {
+    if (createPending.current) return;
+    setCreateOrg(null);
+    form.resetFields();
+  };
 
   const handleCreate = async (values: { email: string; password: string; display_name: string; role: UserRole }) => {
+    if (!createOrg || createPending.current) return;
+    createPending.current = true;
+    setCreating(true);
     try {
-      await adminApi.post(`/v1/orgs/${selectedOrgId}/users`, values);
+      await adminApi.post(`/v1/orgs/${createOrg.id}/users`, values);
+      setCreateOrg(null);
       form.resetFields();
-      const updated = await adminApi.get<AdminUser[]>(`/v1/orgs/${selectedOrgId}/users`);
-      setUsers(updated);
       message.success('User created');
+      setUsersRevision((revision) => revision + 1);
     } catch (err: any) {
       message.error(err.message);
+    } finally {
+      createPending.current = false;
+      setCreating(false);
     }
   };
 
@@ -158,7 +183,21 @@ export default function UsersPage() {
 
   return (
     <div>
-      <Title level={3}>Users</Title>
+      <Space align="center" wrap style={{ width: '100%', justifyContent: 'space-between', marginBottom: 24 }}>
+        <Title level={3} style={{ margin: 0 }}>Users</Title>
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          disabled={!selectedOrg || creating}
+          onClick={() => {
+            if (!selectedOrg || createPending.current) return;
+            form.resetFields();
+            setCreateOrg(selectedOrg);
+          }}
+        >
+          Create user
+        </Button>
+      </Space>
 
       <Space style={{ marginBottom: 16 }}>
         <Typography.Text>Organization:</Typography.Text>
@@ -175,31 +214,50 @@ export default function UsersPage() {
         </Select>
       </Space>
 
-      <Card size="small" style={{ marginBottom: 24 }}>
-        <Form form={form} layout="inline" onFinish={handleCreate} initialValues={{ role: 'member' }}>
-          <Form.Item name="email" rules={[{ required: true }]}>
-            <Input placeholder="Email" />
+      <Modal
+        title="Create user"
+        open={!!createOrg}
+        onCancel={closeCreate}
+        okText="Create user"
+        okButtonProps={{ htmlType: 'submit', form: createFormId }}
+        confirmLoading={creating}
+        cancelButtonProps={{ disabled: creating }}
+        closable={!creating}
+        mask={{ closable: !creating }}
+        keyboard={!creating}
+        destroyOnHidden
+      >
+        <Typography.Paragraph>
+          Organization: <Typography.Text strong>{createOrg?.name} ({createOrg?.slug})</Typography.Text>
+        </Typography.Paragraph>
+        <Form
+          id={createFormId}
+          form={form}
+          layout="vertical"
+          onFinish={handleCreate}
+          initialValues={{ role: 'member' }}
+          disabled={creating}
+          preserve={false}
+          autoComplete="off"
+        >
+          <Form.Item label="Email" name="email" rules={[{ required: true }]}>
+            <Input />
           </Form.Item>
-          <Form.Item name="password" rules={[{ required: true }]}>
-            <Input.Password placeholder="Password" />
+          <Form.Item label="Password" name="password" rules={[{ required: true }]}>
+            <Input.Password autoComplete="new-password" />
           </Form.Item>
-          <Form.Item name="display_name" rules={[{ required: true }]}>
-            <Input placeholder="Display Name" />
+          <Form.Item label="Display name" name="display_name" rules={[{ required: true }]}>
+            <Input />
           </Form.Item>
-          <Form.Item name="role">
-            <Select style={{ width: 180 }}>
+          <Form.Item label="Role" name="role">
+            <Select>
               {createRoleOptions.map((option) => (
                 <Select.Option key={option.value} value={option.value}>{option.label}</Select.Option>
               ))}
             </Select>
           </Form.Item>
-          <Form.Item>
-            <Button type="primary" htmlType="submit" icon={<PlusOutlined />}>
-              Create
-            </Button>
-          </Form.Item>
         </Form>
-      </Card>
+      </Modal>
 
       <Table
         columns={columns}
