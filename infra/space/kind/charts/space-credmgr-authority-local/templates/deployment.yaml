@@ -163,6 +163,23 @@ spec:
             capabilities:
               drop: ["ALL"]
           env:
+            {{- if .Values.anchorAuthority.keyArn }}
+            - name: SPACE_ANCHOR_KMS_KEY_ARN
+              value: {{ .Values.anchorAuthority.keyArn | quote }}
+            - name: SPACE_ANCHOR_ENVIRONMENT
+              value: {{ .Values.anchorAuthority.environment | quote }}
+            - name: SPACE_ANCHOR_KMS_REPLICA_REGION
+              value: {{ .Values.anchorAuthority.kmsReplicaRegion | quote }}
+            {{- if .Values.anchorAuthority.credentialsSecretName }}
+            {{- range list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "AWS_SESSION_TOKEN" }}
+            - name: SPACE_ANCHOR_{{ . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.anchorAuthority.credentialsSecretName }}
+                  key: {{ . }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             - name: SPACE_CLUSTER_ID
               value: {{ .Values.clusterId | quote }}
             {{- include "space-kind-telemetry.env" . | nindent 12 }}

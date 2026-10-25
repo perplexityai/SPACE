@@ -13,6 +13,55 @@ use crate::kek_store::KekRecord;
 
 mod assume_role;
 
+#[tokio::test]
+async fn x509_exchange_requires_node_auth_and_stays_disabled_without_a_keyring() {
+    use pplx_space_credmgr_client::x509::CredentialKind;
+    let service = CredentialManagerService::new(
+        Arc::new(InMemoryKeyWrapper::new()),
+        PeerProcessCheckMode::Off,
+    );
+    let disabled = tonic::Code::FailedPrecondition;
+    let sandbox = SandboxId::from_uuid(Uuid::now_v7());
+    for (caller, expected) in [
+        (ClientService::NodeCredentialAgent, disabled),
+        (ClientService::ApiSvc, tonic::Code::PermissionDenied),
+        (ClientService::SandboxManager, tonic::Code::PermissionDenied),
+        (ClientService::VolumeManager, tonic::Code::PermissionDenied),
+    ] {
+        let mut request = Request::new(CredentialKind::Certificate.request(sandbox));
+        request
+            .extensions_mut()
+            .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
+                test_k8s_identity(caller),
+            ));
+        let error = service.exchange_token(request).await.unwrap_err();
+        assert_eq!(error.code(), expected, "{caller:?}");
+    }
+    let error = service
+        .exchange_token(plaintext_request(
+            CredentialKind::Certificate.request(sandbox),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    let mut retired = CredentialKind::Certificate.request(sandbox);
+    retired.requested_token_type = "urn:space:token-type:x509-signing-credentials".into();
+    let mut spoofed = CredentialKind::Certificate.request(sandbox);
+    spoofed.actor_token = Some("sandbox:spoofed".into());
+    for invalid in [retired, spoofed] {
+        let mut request = Request::new(invalid);
+        request
+            .extensions_mut()
+            .insert(crate::tcp_auth::TcpCallerIdentity::K8sJwt(
+                test_k8s_identity(ClientService::NodeCredentialAgent),
+            ));
+        assert_eq!(
+            service.exchange_token(request).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+}
+
 /// In-memory KEK-row map standing in for Postgres.
 struct TestKekStore {
     rows: HashMap<(Uuid, OrgId), KekRecord>,
@@ -1488,6 +1537,7 @@ async fn a_valid_request_reaches_the_backend_and_its_certificate_is_returned() {
     let csr = node_csr();
     let response = service_with_issuer(Ok(Vec::new()))
         .issue_intermediate_certificate(agent_request(IssueIntermediateCertificateRequest {
+            anchor_key_id: None,
             csr: csr.clone(),
             ..Default::default()
         }))
@@ -1510,6 +1560,7 @@ async fn instance_without_an_issuer_refuses_intermediate_issuance() {
         PeerProcessCheckMode::Off,
     )
     .issue_intermediate_certificate(agent_request(IssueIntermediateCertificateRequest {
+        anchor_key_id: None,
         csr: node_csr(),
         ..Default::default()
     }))
@@ -1565,6 +1616,7 @@ async fn precondition_and_validation_failures_are_metered() {
         PeerProcessCheckMode::Off,
     )
     .issue_intermediate(IssueIntermediateCertificateRequest {
+        anchor_key_id: None,
         csr: node_csr(),
         ..Default::default()
     })
@@ -1573,6 +1625,7 @@ async fn precondition_and_validation_failures_are_metered() {
 
     let rejected = service_with_issuer(Ok(Vec::new()))
         .issue_intermediate(IssueIntermediateCertificateRequest {
+            anchor_key_id: None,
             csr: b"not der".to_vec(),
             ..Default::default()
         })

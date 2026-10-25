@@ -3,6 +3,35 @@ use std::future::{Ready, ready};
 
 use super::*;
 
+#[test]
+fn decoded_admission_keeps_backend_rate_and_cancellation_limits_separate() {
+    let limiter = GrpcRateLimiterLayer::new(
+        GrpcRateLimiterConfig::enforce("decoded")
+            .with_unknown_peer_policy(UnknownPeerPolicy::SharedBucket)
+            .with_method_limits(
+                "legacy",
+                GrpcRateLimiterLimits::disabled()
+                    .with_max_requests_per_peer(1, Duration::from_secs(60)),
+            )
+            .with_method_limits(
+                "scoped",
+                GrpcRateLimiterLimits::disabled().with_max_global_in_flight(1),
+            ),
+    );
+    drop(limiter.try_acquire("legacy", None).unwrap());
+    assert_eq!(
+        limiter.try_acquire("legacy", None).err().unwrap().code(),
+        tonic::Code::ResourceExhausted
+    );
+    let first = limiter.try_acquire("scoped", None).unwrap();
+    assert_eq!(
+        limiter.try_acquire("scoped", None).err().unwrap().code(),
+        tonic::Code::ResourceExhausted
+    );
+    drop(first);
+    drop(limiter.try_acquire("scoped", None).unwrap());
+}
+
 #[derive(Clone)]
 struct OkService;
 

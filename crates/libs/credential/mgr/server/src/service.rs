@@ -175,6 +175,9 @@ pub struct CredentialManagerService {
     /// Reference-based resolution endpoint. Present only on instances with
     /// access to durable credential-injection state.
     credential_injection_rpc: Option<CredentialInjectionRpc>,
+    #[cfg(feature = "split-trust-prototype")]
+    pub(crate) sandbox_anchor_authority: Option<crate::split_trust::authority::Authority>,
+    legacy_issuance_limiter: pplx_space_common_svc::GrpcRateLimiterLayer,
 }
 
 impl CredentialManagerService {
@@ -241,6 +244,15 @@ impl CredentialManagerService {
             kek_provisioner: None,
             intermediate_ca_issuer: None,
             credential_injection_rpc: None,
+            #[cfg(feature = "split-trust-prototype")]
+            sandbox_anchor_authority: None,
+            legacy_issuance_limiter: pplx_space_common_svc::grpc_rate_limiter_layer(
+                pplx_space_common_svc::GrpcRateLimiterConfig::enforce(
+                    "credential_manager_legacy_ca",
+                )
+                .with_unknown_peer_policy(pplx_space_common_svc::UnknownPeerPolicy::SharedBucket)
+                .with_default_limits(intermediate_ca::issue_rate_limits()),
+            ),
         }
     }
 
@@ -386,6 +398,40 @@ impl CredentialManager for CredentialManagerService {
         &self,
         request: Request<ExchangeTokenRequest>,
     ) -> Result<Response<ExchangeTokenResponse>, Status> {
+        use pplx_space_credmgr_client::x509::AnchorRequest;
+        if AnchorRequest::recognizes(request.get_ref()) {
+            // Keep profile authorization separate: storage consumers do not
+            // acquire sandbox trust privileges by sharing this RPC method.
+            let caller = self.caller_resolver.resolve(&request)?;
+            if !matches!(&caller, ResolvedCaller::K8sJwt(identity)
+                if identity.service() == ClientService::NodeCredentialAgent)
+            {
+                return Err(Status::permission_denied(
+                    "X.509 credentials require an authenticated node credential agent",
+                ));
+            }
+            let anchor = AnchorRequest::parse(request.get_ref())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            #[cfg(feature = "split-trust-prototype")]
+            {
+                let authority = self.sandbox_anchor_authority.as_ref().ok_or_else(|| {
+                    Status::failed_precondition("sandbox anchors are not enabled")
+                })?;
+                let certificate = authority
+                    .public_anchor(anchor.sandbox_id, anchor.key_id)
+                    .await?;
+                return Ok(Response::new(
+                    pplx_space_credmgr_client::x509::certificate_response(certificate),
+                ));
+            }
+            #[cfg(not(feature = "split-trust-prototype"))]
+            {
+                let _ = anchor;
+                return Err(Status::failed_precondition(
+                    "sandbox anchors are not compiled",
+                ));
+            }
+        }
         let caller = match self.caller_resolver.resolve(&request) {
             Ok(caller) => caller,
             Err(status) => {
@@ -807,13 +853,35 @@ impl CredentialManager for CredentialManagerService {
             ALLOW_ISSUE_INTERMEDIATE_SERVICES,
         )?;
         if request.get_ref().sandbox_id.is_some() || request.get_ref().anchor_key_id.is_some() {
+            // The existing node-agent identity remains the authorization
+            // boundary; there is no placement database or caller-supplied grant.
+            let caller = self.caller_resolver.resolve(&request)?;
+            if !matches!(&caller, ResolvedCaller::K8sJwt(identity)
+                if identity.service() == ClientService::NodeCredentialAgent)
+            {
+                return Err(Status::permission_denied(
+                    "scoped CA issuance requires an authenticated node credential agent",
+                ));
+            }
+            #[cfg(feature = "split-trust-prototype")]
+            return self
+                .sandbox_anchor_authority
+                .as_ref()
+                .ok_or_else(|| Status::failed_precondition("sandbox anchors are not configured"))?
+                .issue(request.into_inner())
+                .await
+                .map(Response::new);
+            #[cfg(not(feature = "split-trust-prototype"))]
             return Err(Status::failed_precondition(
-                "sandbox-scoped CA issuance is not supported",
+                "sandbox anchors are not compiled",
             ));
         }
 
         // The gRPC layer already logs and traces the call; this adds the
         // failure class and the latency of an issuance that polls for seconds.
+        let _legacy_permit = self
+            .legacy_issuance_limiter
+            .try_acquire(intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH, None)?;
         let started = Instant::now();
         let issued = self.issue_intermediate(request.into_inner()).await;
         pplx_space_metrics::credmgr::intermediate_ca_issue(

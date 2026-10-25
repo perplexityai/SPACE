@@ -232,6 +232,27 @@ impl GrpcRateLimiterLayer {
             state: Arc::new(Mutex::new(RateLimiterState::default())),
         }
     }
+
+    /// Admit a decoded unary operation using the same budgets as the layer.
+    /// Retain the permit until completion. This lets an existing RPC keep a
+    /// narrower budget for one backend without throttling its local variant.
+    pub fn try_acquire(
+        &self,
+        method: &str,
+        peer: Option<&PeerIdentity>,
+    ) -> Result<GrpcRateLimitPermit, Status> {
+        match rate_limit_request(&self.config, &self.state, peer, method) {
+            RateLimiterResult::Accepted(guard) | RateLimiterResult::ObservedWouldReject(guard) => {
+                Ok(GrpcRateLimitPermit { _guard: guard })
+            }
+            RateLimiterResult::Rejected(status) => Err(status),
+        }
+    }
+}
+
+#[must_use = "retain the permit until the admitted operation completes"]
+pub struct GrpcRateLimitPermit {
+    _guard: RateLimiterGuard,
 }
 
 pub fn grpc_rate_limiter_layer(config: GrpcRateLimiterConfig) -> GrpcRateLimiterLayer {

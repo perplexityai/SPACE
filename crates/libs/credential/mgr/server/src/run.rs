@@ -158,6 +158,11 @@ pub enum RunCredmgrError {
     PlaintextTcpRefused { addr: SocketAddr },
     #[error("failed to initialize the credential-manager space_creds pool: {0}")]
     DatabasePool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    #[error("configured anchor authority requires the split-trust-prototype Cargo feature")]
+    SplitTrustNotCompiled,
+    #[cfg(feature = "split-trust-prototype")]
+    #[error("sandbox anchor authority: {0}")]
+    SandboxAnchor(#[from] crate::split_trust::authority::AuthorityError),
     #[error("invalid intermediate-key broker URL {url:?}: {source}")]
     IntermediateKeyBrokerUrl {
         url: String,
@@ -745,6 +750,16 @@ async fn initialize_authority_service(
         }
     }
 
+    if std::env::var_os("SPACE_ANCHOR_KMS_KEY_ARN").is_some()
+        && !cfg!(feature = "split-trust-prototype")
+    {
+        return Err(RunCredmgrError::SplitTrustNotCompiled);
+    }
+    #[cfg(feature = "split-trust-prototype")]
+    if std::env::var_os("SPACE_ANCHOR_KMS_KEY_ARN").is_some() {
+        service.sandbox_anchor_authority =
+            Some(crate::split_trust::authority::Authority::load().await?);
+    }
     Ok(service)
 }
 
@@ -1483,14 +1498,15 @@ async fn run_agent(
     // already made.
     let node_ca = Arc::new(NodeCa::new(upstream.clone()).map_err(RunCredmgrError::NodeCaKeypair)?);
 
+    let node_service = NodeCredentialManager::new(
+        upstream,
+        node_ca,
+        peer_process_check_mode,
+        shutdown_token.clone(),
+    );
     serve_node_local_uds(
         listener,
-        NodeCredentialManager::new(
-            upstream,
-            node_ca,
-            peer_process_check_mode,
-            shutdown_token.clone(),
-        ),
+        node_service,
         config.socket_path,
         node_local,
         shutdown_token,
@@ -1574,7 +1590,13 @@ async fn serve_tcp_until(
                 )
                 .with_method_limits(
                     intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH,
-                    intermediate_ca::issue_rate_limits(),
+                    // Scoped signing is local and happens per sandbox, rather
+                    // than per worker. The decoded legacy branch retains the
+                    // original 10/s cloud-CA budget.
+                    pplx_space_common_svc::GrpcRateLimiterLimits::disabled()
+                        .with_max_global_in_flight(128)
+                        .with_max_in_flight_per_peer(128)
+                        .with_max_requests_per_peer(1000, Duration::from_secs(1)),
                 )
                 // TCP peers carry no Linux peer identity; rate-limit them
                 // as one shared bucket instead of rejecting outright.

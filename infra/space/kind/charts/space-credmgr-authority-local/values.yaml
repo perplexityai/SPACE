@@ -98,6 +98,17 @@ keyBroker:
 # volume_wrap_store.rs). Kind has one infra node, so both run there.
 replicas: 2
 
+# Backend configuration, not an enrollment flag. Provision before enabling the
+# sole space-sandbox-scoped-trust feature flag in sandbox-manager.
+anchorAuthority:
+  # Empty means this deployment has no sandbox-anchor backend.
+  keyArn: ""
+  environment: "kind"
+  # A replica region requires related multi-region HMAC keys.
+  kmsReplicaRegion: ""
+  # Optional dedicated Kind identity; separate from the storage STS bridge.
+  credentialsSecretName: ""
+
 # The TCP-only authority has no service mutex or drain budget of its own: on
 # SIGTERM tonic's serve_with_shutdown stops accepting and finishes in-flight
 # unary RPCs (serve_tcp_until, crates/libs/credential/mgr/server/src/run.rs).
