@@ -177,7 +177,7 @@ struct FakeSink {
     /// [`FakeSink::set_forced`].
     draining_modes: StdMutex<HashMap<NodeId, NodeDrainMode>>,
     /// `(node, exclude_legacy_rows)` per pinned-list call, so a test can pin that
-    /// gentle drains refuse the legacy reupload route.
+    /// gentle drains refuse the unnamed current-instance route.
     pinned_legacy_exclusions: StdMutex<Vec<(NodeId, bool)>>,
     terminating_list: StdMutex<Vec<NodeId>>,
     node_state: StdMutex<HashMap<NodeId, String>>,
@@ -312,6 +312,8 @@ struct FakeSink {
     // Recorded `(sandbox_id, source_node_id)` per promote call so tests
     // can assert dispatch behavior.
     promoted: StdMutex<Vec<(SandboxId, NodeId)>>,
+    // The `allow_current_instance` each promote call received, in call order.
+    promote_allowances: StdMutex<Vec<bool>>,
     promote_failures: StdMutex<HashMap<SandboxId, PromoteError>>,
     // Recorded `(sandbox_id, source_node_id)` per `mark_sandbox_lost`
     // call so the artifact-missing policy can be asserted in tests.
@@ -747,6 +749,10 @@ impl FakeSink {
         self.promoted.lock().unwrap().clone()
     }
 
+    fn promote_allowances(&self) -> Vec<bool> {
+        self.promote_allowances.lock().unwrap().clone()
+    }
+
     fn marked_lost(&self) -> Vec<(SandboxId, NodeId)> {
         self.marked_lost.lock().unwrap().clone()
     }
@@ -940,7 +946,8 @@ impl NodeDrainSink for FakeSink {
         &self,
         node_id: NodeId,
         exclude_legacy_rows: bool,
-    ) -> Result<Vec<SandboxId>, sqlx::Error> {
+        backup_queue_enabled: bool,
+    ) -> Result<store::PinnedLocalPage, sqlx::Error> {
         self.pinned_legacy_exclusions
             .lock()
             .unwrap()
@@ -965,7 +972,27 @@ impl NodeDrainSink for FakeSink {
             .lock()
             .unwrap()
             .insert(node_id, result.len());
-        Ok(result)
+        // The fake has no gate to consult, so it reports the arm the flag
+        // makes reachable. That is enough for the reconciler-level tests,
+        // which assert on what the reconciler does with the source rather
+        // than on how the store decided it; the per-node gate and its
+        // fallback are asserted against a real Postgres in the store tests,
+        // where a gate row exists to be stale.
+        let source = if backup_queue_enabled {
+            store::PinnedLocalSource::Queue
+        } else {
+            store::PinnedLocalSource::History
+        };
+        Ok(store::PinnedLocalPage {
+            candidates: result
+                .into_iter()
+                .map(|sandbox_id| store::PinnedLocalCandidate {
+                    sandbox_id,
+                    queued_artifact: None,
+                })
+                .collect(),
+            source,
+        })
     }
 
     async fn count_drain_blocking_sandboxes_on_node(
@@ -1038,11 +1065,16 @@ impl NodeDrainSink for FakeSink {
         &self,
         sandbox_id: SandboxId,
         source_node_id: NodeId,
+        allow_current_instance: bool,
     ) -> Result<(), PromoteError> {
         self.promoted
             .lock()
             .unwrap()
             .push((sandbox_id, source_node_id));
+        self.promote_allowances
+            .lock()
+            .unwrap()
+            .push(allow_current_instance);
         if let Some(err) = self.promote_failures.lock().unwrap().remove(&sandbox_id) {
             return Err(err);
         }
@@ -1533,6 +1565,10 @@ impl InstanceStateLookup for FakeInstanceLookup {
 fn config_enabled(max_per_node: usize, max_per_cluster: usize) -> ReconcilerConfig {
     ReconcilerConfig {
         enabled: true,
+        // Off for the whole suite, matching production's default. The queue
+        // arm is asserted against a real Postgres in the store tests, where a
+        // gate row exists; here it would only exercise the fake.
+        backup_queue_enabled: false,
         // On for the whole suite: the tests that pre-date the fourth term are
         // unaffected (their breakdown is empty), and the `tb*` tests assert the
         // term's behaviour, so exercising the enabled path by default is what
@@ -1637,6 +1673,22 @@ fn c1_defaults_when_env_unset() {
         Duration::from_secs(DEFAULT_RESTORE_BACKOFF_CAP_SECS),
     );
     assert!(cfg.drain_evacuation_placement.is_none());
+}
+
+/// The backup-queue flag is read from the environment the config is built
+/// from, like its siblings — not from the process environment, which tests
+/// share, so a value set there leaks into every config built in parallel.
+#[test]
+fn c7_backup_queue_flag_is_read_from_the_config_environment() {
+    let unset = ReconcilerConfig::from_environment(&pplx_space_test_env::TestEnv::default());
+    assert!(
+        !unset.backup_queue_enabled,
+        "off unless an operator opts in"
+    );
+
+    let mut on = pplx_space_test_env::TestEnv::default();
+    on.set("SPACE_NODE_DRAIN_BACKUP_QUEUE_ENABLED", "true");
+    assert!(ReconcilerConfig::from_environment(&on).backup_queue_enabled);
 }
 
 /// An operator turns stopped-resident evacuation on with its env var, and it
@@ -1773,9 +1825,10 @@ impl NodeDrainSink for ArcSink {
         &self,
         n: NodeId,
         exclude_legacy_rows: bool,
-    ) -> Result<Vec<SandboxId>, sqlx::Error> {
+        backup_queue_enabled: bool,
+    ) -> Result<store::PinnedLocalPage, sqlx::Error> {
         self.0
-            .list_pinned_local_only_sandboxes_on_node(n, exclude_legacy_rows)
+            .list_pinned_local_only_sandboxes_on_node(n, exclude_legacy_rows, backup_queue_enabled)
             .await
     }
     async fn count_drain_blocking_sandboxes_on_node(&self, n: NodeId) -> Result<i64, sqlx::Error> {
@@ -1791,8 +1844,11 @@ impl NodeDrainSink for ArcSink {
         &self,
         s: SandboxId,
         source: NodeId,
+        allow_current_instance: bool,
     ) -> Result<(), PromoteError> {
-        self.0.promote_local_snapshot(s, source).await
+        self.0
+            .promote_local_snapshot(s, source, allow_current_instance)
+            .await
     }
     async fn mark_sandbox_lost(&self, s: SandboxId, source: NodeId) -> Result<u64, sqlx::Error> {
         self.0.mark_sandbox_lost(s, source).await
@@ -2736,10 +2792,34 @@ async fn gm2_gentle_mode_still_cordons_and_promotes() {
 
     assert_eq!(reconciler.sink.cordon_calls(), vec![node]);
     assert_eq!(reconciler.sink.promoted(), vec![(pinned, node)]);
+    assert_eq!(
+        reconciler.sink.promote_allowances(),
+        vec![false],
+        "a gentle drain's promotion must not allow the unnamed backup"
+    );
     // The abandon-stuck-transient sweep is deliberately *not* here: it is
     // forced-only, because it selects on age rather than liveness. `gm13` pins
     // that.
     assert!(reconciler.sink.abandon_stale_calls().is_empty());
+}
+
+/// A forced drain's promotion allows the current-instance backup, which is
+/// what lets the node answer a stale or markerless row terminally.
+#[tokio::test]
+async fn a_forced_drain_promotes_allowing_the_current_instance() {
+    let node = NodeId::new();
+    let pinned = SandboxId::new();
+    let sink = FakeSink::new();
+    sink.set_initial_state(node, PHASE_DRAINING);
+    sink.set_draining_list(vec![node]);
+    sink.set_forced(node);
+    sink.enqueue_pinned_local_only(node, vec![pinned]);
+
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    reconciler.tick().await;
+
+    assert_eq!(reconciler.sink.promoted(), vec![(pinned, node)]);
+    assert_eq!(reconciler.sink.promote_allowances(), vec![true]);
 }
 
 /// A gentle drain converges through the same zero-blockers gate as a forced

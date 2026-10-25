@@ -46,6 +46,11 @@ pub(super) fn insert_success_examples(spec: &mut Value) {
         cwd: None,
         user: None,
         tag: None,
+        state: None,
+        exit_code: None,
+        exit_status: None,
+        signal: None,
+        ended_at: None,
     };
     let command = PublicCommand {
         session_id,

@@ -96,9 +96,10 @@ pub(crate) fn reject_query_tokens(query: Option<&str>) -> Result<(), AttachError
 }
 
 /// Largest `Last-Event-ID` a client may resume from. It is the OpenAPI
-/// parameter's `int64` maximum, and it leaves room for the `last + 1` id the
-/// resume contract promises, so the stream can never saturate onto an id the
-/// client already acknowledged.
+/// parameter's `int64` maximum, and it leaves room for the `last + 1` id a
+/// file-watch resume sends, so that stream can never saturate onto an id the
+/// client already acknowledged. Process streams bound their ids by their own
+/// layout (see `ProcessEventId`) and refuse a higher id themselves.
 pub(crate) const MAX_LAST_EVENT_ID: u64 = i64::MAX as u64;
 
 pub(crate) fn last_event_id(headers: &HeaderMap) -> Result<Option<u64>, &'static str> {

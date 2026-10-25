@@ -78,9 +78,9 @@ This prints sandbox listings and the saved creation/deletion operations, sandbox
 | Stream authentication fails | Use `attach.token`, not `SPACE_API_TOKEN`, and the correct session URL. Check expiry and attach promptly after creating the command. |
 | Example rejects an endpoint, events URL, or redirect | Use HTTPS except for loopback HTTP. Check the data-plane origin and session ID; correct the configuration rather than removing destination or redirect checks. |
 | HTTP stream succeeds but output is incomplete | Check for `process_exited`, its exit result, and any `error` or `resync_required` frame. A closed connection is not proof of successful execution. |
-| Reconnect reports `resync_required` | Missed output is not replayed. Inspect the saved event transcript and query the process only if it is still running. Rerun only if repeating the command's effects is safe. |
+| Reconnect reports `resync_required` | The stream could not resume exactly: output from before the reconnect may be missing or repeated. Check that the client sends the last `id` it received exactly as received. A process that has written more than 2^33 - 1 output chunks always resumes this way. Inspect the saved event transcript and query the process only if it is still running. Rerun only if repeating the command's effects is safe. |
 | Command exits nonzero | Read stderr and the exit result from the saved event transcript. Check that the executable and working directory exist inside the sandbox, not just on the host. |
-| Single-process GET returns `not_found` | This endpoint inspects a running process, not historical command results. It returns `not_found` before attachment and after exit. |
+| Single-process GET returns `not_found` | This endpoint inspects a running or recently exited process, not historical command results. It returns `not_found` before attachment and once the sandbox no longer keeps the exit: 15 minutes after exit, sooner once many newer processes start, and right after exit on a sandbox from an older template. |
 
 Inspect a running process with `GET /v1/sandboxes/{sandbox_id}/processes/{process_id}`. An empty process list is expected after a command exits; use the saved event transcript to check its result. Keep a failed transcript for diagnosis, but review it for secrets before sharing it.
 
@@ -110,6 +110,10 @@ Check a returned operation ID before resending a lifecycle mutation. A new key r
 Read the API error's `code`, `message`, `details`, `request_id`, and `retryable` fields. Correct non-retryable errors first, and use bounded backoff for retryable errors without discarding the original key.
 
 A file route's `404` (`not_found`) whose `details` include `{"key": "resource", "value": "path"}` means the sandbox is yours and the path inside it does not exist, so there is no need to look the sandbox up again. Without that detail, the sandbox itself was not found or is not yours; the two answer alike.
+
+`rate_limited` is not the only `429`. A `POST /v1/sandboxes` that would exceed the organization's or the user's sandbox limit gets `429` `quota_exceeded` with `retryable: false` and no `Retry-After`: resending it unchanged fails the same way until a sandbox is deleted or an in-flight create ends. See `SPACE_NATIVE_ORG_SANDBOX_LIMIT` in `docs/configuration.md`.
+
+A command create's `400` (`invalid_request`) whose `details` include `{"key": "field", "value": "pty"}` means it asked for a `pty` with `Accept: text/event-stream`. Server-sent events cannot drive a terminal, so drop the `pty`, or create the command without that header and attach over WebSocket.
 
 A sandbox that is at capacity, or shutting down, can refuse a request before doing any of its work: a retryable `429` (`rate_limited`) or `503` with `Retry-After`. That request did nothing, though an earlier attempt of the same action may have; wait at least that long and resend it with the same body and key, or reattach to the same session. SPACE does not retry these refusals for you. A timeout leaves the outcome unknown, and it is retryable only where the endpoint deduplicates by its key. Lifecycle operations and command creation deduplicate for 24 hours; file writes, batch writes, and renames only for 60 seconds after they complete, and not across a restart of the sandbox's agent, so retry them promptly or check the file first. File `mkdir`, `remove`, and change tracking do not deduplicate: their timeouts are not retryable, so check the sandbox's state before repeating them.
 

@@ -1,6 +1,6 @@
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::SnapshotId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +40,8 @@ use pplx_space_node_api_client::NodeApiClient;
 use sqlx::PgPool;
 
 use pplx_space_common_svc::sql::sandbox_residency::{
-    active_resident_predicate, occupies_node_predicate, resident_lifecycle, resident_lifecycle_strs,
+    active_resident_predicate, node_backup_inventory_fresh, occupies_node_predicate,
+    resident_lifecycle, resident_lifecycle_strs,
 };
 
 use super::{
@@ -1321,10 +1322,11 @@ pub(crate) const PINNED_LOCAL_ONLY_ENUMERATION_CAP: NonZeroUsize = NonZeroUsize:
 /// give-up then applies legitimately).
 ///
 /// `exclude_legacy_rows` drops rows with a NULL `current_local_artifact_id` — the
-/// ones whose backup can only go through the legacy sandbox-id-only reupload.
-/// That path uploads from the **live** `/space/cache/<id>/snapshot/` directory
-/// rather than an artifact-id-keyed staging copy, and it validates the sandbox is
-/// `Suspended` only at enqueue time. It is therefore safe only while nothing can
+/// ones whose backup can only name the node's current instance rather than an
+/// artifact. That path uploads from the **live** `/space/cache/<id>/snapshot/`
+/// directory rather than an artifact-id-keyed staging copy (it adopts an id
+/// *pointing at* that directory), and it validates the sandbox is `Suspended`
+/// only at enqueue time. It is therefore safe only while nothing can
 /// wake the sandbox mid-upload — which used to be guaranteed by the drain gate
 /// 409ing every wake on a draining node. A gentle drain deliberately leaves that
 /// gate open, so a wake + re-suspend there could overwrite those bytes while the
@@ -1459,6 +1461,383 @@ pub(crate) fn pinned_local_only_sandboxes_query(
             {legacy_filter}
           LIMIT {limit}"
     )
+}
+
+/// `$1` = node id. The node's queued backup rows: a subset of
+/// [`pinned_local_only_sandboxes_query`]'s answer, each carrying the artifact
+/// the node reported. The caller interleaves them with the history rows they
+/// do not name, so this statement narrows nothing on its own; what it adds is
+/// the identity.
+///
+/// `node_local_backup_pending` holds one row per (node, sandbox) for an
+/// artifact the **node itself** reported as not yet durably backed up, from
+/// `local_artifacts WHERE backup_completed_at IS NULL` on its last Full
+/// census. `PRIMARY KEY (node_id, sandbox_id)` means `WHERE q.node_id = $1` is
+/// a primary-key prefix scan, and the row count is proportional to in-flight
+/// backups rather than to how long the node has been alive. The history
+/// statement's input is `target_node_id = $1 AND lifecycle = 'suspended'`, and
+/// `target_node_id` is a placement diagnostic suspend never clears, so that one
+/// grows without bound. The live drain still reads history too.
+///
+/// # The queue narrows; the predicates decide
+///
+/// Every surviving row is re-checked against the *same* two fragments the
+/// history statement applies — `snapshot_durable_for_source_release` and
+/// `inflight_suspend_upload_exists` — evaluated over `sandboxes s`, not over
+/// the queue row. That is deliberate and is what makes the differential
+/// assertion meaningful: with identical predicates the queue path can only ever
+/// return a subset of the history path, and equality is reachable whenever the
+/// queue holds every pending artifact. Deciding durability from `q.artifact_id`
+/// instead would let this path return rows the history path does not, which
+/// breaks the subset relation and turns a narrowing optimisation into a second,
+/// independent opinion about durability — the thing a stale queue must never be
+/// able to express.
+///
+/// The queue's artifact pair is projected so a candidate records that the
+/// queue named it (`gated_page_source`), never consulted by the `WHERE`.
+/// Promotion doesn't send it: it names the `sandboxes` marker, which the pair
+/// can only match or lag behind.
+///
+/// # Why both `q.node_id` and `s.target_node_id` are matched
+///
+/// They are not redundant, and dropping the second one silently breaks the
+/// invariant this whole design rests on. The queue row is keyed by the node
+/// whose *disk* holds the artifact; `target_node_id` is the control plane's
+/// placement. They agree almost always and diverge when a sandbox's pin moves
+/// while its old queue row survives — the mirror deletes a row only once its
+/// artifact, or the sandbox's current artifact after it left the node, is
+/// durable, so a pin that moves leaves the row on the old node until then.
+///
+/// With only `q.node_id`, the queue path would return a row the history path
+/// does not, because history is scoped `s.target_node_id = $1`. That breaks
+/// `queue ⊆ history`, which is the property that makes the queue a pure
+/// narrowing of the candidate set rather than a second opinion about which
+/// node owns a sandbox. Matching both keeps the two paths comparable and
+/// keeps the differential test meaningful.
+///
+/// This does not lose work. A sandbox whose pin has moved is already absent
+/// from the old node's enumeration on `main`, since history is
+/// `target_node_id`-scoped. The drain gate's target-pinned arm is scoped the
+/// same way. Its other arm (`drain_gate_blocker_pairs`, driven by
+/// `snapshots.source_node_id`) can still hold the old node while an upload
+/// from it is `creating`, and that hold clears when the upload does, with no
+/// promotion from the old node. Adding the scope preserves parity with shipped
+/// behaviour rather than narrowing past it.
+///
+/// # `artifact_kind`
+///
+/// The table's `CHECK` admits `'disk'` and `'full'` because the node reports
+/// both, so this statement carries its own kind predicate rather than assuming
+/// the queue is pre-filtered for it. `'full'` is the kind whose durability
+/// `snapshot_durable_for_source_release` expresses at all — every branch of it
+/// requires `sn.type = 'full'` — so a `'disk'` row would be enumerated and then
+/// judged by a predicate that cannot describe it.
+///
+/// # Fences carried over
+///
+/// The durability probe stays inside a scalar subquery for the reason
+/// [`pinned_local_only_sandboxes_query`] documents at length: a bare sublink is
+/// pullable and can be realised as a hash or merge anti-join over the whole
+/// snapshot table, and autoanalyze can flip that choice under a `LIMIT`-only
+/// plan. It matters less here, where the driving set is small, but the two
+/// statements are meant to stay comparable, and a fence in one and not the
+/// other is how that stops being true quietly. Nothing asserts their plan
+/// structures are equal today.
+/// The limit is likewise a literal,
+/// not a bind parameter, so the `tuple_fraction` bias survives
+/// `plan_cache_mode = force_generic_plan`.
+pub(crate) fn queued_local_backup_candidates_query(
+    exclude_legacy_rows: bool,
+    limit: NonZeroUsize,
+) -> String {
+    let snapshot_exists = snapshot_durable_for_source_release("s");
+    let inflight_upload = inflight_suspend_upload_exists("s");
+    let legacy_filter = if exclude_legacy_rows {
+        "AND s.current_local_artifact_id IS NOT NULL"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT q.sandbox_id, q.artifact_id, q.artifact_kind
+           FROM node_local_backup_pending q
+           JOIN sandboxes s ON s.id = q.sandbox_id
+          WHERE q.node_id = $1
+            AND s.target_node_id = $1
+            AND q.artifact_kind = 'full'
+            AND s.lifecycle = 'suspended'
+            AND NOT (SELECT {snapshot_exists})
+            AND NOT {inflight_upload}
+            {legacy_filter}
+          LIMIT {limit}"
+    )
+}
+
+/// Choose and run one node's pinned-local enumeration.
+///
+/// A free function rather than a method so the tests can drive the *decision*
+/// — flag, then gate, then which statement — against a real Postgres without
+/// standing up a `KubernetesSubstrate` the choice never consults. A test that
+/// exercised the two statements separately would assert about SQL and leave
+/// the branch between them, which is the part carrying the rollout risk,
+/// uncovered.
+pub(crate) async fn list_pinned_local_candidates(
+    pool: &PgPool,
+    node_id: NodeId,
+    exclude_legacy_rows: bool,
+    backup_queue_enabled: bool,
+) -> Result<PinnedLocalPage, sqlx::Error> {
+    // `cap + 1`, so the caller can tell "exactly the cap" from "more than
+    // the cap" — at `LIMIT cap` a full page is ambiguous between the two and
+    // the truncation warning fires on a node whose gauge is in fact exact.
+    // Same sentinel, for the same reason, as the admin
+    // `:force-upload-local-snapshots` enumeration.
+    let limit = PINNED_LOCAL_ONLY_ENUMERATION_CAP.saturating_add(1);
+
+    // The flag is read before the gate so that "off" costs nothing: no
+    // extra round trip, and the statement below is the pre-change one
+    // unchanged. That is what makes merging this inert.
+    if backup_queue_enabled {
+        let gate = node_backup_inventory_gate_query();
+        let fresh: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(gate.as_str())))
+            .bind(node_id)
+            .fetch_one(pool)
+            .await?;
+        if fresh {
+            let query = queued_local_backup_candidates_query(exclude_legacy_rows, limit);
+            // `artifact_kind` is decoded as its wire `TEXT` and parsed
+            // rather than trusted. The column's CHECK admits only `disk`
+            // and `full` and the statement asks for `full`, so a parse
+            // failure is unreachable through this schema — which is
+            // exactly why it must surface as a decode error and not a
+            // panic: the one way to reach it is a future migration
+            // widening the CHECK, and a drain tick is not a place to
+            // abort the process over that.
+            let rows: Vec<(SandboxId, LocalArtifactId, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+                    .bind(node_id)
+                    .fetch_all(pool)
+                    .await?;
+            let candidates = rows
+                .into_iter()
+                .map(|(sandbox_id, artifact_id, kind)| {
+                    let artifact_kind = kind
+                        .parse::<ArtifactKind>()
+                        .map_err(|err| sqlx::Error::Decode(Box::new(err)))?;
+                    Ok(PinnedLocalCandidate {
+                        sandbox_id,
+                        queued_artifact: Some(QueuedArtifact {
+                            artifact_id,
+                            artifact_kind,
+                        }),
+                    })
+                })
+                .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+            // Then the history rows the queue does not name, interleaved with
+            // the queued rows. The queue supplies priority; history is still
+            // the population.
+            //
+            // Not only when the queue is empty. A queue row can be one no
+            // backup request will ever clear — a pin whose `local_artifacts`
+            // row is gone, which the census reports on purpose so an empty
+            // queue never under-reports, and which both the named and the
+            // current-instance request then refuse as retryable. A
+            // non-empty queue that suppressed history would hold every
+            // other row on the node behind that one for as long as it stays,
+            // including legacy rows the queue cannot represent at all
+            // (`node_local_backup_pending.artifact_id` is NOT NULL, and an
+            // `Unpinned` sandbox has no id to report).
+            //
+            // Interleaved rather than appended for the same reason one level
+            // down: promotion acts on the head of the page
+            // (`PROMOTION_MAX_PER_TICK`), so queued rows first would let as
+            // many stuck queued rows as there are slots hold the history rows
+            // off the slice every tick. Alternating gives each class half the
+            // head while both have rows, and all of it once the other runs
+            // out. Stuck rows within one class can still crowd that class's
+            // share, as they can on the history-only path.
+            //
+            // History rather than the drain gate as the source of the rest,
+            // because history is exactly the promotable set. The gate also
+            // counts rows no promotion can act on — a `suspending` or
+            // `restoring` row, or an upload already in flight from this
+            // node — so a gate-keyed fallback would fire on every tick
+            // between a backup's enqueue and its finalize.
+            //
+            // The cost is the history statement on every gated tick, over
+            // the same `target_node_id` rows `count_drain_blocking_sandboxes_on_node`
+            // already scans each tick for the gate.
+            let queued: HashSet<SandboxId> = candidates.iter().map(|c| c.sandbox_id).collect();
+            // A full queue page means the queue holds more than this page, so
+            // "not on the page" stops meaning "not queued": a history row can
+            // be one of the queued rows the page cut off. Those still go out,
+            // unnamed, as history would send them; what cannot be trusted is
+            // the label that says the census missed them.
+            let queue_page_full = candidates.len() >= limit.get();
+            let query = pinned_local_only_sandboxes_query(exclude_legacy_rows, limit);
+            let history: Vec<SandboxId> =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+                    .bind(node_id)
+                    .fetch_all(pool)
+                    .await?;
+            let unnamed = history
+                .into_iter()
+                .filter(|sandbox_id| !queued.contains(sandbox_id))
+                .map(|sandbox_id| PinnedLocalCandidate {
+                    sandbox_id,
+                    queued_artifact: None,
+                });
+            let mut candidates = interleave(candidates, unnamed);
+            // Keep the `cap + 1` sentinel meaningful for the caller's
+            // truncation check: the union of two `cap + 1` pages can be
+            // longer than either. Every queued row is also a history row, so
+            // the union never exceeds the true population and the sentinel
+            // still reads "more than the cap" exactly when there is more.
+            candidates.truncate(limit.get());
+            let source = gated_page_source(queue_page_full, &candidates);
+            return Ok(PinnedLocalPage { candidates, source });
+        }
+    }
+
+    let query = pinned_local_only_sandboxes_query(exclude_legacy_rows, limit);
+    let ids: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+        .bind(node_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(PinnedLocalPage {
+        candidates: ids
+            .into_iter()
+            .map(|sandbox_id| PinnedLocalCandidate {
+                sandbox_id,
+                queued_artifact: None,
+            })
+            .collect(),
+        source: PinnedLocalSource::History,
+    })
+}
+
+/// Label a gated page: `HistoryQueueIncomplete` when it carries a row the
+/// queue did not name, `Queue` otherwise. A full queue page always reads
+/// `Queue`, because then an unnamed row may be a queued one the page cut off,
+/// and calling it a census gap would fire the operator signal on a healthy
+/// node.
+fn gated_page_source(queue_page_full: bool, page: &[PinnedLocalCandidate]) -> PinnedLocalSource {
+    if !queue_page_full && page.iter().any(|c| c.queued_artifact.is_none()) {
+        PinnedLocalSource::HistoryQueueIncomplete
+    } else {
+        PinnedLocalSource::Queue
+    }
+}
+
+/// Whether a promotion sends nothing: the row names no artifact, and the drain
+/// mode forbids the unnamed current-instance backup, which can upload from the
+/// live snapshot directory while a gentle drain leaves wakes open. The
+/// enumeration keeps markerless rows off a gentle drain's page
+/// (`exclude_legacy_rows`), so this catches a marker cleared between that read
+/// and the promotion's own.
+fn withholds_unnamed_backup(
+    backup_target: Option<&(LocalArtifactId, ArtifactKind)>,
+    allow_current_instance: bool,
+) -> bool {
+    backup_target.is_none() && !allow_current_instance
+}
+
+/// Alternate `first` and `second`, starting with `first`, then append whatever
+/// remains of the longer one.
+fn interleave<T>(first: Vec<T>, second: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut second = second.into_iter();
+    let mut out = Vec::with_capacity(first.len());
+    for item in first {
+        out.push(item);
+        if let Some(other) = second.next() {
+            out.push(other);
+        }
+    }
+    out.extend(second);
+    out
+}
+
+/// `$1` = node id. TRUE iff this node's backup inventory is fresh enough that
+/// an **empty** queue may be read as "nothing pending" rather than "never
+/// reported".
+///
+/// Asked as its own round trip rather than folded into
+/// [`queued_local_backup_candidates_query`] as a `WHERE` term, because the two
+/// answers a fold would produce are indistinguishable and mean opposite
+/// things: a stale gate and a genuinely empty queue would both return zero
+/// rows. The live drain reads history either way, so for it the gate decides
+/// only whether the queue is read at all. The extra round trip happens only
+/// when the flag is on, and
+/// `node_status_snapshots` is keyed by `node_id`, so it is a primary-key
+/// lookup.
+///
+/// Reading the gate and the queue in separate statements admits a window where
+/// freshness changes between them. Both directions are benign: a gate that
+/// goes stale just after the check leaves the read using an inventory at most
+/// one window old, and one that goes fresh just after leaves the node
+/// enumerated from history for one tick. Neither can release a node, because
+/// neither changes what
+/// [`crate::node_drain::store::drain_blocking_sandboxes_query`] counts.
+pub(crate) fn node_backup_inventory_gate_query() -> String {
+    format!("SELECT {}", node_backup_inventory_fresh("$1"))
+}
+
+/// A sandbox on a draining node that still owes a durable backup, plus the
+/// artifact pair the node reported for it — when the queue named it.
+///
+/// `queued_artifact` is `Some` for a row from `node_local_backup_pending`,
+/// where the node itself supplied the pair, and `None` for every row the
+/// history path produced. It labels the page (`gated_page_source`); promotion
+/// doesn't send it, and names the artifact from the `sandboxes` marker either
+/// way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedLocalCandidate {
+    pub sandbox_id: SandboxId,
+    pub queued_artifact: Option<QueuedArtifact>,
+}
+
+/// The `(artifact_id, artifact_kind)` pair carried by a
+/// `node_local_backup_pending` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedArtifact {
+    pub artifact_id: LocalArtifactId,
+    pub artifact_kind: ArtifactKind,
+}
+
+/// One node's pinned-local enumeration, and which statement produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedLocalPage {
+    pub candidates: Vec<PinnedLocalCandidate>,
+    pub source: PinnedLocalSource,
+}
+
+/// Which statement answered a pinned-local enumeration.
+///
+/// Carried out of the store so the reconciler can log and count the two arms
+/// separately: "the queue said zero" and "history said zero" are the same
+/// number and very different facts during a rollout, and gate coverage is the
+/// signal each environment's flip is gated on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedLocalSource {
+    /// The flag is on, this node's inventory gate was fresh, and the page
+    /// carries no row the queue did not name, or the queue page was full and
+    /// an unnamed row there may be a queued one it cut off.
+    Queue,
+    /// The flag is off fleet-wide, or this node's gate was stale or never
+    /// stamped.
+    History,
+    /// The flag is on and the gate was fresh, but history held a promotable
+    /// row the queue did not name, so the page carries it interleaved with the
+    /// queued rows, with no artifact identity.
+    ///
+    /// Distinct from [`Self::History`] because it means something different
+    /// to an operator. `History` is the designed fallback for a node that has
+    /// not reported. This one says the node *did* report, recently enough to
+    /// pass the gate, and its report still omits a row the drain must back
+    /// up. Expected for a legacy row with no artifact id; sustained on a node
+    /// without such rows, it is the signal that a class of local bytes is
+    /// escaping the census.
+    HistoryQueueIncomplete,
 }
 
 /// `$1` = sandbox id, `$2` = source node id. Atomic mark-failed for a sandbox
@@ -3611,20 +3990,15 @@ impl NodeDrainSink for SubstrateSink {
         &self,
         node_id: NodeId,
         exclude_legacy_rows: bool,
-    ) -> Result<Vec<SandboxId>, sqlx::Error> {
-        // `cap + 1`, so the caller can tell "exactly the cap" from "more than
-        // the cap" — at `LIMIT cap` a full page is ambiguous between the two and
-        // the truncation warning fires on a node whose gauge is in fact exact.
-        // Same sentinel, for the same reason, as the admin
-        // `:force-upload-local-snapshots` enumeration.
-        let query = pinned_local_only_sandboxes_query(
+        backup_queue_enabled: bool,
+    ) -> Result<PinnedLocalPage, sqlx::Error> {
+        list_pinned_local_candidates(
+            &self.pool,
+            node_id,
             exclude_legacy_rows,
-            PINNED_LOCAL_ONLY_ENUMERATION_CAP.saturating_add(1),
-        );
-        sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(node_id)
-            .fetch_all(&self.pool)
-            .await
+            backup_queue_enabled,
+        )
+        .await
     }
 
     /// Count sandboxes that still block `draining → drained`.
@@ -3660,6 +4034,7 @@ impl NodeDrainSink for SubstrateSink {
         &self,
         sandbox_id: SandboxId,
         source_node_id: NodeId,
+        allow_current_instance: bool,
     ) -> Result<(), PromoteError> {
         let node = node_api_row(&self.pool, source_node_id)
             .await
@@ -3670,24 +4045,22 @@ impl NodeDrainSink for SubstrateSink {
                 ))
             })?;
         let target = node.as_target();
-        let local_artifact_id: Option<LocalArtifactId> = sandbox_store::get(&self.pool, sandbox_id)
-            .await
-            .map_err(|err| PromoteError::Db(err.to_string()))?
-            .and_then(|record| record.current_local_artifact_id);
+        // The marker names the artifact, as the suspend commit wrote it; a row
+        // without one asks the node for its current instance. The queue's
+        // pair isn't used here even when the row is queued: it is a copy of
+        // the node's pin taken at its last census, so it can only match the
+        // marker or lag behind it, and a marked row's durability is pinned to
+        // the marker's artifact.
+        let backup_target = history_backup_target(&self.pool, sandbox_id).await?;
+        if withholds_unnamed_backup(backup_target.as_ref(), allow_current_instance) {
+            return Err(PromoteError::UnnamedWithheld(format!(
+                "sandbox {sandbox_id} names no artifact, and this drain \
+                 doesn't allow a current-instance backup"
+            )));
+        }
         let promotion = self
             .with_promotion_node_api_client(source_node_id, &target, async |client, addr| {
-                let source = local_artifact_id.map_or(BackupSource::CurrentInstance, |id| {
-                    BackupSource::LocalArtifact(id)
-                });
-                enqueue_artifact_backup_with_node_api(
-                    client,
-                    addr,
-                    sandbox_id,
-                    ArtifactKind::Full,
-                    source,
-                )
-                .await
-                .map(|_| ())
+                dispatch_backup(client, addr, sandbox_id, backup_target).await
             })
             .await;
         match promotion {
@@ -4530,8 +4903,15 @@ impl NodeDrainSink for SubstrateSink {
         // 4. Enqueue backup for the exact local artifact published by suspend.
         //    Failure here leaves a safe local-only suspension; the pinned-local
         //    retry pass will attempt the same artifact again on the next tick.
+        //    The sandbox was suspended moments ago by the call above, so the
+        //    marker promotion resolves through is whatever that suspend wrote:
+        //    the artifact it published, or none when its response carried no
+        //    usable artifact, and then promotion asks for the current
+        //    instance. That is allowed here (`true`) because evacuation runs
+        //    only for a drain that evacuates residents (`spawn_evacuations`),
+        //    whose gate blocks wakes.
         match self
-            .promote_local_snapshot(sandbox_id, source_node_id)
+            .promote_local_snapshot(sandbox_id, source_node_id, true)
             .await
         {
             Ok(()) => {
@@ -5605,6 +5985,13 @@ mod tombstone_tests;
 #[cfg(test)]
 mod durable_upload_gate_tests;
 
+/// Postgres-backed coverage for the per-node backup queue read: the flag, the
+/// per-node gate, the fallback, and the differential against the statement
+/// this replaces. The branch between the two statements lives here because it
+/// is where the rollout risk is — either statement alone is sound.
+#[cfg(test)]
+mod backup_queue_tests;
+
 /// Scale regression for the pinned local-only work queue: the shape of the
 /// statement, not the rows it returns. `durable_upload_gate_tests` covers the
 /// rows; this covers how the work of finding them grows with a node's suspend
@@ -5643,3 +6030,43 @@ mod stopped_evacuation_tests;
 /// stopped evacuation may open on, and which the teardown still refuses.
 #[cfg(test)]
 mod stopped_evacuation_capture_order_tests;
+
+/// What the history path would back up: the `sandboxes` marker if the row
+/// carries one, and `None` for a legacy markerless row, which the caller
+/// turns into an unnamed backup of the node's current instance.
+async fn history_backup_target(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<Option<(LocalArtifactId, ArtifactKind)>, PromoteError> {
+    Ok(sandbox_store::get(pool, sandbox_id)
+        .await
+        .map_err(|err| PromoteError::Db(err.to_string()))?
+        .and_then(|record| record.current_local_artifact_id)
+        .map(|id| (id, ArtifactKind::Full)))
+}
+
+/// One backup dispatch against an already-locked node-api client.
+///
+/// Always the generic RPC; only the source differs. A known artifact
+/// identity is named directly, and a row without one asks the node for its
+/// current instance — the legacy sandbox-id reupload has been retired from
+/// this path. The kind is a parameter rather than fixed at `Full` here, but
+/// its one producer, `history_backup_target`, always supplies `Full`, and the
+/// current-instance request is `Full` too.
+async fn dispatch_backup(
+    client: &mut NodeApiClient,
+    endpoint_addr: &str,
+    sandbox_id: SandboxId,
+    backup_target: Option<(LocalArtifactId, ArtifactKind)>,
+) -> Result<(), SubstrateError> {
+    let (artifact_kind, source) = match backup_target {
+        Some((local_artifact_id, artifact_kind)) => (
+            artifact_kind,
+            BackupSource::LocalArtifact(local_artifact_id),
+        ),
+        None => (ArtifactKind::Full, BackupSource::CurrentInstance),
+    };
+    enqueue_artifact_backup_with_node_api(client, endpoint_addr, sandbox_id, artifact_kind, source)
+        .await
+        .map(|_| ())
+}

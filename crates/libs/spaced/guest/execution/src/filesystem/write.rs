@@ -85,6 +85,7 @@ pub(super) async fn write(
     owner: Option<(u32, u32)>,
     cancelled: tokio_util::sync::CancellationToken,
     buffers: Arc<UploadBufferPool>,
+    tasks: tokio_util::task::TaskTracker,
 ) -> Result<WriteResponse, WriteError> {
     let first = stream
         .next()
@@ -99,7 +100,7 @@ pub(super) async fn write(
     let path = guest_path::normalize_for_account(&open.path, account)?;
     let owner_uid = owner.map_or_else(effective_uid, |(uid, _)| uid);
     let WriteTarget { file, replacement } =
-        open_write_target(path.expose().into(), open.append, owner_uid).await?;
+        open_write_target(path.expose().into(), open.append, owner_uid, tasks.clone()).await?;
     let mut file = UploadWriter::new(file, open.append, buffers)
         .await
         .map_err(map_io_error)?;
@@ -152,6 +153,7 @@ pub(super) async fn write(
 pub(super) async fn write_batch(
     request: WriteBatchRequest,
     account: &GuestAccount,
+    tasks: tokio_util::task::TaskTracker,
 ) -> Result<WriteBatchResponse, Status> {
     if request.entries.len() > pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES {
         return Err(Status::invalid_argument("too many write_batch entries"));
@@ -162,7 +164,13 @@ pub(super) async fn write_batch(
         let WriteTarget {
             mut file,
             replacement,
-        } = open_write_target(path.expose().into(), entry.append, effective_uid()).await?;
+        } = open_write_target(
+            path.expose().into(),
+            entry.append,
+            effective_uid(),
+            tasks.clone(),
+        )
+        .await?;
         let written = file.write_all(&entry.data).await.map_err(map_io_error);
         let flushed = AsyncWriteExt::flush(&mut file).await.map_err(map_io_error);
         written?;

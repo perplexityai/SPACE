@@ -38,7 +38,7 @@ async fn in_tx_local_snapshots(pool: &PgPool, node: NodeId) -> TestResult<i64> {
     let occ =
         sandbox_occupancy_for_node_in_tx(&mut tx, node, ResidencyEvidence::LifecycleOnly).await?;
     tx.commit().await?;
-    Ok(occ.local_snapshots)
+    Ok(occ.drain_blockers)
 }
 
 /// `target_node_id` drifted to another node, but the suspend upload is

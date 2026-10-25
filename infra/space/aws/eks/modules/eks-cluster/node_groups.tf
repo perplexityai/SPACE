@@ -223,19 +223,80 @@ resource "aws_eks_node_group" "managed" {
   # of which honors PodDisruptionBudgets.
   #
   # Otherwise, on a cluster running the autoscaler, plan immediately before
-  # applying a min/max change, check the plan's desired_size against the live
-  # group, and keep the change out of an apply that also rolls the group: the
-  # provider rolls first, which can take hours, and only then sends the
-  # desired size it planned.
+  # applying a min/max change and check the plan's desired_size against the
+  # live group.
   #
   # An out-of-band min/max change through the EKS API is drift: every later
   # apply on the cluster, whatever it's for, plans to revert it, and the plan
   # fails while the live desired size sits outside the configured bounds.
   # Record an emergency resize in node_pools rather than leaving it live-only.
+  #
+  # The launch-template version is held too. A group starts on the
+  # template's latest version, and later versions don't roll it. A change to
+  # what the template launches with bumps the version, a tag in common_tags
+  # included. EKS fails a rolling update if a node's pods haven't left within
+  # about 15 minutes of its drain (PodEvictionFailure), so a pool whose pods
+  # can take longer to leave, through a long termination grace period or a
+  # tight PodDisruptionBudget, can't take a new version that way. These
+  # groups take their AMI from EKS, not the template, but the provider's
+  # template roll sent no Kubernetes or AMI version, so it could also move
+  # them to the cluster's Kubernetes version and its newest AMI. With the
+  # hold, only an apply that replaces a group does that, since a new group
+  # starts at the cluster's version; otherwise it takes
+  # update-nodegroup-version, below. The template ID isn't held: EKS can't
+  # move a group to another template, so a new ID still plans the group's
+  # replacement, which deletes it with its nodes before creating it again.
+  #
+  # A group left behind keeps launching nodes from its old version, so move
+  # it before a change it needs, such as a new security group or metadata
+  # option, is relied on. A group whose pods all leave within EKS's window can
+  # roll in place:
+  # `aws eks update-nodegroup-version --cluster-name <cluster>
+  # --nodegroup-name <pool> --launch-template id=<id>,version=<version>`.
+  # The ID is the group's launchTemplate.id in `aws eks describe-nodegroup`,
+  # and the version is that template's LatestVersionNumber in
+  # `aws ec2 describe-launch-templates`. Without `--kubernetes-version` and
+  # `--release-version`, the call can also upgrade the group's AMI and
+  # Kubernetes version. To change only the template, pass the group's current
+  # version and releaseVersion from describe-nodegroup; EKS's documentation
+  # doesn't say how it treats unchanged values next to a new template
+  # version, so confirm the update's parameters with `aws eks describe-update`
+  # before relying on it. A group running
+  # slower pods can't roll in place, and draining it first doesn't help: its
+  # pods land on its other old-version nodes. `--force` gets the roll past
+  # PodEvictionFailure only by deleting those pods regardless of their
+  # disruption budgets, so don't use it on them. Move the workload to a new
+  # group instead, which starts on the latest version; that's also how to
+  # finish a roll that failed partway and left the group on mixed versions.
+  # The space module's general pools have that path built in, general-2 and
+  # the per-AZ groups. Any other pool needs a second pool key added for it,
+  # which for the space module's other pools means changing the module.
+  # Don't `-replace` a group that runs nodes: EKS deletes them with it.
+  # The next refresh records the version the group runs, so neither path
+  # leaves drift. Until a group is moved, the check below warns about it.
   lifecycle {
     ignore_changes = [
       scaling_config[0].desired_size,
+      launch_template[0].version,
     ]
+  }
+}
+
+# A warning, not an error: a held group behind its template is expected until
+# someone moves it. The plan that changes a template can't name the groups,
+# since the new version isn't known until apply, so it reports the check as
+# known after apply; the apply and every later plan name them.
+locals {
+  managed_node_groups_behind_launch_template = {
+    for name, group in aws_eks_node_group.managed : name => group.launch_template[0].version
+    if group.launch_template[0].version != tostring(aws_launch_template.node_group[name].latest_version)
+  }
+}
+
+check "managed_node_groups_on_latest_launch_template" {
+  assert {
+    condition     = length(local.managed_node_groups_behind_launch_template) == 0
+    error_message = "Node groups ${join(", ", [for name, version in local.managed_node_groups_behind_launch_template : "${name} (version ${version}, latest ${aws_launch_template.node_group[name].latest_version})"])} run an older version of their launch template, and an apply doesn't move them. The comment on aws_eks_node_group.managed in the eks-cluster module describes how to move them."
   }
 }
 

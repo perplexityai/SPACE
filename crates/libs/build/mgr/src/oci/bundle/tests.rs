@@ -442,3 +442,13 @@ fn every_program_a_seed_unit_runs_is_carried_in_the_bundle() {
             .any(|program| program == "/usr/local/bin/spaced-svc")
     );
 }
+
+#[rstest]
+fn image_working_directory_survives_bundle_install(bundle_fixture: BundleFixture) {
+    let working_dir = Path::new("/workspace/with spaces");
+    install_working_directory(&bundle_fixture.target, working_dir, false).unwrap();
+    assert_eq!(
+        fs::read_to_string(bundle_fixture.target.join("etc/spaced/working-directory")).unwrap(),
+        working_dir.to_str().unwrap()
+    );
+}

@@ -377,11 +377,6 @@ pub async fn connect_worker(endpoint: Endpoint) -> Result<RuntimeClient, Control
     Ok(RuntimeClient::new(channel))
 }
 
-/// HTTP/2 connection window for a kept worker connection: 16 default-sized
-/// (2 MiB) stream windows.
-#[cfg(feature = "kubernetes")]
-pub(super) const KEPT_WORKER_CONNECTION_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
-
 /// [`connect_worker`] for a channel a cache keeps: the same dial, plus the
 /// watch that closes once the connection it was dialed with ends.
 #[cfg(feature = "kubernetes")]
@@ -407,14 +402,13 @@ pub(super) async fn connect_worker_watched_with(
     // torn down before the next caller reuses it, rather than only once a
     // call is in flight.
     //
-    // It also carries concurrent streams that used to get a connection each.
-    // A reader that stops polling holds up to one stream window of the
-    // connection window; a window several streams wide keeps a few stalled
-    // readers from blocking the pod's other calls. Buffering stays bounded by
-    // the stream windows, as it was across separate connections.
+    // It also carries concurrent streams that used to get a connection each,
+    // so it takes the multiplexed connection window.
     let endpoint = endpoint
         .keep_alive_while_idle(true)
-        .initial_connection_window_size(KEPT_WORKER_CONNECTION_WINDOW_BYTES);
+        .initial_connection_window_size(
+            pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES,
+        );
     node_api_connect_endpoint(endpoint)
         .await?
         .connect_with_retry_watched("worker-node-api", "worker-node-api", retry_policy)

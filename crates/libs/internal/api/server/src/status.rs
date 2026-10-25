@@ -223,10 +223,20 @@ impl LocalBackupInventoryReport {
 /// the pending-backup mirror — see [`LocalBackupInventoryReport`].
 /// Execution collection has its own receipt time: only a supplied outcome
 /// advances it. Heartbeats and other facets preserve the previous evidence.
+///
+/// `reported_window` is how long past now the node counts as fresh, from
+/// [`reported_freshness`](pplx_space_node_api_client::node_status_freshness::reported_freshness).
+/// A publication that reports no usable interval keeps the row's stored window
+/// (`stale_after - observed_at`), and a node's first such publication gets
+/// [`DEFAULT_NODE_STATUS_FRESHNESS`](pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS).
+/// The stored window is usually the last reported interval's, but the Direct
+/// substrate's create-failure mark writes a 10 s one, and that's the one kept
+/// until a publication reports an interval again: the node reads stale
+/// sooner, never later.
 pub(super) async fn upsert_node_status_from_publish(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    stale_after_secs: i64,
+    reported_window: Option<std::time::Duration>,
     node_status: Option<PublishedNodeStatusDb>,
     inventory_prune: SandboxInventoryPrune,
     local_backup_report: LocalBackupInventoryReport,
@@ -289,7 +299,9 @@ pub(super) async fn upsert_node_status_from_publish(
          )
          SELECT n.id,
                 NOW(),
-                NOW() + ($2::TEXT || ' seconds')::INTERVAL,
+                NOW() + make_interval(
+                    secs => COALESCE($2::DOUBLE PRECISION, $18::DOUBLE PRECISION)
+                ),
                 TRUE,
                 NULL,
                 n.role,
@@ -317,7 +329,13 @@ pub(super) async fn upsert_node_status_from_publish(
          WHERE n.id = $1
          ON CONFLICT (node_id) DO UPDATE
          SET observed_at = EXCLUDED.observed_at,
-             stale_after = EXCLUDED.stale_after,
+             -- No usable interval: keep the row's stored window.
+             stale_after = CASE
+                 WHEN $2::DOUBLE PRECISION IS NULL
+                 THEN EXCLUDED.observed_at
+                     + (node_status_snapshots.stale_after - node_status_snapshots.observed_at)
+                 ELSE EXCLUDED.stale_after
+             END,
              reachable = TRUE,
              error = NULL,
              role = EXCLUDED.role,
@@ -408,7 +426,7 @@ pub(super) async fn upsert_node_status_from_publish(
              updated_at = NOW()"
     ))
     .bind(node_id)
-    .bind(stale_after_secs)
+    .bind(reported_window.map(|window| window.as_secs_f64()))
     .bind(scheduling_status)
     .bind(scheduling_reason)
     .bind(network_slots_ready)
@@ -431,6 +449,10 @@ pub(super) async fn upsert_node_status_from_publish(
         execution_observation
             .and_then(|observation| observation.policy)
             .map(Json),
+    )
+    .bind(
+        pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS
+            .as_secs_f64(),
     )
     .execute(&mut *conn)
     .await
@@ -518,3 +540,7 @@ pub(super) fn reconcile_retry_delay_secs(attempts_before_failure: i32) -> i64 {
 #[cfg(test)]
 #[path = "status_tests.rs"]
 mod status_tests;
+
+#[cfg(test)]
+#[path = "status_freshness_tests.rs"]
+mod status_freshness_tests;

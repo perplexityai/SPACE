@@ -50,6 +50,11 @@ pub struct PublicApiError {
 /// rather than declaring capacity gone. `CapacityUnavailable` is reserved for
 /// placement failing after a request was admitted.
 ///
+/// `QuotaExceeded` is a create refused by the organization or per-user
+/// sandbox limit ([`PublicApiError::sandbox_quota_exceeded`]). A 429 like
+/// `RateLimited`, but not retryable and without `Retry-After`: the limit lifts
+/// once a delete completes or an in-flight create ends, not after a delay.
+///
 /// The statuses here are what this API's own handlers answer. A rejection the
 /// framework produces before a handler runs (405 unsupported method, 413 body
 /// too large, 415 wrong `Content-Type`, 422 body not matching the schema) is
@@ -68,6 +73,7 @@ pub(crate) fn error_contract(code: &PublicErrorCode) -> (StatusCode, bool) {
         }
         PublicErrorCode::FailedPrecondition => (StatusCode::PRECONDITION_FAILED, false),
         PublicErrorCode::RateLimited => (StatusCode::TOO_MANY_REQUESTS, true),
+        PublicErrorCode::QuotaExceeded => (StatusCode::TOO_MANY_REQUESTS, false),
         PublicErrorCode::CapacityUnavailable | PublicErrorCode::ServiceUnavailable => {
             (StatusCode::SERVICE_UNAVAILABLE, true)
         }
@@ -155,6 +161,17 @@ impl PublicApiError {
         )
     }
 
+    /// A create refused because the organization or the caller already holds
+    /// as many sandboxes as its limit allows.
+    pub fn sandbox_quota_exceeded(message: impl Into<String>) -> Self {
+        Self::from_contract(
+            PublicErrorCode::QuotaExceeded,
+            message,
+            ResponseOrigin::Client,
+            ResponseKind::Admission,
+        )
+    }
+
     /// Clear the `retryable` flag, and any `Retry-After` with it.
     ///
     /// For a failure that happens *after* the request's own work committed,
@@ -179,6 +196,16 @@ impl PublicApiError {
         error.details.push(PublicErrorDetail {
             key: pplx_space_public_api::NOT_FOUND_RESOURCE_DETAIL_KEY.to_string(),
             value: pplx_space_public_api::NOT_FOUND_RESOURCE_PATH.to_string(),
+        });
+        error
+    }
+
+    /// An `invalid_request` that names the `pty` request field.
+    pub fn invalid_pty_field(message: impl Into<String>) -> Self {
+        let mut error = Self::bad_request(message);
+        error.details.push(PublicErrorDetail {
+            key: pplx_space_public_api::INVALID_REQUEST_FIELD_DETAIL_KEY.to_string(),
+            value: pplx_space_public_api::INVALID_REQUEST_FIELD_PTY.to_string(),
         });
         error
     }

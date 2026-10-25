@@ -1300,3 +1300,263 @@ async fn gone_node_mark_lost_then_reap_converges() -> TestResult {
 
     Ok(())
 }
+
+/// One row whose flip another node's in-flight upload vetoes doesn't keep the
+/// give-up from a different casualty on the same node.
+///
+/// Stated as what one tick does to the node's rows: the vetoed row stays
+/// `suspended` and the other undurable row is marked lost. The vetoed row is
+/// also queued on this node, so a claim that read the queue first and stopped
+/// there would return it alone, defer it, and leave the casualty for a later
+/// tick that never comes while the upload runs.
+#[tokio::test(flavor = "current_thread")]
+async fn a_vetoed_row_does_not_hold_back_another_casualty() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let sink = NodeDbStore::new(pool.clone(), ResidencyEvidence::default());
+
+    let node = NodeId::new();
+    let other_node = NodeId::new();
+    insert_drained_node(pool, node).await?;
+    let vetoed = insert_suspended_with_creating_upload_from(pool, node, other_node).await?;
+    enqueue_for(pool, node, vetoed).await?;
+    let casualty = insert_suspended_without_snapshots(pool, node).await?;
+
+    let marked = sink
+        .mark_unrecoverable_sandboxes_lost(node, Some(node_uid(node)))
+        .await?;
+    assert_eq!(
+        marked,
+        vec![casualty],
+        "the casualty must be given up on this tick, whatever the vetoed row does"
+    );
+    assert_eq!(lifecycle(pool, casualty).await?, "failed");
+    assert_eq!(
+        lifecycle(pool, vetoed).await?,
+        "suspended",
+        "control: the other node's live upload still defers its own row"
+    );
+    Ok(())
+}
+
+/// A sandbox whose durable copy stops counting after the node is gone is
+/// still given up, on a later tick.
+///
+/// The claim skips rows that are durable when it runs, so a row that loses
+/// durability afterwards isn't claimed on that tick. What keeps that from
+/// stranding it is that it now blocks the reap, so the next tick's give-up
+/// claims it. Here the storage location of the row's only ready copy is
+/// orphaned between two give-ups.
+#[tokio::test(flavor = "current_thread")]
+async fn a_row_that_loses_durability_is_given_up_on_the_next_tick() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let sink = NodeDbStore::new(pool.clone(), ResidencyEvidence::default());
+
+    let node = NodeId::new();
+    insert_drained_node(pool, node).await?;
+    let sandbox = insert_suspended_with_durable_snapshot(pool, node).await?;
+
+    let marked = sink
+        .mark_unrecoverable_sandboxes_lost(node, Some(node_uid(node)))
+        .await?;
+    assert!(
+        marked.is_empty(),
+        "premise: a durable row is not given up, got {marked:?}"
+    );
+
+    sqlx::query(sql!(
+        "UPDATE snapshot_storage_locations ssl
+            SET orphaned_at = NOW()
+           FROM snapshots sn
+          WHERE ssl.snapshot_id = sn.id AND sn.sandbox_id = $1"
+    ))
+    .bind(sandbox)
+    .execute(pool)
+    .await?;
+    let OrphanDeleteOutcome::Refused(refusal) = sink
+        .delete_drained_node_if_orphan(node, Some(node_uid(node)))
+        .await?
+    else {
+        panic!("the row with no durable copy left must refuse the reap");
+    };
+    assert_eq!(
+        refusal.snapshot_blockers, 1,
+        "the row now blocks the reap, which is what runs the give-up again"
+    );
+
+    let marked = sink
+        .mark_unrecoverable_sandboxes_lost(node, Some(node_uid(node)))
+        .await?;
+    assert_eq!(marked, vec![sandbox]);
+    assert_eq!(lifecycle(pool, sandbox).await?, "failed");
+    Ok(())
+}
+
+/// The claim locks the rows the flip could act on and leaves the node's
+/// durable history alone, including the snapshot and storage-location rows its
+/// durability check reads.
+///
+/// Asserted by contention rather than by counting, because `FOR UPDATE` row
+/// locks are recorded in the tuple header and don't appear in `pg_locks`. A
+/// second connection reaches for each row with `NOWAIT`, which succeeds iff
+/// the claim left that row unlocked. The historical claim, every pinned
+/// `suspended` row, is the control: it does lock the durable row, so the probe
+/// can see the lock this test asserts is absent.
+#[tokio::test(flavor = "current_thread")]
+async fn the_claim_locks_only_rows_without_a_durable_copy() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = NodeId::new();
+    insert_drained_node(pool, node).await?;
+    let durable = insert_suspended_with_durable_snapshot(pool, node).await?;
+    let casualty = insert_suspended_without_snapshots(pool, node).await?;
+
+    /// Is the row `probe` selects for `$1 = id` free while `claim` holds its
+    /// locks?
+    async fn free_under(
+        pool: &PgPool,
+        claim: &str,
+        node: NodeId,
+        probe: &str,
+        id: SandboxId,
+    ) -> TestResult<bool> {
+        let mut claim_tx = pool.begin().await?;
+        sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql!(claim)))
+            .bind(node)
+            .fetch_all(&mut *claim_tx)
+            .await?;
+        let mut probe_tx = pool.begin().await?;
+        // Only `lock_not_available` (55P03) means "locked"; any other error
+        // fails the test rather than reading as a lock.
+        let free = match sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql!(probe)))
+            .bind(id)
+            .fetch_one(&mut *probe_tx)
+            .await
+        {
+            Ok(_) => true,
+            Err(sqlx::Error::Database(err)) if err.code().as_deref() == Some("55P03") => false,
+            Err(err) => return Err(err.into()),
+        };
+        probe_tx.rollback().await?;
+        claim_tx.rollback().await?;
+        Ok(free)
+    }
+    const SANDBOX_PROBE: &str = "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE NOWAIT";
+    const SNAPSHOT_PROBE: &str = "SELECT id FROM snapshots WHERE sandbox_id = $1 FOR UPDATE NOWAIT";
+    const STORAGE_LOCATION_PROBE: &str = "SELECT sn.id
+           FROM snapshot_storage_locations ssl
+           JOIN snapshots sn ON sn.id = ssl.snapshot_id
+          WHERE sn.sandbox_id = $1
+            FOR UPDATE OF ssl NOWAIT";
+
+    let historical = "SELECT id FROM sandboxes
+                       WHERE lifecycle = 'suspended' AND target_node_id = $1
+                       ORDER BY id
+                       FOR UPDATE";
+    assert!(
+        !free_under(pool, historical, node, SANDBOX_PROBE, durable).await?,
+        "control: the historical claim locks the durable row, so the probe can \
+         tell the two claims apart"
+    );
+
+    // A claim that joins the durability tables locks their rows too, so the
+    // two probes below can see a lock there when one is taken.
+    let joined = "SELECT s.id
+                    FROM sandboxes s
+                    JOIN snapshots sn ON sn.sandbox_id = s.id
+                    JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+                   WHERE s.lifecycle = 'suspended' AND s.target_node_id = $1
+                     FOR UPDATE";
+    for probe in [SNAPSHOT_PROBE, STORAGE_LOCATION_PROBE] {
+        assert!(
+            !free_under(pool, joined, node, probe, durable).await?,
+            "control: a claim joining the durability tables locks their rows, \
+             so {probe:?} can see such a lock"
+        );
+    }
+
+    let claim = super::gone_node_giveup_claim_query();
+    assert!(
+        free_under(pool, &claim, node, SANDBOX_PROBE, durable).await?,
+        "the claim must not lock a row with a durable copy"
+    );
+    assert!(
+        free_under(pool, &claim, node, SNAPSHOT_PROBE, durable).await?,
+        "the claim must not lock the snapshot rows its durability check reads"
+    );
+    assert!(
+        free_under(pool, &claim, node, STORAGE_LOCATION_PROBE, durable).await?,
+        "...nor the storage-location rows it reads"
+    );
+    assert!(
+        !free_under(pool, &claim, node, SANDBOX_PROBE, casualty).await?,
+        "...but it must lock the row it claims, or the flip races the \
+         concurrent BeginArtifactBackup insert the lock serializes against"
+    );
+    Ok(())
+}
+
+async fn enqueue_for(pool: &PgPool, node: NodeId, sandbox: SandboxId) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO node_local_backup_pending
+             (node_id, sandbox_id, artifact_id, artifact_kind)
+         VALUES ($1, $2, $3, 'full')"
+    ))
+    .bind(node)
+    .bind(sandbox)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The give-up drops a given-up sandbox's queue row on this node, and leaves
+/// the same sandbox's row on another node, which is that node's inventory.
+#[tokio::test(flavor = "current_thread")]
+async fn the_give_up_drops_its_queue_row_on_this_node_only() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let sink = NodeDbStore::new(pool.clone(), ResidencyEvidence::default());
+
+    let node = NodeId::new();
+    let other_node = NodeId::new();
+    insert_drained_node(pool, node).await?;
+    let sandbox = insert_suspended_without_snapshots(pool, node).await?;
+    enqueue_for(pool, node, sandbox).await?;
+    enqueue_for(pool, other_node, sandbox).await?;
+    let queue_rows = |node: NodeId| async move {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT COUNT(*) FROM node_local_backup_pending
+              WHERE node_id = $1 AND sandbox_id = $2"
+        ))
+        .bind(node)
+        .bind(sandbox)
+        .fetch_one(pool)
+        .await
+    };
+
+    let marked = sink
+        .mark_unrecoverable_sandboxes_lost(node, Some(node_uid(node)))
+        .await?;
+    assert_eq!(marked, vec![sandbox]);
+    assert_eq!(
+        queue_rows(node).await?,
+        0,
+        "the given-up sandbox's queue row on this node is dropped"
+    );
+    assert_eq!(
+        queue_rows(other_node).await?,
+        1,
+        "its row on another node belongs to that node's inventory and survives"
+    );
+    Ok(())
+}

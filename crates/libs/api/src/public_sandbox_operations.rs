@@ -7,6 +7,9 @@ use axum::http::StatusCode;
 use pplx_space_common_core::types::{
     NodeId, NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
 };
+use pplx_space_events::{
+    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_public_api::{
     OperationKind, OperationState, PublicErrorCode, PublicOperationResult, PublicSandboxId,
@@ -18,10 +21,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::Instrument;
 
-use crate::controllers::ControllerError;
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
 use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
+use crate::controllers::{ControllerError, SnapshotUploadCheck, SnapshotUploadInFlight};
 use crate::models::{
     CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
     SandboxMetadataValue as ControllerSandboxMetadataValue,
@@ -32,6 +35,22 @@ use crate::public_operations::{ApiProduct, ClaimedPublicOperation, PublicOperati
 use crate::public_sandbox_projection::public_lifecycle_state as project_public_lifecycle_state;
 
 const CREATE_RETRY_AFTER: Duration = Duration::from_secs(5);
+/// The floor of the spacing between checks by a native delete held off by a
+/// snapshot upload. The spacing grows with how long the delete has waited.
+const SNAPSHOT_UPLOAD_RETRY_AFTER: Duration = Duration::from_secs(3);
+/// How long a native delete is patient with snapshot uploads before failing
+/// with the upload conflict. It is an API bound, not a measure of the upload
+/// worker. It is sized against the worker's backoff ladder between attempts,
+/// 5 + 30 + 120 + 300 s, about eight minutes. The worker reuses one row across
+/// its attempts and heartbeats it at the start of each.
+///
+/// The delete fails once the stalest blocking upload has gone this long
+/// without activity: a row whose worker is gone, or a single attempt that runs
+/// longer than this (an attempt may run for up to two hours). It also fails
+/// once the delete itself has been in flight this long, which bounds a run of
+/// backups that each leave a new row. Waiting on would hold the sandbox's
+/// queue until the M1 deadline.
+pub(crate) const SNAPSHOT_UPLOAD_WAIT_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,7 +163,14 @@ pub struct PublicOperationExecutionResult {
     pub state: OperationState,
     pub progress_message: String,
     pub result_json: Option<serde_json::Value>,
+    /// The error code of a failed result. A requeue may carry one too: the
+    /// error it stands for, recorded if the driver fails the operation instead
+    /// of requeueing it (its deadline, deferral window, or retry budget). The
+    /// carried code replaces the driver's own.
     pub terminal_error_code: Option<PublicErrorCode>,
+    /// The error envelope of a failed result. A requeue's carried envelope is
+    /// merged under the driver's own evidence: the driver keeps its fields and
+    /// adds the carried ones it lacks.
     pub terminal_error_json: Option<serde_json::Value>,
     pub retry_after: Option<Duration>,
     pub requeue_reason: PublicOperationRequeueReason,
@@ -494,6 +520,82 @@ impl SandboxLifecycleOperationExecutor {
         }
     }
 
+    /// A delete refused for an in-flight snapshot upload.
+    ///
+    /// A native request waits for the upload. Native deletes carry an
+    /// Idempotency-Key, and a failed operation is immutable, so a terminal
+    /// conflict would leave a caller's cleanup delete failed for the key's
+    /// lifetime. ECW deletes carry no key, so an ECW caller can retry after
+    /// the 409. Admin force-deletes keep the 409 for the operator to act on.
+    /// An ECW delete is told apart by its missing actor
+    /// ([`crate::public_operations::PublicOperationStore::create_or_join_active_sandbox_delete`]).
+    /// `actor_user_id` is cleared if the user row is deleted, so a native
+    /// delete whose user is deleted while it waits fails at its next check.
+    ///
+    /// The wait ends with the conflict once the stalest blocking upload has
+    /// gone [`SNAPSHOT_UPLOAD_WAIT_LIMIT`] without activity, or once that long
+    /// has passed since the delete's first claim. That clock also counts
+    /// retries before the delete first met an upload.
+    async fn snapshot_upload_result(
+        &self,
+        operation: &ClaimedPublicOperation,
+        sandbox_id: SandboxId,
+        upload: SnapshotUploadInFlight,
+        error: ControllerError,
+    ) -> PublicOperationExecutionResult {
+        let conflict = controller_error_result(operation, error);
+        if operation.api_product == ApiProduct::Native && operation.actor_user_id.is_some() {
+            let waited = crate::public_operations::PublicOperationStore::new(self.pool.clone())
+                .time_since_first_claim(operation.id)
+                .await;
+            match waited {
+                Ok(waited) => {
+                    let waited = waited.unwrap_or_default();
+                    if upload.idle_for() < SNAPSHOT_UPLOAD_WAIT_LIMIT
+                        && waited < SNAPSHOT_UPLOAD_WAIT_LIMIT
+                    {
+                        return waiting_for_snapshot_upload(operation, conflict, waited);
+                    }
+                    tracing::warn!(
+                        operation_id = %operation.id,
+                        sandbox_id = %sandbox_id,
+                        upload_idle_for_secs = upload.idle_for().as_secs(),
+                        waited_secs = waited.as_secs(),
+                        "snapshot upload outlasted the delete's wait; failing the delete"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        operation_id = %operation.id,
+                        sandbox_id = %sandbox_id,
+                        error = %error,
+                        "retrying sandbox delete after database error reading its wait"
+                    );
+                    return PublicOperationExecutionResult::retry(
+                        "database unavailable while checking the snapshot upload",
+                        CREATE_RETRY_AFTER,
+                    );
+                }
+            }
+        }
+        SandboxEvent::new(
+            sandbox_id,
+            SandboxEventType::DeleteFailed,
+            SandboxEventSource::Api,
+        )
+        .emit_with(
+            SandboxEventDetails::default()
+                .action("delete")
+                .reason(match upload.check {
+                    SnapshotUploadCheck::Preflight => "in_flight_suspend_upload",
+                    SnapshotUploadCheck::Locked => "in_flight_suspend_upload_locked",
+                })
+                .routine()
+                .trigger(SandboxEventTrigger::User),
+        );
+        conflict
+    }
+
     async fn execute_inner(
         &self,
         operation: &ClaimedPublicOperation,
@@ -540,9 +642,18 @@ impl SandboxLifecycleOperationExecutor {
                     "sandbox already deleted",
                 ));
             }
-            self.controller
+            if let Err(error) = self
+                .controller
                 .delete_control_plane(&self.pool, sandbox_uuid.into(), sandbox.as_ref())
-                .await?;
+                .await
+            {
+                let Some(upload) = error.snapshot_upload_in_flight_details() else {
+                    return Err(error.into());
+                };
+                return Ok(self
+                    .snapshot_upload_result(operation, sandbox_uuid.into(), upload, error)
+                    .await);
+            }
             return Ok(lifecycle_success_result(
                 payload.sandbox_id,
                 payload.action,
@@ -973,6 +1084,32 @@ impl SandboxLifecycleExecutionError {
             }
             Self::Controller(error) => controller_error_result(operation, error),
         }
+    }
+}
+
+/// Requeues a delete behind a snapshot upload, carrying `conflict`'s error as
+/// the one to record if the operation cannot be requeued again.
+///
+/// The wait is workflow progress, so it spends no attempt. It is spaced like a
+/// deferred retry, by how long the delete has `waited`, so a long wait checks
+/// about once a minute.
+fn waiting_for_snapshot_upload(
+    operation: &ClaimedPublicOperation,
+    conflict: PublicOperationExecutionResult,
+    waited: Duration,
+) -> PublicOperationExecutionResult {
+    let retry_after = crate::public_operation_driver::deferred_retry_delay(
+        operation.id,
+        waited,
+        SNAPSHOT_UPLOAD_RETRY_AFTER,
+    );
+    PublicOperationExecutionResult {
+        terminal_error_code: conflict.terminal_error_code,
+        terminal_error_json: conflict.terminal_error_json,
+        ..PublicOperationExecutionResult::workflow_progress(
+            "waiting for the snapshot upload to finalize before deleting",
+            retry_after,
+        )
     }
 }
 

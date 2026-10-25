@@ -79,8 +79,10 @@ service ClusterApi {
   // Postgres but whose local side effects are owned by template-manager.
   rpc GetNodeTemplateDesiredState(GetNodeTemplateDesiredStateRequest) returns (GetNodeTemplateDesiredStateResponse);
 
-  // Whole-node installation intent, including nodes with empty local inventory.
-  // This does not authorize execution or change the default environment.
+  // Whole-node runtime intent, including nodes with empty local inventory: the
+  // environments to install, and the cluster's execution environment policy.
+  // Installation never authorizes execution; a node that applies the policy
+  // never executes an environment its own settings don't allow.
   rpc GetNodeRuntimeDesiredState(GetNodeRuntimeDesiredStateRequest) returns (GetNodeRuntimeDesiredStateResponse);
 
   // Return the control-plane desired sandbox state for node-local sandboxes.
@@ -505,6 +507,30 @@ message TemplateDesiredState {
 
 message GetNodeTemplateDesiredStateResponse {
   repeated TemplateDesiredState templates = 1;
+}
+
+// Cluster execution environment policy. An unset optional field means the
+// cluster sets nothing for it and each node keeps its configured value. A node
+// that applies it combines it with its own settings as
+// docs/execution-environments.md describes: the policy may narrow what the node
+// allows and pick its default among those, never widen it.
+message RuntimeEnvironmentDesiredPolicy {
+  // Policy version, raised by every store write. It restarts at 0 if the
+  // policy schema is rolled back and reapplied, so across that boundary a
+  // lower generation can be newer and an equal one can name a different
+  // policy. A node applies each response in full, and never skips one
+  // because of its generation.
+  uint64 generation = 1;
+  // The environment new unbound work binds to.
+  optional string default_environment_ref = 2;
+  // Environments that may execute (allowed and deprecated), the default
+  // included, in a stable order. It narrows a node's allowlist only while
+  // default_environment_ref is set: with no default, an empty or partial
+  // list leaves the node's configured allowlist in place.
+  repeated string executing_environment_refs = 3;
+  // Whether unbound historical contracts that match no compiled environment
+  // may execute.
+  optional bool legacy_unbound_allowed = 4;
 }
 
 message GetNodeSandboxDesiredStateRequest {
@@ -1259,6 +1285,15 @@ message RuntimeProvisioningRecipe {
 }
 
 message GetNodeRuntimeDesiredStateResponse {
-  // Absent means no policy is assigned; it is not an empty applied recipe.
+  // Absent means no recipe is assigned; it is not an empty applied recipe.
   RuntimeProvisioningRecipe recipe = 1;
+  // Absent while the cluster API runs with
+  // SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED off, the default, and from
+  // cluster APIs that serve this RPC without the field (older ones return
+  // UNIMPLEMENTED); nodes then keep their startup
+  // execution settings. Each cluster API replica reads the setting at startup,
+  // so replicas can disagree while it changes. While enabled, a policy that
+  // can't be read fails the whole call, recipe included, rather than coming
+  // back absent.
+  RuntimeEnvironmentDesiredPolicy execution_policy = 2;
 }

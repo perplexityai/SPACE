@@ -696,7 +696,9 @@ fn e2b_operation_failure(
         Some(PublicErrorCode::CapacityUnavailable | PublicErrorCode::ServiceUnavailable) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
-        Some(PublicErrorCode::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
+        Some(PublicErrorCode::RateLimited | PublicErrorCode::QuotaExceeded) => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
         Some(
             PublicErrorCode::OperationFailed
             | PublicErrorCode::Internal

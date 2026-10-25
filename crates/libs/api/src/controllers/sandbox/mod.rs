@@ -55,10 +55,10 @@ use crate::models::{
     UpdateSandboxRequest, User,
 };
 use crate::reconcile_queue::{
-    FinalizeSandboxDbDeleteError, ReconcileRef, any_creating_snapshot_for_sandbox,
-    delete_reconcile_state_for_elements, enqueue_node_reconcile_refs_and_trigger_tx,
-    enqueue_sandbox_reconcile_and_trigger, enqueue_sandbox_reconcile_and_trigger_tx,
-    finalize_sandbox_db_delete_user_initiated, sandbox_reconcile_cleanup_refs,
+    FinalizeSandboxDbDeleteError, ReconcileRef, delete_reconcile_state_for_elements,
+    enqueue_node_reconcile_refs_and_trigger_tx, enqueue_sandbox_reconcile_and_trigger,
+    enqueue_sandbox_reconcile_and_trigger_tx, finalize_sandbox_db_delete_user_initiated,
+    in_flight_snapshot_upload_idle_for, sandbox_reconcile_cleanup_refs,
 };
 #[derive(Debug, Clone, FromRow)]
 struct SandboxObservedState {

@@ -461,6 +461,17 @@ pub(crate) const HELD_WARN_INTERVAL: Duration = Duration::from_secs(3600);
 
 pub(crate) const DEFAULT_TICK: Duration = Duration::from_secs(5);
 
+/// How many local-only promotions one draining node runs at once.
+pub(crate) const PROMOTION_CONCURRENCY: usize = 8;
+/// Cap per-tick work so a node with a large backlog can't monopolize the
+/// reconciler: promotion acts on the head of the pinned page. The page is
+/// unordered within each class, so a later tick is not guaranteed to reach the
+/// rest; what converges is that a promoted sandbox leaves the set. With the
+/// 5 s per-promotion timeout, 8-wide and one batch, at most 5 s is spent on
+/// this node per tick, so the tick interval (default 5 s) stays meaningful for
+/// other draining and terminating nodes in the same loop.
+pub(crate) const PROMOTION_MAX_PER_TICK: usize = PROMOTION_CONCURRENCY;
+
 /// Wall-clock at which a per-node store query that still succeeded is reported
 /// as slow by [`Reconciler::observe_store_query`], which carries the rationale
 /// for the threshold and for why only the succeeding case warns.
@@ -493,7 +504,7 @@ pub(crate) const DEFAULT_EVACUATE_TIMEOUT_SECS: u64 = 600;
 /// at the config layer so tests can disable the policy; the reconciler always
 /// uses this default.
 pub(crate) const DEFAULT_STALE_ABANDON_SECS: u64 = 600;
-/// How long a `suspended` sandbox whose local-snapshot reupload is permanently
+/// How long a `suspended` sandbox whose local-snapshot backup is permanently
 /// refused (not `Suspended` on the node — a stuck on-node `restoring`) must
 /// have been settled before the node-drain give-up adopts an existing ready
 /// remote snapshot to unblock the drain. Measured by
@@ -651,6 +662,26 @@ pub struct ReconcilerConfig {
     /// still has its existing exits — the owner starting or deleting the
     /// sandbox, or [`Self::gentle_escalate`] rewriting the mode.
     pub evacuate_stopped_residents: bool,
+    /// Read the per-node backup work queue alongside the `target_node_id`
+    /// history statement: queued rows interleaved with the history rows the
+    /// queue does not name. It does not replace the history read, so it does
+    /// not make the enumeration cheaper. Default off, and off enumerates every
+    /// node by the history statement alone, as before. What this flag doesn't
+    /// gate: promotion withholding an unnamed backup under a gentle drain, and
+    /// the drained-node terminator's gone-node give-up, which claims only rows
+    /// without a durable copy and deletes the given-up rows' queue entries.
+    ///
+    /// Global rather than per-node because it is a rollout control, not a
+    /// policy: the per-node decision is the inventory gate, which this flag
+    /// only makes reachable. Turning it on does not switch a node that has
+    /// never reported its inventory — that node keeps using the history
+    /// statement until its own gate is stamped, which is what makes the
+    /// cutover self-pacing rather than a fleet-wide cliff.
+    ///
+    /// Enabling is valid only once nodes report their backup inventory and
+    /// cluster-api mirrors it, and then per environment. Rollback is this flag,
+    /// never a database write.
+    pub backup_queue_enabled: bool,
     pub tick: Duration,
     pub max_per_node: usize,
     /// Cluster-wide budget on concurrent drain-driven substrate operations.
@@ -685,12 +716,12 @@ pub struct ReconcilerConfig {
     /// programmer-error path.
     pub stale_abandon: Option<PositiveDuration>,
     /// Settle window for the local-snapshot-promotion give-up. A `suspended`
-    /// sandbox whose reupload is permanently refused (not `Suspended` on the
+    /// sandbox whose backup is permanently refused (not `Suspended` on the
     /// node — a stuck on-node `restoring`) is, after it has been settled this
     /// long (by `lifecycle_changed_at`) and **if the current suspend cycle's
     /// ready remote snapshot exists**, made durable from that snapshot so the
-    /// node finishes draining instead of retrying the refused reupload forever.
-    /// `None` disables the give-up — the reupload is retried every tick (prior
+    /// node finishes draining instead of retrying the refused backup forever.
+    /// `None` disables the give-up — the backup is retried every tick (prior
     /// behavior).
     ///
     /// `Option<PositiveDuration>` for the same two reasons as
@@ -733,6 +764,7 @@ impl Default for ReconcilerConfig {
             enabled: false,
             termination_blocking_gate: false,
             evacuate_stopped_residents: false,
+            backup_queue_enabled: false,
             tick: DEFAULT_TICK,
             max_per_node: DEFAULT_MAX_PER_NODE,
             max_per_cluster: DEFAULT_MAX_PER_CLUSTER,
@@ -769,6 +801,10 @@ impl ReconcilerConfig {
             termination_blocking_gate: config.truthy_default(
                 "SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE",
                 default.termination_blocking_gate,
+            ),
+            backup_queue_enabled: config.truthy_default(
+                "SPACE_NODE_DRAIN_BACKUP_QUEUE_ENABLED",
+                default.backup_queue_enabled,
             ),
             evacuate_stopped_residents: config.truthy_default(
                 "SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS",
@@ -843,20 +879,20 @@ pub enum PromoteError {
     /// a confusing snapshot-not-found.
     #[error("local suspended artifact gone, sandbox unrecoverable: {0}")]
     ArtifactMissing(String),
-    /// The on-node sbx-mgr refused the suspend-snapshot reupload because the
+    /// The on-node sbx-mgr refused the suspend-snapshot backup because the
     /// sandbox is wedged in `restoring` on the node (a stuck on-node restore)
     /// while the cluster SSOT reads it `suspended`. Classified off
     /// `REUPLOAD_SANDBOX_RESTORING_MARKER`.
     ///
     /// Unlike [`Self::ArtifactMissing`], the local artifacts are not gone — the
-    /// reupload simply can't proceed from a stuck restore, and the divergence
+    /// backup simply can't proceed from a stuck restore, and the divergence
     /// need not self-heal before the node must drain. The reconciler routes
     /// this to the give-up path
     /// ([`NodeDrainSink::make_sandbox_durable_from_remote_snapshot`]): after a
     /// settle window, **if the newest ready remote snapshot already exists**,
     /// it adopts that snapshot (makes the row durable) so the
     /// node finishes draining and the sandbox stays recoverable, instead of
-    /// retrying the permanently refused reupload forever.
+    /// retrying the permanently refused backup forever.
     ///
     /// Scoped to the `restoring` state by design: the VM is loading **from**
     /// the snapshot, so it holds no user state newer than the snapshot, which
@@ -870,6 +906,11 @@ pub enum PromoteError {
     /// node, missing inventory row, …).
     #[error("node-api endpoint unresolved: {0}")]
     EndpointUnresolved(String),
+    /// Nothing was sent: the row names no artifact, and the drain mode
+    /// forbids the unnamed current-instance backup (a gentle drain). Not a
+    /// failure of the node; the next tick asks again.
+    #[error("unnamed backup withheld: {0}")]
+    UnnamedWithheld(String),
 }
 
 /// Surface the reconciler depends on. Implementations: [`SubstrateSink`]
@@ -932,17 +973,27 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// into [`NodeDrainSink::promote_local_snapshot`].
     ///
     /// `exclude_legacy_rows` drops rows with no `current_local_artifact_id`,
-    /// whose only backup route is the legacy sandbox-id-only reupload. That
-    /// route reads the live on-disk snapshot directory and checks the sandbox is
-    /// `Suspended` only when the job is enqueued, so it is safe only while
+    /// whose only backup route names the node's current instance rather than
+    /// an artifact. That route reads the live on-disk snapshot directory and
+    /// checks the sandbox is `Suspended` only when the job is enqueued, so it is safe only while
     /// nothing can wake the sandbox mid-upload. A **gentle** drain leaves the
     /// user-API gate open by design, so it passes `true` here and lets those
     /// rows keep blocking rather than risk registering a torn snapshot.
+    ///
+    /// `backup_queue_enabled` is the global rollout flag. Off, every node is
+    /// enumerated by the pre-change history statement. On, a node whose
+    /// backup-inventory gate is fresh reads `node_local_backup_pending` too,
+    /// interleaving its rows, which carry the artifact identity the node
+    /// reported, with the history rows it does not name; one whose gate is
+    /// stale or never stamped uses history alone. Which arm ran is reported back in
+    /// [`store::PinnedLocalPage::source`]; the flag alone does not tell you,
+    /// because the fallback is per node.
     fn list_pinned_local_only_sandboxes_on_node(
         &self,
         node_id: NodeId,
         exclude_legacy_rows: bool,
-    ) -> impl std::future::Future<Output = Result<Vec<SandboxId>, sqlx::Error>> + Send;
+        backup_queue_enabled: bool,
+    ) -> impl std::future::Future<Output = Result<store::PinnedLocalPage, sqlx::Error>> + Send;
     /// Count sandboxes that **block** `draining → drained` for this
     /// node — the union of the promotable set above plus mid-state
     /// lifecycles (`suspending`, `restoring`) that pin the node by
@@ -988,10 +1039,26 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// to validate and adopt an unpinned suspended instance. Once the
     /// durable worker registers a matching ready backup, the sandbox drops out
     /// of [`NodeDrainSink::list_pinned_local_only_sandboxes_on_node`].
+    ///
+    /// The artifact is the one `sandboxes.current_local_artifact_*` names, the
+    /// marker the suspend commit writes; a row without one asks for the
+    /// current instance. A queued row's pair isn't sent: it is the node's pin
+    /// as of its last census, so it can only match the marker or lag behind
+    /// it, and a marked row's durability is pinned to the marker's artifact.
+    ///
+    /// `allow_current_instance` is false for a gentle drain. An unnamed
+    /// current-instance backup can upload from the live snapshot directory,
+    /// which is safe only while the drain gate blocks wakes, and a gentle
+    /// drain leaves wakes open. With it false, a row naming no artifact
+    /// returns [`PromoteError::UnnamedWithheld`] and nothing is sent. The
+    /// enumeration keeps markerless rows off a gentle drain's page as well
+    /// (`exclude_legacy_rows`), so the withheld case is a marker cleared
+    /// between the two reads.
     fn promote_local_snapshot(
         &self,
         sandbox_id: SandboxId,
         source_node_id: NodeId,
+        allow_current_instance: bool,
     ) -> impl std::future::Future<Output = Result<(), PromoteError>> + Send;
     /// Mark every sandbox wedged in a non-evacuable resident transient
     /// lifecycle (see [`NON_EVACUATABLE_RESIDENT_LIFECYCLES`]) on `node_id`
@@ -1084,8 +1151,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     ///   [`Self::mark_sandbox_lost_on_gone_node`] (`expected_uid` +
     ///   `drain_phase = 'draining'`), refusing once a same-name kube Node
     ///   replacement registered;
-    /// - a current-suspend-cycle anchor on the adopted snapshot. The reupload
-    ///   give-up only adopts with a `SandboxRestoringOnNode` proof (the VM is
+    /// - a current-suspend-cycle anchor on the adopted snapshot. The give-up
+    ///   only adopts with a `SandboxRestoringOnNode` proof (the VM is
     ///   loading *from* the snapshot, making it canonical); this path has no
     ///   such proof, so for a legacy nullable row whose last re-suspend never
     ///   registered a snapshot record, the newest-ready test alone would
@@ -1124,7 +1191,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// snapshot already exists, **adopt it**: make the row durably restorable
     /// from that snapshot so it drops out of the pinned-local / drain-blocking
     /// set and the node can finish draining, instead of retrying the refused
-    /// reupload forever. The sandbox stays `suspended` and recoverable — its
+    /// backup forever. The sandbox stays `suspended` and recoverable — its
     /// next user `restore`/`wake` loads the adopted snapshot — at the cost of
     /// the (un-uploadable) local state the stuck restore left behind.
     ///
@@ -2427,7 +2494,11 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         let pinned_started = Instant::now();
         let pinned_result = self
             .sink
-            .list_pinned_local_only_sandboxes_on_node(node_id, exclude_legacy_rows)
+            .list_pinned_local_only_sandboxes_on_node(
+                node_id,
+                exclude_legacy_rows,
+                self.config.backup_queue_enabled,
+            )
             .await;
         self.observe_store_query(
             "list_pinned_local_only_sandboxes_on_node",
@@ -2435,7 +2506,10 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             pinned_started,
             &pinned_result,
         );
-        let mut local_only = match pinned_result {
+        let store::PinnedLocalPage {
+            candidates: mut local_only,
+            source: pinned_source,
+        } = match pinned_result {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(
@@ -2466,7 +2540,46 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         // cap while this gauge reads one above it.
         let pinned_total = local_only.len();
         let truncated = pinned_total > store::PINNED_LOCAL_ONLY_ENUMERATION_CAP.get();
-        node_drain_metrics::pinned_suspended(&node_id.to_string(), pinned_total as u64);
+        // Which arm produced this number is part of reading it, and the flag
+        // does not answer it: with the flag on, a node whose inventory gate is
+        // stale or never stamped is still enumerated from history. During the
+        // rollout the two arms can report the same count for opposite reasons
+        // — the queue saying "nothing pending" and history saying "nothing
+        // non-durable" — so the source is carried on the gauge rather than
+        // inferred from configuration. It is also the coverage signal
+        // each environment's flip is gated on: the fraction of draining
+        // nodes answering from the queue.
+        let node_label = node_id.to_string();
+        let queue_incomplete = pinned_source == store::PinnedLocalSource::HistoryQueueIncomplete;
+        // Both queue arms read the queue behind a fresh gate; the incomplete
+        // one also carried history rows the queue did not name. Coverage is
+        // about the gate, so both count.
+        let from_queue = pinned_source == store::PinnedLocalSource::Queue || queue_incomplete;
+        let pinned_source = match pinned_source {
+            store::PinnedLocalSource::Queue => "queue",
+            store::PinnedLocalSource::History => "history",
+            store::PinnedLocalSource::HistoryQueueIncomplete => "history_queue_incomplete",
+        };
+        // History held a promotable row the queue did not name. Expected for
+        // a legacy row with no artifact id, and for a sandbox suspended since
+        // the node's last census; anything else is a class of local bytes
+        // escaping the census. The rows are interleaved with the queued ones,
+        // so queued rows that keep being refused cannot hold them off the
+        // promoted slice. The line is `debug` and paced: a node in this state
+        // is in it on every tick until those rows are durable.
+        if queue_incomplete
+            && self
+                .warn_pacer
+                .due(node_id, "pinned_local_queue_incomplete")
+        {
+            tracing::debug!(
+                node_id = %node_id,
+                "node_drain: history held a promotable row the per-node backup queue did \
+                 not name; enumerating it interleaved with the queued rows"
+            );
+        }
+        node_drain_metrics::pinned_suspended(&node_label, pinned_total as u64);
+        node_drain_metrics::backup_queue_gated(&node_label, from_queue);
         local_only.truncate(store::PINNED_LOCAL_ONLY_ENUMERATION_CAP.get());
         // A truncated page means "at least this many", not "this many". Say so
         // rather than leaving the gauge pinned at the cap and readable as a
@@ -2476,6 +2589,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             tracing::warn!(
                 node_id = %node_id,
                 cap = store::PINNED_LOCAL_ONLY_ENUMERATION_CAP.get(),
+                source = pinned_source,
                 "node_drain: pinned local-only enumeration filled its cap, so \
                  `node_drain.pinned_suspended` is a floor and not the true backlog. \
                  The page is unordered, so a later tick may return the same rows \
@@ -2494,7 +2608,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             self.give_up_local_only_on_gone_node(node_id, recovery, &local_only, report)
                 .await;
         } else {
-            self.promote_local_only_sandboxes(node_id, &local_only)
+            self.promote_local_only_sandboxes(node_id, &local_only, !exclude_legacy_rows)
                 .await;
         }
 
@@ -2774,7 +2888,12 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
     /// [`Self::handle_draining_node`] so the KubeNodeGone recovery can
     /// replace it wholesale with the no-RPC give-up path
     /// ([`Self::give_up_local_only_on_gone_node`]).
-    async fn promote_local_only_sandboxes(&self, node_id: NodeId, local_only: &[SandboxId]) {
+    async fn promote_local_only_sandboxes(
+        &self,
+        node_id: NodeId,
+        local_only: &[store::PinnedLocalCandidate],
+        allow_current_instance: bool,
+    ) {
         // Per-promotion ceiling AND bounded concurrency so a slow or
         // wedged node-api on one node can't stall the reconciler's
         // tick. The substrate's backup call tolerates up to 30 s by
@@ -2788,24 +2907,23 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         // Timed-out promotions are reported as `failed`; the next
         // tick retries.
         const PROMOTION_CALL_TIMEOUT: Duration = Duration::from_secs(5);
-        const PROMOTION_CONCURRENCY: usize = 8;
-        // Cap per-tick work so a node with a large backlog can't
-        // monopolize the reconciler. The remainder stays in the
-        // pinned list and gets picked up on subsequent ticks. With
-        // 5 s timeout x 8-wide x 1 batch = <= 5 s spent on this node
-        // per tick, the tick interval (default 5 s) stays meaningful
-        // for other draining/terminating nodes in the same loop.
-        const PROMOTION_MAX_PER_TICK: usize = PROMOTION_CONCURRENCY;
         let node_label = node_id.to_string();
         let sink_ref = self.sink.as_ref();
         type PromotionOutcome = Result<Result<(), PromoteError>, tokio::time::error::Elapsed>;
         use futures_util::stream::{self, StreamExt};
         let outcomes: Vec<(SandboxId, PromotionOutcome)> =
             stream::iter(local_only.iter().copied().take(PROMOTION_MAX_PER_TICK))
-                .map(|sandbox_id| async move {
-                    let fut = sink_ref.promote_local_snapshot(sandbox_id, node_id);
+                .map(|candidate| async move {
+                    // The artifact comes from the `sandboxes` marker; a row
+                    // without one goes out against the node's current instance,
+                    // or not at all under a gentle drain.
+                    let fut = sink_ref.promote_local_snapshot(
+                        candidate.sandbox_id,
+                        node_id,
+                        allow_current_instance,
+                    );
                     let outcome = tokio::time::timeout(PROMOTION_CALL_TIMEOUT, fut).await;
-                    (sandbox_id, outcome)
+                    (candidate.sandbox_id, outcome)
                 })
                 .buffer_unordered(PROMOTION_CONCURRENCY)
                 .collect()
@@ -2932,6 +3050,17 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     };
                     node_drain_metrics::local_snapshot_promotion(&node_label, outcome);
                 }
+                Ok(Err(PromoteError::UnnamedWithheld(detail))) => {
+                    // Nothing went to the node, so this isn't a failure of it;
+                    // the next tick re-reads the marker.
+                    node_drain_metrics::local_snapshot_promotion(&node_label, "unnamed_withheld");
+                    tracing::debug!(
+                        node_id = %node_id,
+                        sandbox_id = %sandbox_id,
+                        detail = %detail,
+                        "node_drain: withheld an unnamed backup under a gentle drain"
+                    );
+                }
                 Ok(Err(err)) => {
                     node_drain_metrics::local_snapshot_promotion(&node_label, "failed");
                     tracing::warn!(
@@ -2990,7 +3119,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         &self,
         node_id: NodeId,
         recovery: &GoneNodeRecovery,
-        local_only: &[SandboxId],
+        local_only: &[store::PinnedLocalCandidate],
         report: &mut TickReport,
     ) {
         if local_only.is_empty() {
@@ -3012,7 +3141,9 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         // tick for other draining nodes.
         const GONE_NODE_GIVEUP_MAX_PER_TICK: usize = 64;
         let node_label = node_id.to_string();
-        for &sandbox_id in local_only.iter().take(GONE_NODE_GIVEUP_MAX_PER_TICK) {
+        for &store::PinnedLocalCandidate { sandbox_id, .. } in
+            local_only.iter().take(GONE_NODE_GIVEUP_MAX_PER_TICK)
+        {
             // Adopt before mark-lost: prefer recovery over declared loss.
             // The mark-lost guard refuses while any ready snapshot exists,
             // so this chain can never terminally fail a row the adopt CAS

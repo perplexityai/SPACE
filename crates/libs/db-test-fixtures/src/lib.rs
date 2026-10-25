@@ -1,5 +1,7 @@
 use pplx_space_common_core::env::{Environment, ProcessEnvironment, test_hook};
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{
+    LocalArtifactId, NodeId, OrgId, SandboxId, SnapshotId, UserId,
+};
 
 use std::error::Error;
 use std::fmt::Display;
@@ -216,6 +218,56 @@ pub async fn publish_ready_disk_artifact(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Insert a `suspended`, `space`-managed sandbox owned by `user_id`, with no
+/// runtime behind it: the state a suspend leaves while its snapshot uploads.
+pub async fn insert_suspended_sandbox(
+    pool: &PgPool,
+    org_id: OrgId,
+    user_id: UserId,
+) -> TestDbResult<SandboxId> {
+    let sandbox_id = SandboxId::new();
+    sqlx::query(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation
+         )
+         VALUES ($1, $2, $3, 'space', 'suspended', 'on_node', 1)",
+    )
+    .bind(sandbox_id)
+    .bind(user_id)
+    .bind(org_id)
+    .execute(pool)
+    .await?;
+    Ok(sandbox_id)
+}
+
+/// Insert a `full` snapshot in `creating` for `sandbox_id`: a backup upload in
+/// flight. The row was created `created_secs_ago`, and its upload worker last
+/// started an attempt `last_attempt_secs_ago`, if it has heartbeated at all.
+pub async fn insert_uploading_snapshot(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    created_secs_ago: u64,
+    last_attempt_secs_ago: Option<u64>,
+) -> TestDbResult<SnapshotId> {
+    let snapshot_id = SnapshotId::new();
+    sqlx::query(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, last_attempt_at)
+         VALUES (
+             $1, $2, 'full', 'creating',
+             NOW() - make_interval(secs => $3::BIGINT),
+             NOW() - make_interval(secs => $4::BIGINT)
+         )",
+    )
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(i64::try_from(created_secs_ago)?)
+    .bind(last_attempt_secs_ago.map(i64::try_from).transpose()?)
+    .execute(pool)
+    .await?;
+    Ok(snapshot_id)
 }
 
 /// Insert a warm-pool slot receipt in the given state (`bound`, `claimed`,

@@ -233,7 +233,7 @@ async fn process_connect_and_kill_relay_to_guest_bridge() {
     let client = fixture.client().await;
 
     let mut events = client
-        .connect_process_stream_with_cursor("proc-1".into(), None, None)
+        .connect_process_stream_with_cursor("proc-1".into(), None, None, false)
         .await
         .expect("connect response");
     assert_eq!(

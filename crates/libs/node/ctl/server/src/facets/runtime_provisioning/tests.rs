@@ -76,15 +76,19 @@ fn recipe_validation_is_complete_and_deduplicates_shared_dependencies() {
 }
 
 #[test]
-fn missing_policy_and_old_servers_do_not_become_empty_recipes() {
+fn missing_recipe_and_old_servers_do_not_become_empty_recipes() {
     for response in [
-        Ok(GetNodeRuntimeDesiredStateResponse { recipe: None }),
+        Ok(GetNodeRuntimeDesiredStateResponse {
+            recipe: None,
+            execution_policy: None,
+        }),
         Err(Status::unimplemented("older cluster")),
     ] {
         assert_eq!(recipe_from_response(response).unwrap(), None);
     }
     let empty = recipe_from_response(Ok(GetNodeRuntimeDesiredStateResponse {
         recipe: Some(recipe(&[])),
+        execution_policy: None,
     }))
     .unwrap();
     assert!(empty.unwrap().required_environments.is_empty());

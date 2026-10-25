@@ -120,7 +120,7 @@ variable "cluster_admin_principal_arns" {
 }
 
 variable "node_instance_metadata_hop_limit" {
-  description = "IMDSv2 PUT response hop limit on every node launch template; 2 lets pods on the node network reach IMDS"
+  description = "IMDSv2 PUT response hop limit on every node launch template; 2 lets pods on the node network reach IMDS. A custom-AMI pool rolls onto a change, and an EKS-managed-AMI pool's node group stays on its old launch-template version until it's moved (see aws_eks_node_group.managed)."
   type        = number
   default     = 2
 }
@@ -137,11 +137,14 @@ variable "node_pools" {
     values may not be. For a pool with no `ami_id`, `min_size` and
     `max_size` are applied whenever they change, and `desired_size` at creation
     only: afterwards it moves through the EKS API or a cluster-autoscaler the
-    caller runs on the group, and Terraform ignores it. A custom-AMI pool
-    keeps all three under Terraform. `update_strategy` is the group's
-    rolling-update strategy: null leaves EKS's default, which launches
-    replacements before draining; `MINIMAL` drains first, so a roll never runs
-    more nodes than the group's size.
+    caller runs on the group, and Terraform ignores it. Such a pool's node
+    group also stays on its launch-template version, so a template change
+    doesn't roll it; the comment on `aws_eks_node_group.managed` gives the
+    ways to move it. A custom-AMI pool keeps all three sizes and its launch
+    template version under Terraform, and a template change rolls it.
+    `update_strategy` is the group's rolling-update strategy: null leaves
+    EKS's default, which launches replacements before draining; `MINIMAL`
+    drains first, so a roll never runs more nodes than the group's size.
 
     `launch_template_and_role_only` true keeps only the pool's launch template,
     node IAM role, and the role's policy attachments, and creates no node

@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    native::{ProcessReplayState, first_frame_attach_token_from_recv},
-    runtime_route::sweep_expired_ecw_routes,
-};
+use crate::{native::first_frame_attach_token_from_recv, runtime_route::sweep_expired_ecw_routes};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
 use pplx_space_common_core::{
@@ -31,8 +28,8 @@ use pplx_space_node_api_client::proto::{
     UnstableResolveSandboxServiceRouteRequest, UnstableResolveSandboxServiceRouteResponse,
 };
 use pplx_space_sbx_mgr_client::proto::{
-    SpacedProcessExit, SpacedProcessExited, SpacedProcessOutput, spaced_process_event,
-    spaced_process_exit,
+    SpacedProcessExit, SpacedProcessExited, SpacedProcessOutput, SpacedProcessSignaled,
+    SpacedProcessTimedOut, SpacedProcessUnknown, spaced_process_event, spaced_process_exit,
 };
 use std::borrow::Cow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1169,6 +1166,68 @@ async fn backend_channels_accept_bare_direct_node_endpoints() {
 
     assert_eq!(channels.len(), 2);
     assert_eq!(dns_channels.len(), 1);
+}
+
+#[tokio::test]
+async fn backend_channels_advertise_the_configured_connection_window() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const FRAME_SETTINGS: u8 = 0x4;
+    const FRAME_WINDOW_UPDATE: u8 = 0x8;
+    const DEFAULT_WINDOW: u32 = 65_535;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let channel = build_backend_channels(&endpoint, 1)
+        .await
+        .expect("backend channel")
+        .remove(0);
+    // A lazy channel dials on its first call; the call itself never completes.
+    let call = tokio::spawn(
+        channel.oneshot(
+            tonic::codegen::http::Request::builder()
+                .uri(format!("http://{endpoint}/probe"))
+                .body(tonic::body::Body::empty())
+                .unwrap(),
+        ),
+    );
+
+    let increment = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut preface = [0; PREFACE.len()];
+        socket.read_exact(&mut preface).await.unwrap();
+        assert_eq!(preface, PREFACE);
+        socket
+            .write_all(&[0, 0, 0, FRAME_SETTINGS, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        // The client raises the connection window past the protocol default
+        // with a WINDOW_UPDATE on stream 0.
+        loop {
+            let mut header = [0; 9];
+            socket.read_exact(&mut header).await.unwrap();
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
+            let mut payload = vec![0; len];
+            socket.read_exact(&mut payload).await.unwrap();
+            if header[3] == FRAME_WINDOW_UPDATE && stream & 0x7fff_ffff == 0 {
+                break u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fff_ffff;
+            }
+        }
+    })
+    .await
+    .expect("connection WINDOW_UPDATE");
+    call.abort();
+
+    assert_eq!(
+        DEFAULT_WINDOW + increment,
+        pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES
+    );
 }
 
 #[tokio::test]
@@ -3565,27 +3624,49 @@ fn process_events_map_to_native_data_plane_frames() {
         }]
     );
 
-    let exited = process_event_frames(
-        ProcessEvent {
-            process_id: "proc-1".to_string(),
-            pid: Some(7),
-            event: Some(spaced_process_event::Event::Exit(SpacedProcessExit {
-                outcome: Some(spaced_process_exit::Outcome::Exited(SpacedProcessExited {
-                    exit_code: 13,
+    // Each outcome's shell-style code, as `getProcess` reports it too.
+    for (outcome, exit_code, status) in [
+        (
+            spaced_process_exit::Outcome::Exited(SpacedProcessExited { exit_code: 13 }),
+            13,
+            DataPlaneProcessExitStatus::Exited,
+        ),
+        (
+            spaced_process_exit::Outcome::Signaled(SpacedProcessSignaled { signal: Some(9) }),
+            137,
+            DataPlaneProcessExitStatus::Signaled,
+        ),
+        (
+            spaced_process_exit::Outcome::TimedOut(SpacedProcessTimedOut { signal: Some(9) }),
+            124,
+            DataPlaneProcessExitStatus::TimedOut,
+        ),
+        (
+            spaced_process_exit::Outcome::Unknown(SpacedProcessUnknown {}),
+            1,
+            DataPlaneProcessExitStatus::Unknown,
+        ),
+    ] {
+        let exited = process_event_frames(
+            ProcessEvent {
+                process_id: "proc-1".to_string(),
+                pid: Some(7),
+                event: Some(spaced_process_event::Event::Exit(SpacedProcessExit {
+                    outcome: Some(outcome),
                 })),
-            })),
-        },
-        &mut seq,
-    );
-    assert_eq!(exited.output_bytes, 0);
-    assert_eq!(
-        exited.frames,
-        vec![DataPlaneServerFrame::ProcessExited {
-            process_id: "proc-1".to_string(),
-            exit_code: 13,
-            status: DataPlaneProcessExitStatus::Exited,
-        }]
-    );
+            },
+            &mut seq,
+        );
+        assert_eq!(exited.output_bytes, 0);
+        assert_eq!(
+            exited.frames,
+            vec![DataPlaneServerFrame::ProcessExited {
+                process_id: "proc-1".to_string(),
+                exit_code,
+                status,
+            }]
+        );
+    }
 }
 
 #[test]
@@ -3701,47 +3782,29 @@ async fn first_frame_attach_token_times_out_at_deadline() {
     assert_eq!(result, Err(DataPlaneErrorCode::AttachDeadlineExceeded));
 }
 
-#[test]
-fn process_sse_resume_emits_resync_at_next_event_id() {
-    let session_id = DataPlaneSessionId::Process(Default::default());
-    let replay = ProcessReplayState::load(session_id, Some(41));
-
-    assert_eq!(replay.event_seq, 42);
-    assert_eq!(replay.backend_output_cursor, None);
-    assert_eq!(replay.pending.len(), 1);
-
-    let fresh = ProcessReplayState::load(session_id, None);
-    assert_eq!(fresh.event_seq, 0);
-    assert!(fresh.pending.is_empty());
-}
-
-/// The public reconnection contract, shared by process and file-watch
-/// sessions: `Last-Event-ID` resumes the live stream at `last + 1` behind a
-/// `resync_required(cursor_replay_unavailable)` frame; no cursor, no frame.
-/// Missed output is never replayed, so the backend cursor stays unset.
+/// The file-watch reconnection contract: `Last-Event-ID` resumes the live
+/// stream at `last + 1` behind a `resync_required(cursor_replay_unavailable)`
+/// frame; no cursor, no frame.
 #[test]
 fn last_event_id_resume_is_a_cursor_replay_unavailable_resync() {
-    for kind in ["process", "file_watch"] {
-        assert_eq!(resume_resync_frame(kind, None), None, "{kind}");
-        assert_eq!(
-            resume_resync_frame(kind, Some(41)),
-            Some((
-                42,
-                DataPlaneServerFrame::ResyncRequired {
-                    reason: DataPlaneResyncReason::CursorReplayUnavailable,
-                },
-            )),
-            "{kind}"
-        );
-        // The largest cursor the request boundary admits still gets a fresh id.
-        assert_eq!(
-            resume_resync_frame(kind, Some(MAX_LAST_EVENT_ID)).map(|(seq, _)| seq),
-            Some(MAX_LAST_EVENT_ID + 1),
-            "{kind}"
-        );
-    }
+    let kind = "file_watch";
+    assert_eq!(resume_resync_frame(kind, None), None);
     assert_eq!(
-        resume_resync_frame("process", Some(0)).map(|(seq, _)| seq),
+        resume_resync_frame(kind, Some(41)),
+        Some((
+            42,
+            DataPlaneServerFrame::ResyncRequired {
+                reason: DataPlaneResyncReason::CursorReplayUnavailable,
+            },
+        ))
+    );
+    // The largest cursor the request boundary admits still gets a fresh id.
+    assert_eq!(
+        resume_resync_frame(kind, Some(MAX_LAST_EVENT_ID)).map(|(seq, _)| seq),
+        Some(MAX_LAST_EVENT_ID + 1)
+    );
+    assert_eq!(
+        resume_resync_frame(kind, Some(0)).map(|(seq, _)| seq),
         Some(1)
     );
 }

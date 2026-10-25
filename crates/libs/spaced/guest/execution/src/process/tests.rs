@@ -335,7 +335,7 @@ async fn losing_start_response_preserves_output_supervision_and_idempotency() {
             let mut changed = record.journal.subscribe();
             while record.journal.tail_cursor() < 2
                 || (completed && !record.journal.is_completed())
-                || (evicted && !matches!(record.journal.read(0), ProcessJournalRead::Lagged))
+                || (evicted && !matches!(record.journal.read(0), ProcessJournalRead::Lagged { .. }))
             {
                 changed.changed().await.unwrap();
             }
@@ -369,7 +369,10 @@ async fn losing_start_response_preserves_output_supervision_and_idempotency() {
                         Err(error) => {
                             assert!(evicted);
                             assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-                            assert_eq!(error.message(), PROCESS_OUTPUT_LAGGED_MESSAGE);
+                            assert_eq!(
+                                error.message(),
+                                pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE
+                            );
                             lagged = true;
                             assert!(replay.next().await.is_none());
                             break;
@@ -456,7 +459,7 @@ async fn failed_start_retains_admission_until_the_child_is_reaped() {
             child.wait().await.expect("child exits");
             assert!(child.id().is_none());
         }
-        terminate_and_reap_failed_start(child, reservation);
+        terminate_and_reap_failed_start(child, reservation, &tokio_util::task::TaskTracker::new());
         assert_eq!(
             registry.record_slots.available_permits(),
             PROCESS_RECORD_LIMIT - 1
@@ -521,7 +524,7 @@ async fn process_journal_reports_lag_when_local_ring_evicts_output() {
             ));
         }
         assert!(
-            matches!(journal.read(0), ProcessJournalRead::Lagged),
+            matches!(journal.read(0), ProcessJournalRead::Lagged { .. }),
             "retention must charge tiny event overhead as well as payloads"
         );
         assert!(matches!(
@@ -545,7 +548,7 @@ async fn attached_output_backpressures_and_disconnect_releases_the_producer() {
             shared_bytes,
         ))));
         let process_id = ProcessId::new();
-        let cursor = journal.cursor(Some(0));
+        let cursor = journal.cursor(Some(0), false);
         let event = process_stdout_event(&process_id, Some(1), vec![b'a'; 8192]);
         while journal.try_append_output(event.clone()).is_none() {}
         let tail = journal.tail_cursor();
@@ -646,7 +649,8 @@ async fn fallback_drain_bounds_inherited_writer_despite_consuming_reader() {
     let id = ProcessId::new();
     let pid = std::process::id();
     let journal = Arc::new(ProcessEventJournal::new(output_slots()));
-    let mut stream = process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0))));
+    let mut stream =
+        process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0), false)));
     let event = process_stdout_event(&id, Some(pid), vec![0; 8192]);
     while journal.try_append_output(event.clone()).is_none() {}
     let (blocked, mut pending) = tokio::sync::mpsc::channel(1);
@@ -773,7 +777,7 @@ async fn kill_reaped_process_releases_stalled_output_and_capacity() {
     )
     .await;
     let completed = tokio::time::timeout(Duration::from_secs(2), async {
-        while !service.inner.processes.list().is_empty() {
+        while !service.inner.processes.list(false, None).is_empty() {
             tokio::task::yield_now().await;
         }
     })
@@ -804,7 +808,7 @@ fn process_journal_drops_oversized_chunk_without_panicking() {
         vec![0; PROCESS_OUTPUT_RETENTION_BYTES + 1],
     ));
 
-    assert!(matches!(journal.read(0), ProcessJournalRead::Lagged));
+    assert!(matches!(journal.read(0), ProcessJournalRead::Lagged { .. }));
 }
 
 #[test]
@@ -823,7 +827,7 @@ fn output_pressure_is_isolated_to_one_process() {
     ));
     noisy.append_output(process_stdout_event(&noisy_id, Some(1), vec![1]));
 
-    assert!(matches!(noisy.read(0), ProcessJournalRead::Lagged));
+    assert!(matches!(noisy.read(0), ProcessJournalRead::Lagged { .. }));
     assert!(matches!(quiet.read(0), ProcessJournalRead::Event(_)));
 }
 
@@ -904,6 +908,138 @@ async fn evicted_cursor_reports_lag_before_terminal_event() {
     );
 }
 
+/// A cursor past the written output fails at once, whether the process is
+/// still running or has exited, rather than waiting for output to reach it and
+/// skipping everything written before. The end of the output stays valid.
+#[tokio::test]
+async fn cursor_past_the_output_fails_instead_of_waiting() {
+    for completed in [false, true] {
+        let journal = Arc::new(ProcessEventJournal::new(output_slots()));
+        let process_id = ProcessId::new();
+        journal.append_output(process_stdout_event(
+            &process_id,
+            Some(1),
+            b"written".to_vec(),
+        ));
+        let exit = process_stdout_event(&process_id, Some(1), b"terminal".to_vec());
+        if completed {
+            journal.complete(exit.clone());
+        }
+
+        let mut ahead =
+            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(5), false)));
+        let error = tokio::time::timeout(Duration::from_secs(1), ahead.next())
+            .await
+            .expect("a cursor past the output must not wait")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::OutOfRange,
+            "completed: {completed}"
+        );
+        assert_eq!(
+            error
+                .metadata()
+                .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+        );
+        assert!(ahead.next().await.is_none());
+
+        let mut at_end =
+            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(1), false)));
+        let next = tokio::time::timeout(Duration::from_millis(100), at_end.next()).await;
+        if completed {
+            assert_eq!(next.unwrap().unwrap().unwrap(), exit);
+        } else {
+            assert!(next.is_err(), "the end of a running process's output waits");
+        }
+    }
+}
+
+/// A cursor before the oldest retained output fails with a status that says
+/// so and where that output starts, so the caller can continue from there
+/// instead of jumping to the live tail.
+#[tokio::test]
+async fn lagged_cursor_reports_the_oldest_retained_output() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+
+    let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(0))));
+    let process_id = ProcessId::new();
+    journal.append_output(process_stdout_event(
+        &process_id,
+        Some(1),
+        vec![0; PROCESS_OUTPUT_RETENTION_BYTES],
+    ));
+    journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
+
+    let mut lagged =
+        process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0), false)));
+    let error = lagged.next().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    let metadata = |key| {
+        error
+            .metadata()
+            .get(key)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        metadata(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY).as_deref(),
+        Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED)
+    );
+    let first_sequence: u64 =
+        metadata(pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+            .expect("the oldest retained output")
+            .parse()
+            .unwrap();
+    assert_eq!(first_sequence, 1);
+    assert!(lagged.next().await.is_none());
+
+    let mut retained = process_event_stream_with_prefix(
+        Vec::new(),
+        Some(journal.cursor(Some(first_sequence), false)),
+    );
+    let event = retained.next().await.unwrap().unwrap();
+    assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
+}
+
+/// A lagged cursor that asks for the oldest retained output starts there,
+/// and holds it: the start is chosen under the lock that makes the reader
+/// primary, so output written before it reads anything waits for it instead
+/// of evicting that output, and the reader cannot lag again.
+#[tokio::test]
+async fn lagged_cursor_from_oldest_retained_starts_there_and_holds_it() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+
+    let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(0))));
+    let process_id = ProcessId::new();
+    journal.append_output(process_stdout_event(
+        &process_id,
+        Some(1),
+        vec![0; PROCESS_OUTPUT_RETENTION_BYTES],
+    ));
+    journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
+
+    let cursor = journal.cursor(Some(0), true);
+    assert_eq!(
+        cursor.next_sequence, 1,
+        "starts at the oldest retained output"
+    );
+    let more = process_stdout_event(&process_id, Some(1), vec![0; 8192]);
+    let waited = (0..2 * PROCESS_OUTPUT_RETENTION_BYTES / 8192)
+        .any(|_| journal.try_append_output(more.clone()).is_some());
+    assert!(
+        waited,
+        "later output waits for the reader instead of evicting"
+    );
+
+    let mut retained = process_event_stream_with_prefix(Vec::new(), Some(cursor));
+    let event = retained.next().await.unwrap().unwrap();
+    assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
+}
+
 #[tokio::test]
 async fn login_tty_pty_supports_output_input_and_resize() {
     let prepared = prepare_pty(Some(PtySize { rows: 24, cols: 80 })).expect("open test pty");
@@ -981,24 +1117,50 @@ async fn login_tty_pty_supports_output_input_and_resize() {
 
 #[tokio::test]
 async fn cancelled_account_lookup_retains_admission_until_nss_returns() {
+    let service = cancellation_service();
     let slots = Arc::new(Semaphore::new(
         pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS as usize,
     ));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let lookup = tokio::spawn(resolve_process_account(slots.clone(), None, move || {
-        let _ = started_tx.send(());
-        release_rx.recv().unwrap();
-        Err(Status::unavailable("lookup fixture finished"))
-    }));
+    let lookup = tokio::spawn(resolve_process_account(
+        service.inner.process_tasks.clone(),
+        slots.clone(),
+        None,
+        move || {
+            let _ = started_tx.send(());
+            release_rx.recv().unwrap();
+            Err(Status::unavailable("lookup fixture finished"))
+        },
+    ));
     started_rx.await.unwrap();
     lookup.abort();
     let _ = lookup.await;
-    let retry = resolve_process_account(slots.clone(), None, || {
-        Err(Status::unavailable("lookup ran"))
-    })
+    let retry = resolve_process_account(
+        service.inner.process_tasks.clone(),
+        slots.clone(),
+        None,
+        || Err(Status::unavailable("lookup ran")),
+    )
     .await;
+    let mut draining = Box::pin(service.drain());
+    assert!(futures_util::poll!(&mut draining).is_pending());
+    drop(draining);
+    assert!(
+        !service.inner.shutdown.is_cancelled(),
+        "dropping a graceful drain must not cancel work"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            service.drain_with_timeout(Duration::ZERO).await,
+            Err(crate::IncompleteExecutionDrain)
+        );
+    }
+    assert!(service.inner.shutdown.is_cancelled());
     release_tx.send(()).unwrap();
+    let (first, second) = tokio::join!(service.drain(), service.drain());
+    first.expect("first drain observes lookup completion");
+    second.expect("concurrent drain observes lookup completion");
     let retry = retry.unwrap_err();
     assert_eq!(retry.code(), tonic::Code::ResourceExhausted);
     assert!(pplx_space_common_grpc::is_refused_before_start(&retry));
@@ -1118,7 +1280,7 @@ fn stalled_placement_service() -> (ExecutionService, StalledPlacement) {
 #[cfg(target_os = "linux")]
 async fn wait_for_start_owner(service: &ExecutionService) {
     tokio::time::timeout(Duration::from_secs(10), async {
-        while service.inner.process_tasks.is_empty() {
+        while service.inner.processes.records.is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -1128,9 +1290,8 @@ async fn wait_for_start_owner(service: &ExecutionService) {
 
 #[cfg(target_os = "linux")]
 async fn shut_down(service: &ExecutionService) {
-    service.inner.shutdown.cancel();
-    service.close_process_admission();
-    service.inner.process_tasks.wait().await;
+    service.cancel();
+    service.drain().await.expect("complete shutdown");
 }
 
 // A spawn can stall for seconds under memory or I/O pressure. It must hold up
@@ -1187,7 +1348,7 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
                         .map(drop)
                     }
                 });
-                while service.inner.process_tasks.len() < 2 {
+                while service.inner.processes.records.len() < 2 {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 let _ = admitted_tx.send(());
@@ -1296,7 +1457,7 @@ async fn a_start_dropped_during_its_spawn_still_runs_once() {
     let (service, placement) = stalled_placement_service();
     let mut start = Box::pin(Process::start(&service, cancellation_start_request()));
     tokio::time::timeout(Duration::from_secs(1), async {
-        while service.inner.process_tasks.is_empty() {
+        while service.inner.processes.records.is_empty() {
             assert!(futures_util::poll!(start.as_mut()).is_pending());
             tokio::task::yield_now().await;
         }
@@ -1333,8 +1494,8 @@ async fn a_start_dropped_during_its_spawn_still_runs_once() {
     shut_down(&service).await;
 }
 
-// Shutdown closes `process_tasks` under the start gate, so it must also wait
-// for a start whose spawn is still in progress, then stop that process.
+// Cancellation must retain a start whose spawn is still in progress, then
+// stop and reap that process before reporting a complete drain.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn shutdown_waits_for_a_start_stalled_in_its_spawn() {
@@ -1355,21 +1516,18 @@ async fn shutdown_waits_for_a_start_stalled_in_its_spawn() {
         }
     });
     wait_for_start_owner(&service).await;
-    service.inner.shutdown.cancel();
-    service.close_process_admission();
+    service.cancel();
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            service.inner.process_tasks.wait()
-        )
-        .await
-        .is_err(),
+        tokio::time::timeout(Duration::from_millis(200), service.drain())
+            .await
+            .is_err(),
         "the drain must wait for a start still in its spawn"
     );
     placement.release();
-    tokio::time::timeout(Duration::from_secs(5), service.inner.process_tasks.wait())
+    tokio::time::timeout(Duration::from_secs(5), service.drain())
         .await
-        .expect("the drain completes once the spawn returns");
+        .expect("the drain completes once the spawn returns")
+        .expect("cleanup completed");
     start.await.unwrap().expect("the admitted start completes");
     let record = service
         .inner
@@ -1417,12 +1575,18 @@ async fn an_exited_process_task_does_not_wait_out_its_record_retention() {
         event.expect("process stream remains successful");
     }
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !service.inner.process_tasks.is_empty() {
+        while service.inner.process_tasks.len() != 1
+            || !service
+                .inner
+                .processes
+                .reaper_running
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the exited process's task ends without waiting out the retention");
+    .expect("only the shared retention reaper remains");
     let registry = &service.inner.processes;
     assert_eq!(registry.records.len(), 1, "the record is still retained");
     assert!(registry.next_expiry().is_some());
@@ -1440,11 +1604,458 @@ async fn an_exited_process_task_does_not_wait_out_its_record_retention() {
             .record()
             .expect("published")
             .journal
-            .backdate_completion(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
+            .backdate_completion(COMPLETED_PROCESS_RETENTION + Duration::from_secs(1));
     }
     registry.remove_expired();
     assert_eq!(registry.records.len(), 0);
     assert_eq!(registry.next_expiry(), None);
+}
+
+// A client that reattaches after its command ended still reads the exit, well
+// past the start's idempotency window, until the completed record's retention
+// ends. The process list reports it, with its exit, only when asked.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_completed_process_exit_stays_connectable_until_its_retention_ends() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        process_event::Event, process_exit::Outcome,
+    };
+    let service = cancellation_service();
+    let process_id = "sbxps_2f1c9a4e-0000-7000-8000-000000000003";
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+            idempotency_key: Some("exit-retention".into()),
+            process_id: Some(process_id.into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    let connect = || {
+        Process::connect_process(
+            &service,
+            Request::new(ConnectProcessRequest {
+                process_id: process_id.into(),
+                timeout: None,
+                output_cursor: None,
+                resume_from_oldest_retained: false,
+            }),
+        )
+    };
+    let backdate = |by: Duration| {
+        for entry in service.inner.processes.records.iter() {
+            entry
+                .record()
+                .expect("published")
+                .journal
+                .backdate_completion(by);
+        }
+    };
+
+    backdate(COMPLETED_PROCESS_OUTPUT_RETENTION + Duration::from_secs(1));
+    service.inner.processes.remove_expired();
+    let events = connect()
+        .await
+        .expect("the completed process is still retained")
+        .into_inner()
+        .collect::<Vec<_>>()
+        .await;
+    let exit = events
+        .last()
+        .and_then(|event| event.as_ref().ok())
+        .and_then(|event| event.event.clone());
+    let Some(Event::Exit(exit)) = exit else {
+        panic!("reattach ends with the exit: {events:?}");
+    };
+    assert_eq!(
+        exit.outcome,
+        Some(Outcome::Exited(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessExited { exit_code: 7 }
+        ))
+    );
+    assert!(
+        service.inner.processes.list(false, None).is_empty(),
+        "the default list reports running processes only"
+    );
+    assert!(
+        service
+            .inner
+            .processes
+            .list(true, Some("sbxps_2f1c9a4e-0000-7000-8000-000000000099"))
+            .is_empty(),
+        "a filtered list reports only the process asked for"
+    );
+    let listed = service.inner.processes.list(true, Some(process_id));
+    let [listed] = listed.as_slice() else {
+        panic!("the exited process is listed when asked: {listed:?}");
+    };
+    assert_eq!(listed.process_id, process_id);
+    assert_eq!(
+        listed.exit.as_ref().and_then(|exit| exit.outcome),
+        Some(Outcome::Exited(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessExited { exit_code: 7 }
+        ))
+    );
+    assert!(listed.ended_at.is_some(), "{listed:?}");
+
+    backdate(COMPLETED_PROCESS_RETENTION);
+    service.inner.processes.remove_expired();
+    let status = connect()
+        .await
+        .err()
+        .expect("the record is gone once its retention ends");
+    assert_eq!(status.code(), tonic::Code::NotFound, "{status:?}");
+    shut_down(&service).await;
+}
+
+// A finished process keeps its output only for its start's idempotency
+// window; after that the reaper returns the shared output budget to running
+// processes and the record keeps just its exit.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_completed_process_releases_its_output_after_the_idempotency_window() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+    let service = cancellation_service();
+    let registry = &service.inner.processes;
+    let process_id = "sbxps_2f1c9a4e-0000-7000-8000-000000000004";
+    let idle_shared = registry.shared_output_slots.available_permits();
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            // Past the per-record guaranteed share, so it borrows shared budget.
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "head -c 1048576 /dev/zero".into(),
+            ],
+            env: [("OUTPUT_RELEASE".into(), "kept".into())].into(),
+            idempotency_key: Some("output-release".into()),
+            process_id: Some(process_id.into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    assert!(
+        registry.shared_output_slots.available_permits() < idle_shared,
+        "the finished process still holds its output for a retried start"
+    );
+    let listed_env = || {
+        registry
+            .list(true, Some(process_id))
+            .pop()
+            .expect("the exited process is listed")
+            .env
+    };
+    assert_eq!(
+        listed_env().get("OUTPUT_RELEASE").map(String::as_str),
+        Some("kept")
+    );
+
+    for entry in registry.records.iter() {
+        entry
+            .record()
+            .expect("published")
+            .journal
+            .backdate_completion(COMPLETED_PROCESS_OUTPUT_RETENTION + Duration::from_secs(1));
+    }
+    registry.remove_expired();
+    assert_eq!(
+        registry.shared_output_slots.available_permits(),
+        idle_shared,
+        "the shared output budget is released"
+    );
+    assert!(
+        listed_env().is_empty(),
+        "the environment goes with the output"
+    );
+    // The reaper's next work for it is the end of its retention.
+    assert!(
+        registry.next_expiry().is_some_and(
+            |next| next > tokio::time::Instant::now() + COMPLETED_PROCESS_OUTPUT_RETENTION
+        ),
+        "{:?}",
+        registry.next_expiry()
+    );
+    let events = Process::connect_process(
+        &service,
+        Request::new(ConnectProcessRequest {
+            process_id: process_id.into(),
+            timeout: None,
+            output_cursor: None,
+            resume_from_oldest_retained: false,
+        }),
+    )
+    .await
+    .expect("the exit is still retained")
+    .into_inner()
+    .collect::<Vec<_>>()
+    .await;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [Ok(started), Ok(exit)]
+                if matches!(started.event, Some(Event::Started(_)))
+                    && matches!(exit.event, Some(Event::Exit(_)))
+        ),
+        "a reattach without a cursor gets the start and the exit: {events:?}"
+    );
+    shut_down(&service).await;
+}
+
+// Each finished process's output is released on time, even while the reaper
+// sleeps toward a later deadline. It used to wake only on its timer, so after
+// releasing one record's output it slept until that record expired, and a
+// command finishing meanwhile kept its output and shared budget until then.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_reaper_releases_a_later_exit_output_on_time() {
+    let service = cancellation_service();
+    let registry = &service.inner.processes;
+    let idle_shared = registry.shared_output_slots.available_permits();
+    let run = |key: &'static str, script: &'static str| {
+        let service = &service;
+        async move {
+            let response = Process::start(
+                service,
+                Request::new(StartRequest {
+                    command: vec!["/bin/sh".into(), "-c".into(), script.into()],
+                    idempotency_key: Some(key.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("process starts");
+            let mut events = response.into_inner();
+            while let Some(event) = events.next().await {
+                event.expect("process stream remains successful");
+            }
+        }
+    };
+    // Advances the reaper's clock past an output window and lets it work.
+    let after_output_window = || async {
+        tokio::time::pause();
+        tokio::time::advance(COMPLETED_PROCESS_OUTPUT_RETENTION + Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    };
+
+    run("reaper-first", "exit 0").await;
+    after_output_window().await;
+    assert!(
+        registry.next_expiry().is_some_and(|next| {
+            next > tokio::time::Instant::now() + COMPLETED_PROCESS_OUTPUT_RETENTION
+        }),
+        "the first output is released and the reaper sleeps toward its retention end"
+    );
+    tokio::time::resume();
+
+    // Past the per-record guaranteed share, so it borrows shared budget.
+    run("reaper-second", "head -c 1048576 /dev/zero").await;
+    assert!(registry.shared_output_slots.available_permits() < idle_shared);
+    after_output_window().await;
+    let released = registry.shared_output_slots.available_permits();
+    tokio::time::resume();
+    assert_eq!(
+        released, idle_shared,
+        "the second output is released one window after its exit"
+    );
+    shut_down(&service).await;
+}
+
+// A write in flight when the process exits keeps the stdin pipe only until it
+// returns; the release used to skip a held pipe and never come back to it, so
+// a descendant read no EOF until the record went. A write that passed its
+// running check just before the exit is answered as for an exited process.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_write_in_flight_at_exit_closes_stdin_when_it_returns() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::SendSignalRequest;
+    let service = cancellation_service();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("stdin-closed");
+    let reading = directory.path().join("reading");
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"exec 3<&0; (touch "$2"; cat <&3 >/dev/null; touch "$1") >/dev/null 2>&1 & exec sleep 30"#
+                    .into(),
+                "sh".into(),
+                marker.to_str().unwrap().into(),
+                reading.to_str().unwrap().into(),
+            ],
+            stdin: true,
+            idempotency_key: Some("stdin-held-release".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    let started = events
+        .next()
+        .await
+        .expect("started")
+        .expect("process stream remains successful");
+    let record = service
+        .inner
+        .processes
+        .get_running(&ProcessId::parse(started.process_id.clone()).unwrap())
+        .expect("running");
+    let ProcessInput::Pipe(stdin) = &record.input else {
+        panic!("pipe stdin")
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !reading.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the descendant reads stdin");
+    let held = stdin.lock().await;
+    Process::send_signal(
+        &service,
+        Request::new(SendSignalRequest {
+            process_id: started.process_id,
+            signal: libc::SIGKILL,
+        }),
+    )
+    .await
+    .expect("the leader is killed");
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    assert!(record.journal.is_completed());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!marker.exists(), "the held write keeps the pipe open");
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the descendant reads EOF once the held write returns");
+    let status = record
+        .write_stdin(b"late")
+        .await
+        .expect_err("the process has exited");
+    assert_eq!(status.code(), tonic::Code::NotFound, "{status:?}");
+    drop(record);
+    shut_down(&service).await;
+}
+
+// Once the process has exited its input descriptors close: a descendant still
+// reading the stdin pipe sees EOF rather than blocking for the retention.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_exited_process_closes_its_stdin_for_descendants() {
+    let service = cancellation_service();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("stdin-closed");
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                // The background reader holds the stdin pipe, not the output.
+                r#"exec 3<&0; (cat <&3 >/dev/null; touch "$1") >/dev/null 2>&1 & exit 0"#.into(),
+                "sh".into(),
+                marker.to_str().unwrap().into(),
+            ],
+            stdin: true,
+            idempotency_key: Some("stdin-release".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the descendant reads EOF once the process has exited");
+    shut_down(&service).await;
+}
+
+// The PTY's writer and resize descriptors close with the exit, so the master
+// is gone and a descendant still writing to the terminal gets EIO. The
+// descendant leaves the process group, so it outlives the output drain.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_exited_pty_process_closes_its_terminal() {
+    let service = cancellation_service();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("terminal-write");
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                // The leader exits once the descendant has left its group.
+                concat!(
+                    "setsid sh -c 'touch \"$2\"; for _ in $(seq 100); do ",
+                    "echo x >&3 2>/dev/null || { echo failed > \"$1\"; exit; }; sleep 0.1; ",
+                    "done; echo written > \"$1\"' sh \"$1\" \"$2\" 3>&1 </dev/null >/dev/null 2>&1 & ",
+                    "while [ ! -e \"$2\" ]; do sleep 0.05; done; exit 0",
+                )
+                .into(),
+                "sh".into(),
+                marker.to_str().unwrap().into(),
+                directory.path().join("detached").to_str().unwrap().into(),
+            ],
+            pty: Some(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::PtyConfig { size: None },
+            ),
+            idempotency_key: Some("pty-release".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(result) = std::fs::read_to_string(&marker) {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the descendant finishes writing");
+    assert_eq!(
+        result.trim(),
+        "failed",
+        "a terminal write fails once the process has exited"
+    );
+    shut_down(&service).await;
 }
 
 // The retained-output budget follows the guest's memory: a 2 GiB guest keeps
@@ -1504,4 +2115,97 @@ async fn native_process_payloads_obey_message_limits_before_lookup_or_spawn() {
         assert_eq!(error.code(), tonic::Code::OutOfRange);
     }
     assert!(service.inner.processes.records.is_empty());
+}
+
+#[tokio::test]
+async fn image_working_directory_is_used_unless_command_overrides_it() {
+    let image_directory = tempfile::tempdir().unwrap();
+    let override_directory = tempfile::tempdir().unwrap();
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .unwrap()
+        .unwrap();
+    for (default, requested, expected) in [
+        (Some(image_directory.path()), None, image_directory.path()),
+        (
+            Some(image_directory.path()),
+            Some(override_directory.path()),
+            override_directory.path(),
+        ),
+        (None, None, user.dir.as_path()),
+    ] {
+        let service = ExecutionService::with_config(
+            CancellationToken::new(),
+            ExecutionServiceConfig {
+                default_operation_user: GuestUserName::parse(user.name.clone()).unwrap(),
+                default_working_dir: default.map(std::path::Path::to_path_buf),
+                filesystem_execution: FilesystemExecutionMode::Direct,
+                identity_policy: IdentityPolicy::Guest,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let response = Process::start(
+            &service,
+            Request::new(StartRequest {
+                command: vec!["/bin/pwd".into()],
+                cwd: requested.map(|path| path.to_str().unwrap().to_string()),
+                idempotency_key: Some("image-workdir".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+        let mut stdout = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let Some(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Stdout(
+                    output,
+                ),
+            ) = event.unwrap().event
+            {
+                stdout.extend(output.data);
+            }
+        }
+        service.inner.shutdown.cancel();
+        service.inner.process_tasks.close();
+        service.inner.process_tasks.wait().await;
+        assert_eq!(
+            String::from_utf8(stdout).unwrap().trim(),
+            expected.canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+}
+
+// Closing admission must not cancel an admitted spawn, including after it
+// crosses the asynchronous spawn boundary. The process itself completes normally.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn graceful_drain_waits_for_an_admitted_start_without_killing_it() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{process_event, process_exit};
+
+    let (service, placement) = stalled_placement_service();
+    let start = tokio::spawn({
+        let service = service.clone();
+        async move { Process::start(&service, cancellation_start_request()).await }
+    });
+    wait_for_start_owner(&service).await;
+    service.close();
+    let mut draining = Box::pin(service.drain());
+    assert!(futures_util::poll!(&mut draining).is_pending());
+    assert!(!service.inner.shutdown.is_cancelled());
+    placement.release();
+    let mut events = start.await.unwrap().unwrap().into_inner();
+    let mut success = false;
+    while let Some(event) = events.next().await {
+        if let Some(process_event::Event::Exit(exit)) = event.unwrap().event {
+            success = matches!(exit.outcome, Some(process_exit::Outcome::Exited(exit)) if exit.exit_code == 0);
+        }
+    }
+    assert!(
+        success,
+        "graceful closure must preserve normal process completion"
+    );
+    draining.await.expect("complete drain");
+    assert!(!service.inner.shutdown.is_cancelled());
 }

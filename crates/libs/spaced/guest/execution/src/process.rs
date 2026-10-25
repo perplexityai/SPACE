@@ -32,6 +32,16 @@ const PROCESS_OUTPUT_RETENTION_MIN_BYTES: usize = 16 * 1024 * 1024;
 // cap them as well as the output bytes. Completed records are evicted first
 // under pressure; if every slot belongs to a running process, admission fails.
 const PROCESS_RECORD_LIMIT: usize = 128;
+// How long a completed record, and so its exit, stays connectable: a client
+// that reattaches after the command ends still reads `process_exited`. Its
+// output is released `COMPLETED_PROCESS_OUTPUT_RETENTION` after the exit, so
+// finished processes do not hold the shared output budget. The record limit
+// above still bounds what is retained.
+const COMPLETED_PROCESS_RETENTION: Duration = Duration::from_secs(15 * 60);
+// How long a completed record keeps its output. A retried start replays it,
+// so this is at least the start's idempotency window. A reconnect that resumes
+// from an output cursor also replays it; after this it reads the lagged error.
+const COMPLETED_PROCESS_OUTPUT_RETENTION: Duration = IDEMPOTENCY_RECORD_TTL;
 // One process retains at most a quarter of the smallest total.
 const PROCESS_OUTPUT_RETENTION_BYTES: usize = PROCESS_OUTPUT_RETENTION_MIN_BYTES / 4;
 
@@ -79,8 +89,8 @@ const PROCESS_OUTPUT_GUARANTEED_BYTES: usize =
 const PROCESS_OUTPUT_SHARED_BYTES: usize =
     PROCESS_OUTPUT_RETENTION_MAX_BYTES - PROCESS_RECORD_LIMIT * PROCESS_OUTPUT_GUARANTEED_BYTES;
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
-const PROCESS_OUTPUT_LAGGED_MESSAGE: &str =
-    "process output stream fell behind retained output buffer";
+const PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE: &str =
+    "process output cursor is past the output the process has written";
 const PROCESS_CAPACITY_MESSAGE: &str = "too many retained processes";
 // A start phase slower than this is logged with every phase's duration once
 // the spawn returns, so a slow start names its cause. The account lookup
@@ -104,6 +114,8 @@ struct ProcessSupervision {
     process_id: ProcessId,
     pid: u32,
     registry: ProcessRegistry,
+    retained_tasks: tokio_util::task::TaskTracker,
+    closed: CancellationToken,
 }
 
 impl ProcessSupervision {
@@ -118,6 +130,8 @@ impl ProcessSupervision {
             process_id,
             pid,
             registry,
+            retained_tasks,
+            closed,
         } = self;
         let completion = async {
             #[cfg(target_os = "linux")]
@@ -183,7 +197,13 @@ impl ProcessSupervision {
             }
         }
         let exit = process_exit_event(&process_id, Some(pid), outcome);
+        // Completed first, so input that arrives from here on is refused as
+        // for an exited process before its descriptors close. Output tasks
+        // have ended, so these are the last input descriptors. The signal
+        // pidfd stays: a signal racing this exit uses it safely, as a reaped
+        // pidfd only reports ESRCH, and the record limit bounds it.
         record.journal.complete(exit);
+        record.input.release();
         // Release supervisor ownership. Eviction can free this record's
         // permit once any in-flight stdin/control handlers also release it.
         drop(record);
@@ -196,13 +216,13 @@ impl ProcessSupervision {
         drop(exit_observer);
         #[cfg(not(target_os = "linux"))]
         let () = exit_observer;
-        // The record stays for `IDEMPOTENCY_RECORD_TTL`; the registry's single
-        // reaper removes it. Waiting here instead kept this whole task (its
-        // future, about 2 KiB) alive for the retention of every start, so at
-        // sustained start rates spaced held starts/s x 60 s of them: ~48 MiB
-        // at 450 starts/s, though at most 128 records exist.
+        // The record stays for `COMPLETED_PROCESS_RETENTION`; the registry's
+        // single reaper removes it. Waiting here instead kept this whole task
+        // (its future, about 2 KiB) alive for the retention of every start:
+        // ~48 MiB at 450 starts/s with a 60 s retention, though at most 128
+        // records exist.
         drop(process_id);
-        registry.ensure_reaper(shutdown);
+        registry.ensure_reaper(closed, &retained_tasks);
     }
 }
 
@@ -354,13 +374,13 @@ impl ProcessLaunch {
         let (spawn_result, mut prepared_pty) = spawned?;
         let mut child = spawn_result.map_err(map_io_error)?;
         let Some(pid) = child.id() else {
-            terminate_and_reap_failed_start(child, process_reservation);
+            terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
             return Err(Status::internal("spawned child has no pid"));
         };
         let (signal_handle, exit_observer) = match ProcessSignalHandle::open(pid) {
             Ok(handle) => handle,
             Err(error) => {
-                terminate_and_reap_failed_start(child, process_reservation);
+                terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
                 return Err(Status::internal(format!(
                     "failed to create safe handle for spawned process: {error}"
                 )));
@@ -369,8 +389,8 @@ impl ProcessLaunch {
         let (input, pty_reader, stdout, stderr) = if let Some(pty) = prepared_pty.take() {
             (
                 ProcessInput::Pty(PtyInput {
-                    writer: Mutex::new(pty.writer),
-                    resize_fd: pty.resize_fd,
+                    writer: InputDescriptor::new(Some(pty.writer)),
+                    resize_fd: std::sync::Mutex::new(Some(pty.resize_fd)),
                 }),
                 Some(pty.reader),
                 None,
@@ -383,7 +403,7 @@ impl ProcessLaunch {
                 None
             };
             let input = if stdin_enabled {
-                ProcessInput::Pipe(Mutex::new(stdin))
+                ProcessInput::Pipe(InputDescriptor::new(stdin))
             } else {
                 ProcessInput::Disabled
             };
@@ -406,14 +426,14 @@ impl ProcessLaunch {
         {
             Ok(sources) => sources,
             Err(error) => {
-                terminate_and_reap_failed_start(child, process_reservation);
+                terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
                 return Err(map_io_error(error));
             }
         };
         let started = match process_started_event(&process_id, Some(pid)) {
             Ok(started) => started,
             Err(status) => {
-                terminate_and_reap_failed_start(child, process_reservation);
+                terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
                 return Err(status);
             }
         };
@@ -427,7 +447,7 @@ impl ProcessLaunch {
         ));
         claim.publish(Arc::clone(&record));
 
-        let cursor = record.journal.cursor(Some(0));
+        let cursor = record.journal.cursor(Some(0), false);
         let mut output_tasks = VecDeque::new();
         if let Some(reader) = pty_reader {
             output_tasks.push_back(spawn_process_output_reader(
@@ -471,6 +491,8 @@ impl ProcessLaunch {
             output_tasks,
             timeout,
             shutdown: inner.shutdown.clone(),
+            closed: inner.lifecycle.closed(),
+            retained_tasks: inner.process_tasks.clone(),
             record: Arc::clone(&record),
             process_id,
             pid,
@@ -501,10 +523,12 @@ impl ExecutionService {
             pplx_space_common_grpc::QueuedSlots::new(self.inner.process_payload_slots.clone()),
             process_limits::PAYLOAD_METHODS,
         )
+        .with_observation(pplx_space_metrics::payload::Budget::GuestProcess)
     }
 }
 
 async fn resolve_process_account(
+    tasks: tokio_util::task::TaskTracker,
     slots: Arc<Semaphore>,
     ingress: Option<pplx_space_common_grpc::RequestPermit>,
     resolve: impl FnOnce() -> Result<GuestAccount, Status> + Send + 'static,
@@ -512,11 +536,14 @@ async fn resolve_process_account(
     let admission = crate::payload::acquire(
         &slots,
         pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
+        pplx_space_metrics::payload::Budget::GuestProcess,
         ingress,
     )?;
     // NSS may block on external account providers. Keep the existing Start
     // admission with the physical lookup even if its requesting future drops.
-    tokio::task::spawn_blocking(move || resolve().map(|account| (account, admission)))
+    admission
+        .request_lifetime()
+        .observe(tasks.spawn_blocking(move || resolve().map(|account| (account, admission))))
         .await
         .map_err(|error| Status::internal(format!("guest account lookup task failed: {error}")))?
 }
@@ -532,6 +559,9 @@ pub(super) struct ProcessRegistry {
     /// Whether the retention reaper is running. It runs only while a
     /// completed record is retained, so an idle daemon has no timer.
     reaper_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes a running reaper to look again: a newly completed record's
+    /// output can be due before the deadline it is sleeping until.
+    reaper_wake: Arc<Notify>,
     output_budget: ProcessOutputBudget,
 }
 
@@ -589,7 +619,11 @@ struct ProcessRecord {
     // RPCs can retain a completed record beyond registry eviction.
     _record_slot: OwnedSemaphorePermit,
     started: ProcessEvent,
+    /// What `list` reports, without `env`.
     info: ProcessInfo,
+    /// Up to 64 KiB, kept apart from `info` so a finished record can drop it
+    /// with its output: no caller reads an exited process's environment.
+    env: std::sync::Mutex<HashMap<String, String>>,
     input: ProcessInput,
     signal_handle: ProcessSignalHandle,
     journal: Arc<ProcessEventJournal>,
@@ -598,15 +632,17 @@ struct ProcessRecord {
 impl ProcessRecord {
     fn new(
         started: ProcessEvent,
-        info: ProcessInfo,
+        mut info: ProcessInfo,
         input: ProcessInput,
         signal_handle: ProcessSignalHandle,
         reservation: ProcessRecordReservation,
     ) -> Self {
+        let env = std::mem::take(&mut info.env);
         Self {
             _record_slot: reservation.record_slot,
             started,
             info,
+            env: std::sync::Mutex::new(env),
             input,
             signal_handle,
             journal: Arc::new(ProcessEventJournal::with_budget(
@@ -627,6 +663,27 @@ impl ProcessRecord {
     fn resize_pty(&self, size: PtySize) -> Result<(), Status> {
         self.input.resize_pty(size)
     }
+
+    /// What `list` reports for this process.
+    fn listed_info(&self) -> ProcessInfo {
+        ProcessInfo {
+            env: self
+                .env
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            ..self.info.clone()
+        }
+    }
+
+    fn release_env(&self) {
+        std::mem::take(
+            &mut *self
+                .env
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
 }
 
 impl Default for ProcessRegistry {
@@ -643,6 +700,7 @@ impl ProcessRegistry {
             record_slots: Arc::new(Semaphore::new(PROCESS_RECORD_LIMIT)),
             shared_output_slots: Arc::new(Semaphore::new(output_budget.shared)),
             reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reaper_wake: Arc::new(Notify::new()),
             output_budget,
         }
     }
@@ -656,13 +714,88 @@ struct ProcessRecordReservation {
 
 enum ProcessInput {
     Disabled,
-    Pipe(Mutex<Option<tokio::process::ChildStdin>>),
+    Pipe(InputDescriptor<tokio::process::ChildStdin>),
     Pty(PtyInput),
 }
 
 struct PtyInput {
-    writer: Mutex<PtyIo>,
-    resize_fd: PtyIo,
+    writer: InputDescriptor<PtyIo>,
+    resize_fd: std::sync::Mutex<Option<PtyIo>>,
+}
+
+/// A process input descriptor that [`InputDescriptor::release`] closes once
+/// the process has exited. A write still in flight then keeps it only until
+/// that write returns or is cancelled.
+struct InputDescriptor<T> {
+    descriptor: Mutex<Option<T>>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl<T> InputDescriptor<T> {
+    fn new(descriptor: Option<T>) -> Self {
+        Self {
+            descriptor: Mutex::new(descriptor),
+            released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    async fn lock(&self) -> HeldInput<'_, T> {
+        HeldInput {
+            guard: Some(self.descriptor.lock().await),
+            input: self,
+        }
+    }
+
+    fn is_released(&self) -> bool {
+        self.released.load(Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        // Otherwise a write holds it, and closes it once it unlocks.
+        if let Ok(mut descriptor) = self.descriptor.try_lock() {
+            descriptor.take();
+        }
+    }
+}
+
+/// Exclusive use of an input descriptor for one write or close.
+struct HeldInput<'a, T> {
+    guard: Option<tokio::sync::MutexGuard<'a, Option<T>>>,
+    input: &'a InputDescriptor<T>,
+}
+
+impl<T> std::ops::Deref for HeldInput<'_, T> {
+    type Target = Option<T>;
+
+    fn deref(&self) -> &Option<T> {
+        self.guard.as_ref().expect("held until dropped")
+    }
+}
+
+impl<T> std::ops::DerefMut for HeldInput<'_, T> {
+    fn deref_mut(&mut self) -> &mut Option<T> {
+        self.guard.as_mut().expect("held until dropped")
+    }
+}
+
+impl<T> Drop for HeldInput<'_, T> {
+    fn drop(&mut self) {
+        // Unlock first: a release that saw the lock held either set its flag
+        // before this check or tries the lock again after this unlock.
+        drop(self.guard.take());
+        if self.input.is_released()
+            && let Ok(mut descriptor) = self.input.descriptor.try_lock()
+        {
+            descriptor.take();
+        }
+    }
+}
+
+/// The answer for input to a process that has exited, as for one no longer
+/// running when the request arrived.
+fn exited_input_status() -> Status {
+    Status::not_found("process not found")
 }
 
 impl ProcessInput {
@@ -671,16 +804,22 @@ impl ProcessInput {
             Self::Disabled => Err(Status::failed_precondition(
                 "process stdin is not enabled or closed",
             )),
-            Self::Pipe(stdin) => {
-                let mut stdin = stdin.lock().await;
-                let stdin = stdin.as_mut().ok_or_else(|| {
-                    Status::failed_precondition("process stdin is not enabled or closed")
-                })?;
+            Self::Pipe(input) => {
+                let mut stdin = input.lock().await;
+                let Some(stdin) = stdin.as_mut() else {
+                    return Err(if input.is_released() {
+                        exited_input_status()
+                    } else {
+                        Status::failed_precondition("process stdin is not enabled or closed")
+                    });
+                };
                 stdin.write_all(data).await.map_err(map_io_error)?;
                 stdin.flush().await.map_err(map_io_error)
             }
             Self::Pty(pty) => {
                 let mut writer = pty.writer.lock().await;
+                // Only the release closes a PTY writer.
+                let writer = writer.as_mut().ok_or_else(exited_input_status)?;
                 writer.write_all(data).await.map_err(map_io_error)?;
                 writer.flush().await.map_err(map_io_error)
             }
@@ -690,8 +829,9 @@ impl ProcessInput {
     async fn close(&self) -> Result<(), Status> {
         match self {
             Self::Disabled => Ok(()),
-            Self::Pipe(stdin) => {
-                if let Some(mut stdin) = stdin.lock().await.take() {
+            Self::Pipe(input) => {
+                // Already closed, by the caller or by the release: done.
+                if let Some(mut stdin) = input.lock().await.take() {
                     stdin.shutdown().await.map_err(map_io_error)?;
                 }
                 Ok(())
@@ -704,9 +844,36 @@ impl ProcessInput {
 
     fn resize_pty(&self, size: PtySize) -> Result<(), Status> {
         match self {
-            Self::Pty(pty) => set_pty_size(&pty.resize_fd, size),
+            Self::Pty(pty) => {
+                let resize_fd = pty
+                    .resize_fd
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Only the release closes it.
+                let resize_fd = resize_fd.as_ref().ok_or_else(exited_input_status)?;
+                set_pty_size(resize_fd, size)
+            }
             Self::Disabled | Self::Pipe(_) => {
                 Err(Status::failed_precondition("process is not pty-backed"))
+            }
+        }
+    }
+
+    /// Closes the input descriptors once the process has exited, so a
+    /// descendant still reading the stdin pipe sees EOF and one still writing
+    /// to the terminal gets EIO, rather than either blocking for the record's
+    /// retention. A write still in flight closes its descriptor when it
+    /// returns.
+    fn release(&self) {
+        match self {
+            Self::Disabled => {}
+            Self::Pipe(stdin) => stdin.release(),
+            Self::Pty(pty) => {
+                pty.writer.release();
+                pty.resize_fd
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
             }
         }
     }
@@ -1010,7 +1177,58 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned")
             .completed_at
-            .is_some_and(|completed_at| completed_at.elapsed() > IDEMPOTENCY_RECORD_TTL)
+            .is_some_and(|completed_at| completed_at.elapsed() > COMPLETED_PROCESS_RETENTION)
+    }
+
+    /// Drops the retained output of a process that completed more than
+    /// `COMPLETED_PROCESS_OUTPUT_RETENTION` ago, keeping its exit, and says
+    /// whether this call released it. A reconnect without a cursor needs just
+    /// the start and the exit; one that resumes from a cursor reads the lagged
+    /// error from then on.
+    fn release_output_if_due(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        if state.output_released
+            || !state.completed_at.is_some_and(|completed_at| {
+                completed_at.elapsed() > COMPLETED_PROCESS_OUTPUT_RETENTION
+            })
+        {
+            return false;
+        }
+        state.output.clear();
+        state.retained_bytes = 0;
+        state.guaranteed_bytes = 0;
+        state.first_sequence = state.next_sequence;
+        state.output_released = true;
+        true
+    }
+
+    /// When the reaper next has work for this record: releasing its output,
+    /// then ending its retention (just after each, as both are strictly past).
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        let state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        let retained_for = if state.output_released {
+            COMPLETED_PROCESS_RETENTION
+        } else {
+            COMPLETED_PROCESS_OUTPUT_RETENTION
+        };
+        state
+            .completed_at
+            .map(|completed_at| completed_at + retained_for + Duration::from_millis(1))
+    }
+
+    /// The exit and its wall-clock time, once the process has completed.
+    fn ended(&self) -> Option<(ProcessEvent, Option<SystemTime>)> {
+        let state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        state.exit.clone().map(|exit| (exit, state.ended_at))
     }
 
     /// Moves the completion time back, as if `by` had passed since.
@@ -1023,19 +1241,32 @@ impl ProcessEventJournal {
         state.completed_at = state.completed_at.map(|completed_at| completed_at - by);
     }
 
-    fn completed_at(&self) -> Option<Instant> {
+    fn completed_at(&self) -> Option<tokio::time::Instant> {
         self.state
             .lock()
             .expect("process output journal lock poisoned")
             .completed_at
     }
 
-    fn cursor(self: &Arc<Self>, requested: Option<u64>) -> ProcessJournalCursor {
+    /// A reader from `requested`, or from the live tail when `None`. With
+    /// `from_oldest_retained`, a cursor before the oldest retained output
+    /// starts there instead of lagging. That start is chosen under the lock
+    /// that also claims the primary reader's place, so no output written
+    /// meanwhile can evict it.
+    fn cursor(
+        self: &Arc<Self>,
+        requested: Option<u64>,
+        from_oldest_retained: bool,
+    ) -> ProcessJournalCursor {
         let mut state = self
             .state
             .lock()
             .expect("process output journal lock poisoned");
-        let next_sequence = requested.unwrap_or(state.next_sequence);
+        let next_sequence = match requested {
+            Some(cursor) if from_oldest_retained => cursor.max(state.first_sequence),
+            Some(cursor) => cursor,
+            None => state.next_sequence,
+        };
         // Only one reader controls the producer. Observers cannot stall an
         // existing consumer; after disconnect a new attachment can take over.
         let primary = if !state.backpressure_disabled
@@ -1196,7 +1427,8 @@ impl ProcessEventJournal {
                 .lock()
                 .expect("process output journal lock poisoned");
             state.exit = Some(exit.clone());
-            state.completed_at = Some(Instant::now());
+            state.completed_at = Some(tokio::time::Instant::now());
+            state.ended_at = Some(SystemTime::now());
             state.next_sequence
         };
         self.changed.send_replace(ProcessJournalChange::Exit {
@@ -1211,7 +1443,15 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned");
         if cursor < state.first_sequence {
-            return ProcessJournalRead::Lagged;
+            return ProcessJournalRead::Lagged {
+                first_sequence: state.first_sequence,
+            };
+        }
+        // A cursor only ever advances over output it has read, so one past the
+        // end came from a caller, not from this journal: waiting for output to
+        // reach it would skip everything written before it.
+        if cursor > state.next_sequence {
+            return ProcessJournalRead::Ahead;
         }
         if cursor < state.next_sequence {
             let offset = (cursor - state.first_sequence) as usize;
@@ -1241,7 +1481,10 @@ struct ProcessJournalState {
     retained_bytes: usize,
     guaranteed_bytes: usize,
     exit: Option<ProcessEvent>,
-    completed_at: Option<Instant>,
+    // Tokio's clock, which is the reaper's, so tests can drive it.
+    completed_at: Option<tokio::time::Instant>,
+    ended_at: Option<SystemTime>,
+    output_released: bool,
 }
 
 struct SequencedProcessEvent {
@@ -1282,7 +1525,8 @@ enum ProcessJournalRead {
     Event(ProcessEvent),
     Exit(ProcessEvent),
     Pending,
-    Lagged,
+    Lagged { first_sequence: u64 },
+    Ahead,
 }
 
 #[derive(Clone, Copy)]
@@ -1409,7 +1653,12 @@ impl ProcessRegistry {
         Some(record)
     }
 
-    fn replay(&self, process_id: &ProcessId, output_cursor: Option<u64>) -> Option<ProcessReplay> {
+    fn replay(
+        &self,
+        process_id: &ProcessId,
+        output_cursor: Option<u64>,
+        from_oldest_retained: bool,
+    ) -> Option<ProcessReplay> {
         let record = self.get_record(process_id)?;
         if output_cursor.is_none()
             && let Some(exit) = record.journal.exit()
@@ -1421,20 +1670,28 @@ impl ProcessRegistry {
         }
         Some(ProcessReplay::Running {
             started: record.started.clone(),
-            cursor: record.journal.cursor(output_cursor),
+            cursor: record.journal.cursor(output_cursor, from_oldest_retained),
         })
     }
 
     /// Removes completed records whose retention has ended. One task at most:
     /// it sleeps until the earliest record expires and exits when no completed
-    /// record is retained; the next process to complete starts it again.
-    fn ensure_reaper(&self, shutdown: tokio_util::sync::CancellationToken) {
+    /// record is retained; the next process to complete starts it again, or
+    /// wakes it to recompute that deadline.
+    fn ensure_reaper(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+        tasks: &tokio_util::task::TaskTracker,
+    ) {
         use std::sync::atomic::Ordering;
         if self.reaper_running.swap(true, Ordering::AcqRel) {
+            // The permit is kept if the reaper is between sleeps, so it looks
+            // again before its next one.
+            self.reaper_wake.notify_one();
             return;
         }
         let registry = self.clone();
-        drop(tokio::spawn(async move {
+        drop(tasks.spawn(async move {
             loop {
                 registry.remove_expired();
                 let Some(next) = registry.next_expiry() else {
@@ -1449,7 +1706,8 @@ impl ProcessRegistry {
                     return;
                 };
                 tokio::select! {
-                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(next)) => {}
+                    () = tokio::time::sleep_until(next) => {}
+                    () = registry.reaper_wake.notified() => {}
                     () = shutdown.cancelled() => {
                         registry.reaper_running.store(false, Ordering::Release);
                         return;
@@ -1461,40 +1719,63 @@ impl ProcessRegistry {
 
     fn remove_expired(&self) {
         self.records.retain(|_, entry| {
-            !entry
-                .record()
-                .is_some_and(|record| record.journal.is_expired())
+            let Some(record) = entry.record() else {
+                return true;
+            };
+            if record.journal.release_output_if_due() {
+                record.release_env();
+            }
+            !record.journal.is_expired()
         });
     }
 
-    /// When the earliest retained completed record expires (just after, as
-    /// expiry is strictly past the TTL).
-    fn next_expiry(&self) -> Option<Instant> {
+    /// When the reaper next has work: releasing a completed record's output
+    /// or ending its retention, whichever comes first.
+    fn next_expiry(&self) -> Option<tokio::time::Instant> {
         self.records
             .iter()
-            .filter_map(|entry| entry.record()?.journal.completed_at())
+            .filter_map(|entry| entry.record()?.journal.next_deadline())
             .min()
-            .map(|completed_at| completed_at + IDEMPOTENCY_RECORD_TTL + Duration::from_millis(1))
     }
 
-    fn list(&self) -> Vec<ProcessInfo> {
+    /// Running processes, and with `include_exited` also the retained
+    /// completed ones, each with its exit. With `process_id`, only that one.
+    fn list(&self, include_exited: bool, process_id: Option<&str>) -> Vec<ProcessInfo> {
         let mut expired = Vec::new();
-        let running = self
+        let listed = self
             .records
             .iter()
+            .filter(|entry| process_id.is_none_or(|process_id| entry.key().as_str() == process_id))
             .filter_map(|entry| {
                 let record = entry.record()?;
                 if record.journal.is_expired() {
                     expired.push(entry.key().clone());
                     return None;
                 }
-                (!record.journal.is_completed()).then(|| record.info.clone())
+                let Some((exit, ended_at)) = record.journal.ended() else {
+                    return Some(record.listed_info());
+                };
+                let Some(
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Exit(
+                        exit,
+                    ),
+                ) = exit.event
+                else {
+                    return None;
+                };
+                include_exited.then(|| ProcessInfo {
+                    exit: Some(exit),
+                    ended_at: ended_at.and_then(|ended_at| {
+                        pplx_space_spaced_guest_protocol::system_time_to_proto(ended_at).ok()
+                    }),
+                    ..record.listed_info()
+                })
             })
             .collect();
         for process_id in expired {
             self.records.remove(&process_id);
         }
-        running
+        listed
     }
 }
 
@@ -1542,9 +1823,10 @@ fn process_event_stream_with_prefix(
                         return Some((Ok(event), (prefix, cursor)));
                     }
                     ProcessJournalRead::Exit(exit) => break Ok(exit),
-                    ProcessJournalRead::Lagged => {
-                        break Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE));
+                    ProcessJournalRead::Lagged { first_sequence } => {
+                        break Err(process_output_lagged_status(Some(first_sequence)));
                     }
+                    ProcessJournalRead::Ahead => break Err(process_output_cursor_ahead_status()),
                     ProcessJournalRead::Pending => {
                         if current.changed.changed().await.is_err() {
                             break evicted_process_journal_result(current);
@@ -1557,15 +1839,46 @@ fn process_event_stream_with_prefix(
     ))
 }
 
+fn process_output_cursor_ahead_status() -> Status {
+    let mut status = Status::out_of_range(PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE);
+    status.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+        ),
+    );
+    status
+}
+
+/// The status that ends a stream whose cursor is before the oldest retained
+/// output, naming where that output starts, `first_sequence`, so the caller
+/// can continue from there. `None` once the journal itself is gone.
+fn process_output_lagged_status(first_sequence: Option<u64>) -> Status {
+    let mut status =
+        Status::resource_exhausted(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE);
+    let metadata = status.metadata_mut();
+    metadata.insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+        ),
+    );
+    if let Some(first_sequence) = first_sequence {
+        metadata.insert(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            tonic::metadata::MetadataValue::from(first_sequence),
+        );
+    }
+    status
+}
+
 fn evicted_process_journal_result(cursor: &ProcessJournalCursor) -> Result<ProcessEvent, Status> {
     match cursor.changed.borrow().clone() {
         ProcessJournalChange::Exit {
             event,
             next_sequence,
         } if cursor.next_sequence >= next_sequence => Ok(event),
-        ProcessJournalChange::Exit { .. } => {
-            Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE))
-        }
+        ProcessJournalChange::Exit { .. } => Err(process_output_lagged_status(None)),
         ProcessJournalChange::OutputChanged => Err(Status::resource_exhausted(
             "process replay state was evicted",
         )),
@@ -1587,13 +1900,19 @@ fn process_started_event(process_id: &ProcessId, pid: Option<u32>) -> Result<Pro
     })
 }
 
-fn process_connected_event(process_id: &ProcessId, pid: Option<u32>) -> ProcessEvent {
+fn process_connected_event(
+    process_id: &ProcessId,
+    pid: Option<u32>,
+    output_cursor: Option<u64>,
+) -> ProcessEvent {
     ProcessEvent {
         process_id: process_id.as_str().to_string(),
         pid,
         event: Some(
             pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Connected(
-                pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {},
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {
+                    output_cursor,
+                },
             ),
         ),
     }
@@ -1811,6 +2130,7 @@ fn process_status_outcome(status: Option<std::process::ExitStatus>) -> ProcessEx
 fn terminate_and_reap_failed_start(
     mut child: tokio::process::Child,
     process_reservation: ProcessRecordReservation,
+    tasks: &tokio_util::task::TaskTracker,
 ) {
     let pid = child.id();
     if let Some(pid) = pid {
@@ -1836,7 +2156,7 @@ fn terminate_and_reap_failed_start(
 
     // Cleanup outlives the request and retains admission until reaping finishes.
     // A slow or failed kill must not allow unbounded unreaped failed starts.
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let _process_reservation = process_reservation;
         if let Err(error) = child.wait().await {
             tracing::warn!(%error, ?pid, "failed to reap child after start failure");
@@ -1901,7 +2221,7 @@ impl Process for ExecutionService {
         &self,
         mut request: Request<StartRequest>,
     ) -> Result<Response<Self::StartStream>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -1953,6 +2273,7 @@ impl Process for ExecutionService {
         }
         let account_name = user.unwrap_or_else(|| self.inner.default_operation_user.clone());
         let (account, _start_admission) = resolve_process_account(
+            self.inner.process_tasks.clone(),
             self.inner.process_payload_slots.clone(),
             ingress,
             move || {
@@ -1965,16 +2286,22 @@ impl Process for ExecutionService {
         let listed_command = process_command.argv().to_vec();
         let env = parse_env(requested_env);
         let listed_env = proto_env(&env);
+        let default_cwd = self
+            .inner
+            .default_working_dir
+            .as_deref()
+            .map(|path| {
+                path.to_str()
+                    .ok_or_else(|| Status::internal("image working directory is not UTF-8"))
+            })
+            .transpose()?;
+        // A command's explicit cwd wins over the image's WORKDIR.
         let cwd = requested_cwd
             .as_deref()
+            .or(default_cwd)
             .map(|cwd| guest_path::normalize_for_account(cwd, &account))
             .transpose()?;
-        let listed_cwd = requested_cwd.map(|_| {
-            cwd.as_ref()
-                .expect("requested cwd produced normalized cwd")
-                .expose()
-                .to_string()
-        });
+        let listed_cwd = cwd.as_ref().map(|cwd| cwd.expose().to_string());
         let timeout = validate_optional_timeout(request.timeout)?;
         let background = request.background;
         let stdin_enabled = request.stdin;
@@ -2068,7 +2395,7 @@ impl Process for ExecutionService {
                 let replay = self
                     .inner
                     .processes
-                    .replay(&process_id, Some(0))
+                    .replay(&process_id, Some(0), false)
                     .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
                 return Ok(Response::new(
                     replay_process_event_stream(replay) as Self::StartStream
@@ -2097,7 +2424,7 @@ impl Process for ExecutionService {
             .start_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.require_running()?;
+        crate::execution::require_running(&self.inner.shutdown)?;
         // Re-claim the identity inside the gate. The check at the top of this
         // handler is reachable across suspension points, so on its own it would
         // let two starts carrying the same assigned id both pass and have the
@@ -2117,6 +2444,7 @@ impl Process for ExecutionService {
             }
         };
         let operation = reservation.begin()?;
+        let request_lifetime = _start_admission.request_lifetime();
         let launch = ProcessLaunch {
             command,
             prepared_pty,
@@ -2130,6 +2458,8 @@ impl Process for ExecutionService {
                 user: listed_user,
                 tag: listed_tag,
                 pty: Some(uses_pty),
+                exit: None,
+                ended_at: None,
             },
             timeout,
             process_id: process_id.clone(),
@@ -2161,7 +2491,8 @@ impl Process for ExecutionService {
         });
         drop(start_gate);
 
-        let (pid, started, cursor) = started_rx
+        let (pid, started, cursor) = request_lifetime
+            .observe(started_rx)
             .await
             .map_err(|_| Status::internal("process start ended without a result"))??;
         tracing::debug!(
@@ -2180,7 +2511,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<ConnectProcessRequest>,
     ) -> Result<Response<Self::ConnectProcessStream>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -2195,7 +2526,11 @@ impl Process for ExecutionService {
         let replay = self
             .inner
             .processes
-            .replay(&process_id, request.output_cursor)
+            .replay(
+                &process_id,
+                request.output_cursor,
+                request.resume_from_oldest_retained,
+            )
             .ok_or_else(|| Status::not_found("process not found"))?;
         let pid = match &replay {
             ProcessReplay::Running { started, .. } | ProcessReplay::Completed { started, .. } => {
@@ -2203,10 +2538,13 @@ impl Process for ExecutionService {
             }
         };
         let stream = match replay {
-            ProcessReplay::Running { cursor, .. } => process_event_stream_with_prefix(
-                vec![process_connected_event(&process_id, pid)],
-                Some(cursor),
-            ),
+            ProcessReplay::Running { cursor, .. } => {
+                let output_cursor = request.output_cursor.map(|_| cursor.next_sequence);
+                process_event_stream_with_prefix(
+                    vec![process_connected_event(&process_id, pid, output_cursor)],
+                    Some(cursor),
+                )
+            }
             replay @ ProcessReplay::Completed { .. } => replay_process_event_stream(replay),
         };
         tracing::debug!(
@@ -2222,12 +2560,16 @@ impl Process for ExecutionService {
         &self,
         request: Request<ListProcessesRequest>,
     ) -> Result<Response<Self::ListProcessesStream>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
-        let processes = self.inner.processes.list();
+        let request = request.into_inner();
+        let processes = self
+            .inner
+            .processes
+            .list(request.include_exited, request.process_id.as_deref());
         tracing::debug!(
             command = "bridge_guest_process_list",
             count = processes.len(),
@@ -2243,7 +2585,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<SendSignalRequest>,
     ) -> Result<Response<SendSignalResponse>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -2280,11 +2622,12 @@ impl Process for ExecutionService {
         &self,
         mut request: Request<SendInputRequest>,
     ) -> Result<Response<SendInputResponse>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         let _admission = crate::payload::admit(
             &mut request,
             &self.inner.process_payload_slots,
             1,
+            pplx_space_metrics::payload::Budget::GuestProcess,
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let mut request = request.into_inner();
@@ -2309,7 +2652,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<CloseStdinRequest>,
     ) -> Result<Response<CloseStdinResponse>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
@@ -2334,7 +2677,7 @@ impl Process for ExecutionService {
         &self,
         request: Request<ResizePtyRequest>,
     ) -> Result<Response<ResizePtyResponse>, Status> {
-        self.require_running()?;
+        let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,

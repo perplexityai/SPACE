@@ -99,3 +99,25 @@ fn bounded_runtime_shutdown_does_not_wait_for_stuck_blocking_threads() {
     );
     drop(release);
 }
+
+#[tokio::test]
+async fn image_working_directory_preserves_path_and_rejects_invalid_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("working-directory");
+    assert_eq!(
+        super::read_image_working_directory(&path).await.unwrap(),
+        None
+    );
+    for value in ["/workspace/with spaces", "/", "relative", "", "/bad\0path"] {
+        tokio::fs::write(&path, value).await.unwrap();
+        let result = super::read_image_working_directory(&path).await;
+        if value.starts_with('/') && !value.contains('\0') {
+            assert_eq!(
+                result.unwrap().as_deref(),
+                Some(std::path::Path::new(value))
+            );
+        } else {
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+}

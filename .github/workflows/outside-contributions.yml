@@ -79,10 +79,11 @@ jobs:
           else
             what='issue'
           fi
-          body="$(printf '%s\n\n%s\n%s\n' \
+          # One line per paragraph: GitHub renders every newline in a comment.
+          contributing="https://github.com/${GH_REPO}/blob/main/CONTRIBUTING.md"
+          body="$(printf '%s\n\n%s' \
             "Thanks for opening this ${what}! A SPACE maintainer will take a look." \
-            "[CONTRIBUTING.md](https://github.com/${GH_REPO}/blob/main/CONTRIBUTING.md) explains how we review" \
-            "outside contributions. ${marker}")"
+            "[CONTRIBUTING.md](${contributing}) explains how we review outside contributions. ${marker}")"
           gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/comments" \
             -f body="${body}" >/dev/null
 

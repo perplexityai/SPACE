@@ -8,6 +8,7 @@ mod postgres_tests {
     use pplx_space_db_test_fixtures::{
         insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
     };
+    use uuid::Uuid;
 
     use super::*;
 
@@ -271,7 +272,7 @@ mod postgres_tests {
         assert!(
             matches!(
                 result,
-                Err(FinalizeSandboxDbDeleteError::InFlightSuspendUpload)
+                Err(FinalizeSandboxDbDeleteError::InFlightSuspendUpload { .. })
             ),
             "expected InFlightSuspendUpload, got {result:?}"
         );
@@ -286,34 +287,40 @@ mod postgres_tests {
         Ok(())
     }
 
-    /// `any_creating_snapshot_for_sandbox` returns true iff
+    /// `in_flight_snapshot_upload_idle_for` reports an upload iff
     /// there is at least one snapshot for the sandbox in
     /// `state='creating'`. Used by the HTTP DELETE pre-flight to
     /// refuse 409 before the runtime is torn down. Covers the
     /// happy path (creating exists), the negative (only ready),
     /// and the empty case (no snapshots at all).
     #[tokio::test(flavor = "current_thread")]
-    async fn any_creating_snapshot_for_sandbox_classifies_states() -> TestResult {
+    async fn in_flight_snapshot_upload_idle_for_classifies_states() -> TestResult {
         let db = pg_test_db().await?;
         let sandbox_id = SandboxId::new();
         insert_sandbox(&db.pool, sandbox_id, "suspending").await?;
 
         assert!(
-            !any_creating_snapshot_for_sandbox(&db.pool, sandbox_id).await?,
+            in_flight_snapshot_upload_idle_for(&db.pool, sandbox_id)
+                .await?
+                .is_none(),
             "no snapshots → not in flight"
         );
 
         let ready_snap = SnapshotId::new();
         insert_snapshot_with_state(&db.pool, sandbox_id, ready_snap, "ready").await?;
         assert!(
-            !any_creating_snapshot_for_sandbox(&db.pool, sandbox_id).await?,
+            in_flight_snapshot_upload_idle_for(&db.pool, sandbox_id)
+                .await?
+                .is_none(),
             "only 'ready' snapshots → not in flight"
         );
 
         let creating_snap = SnapshotId::new();
         insert_snapshot_with_state(&db.pool, sandbox_id, creating_snap, "creating").await?;
         assert!(
-            any_creating_snapshot_for_sandbox(&db.pool, sandbox_id).await?,
+            in_flight_snapshot_upload_idle_for(&db.pool, sandbox_id)
+                .await?
+                .is_some(),
             "one 'creating' snapshot → in flight"
         );
         Ok(())

@@ -121,10 +121,11 @@ impl RejectingControlService {
 fn connect_process_request_preserves_output_cursor() {
     let process_id = ProcessId::new();
 
-    let request = connect_process_request(&process_id, None, Some(7));
+    let request = connect_process_request(&process_id, None, Some(7), true);
 
     assert_eq!(request.process_id, process_id.as_str());
     assert_eq!(request.output_cursor, Some(7));
+    assert!(request.resume_from_oldest_retained);
 }
 
 #[tokio::test]

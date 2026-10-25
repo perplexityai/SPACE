@@ -11,6 +11,7 @@ add the host setup SPACE's node services expect to find:
 | `02-users.sh`, `08-sudoers.sh`, `10-ssh-key.sh` | The `deploy` and `dev` users, their sudo rules, and an optional SSH key |
 | `03-packages.sh` | A full package upgrade, base tools, and `btrfs-progs` from AL2023's supplementary SPAL repository; automatic updates off, since nodes are patched by replacing the image |
 | `04-firecracker.sh` | Firecracker and the jailer from their GitHub release, and a guest kernel from Firecracker's CI bucket, baked into the existing execution roots `/space/vendor/{firecracker,kernels}`; node-manager creates the separate, initially empty managed store `/space/vendor/artifacts` |
+| `05-grpc-health-probe.sh` | A checksum-pinned gRPC health probe for host-side worker service startup and health checks |
 | `06-e2fsprogs.sh` | e2fsprogs 1.47, built from source; AL2023's 1.46 can't handle the seed rootfs |
 | `07-sysctl.sh` | SPACE's host users and groups (from `infra/space/identity/node-identities.sh`), the `/space` directory skeleton, the `/sys/fs/cgroup/space` cgroup parent, `/dev/kvm` and `tun` access, loop devices, and kernel settings. The artifact store `04-firecracker.sh` filled stays root's: the runtime manager stages installs under `/space/cache` and node-manager publishes them into the store; the runtime manager's state directory is `/space/run/runtime-manager`, as other node services' are |
 | `09-auditd.sh` | Audit rules on the SPACE binaries and `/dev/kvm` |
@@ -20,8 +21,9 @@ add the host setup SPACE's node services expect to find:
 
 Nothing is downloaded from a private source, and every artifact the recipes
 download directly is checked against a pinned SHA-256: the Firecracker release
-and guest kernel in `04-firecracker.sh`, the e2fsprogs tarball in
-`06-e2fsprogs.sh`. The Firecracker and e2fsprogs pins match the checksums their
+and guest kernel in `04-firecracker.sh`, the gRPC health probe in
+`05-grpc-health-probe.sh`, and the e2fsprogs tarball in `06-e2fsprogs.sh`.
+The Firecracker, gRPC health probe, and e2fsprogs pins match checksums their
 publishers list. Firecracker's CI bucket publishes none for guest kernels, so
 the kernel's pin records the file as first downloaded. The guest kernel is the newest pinned one for its
 Firecracker CI series, not the newest the bucket lists, so a new upstream

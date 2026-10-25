@@ -637,8 +637,8 @@ class TestPickTerminateCandidates:
         `:terminate` endpoint's is, so filtering on it here would exclude nodes
         the endpoint would terminate — a worker whose census disproves thousands
         of phantom `active_node_id` rows would sit in `drained` forever without
-        this script ever asking. The endpoint is authoritative; this picker only
-        screens on the count that agrees with it (`local_snapshots`)."""
+        this script ever asking. The endpoint is authoritative; this picker
+        screens on neither listing count."""
 
         phantom_admin = make_admin_node(
             node_id="a-phantom",
@@ -653,16 +653,26 @@ class TestPickTerminateCandidates:
             "the listing's active count must not gate the terminate wave"
         )
 
-    def test_excludes_local_snapshot_blocked(self) -> None:
-        """Admin :terminate 409s when sandboxes_local_snapshots > 0. Without
-        this filter the blocked node would sit at the head of the
-        deterministic sort and 409 every tick, aborting the terminate wave
-        via the outer broad-except."""
+    def test_replace_semantics_is_named_whatever_the_listing_counts(self) -> None:
+        """A node the wave never POSTs has no refusal to name its blocker, so
+        the replace-semantics report must not be hidden behind a listed local
+        snapshot the guard may not even count."""
 
-        blocked_admin = make_admin_node(
-            node_id="a-blocked",
+        admin = make_admin_node(
+            node_id="a-replace",
             drain_phase=rollout.DrainPhase.DRAINED,
+            sandboxes_local_snapshots=1,
+            terminate_decrement_capacity=False,
         )
+        node = make_node_status(instance_id="i-0", admin=admin)
+        assert rollout.pick_terminate_candidates([node]) == []
+        assert rollout.pick_terminate_blocked_by_replace_semantics([node]) == [node]
+
+    def test_a_listed_local_snapshot_does_not_hold_a_node_out(self) -> None:
+        """The listing's local-snapshot count disagrees with the `:terminate`
+        guard both ways, so it names the likely blocker without deciding: the
+        node is still asked, and the guard's answer decides."""
+
         blocked_admin = make_admin_node(
             node_id="a-blocked",
             drain_phase=rollout.DrainPhase.DRAINED,
@@ -671,7 +681,7 @@ class TestPickTerminateCandidates:
         blocked = make_node_status(instance_id="i-0", admin=blocked_admin)
         ok = self._node(1, rollout.DrainPhase.DRAINED)
         picked = rollout.pick_terminate_candidates([blocked, ok])
-        assert [p.instance_id for p in picked] == ["i-1"]
+        assert [p.instance_id for p in picked] == ["i-0", "i-1"]
 
         blocker_list = rollout.pick_terminate_blocked_by_snapshots([blocked, ok])
         assert [n.instance_id for n in blocker_list] == ["i-0"]
@@ -2873,3 +2883,348 @@ class TestIssueDrainWave:
         assert capsys.readouterr().out.strip() == "", (
             "an empty wave emits nothing at all"
         )
+
+
+class _RowBackedAdminApi:
+    """An admin API whose two answers come from the same sandbox rows.
+
+    The node listing's `sandboxes_local_snapshots` counts non-durable
+    `suspended` rows pinned to the node (and uploads in flight from it, which
+    this fixture doesn't model). The `:terminate` guard refuses on every
+    drain-gate blocker, which also includes a `suspending` row and a
+    non-evacuation `restoring` row pinned there. Building both from one row set
+    is what lets a test see the two disagree, the way the real endpoints do.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.posts: list[str] = []
+
+    @staticmethod
+    def _local_snapshot(row: dict[str, Any]) -> bool:
+        return row["lifecycle"] == "suspended" and not row.get("durable", False)
+
+    @classmethod
+    def _drain_blocker(cls, row: dict[str, Any]) -> bool:
+        return (
+            cls._local_snapshot(row)
+            or row["lifecycle"] == "suspending"
+            or (row["lifecycle"] == "restoring" and not row.get("evacuation", False))
+        )
+
+    def local_snapshots(self) -> int:
+        return sum(1 for row in self.rows if self._local_snapshot(row))
+
+    def terminate(self, node_id: str) -> dict[str, Any] | None:
+        self.posts.append(node_id)
+        blockers = sum(1 for row in self.rows if self._drain_blocker(row))
+        if blockers == 0:
+            return None
+        return {
+            "error": "node still holds sandboxes",
+            "sandboxes_active": 0,
+            "sandboxes_drain_blockers": blockers,
+            "sandboxes_local_snapshots": blockers,
+        }
+
+
+class TestTerminateWaveDefersToTheGuard:
+    """The terminate wave acts on the `:terminate` guard's answer, not on the
+    listing's local-snapshot count.
+
+    The operator-visible properties: a node the guard refuses for a `suspending`
+    or non-evacuation `restoring` row is not re-POSTed on every poll, it is
+    reported under the event that names the drain gate with the guard's own
+    blocker count, and it is terminated once the rows clear.
+    """
+
+    NODE = "00000000-0000-0000-0000-000000000007"
+
+    def _drained(self, local_snapshots: int) -> Any:
+        return make_node_status(
+            admin=make_admin_node(
+                node_id=self.NODE,
+                drain_phase=rollout.DrainPhase.DRAINED,
+                sandboxes_local_snapshots=local_snapshots,
+            )
+        )
+
+    def _events(self, monkeypatch: Any) -> list[tuple[Any, dict[str, Any]]]:
+        seen: list[tuple[Any, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rollout, "emit_event", lambda event, **fields: seen.append((event, fields))
+        )
+        return seen
+
+    def _fixture(self) -> _RowBackedAdminApi:
+        # Neither row is a local snapshot, so the listing reads zero. Both are
+        # drain-gate blockers, so the guard refuses.
+        return _RowBackedAdminApi(
+            [
+                {"lifecycle": "suspending"},
+                {"lifecycle": "restoring", "evacuation": False},
+            ]
+        )
+
+    def test_the_listing_passes_a_node_the_guard_refuses(self) -> None:
+        # Premise for the rest: the listing screen alone cannot keep this node
+        # out of the wave, so the pass is what has to handle the refusal.
+        api = self._fixture()
+        node = self._drained(api.local_snapshots())
+        assert api.local_snapshots() == 0
+        assert rollout.pick_terminate_candidates([node]) == [node]
+        assert api.terminate(self.NODE) is not None
+
+    def test_a_refused_node_is_not_reposted_every_poll(self, monkeypatch: Any) -> None:
+        self._events(monkeypatch)
+        api = self._fixture()
+        node = self._drained(api.local_snapshots())
+        state = rollout.TerminateState()
+        poll = 5.0
+        ticks = int(rollout.TERMINATE_BLOCKED_RETRY_SEC / poll)
+        for tick in range(ticks):
+            rollout.run_terminate_pass(
+                api, [node], cohort="c", state=state, now=tick * poll
+            )
+        assert api.posts == [self.NODE], (
+            "one POST inside the retry window, not one per poll"
+        )
+        rollout.run_terminate_pass(
+            api, [node], cohort="c", state=state, now=rollout.TERMINATE_BLOCKED_RETRY_SEC
+        )
+        assert api.posts == [self.NODE, self.NODE], "asked again once the window passes"
+        assert self.NODE not in state.issued
+
+    def test_the_refusal_is_reported_as_the_drain_gate(self, monkeypatch: Any) -> None:
+        events = self._events(monkeypatch)
+        api = self._fixture()
+        node = self._drained(api.local_snapshots())
+        rollout.run_terminate_pass(
+            api, [node], cohort="c", state=rollout.TerminateState(), now=0.0
+        )
+        kinds = [event for event, _ in events]
+        assert kinds == [rollout.Event.TERMINATE_BLOCKED_DRAIN_GATE]
+        assert rollout.Event.TERMINATE_BLOCKED_LOCAL_SNAPSHOTS not in kinds
+        assert events[0][1]["sandboxes_drain_blockers"] == 2
+
+    def test_a_node_the_listing_over_reports_is_still_terminated(
+        self, monkeypatch: Any
+    ) -> None:
+        # The listing can count a local snapshot the guard doesn't. The node
+        # must still be asked, and terminate when the guard accepts it.
+        events = self._events(monkeypatch)
+
+        class Accepting:
+            def terminate(self, node_id: str) -> None:
+                return None
+
+        node = self._drained(local_snapshots=1)
+        state = rollout.TerminateState()
+        rollout.run_terminate_pass(
+            Accepting(),
+            rollout.pick_terminate_candidates([node]),
+            cohort="c",
+            state=state,
+            now=0.0,
+        )
+        assert self.NODE in state.issued
+        assert [event for event, _ in events] == [rollout.Event.TERMINATE_STARTED]
+
+    def test_a_node_holding_local_snapshots_keeps_being_reported(
+        self, monkeypatch: Any
+    ) -> None:
+        # A node the listing shows holding a local snapshot is refused by the
+        # guard like any other blocker, so it is re-reported while wedged
+        # rather than named once and left silent.
+        events = self._events(monkeypatch)
+        api = _RowBackedAdminApi([{"lifecycle": "suspended"}])
+        node = self._drained(api.local_snapshots())
+        assert api.local_snapshots() == 1
+        state = rollout.TerminateState()
+        now = 0.0
+        while now < 2 * rollout.BLOCKED_REPORT_INTERVAL_SEC:
+            rollout.run_terminate_pass(
+                api,
+                rollout.pick_terminate_candidates([node]),
+                cohort="c",
+                state=state,
+                now=now,
+            )
+            now += rollout.TERMINATE_BLOCKED_RETRY_SEC
+        kinds = [event for event, _ in events]
+        assert kinds.count(rollout.Event.TERMINATE_BLOCKED_DRAIN_GATE) > 1
+
+    def test_the_local_snapshot_hint_skips_a_node_just_terminated(
+        self, monkeypatch: Any
+    ) -> None:
+        # On the tick its POST is accepted the listing still shows the node in
+        # `drained` with its count; naming it as blocked would contradict the
+        # `terminate_started` line just emitted.
+        events = self._events(monkeypatch)
+        node = self._drained(local_snapshots=1)
+        logged: set[str] = set()
+        rollout.report_local_snapshot_hints(
+            [node], cohort="c", logged=logged, terminated={self.NODE}
+        )
+        assert events == []
+        rollout.report_local_snapshot_hints(
+            [node], cohort="c", logged=logged, terminated=set()
+        )
+        rollout.report_local_snapshot_hints(
+            [node], cohort="c", logged=logged, terminated=set()
+        )
+        assert [event for event, _ in events] == [
+            rollout.Event.TERMINATE_BLOCKED_LOCAL_SNAPSHOTS
+        ], "named once per node"
+
+    def test_a_wedged_node_keeps_being_reported(self, monkeypatch: Any) -> None:
+        # `detect_stuck` can't see a `drained` node, so a node the guard keeps
+        # refusing must not go silent after its first report, nor repeat it on
+        # every retry.
+        events = self._events(monkeypatch)
+        api = self._fixture()
+        node = self._drained(api.local_snapshots())
+        state = rollout.TerminateState()
+        reported_at: list[float] = []
+        now = 0.0
+        while now < 2 * rollout.BLOCKED_REPORT_INTERVAL_SEC:
+            before = len(events)
+            rollout.run_terminate_pass(api, [node], cohort="c", state=state, now=now)
+            if len(events) > before:
+                reported_at.append(now)
+            now += rollout.TERMINATE_BLOCKED_RETRY_SEC
+        assert len(api.posts) > len(reported_at) > 1, (
+            "reported again while still wedged, but not on every retry"
+        )
+        gaps = [b - a for a, b in zip(reported_at, reported_at[1:])]
+        assert all(gap >= rollout.BLOCKED_REPORT_INTERVAL_SEC for gap in gaps)
+        assert all(
+            gap < rollout.BLOCKED_REPORT_INTERVAL_SEC + rollout.TERMINATE_BLOCKED_RETRY_SEC
+            for gap in gaps
+        ), "re-reported on the first retry past the interval"
+
+    def test_a_node_whose_refusal_changes_half_is_reported_under_the_new_half(
+        self, monkeypatch: Any
+    ) -> None:
+        # Once the active sandboxes leave, the operator must see what is still
+        # holding the node, not the stale active-sandbox report.
+        events = self._events(monkeypatch)
+        answers = iter(
+            [
+                {"sandboxes_active": 1, "sandboxes_drain_blockers": 2},
+                {"sandboxes_active": 0, "sandboxes_drain_blockers": 2},
+                {"sandboxes_active": 1, "sandboxes_drain_blockers": 2},
+            ]
+        )
+
+        class Shifting:
+            def terminate(self, node_id: str) -> dict[str, Any]:
+                return next(answers)
+
+        node = self._drained(0)
+        state = rollout.TerminateState()
+        for retry in range(3):
+            rollout.run_terminate_pass(
+                Shifting(),
+                [node],
+                cohort="c",
+                state=state,
+                now=retry * rollout.TERMINATE_BLOCKED_RETRY_SEC,
+            )
+        assert [event for event, _ in events] == [
+            rollout.Event.TERMINATE_BLOCKED_ACTIVE_SANDBOXES,
+            rollout.Event.TERMINATE_BLOCKED_DRAIN_GATE,
+            rollout.Event.TERMINATE_BLOCKED_ACTIVE_SANDBOXES,
+        ], "every move between the halves is reported, back as well as forth"
+
+    def test_the_reported_count_is_the_guards_own(self, monkeypatch: Any) -> None:
+        # The alias is only the fallback for an endpoint that predates the
+        # guard's field; when both are present the guard's count is reported.
+        events = self._events(monkeypatch)
+        bodies = [
+            {
+                "sandboxes_active": 0,
+                "sandboxes_drain_blockers": 4,
+                "sandboxes_local_snapshots": 1,
+            },
+            {"sandboxes_active": 0, "sandboxes_local_snapshots": 3},
+        ]
+        for i, body in enumerate(bodies):
+
+            class Fixed:
+                def terminate(self, node_id: str, body: dict[str, Any] = body) -> dict[str, Any]:
+                    return body
+
+            node = make_node_status(
+                admin=make_admin_node(
+                    node_id=f"00000000-0000-0000-0000-00000000001{i}",
+                    drain_phase=rollout.DrainPhase.DRAINED,
+                )
+            )
+            rollout.run_terminate_pass(
+                Fixed(), [node], cohort="c", state=rollout.TerminateState(), now=0.0
+            )
+        assert [fields["sandboxes_drain_blockers"] for _, fields in events] == [4, 3]
+
+    @pytest.mark.parametrize(
+        ("body", "event"),
+        [
+            # `db_error` maps a serialization failure or deadlock to a 409 with
+            # only an error.
+            ({"error": "could not serialize access"}, "TERMINATE_REFUSED_UNKNOWN"),
+            # The node left `drained` before the POST.
+            (
+                {"error": "not drained", "current_drain_phase": "draining"},
+                "TERMINATE_BLOCKED_PHASE_DRIFT",
+            ),
+        ],
+    )
+    def test_a_refusal_that_is_not_occupancy_is_neither_paced_nor_a_blocker(
+        self, monkeypatch: Any, body: dict[str, Any], event: str
+    ) -> None:
+        # A transient conflict says nothing about sandboxes: the operator must
+        # not see a drain-gate block, and the node must be asked again on the
+        # next poll rather than after the occupancy retry interval.
+        events = self._events(monkeypatch)
+        posts: list[str] = []
+
+        class Conflict:
+            def terminate(self, node_id: str) -> dict[str, Any]:
+                posts.append(node_id)
+                return body
+
+        node = self._drained(0)
+        state = rollout.TerminateState()
+        for now in (0.0, 1.0):
+            rollout.run_terminate_pass(Conflict(), [node], cohort="c", state=state, now=now)
+        assert posts == [self.NODE, self.NODE]
+        assert [kind for kind, _ in events] == [getattr(rollout.Event, event)] * 2
+        assert self.NODE not in state.retry_after
+
+    def test_the_node_terminates_once_the_rows_clear(self, monkeypatch: Any) -> None:
+        events = self._events(monkeypatch)
+        api = self._fixture()
+        node = self._drained(api.local_snapshots())
+        state = rollout.TerminateState()
+        rollout.run_terminate_pass(api, [node], cohort="c", state=state, now=0.0)
+        api.rows.clear()
+        rollout.run_terminate_pass(
+            api, [node], cohort="c", state=state, now=rollout.TERMINATE_BLOCKED_RETRY_SEC
+        )
+        assert self.NODE in state.issued
+        assert events[-1][0] == rollout.Event.TERMINATE_STARTED
+
+    def test_an_active_refusal_keeps_its_own_event(self, monkeypatch: Any) -> None:
+        events = self._events(monkeypatch)
+
+        class Active:
+            def terminate(self, node_id: str) -> dict[str, Any]:
+                return {"sandboxes_active": 3, "sandboxes_drain_blockers": 0}
+
+        node = self._drained(0)
+        rollout.run_terminate_pass(
+            Active(), [node], cohort="c", state=rollout.TerminateState(), now=0.0
+        )
+        assert [event for event, _ in events] == [
+            rollout.Event.TERMINATE_BLOCKED_ACTIVE_SANDBOXES
+        ]

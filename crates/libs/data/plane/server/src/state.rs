@@ -463,9 +463,13 @@ pub(super) async fn build_backend_channels(
     endpoint: &str,
     pool_size: usize,
 ) -> Result<Vec<Channel>, pplx_space_common_grpc::internal_transport::TransportError> {
+    // Each pooled channel carries calls for many sandboxes on one connection.
     let endpoint = pplx_space_node_api_client::configure_node_api_endpoint(
         Endpoint::from_shared(normalize_backend_endpoint(endpoint)?)?,
         pplx_space_node_api_client::NodeApiEndpointConfig::default(),
+    )
+    .initial_connection_window_size(
+        pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES,
     );
     let endpoint = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,

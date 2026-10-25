@@ -80,3 +80,12 @@ Auto-kill (both the omitted/default lifecycle and explicit
 registered. The SPACE ECW API does not currently support those behaviors as
 dependable client contracts. Add their scenarios when that support is
 available; until then they must not make the smoke suite fail.
+
+## Exit retention on native
+
+`ecw.background_process_control` requires the native API to keep reporting a
+killed process as `exited` by `SIGKILL`. Templates built from this tree do, so
+the Kind backend requires it. Deployed clusters run templates that may predate
+that guest; there the scenario accepts an absent exit and still requires the
+`SIGKILL` exit when one is reported. Set `SPACE_SMOKE_REQUIRE_EXIT_RETENTION=1`
+or `0` to override the backend default.

@@ -686,6 +686,7 @@ async fn stop_and_kill_end_the_sandbox_processes_before_a_restart() {
                     process_id: process_id.clone(),
                     timeout: None,
                     output_cursor: None,
+                    resume_from_oldest_retained: false,
                 }),
             }))
             .await;

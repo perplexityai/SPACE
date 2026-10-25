@@ -12,11 +12,13 @@ pub(super) fn connect_process_request(
     process_id: &ProcessId,
     timeout: Option<ReadyTimeout>,
     output_cursor: Option<u64>,
+    resume_from_oldest_retained: bool,
 ) -> ConnectProcessRequest {
     ConnectProcessRequest {
         process_id: process_id.as_str().to_string(),
         timeout: timeout.map(proto_duration),
         output_cursor,
+        resume_from_oldest_retained,
     }
 }
 
@@ -89,6 +91,7 @@ impl SpacedHostClient {
         process_id: String,
         timeout: Option<std::time::Duration>,
         output_cursor: Option<u64>,
+        resume_from_oldest_retained: bool,
     ) -> Result<tonic::Streaming<proto::ProcessEvent>, tonic::Status> {
         let process_id = ProcessId::parse(process_id).map_err(invalid_argument_status)?;
         let timeout = timeout
@@ -108,6 +111,7 @@ impl SpacedHostClient {
                             &process_id,
                             timeout,
                             output_cursor,
+                            resume_from_oldest_retained,
                         ))
                         .await
                         .map(Response::into_inner)
@@ -117,7 +121,14 @@ impl SpacedHostClient {
         .await
     }
 
-    pub async fn list_processes(&self) -> Result<Vec<proto::ProcessInfo>, tonic::Status> {
+    /// Running processes, and with `include_exited` also those that have
+    /// exited but are still retained. With `process_id`, a guest that
+    /// supports the filter lists only that process; an older one lists all.
+    pub async fn list_processes(
+        &self,
+        include_exited: bool,
+        process_id: Option<&str>,
+    ) -> Result<Vec<proto::ProcessInfo>, tonic::Status> {
         tokio::time::timeout(
             PROCESS_LIST_TIMEOUT,
             pplx_space_spaced_common::retry_status(
@@ -128,7 +139,10 @@ impl SpacedHostClient {
                     let mut client = self.process.clone();
                     async move {
                         let mut stream = client
-                            .list_processes(ListProcessesRequest {})
+                            .list_processes(ListProcessesRequest {
+                                include_exited,
+                                process_id: process_id.map(str::to_owned),
+                            })
                             .await?
                             .into_inner();
                         let mut processes = Vec::new();

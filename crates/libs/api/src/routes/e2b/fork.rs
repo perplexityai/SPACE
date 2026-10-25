@@ -483,7 +483,9 @@ fn fork_terminal_failure_status(code: &PublicErrorCode) -> StatusCode {
         PublicErrorCode::CapacityUnavailable | PublicErrorCode::ServiceUnavailable => {
             StatusCode::SERVICE_UNAVAILABLE
         }
-        PublicErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        PublicErrorCode::RateLimited | PublicErrorCode::QuotaExceeded => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
         // A code this build does not know was stored by a newer server; the
         // ECW wrapper cannot classify it more precisely than a server error.
         PublicErrorCode::OperationFailed
