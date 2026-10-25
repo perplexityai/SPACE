@@ -82,6 +82,135 @@ fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     ))
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let controller = direct_sandbox_controller(&db.pool);
+    let policy = crate::e2b::auto_lifecycle_policy(90, true, false);
+    let node = pplx_space_common_core::types::NodeId::new();
+    let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(node.to_string())
+        .with_internal_api()
+        .start()
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1', 'worker', $2, 'registered')"
+    ))
+    .bind(node)
+    .bind(pplx_space_common_core::types::SubstrateKind::Space)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_direct (node_id, node_api_endpoint) VALUES ($1, $2)"
+    ))
+    .bind(node)
+    .bind(worker.endpoint())
+    .execute(&db.pool)
+    .await?;
+
+    for lifecycle in ["created", "paused", "suspended", "started"] {
+        let sandbox = seed_sandbox(&db.pool, &actor).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = $2, auto_lifecycle_json = $3,
+                active_node_id = $4, placement = $5 WHERE id = $1"
+        ))
+        .bind(sandbox.id)
+        .bind(lifecycle)
+        .bind(sqlx::types::Json(&policy))
+        .bind((lifecycle == "started").then_some(node))
+        .bind(if lifecycle == "started" {
+            "on_node"
+        } else {
+            "unplaced"
+        })
+        .execute(&db.pool)
+        .await?;
+        if lifecycle == "started" {
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_direct_route_identities
+                 (sandbox_id, route_generation, current_node_id, substrate_kind,
+                  execution_generation, activation_attempt_id)
+                 VALUES ($1, 7, $2, 'space', 7, $3)"
+            ))
+            .bind(sandbox.id)
+            .bind(node)
+            .bind(uuid::Uuid::now_v7())
+            .execute(&db.pool)
+            .await?;
+            worker
+                .state()
+                .ensure_default_running(&sandbox.id.to_string())
+                .await?;
+            worker
+                .state()
+                .set_route_identity_provenance(&sandbox.id.to_string(), Some(7), Some(7), None)
+                .await?;
+            worker
+                .state()
+                .apply_access_deadline(&sandbox.id.to_string(), Some(1_900_000_000), None)
+                .await?;
+        }
+        let before: serde_json::Value =
+            sqlx::query_scalar(sql!("SELECT to_jsonb(s) FROM sandboxes s WHERE id = $1"))
+                .bind(sandbox.id)
+                .fetch_one(&db.pool)
+                .await?;
+        let mut holder = db.pool.begin().await?;
+        sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+            .bind(sandbox.id)
+            .execute(&mut *holder)
+            .await?;
+        let result = controller
+            .set_access_idle_timeout(
+                &db.pool,
+                &sandbox,
+                90,
+                prost_types::Timestamp {
+                    seconds: 1_800_000_000,
+                    nanos: 0,
+                },
+                // Runtime requests encode whole seconds; keep their budget
+                // above one second while the stored-only lock check uses 500ms.
+                tokio::time::Instant::now()
+                    + if lifecycle == "started" {
+                        Duration::from_secs(2)
+                    } else {
+                        Duration::from_millis(500)
+                    },
+                Some(&policy),
+            )
+            .await;
+        // Keep the lock until after the controller finishes, even on failure.
+        holder.rollback().await?;
+        assert!(
+            result.is_ok(),
+            "{lifecycle}: unchanged timeout must not wait for the row lock: {result:?}"
+        );
+        assert_eq!(
+            matches!(result?, AccessIdleTimeoutOutcome::Applied),
+            lifecycle == "started"
+        );
+        let after: serde_json::Value =
+            sqlx::query_scalar(sql!("SELECT to_jsonb(s) FROM sandboxes s WHERE id = $1"))
+                .bind(sandbox.id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(after, before);
+        if lifecycle == "started" {
+            let record = worker.state().get(&sandbox.id.to_string()).await?;
+            assert_eq!(
+                record.access_extended_until, None,
+                "ResetPolicy clears the floor"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The whole path: request in, row written, and the value visible through
 /// the api's own read. Every metadata value variant is exercised, because
 /// the document is an untagged enum and this is the layer where a number or

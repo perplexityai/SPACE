@@ -84,7 +84,7 @@ pub(super) fn observed_access_idle_generation(
         .map_err(|_| unavailable())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum AccessIdleTimeoutOutcome {
     StoredOnly,
     Applied,
@@ -224,49 +224,6 @@ fn access_idle_deadline_request(
     });
     request.set_timeout(budget);
     Ok(request)
-}
-
-/// Lost compare-and-set rounds before a timeout reports a retryable conflict.
-const TIMEOUT_POLICY_WRITE_ATTEMPTS: usize = 3;
-
-async fn read_timeout_execution(
-    pool: &PgPool,
-    sandbox_id: SandboxId,
-) -> Result<sandbox_store::AutoLifecycleExecution, ControllerError> {
-    sandbox_store::auto_lifecycle_execution(pool, sandbox_id)
-        .await
-        .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
-        .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))
-}
-
-/// Whether a timeout must reach a live execution; terminal sandboxes are absent.
-fn timeout_needs_runtime(
-    execution: &sandbox_store::AutoLifecycleExecution,
-) -> Result<bool, ControllerError> {
-    let lifecycle = execution
-        .lifecycle
-        .parse::<SandboxLifecycle>()
-        .map_err(|error| {
-            ControllerError::internal(format!("invalid stored sandbox lifecycle: {error}"))
-        })?;
-    match lifecycle {
-        SandboxLifecycle::Created | SandboxLifecycle::Paused | SandboxLifecycle::Suspended => {
-            Ok(false)
-        }
-        SandboxLifecycle::Started => Ok(!execution.proves_no_execution()),
-        SandboxLifecycle::Creating
-        | SandboxLifecycle::Starting
-        | SandboxLifecycle::Restoring
-        | SandboxLifecycle::Resuming
-        | SandboxLifecycle::Pausing
-        | SandboxLifecycle::Suspending
-        | SandboxLifecycle::Checkpointing => Ok(true),
-        SandboxLifecycle::Stopping
-        | SandboxLifecycle::Stopped
-        | SandboxLifecycle::Deleting
-        | SandboxLifecycle::Quarantined
-        | SandboxLifecycle::Failed => Err(ControllerError::not_found("sandbox is terminal")),
-    }
 }
 
 impl SandboxController {
@@ -625,13 +582,7 @@ impl SandboxController {
             .map_err(|error| {
                 db_contention_error("failed to update sandbox auto lifecycle", &error.into())
             })?;
-        Self::enqueue_auto_lifecycle_reconcile(tx, sandbox_id).await
-    }
 
-    async fn enqueue_auto_lifecycle_reconcile(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        sandbox_id: SandboxId,
-    ) -> Result<(), ControllerError> {
         let refs = [ReconcileRef::sandbox_desired_state(sandbox_id)];
         enqueue_sandbox_reconcile_and_trigger_tx(
             tx,
@@ -651,12 +602,9 @@ impl SandboxController {
         Ok(())
     }
 
-    /// Persist timeout intent without locking the sandbox row. Activation
-    /// publishes its execution claim and then reads the policy, so this writes
-    /// the policy and then reads the claim: either the activation starts with
-    /// our policy, or the read after our write sees its claim and we reset the
-    /// policy on that execution. The request budget includes observation of an
-    /// already-owned activation; this never starts one.
+    /// Persist timeout intent while serializing its absence decision with
+    /// execution acquisition. The request budget includes the transaction and
+    /// any observation of an already-owned activation; this never starts one.
     pub(crate) async fn set_access_idle_timeout(
         &self,
         pool: &PgPool,
@@ -666,41 +614,107 @@ impl SandboxController {
         deadline: tokio::time::Instant,
         expected_policy: Option<&AutoLifecyclePolicy>,
     ) -> Result<AccessIdleTimeoutOutcome, ControllerError> {
-        let policy_changed =
-            || tonic::Status::failed_precondition("sandbox lifecycle policy changed").into();
         tokio::time::timeout_at(deadline, async {
-            let mut execution = read_timeout_execution(pool, sandbox.id).await?;
-            let mut accepted = None;
-            for _ in 0..TIMEOUT_POLICY_WRITE_ATTEMPTS {
-                timeout_needs_runtime(&execution)?;
-                let current_policy = execution.policy.0.clone().normalized();
-                if expected_policy
-                    .is_some_and(|expected| expected.clone().normalized() != current_policy)
-                {
-                    return Err(policy_changed());
+            let execution = sandbox_store::auto_lifecycle_execution(pool, sandbox.id)
+                .await
+                .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
+                .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
+            let current_policy = execution.policy.0.clone().normalized();
+            // An unchanged policy needs no persistence. Only bypass the lock
+            // when the runtime decision does not rely on execution absence:
+            // Started without ownership evidence must still serialize with
+            // activation acquisition and read its claim after taking the lock.
+            let unchanged = crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs)
+                .normalized()
+                == current_policy
+                && expected_policy
+                    .is_none_or(|expected| expected.clone().normalized() == current_policy);
+            let claim_independent = match execution.lifecycle.parse::<SandboxLifecycle>() {
+                Ok(
+                    SandboxLifecycle::Created
+                    | SandboxLifecycle::Paused
+                    | SandboxLifecycle::Suspended
+                    | SandboxLifecycle::Creating
+                    | SandboxLifecycle::Starting
+                    | SandboxLifecycle::Restoring
+                    | SandboxLifecycle::Resuming
+                    | SandboxLifecycle::Pausing
+                    | SandboxLifecycle::Suspending
+                    | SandboxLifecycle::Checkpointing,
+                ) => true,
+                Ok(SandboxLifecycle::Started) => !execution.proves_no_execution(),
+                _ => false,
+            };
+            let (execution, tx) = if unchanged && claim_independent {
+                (execution, None)
+            } else {
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .map_err(|error| db_contention_error("begin timeout intent", &error))?;
+                // Lock separately from the joined read: after waiting for an
+                // activation's row lock, READ COMMITTED must see its new claim.
+                let locked = sqlx::query_scalar::<_, SandboxId>(sql!(
+                    "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
+                ))
+                .bind(sandbox.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| db_contention_error("lock timeout intent", &error))?;
+                if locked.is_none() {
+                    return Err(ControllerError::not_found("sandbox no longer exists"));
                 }
-                let policy = crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs)
-                    .normalized();
-                if policy == current_policy {
-                    accepted = Some(policy);
-                    break;
+                let execution = sandbox_store::auto_lifecycle_execution(&mut *tx, sandbox.id)
+                    .await
+                    .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
+                    .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
+                (execution, Some(tx))
+            };
+            let lifecycle = execution
+                .lifecycle
+                .parse::<SandboxLifecycle>()
+                .map_err(|error| {
+                    ControllerError::internal(format!("invalid stored sandbox lifecycle: {error}"))
+                })?;
+            let needs_runtime = match lifecycle {
+                SandboxLifecycle::Created
+                | SandboxLifecycle::Paused
+                | SandboxLifecycle::Suspended => false,
+                SandboxLifecycle::Started => !execution.proves_no_execution(),
+                SandboxLifecycle::Creating
+                | SandboxLifecycle::Starting
+                | SandboxLifecycle::Restoring
+                | SandboxLifecycle::Resuming
+                | SandboxLifecycle::Pausing
+                | SandboxLifecycle::Suspending
+                | SandboxLifecycle::Checkpointing => true,
+                SandboxLifecycle::Stopping
+                | SandboxLifecycle::Stopped
+                | SandboxLifecycle::Deleting
+                | SandboxLifecycle::Quarantined
+                | SandboxLifecycle::Failed => {
+                    return Err(ControllerError::not_found("sandbox is terminal"));
                 }
-                let written = Self::replace_auto_lifecycle_policy(
-                    pool,
-                    sandbox.id,
-                    &execution.policy_raw,
-                    &policy,
-                )
-                .await?;
-                // Must follow the write; see the doc comment.
-                execution = read_timeout_execution(pool, sandbox.id).await?;
-                if written {
-                    accepted = Some(policy);
-                    break;
-                }
+            };
+            let current_policy = execution.policy.0.normalized();
+            if expected_policy
+                .is_some_and(|expected| expected.clone().normalized() != current_policy)
+            {
+                return Err(
+                    tonic::Status::failed_precondition("sandbox lifecycle policy changed").into(),
+                );
             }
-            let policy = accepted.ok_or_else(policy_changed)?;
-            if !timeout_needs_runtime(&execution)? {
+            let policy =
+                crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs).normalized();
+            if let Some(mut tx) = tx {
+                if policy != current_policy {
+                    Self::persist_auto_lifecycle_policy(&mut tx, sandbox.id, &policy).await?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|error| db_contention_error("commit timeout intent", &error))?;
+            }
+            if !needs_runtime {
                 return Ok(AccessIdleTimeoutOutcome::StoredOnly);
             }
             // Only an identified execution is eligible for bounded readiness
@@ -731,32 +745,6 @@ impl SandboxController {
         })
         .await
         .map_err(|_| ControllerError::service_unavailable("sandbox deadline update expired"))?
-    }
-
-    /// Returns false when another writer changed the policy or the sandbox
-    /// became terminal after `expected` was read.
-    async fn replace_auto_lifecycle_policy(
-        pool: &PgPool,
-        sandbox_id: SandboxId,
-        expected: &serde_json::Value,
-        policy: &AutoLifecyclePolicy,
-    ) -> Result<bool, ControllerError> {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|error| db_contention_error("begin timeout intent", &error))?;
-        let written =
-            sandbox_store::replace_auto_lifecycle_policy(&mut *tx, sandbox_id, expected, policy)
-                .await
-                .map_err(|error| db_contention_error("write timeout intent", &error.into()))?;
-        if !written {
-            return Ok(false);
-        }
-        Self::enqueue_auto_lifecycle_reconcile(&mut tx, sandbox_id).await?;
-        tx.commit()
-            .await
-            .map_err(|error| db_contention_error("commit timeout intent", &error))?;
-        Ok(true)
     }
 
     pub(crate) async fn update_access_idle_deadline(
@@ -1164,8 +1152,6 @@ fn snapshots_response_json(
 
 #[cfg(test)]
 mod postgres_tests;
-#[cfg(test)]
-mod timeout_tests;
 #[cfg(test)]
 mod transport_tests;
 
