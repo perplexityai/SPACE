@@ -21,7 +21,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::{
-    Arch, ArtifactVersion, Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+    Arch, ArtifactVersion, Digest, DigestPrefix, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -399,44 +399,52 @@ pub fn release_digest<'a>(binaries: impl IntoIterator<Item = (&'a str, Digest)>)
     Digest::sha256(Sha256::digest(text.as_bytes()).into())
 }
 
-/// A managed directory retains both its diagnostic label and content identity.
+/// A managed directory is a compact locator, not a content identity. Full
+/// digests remain authoritative for verification, publication, and removal.
 /// This naming scheme is not used by external execution roots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedDirectoryName {
     label: String,
-    digest: Digest,
+    digest_prefix: DigestPrefix,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid managed artifact directory name {0:?}; expected <label>--<sha256>")]
+#[error(
+    "invalid managed artifact directory name {0:?}; expected <label>--<12 lowercase SHA-256 hex digits>"
+)]
 pub struct ManagedDirectoryNameParseError(String);
 
 impl ManagedDirectoryName {
     pub fn release(release: &RuntimeIdentity, digest: Digest) -> Self {
         Self {
             label: format!("v{}", release.version),
-            digest,
+            digest_prefix: digest.short_prefix(),
         }
     }
 
     pub fn kernel(version: &ArtifactVersion, digest: Digest) -> Self {
         Self {
             label: version.to_string(),
-            digest,
+            digest_prefix: digest.short_prefix(),
         }
     }
 
     pub fn label(&self) -> &str {
         &self.label
     }
-    pub fn digest(&self) -> Digest {
-        self.digest
+    pub fn digest_prefix(&self) -> &DigestPrefix {
+        &self.digest_prefix
     }
 }
 
 impl std::fmt::Display for ManagedDirectoryName {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}--{}", self.label, self.digest.hex_string())
+        write!(
+            formatter,
+            "{}--{}",
+            self.label,
+            self.digest_prefix.hex_prefix()
+        )
     }
 }
 
@@ -453,13 +461,13 @@ impl std::str::FromStr for ManagedDirectoryName {
         {
             return Err(invalid());
         }
-        if digest.len() != 64 {
+        if digest.len() != 12 {
             return Err(invalid());
         }
-        let digest = format!("sha256:{digest}").parse().map_err(|_| invalid())?;
+        let digest_prefix = format!("sha256:{digest}").parse().map_err(|_| invalid())?;
         Ok(Self {
             label: label.to_string(),
-            digest,
+            digest_prefix,
         })
     }
 }

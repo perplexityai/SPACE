@@ -466,6 +466,17 @@ cache files are sealed and measured against independently pinned verity digests.
 The profile uses SHA-256, 4096-byte blocks and no salt. Verity digests are separate
 catalog metadata: E0 and the other environment references do not change.
 
+Managed runtime and kernel directories use `<version>--<12 hex digits>`, where
+that suffix is a SHA-256 prefix used only as a locator. Catalog pins, execution
+identities and verification retain full digests. An existing directory whose
+bytes do not match the requested full pins is refused; a prefix collision never
+overwrites or adopts another artifact. Removal also checks the full digest.
+The same naming rule applies to the execution cache. Deploy matching
+node-manager, runtime-manager and supervisor versions before installing managed
+artifacts. This layout replaces the full-digest directory names; existing
+managed development installs must be reinstalled or renamed while unused. Baked
+E0 paths are unchanged.
+
 Existing cache files are sealed in place. Node-manager warms the cache in tracked
 background work at startup; inventory consumers await the same serialized discovery,
 while unrelated lifecycle RPCs can serve. For missing copies, source presence is
