@@ -65,6 +65,10 @@ pub(super) struct BuildExecutionBinding {
 }
 
 impl BuildExecutionBinding {
+    pub(super) fn runtime_kind(&self) -> pplx_space_common_core::types::RuntimeKind {
+        self.execution.runtime().kind
+    }
+
     pub(super) fn reference(&self) -> EnvironmentReference {
         self.definition.reference()
     }

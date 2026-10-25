@@ -65,20 +65,9 @@ use vm::TEMPLATE_DIR;
 
 const DEFAULT_UBUNTU_APT_MIRROR: &str = "https://archive.ubuntu.com/ubuntu";
 const UBUNTU_APT_MIRROR_ENV: &str = "SPACE_UBUNTU_APT_MIRROR";
-/// Foreground, *blocking* flush run over SSH before the guest is torn down.
-/// `sync` returns only after buffered writes are committed, so the build's last
-/// filesystem mutations — notably the e2b start_cmd systemd unit + its
-/// `space.target.wants` enable symlink, which is the final recipe step — are
-/// durably on disk before the VM dies. Without this, the backgrounded sysrq
-/// reboot below can race in-flight writeback, and the finalize `e2fsck` journal
-/// recovery then discards the uncommitted tail — silently dropping the last
-/// step from the published rootfs (intermittent / non-deterministic). Two syncs
-/// for the traditional belt-and-suspenders flush.
+/// Foreground flush before terminating the build VM. Wait for it before
+/// requesting guest exit so the last recipe step reaches the backing disk.
 const GUEST_FLUSH_CMD: &str = "sync; sync";
-/// Backgrounded power-off via sysrq, issued only after `GUEST_FLUSH_CMD` has
-/// returned. The durability barrier is the prior blocking `sync`, not the
-/// `sleep` here.
-const GUEST_EXIT_CMD: &str = "nohup sh -c 'sync; echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true; if [ -w /proc/sysrq-trigger ]; then echo s > /proc/sysrq-trigger; echo u > /proc/sysrq-trigger; sleep 1; echo b > /proc/sysrq-trigger; else reboot -f; fi' >/dev/null 2>&1 </dev/null &";
 
 const SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -184,6 +173,8 @@ struct GuestRuntimeMetadata {
 pub enum BuildError {
     #[error(transparent)]
     ExecutionBinding(#[from] BuildExecutionBindingError),
+    #[error("no guest exit strategy for build runtime {0}")]
+    UnsupportedGuestExit(pplx_space_common_core::types::RuntimeKind),
     #[error(transparent)]
     Environment(#[from] BuildEnvironmentError),
     #[error(transparent)]
@@ -242,6 +233,7 @@ impl BuildError {
                 TemplateBuildErrorKind::StorageAdmission
             }
             Self::ExecutionBinding(_)
+            | Self::UnsupportedGuestExit(_)
             | Self::RootfsReservation(_)
             | Self::InvalidSpacedVersion { .. }
             | Self::InvalidSandboxId(_)
@@ -761,6 +753,10 @@ impl TemplateBuilder {
             ))?;
         let execution_binding =
             BuildExecutionBinding::for_base(self.environment, base_execution).await?;
+        let guest_exit_command = vm::guest_exit_command(execution_binding.as_ref().map_or(
+            base_execution.runtime().kind,
+            BuildExecutionBinding::runtime_kind,
+        ))?;
 
         println!("  Resolved base: {}", resolved_base.resolved_reference);
         if !std::path::Path::new(&resolved_base.rootfs_path).exists() {
@@ -1029,7 +1025,7 @@ impl TemplateBuilder {
         println!("Shutting down build VM...");
         build_phase(template_id, BuildPhase::ShutdownGuest, async {
             // Flush the guest filesystem to disk and WAIT for it before issuing
-            // the (backgrounded) power-off. This is the durability barrier that
+            // the backgrounded guest exit. This is the durability barrier that
             // guarantees the build's final recipe step survives the snapshot —
             // see GUEST_FLUSH_CMD. Best-effort: if the flush call fails we still
             // attempt the exit, but log it since a failed flush is exactly the
@@ -1038,7 +1034,7 @@ impl TemplateBuilder {
                 tracing::warn!(error = %e, "guest pre-shutdown sync failed; last write may not be durable");
                 eprintln!("Guest pre-shutdown sync failed: {e}");
             }
-            if let Err(e) = ssh.exec(GUEST_EXIT_CMD, "root", &StepEnvironment::default()) {
+            if let Err(e) = ssh.exec(guest_exit_command, "root", &StepEnvironment::default()) {
                 tracing::warn!(error = %e, "guest exit request failed; force cleanup may be needed");
                 eprintln!("Guest exit request failed, force cleaning: {e}");
             }
