@@ -21,18 +21,32 @@ pub struct NodeMemorySnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MemoryReservationMode {
+    Elastic,
+    FullyReserved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ActiveLeaseMemoryReservation {
     pub slot_id: u32,
     pub sandbox_id: SandboxId,
     pub generation: u64,
     pub memory_reservation_mib: u64,
+    pub mode: MemoryReservationMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryAdmissionObservation {
     node_memory: NodeMemorySnapshot,
-    observed_leases: Vec<ActiveLeaseMemoryReservation>,
+    observed_leases: Vec<ObservedLease>,
     existing_growth_reserve_mib: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedLease {
+    lease: ActiveLeaseMemoryReservation,
+    growth_mib: u64,
+    fully_reserved_growth_mib: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -97,12 +111,28 @@ impl MemoryAdmissionConfig {
         sources: &MemoryAdmissionSources,
     ) -> Result<MemoryAdmissionObservation, NodeMemoryCapacityError> {
         let memory = read_node_memory_snapshot_from(&sources.meminfo_path).await?;
-        let existing_growth_reserve_mib = self
-            .measure_existing_growth_reserve_mib(active_leases, sources)
-            .await;
+        let mut observed_leases = Vec::with_capacity(active_leases.len());
+        for lease in active_leases {
+            let (elastic, full) = self
+                .read_growth_reserves_mib(lease, sources)
+                .await
+                .unwrap_or((lease.memory_reservation_mib, lease.memory_reservation_mib));
+            observed_leases.push(ObservedLease {
+                lease: *lease,
+                growth_mib: match lease.mode {
+                    MemoryReservationMode::Elastic => elastic,
+                    MemoryReservationMode::FullyReserved => full,
+                },
+                fully_reserved_growth_mib: full,
+            });
+        }
+        let existing_growth_reserve_mib = observed_leases
+            .iter()
+            .map(|observed| observed.growth_mib)
+            .fold(0u64, u64::saturating_add);
         Ok(MemoryAdmissionObservation {
             node_memory: memory,
-            observed_leases: active_leases.to_vec(),
+            observed_leases,
             existing_growth_reserve_mib,
         })
     }
@@ -116,18 +146,27 @@ impl MemoryAdmissionConfig {
         let committed_after_observation_mib = active_leases
             .iter()
             .map(|lease| {
-                let previously_reserved = observation
-                    .observed_leases
-                    .iter()
-                    .find(|observed| {
-                        observed.slot_id == lease.slot_id
-                            && observed.generation == lease.generation
-                            && observed.sandbox_id == lease.sandbox_id
-                    })
-                    .map_or(0, |observed| observed.memory_reservation_mib);
+                let previous = observation.observed_leases.iter().find(|observed| {
+                    observed.lease.slot_id == lease.slot_id
+                        && observed.lease.generation == lease.generation
+                        && observed.lease.sandbox_id == lease.sandbox_id
+                });
+                let Some(previous) = previous else {
+                    return lease.memory_reservation_mib;
+                };
+                // Device ownership can be committed after this observation.
+                // Reuse the same cgroup sample, so already charged RAM is not
+                // counted twice when an elastic lease becomes fully reserved.
+                let mode_increase = match lease.mode {
+                    MemoryReservationMode::Elastic => 0,
+                    MemoryReservationMode::FullyReserved => previous
+                        .fully_reserved_growth_mib
+                        .saturating_sub(previous.growth_mib),
+                };
                 lease
                     .memory_reservation_mib
-                    .saturating_sub(previously_reserved)
+                    .saturating_sub(previous.lease.memory_reservation_mib)
+                    .saturating_add(mode_increase)
             })
             .fold(0u64, u64::saturating_add);
         let existing_growth_reserve_mib = observation
@@ -178,27 +217,11 @@ impl MemoryAdmissionConfig {
         Ok(measurement)
     }
 
-    async fn measure_existing_growth_reserve_mib(
-        self,
-        active_leases: &[ActiveLeaseMemoryReservation],
-        sources: &MemoryAdmissionSources,
-    ) -> u64 {
-        let mut growth_reserve_mib = 0u64;
-        for lease in active_leases {
-            let lease_growth_mib = self
-                .read_firecracker_growth_reserve_mib(lease, sources)
-                .await
-                .unwrap_or(lease.memory_reservation_mib);
-            growth_reserve_mib = growth_reserve_mib.saturating_add(lease_growth_mib);
-        }
-        growth_reserve_mib
-    }
-
-    async fn read_firecracker_growth_reserve_mib(
+    async fn read_growth_reserves_mib(
         self,
         lease: &ActiveLeaseMemoryReservation,
         sources: &MemoryAdmissionSources,
-    ) -> Option<u64> {
+    ) -> Option<(u64, u64)> {
         let cgroup_path = sources
             .firecracker_cgroup_base
             .join(lease.sandbox_id.to_string());
@@ -206,7 +229,12 @@ impl MemoryAdmissionConfig {
         let maximum = read_cgroup_memory_bytes(&cgroup_path.join("memory.max")).await?;
         let reserve_bytes = self.reserve_mib.checked_mul(BYTES_PER_MIB)?;
         let remaining_bytes = maximum.saturating_sub(current);
-        Some(remaining_bytes.min(reserve_bytes).div_ceil(BYTES_PER_MIB))
+        let promised_bytes = lease.memory_reservation_mib.checked_mul(BYTES_PER_MIB)?;
+        let full_remaining = maximum.max(promised_bytes).saturating_sub(current);
+        Some((
+            remaining_bytes.min(reserve_bytes).div_ceil(BYTES_PER_MIB),
+            full_remaining.div_ceil(BYTES_PER_MIB),
+        ))
     }
 }
 

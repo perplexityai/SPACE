@@ -4,6 +4,7 @@ package space.node.runtime.v1;
 import "execution/v1/execution.proto";
 
 service RuntimeSupervisor {
+  rpc GetExecutionCapabilities(GetExecutionCapabilitiesRequest) returns (GetExecutionCapabilitiesResponse);
   // Every mutation requires explicit execution identity; no unfenced mode.
   rpc BindExecution(BindExecutionRequest) returns (BindExecutionResponse);
   rpc RetireExecution(RetireExecutionRequest) returns (RetireExecutionResponse);
@@ -127,8 +128,17 @@ message LaunchRuntimeRequest {
   string metrics_path = 13;
   CgroupLimits resource_limits = 14;
   VerifiedRuntimeLaunch verified_runtime = 15;
+  // Required identity for device launches; sandbox_id must be empty.
+  space.execution.v1.DeviceExecutionInput device_execution = 16;
 }
 message LaunchRuntimeResponse {
   uint32 pid = 1;
   string accepted_environment_reference = 2;
+  space.execution.v1.DeviceAcknowledgement devices = 3;
+}
+
+message GetExecutionCapabilitiesRequest {}
+message GetExecutionCapabilitiesResponse {
+  // Protocol support, not availability or qualification of a device profile.
+  bool exclusive_devices_v1 = 1;
 }

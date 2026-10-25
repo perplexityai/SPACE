@@ -2,6 +2,7 @@
 //! boot configuration remain owned by the node-manager adapter.
 use super::*;
 use pplx_space_common_core::types::{EnvironmentReference, RuntimeKind};
+use pplx_space_execution_common::devices::{DeviceExecution, decode_execution};
 use pplx_space_node_runtime_core::{
     artifact_store::managed_release_directory,
     authenticated_source::SourcePins,
@@ -17,13 +18,19 @@ impl RuntimeSupervisorService {
         req: LaunchRuntimeRequest,
         caller: Option<launch::ProcessHandle>,
     ) -> Result<Response<LaunchRuntimeResponse>, Status> {
-        let sandbox_id = parse_sandbox_id(&req.sandbox_id)?;
+        let (sandbox_id, devices) =
+            decode_execution(&req.sandbox_id, req.device_execution.as_ref()).map_err(|error| {
+                pplx_space_node_runtime_core::launch_admission::admission_refusal(
+                    Status::invalid_argument(error.to_string()),
+                )
+            })?;
+        let acknowledgement = devices.as_ref().map(DeviceExecution::acknowledgement);
         let input = req.verified_runtime.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "standalone runtime requires authenticated immutable sources",
             )
         })?;
-        if input.sandbox_id != req.sandbox_id || req.launcher_binary.is_some() {
+        if parse_sandbox_id(&input.sandbox_id)? != sandbox_id || req.launcher_binary.is_some() {
             return Err(Status::invalid_argument(
                 "inconsistent standalone launch identity",
             ));
@@ -50,12 +57,19 @@ impl RuntimeSupervisorService {
         // This acknowledgement is contract compatibility, not a fresh-launch
         // attestation. A resident VM retains the contract under which it started.
         if let Some(pid) = live_runtime_pid(&sandbox_id, "fc.pid")? {
+            self.execution_io(move |store| {
+                store
+                    .check_device_adoption(sandbox_id, execution, devices.as_ref())
+                    .map_err(execution::device_store_status)
+            })
+            .await?;
             return Ok(Response::new(LaunchRuntimeResponse {
+                devices: acknowledgement,
                 pid,
                 accepted_environment_reference: reference.to_string(),
             }));
         }
-        let config = standalone_config(&req, sandbox_id, reference)
+        let config = standalone_config(&req, sandbox_id, reference, devices.as_ref())
             .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
         let limits = req.resource_limits.as_ref().ok_or_else(|| {
             Status::invalid_argument("standalone launch requires resource limits")
@@ -79,6 +93,9 @@ impl RuntimeSupervisorService {
                     "unidentified VM still occupies resource domain",
                 ));
             }
+            store
+                .record_device_intent(sandbox_id, execution, devices.as_ref())
+                .map_err(execution::device_store_status)?;
             store
                 .record_cpu_budget(sandbox_id, execution, budget)
                 .map_err(|e| {
@@ -118,6 +135,7 @@ impl RuntimeSupervisorService {
             write_pid_symlink(&sandbox_id, "fc.pid", runtime_pid)?;
             pending.disarm();
             Ok(Response::new(LaunchRuntimeResponse {
+                devices: acknowledgement,
                 pid: runtime_pid,
                 accepted_environment_reference: reference.to_string(),
             }))
@@ -141,6 +159,7 @@ fn standalone_config(
     req: &LaunchRuntimeRequest,
     sandbox: SandboxId,
     reference: EnvironmentReference,
+    devices: Option<&DeviceExecution>,
 ) -> Result<crate::contained_launcher::Config, Status> {
     let architecture = host_arch().map_err(|e| Status::failed_precondition(e.to_string()))?;
     let environments = CompiledEnvironment::cached_for_architecture(architecture)
@@ -155,6 +174,30 @@ fn standalone_config(
             "environment does not select standalone runtime",
         ));
     }
+    let devices = devices
+        .map(|execution| {
+            let resources = environment
+                .exclusive_device_resources(execution)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            let memory_mib = req
+                .resource_limits
+                .as_ref()
+                .and_then(|limits| limits.memory_mib)
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "device execution requires a finite reserved memory budget",
+                    )
+                })?;
+            let locked_memory_bytes = resources
+                .locked_memory_bytes(memory_mib)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            Ok::<_, Status>(crate::contained_launcher::DeviceContainment {
+                environment: reference,
+                execution: execution.clone(),
+                locked_memory_bytes,
+            })
+        })
+        .transpose()?;
     let binary = Path::new(&req.runtime_binary);
     let root = binary
         .parent()
@@ -209,6 +252,7 @@ fn standalone_config(
         ),
         output: req.console_path.clone().into(),
         arguments: vec!["--api-socket".into(), "/control.sock".into()],
+        devices,
     })
 }
 
