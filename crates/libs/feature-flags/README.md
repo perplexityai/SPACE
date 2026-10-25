@@ -144,6 +144,7 @@ can match on beyond the subject.
 | `space-cluster-api-client-side-balancing` | boolean | `sandbox:`/`session:`/`org:` prefixed id | `cluster_id` | off |
 | `space-native-create-pool-claim` | boolean | constant `space-cluster` | none | off |
 | `space-native-hidden-operations` | boolean | SPACE org id | `operation_id` | off |
+| `space-sandbox-scoped-trust` | boolean | sandbox UUID | none | off; existing host/snapshot enrollment wins |
 | `space-snapshot-retention-config` | JSON object | cluster id | none | env-configured limits |
 
 Each fallback is chosen so that losing the flag backend cannot turn a

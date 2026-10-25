@@ -132,6 +132,10 @@ pub struct SnapshotMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<pplx_space_common_core::types::SnapshotExecutionMetadata>,
     pub sandbox_id: String,
+    /// Captured host enrollment. Absent on older snapshots means legacy;
+    /// restores do not re-evaluate the enrollment feature flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_tls_key_id: Option<String>,
     /// Total logical (uncompressed) bytes of all VM artifacts, summed from
     /// the local files at submit time. vol-mgr may compress the bytes it
     /// ships to S3; this records the on-disk snapshot size, which is what
@@ -184,6 +188,7 @@ pub struct SnapshotMeta {
 }
 
 pub const SNAPSHOT_METADATA_VERSION: u32 = 2;
+pub const SCOPED_TLS_SNAPSHOT_METADATA_VERSION: u32 = 4;
 
 impl SnapshotMeta {
     pub fn execution_metadata(
@@ -193,12 +198,19 @@ impl SnapshotMeta {
         pplx_space_common_core::types::SnapshotExecutionMetadata,
         SnapshotRuntimeMetadataError,
     > {
+        if self.scoped_tls_key_id.is_some()
+            != (self.version == SCOPED_TLS_SNAPSHOT_METADATA_VERSION)
+        {
+            return Err(SnapshotRuntimeMetadataError::UnsupportedVersion(
+                self.version,
+            ));
+        }
         match self.version {
             1 => pplx_space_common_core::types::SnapshotExecutionMetadata::new(
                 self.source.legacy_execution_metadata(legacy_architecture)?,
             )
             .map_err(SnapshotRuntimeMetadataError::InvalidExecution),
-            SNAPSHOT_METADATA_VERSION => self
+            SNAPSHOT_METADATA_VERSION | SCOPED_TLS_SNAPSHOT_METADATA_VERSION => self
                 .execution
                 .clone()
                 .ok_or(SnapshotRuntimeMetadataError::MissingExecution),

@@ -101,6 +101,17 @@ CHART_SET = TELEMETRY_SET + [
     "storageExchange.secretChecksum=" + STS_BRIDGE_SECRET_CHECKSUM,
     "rustBuild=" + RUST_BUILD,
 ]
+# Build/provision the optional proof backend. Enrollment itself uses the same
+# single feature-flag key as production, served by the Kind file provider.
+SCOPED_TRUST_BUILD = os.getenv("SPACE_BUILD_SCOPED_TRUST", "false")
+if SCOPED_TRUST_BUILD in ["true", "1"]:
+    CHART_SET += [
+        "anchorAuthority.keyArn=" + os.getenv("SPACE_ANCHOR_KMS_KEY_ARN", ""),
+        "anchorAuthority.environment=" + os.getenv("SPACE_ANCHOR_ENVIRONMENT", "kind"),
+        "anchorAuthority.kmsReplicaRegion=" + os.getenv("SPACE_ANCHOR_KMS_REPLICA_REGION", ""),
+        "anchorAuthority.credentialsSecretName=" + os.getenv("SPACE_ANCHOR_CREDENTIALS_SECRET_NAME", ""),
+        "featureFlags.space-sandbox-scoped-trust=true",
+    ]
 watch_file("infra/space/kind/charts/space-kind-telemetry")
 # Reconcile before returning any changed producer manifests, including on a
 # watched profile transition. Resource startup dependencies alone do not gate

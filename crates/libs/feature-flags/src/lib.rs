@@ -229,6 +229,11 @@ pub const SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG: JsonFlag =
 pub const SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS_FLAG: JsonFlag =
     JsonFlag::new("space-net-gateway-known-egress-domains");
 
+/// Sole scoped-TLS enrollment gate. The initial decision is persisted in host
+/// and snapshot metadata; false/unresolved never downgrades enrolled sandboxes.
+pub const SPACE_SANDBOX_SCOPED_TRUST_FLAG: BoolFlag =
+    BoolFlag::new("space-sandbox-scoped-trust", false);
+
 /// Selects EndpointSlice-balanced cluster-api clients in data-plane. The
 /// deploy-time endpoint-discovery setting is the hard availability gate; this
 /// flag falls back off and is evaluated per sandbox, session, or organization,

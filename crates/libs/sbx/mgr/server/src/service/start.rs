@@ -1565,6 +1565,11 @@ impl SandboxManagerService {
                 route_identity_provenance: ctx.route_identity_provenance,
                 open_activation_claim_eligible: ctx.open_activation_claim_eligible,
                 restored_snapshot,
+                trust_preparation: if ctx.restore_artifact_as_new.is_some() || ctx.from_warm {
+                    crate::split_trust::Preparation::Initialize
+                } else {
+                    crate::split_trust::Preparation::Preserve
+                },
             })
             .instrument(resume_span.clone())
             .await;
@@ -1709,6 +1714,7 @@ impl SandboxManagerService {
                     storage_uri: ctx.suspend_restore_storage_uri.clone(),
                     local_artifact_id: None,
                 },
+                trust_preparation: crate::split_trust::Preparation::Initialize,
             })
             .await?;
         Ok(Some(response))
@@ -2304,6 +2310,7 @@ impl SandboxManagerService {
         // metadata, this call also performs the first rootfs clone.
         let mut prepare_client = node_client.clone();
         let prepare_rootfs_size_mb = prepare_template.as_ref().and(sandbox.rootfs_size_mb);
+        let trust = self.initial_trust_enrollment(&sandbox).await?;
         let prepare_sandbox = async {
             prepare_client
                 .prepare_sandbox(PrepareSandboxRequest {
@@ -2318,6 +2325,7 @@ impl SandboxManagerService {
                             pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu)
                                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
                         ),
+                        &trust,
                     )?,
                     runtime: sandbox.runtime.clone(),
                     template_dir: prepare_template_dir,

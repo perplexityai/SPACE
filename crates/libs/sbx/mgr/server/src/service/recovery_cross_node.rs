@@ -2422,12 +2422,13 @@ fn publish_rebound_sandbox_artifact_metadata(
                 "invalid restored artifact content hash: {error}"
             ))
         })?;
-    let sandbox_metadata = pplx_space_common_core::types::SandboxArtifactMetadata::new(
+    let mut sandbox_metadata = pplx_space_common_core::types::SandboxArtifactMetadata::new(
         sandbox_id,
         execution,
         template,
         content_hash,
     );
+    sandbox_metadata = sandbox_metadata.with_scoped_tls_key_id(meta.scoped_tls_key_id.clone());
     let metadata_path = sandbox_dir.join("metadata.json");
     let bytes = serde_json::to_vec_pretty(&sandbox_metadata).map_err(|error| {
         crate::snapshot_restore::RestoreError::Other(format!(

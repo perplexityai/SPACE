@@ -40,6 +40,7 @@ async fn fork_copy_transfer_deadline_bounds_a_stalled_rpc() {
 
 fn suspended_metadata(sandbox_id: SandboxId) -> crate::snapshot_upload::SnapshotMeta {
     crate::snapshot_upload::SnapshotMeta {
+        scoped_tls_key_id: None,
         version: 1,
         execution: None,
         sandbox_id: sandbox_id.to_string(),

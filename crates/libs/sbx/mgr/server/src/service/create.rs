@@ -38,6 +38,7 @@ pub(super) struct StartFromCheckpointLaunch<'a> {
         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     pub(super) open_activation_claim_eligible: bool,
     pub(super) restored_snapshot: RestoredSnapshotProvenance,
+    pub(super) trust_preparation: crate::split_trust::Preparation,
 }
 
 /// BYOK restore: rebuild the encrypted rootfs from the suspended `cow.luks` and
@@ -641,6 +642,7 @@ impl SandboxManagerService {
             route_identity_provenance,
             open_activation_claim_eligible,
             restored_snapshot,
+            trust_preparation,
         } = launch;
         // A stopped target is a data placement that must end before
         // Firecracker. The `Start` boundaries answer it before reaching here;
@@ -721,7 +723,53 @@ impl SandboxManagerService {
         let snapshot_execution = checkpoint_execution_metadata(&snapshot_dir)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let cpu_budget = restore_cpu_budget(vcpu, snapshot_execution.cpu_budget())?;
-        let metadata_json = activation_metadata_json(sandbox, cpu_budget)?;
+        // Checkpoints preserve their producer's decision. The old runtime-only
+        // sidecar format predates enrollment and remains legacy.
+        let snapshot_path = std::path::Path::new(&snapshot_dir)
+            .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+        let trust = match std::fs::read(&snapshot_path) {
+            Ok(bytes) => {
+                let meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&bytes)
+                    .map_err(|error| {
+                        Status::failed_precondition(format!("decode snapshot trust: {error}"))
+                    })?;
+                meta.execution_metadata(
+                    host_architecture()
+                        .map_err(|error| Status::failed_precondition(error.to_string()))?,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                let inherited =
+                    crate::split_trust::Enrollment::from_key_id(meta.scoped_tls_key_id.as_deref())?;
+                if inherited.is_scoped()
+                    && trust_preparation == crate::split_trust::Preparation::Initialize
+                {
+                    // A child inherits the mode, never the producer's key pin.
+                    self.fresh_scoped_enrollment(id).await?
+                } else {
+                    inherited
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match crate::split_trust::enrollment(cache_root, id)? {
+                    Some(enrolled) => enrolled,
+                    None if matches!(
+                        trust_preparation,
+                        crate::split_trust::Preparation::Initialize
+                    ) =>
+                    {
+                        self.initial_trust_enrollment(sandbox).await?
+                    }
+                    None => crate::split_trust::Enrollment::Legacy,
+                }
+            }
+            Err(error) => {
+                return Err(Status::failed_precondition(format!(
+                    "read snapshot trust: {error}"
+                )));
+            }
+        };
+        crate::split_trust::require_support(trust.is_scoped())?;
+        let metadata_json = activation_metadata_json(sandbox, cpu_budget, &trust)?;
         let producer_execution = snapshot_execution.into_execution();
         let requested_execution = start_stage_timeout(
             "restore.select_consumer",
@@ -1388,12 +1436,16 @@ impl SandboxManagerService {
         // the proto-to-state mapping only emits these two — but the
         // FSM transition below will reject anything invalid.
         let final_state = target_state;
+        let finalization = super::activation_support::RestoreFinalization {
+            state: final_state,
+            trust: trust_preparation,
+        };
         if blocking {
             if let Err(error) = complete_restore_and_mark_final(
                 self.db.clone(),
                 id,
                 &sandbox.process_env,
-                final_state,
+                finalization,
                 Some(cleanup_id),
             )
             .await
@@ -1409,7 +1461,7 @@ impl SandboxManagerService {
                 self,
                 id.clone(),
                 sandbox.process_env.clone(),
-                final_state,
+                finalization,
                 sandbox.pool_template.is_none().then_some(snapshot_dir),
                 activation_cleanup,
                 cleanup_id,

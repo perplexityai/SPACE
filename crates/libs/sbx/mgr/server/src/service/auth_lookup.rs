@@ -886,6 +886,7 @@ impl SandboxManagerService {
                 &sandbox.process_env,
                 "resume",
                 None,
+                crate::split_trust::Preparation::Preserve,
             )
             .await?;
             Ok::<_, Status>(ready)

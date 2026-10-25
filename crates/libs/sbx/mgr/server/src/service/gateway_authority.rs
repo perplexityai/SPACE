@@ -192,10 +192,23 @@ impl SandboxManagerService {
                 request.get_ref().execution_generation,
             )
             .await?;
+            let cache_root = std::path::Path::new(super::CACHE_DIR);
+            #[cfg(test)]
+            let cache_root = self.create_cache_dir.as_deref().unwrap_or(cache_root);
+            let expected_anchor = crate::split_trust::gateway_anchor(
+                &self.credential_manager_endpoint,
+                cache_root,
+                &before.id,
+                super::activation_support::spaced_host_socket_path(&before.id),
+                before.state == crate::state::SandboxState::Started,
+            )
+            .await?;
             let issued = issuer(NodeRequest {
                 csr: request.get_ref().csr.clone(),
-                sandbox_id: None,
-                anchor_key_id: None,
+                sandbox_id: expected_anchor.as_ref().map(|_| before.id.clone()),
+                anchor_key_id: expected_anchor
+                    .as_ref()
+                    .map(|anchor| anchor.key_id.to_string()),
             })
             .await?;
             self.authorize_gateway_launch(
@@ -215,6 +228,14 @@ impl SandboxManagerService {
             if !same_execution_authority(&before, &after) {
                 return Err(Status::aborted(
                     "gateway CA execution ownership changed during issuance",
+                ));
+            }
+            if expected_anchor
+                .as_ref()
+                .is_some_and(|expected| expected.certificate_der != issued.issuer_certificate_der)
+            {
+                return Err(Status::failed_precondition(
+                    "node returned a different sandbox anchor",
                 ));
             }
             if [&issued.certificate_der, &issued.issuer_certificate_der]

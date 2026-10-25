@@ -37,10 +37,12 @@ SUBJECT_ID_TOKEN_TYPE = "urn:space:token-type:subject-id"
 STORAGE_AUDIENCE = "s3.amazonaws.com"
 
 # Copies stdin to the socket and the socket to stdout until either side
-# closes. `$ARGV[0]` is the socket path.
+# closes. `$ARGV[0]` is a Unix path, or a TCP host when a port follows it.
 RELAY = r"""
-use strict; use IO::Socket::UNIX; use IO::Select;
-my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $ARGV[0]) or die "connect $ARGV[0]: $!\n";
+use strict; use IO::Socket::UNIX; use IO::Socket::INET; use IO::Select;
+my $s = (@ARGV > 1
+  ? IO::Socket::INET->new(PeerAddr => $ARGV[0], PeerPort => $ARGV[1], Proto => "tcp")
+  : IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $ARGV[0])) or die "connect $ARGV[0]: $!\n";
 binmode STDIN; binmode STDOUT;
 my $sel = IO::Select->new(\*STDIN, $s);
 while (my @ready = $sel->can_read) {
@@ -180,7 +182,9 @@ def _grpc():
 
 
 @contextlib.contextmanager
-def relayed_channel(argv: Sequence[str]) -> Iterator[grpc.Channel]:
+def relayed_channel(
+    argv: Sequence[str], *, tls_root: bytes | None = None, authority: str = "localhost"
+) -> Iterator[grpc.Channel]:
     """A gRPC channel whose every connection runs `argv` as its byte relay."""
 
     directory = tempfile.mkdtemp(prefix="space-smoke-credmgr-")
@@ -225,9 +229,15 @@ def relayed_channel(argv: Sequence[str]) -> Iterator[grpc.Channel]:
     grpc = _grpc()
     # The default :authority for a unix target is the percent-encoded path,
     # which the agent's HTTP/2 server rejects as malformed.
-    channel = grpc.insecure_channel(
-        f"unix:{path}", options=[("grpc.enable_retries", 0), ("grpc.default_authority", "localhost")]
-    )
+    options = [("grpc.enable_retries", 0), ("grpc.default_authority", authority)]
+    if tls_root is None:
+        channel = grpc.insecure_channel(f"unix:{path}", options=options)
+    else:
+        channel = grpc.secure_channel(
+            f"unix:{path}",
+            grpc.ssl_channel_credentials(root_certificates=tls_root),
+            options=[*options, ("grpc.ssl_target_name_override", authority)],
+        )
     try:
         yield channel
     finally:
@@ -261,3 +271,45 @@ def exchange_token(
         except _grpc().RpcError as error:
             return None, error.code().name, error.details() or ""
     return decode_exchange_response(response), "OK", ""
+
+
+def sandbox_anchor(
+    argv: Sequence[str], *, sandbox_id: str, key_id: str, private: bool = False, timeout: float = 30,
+    tls_root: bytes | None = None, authority: str = "localhost",
+) -> tuple[bytes, str]:
+    """Return only the public certificate and status; reject a private-key leak."""
+    requested_type = (
+        "urn:space:token-type:x509-signing-credentials" if private
+        else "urn:space:token-type:x509-certificate"
+    )
+    request = b"".join((
+        _string_field(1, "urn:ietf:params:oauth:grant-type:token-exchange"),
+        _string_field(2, f"urn:space:credential:sandbox-tls-anchor:{key_id}"),
+        _string_field(5, requested_type),
+        _string_field(6, f"sandbox:{sandbox_id}"),
+        _string_field(7, "urn:space:token-type:subject-id"),
+    ))
+    with relayed_channel(argv, tls_root=tls_root, authority=authority) as channel:
+        call = channel.unary_unary(
+            EXCHANGE_TOKEN_METHOD,
+            request_serializer=lambda message: message,
+            response_deserializer=lambda message: message,
+        )
+        try:
+            response = call(request, timeout=timeout)
+        except _grpc().RpcError as error:
+            return b"", error.code().name
+    certificate = b""
+    returned_key = ""
+    for number, value in _fields(response):
+        if number in (8, 9) and value:
+            raise RuntimeError("anchor probe received a retired unpinned or private payload")
+        if number == 10 and isinstance(value, bytes):
+            for field, content in _fields(value):
+                if field == 1 and isinstance(content, bytes):
+                    certificate = content
+                if field == 2 and isinstance(content, bytes):
+                    returned_key = content.decode()
+    if not certificate or returned_key != key_id:
+        raise RuntimeError("anchor response omitted its certificate or ignored the key pin")
+    return certificate, "OK"

@@ -1,8 +1,11 @@
 use super::super::tests::service_tests::insert_test_sandbox;
 use super::*;
-use pplx_space_common_core::types::RouteGeneration;
+use pplx_space_common_core::types::{
+    Arch, ExecutionMetadata, RouteGeneration, SandboxArtifactMetadata, TemplateName,
+};
 
 struct Fixture {
+    cache: tempfile::TempDir,
     _gateway: super::super::gateway_identity::tests::GatewayNode,
     service: SandboxManagerService,
     sandbox_id: SandboxId,
@@ -41,8 +44,11 @@ impl Fixture {
         )
         .unwrap();
         let mut service = SandboxManagerService::new_with_options(conn, options);
+        let cache = tempfile::tempdir().unwrap();
+        service.create_cache_dir = Some(cache.path().to_path_buf());
         let gateway = super::super::gateway_identity::tests::GatewayNode::attach(&mut service);
         Self {
+            cache,
             _gateway: gateway,
             service,
             sandbox_id,
@@ -356,6 +362,27 @@ async fn gateway_authority_retries_until_identity_and_launch_evidence_publish() 
         ._gateway
         .authorized
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Launch identity alone is insufficient while the host-owned enrollment
+    // decision has not been published. Otherwise a scoped activation can race
+    // into issuance under the old shared root.
+    assert_eq!(
+        fixture.issue().await.unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let path = fixture.cache.path().join(fixture.sandbox_id.to_string());
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(
+        path.join("metadata.json"),
+        serde_json::to_vec(&SandboxArtifactMetadata::new(
+            fixture.sandbox_id,
+            ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]),
+            TemplateName::parse("test").unwrap(),
+            None,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
     let response = fixture
         .issue()
         .await

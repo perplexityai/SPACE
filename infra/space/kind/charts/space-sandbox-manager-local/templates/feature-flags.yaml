@@ -1,0 +1,15 @@
+{{- if .Values.featureFlags }}
+{{- $flags := dict }}
+{{- range $name, $enabled := .Values.featureFlags }}
+{{- $_ := set $flags $name (dict "state" "ENABLED" "variants" (dict "on" true "off" false) "defaultVariant" (ternary "on" "off" $enabled)) }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-sandbox-feature-flags
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  flags.json: {{ dict "flags" $flags | toJson | quote }}
+{{- end }}

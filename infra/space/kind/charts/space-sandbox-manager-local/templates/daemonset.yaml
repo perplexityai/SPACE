@@ -85,6 +85,14 @@ spec:
               value: k8s
             - name: SPACE_SBXMGR_NETWORK_CREDENTIALS_ENABLED
               value: {{ .Values.networkCredentials.enabled | quote }}
+            {{- if .Values.featureFlags }}
+            - name: SPACE_FLAGD_ENABLED
+              value: "true"
+            - name: FLAGD_RESOLVER
+              value: "file"
+            - name: FLAGD_OFFLINE_FLAG_SOURCE_PATH
+              value: /etc/space-feature-flags/flags.json
+            {{- end }}
             # Snapshot upload destination (SnapshotUploadConfig::from_env, the
             # suspend artifact-backup path). volume-manager performs the transfer
             # with the object-store credentials it holds or exchanges;
@@ -169,6 +177,11 @@ spec:
             {{- end }}
           {{- include "space-node-service.probes" $ctx | nindent 10 }}
           volumeMounts:
+            {{- if .Values.featureFlags }}
+            - name: feature-flags
+              mountPath: /etc/space-feature-flags
+              readOnly: true
+            {{- end }}
             {{- include "space-node-service.mount.run" . | nindent 12 }}
             {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
             # Per-VM defaults (/space/etc/sandbox.toml), which the node image
@@ -185,6 +198,11 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
       volumes:
+        {{- if .Values.featureFlags }}
+        - name: feature-flags
+          configMap:
+            name: {{ .Release.Name }}-sandbox-feature-flags
+        {{- end }}
         {{- include "space-node-service.volume.run" . | nindent 8 }}
         {{- include "space-node-service.volume.cache" . | nindent 8 }}
         - name: space-etc

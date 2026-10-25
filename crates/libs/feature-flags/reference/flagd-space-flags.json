@@ -2,6 +2,13 @@
   "$schema": "https://flagd.dev/schema/v0/flags.json",
   "_comment": "Worked flagd definitions for every flag SPACE reads. Defaults here reproduce the behaviour of an unconfigured deployment, so serving this file unchanged changes nothing. See ../README.md for the subject shape and targeting attributes each flag expects. Guarded against drift by tests/flagd_reference.rs.",
   "flags": {
+    "space-sandbox-scoped-trust": {
+      "state": "ENABLED",
+      "defaultVariant": "off",
+      "variants": {"on": true, "off": false},
+      "_comment": "Subject is the sandbox UUID. Only fresh initializations consult this gate; host and snapshot metadata preserve existing enrollment through flag changes and restores.",
+      "targeting": {}
+    },
     "space-cluster-rate-limiter": {
       "state": "ENABLED",
       "defaultVariant": "on",

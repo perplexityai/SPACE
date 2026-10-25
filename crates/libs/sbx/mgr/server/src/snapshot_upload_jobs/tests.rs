@@ -648,6 +648,7 @@ fn reclaim_fixture_meta(
     local_artifact_id: Option<LocalArtifactId>,
 ) -> SnapshotMeta {
     SnapshotMeta {
+        scoped_tls_key_id: None,
         version: 1,
         execution: None,
         sandbox_id: "sbx-reclaim".to_string(),

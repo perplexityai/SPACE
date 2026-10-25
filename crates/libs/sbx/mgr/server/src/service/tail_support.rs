@@ -43,7 +43,7 @@ fn sandbox_artifact_metadata(
     sandbox_artifact_metadata_in(std::path::Path::new(CACHE_DIR), sandbox_id)
 }
 
-fn sandbox_artifact_metadata_in(
+pub(crate) fn sandbox_artifact_metadata_in(
     cache_dir: &std::path::Path,
     sandbox_id: &str,
 ) -> Result<Option<pplx_space_common_core::types::SandboxArtifactMetadata>, RuntimeArtifactReadError>
@@ -90,6 +90,7 @@ pub(super) fn sandbox_snapshot_execution_metadata(
 pub(super) fn activation_metadata_json(
     sandbox: &crate::db::SandboxRow,
     cpu_budget: Option<pplx_space_common_core::types::VcpuCount>,
+    trust: &crate::split_trust::Enrollment,
 ) -> Result<String, Status> {
     use pplx_space_common_core::types::SandboxArtifactMetadata;
     let invalid = |error: String| Status::failed_precondition(error);
@@ -117,6 +118,7 @@ pub(super) fn activation_metadata_json(
             .map_err(|error| invalid(error.to_string()))?,
     );
     metadata.cpu_budget = cpu_budget;
+    metadata = metadata.with_scoped_tls_key_id(trust.key_id().map(ToString::to_string));
     serde_json::to_string(&metadata)
         .map_err(|error| Status::internal(format!("serialize activation metadata: {error}")))
 }

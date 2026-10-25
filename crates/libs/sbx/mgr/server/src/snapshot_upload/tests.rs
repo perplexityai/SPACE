@@ -43,6 +43,7 @@ fn object_store_identity_excludes_only_the_object_prefix() {
 
 fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
     SnapshotMeta {
+        scoped_tls_key_id: None,
         version: 1,
         execution: None,
         sandbox_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".to_string(),
@@ -70,6 +71,36 @@ fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
         artifact_kind: None,
         artifact_origin: None,
         artifact_snapshot_name: None,
+    }
+}
+
+#[test]
+fn snapshot_trust_enrollment_round_trips_with_a_required_reader_version() {
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata, SnapshotExecutionMetadata};
+    for (version, scoped, accepted) in [
+        (1, false, true),
+        (2, false, true),
+        (4, true, true),
+        (1, true, false),
+        (2, true, false),
+        (3, false, false),
+        (3, true, false),
+        (4, false, false),
+    ] {
+        let mut meta = fixture_meta(None);
+        meta.version = version;
+        meta.scoped_tls_key_id = scoped.then(|| "mrk-0123456789abcdef0123456789abcdef".into());
+        meta.execution = Some(
+            SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+                Arch::X86_64,
+                vec![],
+            ))
+            .unwrap(),
+        );
+        let encoded = serde_json::to_vec(&meta).unwrap();
+        let decoded: SnapshotMeta = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.scoped_tls_key_id, meta.scoped_tls_key_id);
+        assert_eq!(decoded.execution_metadata(Arch::X86_64).is_ok(), accepted);
     }
 }
 

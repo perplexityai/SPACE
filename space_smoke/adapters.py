@@ -17,7 +17,6 @@ import sys
 import tempfile
 import threading
 import socket
-import sys
 import time
 import uuid
 from collections import deque
@@ -88,6 +87,7 @@ from space_smoke.capabilities import (
     ColdEvictionConfig,
     SnapshotReaperConfig,
     SandboxPodPlacement,
+    SandboxAnchorHardwareOps,
     SnapshotRecord,
     StorageExchangeOutcome,
     StorageObject,
@@ -1108,12 +1108,7 @@ class KindHarness:
             self._assert_retention_lease_owned()
 
         assert_lease()
-        if self.config.context != "kind-space-local" or urlsplit(
-            self.config.api_url
-        ).hostname not in {"localhost", "127.0.0.1"}:
-            raise SmokeConfigurationError(
-                "cold setup requires the isolated local Kind API"
-            )
+        self._require_isolated_kind("cold setup")
         token_file = self.environment.get("SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
         receipts = self.environment.get("SPACE_SMOKE_KIND_COLD_RECEIPTS")
         if not token_file or not receipts:
@@ -2607,6 +2602,232 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
             cleared.append(name)
         return tuple(cleared)
+
+    def probe_anchor_access(self, sandbox_id: str) -> Mapping[str, str]:
+        import hashlib
+        from space_smoke.credmgr_socket import RELAY, sandbox_anchor
+
+        self._require_isolated_kind("sandbox anchor authentication and delivery probes")
+        placement = self.sandbox_pod_placement(sandbox_id)
+        if placement is None:
+            raise SmokeConfigurationError("anchor probe needs one active sandbox execution")
+        other = next((node for node in self.sandbox_worker_nodes() if node != placement.node_name), None)
+        if other is None:
+            raise SmokeConfigurationError("anchor authentication proof requires a second worker")
+        canonical = _sql_uuid(sandbox_id)
+        metadata = json.loads(_require_ok(self.kubectl(
+            "exec", self._node_shell_pod(placement.node_name),
+            "-c", KIND_NODE_SHELL_CONTAINER, "--", "cat",
+            f"/space/cache/firecracker/sandboxes/{canonical}/metadata.json",
+            timeout=15,
+        ), "read host-owned sandbox trust pin"))
+        key_id = metadata.get("scoped_tls_key_id")
+        if (
+            metadata.get("schema_version") != 4
+            or metadata.get("sandbox_id") != canonical
+            or not isinstance(key_id, str)
+        ):
+            raise SmokeConfigurationError("sandbox has no valid host-owned scoped trust pin")
+
+        def probe(node: str, user: str = "space-sbxmgr", *, private: bool = False) -> tuple[bytes, str]:
+            argv = relay_argv(
+                ["kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE],
+                self._node_shell_pod(node), KIND_NODE_SHELL_CONTAINER,
+                "/space/run/credential-manager/credmgr.sock",
+                user=user, groups=("space-sbxclients",),
+            )
+            return sandbox_anchor(argv, sandbox_id=canonical, key_id=key_id, private=private)
+
+        certificate, assigned = probe(placement.node_name)
+        foreign_certificate, foreign = probe(other)
+        _, signing_refused = probe(placement.node_name, private=True)
+        _, unprivileged = probe(placement.node_name, "nobody")
+        # Read only the public TLS certificate, never the private key. This
+        # direct authority call has server authentication but no caller token.
+        public_tls = _require_ok(
+            self.kubectl(
+                "get", "secret", "space-credmgr-authority-tls",
+                "-o", r"jsonpath={.data.tls\.crt}", timeout=15,
+            ),
+            "read authority public TLS certificate",
+        )
+        authority_port = _require_ok(
+            self.kubectl(
+                "get", "service", "space-credmgr-authority",
+                "-o", 'jsonpath={.spec.ports[?(@.name=="grpc")].port}', timeout=15,
+            ),
+            "read authority gRPC service port",
+        ).strip()
+        if not authority_port.isdecimal() or not 0 < int(authority_port) < 65536:
+            raise SmokeConfigurationError("authority Service has no valid gRPC port")
+        tcp_relay = [
+            "kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE,
+            "exec", "-i", self._node_shell_pod(placement.node_name),
+            "-c", KIND_NODE_SHELL_CONTAINER, "--", "perl", "-e", RELAY,
+            f"space-credmgr-authority.{KIND_NAMESPACE}.svc.cluster.local", authority_port,
+        ]
+        _, unauthenticated = sandbox_anchor(
+            tcp_relay, sandbox_id=canonical, key_id=key_id, private=True,
+            tls_root=base64.b64decode(public_tls, validate=True),
+            authority="space-credmgr-authority",
+        )
+        return {
+            "anchor_key_id": key_id,
+            "assigned_node": placement.node_name,
+            "foreign_node": other,
+            "assigned_status": assigned,
+            "foreign_node_status": foreign,
+            "local_signing_profile_status": signing_refused,
+            "unprivileged_peer_status": unprivileged,
+            "unauthenticated_authority_status": unauthenticated,
+            "public_certificate_sha256": hashlib.sha256(certificate).hexdigest(),
+            "foreign_certificate_sha256": hashlib.sha256(foreign_certificate).hexdigest(),
+        }
+
+    def recover_anchor_keyring(self) -> Mapping[str, str]:
+        from space_smoke.anchor_recovery import AnchorRecoveryDriver
+
+        self._require_isolated_kind("sandbox anchor keyring recovery")
+
+        def driver(ownership: _LeaseOwnership) -> AnchorRecoveryDriver:
+            return AnchorRecoveryDriver(
+                self.kubectl,
+                lambda action, annotations: self._renew_lease(ownership, action, annotations),
+            )
+
+        def repair(previous: Mapping[str, object], ownership: _LeaseOwnership) -> None:
+            driver(ownership).repair(_lease_annotations(previous))
+
+        ownership = self._acquire_named_mutation_lease(
+            "space-smoke-sandbox-anchor-recovery",
+            "sandbox anchor recovery",
+            repair=repair,
+        )
+        try:
+            return driver(ownership).run()
+        finally:
+            self._release_lease(ownership)
+
+    @contextlib.contextmanager
+    def enrollment(self, enabled: bool) -> Iterator[None]:
+        from space_smoke.anchor_recovery import EnrollmentDriver, FLAG_RECORD
+
+        self._require_isolated_kind("sandbox trust enrollment proof")
+
+        def driver(ownership: _LeaseOwnership) -> EnrollmentDriver:
+            return EnrollmentDriver(
+                self.kubectl,
+                lambda action, annotations: self._renew_lease(ownership, action, annotations),
+            )
+
+        ownership = self._acquire_named_mutation_lease(
+            "space-smoke-sandbox-trust-enrollment", "sandbox trust enrollment",
+            repair=lambda previous, current: driver(current).repair(_lease_annotations(previous)),
+        )
+        previous: str | None = None
+        try:
+            previous = driver(ownership).current()
+            driver(ownership).set(enabled)
+            yield
+        finally:
+            try:
+                if previous is not None:
+                    driver(ownership).repair({FLAG_RECORD: previous})
+            finally:
+                self._release_lease(ownership)
+
+    def set_interception(self, sandbox_id: str, *, enabled: bool) -> None:
+        """Set policy through the public Native API, not an invented ECW SDK method."""
+        from space_smoke.native import NativeConfig, NativeSandboxFactory
+
+        self._require_isolated_kind("sandbox trust policy proof")
+        public_id = f"sbx_{uuid.UUID(sandbox_id.removeprefix('sbx_'))}"
+        native = NativeSandboxFactory(NativeConfig(
+            api_url=self.config.api_url,
+            data_plane_url=self.config.data_plane_url,
+            token=self._admin_token(),
+            template=self.environment.get("SPACE_TEMPLATE", "seed:latest"),
+        ))
+        native.set_network_policy(public_id, {
+            "version": "v1",
+            "egress": {"default_action": "allow"},
+            "tls_interception": "on" if enabled else "off",
+        })
+
+    @contextlib.contextmanager
+    def hardware(self) -> Iterator[SandboxAnchorHardwareOps]:
+        from space_smoke.anchor_hardware import HardwareControl, HardwareFixture
+        from space_smoke.anchor_recovery import AnchorRecoveryDriver
+
+        self._require_isolated_kind("sandbox anchor hardware proof")
+        required = (
+            "SPACE_SMOKE_ANCHOR_HARDWARE_JOURNAL",
+            "SPACE_SMOKE_ANCHOR_AWS_PROFILE",
+            "SPACE_SMOKE_ANCHOR_AWS_ACCOUNT",
+            "SPACE_SMOKE_KIND_CLUSTER_UID",
+        )
+        if any(not self.environment.get(name) for name in required):
+            raise SmokeConfigurationError("hardware proof requires an explicit journal/profile/account")
+        fixture = HardwareFixture(
+            Path(self.environment[required[0]]),
+            self.environment[required[1]],
+            self.environment[required[2]],
+        )
+        key_record = "space.pplx.net/smoke-anchor-standing-key"
+        key_env = "SPACE_ANCHOR_KMS_KEY_ARN"
+        deployment = "space-credmgr-authority"
+
+        def restore_key(recorded: str, ownership: _LeaseOwnership) -> None:
+            standing = json.loads(recorded)
+            if (
+                not isinstance(standing, dict) or set(standing) != {key_env}
+                or standing[key_env] not in {key["primary"] for key in fixture.state["keys"]}
+            ):
+                raise SmokeConfigurationError("invalid recorded hardware-key configuration")
+            self._renew_lease(ownership, "restore standing authority key", None)
+            self._set_deployment_env(deployment, standing, timeout=150)
+            if self._deployment_env_literals(deployment, (key_env,)) != standing:
+                raise SmokeConfigurationError("standing authority key was not restored")
+            self._renew_lease(ownership, "authority key restored", {key_record: None})
+
+        def repair(previous: Mapping[str, object], ownership: _LeaseOwnership) -> None:
+            fixture.recover_availability()
+            self._renew_lease(ownership, "refresh owned hardware credentials before repair", None)
+            fixture.install(self.config.context, self.environment[required[3]])
+            driver = AnchorRecoveryDriver(
+                self.kubectl,
+                lambda action, annotations: self._renew_lease(ownership, action, annotations),
+            )
+            driver.repair(_lease_annotations(previous))
+            recorded = _lease_annotations(previous).get(key_record)
+            if isinstance(recorded, str):
+                restore_key(recorded, ownership)
+
+        ownership = self._acquire_named_mutation_lease(
+            "space-smoke-sandbox-anchor-recovery", "sandbox anchor hardware", repair=repair,
+        )
+        control = HardwareControl(
+            fixture, self.kubectl,
+            lambda action, annotations: self._renew_lease(ownership, action, annotations),
+        )
+        standing = json.dumps(self._deployment_env_literals(deployment, (key_env,)))
+        self._renew_lease(ownership, "record authority key before hardware proof", {key_record: standing})
+        try:
+            fixture.recover_availability()
+            self._renew_lease(ownership, "refresh owned hardware credentials", None)
+            fixture.install(self.config.context, self.environment[required[3]])
+            yield control
+        finally:
+            try:
+                fixture.recover_availability()
+                if control.cold_restore is not None:
+                    AnchorRecoveryDriver(
+                        self.kubectl,
+                        lambda action, annotations: self._renew_lease(ownership, action, annotations),
+                    ).restore(control.cold_restore)
+                restore_key(standing, ownership)
+            finally:
+                self._release_lease(ownership)
 
     def _require_isolated_kind(self, action: str) -> None:
         if urlsplit(self.config.api_url).hostname not in {"localhost", "127.0.0.1"}:

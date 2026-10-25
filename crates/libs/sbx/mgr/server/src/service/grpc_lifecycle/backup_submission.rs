@@ -64,8 +64,18 @@ pub(super) fn suspend_snapshot_metadata(
         }
         _ => None,
     };
+    let trust = crate::split_trust::enrollment(
+        std::path::Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR),
+        &sandbox.id,
+    )?
+    .unwrap_or(crate::split_trust::Enrollment::Legacy);
     Ok(crate::snapshot_upload::SnapshotMeta {
-        version: crate::snapshot_upload::SNAPSHOT_METADATA_VERSION,
+        scoped_tls_key_id: trust.key_id().map(ToString::to_string),
+        version: if trust.is_scoped() {
+            crate::snapshot_upload::SCOPED_TLS_SNAPSHOT_METADATA_VERSION
+        } else {
+            crate::snapshot_upload::SNAPSHOT_METADATA_VERSION
+        },
         execution: Some(snapshot_execution),
         sandbox_id: sandbox.id.clone(),
         size_bytes: 0,

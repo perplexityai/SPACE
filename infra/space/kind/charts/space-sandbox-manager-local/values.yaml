@@ -167,3 +167,9 @@ resources:
   requests:
     cpu: 50m
     memory: 64Mi
+# Must match the authority rollout; there is no anchor-to-shared fallback.
+# Optional Kind-only flagd file-provider definitions. Empty leaves the normal
+# feature-flag backend unchanged. The production Eppo key has the same name.
+# featureFlags:
+#   space-sandbox-scoped-trust: false
+featureFlags: {}

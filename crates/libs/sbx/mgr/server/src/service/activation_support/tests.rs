@@ -129,9 +129,17 @@ async fn restore_defers_guest_readiness_only_while_paused() {
         // before Started. No guest exists to answer this synthetic sandbox.
         crate::db::set_pool_template(&conn, &id, Some("seed")).unwrap();
         let db = crate::db::SharedConnection::new(conn);
-        let result =
-            complete_restore_and_mark_final(db.clone(), &id, &BTreeMap::new(), final_state, None)
-                .await;
+        let result = complete_restore_and_mark_final(
+            db.clone(),
+            &id,
+            &BTreeMap::new(),
+            RestoreFinalization {
+                state: final_state,
+                trust: crate::split_trust::Preparation::Preserve,
+            },
+            None,
+        )
+        .await;
         if final_state == SandboxState::Started {
             let status = result.expect_err("snapshot alone cannot establish guest compatibility");
             assert!(matches!(
@@ -534,7 +542,10 @@ async fn restore_final_state_db_error_is_propagated() {
         db,
         "sandbox-1",
         &BTreeMap::new(),
-        SandboxState::Paused,
+        RestoreFinalization {
+            state: SandboxState::Paused,
+            trust: crate::split_trust::Preparation::Preserve,
+        },
         None,
     )
     .await;
@@ -557,7 +568,10 @@ async fn restore_final_state_requires_a_restoring_row() {
         db,
         "missing-sandbox",
         &BTreeMap::new(),
-        SandboxState::Paused,
+        RestoreFinalization {
+            state: SandboxState::Paused,
+            trust: crate::split_trust::Preparation::Preserve,
+        },
         None,
     )
     .await;
@@ -608,7 +622,10 @@ async fn restore_finalizer_retains_cleanup_until_state_persistence_succeeds() {
             &service,
             sandbox_id,
             BTreeMap::new(),
-            final_state,
+            RestoreFinalization {
+                state: final_state,
+                trust: crate::split_trust::Preparation::Preserve,
+            },
             Some(snapshot_dir.to_string_lossy().into_owned()),
             cleanup_guard,
             cleanup_id,
@@ -728,10 +745,16 @@ async fn activation_env_failure_keeps_setup_context_for_callers_and_cleanup() {
 
         // No host exists for this synthetic sandbox. Exhausting connection
         // retries must retain setup context; lifecycle fences remain distinct.
-        let status =
-            configure_process_env_for_activation(&db, &sandbox_id, &env, phase, cleanup_id)
-                .await
-                .unwrap_err();
+        let status = configure_process_env_for_activation(
+            &db,
+            &sandbox_id,
+            &env,
+            phase,
+            cleanup_id,
+            crate::split_trust::Preparation::Preserve,
+        )
+        .await
+        .unwrap_err();
         let status = cleanup.failure(status);
         drop(cleanup);
 
@@ -870,9 +893,16 @@ async fn activation_env_rejects_requested_or_unowned_cleanup() {
             if !requested && owner == Some(episode.id) {
                 continue; // The setup-context test covers the current owner.
             }
-            let status = configure_process_env_for_activation(&db, &id, &env, "restore", owner)
-                .await
-                .unwrap_err();
+            let status = configure_process_env_for_activation(
+                &db,
+                &id,
+                &env,
+                "restore",
+                owner,
+                crate::split_trust::Preparation::Preserve,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
                 status.code(),
                 tonic::Code::Aborted,

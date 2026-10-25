@@ -79,6 +79,7 @@ pub(crate) mod network_policy;
 mod restart_admission;
 mod suspend_snapshot_publication;
 mod template_apps;
+mod trust_enrollment;
 
 /// Enables the network-credential authority path (off by default).
 const NETWORK_CREDENTIALS_ENABLED_ENV: &str = "SPACE_SBXMGR_NETWORK_CREDENTIALS_ENABLED";
@@ -2077,7 +2078,7 @@ mod start;
 mod start_support;
 mod startup_resident;
 mod storage;
-mod tail_support;
+pub(crate) mod tail_support;
 mod template_snapshot_support;
 #[cfg(test)]
 pub(crate) mod test_options;

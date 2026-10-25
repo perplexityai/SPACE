@@ -13,6 +13,7 @@ fn snapshot_meta_with_sandbox(
     sandbox: Option<crate::snapshot_upload::SnapshotSandbox>,
 ) -> crate::snapshot_upload::SnapshotMeta {
     crate::snapshot_upload::SnapshotMeta {
+        scoped_tls_key_id: None,
         version: 1,
         execution: None,
         sandbox_id: "019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),

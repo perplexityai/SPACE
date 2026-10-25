@@ -418,6 +418,7 @@ fn disk_artifact_meta() -> (
     .unwrap();
     (
         crate::snapshot_upload::SnapshotMeta {
+            scoped_tls_key_id: None,
             version: crate::snapshot_upload::SNAPSHOT_METADATA_VERSION,
             execution: Some(execution),
             sandbox_id: "019f8000-0000-7000-8000-000000000002".to_string(),
