@@ -1,0 +1,25 @@
+# Build from the exact digest of a seed bound to the matching signed boot bundle.
+# The build VM needs no device assignment; drivers come from authenticated boot inputs.
+[metadata]
+name = "nvidia-compute"
+description = "Compute userspace matched to the signed GPU boot bundle"
+base = "seed"
+
+[[steps]]
+type = "run"
+name = "install matching compute userspace"
+user = "root"
+command = '''
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+version="$(apt-cache madison libnvidia-compute-580 | awk '$3 ~ /^580[.]178[.]04-/ {print $3; exit}')"
+test -n "$version"
+apt-get install -y --no-install-recommends python3 "libnvidia-compute-580=$version" "nvidia-utils-580=$version"
+ldconfig
+python3 -c 'import ctypes; ctypes.CDLL("libcuda.so.1")'
+mkdir -p /opt/space
+uname -r > /opt/space/template-build-kernel
+printf '%s\n' "$version" > /opt/space/nvidia-userspace-version
+test ! -e /sys/module/nvidia
+'''
