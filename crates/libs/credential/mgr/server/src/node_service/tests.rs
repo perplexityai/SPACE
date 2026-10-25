@@ -36,6 +36,62 @@ fn plaintext_tcp_upstream_is_accepted() {
     validate_upstream(&CredmgrEndpoint::Tcp(uri)).unwrap();
 }
 
+#[tokio::test]
+async fn x509_exchange_does_not_expand_storage_access_or_expose_signing_keys() {
+    use pplx_space_credmgr_client::x509::CredentialKind;
+    with_authority(ResolveResponse::default(), |node, _requests| async move {
+        let id = pplx_space_common_core::types::SandboxId::from_uuid(uuid::Uuid::now_v7());
+        for (uid, private, expected) in [
+            (users::SPACE_SBXMGR.uid, true, Code::InvalidArgument),
+            (users::SPACE_VOLMGR.uid, false, Code::PermissionDenied),
+            (65534, false, Code::PermissionDenied),
+        ] {
+            let mut request = Request::new(CredentialKind::Certificate.request(id));
+            if private {
+                request.get_mut().requested_token_type =
+                    "urn:space:token-type:x509-signing-credentials".into();
+            }
+            request
+                .extensions_mut()
+                .insert(PeerIdentity::new(uid, uid, Some(1)));
+            assert_eq!(
+                node.exchange_token(request).await.unwrap_err().code(),
+                expected
+            );
+        }
+        let mut scoped = Request::new(IssueIntermediateCertificateRequest {
+            anchor_key_id: None,
+            csr: Vec::new(),
+            sandbox_id: Some("not-a-canonical-sandbox".into()),
+        });
+        // Authorization precedes body validation; the new public profile must
+        // not admit sandbox manager to the existing storage forwarder.
+        let mut storage = Request::new(crate::proto::ExchangeTokenRequest::default());
+        storage.extensions_mut().insert(PeerIdentity::new(
+            users::SPACE_SBXMGR.uid,
+            users::SPACE_SBXMGR.uid,
+            Some(1),
+        ));
+        assert_eq!(
+            node.exchange_token(storage).await.unwrap_err().code(),
+            Code::PermissionDenied
+        );
+        scoped.extensions_mut().insert(PeerIdentity::new(
+            users::SPACE_SBXMGR.uid,
+            users::SPACE_SBXMGR.uid,
+            Some(1),
+        ));
+        assert_eq!(
+            node.issue_intermediate_certificate(scoped)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    })
+    .await;
+}
+
 #[test]
 fn server_tls_upstream_is_accepted() {
     let uri = "https://space-credential-manager:9810".parse().unwrap();

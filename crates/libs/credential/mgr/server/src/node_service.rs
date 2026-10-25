@@ -341,6 +341,18 @@ impl CredentialManager for NodeCredentialManager {
         &self,
         request: Request<ExchangeTokenRequest>,
     ) -> Result<Response<ExchangeTokenResponse>, Status> {
+        use pplx_space_credmgr_client::x509::AnchorRequest;
+        if AnchorRequest::recognizes(request.get_ref()) {
+            self.authorize_sandbox_anchor(&request)?;
+            AnchorRequest::parse(request.get_ref())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let mut up = self.upstream.clone();
+            return self
+                .forward("ExchangeToken", async move {
+                    up.exchange_token(request.into_inner()).await
+                })
+                .await;
+        }
         let caller = self.caller_resolver.resolve(&request)?;
         if !matches!(caller, ResolvedCaller::UdsPeer(_)) {
             return Err(Status::permission_denied(
@@ -441,13 +453,20 @@ impl CredentialManager for NodeCredentialManager {
             ALLOW_GATEWAY_CA_ISSUANCE,
             &[],
         )?;
-        if request.get_ref().sandbox_id.is_some() || request.get_ref().anchor_key_id.is_some() {
-            return Err(Status::failed_precondition(
-                "sandbox-scoped CA issuance is not supported",
-            ));
+        let request = request.into_inner();
+        if pplx_space_credmgr_client::x509::ScopedIssuer::parse(&request)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?
+            .is_some()
+        {
+            let mut up = self.upstream.clone();
+            return self
+                .forward("IssueIntermediateCertificate", async move {
+                    up.issue_intermediate_certificate(request).await
+                })
+                .await;
         }
         self.node_ca
-            .issue_intermediate(request.into_inner())
+            .issue_intermediate(request)
             .await
             .map(Response::new)
             .map_err(|error| error.to_status())
@@ -456,3 +475,21 @@ impl CredentialManager for NodeCredentialManager {
 
 #[cfg(test)]
 mod tests;
+
+impl NodeCredentialManager {
+    fn authorize_sandbox_anchor<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let caller = self.caller_resolver.resolve(request)?;
+        if !matches!(caller, ResolvedCaller::UdsPeer(_)) {
+            return Err(Status::permission_denied(
+                "sandbox anchor requests are node-local only",
+            ));
+        }
+        self.caller_resolver.authorize_caller(
+            &caller,
+            "ExchangeToken(X509Certificate)",
+            ALLOW_GATEWAY_CA_ISSUANCE,
+            &[],
+        )?;
+        Ok(())
+    }
+}
