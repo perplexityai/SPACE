@@ -551,6 +551,7 @@ impl Meta for MockBridgeGuest {
         _request: Request<WaitReadyRequest>,
     ) -> Result<Response<WaitReadyResponse>, Status> {
         Ok(Response::new(WaitReadyResponse {
+            process_execution: None,
             ready: self.ready,
             guest_uptime: self.ready.then_some(prost_types::Duration {
                 seconds: 1,

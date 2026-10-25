@@ -240,7 +240,31 @@ async fn process_adapter_requires_guest_readiness_and_observes_shutdown() {
             .code(),
         tonic::Code::FailedPrecondition,
     );
+    let metadata = || {
+        Request::new(BridgeGuestWaitReadyRequest {
+            timeout: Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 1,
+            }),
+        })
+    };
+    assert!(
+        BridgeGuestMeta::wait_ready(&service, metadata())
+            .await
+            .unwrap()
+            .into_inner()
+            .process_execution
+            .is_none()
+    );
     service.ready();
+    let ready = BridgeGuestMeta::wait_ready(&service, metadata())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        ready.process_execution,
+        Some(service.inner.execution.process_execution_info())
+    );
     let mut processes = Process::list_processes(&service, request())
         .await
         .unwrap()

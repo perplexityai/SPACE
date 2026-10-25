@@ -47,6 +47,12 @@ and error evolution, requires a separate crate-level policy before stabilization
   executable during construction: an unreadable or invalid `/proc/self/exe`
   intentionally fails startup before readiness, rather than deferring that
   failure to the first filesystem request.
+- `ExecutionService::process_execution_info()` reports the service instance and
+  implemented process capabilities before starting work. Clones share an instance;
+  a newly constructed service has a new one. Guest readiness forwards the identity
+  and supported capabilities through host and manager metadata; older peers omit it. Memory
+  snapshots preserve it, so handles must also identify their sandbox. Discovery is
+  only an observation: it does not yet fence requests or make mutations retry-safe.
 - `ExecutionServiceConfig::process_retention` independently sets completed-exit,
   completed-output and completed-start idempotency windows. Defaults preserve
   guest behavior: 15 minutes for exits, 60 seconds for output and idempotency.

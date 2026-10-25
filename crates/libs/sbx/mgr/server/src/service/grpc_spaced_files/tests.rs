@@ -20,3 +20,37 @@ fn inspect_warnings_are_rate_limited_per_sandbox() {
     assert!(warnings.admit("c", start + Duration::from_secs(120)));
     assert_eq!(warnings.last_warned.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn readiness_discovery_preserves_instance_and_filters_unsupported_guarantees() {
+    use pplx_space_spaced_host_client::proto::{
+        GetStatusResponse, ProcessExecutionInfo, WaitReadyResponse,
+    };
+
+    for info in [
+        None,
+        Some(ProcessExecutionInfo {
+            instance_id: "01900000-0000-7000-8000-000000000001".into(),
+            capabilities: vec![
+                "process_output_gap_resume".into(),
+                "future_capability".into(),
+            ],
+        }),
+    ] {
+        let expected = info.clone().map(|mut info| {
+            info.capabilities = vec!["process_output_gap_resume".into()];
+            info
+        });
+        let ready = spaced_ready_response(WaitReadyResponse {
+            process_execution: info.clone(),
+            ..Default::default()
+        });
+        let status = spaced_status_response(GetStatusResponse {
+            ready: true,
+            process_execution: info,
+            ..Default::default()
+        });
+        assert_eq!(ready.process_execution, expected);
+        assert_eq!(status.process_execution, expected);
+    }
+}

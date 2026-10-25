@@ -1074,6 +1074,7 @@ impl WorkerApi for SimWorkerApiService {
             .await
             .map_err(map_state_error)?;
         Ok(Response::new(sbx::SpacedGetStatusResponse {
+            process_execution: None,
             ready: rec.status == status::RUNNING,
             guest_uptime: None,
             host_version: Some(sbx::SpacedVersionInfo {
@@ -1103,6 +1104,7 @@ impl WorkerApi for SimWorkerApiService {
             .await
             .map_err(map_state_error)?;
         Ok(Response::new(sbx::SpacedWaitReadyResponse {
+            process_execution: None,
             guest_uptime: None,
         }))
     }

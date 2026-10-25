@@ -136,6 +136,7 @@ pub struct ExecutionService {
 }
 
 pub(super) struct ExecutionServiceInner {
+    instance_id: uuid::Uuid,
     pub(super) shutdown: CancellationToken,
     pub(super) lifecycle: crate::lifecycle::Lifecycle,
     drain_gate: Mutex<()>,
@@ -155,6 +156,23 @@ pub(super) struct ExecutionServiceInner {
 }
 
 impl ExecutionService {
+    /// Describe this in-memory execution service, before starting any process.
+    /// Clones share the identity; reconstructing the service creates a new one.
+    /// A memory snapshot preserves it, so callers must also bind handles to the
+    /// sandbox they address. This observation alone does not fence any request.
+    pub fn process_execution_info(
+        &self,
+    ) -> pplx_space_spaced_guest_protocol::proto::operations::ProcessExecutionInfo {
+        pplx_space_spaced_guest_protocol::proto::operations::ProcessExecutionInfo {
+            instance_id: self.inner.instance_id.to_string(),
+            capabilities: vec![
+                pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume
+                    .as_str()
+                    .to_owned(),
+            ],
+        }
+    }
+
     /// Construct a service with the caller's filesystem execution configuration.
     ///
     /// Caller cancellation closes the service. Closing or draining the service
@@ -206,6 +224,7 @@ impl ExecutionService {
             .validate(config.filesystem_execution)?;
         Ok(Self {
             inner: Arc::new(ExecutionServiceInner {
+                instance_id: uuid::Uuid::now_v7(),
                 lifecycle: filesystem.lifecycle.clone(),
                 drain_gate: Mutex::new(()),
                 shutdown,
