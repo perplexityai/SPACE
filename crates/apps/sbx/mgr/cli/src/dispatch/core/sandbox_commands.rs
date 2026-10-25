@@ -5,6 +5,8 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
         Commands::Create {
             content_hash,
             environment,
+            device_profile,
+            device_count,
             runtime,
             template,
             user,
@@ -21,6 +23,8 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
                 CreateCommandInput {
                     content_hash,
                     environment,
+                    device_profile,
+                    device_count,
                     runtime,
                     template,
                     user,
@@ -41,6 +45,7 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
             from_warm,
             blocking,
             ready_timeout_secs,
+            memory_mib,
         } => {
             handle_start(
                 client,
@@ -49,6 +54,7 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
                 from_warm,
                 blocking,
                 ready_timeout_secs,
+                memory_mib,
             )
             .await
         }
@@ -72,6 +78,8 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
 struct CreateCommandInput {
     content_hash: Option<pplx_space_common_core::types::ContentHash>,
     environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    device_profile: Option<pplx_space_execution_spec::devices::DeviceProfile>,
+    device_count: Option<u32>,
     runtime: Option<String>,
     template: String,
     user: Option<String>,
@@ -96,7 +104,8 @@ async fn handle_create(client: &mut SandboxClient, mut input: CreateCommandInput
     if input.snapshots {
         warn_if_inbound_reconciliation_active(FACET_SANDBOX_DESIRED_STATE).await;
     }
-    let request = local_create_request(input, boot_mode, owner, env, auto_lifecycle);
+    let request = local_create_request(input, boot_mode, owner, env, auto_lifecycle)
+        .unwrap_or_else(|error| exit_error(error));
     let resp = pplx_space_sbx_mgr_client::environment::create(client, request)
         .await
         .unwrap_or_else(|error| exit_error(error));
@@ -112,8 +121,9 @@ fn local_create_request(
     owner: String,
     env: std::collections::BTreeMap<String, String>,
     auto_lifecycle: Option<AutoLifecyclePolicy>,
-) -> CreateRequest {
+) -> Result<CreateRequest, tonic::Status> {
     let mut request = CreateRequest {
+        device_create: None,
         environment: None,
         template: input.template,
         owner,
@@ -146,10 +156,30 @@ fn local_create_request(
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
     };
-    if let Some(reference) = input.environment {
-        pplx_space_sbx_mgr_client::environment::bind(&mut request, reference);
+    if let Some(profile) = input.device_profile {
+        use pplx_space_execution_spec::devices::{DeviceRequirement, DeviceRequirements};
+        let reference = input
+            .environment
+            .ok_or_else(|| tonic::Status::invalid_argument("devices require an environment"))?;
+        let requirements = DeviceRequirement::new(profile, input.device_count.unwrap_or(1))
+            .and_then(|entry| DeviceRequirements::new(vec![entry]))
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        pplx_space_sbx_mgr_client::environment::bind_devices(
+            &mut request,
+            reference,
+            &requirements,
+        )?;
+    } else {
+        if input.device_count.is_some() {
+            return Err(tonic::Status::invalid_argument(
+                "device count requires a device profile",
+            ));
+        }
+        if let Some(reference) = input.environment {
+            pplx_space_sbx_mgr_client::environment::bind(&mut request, reference);
+        }
     }
-    request
+    Ok(request)
 }
 
 fn parse_boot_mode(value: &str) -> Result<BootMode, String> {
@@ -211,6 +241,7 @@ async fn handle_start(
     from_warm: bool,
     blocking: bool,
     ready_timeout_secs: Option<u32>,
+    memory_mib: Option<u32>,
 ) {
     let resp = client
         .start(local_start_request(
@@ -219,6 +250,7 @@ async fn handle_start(
             from_warm,
             blocking,
             ready_timeout_secs,
+            memory_mib,
         ))
         .await
         .unwrap_or_else(|error| exit_error(error))
@@ -237,6 +269,7 @@ fn local_start_request(
     from_warm: bool,
     blocking: bool,
     ready_timeout_secs: Option<u32>,
+    memory_mib: Option<u32>,
 ) -> StartRequest {
     StartRequest {
         activation_auto_lifecycle: None,
@@ -245,7 +278,7 @@ fn local_start_request(
         expected_local_artifact_id: None,
         sandbox_id,
         vcpu: None,
-        memory_mib: None,
+        memory_mib,
         checkpoint,
         from_warm,
         blocking,

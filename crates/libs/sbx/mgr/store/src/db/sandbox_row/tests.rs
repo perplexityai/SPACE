@@ -12,6 +12,7 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            device_requirements: None,
             id: &id,
             uuid8: &runtime_label,
             state: SandboxState::Stopped,
@@ -55,7 +56,7 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
                     restore_origin, restore_phase, restore_storage_uri,
                     space_api_route_substrate_kind, space_api_route_activation_attempt_id,
                     spaced_endpoint_proof_json, disk_io_max_operations_per_sec,
-                    disk_io_max_bandwidth_mib_per_sec, node_execution_id, id
+                    disk_io_max_bandwidth_mib_per_sec, node_execution_id, device_requirements_json, id
                FROM sandboxes WHERE id = ?1",
         )
         .unwrap();
@@ -97,6 +98,7 @@ fn absent_or_malformed_counters_fail_closed_instead_of_decoding_zero() {
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            device_requirements: None,
             id: &id,
             uuid8: &SandboxRuntimeLabel::parse("abcdef12").unwrap(),
             state: SandboxState::Stopped,
@@ -186,4 +188,66 @@ fn sandbox_projection(conn: &Connection, omitted: Option<&str>) -> String {
         "projection must actually omit the column under test"
     );
     format!("SELECT {} FROM sandboxes WHERE id = ?1", columns.join(", "))
+}
+
+#[test]
+fn device_requirements_persist_and_corruption_cannot_become_cpu_only() {
+    use pplx_space_execution_spec::devices::{DeviceRequirement, DeviceRequirements};
+    let conn = test_conn();
+    let id = SandboxId::new().to_string();
+    let requirements = DeviceRequirements::new(vec![
+        DeviceRequirement::new("compute".parse().unwrap(), 1).unwrap(),
+    ])
+    .unwrap();
+    insert_sandbox(
+        &conn,
+        InsertSandboxParams {
+            device_requirements: Some(&requirements),
+            id: &id,
+            uuid8: &SandboxRuntimeLabel::parse("abcdef12").unwrap(),
+            state: SandboxState::Stopped,
+            template: "device-template",
+            template_hash: None,
+            user: &SandboxOwner::parse("device-owner").unwrap(),
+            runtime: "ch",
+            snapshots_enabled: false,
+            rootfs_size_mb: None,
+            disk_io_limits: Default::default(),
+            pool_template: None,
+            volume_encryption: false,
+            process_env: &BTreeMap::new(),
+            auto_lifecycle: &AutoLifecyclePolicy::disabled(),
+            network_policy_override: None,
+            network_policy_generation: 0,
+            network_policy_authority: PolicyAuthority::Local,
+            auto_lifecycle_authority: PolicyAuthority::Local,
+        },
+    )
+    .unwrap();
+    let row = crate::db::read::sandbox(&conn, &id).unwrap().unwrap();
+    assert_eq!(row.device_requirements, Some(requirements));
+    conn.execute_batch("SAVEPOINT rollback_test").unwrap();
+    conn.execute_batch(include_str!(
+        "../../../../../../../../db/sandbox-manager/20261025051000_device_requirements.down.sql"
+    ))
+    .unwrap_err();
+    conn.execute_batch("ROLLBACK TO rollback_test; RELEASE rollback_test")
+        .unwrap();
+    assert!(
+        crate::db::read::sandbox(&conn, &id)
+            .unwrap()
+            .unwrap()
+            .device_requirements
+            .is_some()
+    );
+    for invalid in ["{}", r#"{"schema_version":2,"entries":[]}"#, "null"] {
+        conn.execute(
+            "UPDATE sandboxes SET device_requirements_json = ?2 WHERE id = ?1",
+            rusqlite::params![id, invalid],
+        )
+        .unwrap();
+        crate::db::read::sandbox(&conn, &id)
+            .map(|_| ())
+            .unwrap_err();
+    }
 }

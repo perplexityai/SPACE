@@ -329,6 +329,7 @@ async fn create_intent_preserves_immutables_independently_of_pool_occupancy() {
             crate::db::insert_sandbox(
                 &conn,
                 crate::db::InsertSandboxParams {
+                    device_requirements: None,
                     id: &donor.to_string(),
                     uuid8: &SandboxRuntimeLabel::from_sandbox_id(donor),
                     state: SandboxState::Paused,

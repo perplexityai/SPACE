@@ -50,6 +50,8 @@ pub(super) struct RequestedSandboxCreateSpec<'a> {
 }
 
 pub(super) struct CreateWithIdArgs<'a> {
+    pub(super) device_requirements:
+        Option<&'a pplx_space_execution_spec::devices::DeviceRequirements>,
     pub(super) req: &'a CreateRequest,
     pub(super) sandbox_owner: &'a SandboxOwner,
     pub(super) effective_mode: BootMode,
@@ -545,6 +547,11 @@ pub(super) fn create_response_for_existing_sandbox(
 ) -> CreateResponse {
     let has_process = existing.pid.is_some();
     CreateResponse {
+        accepted_device_requirements_digest: existing
+            .device_requirements
+            .as_ref()
+            .map(pplx_space_execution_common::devices::requirements_digest)
+            .map(|digest| digest.to_string()),
         environment: None,
         sandbox_id: existing.id.clone(),
         pid: existing.pid,

@@ -56,3 +56,34 @@ fn sandbox_cpu_budget_round_trips_without_changing_legacy_shape() {
         }
     }
 }
+
+#[test]
+fn device_metadata_cannot_be_downgraded_or_lose_requirements() {
+    use pplx_space_execution_spec::devices::{DeviceRequirement, DeviceRequirements};
+    let requirements = DeviceRequirements::new(vec![
+        DeviceRequirement::new("compute".parse().unwrap(), 1).unwrap(),
+    ])
+    .unwrap();
+    let metadata = SandboxArtifactMetadata::new(
+        "019d84bd-280d-7331-99c6-b63377f3a3a2".parse().unwrap(),
+        ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]),
+        TemplateName::parse("seed").unwrap(),
+        None,
+    )
+    .with_device_requirements(requirements.clone());
+    let encoded = serde_json::to_value(&metadata).unwrap();
+    assert_eq!(encoded["schema_version"], 3);
+    let decoded: SandboxArtifactMetadata = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded.device_requirements(), Some(&requirements));
+    for (version, keep_requirements) in [(2, true), (3, false), (1, true), (4, true)] {
+        let mut invalid = encoded.clone();
+        invalid["schema_version"] = version.into();
+        if !keep_requirements {
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .remove("device_requirements");
+        }
+        serde_json::from_value::<SandboxArtifactMetadata>(invalid).unwrap_err();
+    }
+}

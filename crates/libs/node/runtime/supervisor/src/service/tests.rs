@@ -111,6 +111,26 @@ async fn retirement_failure_does_not_skip_locked_runtime_cleanup() {
                 lock.try_write().is_ok(),
                 "completed stop must release exclusion"
             );
+            if !matches!(retirement, Retirement::AdmissionClosed) {
+                use pplx_space_execution_common::{devices::decode_execution, proto};
+                let input = proto::DeviceExecutionInput {
+                    sandbox_id: sandbox_id.to_string(),
+                    requirements_digest: format!("sha256:{}", "ab".repeat(32)),
+                    assignments: vec![proto::ExclusiveDeviceAssignment {
+                        lease_id: pplx_space_common_core::types::SandboxActivationAttemptId::new()
+                            .to_string(),
+                        parent_id: pplx_space_common_core::types::SandboxActivationAttemptId::new()
+                            .to_string(),
+                        profile: "compute".into(),
+                        host_device_ids: vec!["pci:0000:01:00.0".into()],
+                    }],
+                };
+                let devices = decode_execution("", Some(&input)).unwrap().1.unwrap();
+                service
+                    .execution_store
+                    .record_device_intent(sandbox_id, execution_id, Some(&devices))
+                    .unwrap_err();
+            }
             if matches!(retirement, Retirement::AdmissionClosed) {
                 assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
                 assert!(!retired.load(Ordering::SeqCst));

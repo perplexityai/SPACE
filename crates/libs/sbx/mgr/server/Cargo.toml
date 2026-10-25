@@ -66,6 +66,7 @@ pplx-space-credential-injection-core = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-execution-common = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-feature-flags = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
