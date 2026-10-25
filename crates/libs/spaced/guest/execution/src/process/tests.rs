@@ -1119,31 +1119,46 @@ async fn lagged_cursor_reports_the_oldest_retained_output() {
 async fn lagged_cursor_from_oldest_retained_starts_there_and_holds_it() {
     use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
 
-    let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(0))));
-    let process_id = ProcessId::new();
-    journal.append_output(process_stdout_event(
-        &process_id,
-        Some(1),
-        vec![0; PROCESS_OUTPUT_RETENTION_BYTES],
-    ));
-    journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
+    for (from_oldest, gap_resume) in [(true, false), (false, true), (true, true)] {
+        let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(0))));
+        let process_id = ProcessId::new();
+        journal.append_output(process_stdout_event(
+            &process_id,
+            Some(1),
+            vec![0; PROCESS_OUTPUT_RETENTION_BYTES],
+        ));
+        journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
 
-    let cursor = journal.cursor(Some(0), true, None);
-    assert_eq!(
-        cursor.next_sequence, 1,
-        "starts at the oldest retained output"
-    );
-    let more = process_stdout_event(&process_id, Some(1), vec![0; 8192]);
-    let waited = (0..2 * PROCESS_OUTPUT_RETENTION_BYTES / 8192)
-        .any(|_| journal.try_append_output(more.clone()).is_some());
-    assert!(
-        waited,
-        "later output waits for the reader instead of evicting"
-    );
+        let cursor = journal.cursor(
+            Some(0),
+            from_oldest,
+            gap_resume.then(|| OutputGapResume {
+                process_id: process_id.as_str().to_string(),
+                pid: Some(1),
+            }),
+        );
+        let more = process_stdout_event(&process_id, Some(1), vec![0; 8192]);
+        let waited = (0..2 * PROCESS_OUTPUT_RETENTION_BYTES / 8192)
+            .any(|_| journal.try_append_output(more.clone()).is_some());
+        assert!(
+            waited,
+            "later output waits for the reader instead of evicting"
+        );
 
-    let mut retained = process_event_stream_with_prefix(Vec::new(), Some(cursor));
-    let event = retained.next().await.unwrap().unwrap();
-    assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
+        let mut retained = process_event_stream_with_prefix(Vec::new(), Some(cursor));
+        if gap_resume {
+            let event = retained.next().await.unwrap().unwrap();
+            assert!(
+                matches!(event.event, Some(Event::OutputGap(gap)) if gap.output_cursor == 1 && gap.skipped_events == 1)
+            );
+            assert!(
+                journal.try_append_output(more.clone()).is_some(),
+                "reporting the gap must not release retained output"
+            );
+        }
+        let event = retained.next().await.unwrap().unwrap();
+        assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
+    }
 }
 
 #[tokio::test]

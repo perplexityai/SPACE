@@ -4,6 +4,22 @@ use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 
+/// Translate the manager's wire operation at the host-client boundary.
+pub(super) async fn connect_process_stream(
+    client: &pplx_space_spaced_host_client::SpacedHostClient,
+    operation: &pplx_space_sbx_mgr_client::operations::ConnectProcessRequest,
+) -> Result<tonic::Streaming<host_proto::ProcessEvent>, Status> {
+    client
+        .connect_process_stream_with_cursor(
+            operation.process_id.clone(),
+            proto_duration_to_std(operation.timeout),
+            operation.output_cursor,
+            operation.resume_from_oldest_retained,
+            operation.resume_after_output_gap.unwrap_or(false),
+        )
+        .await
+}
+
 pub(super) async fn launch_spaced_host_via_node(
     node_client: &mut NodeManagerGrpcClient,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,

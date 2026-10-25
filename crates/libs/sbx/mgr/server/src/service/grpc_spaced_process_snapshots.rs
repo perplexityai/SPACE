@@ -219,15 +219,7 @@ impl SandboxManagerService {
         route_auth.authorize_sandbox(&sandbox)?;
         let identity_token = self.route_stream_identity_token(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
-        let stream = client
-            .connect_process_stream_with_cursor(
-                operation.process_id.clone(),
-                proto_duration_to_std(operation.timeout),
-                operation.output_cursor,
-                operation.resume_from_oldest_retained,
-                operation.resume_after_output_gap.unwrap_or(false),
-            )
-            .await?;
+        let stream = connect_process_stream(&client, operation).await?;
         // A reconnected foreground stream is the same liveness signal as the
         // original one (and reconnecting starts a fresh presence cap — by
         // design, reconnecting is real activity). This deliberately also

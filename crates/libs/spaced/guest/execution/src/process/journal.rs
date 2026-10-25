@@ -230,12 +230,19 @@ impl ProcessEventJournal {
         };
         // Only one reader controls the producer. Observers cannot stall an
         // existing consumer; after disconnect a new attachment can take over.
+        // A gap reader reports its original cursor, but holds the first retained
+        // position now, under the same lock, so reporting the gap cannot lose it.
+        let primary_sequence = if gap_resume.is_some() {
+            next_sequence.max(state.first_sequence)
+        } else {
+            next_sequence
+        };
         let primary = if !state.backpressure_disabled
             && state.primary.upgrade().is_none()
-            && next_sequence >= state.first_sequence
-            && next_sequence <= state.next_sequence
+            && primary_sequence >= state.first_sequence
+            && primary_sequence <= state.next_sequence
         {
-            let position = Arc::new(AtomicU64::new(next_sequence));
+            let position = Arc::new(AtomicU64::new(primary_sequence));
             state.primary = Arc::downgrade(&position);
             Some(position)
         } else {
