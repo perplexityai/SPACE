@@ -2339,7 +2339,7 @@ async fn completed_process_replay_follows_configured_retention() {
     assert!(
         error
             .metadata()
-            .get("space-process-output-first-sequence")
+            .get(pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
             .is_some()
     );
     assert!(retry.next().await.is_none());
