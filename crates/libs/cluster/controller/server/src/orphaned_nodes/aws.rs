@@ -1,6 +1,6 @@
 //! EC2-backed [`super::InstanceLookup`].
 //!
-//! Same seam pattern as [`crate::node_drain::AsgTerminateClient`]: a thin
+//! Same seam pattern as [`crate::node_drain::aws::AsgTerminateClient`]: a thin
 //! trait wraps the SDK call so unit tests can substitute a recording fake
 //! without exercising the real AWS SDK.
 //!
