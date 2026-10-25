@@ -256,6 +256,16 @@ build {
     script          = "../scripts/base/12-nodeadm-config-retry.sh"
   }
 
+  provisioner "file" {
+    source      = "../scripts/base/space-gpu-preflight.sh"
+    destination = "/tmp/space-gpu-preflight"
+  }
+
+  provisioner "shell" {
+    execute_command = "chmod +x {{ .Path }}; {{ .Vars }} sudo -E {{ .Path }}"
+    script          = "../scripts/base/13-gpu-passthrough.sh"
+  }
+
   provisioner "shell" {
     execute_command = "chmod +x {{ .Path }}; {{ .Vars }} sudo -E {{ .Path }}"
     script          = "../scripts/base/99-cleanup.sh"
