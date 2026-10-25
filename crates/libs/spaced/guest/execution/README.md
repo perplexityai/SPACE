@@ -226,6 +226,10 @@ integration separately; privileged container tests do not replace it. Other Linu
 architectures, real caller cgroup placement and downstream packaging require their
 own acceptance evidence.
 
+Process-retention configuration is a separate extension described in the
+[process recovery RFC](../../../../../docs/space/rfcs/2026-10-25-process-recovery.md).
+It is not required to host the execution service under the embedding contract.
+
 The proposed support profile, ownership contract, and implementation acceptance
 criteria are in the [embedding RFC](../../../../../docs/space/rfcs/2026-10-06-guest-execution-embedding.md).
 It is a proposal; the requirements above describe current behavior.
