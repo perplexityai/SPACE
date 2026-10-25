@@ -131,7 +131,8 @@ impl SpacedHostService {
 /// a lagged reader. Only a guest that honors the request acknowledges it on its
 /// first connected event. Cursor-based replay requires that acknowledgement;
 /// cursorless completed replay retains its existing Started/Exit shape.
-/// Upstream errors remain errors. Callers that do not opt in never wait here.
+/// An upstream error before acknowledgement becomes the RPC status, before any
+/// events are relayed. Callers that do not opt in never wait here.
 pub(super) async fn require_output_gap_resume_ack<S>(
     mut stream: S,
     output_cursor: Option<u64>,
