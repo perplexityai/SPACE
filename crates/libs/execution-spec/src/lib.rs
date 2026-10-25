@@ -19,6 +19,7 @@ use pplx_space_k8s_ids::{LabelValue, LabelValueParseError};
 
 pub mod balloon;
 pub mod compute;
+pub mod devices;
 pub mod disk_io;
 pub mod environment;
 pub mod execution;
