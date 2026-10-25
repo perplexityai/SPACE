@@ -67,7 +67,9 @@ boundary; any discovery addition must use an explicitly reviewed metadata path.
 | `output` | 60 seconds | Keep completed output and environment, no longer than the record. |
 | `idempotency` | 60 seconds | Keep completed keyed-start results. |
 
-Each window must be nonzero and at most seven days. In-progress starts retain
+Output retention must not exceed completed-record retention; construction rejects
+that configuration rather than silently shortening the requested window. Each
+window must be nonzero and at most seven days. In-progress starts retain
 their fixed 60-second bound. The existing record limits, output budgets and
 eviction rules still apply: a longer window is not a reservation of capacity.
 Record eviction can end reconnectability before the configured deadline. A key
@@ -95,11 +97,17 @@ readers can hold independent cursors; reads consume no shared client position.
 The new option uses request field 5 and connection-acknowledgement field 2,
 preserving `resume_from_oldest_retained` at field 4 and the existing connected
 cursor at field 1. If both recovery options are enabled, the counted-gap option
-takes precedence. Callers omitting it retain existing reconnect behavior.
+takes precedence for reporting the lost output. When producer backpressure is
+available, a stale gap reader atomically claims the first retained position while
+preserving its original cursor for the gap event. Reporting the gap does not
+release that hold. A reader does not displace an existing primary reader;
+observers can still encounter further gaps. Callers omitting the option retain
+existing reconnect behavior.
 
-The host checks acknowledgement on live connections and rejects an older guest
-that does not confirm the option. Completed cursorless replay retains its
-existing started/exit shape; it is not proof of capability support. Native and
+The host requires an affirmative first `Connected` event for cursor-based opt-ins;
+a missing, malformed or unacknowledged event is refused. Upstream errors are
+propagated. Completed cursorless replay retains its existing started/exit shape;
+it is not proof of capability support. Native and
 compatibility endpoints do not opt in automatically. Full client exposure needs
 explicit capability handling and forwarding at every intervening adapter.
 
