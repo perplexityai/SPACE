@@ -1324,6 +1324,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
             ComposedProbeResult {
                 observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
                 guest_status: Some(pplx_space_spaced_host_client::proto::GetStatusResponse {
+                    process_execution: None,
                     ready: false,
                     guest_uptime: None,
                     host_version: None,
@@ -1434,6 +1435,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                         sample(HealthProbeOutcome::Success),
                     ],
                     guest_status: Some(pplx_space_spaced_host_client::proto::GetStatusResponse {
+                        process_execution: None,
                         ready: true,
                         guest_uptime: None,
                         host_version: None,

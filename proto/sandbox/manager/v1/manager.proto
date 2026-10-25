@@ -1177,6 +1177,7 @@ message SpacedGetStatusResponse {
   optional google.protobuf.Duration guest_uptime = 2;
   optional SpacedVersionInfo host_version = 3;
   optional SpacedVersionInfo guest_version = 4;
+  space.spaced.operations.v1.ProcessExecutionInfo process_execution = 5;
 }
 
 message SpacedVersionInfo {
@@ -1190,6 +1191,7 @@ message SpacedWaitReadyRequest {
 }
 message SpacedWaitReadyResponse {
   optional google.protobuf.Duration guest_uptime = 1;
+  space.spaced.operations.v1.ProcessExecutionInfo process_execution = 2;
 }
 
 message SpacedStatRequest {

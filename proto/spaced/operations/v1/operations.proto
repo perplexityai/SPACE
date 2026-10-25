@@ -194,6 +194,16 @@ message GetModifiedFilesResponse {
   bool overflowed = 6;
 }
 
+// Observation of one in-memory execution service. It is not an authorization
+// token or a request fence. Adapters retain only capabilities they preserve.
+// A memory snapshot preserves this identity; bind handles to their sandbox too.
+message ProcessExecutionInfo {
+  // Changes when the execution service is constructed again, not on reconnect.
+  string instance_id = 1;
+  // Unknown names may be ignored. Absence does not establish support.
+  repeated string capabilities = 2;
+}
+
 message StartRequest {
   repeated string command = 1;
   optional string cwd = 2;

@@ -91,6 +91,8 @@ message WaitReadyResponse {
   string compatibility_family = 4;
   optional uint64 mem_total_bytes = 5;
   optional uint32 vcpu_count = 6;
+  // Absent from older guests or while the guest is not ready.
+  space.spaced.operations.v1.ProcessExecutionInfo process_execution = 7;
 }
 
 message ConfigureProcessEnvRequest {

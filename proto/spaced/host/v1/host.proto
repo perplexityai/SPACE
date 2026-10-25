@@ -79,6 +79,7 @@ message GetStatusResponse {
   google.protobuf.Duration guest_uptime = 2;
   VersionInfo host_version = 3;
   VersionInfo guest_version = 4;
+  space.spaced.operations.v1.ProcessExecutionInfo process_execution = 5;
 }
 
 message VersionInfo {
@@ -93,6 +94,7 @@ message WaitReadyResponse {
   optional uint32 vcpu_count = 3;
   // Identity from the same guest observation that established readiness.
   VersionInfo guest_version = 4;
+  space.spaced.operations.v1.ProcessExecutionInfo process_execution = 5;
 }
 
 message ConfigureProcessEnvRequest {
