@@ -97,6 +97,12 @@ variable "disable_root_ssh" {
   description = "Disable root SSH login (default true for AWS)"
 }
 
+variable "gpu_passthrough" {
+  type        = bool
+  default     = false
+  description = "Configure this x86_64 worker AMI for opt-in PCI GPU passthrough"
+}
+
 variable "subnet_id" {
   type        = string
   default     = ""
@@ -124,7 +130,7 @@ variable "ssh_interface" {
 source "amazon-ebs" "al2023" {
   region                      = var.aws_region
   instance_type               = var.instance_type
-  ami_name                    = "space-worker-{{timestamp}}"
+  ami_name                    = var.gpu_passthrough ? "space-gpu-worker-{{timestamp}}" : "space-worker-{{timestamp}}"
   subnet_id                   = var.subnet_id != "" ? var.subnet_id : null
   security_group_id           = var.security_group_id != "" ? var.security_group_id : null
   associate_public_ip_address = var.associate_public_ip_address
@@ -151,9 +157,10 @@ source "amazon-ebs" "al2023" {
   ssh_interface = var.ssh_interface
 
   tags = {
-    Name              = "space-worker"
-    Role              = "worker"
+    Name              = var.gpu_passthrough ? "space-gpu-worker" : "space-worker"
+    Role              = var.gpu_passthrough ? "gpu-worker" : "worker"
     Base              = "al2023-eks"
+    GPUPassthrough    = var.gpu_passthrough ? "enabled" : "disabled"
     KubernetesVersion = var.kubernetes_version
     GitSHA            = var.git_sha
     GitBranch         = var.git_branch
@@ -259,6 +266,19 @@ build {
   provisioner "shell" {
     execute_command = "chmod +x {{ .Path }}; {{ .Vars }} sudo -E {{ .Path }}"
     script          = "../scripts/base/12-nodeadm-config-retry.sh"
+  }
+
+  provisioner "file" {
+    source      = "../scripts/base/space-gpu-preflight.sh"
+    destination = "/tmp/space-gpu-preflight"
+  }
+
+  provisioner "shell" {
+    execute_command = "chmod +x {{ .Path }}; {{ .Vars }} sudo -E {{ .Path }}"
+    script          = "../scripts/base/13-gpu-passthrough.sh"
+    environment_vars = [
+      "GPU_PASSTHROUGH=${var.gpu_passthrough}",
+    ]
   }
 
   provisioner "shell" {

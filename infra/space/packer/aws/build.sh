@@ -4,7 +4,7 @@
 # Usage: ./build.sh --kubernetes-version VER [--type TYPE] [--region REGION]
 #                   [--skip-conflict-check] [packer-var-args...]
 #   --kubernetes-version VER  Kubernetes minor for the AL2023 EKS base AMI, e.g. 1.36 (required)
-#   --type TYPE               Image type: worker (default) or builder
+#   --type TYPE               Image type: worker (default), gpu-worker, or builder
 #   --region REGION           AWS region (default: us-east-1)
 #   --skip-conflict-check     Skip the same-GitSHA/different-minor AMI check
 #
@@ -110,6 +110,10 @@ while [[ $# -gt 0 ]]; do
       echo "Set the region with --region; drop '$1'." >&2
       exit 1
       ;;
+    gpu_passthrough=*|-var=gpu_passthrough=*)
+      echo "Select GPU passthrough with --type gpu-worker; drop '$1'." >&2
+      exit 1
+      ;;
     *)
       PACKER_ARGS+=("$1")
       shift
@@ -129,10 +133,21 @@ fi
 
 # Map type to HCL file
 case "$IMAGE_TYPE" in
-  worker)  HCL_FILE="space-worker.pkr.hcl" ;;
-  builder) HCL_FILE="space-builder.pkr.hcl" ;;
+  worker)
+    HCL_FILE="space-worker.pkr.hcl"
+    AMI_ROLE="worker"
+    ;;
+  gpu-worker)
+    HCL_FILE="space-worker.pkr.hcl"
+    AMI_ROLE="gpu-worker"
+    PACKER_ARGS+=("-var" "gpu_passthrough=true")
+    ;;
+  builder)
+    HCL_FILE="space-builder.pkr.hcl"
+    AMI_ROLE="builder"
+    ;;
   *)
-    echo "Unknown image type: $IMAGE_TYPE. Use: worker, builder" >&2
+    echo "Unknown image type: $IMAGE_TYPE. Use: worker, gpu-worker, builder" >&2
     exit 1
     ;;
 esac
@@ -168,7 +183,7 @@ if [[ "$SKIP_CONFLICT_CHECK" == "false" ]]; then
   if ! conflicting="$(aws ec2 describe-images \
     --owners self \
     --region "$REGION" \
-    --filters "Name=tag:GitSHA,Values=$GIT_SHA" "Name=tag:Role,Values=$IMAGE_TYPE" \
+    --filters "Name=tag:GitSHA,Values=$GIT_SHA" "Name=tag:Role,Values=$AMI_ROLE" \
     --query "$conflict_query" \
     --output text)"; then
     echo "Could not list existing AMIs to check for a GitSHA/minor conflict." >&2
@@ -179,8 +194,7 @@ if [[ "$SKIP_CONFLICT_CHECK" == "false" ]]; then
   if [[ -n "$conflicting" ]]; then
     echo "Refusing to bake: commit $GIT_SHA already has a $IMAGE_TYPE AMI that is" >&2
     echo "not tagged KubernetesVersion=$KUBERNETES_VERSION: $conflicting" >&2
-    echo "Both would carry the same GitSHA and Role tags, and modules/space's AMI" >&2
-    echo "lookup takes the most recent of them for every cluster on that SHA." >&2
+    echo "Both would carry the same GitSHA and Role tags, making role lookup ambiguous." >&2
     echo "Bake this minor from its own commit." >&2
     exit 1
   fi
