@@ -1,14 +1,65 @@
-# Credential Manager storage token exchange
+# Credential Manager token exchange
 
-Status: implemented contract
+Status: implemented storage contract; default-off X.509 prototype
 
 `CredentialManager.ExchangeToken` is the storage-lease boundary for SPACE
 host-side consumers. It implements the RFC 8693 request/response shape with
-one deliberately narrow profile: short-lived AWS credentials for one S3 object
+one deliberately narrow storage profile: short-lived AWS credentials for one S3 object
 or one canonical SPACE artifact prefix. It never returns the authority's
 ambient or statically configured AWS credentials.
 
-## Request contract
+## Prototype sandbox X.509 profile
+
+This separately authorized profile requires the `split-trust-prototype` build
+capability and a configured anchor authority. The sole enrollment flag is
+`space-sandbox-scoped-trust`, default false, evaluated by sandbox manager only
+for fresh initializations without an inherited trust decision. It does not
+relax the storage contract below. No anchor-release, cache-eviction or
+guest-installation RPC is introduced.
+
+- **Resource:** `urn:space:credential:sandbox-tls-anchor` for new enrollment,
+  or `urn:space:credential:sandbox-tls-anchor:<key-id>` for a persisted issuer.
+- **Subject:** canonical `sandbox:<UUIDv7>` with
+  `subject_token_type=urn:space:token-type:subject-id`.
+- **Grant:** `urn:ietf:params:oauth:grant-type:token-exchange`.
+- **Public type:** `urn:space:token-type:x509-certificate`, accepted only from
+  the node-local sandbox-manager identity. Its response uses
+  `sandbox_trust_anchor`, containing public `certificate_der` and concrete
+  `key_id`. The key ID must be persisted before trust installation/readiness.
+- **No private type:** the retired signing-credentials profile is rejected;
+  its response tag9/name and the old unpinned tag8/name are reserved. No seed or anchor private key travels
+  through this RPC.
+
+Audience, scope, actor, requested expiry and copy-source fields must be absent.
+The response echoes the requested type, uses `token_type=N_A`, and contains no
+expiry, refresh token or scope. Certificate validity is encoded in the
+certificate; a local cache TTL is not key revocation.
+
+The agent forwards the public request upstream as its existing authenticated
+node identity. Authority alone holds a shared seed per hardware key and derives
+sandbox anchor keys locally; the agent has no anchor-private-key cache.
+Storage consumers gain no X.509 privileges, and sandbox manager gains no
+storage privileges through the shared RPC method.
+
+Gateway signing continues through `IssueIntermediateCertificate`. Omitted
+`sandbox_id` and `anchor_key_id` retain shared signing; both present request a
+sandbox-scoped issuer. Providing only one is invalid. The node forwards the CSR to authority, which signs
+locally; an unconfigured or unsupported scoped request fails closed.
+The response's existing issuer certificate identifies the signing anchor, which
+sandbox manager checks against the expected public certificate. No issuer enum,
+execution generation or separate key-management RPC is added.
+
+Sandbox manager installs public trust through existing filesystem and process
+APIs before activation. Host and snapshot metadata preserve the enrollment
+key pin, so flag changes and master rotation do not rewrite existing trust.
+Scoped metadata uses schema4 so older binaries reject it instead of dropping
+the pin. Same-ID restore preserves the pin; a fork inherits the mode and
+selects the active key for its new UUID.
+No placement/lifecycle database checks or grants are added: authenticated nodes
+remain trusted to request other sandbox anchors. Production hardware-key governance,
+rollout/rollback, dependency vetting and security review remain separate gates.
+
+## Storage request contract
 
 Every request must provide all of the following. Missing, malformed,
 unknown, or duplicated values are rejected; an authorization or validation

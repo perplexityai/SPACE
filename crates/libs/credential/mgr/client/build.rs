@@ -13,6 +13,10 @@ fn main() -> anyhow::Result<()> {
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )
         .type_attribute(
+            ".space.credential.manager.v1.SandboxTrustAnchor",
+            "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
+        )
+        .type_attribute(
             ".space.credential.manager.v1.AwsCredentials",
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )

@@ -806,6 +806,11 @@ impl CredentialManager for CredentialManagerService {
             ALLOW_ISSUE_INTERMEDIATE,
             ALLOW_ISSUE_INTERMEDIATE_SERVICES,
         )?;
+        if request.get_ref().sandbox_id.is_some() || request.get_ref().anchor_key_id.is_some() {
+            return Err(Status::failed_precondition(
+                "sandbox-scoped CA issuance is not supported",
+            ));
+        }
 
         // The gRPC layer already logs and traces the call; this adds the
         // failure class and the latency of an issuance that polls for seconds.

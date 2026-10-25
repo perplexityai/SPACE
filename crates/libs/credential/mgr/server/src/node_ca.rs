@@ -567,7 +567,9 @@ impl NodeCa {
             async move {
                 upstream
                     .issue_intermediate_certificate(IssueIntermediateCertificateRequest {
+                        anchor_key_id: None,
                         csr: csr_der,
+                        ..Default::default()
                     })
                     .await
                     .map(|response| response.into_inner().certificate_der)

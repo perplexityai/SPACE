@@ -35,6 +35,7 @@ pub mod proto {
 
 mod endpoint;
 mod token;
+pub mod x509;
 
 /// Fixed subject and size limit for both hops of intermediate CA issuance.
 pub const INTERMEDIATE_CSR_COMMON_NAME: &str = "space-node-intermediate-ca";

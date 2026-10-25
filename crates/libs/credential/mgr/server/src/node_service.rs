@@ -441,6 +441,11 @@ impl CredentialManager for NodeCredentialManager {
             ALLOW_GATEWAY_CA_ISSUANCE,
             &[],
         )?;
+        if request.get_ref().sandbox_id.is_some() || request.get_ref().anchor_key_id.is_some() {
+            return Err(Status::failed_precondition(
+                "sandbox-scoped CA issuance is not supported",
+            ));
+        }
         self.node_ca
             .issue_intermediate(request.into_inner())
             .await

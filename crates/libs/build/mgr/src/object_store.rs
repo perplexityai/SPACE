@@ -209,6 +209,9 @@ pub(crate) async fn object_store_credentials(
         Some(exchange_token_response::Payload::AccessToken(_)) => {
             Err(CredentialExchangeError::UnexpectedPayload("access_token"))
         }
+        Some(exchange_token_response::Payload::SandboxTrustAnchor(_)) => Err(
+            CredentialExchangeError::UnexpectedPayload("X.509 credential"),
+        ),
         None => Err(CredentialExchangeError::UnexpectedPayload("empty payload")),
     }
 }
