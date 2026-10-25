@@ -195,9 +195,14 @@ and error evolution, requires a separate crate-level policy before stabilization
   reports followed by retained output and the exit. `ProcessOutputGap` names the
   next cursor, skipped events and cumulative bytes before that cursor. It also
   applies to gaps that arise after connecting and takes precedence over
-  `resume_from_oldest_retained`. Callers that omit it keep existing reconnect
-  behavior. The host rejects an opted-in live connection when the guest does not
-  acknowledge support; ordinary connections remain available to older guests.
+  `resume_from_oldest_retained` for reporting loss. When backpressure is enabled
+  and the primary reader position is free, a stale gap reader holds the oldest
+  retained output before reporting the gap. Observers do not displace a primary
+  reader and can encounter further gaps. Callers that omit the option keep
+  existing reconnect behavior. Cursor-based opt-ins require an affirmative first
+  `Connected` acknowledgement; upstream errors are propagated. Cursorless
+  completed replay retains its Started/Exit shape without claiming capability
+  support. Ordinary connections remain available to older guests.
 - By default, a completed process stays connectable for 15 minutes after it exits, so a
   client that reattaches still reads its exit, and the process list includes it
   with its exit when asked to (`include_exited`); by default it lists running
