@@ -3,7 +3,9 @@
 **Status: proposal.** Reuse SPACE's process/filesystem implementation inside an
 independently isolated application, without guest listeners or daemon startup.
 The [execution crate README](../../../crates/libs/spaced/guest/execution/README.md)
-describes today's supported behavior; this RFC defines the work required for embedding.
+describes implemented behavior. The initial profile has implementation and
+acceptance coverage; see [Implementation coverage](#implementation-coverage).
+That does not establish stable Rust APIs or validate downstream packaging.
 
 ## Decisions requested
 
@@ -16,13 +18,15 @@ describes today's supported behavior; this RFC defines the work required for emb
 
 Unprivileged hosting, privileged workloads, non-Linux embedding, and a new SPACE
 sandbox backend require separate designs. Existing daemon support is unchanged.
+Configurable process retention, output-gap recovery, retry-safe process input and
+restart fencing are separate API extensions, not prerequisites for embedding.
 
 ## Before: the extracted daemon
 
-The library is separated, but its production integration still supplies
-whole-daemon assumptions. Filesystem workers re-execute the daemon through its
-early dispatch hook; native calls do not acquire all transport admission checks
-or a complete shutdown-and-reject contract.
+At the proposal's baseline, the library was separated, but its production
+integration supplied whole-daemon assumptions. Filesystem workers re-executed the
+daemon through its early dispatch hook; native calls lacked some transport
+admission checks and a complete shutdown-and-reject contract.
 
 ```mermaid
 flowchart LR
@@ -124,7 +128,9 @@ that outlives the service. Signal-handler neutrality is not promised.
 
 Order operation registration with admission closure: **running → closing → drained**.
 Closing rejects every new operation, including reads, mutations, watches and
-environment updates, without cancelling work already admitted. Explicit
+environment updates, without cancelling admitted finite operations. Passive
+worker watches retire with recoverable `Unavailable` at close; Direct watches
+retire quietly during drain or cancellation. Explicit
 cancellation or a drain deadline requests abortive cleanup; caller cancellation
 propagates into the service, never from the service into its caller. Repeated
 shutdown observes the same transition. Successful drain means owned operations, worker startup/cleanup and command supervisors have
@@ -165,3 +171,24 @@ Each PR identifies established and pending guarantees; launcher work alone does
 not establish embedding support. Preserve wire/import compatibility and follow
 [versioning policy](../../versioning.md). Packaging and hermetic consumer builds
 need separate validation.
+
+## Implementation coverage
+
+The initial Linux profile uses the execution crate with a separate worker binary;
+it does not depend on the process-API extensions listed above. These are the
+owning acceptance checks, rather than a second implementation of the contract:
+
+| Requirement | Implementation and acceptance coverage |
+| --- | --- |
+| Explicit worker artifact and startup ownership | [Worker executable tests](../../../crates/libs/spaced/guest/execution/src/worker_executable/tests.rs) and the [embedding host](../../../crates/apps/spaced/guest/worker/tests/embedding/linux.rs): artifact replacement, invalid/incompatible workers, cancelled startup and reaping. |
+| Restricted child identity, unchanged host authority | [Identity probes](../../../crates/apps/spaced/guest/worker/tests/embedding/identity.rs): IDs, groups, capabilities, PTYs, privilege-gaining executables and directory traversal; the [entrypoint](../../../crates/apps/spaced/guest/worker/tests/embedding.rs) also rejects dispatch after threads start. |
+| Native operations and bounded admission | [Ingress tests](../../../crates/libs/spaced/guest/execution/src/filesystem/router/ingress_tests.rs), [process tests](../../../crates/libs/spaced/guest/execution/src/process/tests.rs) and the embedding host: payload limits, shared permits, uploads, environment updates and cancellation. |
+| Admission closure and retained cleanup ownership | [Execution tests](../../../crates/libs/spaced/guest/execution/src/execution/tests.rs) and [router tests](../../../crates/libs/spaced/guest/execution/src/filesystem/router/tests.rs): every closed entrypoint, admitted work, incomplete/repeated drain and interrupted streams. |
+| Caller placement and final teardown | [Boundary probe](../../../crates/apps/spaced/guest/worker/tests/embedding/boundary.rs): real workload/worker cgroups, unrelated children, descriptor inheritance and a surviving descendant cleaned up by the caller. |
+
+The [README](../../../crates/libs/spaced/guest/execution/README.md) specifies the
+privileged probe's disposable environment and fail-closed prerequisites. Routine
+Rust tests cover operation behavior; Kind/Firecracker checks cover the daemon
+integration. Passing the Linux checks does not establish native macOS coverage,
+acceptance on another Linux architecture, resource-limit policy or hermetic
+consumer builds. Those need evidence in their own environments.
