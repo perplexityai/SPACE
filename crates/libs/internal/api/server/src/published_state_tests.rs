@@ -12,6 +12,146 @@ use sqlx::PgPool;
 mod support;
 use support::*;
 
+#[tokio::test(flavor = "current_thread")]
+async fn steady_publish_skips_inapplicable_quarantine_queries_but_consumes_receipts() -> TestResult
+{
+    async fn calls(pool: &PgPool) -> TestResult<[i64; 6]> {
+        let statements: Vec<(String, i64)> = sqlx::query_as(sql!(
+            "SELECT query, calls FROM pg_stat_statements
+             WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+               AND query LIKE $1"
+        ))
+        .bind("%jsonb_to_recordset%")
+        .fetch_all(pool)
+        .await?;
+        let mut counts = [0; 6];
+        for (query, count) in statements {
+            let signature = query.split_whitespace().collect::<Vec<_>>().join(" ");
+            let index = if signature.contains("released AS (")
+                && signature.contains("activation_attempt_expires_at")
+            {
+                Some(0)
+            } else if signature.contains("FOR UPDATE OF s, execution") {
+                Some(1)
+            } else if signature.contains("SELECT s.id, qs.quarantine_id,") {
+                Some(2)
+            } else if signature.contains("AS published_pod_uid_was_missing") {
+                Some(3)
+            } else if signature.contains("publishable.quarantine_recovery_payload") {
+                Some(4)
+            } else if signature.contains("clearable AS (") {
+                Some(5)
+            } else {
+                None
+            };
+            if let Some(index) = index {
+                counts[index] += count;
+            }
+        }
+        Ok(counts)
+    }
+
+    let db = pg_test_db().await?;
+    sqlx::query(sql!("CREATE EXTENSION pg_stat_statements"))
+        .execute(&db.pool)
+        .await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let mut inventory = Vec::new();
+    for _ in 0..50 {
+        let sandbox_id = SandboxId::new();
+        insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
+        inventory.push(PublishedSandboxState {
+            sandbox_id: sandbox_id.to_string(),
+            present: true,
+            status: Some("started".to_string()),
+            ..PublishedSandboxState::default()
+        });
+    }
+    let mut conn = db.pool.acquire().await?;
+    // Establish observed state so the measured call is a steady-state publish.
+    publish_sandbox_states(&mut conn, node_id, &inventory).await?;
+    let before: Vec<serde_json::Value> =
+        sqlx::query_scalar(sql!("SELECT to_jsonb(s) FROM sandboxes s ORDER BY id"))
+            .fetch_all(&db.pool)
+            .await?;
+    let before_calls = calls(&db.pool).await?;
+    let outcome = publish_sandbox_states(&mut conn, node_id, &inventory).await?;
+    assert_eq!(outcome.accepted, inventory.len() as u64);
+    assert!(outcome.post_commit_events.is_empty());
+    assert!(outcome.post_commit_state_convergence.is_empty());
+    assert!(outcome.state_only_sandbox_ids.is_empty());
+    let after: Vec<serde_json::Value> =
+        sqlx::query_scalar(sql!("SELECT to_jsonb(s) FROM sandboxes s ORDER BY id"))
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(after, before);
+    let after_calls = calls(&db.pool).await?;
+    let delta = std::array::from_fn::<_, 6, _>(|i| after_calls[i] - before_calls[i]);
+
+    let sandbox_id = SandboxId::new();
+    let attempt = Uuid::now_v7();
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "stopped").await?;
+    insert_k8s_execution(&db.pool, sandbox_id, 7, "running", Some("192.0.2.7")).await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+         SET activation_attempt_id = $2,
+             activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+             activation_attempt_target_state = 'started', route_activation_id = $2
+         WHERE sandbox_id = $1 AND generation = 7"
+    ))
+    .bind(sandbox_id)
+    .bind(attempt)
+    .execute(&db.pool)
+    .await?;
+    inventory.push(PublishedSandboxState {
+        sandbox_id: sandbox_id.to_string(),
+        present: true,
+        status: Some("started".to_string()),
+        transition_receipt: Some(pplx_space_sbx_mgr_client::proto::TransitionReceipt {
+            id: Uuid::now_v7().to_string(),
+            kind: "activation_completed".to_string(),
+            target_state: "started".to_string(),
+            execution_generation: 7,
+            activation_attempt_id: Some(attempt.to_string()),
+            ..Default::default()
+        }),
+        ..PublishedSandboxState::default()
+    });
+    publish_sandbox_states(&mut conn, node_id, &inventory).await?;
+    let lifecycle: String =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(lifecycle, "started");
+    let owner: Option<Uuid> = sqlx::query_scalar(sql!(
+        "SELECT activation_attempt_id FROM sandbox_k8s_executions
+         WHERE sandbox_id = $1 AND generation = 7"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        owner, None,
+        "the matching completion receipt must release its claim"
+    );
+    let receipt_calls = calls(&db.pool).await?;
+    assert_eq!(
+        receipt_calls[0] - after_calls[0],
+        1,
+        "receipt query really executes"
+    );
+    // Started inventory can recover pause_failed state stored in Postgres, and
+    // absent payloads can clear stored observations. Neither query is skippable.
+    assert_eq!(
+        delta,
+        [0, 0, 1, 0, 0, 1],
+        "completion, rollback, pause recovery, suspended projection, record, clear"
+    );
+    Ok(())
+}
+
 #[test]
 fn published_fork_artifact_origin_maps_to_the_core_vocabulary() {
     assert_eq!(

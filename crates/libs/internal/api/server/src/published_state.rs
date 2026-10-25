@@ -2519,8 +2519,14 @@ pub async fn publish_sandbox_states(
             changed_at: row.state_changed_at?,
         })
     }));
-    sqlx::query(sql!(
-        "WITH input AS (
+    if let Some(recovery_rows) =
+        crate::sandbox_quarantine_store::matching_inventory(rows_json.clone(), |row| {
+            !row["quarantine_recovery_payload"].is_null()
+                && row["quarantine_recovery_observation_degraded"].as_bool() != Some(true)
+        })
+    {
+        sqlx::query(sql!(
+            "WITH input AS (
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
@@ -2558,18 +2564,19 @@ pub async fn publish_sandbox_states(
                IS DISTINCT FROM EXCLUDED.observed_payload -> 'quarantine_recovery'
             OR node_facet_observed_status.observed_at
                < NOW() - make_interval(secs => $4::BIGINT)"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "write published quarantine recovery observation: {err}"
         ))
-    })?;
+        .bind(node_id)
+        .bind(recovery_rows)
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "write published quarantine recovery observation: {err}"
+            ))
+        })?;
+    }
     sqlx::query(sql!(
         "WITH input AS (
              SELECT *

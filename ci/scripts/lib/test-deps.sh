@@ -125,6 +125,7 @@ space_start_test_postgres() {
         -c synchronous_commit=off \
         -c full_page_writes=off \
         -c max_connections=200 \
+        -c shared_preload_libraries=pg_stat_statements \
         "$@"
 }
 

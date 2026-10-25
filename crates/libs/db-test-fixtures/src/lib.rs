@@ -690,6 +690,12 @@ impl SharedPostgres {
             .with_host_auth()
             .with_name(image_name)
             .with_tag(image_tag)
+            .with_cmd([
+                "-c",
+                "fsync=off",
+                "-c",
+                "shared_preload_libraries=pg_stat_statements",
+            ])
             .start()
             .await
             .map_err(|error| InitError::Unavailable(error.to_string()))?;
