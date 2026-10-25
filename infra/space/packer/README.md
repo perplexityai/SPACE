@@ -16,6 +16,7 @@ add the host setup SPACE's node services expect to find:
 | `09-auditd.sh` | Audit rules on the SPACE binaries and `/dev/kvm` |
 | `11-nvme-cache.sh` | A boot-time service that formats instance-store NVMe as the btrfs `/space/cache`, replacing the loopback image. The node's user data runs the same script, so it holds a lock, and a run that finished leaves a marker that makes later runs that boot a no-op. After granting the cache to `space-cache-rw`, it returns the rehydrated kernel and asset trees to root-only and makes the two shared cache parents sticky |
 | `12-nodeadm-config-retry.sh` | Retries `nodeadm-config.service` on a transient IMDS failure at boot |
+| `13-gpu-passthrough.sh` | On opt-in GPU workers, adds `intel_iommu=on iommu=pt` to every installed kernel and loads the VFIO modules on boot |
 | `99-cleanup.sh` | Key-only SSH and image cleanup |
 
 Nothing is downloaded from a private source, and every artifact the recipes
@@ -34,12 +35,17 @@ With AWS credentials for the target account, from the repository root:
 
 ```bash
 infra/space/packer/aws/build.sh --kubernetes-version 1.36 --type worker
+infra/space/packer/aws/build.sh --kubernetes-version 1.36 --type gpu-worker
 infra/space/packer/aws/build.sh --kubernetes-version 1.36 --type builder
 ```
 
 - `--kubernetes-version` is required. It picks the EKS base image, and so the
   kubelet minor of every node launched from the result; bake at the minor of the
   oldest control plane the image will join.
+- `--type gpu-worker` enables x86 PCI GPU passthrough prerequisites. The normal
+  worker image remains the default and does not enable IOMMU or VFIO. The GPU
+  variant has `Role=gpu-worker` so existing `Role=worker` selectors cannot
+  accidentally choose it.
 - `--region` defaults to `us-east-1`. The AMI lands in the account and region
   the credentials and flag name.
 - The build instance gets a public IP in the region's default VPC. Pass
@@ -49,7 +55,7 @@ infra/space/packer/aws/build.sh --kubernetes-version 1.36 --type builder
   arguments it doesn't recognize through to `packer build`.
 
 Each image is named `space-<role>-<timestamp>` and tagged `Role`
-(`worker`/`builder`), `KubernetesVersion`, `GitSHA`, `GitBranch` and `BuiltAt`.
+(`worker`/`gpu-worker`/`builder`), `KubernetesVersion`, `GitSHA`, `GitBranch` and `BuiltAt`.
 Consumers select on those tags: `modules/space` by `GitSHA` (or a name pattern)
 and `Role`, the reference cluster by `Role`, `KubernetesVersion` and
 `GitBranch`. `build.sh` refuses to bake a commit that already has an image of
@@ -60,3 +66,26 @@ would then take whichever is newest.
 name, with no check that the tree is clean or up to date. A consumer that trusts
 `GitBranch=main` should be baked from a clean checkout of the current `main`,
 and a detached checkout is tagged `GitBranch=HEAD`.
+
+## GPU passthrough preflight
+
+The GPU bake checks that `grubby` updated every installed kernel and that its
+kernel contains the VFIO modules. Hardware cannot be checked on the ordinary
+Packer build instance. After launching the GPU worker and rebooting it, run:
+
+```bash
+sudo /opt/space/bin/space-gpu-preflight
+```
+
+This requires a display-class PCI device, an IOMMU group for every such device,
+the expected running-kernel arguments and modules, and `/dev/vfio/vfio`.
+SPACE intentionally does not bind a GPU during boot. Once an operator or
+allocator binds one exact PCI address to `vfio-pci`, verify its group device:
+
+```bash
+sudo /opt/space/bin/space-gpu-preflight 0000:00:00.0
+```
+
+That selected-address check also requires `/dev/vfio/<group>`. Do not bind a
+vendor/device ID shared by several GPUs. If preflight reports no IOMMU group,
+the instance cannot safely provide that GPU to a guest.
