@@ -309,6 +309,11 @@ async fn drain_retains_cancelled_direct_io_and_temporary_file_cleanup() {
 fn process_retention_is_bounded() {
     for retention in [
         ProcessRetention {
+            completed: Duration::from_secs(30),
+            output: Duration::from_secs(31),
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
             completed: Duration::ZERO,
             ..ProcessRetention::default()
         },

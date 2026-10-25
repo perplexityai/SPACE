@@ -53,7 +53,7 @@ pub struct ProcessRetention {
     /// How long a completed process's exit stays replayable. When every record
     /// slot is held, the record that completed first is evicted to admit a new start.
     pub completed: Duration,
-    /// How long completed output and environment remain retained, bounded by
+    /// How long completed output and environment remain retained. Must not exceed
     /// `completed`. Retained bytes still consume the shared output budget.
     pub output: Duration,
     /// How long a completed keyed start is remembered. The key store's fixed
@@ -75,7 +75,11 @@ impl Default for ProcessRetention {
 impl ProcessRetention {
     fn validate(self) -> Result<(), CreateExecutionServiceError> {
         let valid = |window: Duration| !window.is_zero() && window <= MAX_RETENTION;
-        if valid(self.completed) && valid(self.output) && valid(self.idempotency) {
+        if valid(self.completed)
+            && valid(self.output)
+            && valid(self.idempotency)
+            && self.output <= self.completed
+        {
             Ok(())
         } else {
             Err(CreateExecutionServiceError::InvalidProcessRetention)
@@ -120,7 +124,9 @@ pub enum CreateExecutionServiceError {
     RestrictedRequiresPrivilege,
     #[error("cannot inspect launcher capabilities: {0}")]
     InspectPrivileges(#[source] std::io::Error),
-    #[error("process retention windows must be nonzero and at most seven days")]
+    #[error(
+        "process retention windows must be nonzero and at most seven days, with output no longer than completed retention"
+    )]
     InvalidProcessRetention,
 }
 

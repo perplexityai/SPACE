@@ -55,7 +55,12 @@ and error evolution, requires a separate crate-level policy before stabilization
   retaining output longer keeps its share of the shared output budget. A long
   idempotency window lowers the sustained keyed-start rate the fixed key store
   admits. In-progress starts keep their fixed 60-second bound regardless of these
-  windows. Each configured window must be nonzero and at most seven days.
+  windows. Each configured window must be nonzero and at most seven days, and
+  output retention must not exceed completed-record retention.
+  A key may outlive output or the record: a keyed Start retry after output expiry
+  returns Started followed by a lagged `ResourceExhausted`; after record expiry
+  it returns `FailedPrecondition` (process replay state expired). Neither outcome
+  starts a replacement process.
 - Linux identity workers require the daemon's privilege to install the requested
   OS account's groups and IDs; an unprivileged worker host is unsupported. Direct mode
   runs filesystem syscalls with the daemon's credentials; its `user` selects path
@@ -195,7 +200,7 @@ and error evolution, requires a separate crate-level policy before stabilization
   measured on the guest's monotonic clock, so time the sandbox spends suspended
   does not count. Starts beyond the 128-record limit evict the oldest completed
   records first, which can end it early. The record keeps its output only for
-  the start idempotency window (60 seconds), then just its command and exit,
+  the default output window (60 seconds), then just its command and exit,
   dropping its environment with the output. It closes its stdin and terminal
   descriptors when the process exits; a write still in flight then closes them
   when it returns. A caller-assigned process id stays in use for the whole
