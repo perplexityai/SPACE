@@ -16,6 +16,7 @@ add the host setup SPACE's node services expect to find:
 | `09-auditd.sh` | Audit rules on the SPACE binaries and `/dev/kvm` |
 | `11-nvme-cache.sh` | A boot-time service that formats instance-store NVMe as the btrfs `/space/cache`, replacing the loopback image. The node's user data runs the same script, so it holds a lock, and a run that finished leaves a marker that makes later runs that boot a no-op. After granting the cache to `space-cache-rw`, it returns the rehydrated kernel and asset trees to root-only and makes the two shared cache parents sticky |
 | `12-nodeadm-config-retry.sh` | Retries `nodeadm-config.service` on a transient IMDS failure at boot |
+| `13-gpu-passthrough.sh` | Adds `intel_iommu=on iommu=pt` to every worker kernel and loads VFIO modules so x86 GPU hardware can be assigned when present |
 | `99-cleanup.sh` | Key-only SSH and image cleanup |
 
 Nothing is downloaded from a private source, and every artifact the recipes
@@ -60,3 +61,27 @@ would then take whichever is newest.
 name, with no check that the tree is clean or up to date. A consumer that trusts
 `GitBranch=main` should be baked from a clean checkout of the current `main`,
 and a detached checkout is tagged `GitBranch=HEAD`.
+
+## GPU passthrough preflight
+
+Every worker bake checks that `grubby` updated every installed kernel and that
+its kernel contains the VFIO modules. Hardware cannot be checked on the ordinary
+Packer build instance. After launching a worker with GPU hardware and rebooting
+it, run:
+
+```bash
+sudo /opt/space/bin/space-gpu-preflight
+```
+
+This requires a display-class PCI device, an IOMMU group for every such device,
+the expected running-kernel arguments and modules, and `/dev/vfio/vfio`.
+SPACE intentionally does not bind a GPU during boot. Once an operator or
+allocator binds one exact PCI address to `vfio-pci`, verify its group device:
+
+```bash
+sudo /opt/space/bin/space-gpu-preflight 0000:00:00.0
+```
+
+That selected-address check also requires `/dev/vfio/<group>`. Do not bind a
+vendor/device ID shared by several GPUs. If preflight reports no IOMMU group,
+the instance cannot safely provide that GPU to a guest.
