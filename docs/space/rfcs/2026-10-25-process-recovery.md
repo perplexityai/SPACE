@@ -15,10 +15,10 @@ guest daemon or an embedding application.
 | --- | --- |
 | Configurable exit, output and completed-start retention | [Separate retention implementation](https://github.com/perplexityai/SPACE/pull/888). |
 | Counted output gaps with opt-in replay | [Gap-recovery implementation](https://github.com/perplexityai/SPACE/pull/889). |
-| Bind a start key to the request it identifies | Proposed; compatibility and request normalization need review. |
-| Reject handles from an earlier engine lifetime | Proposed; discovery before the first start needs review. |
-| Deduplicate process input, stdin closure and signals | Proposed; ordering, receipts and partial effects need review. |
-| Capability discovery and end-to-end forwarding | Proposed; the gap implementation provides a connection acknowledgement, not complete discovery or external API exposure. |
+| Bind a start key to the request it identifies | Proposed opt-in recovery start; equality and compatibility are specified below. |
+| Reject stale engine and process handles | Proposed recovery handle, using discovery before the first start. |
+| Deduplicate process input, stdin closure and signals | Proposed ordered, bounded mutation receipts below. |
+| Capability discovery and end-to-end forwarding | Initial readiness/status discovery is described below. Operation enforcement and complete external API exposure remain proposed. |
 
 The first two changes do not provide the remaining guarantees. Field names for
 later changes are provisional; do not reserve wire numbers until implementation.
@@ -115,75 +115,195 @@ Retrying a cursor is another read, not a promise that bytes remain forever:
 eviction can turn a retry into a counted gap, and record expiry can make the
 handle unavailable. A future cursor still fails rather than silently moving it.
 
-## Remaining design decisions
+## Proposed recovery requests
+
+The following contracts remain proposals. Discovery can ship independently;
+it does not enable these guarantees. Implement each operation with its adapter
+forwarding, compatibility checks and owning tests before advertising support.
+
+### Fail closed on older peers
+
+A new optional fence or sequence field alone is insufficient: protobuf readers
+ignore unknown fields. A readiness check also cannot prevent a peer replacement
+between discovery and a mutation. The recovery form must therefore be invalid
+as a legacy request, not merely accompanied by a capability assertion.
+
+| Operation | Proposed recovery form | What a legacy reader sees |
+| --- | --- | --- |
+| Start | A recovery envelope containing the command, expected engine instance and contract version. The existing command field must be empty. | An empty command, rejected before launching. |
+| ConnectProcess and process controls | A recovery envelope containing the process handle and contract version. The existing process ID field must be empty. | An empty process ID, rejected before lookup or effects. |
+
+Both forms populated is `InvalidArgument`. New readers reject unknown contract
+versions before replay, lookup or effects; adapters preserve the envelope rather
+than copying its values into legacy fields. Adding an effect-related field to an
+existing recovery envelope requires a new enforced contract version. An old
+recovery reader must reject it, not ignore the new guarantee. Capability names
+identify the supported operation contracts; they do not replace these checks.
+
+Existing requests retain their current behavior. These are additive fields on
+the existing RPCs, not new Process methods. Envelope names and field numbers
+remain provisional until implementation. Compatibility tests must send encoded
+recovery requests to an actual older service, not just test the new validator.
 
 ### Bind start keys to requests
 
-A key should identify one logical start: the same key and request replays the
-result; a different request returns `InvalidArgument` before launching anything.
-Define canonical equality over execution-affecting fields, including account,
-argv, working directory, environment, timeout, PTY and requested process ID.
-Map order must not matter. Resolve how omitted fields and changing configured
-defaults participate before implementation; retries must not silently select a
-different command because defaults changed.
+After message-size validation and payload admission, recovery Start binds its
+key atomically to the validated request before any account lookup, PTY allocation
+or process launch. A matching retry waits for the
+same owner or replays its result. A conflicting request returns `InvalidArgument`
+without waiting for the original launch. Legacy and recovery use of one key
+cannot be upgraded or downgraded: a mode mismatch returns `FailedPrecondition`.
+Legacy keys used only by legacy requests keep their current behavior.
 
-Rejecting a changed request under an existing key changes today's behavior even
-without a new field. Select an opt-in or an explicitly reviewed compatibility
-policy before shipping this change. Key expiry still bounds deduplication.
+| Equality input | Rule |
+| --- | --- |
+| Command, user, cwd, tag, requested process ID | Compare supplied values and option presence. Omitted and explicitly supplied defaults are distinct; do not resolve filesystem aliases. |
+| Environment | Validate the complete supplied map, then compare entries independent of order. Recovery starts reject invalid entries; legacy parsing remains unchanged. |
+| Timeout, background, stdin, PTY, clean environment | Include every field and option presence. Validate values before binding. |
+| Configured environment, account data and default cwd | Resolve once for the owning launch. A retry replays that launch, even if defaults or account data change. |
+| Engine instance and contract version | Validate the instance before key lookup; versions with different request semantics cannot share a binding. |
 
-### Fence engine lifetimes
+Store a server-computed cryptographic digest of canonical request data alongside
+the bounded key record; do not retain another copy of argv or environment.
+Canonical encoding must be unambiguous and account for every execution-affecting
+field. Do not accept a caller-supplied digest as evidence of equality.
 
-Give each service lifetime an opaque `instance_id`. A supplied
-`expected_instance_id` must be checked before keyed replay, lookup or effects on
-Start, ConnectProcess, SendInput, CloseStdin and SendSignal. A mismatch returns
-`FailedPrecondition`; it never runs the command again or resolves a reused ID in
-the new lifetime. A fence is not authorization.
+A matching keyed replay precedes the caller-assigned process-ID collision check
+in recovery mode. Another key using an occupied process ID still fails; it must
+not silently attach to that process. The legacy collision precedence is unchanged.
+Dropping an unstarted reservation releases its binding. After launch ownership
+transfers, cancellation must not permit another launch or discard its result.
 
-Returning the instance only in `ProcessStarted` is insufficient: the first reply
-can be lost before the client learns it. A client requiring restart-safe starts
-must discover the instance **before its first Start** and retain that expectation
-on every retry. The metadata/discovery path and capability confirmation are
-required design decisions. Without that handshake, an unfenced lost start has an
-unknown outcome and must not be advertised as safe to retry across restart.
+The existing key window and capacity limits still bound deduplication. Discovery
+must expose the configured key window before clients enable recovery starts.
+Clients bound their retry deadline from the first attempt; after the window,
+the result is unknown and automatic resend is unsafe, even if the engine has
+not restarted. Expired tombstones need not live forever. A key outliving its
+output or process record retains the expiry behavior specified under retention.
+
+### Discover the execution service before effects
+
+Use the existing readiness/status metadata path rather than a new Process RPC.
+`process_execution` carries an opaque `instance_id` and named guest capabilities
+from the same readiness observation. The native service exposes the same data
+through `process_execution_info()`. Older guests and adapters omit it; absence
+never authorizes an opt-in. Each adapter intersects the guest list with the
+guarantees its request path implements; unknown names are omitted. A newer guest
+behind an older adapter must not advertise a guarantee that the adapter would strip on the request.
+Version numbers alone never establish support.
+
+The identity belongs to the in-memory execution state. Cloning a service handle
+or reconnecting does not change it; constructing a replacement does. A memory
+snapshot preserves the state and identity, including when cloned to a different
+sandbox. Handles therefore include the sandbox identity as well as the instance.
+This addition advertises only implemented capabilities, initially output-gap
+recovery. It does not yet implement fencing, bound starts or mutation receipts.
+Those operations must separately enforce their expectations before effects;
+discovery followed by an unchecked mutation would still have a restart race.
+
+### Fence engine and process lifetimes
+
+A recovery start requires the instance observed **before the first attempt**.
+The service checks it before keyed replay, ID collision checks or launch. A
+mismatch returns `FailedPrecondition` with a machine-readable instance-mismatch
+reason; it never reruns the command. A lost first reply is retried with the same
+key, request and original instance, not an instance learned from a later probe.
+
+The first started event identifies both the engine instance and a fresh opaque
+process incarnation. A recovery handle is the tuple:
+
+```
+(sandbox identity, engine instance, process ID, process incarnation)
+```
+
+The incarnation distinguishes reuse of a caller-assigned process ID after record
+expiry within the same engine. Connect and control operations check the engine,
+then the selected record's incarnation, before replay or effects. A different
+incarnation returns `FailedPrecondition` with a distinct reason; a missing record
+remains `NotFound`. Tokens identify state; they are not authorization credentials.
+Memory snapshots preserve both tokens and their records, so the sandbox identity
+remains part of the caller's handle. It is not sufficient for rollback into the
+same sandbox: restoring an earlier image also rewinds keys and mutation receipts.
+
+Before recovery requests are admitted after a memory restore, the supervisor
+must install a fresh activation epoch from outside the snapshot. The effective
+engine instance incorporates that epoch; repeated notification of the same
+activation is idempotent. The routing path gates recovery traffic until this
+handshake completes. A native host supporting memory restore must supply the
+same lifecycle boundary. Discovery's current in-memory ID alone does not provide
+this guarantee. Conservatively invalidate recovery handles on every memory
+restore, including suspend/restore; resident pause/resume keeps the instance.
+Legacy operations retain their current lifecycle behavior. Fencing prevents new
+requests using old handles; it cannot undo external effects of rolled-back work.
 
 ### Deduplicate process mutations
 
-A proposed `sequence` on SendInput, CloseStdin and SendSignal identifies a
-mutation within a fenced process lifetime. The service needs a bounded receipt
-containing the operation, request identity and outcome. A matching duplicate
-replays the receipt; conflicting reuse is rejected. Admission, registration,
-side-effect ownership and receipt publication must remain ordered after caller
-cancellation.
+SendInput, CloseStdin and SendSignal share one ordered sequence per recovery
+handle. The caller coordinates writers; the engine adds no client registration.
+Legacy controls remain available outside this ordering; callers must coordinate
+any mixing of the two forms. Sequences start at one. The next operation uses the
+preceding sequence plus one,
+only after learning its terminal outcome. Sequence exhaustion is a terminal
+refusal, never wraparound. ResizePty can use a fenced handle but is outside the
+mutation-receipt contract in this proposal.
 
-Before implementation, decide sequence ordering, concurrent-writer ownership,
-receipt retention and behavior for expired, out-of-order or unknown sequences.
-Do not acknowledge every lower number without checking its receipt. A partial
-stdin write cannot be rolled back, and a signal acknowledgement does not prove
-the target handled it. Preserve an explicit unknown/partial outcome when an
-effect cannot be established; do not repeat an uncertain effect or call it an
-exactly-once guarantee. Calls without a sequence retain existing behavior.
+| Request | Result before any new effect |
+| --- | --- |
+| Next sequence, no owner in progress | Atomically reserve the operation kind and canonical payload digest. |
+| Same sequence and payload as the in-flight owner | Wait for that owner; never perform the effect again. |
+| Retained sequence and matching receipt | Replay the recorded success or error, even after the process exits. |
+| Same in-flight or retained sequence with another operation or payload | `InvalidArgument`. |
+| Sequence ahead of the next expected value, including while an earlier owner runs | `FailedPrecondition`; caller resolves the earlier operation first. |
+| Sequence at or below the high-water mark whose receipt expired | `FailedPrecondition` with a receipt-expired reason; never acknowledge or reapply it. |
+
+Retain the last 64 terminal receipts per process, until its record expires or is
+evicted. Keep the high-water mark for the record's entire lifetime, even after
+individual receipts leave the bounded ring. Each receipt holds a digest and a
+bounded outcome, not input bytes. At most one owner may apply effects per process;
+duplicate waiters also consume bounded admission slots. Matching receipt lookup
+precedes the running-process check; a completed process can still answer a retry.
+
+Admission refusals and cancelled reservations that have not begun effects do not
+consume a sequence. Once begun, a tracked owner retains admission and completes
+the effect and receipt publication despite caller cancellation. Service shutdown
+can interrupt it, but must publish a known failure or an explicit uncertain
+outcome, never free that sequence for another attempt.
+
+A terminal result consumes its sequence, including a recorded error. A partial
+stdin write reports the known written prefix and an uncertain remainder; the
+original bytes are never resent automatically. Signals acknowledge the attempted
+OS delivery, not handling by the target process. An uncertain result stays
+uncertain on every replay. A caller may issue a later cleanup operation after
+receiving that result, but cannot infer rollback or claim exactly-once execution.
 
 ### Rollout and capability handling
 
-Each guarantee needs discovery and confirmation appropriate to its operation.
-Do not infer support from unknown protobuf fields being accepted. Older peers
-must keep serving existing requests; opt-in requests must fail explicitly when
-the required guarantee is unavailable. Preserve fields through every adapter,
-and test mixed versions and rollback before enabling a feature for callers.
+Ship contracts in dependency order: discovery, recovery Start with key binding,
+fenced reconnect/control handles, then mutation receipts. Each implementation
+includes every affected public adapter and only then advertises its capability.
+A client must discover support before selecting the recovery encoding; absent
+or filtered capabilities select the existing path only for new work. Never
+translate an uncertain recovery retry into a legacy request.
+
+Adapters filter capabilities at each hop and preserve recovery fields intact.
+Test old guest/new host, new guest/old host, older manager, downgraded recovery
+contract version, and peer replacement between discovery and the request.
+Refusal must happen before effects even when a cached capability observation is
+stale. Existing daemon, Linux and macOS call paths keep their current defaults.
 
 ## Acceptance and delivery
 
 Keep the embedding acceptance change independent. Deliver retention and gap
 recovery as the two existing implementation changes; subsequent primitives need
-their decisions above resolved in focused, separately reviewed changes.
+the proposed contracts above implemented in focused, separately reviewed changes.
 
 | Area | Required evidence |
 | --- | --- |
 | Retention | Unchanged defaults; configured expiry of exit, output and keys; unchanged in-progress and capacity bounds. |
 | Gaps | Exact counts under eviction/expiry; continued replay through exit; independent readers; legacy cursor/error behavior; older-peer rejection. |
 | Key binding | Same-request replay, conflicting reuse, normalized maps/defaults, concurrent and cancelled starts. |
-| Fencing | Restart between discovery and start, lost first reply, stale reconnect/mutation, reused process IDs and unsupported peers. |
-| Mutation receipts | Lost replies, cancellation during effects, partial writes, duplicate/conflicting sequences, concurrency and bounded retention. |
+| Fencing | Restart between discovery and start, lost first reply, stale reconnect/mutation, same-engine process-ID reuse, restore activation/rollback fencing and unsupported peers. |
+| Mutation receipts | Lost replies, cancellation during effects, partial writes, duplicate/conflicting sequences, ordered writers, receipt eviction and no reapplication after expiry. |
 | Adapters | End-to-end field preservation and capability failures; existing daemon/platform tests remain green. |
 
 Retention and gap recovery are useful independently. Neither enables automatic
