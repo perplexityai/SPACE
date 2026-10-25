@@ -2231,25 +2231,24 @@ async fn completed_process_replay_follows_configured_retention() {
             process_retention: ProcessRetention {
                 completed: retention,
                 output: output_retention,
-                idempotency: IDEMPOTENCY_RECORD_TTL,
+                idempotency: retention * 3,
             },
             ..ExecutionServiceConfig::default()
         },
     )
     .expect("direct execution service");
-    let process_id = ProcessId::new();
-    let mut events = Process::start(
-        &service,
-        Request::new(StartRequest {
-            command: vec!["/bin/sh".into(), "-c".into(), "printf done; exit 3".into()],
-            process_id: Some(process_id.as_str().to_string()),
-            idempotency_key: Some("long-retention".into()),
-            ..Default::default()
-        }),
-    )
-    .await
-    .expect("process starts")
-    .into_inner();
+    let request = StartRequest {
+        command: vec!["/bin/sh".into(), "-c".into(), "printf done; exit 3".into()],
+        idempotency_key: Some("long-retention".into()),
+        ..Default::default()
+    };
+    let mut events = Process::start(&service, Request::new(request.clone()))
+        .await
+        .expect("process starts")
+        .into_inner();
+    let started = events.next().await.unwrap().unwrap();
+    assert!(matches!(started.event, Some(Event::Started(_))));
+    let process_id = ProcessId::parse(started.process_id).unwrap();
     while let Some(event) = events.next().await {
         event.expect("process stream remains successful");
     }
@@ -2327,6 +2326,25 @@ async fn completed_process_replay_follows_configured_retention() {
     assert!(record.journal.state.lock().unwrap().output.is_empty());
     drop(record);
 
+    // A key keeps the original identity, not a second copy of its output.
+    let mut retry = Process::start(&service, Request::new(request.clone()))
+        .await
+        .expect("the key still identifies the completed process")
+        .into_inner();
+    let started = retry.next().await.unwrap().unwrap();
+    assert_eq!(started.process_id, process_id.as_str());
+    assert!(matches!(started.event, Some(Event::Started(_))));
+    let error = retry.next().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        error
+            .metadata()
+            .get("space-process-output-first-sequence")
+            .is_some()
+    );
+    assert!(retry.next().await.is_none());
+    drop(retry);
+
     backdate(retention);
     registry.remove_expired();
     assert_eq!(registry.records.len(), 0);
@@ -2344,5 +2362,15 @@ async fn completed_process_replay_follows_configured_retention() {
         Err(error) => error,
     };
     assert_eq!(error.code(), tonic::Code::NotFound);
+    let error = match Process::start(&service, Request::new(request)).await {
+        Ok(_) => panic!("a live key must not rerun a process whose record expired"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "process replay state expired");
+    assert!(
+        registry.records.is_empty(),
+        "the retry must not spawn a new process"
+    );
     shut_down(&service).await;
 }
