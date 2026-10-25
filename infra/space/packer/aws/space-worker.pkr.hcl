@@ -209,6 +209,11 @@ build {
 
   provisioner "shell" {
     execute_command = "chmod +x {{ .Path }}; {{ .Vars }} sudo -E {{ .Path }}"
+    script          = "../scripts/base/05-grpc-health-probe.sh"
+  }
+
+  provisioner "shell" {
+    execute_command = "chmod +x {{ .Path }}; {{ .Vars }} sudo -E {{ .Path }}"
     script          = "../scripts/base/06-e2fsprogs.sh"
   }
 
