@@ -15,6 +15,7 @@ impl SandboxManager for SandboxManagerService {
         Ok(Response::new(
             crate::proto::GetExecutionCapabilitiesResponse {
                 environment_selection: true,
+                exclusive_devices_v1: cfg!(target_os = "linux") && self.node_managed_by.is_none(),
             },
         ))
     }

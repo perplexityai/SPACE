@@ -184,8 +184,36 @@ pub struct SnapshotMeta {
 }
 
 pub const SNAPSHOT_METADATA_VERSION: u32 = 2;
+pub const DEVICE_DISK_METADATA_VERSION: u32 = 3;
 
 impl SnapshotMeta {
+    /// Device requirements are mandatory in version 3 and supported only for
+    /// disk artifacts. Older readers reject that version instead of booting
+    /// the recovered disk without its devices.
+    pub fn device_requirements(
+        &self,
+    ) -> Result<
+        Option<&pplx_space_execution_spec::devices::DeviceRequirements>,
+        SnapshotRuntimeMetadataError,
+    > {
+        let requirements = self
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.device_requirements.as_ref());
+        match (self.version, requirements) {
+            (1 | SNAPSHOT_METADATA_VERSION, None) => Ok(None),
+            (DEVICE_DISK_METADATA_VERSION, Some(requirements))
+                if self.artifact_kind == Some(ArtifactKind::Disk) =>
+            {
+                Ok(Some(requirements))
+            }
+            (1 | SNAPSHOT_METADATA_VERSION | DEVICE_DISK_METADATA_VERSION, _) => {
+                Err(SnapshotRuntimeMetadataError::DeviceRequirements)
+            }
+            (version, _) => Err(SnapshotRuntimeMetadataError::UnsupportedVersion(version)),
+        }
+    }
+
     pub fn execution_metadata(
         &self,
         legacy_architecture: pplx_space_common_core::types::Arch,
@@ -193,12 +221,13 @@ impl SnapshotMeta {
         pplx_space_common_core::types::SnapshotExecutionMetadata,
         SnapshotRuntimeMetadataError,
     > {
+        self.device_requirements()?;
         match self.version {
             1 => pplx_space_common_core::types::SnapshotExecutionMetadata::new(
                 self.source.legacy_execution_metadata(legacy_architecture)?,
             )
             .map_err(SnapshotRuntimeMetadataError::InvalidExecution),
-            SNAPSHOT_METADATA_VERSION => self
+            SNAPSHOT_METADATA_VERSION | DEVICE_DISK_METADATA_VERSION => self
                 .execution
                 .clone()
                 .ok_or(SnapshotRuntimeMetadataError::MissingExecution),
@@ -260,6 +289,8 @@ pub(crate) enum SnapshotMetadataWriteError {
 /// snapshot metadata for restores on other nodes.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotSandbox {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_requirements: Option<pplx_space_execution_spec::devices::DeviceRequirements>,
     /// Sandbox owner identifier. Checked against the template-manager owner.
     /// in `auth_lookup` to gate template-manager privileges.
     #[serde(alias = "user")]
@@ -400,7 +431,11 @@ impl SnapshotSource {
 pub enum SnapshotRuntimeMetadataError {
     #[error("unsupported snapshot metadata version {0}")]
     UnsupportedVersion(u32),
-    #[error("snapshot metadata version 2 requires execution metadata")]
+    #[error(
+        "device requirements require version 3 disk metadata; memory snapshots with devices are unsupported"
+    )]
+    DeviceRequirements,
+    #[error("snapshot metadata requires execution metadata")]
     MissingExecution,
     #[error("legacy snapshot metadata cannot describe runtime {0}")]
     UnsupportedLegacyRuntime(pplx_space_common_core::types::RuntimeKind),

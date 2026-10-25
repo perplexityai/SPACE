@@ -62,28 +62,58 @@ fn id_prefix_for_selected_scope_requires_id_or_all() {
 
 #[test]
 fn local_create_and_start_delegate_direct_identity_to_sandbox_manager() {
-    let create = local_create_request(
-        CreateCommandInput {
-            environment: None,
-            content_hash: None,
-            runtime: Some("fc".to_string()),
-            template: "seed".to_string(),
-            user: None,
-            snapshots: false,
-            autostart: false,
-            boot_mode: "cold".to_string(),
-            blocking: false,
-            env: Vec::new(),
-            rootfs_size_mb: None,
-            auto_lifecycle: AutoLifecycleArgs::default(),
-        },
-        BootMode::Cold,
-        "root".to_string(),
-        Default::default(),
-        None,
-    );
-    let start = local_start_request("sandbox-id".to_string(), None, false, true, Some(60));
+    for device in [false, true] {
+        let create = local_create_request(
+            CreateCommandInput {
+                device_profile: device.then(|| "compute".parse().unwrap()),
+                device_count: device.then_some(2),
+                environment: device.then(|| {
+                    pplx_space_common_core::types::EnvironmentReference::new(
+                        pplx_space_common_core::types::Digest::sha256([8; 32]),
+                    )
+                }),
+                content_hash: None,
+                runtime: Some("fc".to_string()),
+                template: "seed".to_string(),
+                user: None,
+                snapshots: false,
+                autostart: false,
+                boot_mode: "cold".to_string(),
+                blocking: false,
+                env: Vec::new(),
+                rootfs_size_mb: None,
+                auto_lifecycle: AutoLifecycleArgs::default(),
+            },
+            BootMode::Cold,
+            "root".to_string(),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        let start = local_start_request(
+            "sandbox-id".to_string(),
+            None,
+            false,
+            true,
+            Some(60),
+            Some(4096),
+        );
+        assert_eq!(start.memory_mib, Some(4096));
 
-    assert_eq!(create.route_identity, None);
-    assert_eq!(start.route_identity, None);
+        assert_eq!(create.route_identity, None);
+        assert_eq!(start.route_identity, None);
+        if device {
+            assert!(create.runtime.is_empty());
+            assert!(create.template.is_empty());
+            assert!(create.environment.is_none());
+            let input = create.device_create.unwrap();
+            assert_eq!(input.environment.unwrap().template, "seed");
+            let requirements = input.requirements.unwrap();
+            assert_eq!(requirements.entries[0].profile, "compute");
+            assert_eq!(requirements.entries[0].count, 2);
+        } else {
+            assert!(create.device_create.is_none());
+            assert_eq!(create.runtime, "fc");
+        }
+    }
 }
