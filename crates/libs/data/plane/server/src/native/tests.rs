@@ -3576,6 +3576,83 @@ async fn an_attach_waits_for_a_route_within_its_deadline() {
     assert_eq!(calls.load(Ordering::Relaxed), 1, "nothing to wait for");
 }
 
+/// A WebSocket attach has one attach deadline from accept: the wait for a
+/// first-frame token and the wait for the sandbox's route share it, so the
+/// first frame cannot hold the socket for one deadline and the route a second.
+#[tokio::test(start_paused = true)]
+async fn a_websocket_attach_has_one_deadline_for_its_token_and_route() {
+    use std::sync::atomic::AtomicUsize;
+
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "a".repeat(64));
+    let attach = serde_json::to_string(&DataPlaneClientFrame::Attach {
+        token: token.clone(),
+    })
+    .unwrap();
+    let not_ready = |resolved: &AtomicUsize| {
+        resolved.fetch_add(1, Ordering::Relaxed);
+        std::future::ready(Err::<(), _>(RouteResolutionError::SessionNotReady))
+    };
+
+    // The token arrives four seconds into a five-second deadline: the route
+    // has the last second, not five more.
+    let accepted = tokio::time::Instant::now();
+    let deadline = accepted + Duration::from_secs(5);
+    let late_token = async {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        Some(Ok::<_, ()>(Message::Text(attach.clone().into())))
+    };
+    let resolved = AtomicUsize::new(0);
+    let answer = attach_token_and_route(None, late_token, deadline, |sent| {
+        assert_eq!(sent, token);
+        not_ready(&resolved)
+    })
+    .await;
+    assert_eq!(
+        answer,
+        Err(AttachRefused::Route(RouteResolutionError::SessionNotReady))
+    );
+    assert!(
+        accepted.elapsed() <= Duration::from_secs(5),
+        "{:?}",
+        accepted.elapsed()
+    );
+    assert!(resolved.load(Ordering::Relaxed) >= 1);
+
+    // A header token leaves the route the whole deadline.
+    let accepted = tokio::time::Instant::now();
+    let resolved = AtomicUsize::new(0);
+    let answer = attach_token_and_route(
+        Some(token.clone()),
+        std::future::pending::<Option<Result<Message, ()>>>(),
+        accepted + Duration::from_secs(5),
+        |_| not_ready(&resolved),
+    )
+    .await;
+    assert_eq!(
+        answer,
+        Err(AttachRefused::Route(RouteResolutionError::SessionNotReady))
+    );
+    assert!(accepted.elapsed() >= Duration::from_secs(4));
+    assert!(accepted.elapsed() <= Duration::from_secs(5));
+
+    // No token by the deadline: no route lookup at all.
+    let resolved = AtomicUsize::new(0);
+    let answer = attach_token_and_route(
+        None,
+        std::future::pending::<Option<Result<Message, ()>>>(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        |_| not_ready(&resolved),
+    )
+    .await;
+    assert_eq!(
+        answer,
+        Err(AttachRefused::Token(
+            DataPlaneErrorCode::AttachDeadlineExceeded
+        ))
+    );
+    assert_eq!(resolved.load(Ordering::Relaxed), 0);
+}
+
 #[test]
 fn a_route_refusal_marked_at_rest_is_not_a_route_that_is_coming() {
     let plain = tonic::Status::failed_precondition("no node");

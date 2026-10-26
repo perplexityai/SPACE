@@ -3775,7 +3775,7 @@ fn last_event_id_header_parses_unsigned_cursor() {
 async fn first_frame_attach_token_times_out_at_deadline() {
     let result = first_frame_attach_token_from_recv(
         std::future::pending::<Option<Result<Message, ()>>>(),
-        Duration::from_millis(1),
+        tokio::time::Instant::now() + Duration::from_millis(1),
     )
     .await;
 

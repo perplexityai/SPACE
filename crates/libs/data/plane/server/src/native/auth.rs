@@ -1,21 +1,14 @@
 use super::*;
 use std::future::Future;
 
-pub(crate) async fn first_frame_attach_token(
-    socket: &mut WebSocket,
-    deadline: Duration,
-) -> Result<String, DataPlaneErrorCode> {
-    first_frame_attach_token_from_recv(socket.recv(), deadline).await
-}
-
 pub(crate) async fn first_frame_attach_token_from_recv<F, E>(
     recv: F,
-    deadline: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<String, DataPlaneErrorCode>
 where
     F: Future<Output = Option<Result<Message, E>>>,
 {
-    let message = tokio::time::timeout(deadline, recv)
+    let message = tokio::time::timeout_at(deadline, recv)
         .await
         .map_err(|_| DataPlaneErrorCode::AttachDeadlineExceeded)?
         .ok_or(DataPlaneErrorCode::AttachRequired)?
