@@ -3,7 +3,7 @@ use crate::proto::{ArtifactIntegrityRequirement, CgroupLimits, VerifiedRuntimeLa
 
 #[test]
 fn launch_conversion_preserves_verified_identity_isolation_and_limits() {
-    let original = LaunchFirecrackerRequest {
+    let original = FirecrackerLaunch {
         execution_id: "execution".into(),
         jailer_bin: "/runtime/bin/jailer".into(),
         firecracker_bin: "/runtime/bin/firecracker".into(),
@@ -35,24 +35,24 @@ fn launch_conversion_preserves_verified_identity_isolation_and_limits() {
         original.verified_runtime.as_ref().unwrap().sandbox_id
     );
     assert_eq!(
-        LaunchFirecrackerRequest::try_from(generic.clone()).unwrap(),
+        FirecrackerLaunch::try_from(generic.clone()).unwrap(),
         original
     );
     for sandbox_id in ["", "another-sandbox"] {
         let mut conflict = generic.clone();
         conflict.sandbox_id = sandbox_id.into();
         assert!(matches!(
-            LaunchFirecrackerRequest::try_from(conflict),
+            FirecrackerLaunch::try_from(conflict),
             Err(LaunchContractError::IdentityMismatch)
         ));
     }
 }
 
 #[test]
-fn legacy_launch_rejects_both_identity_fields_even_when_equal() {
+fn adapter_launch_rejects_both_identity_fields_even_when_equal() {
     let verified_id = "018e390d-4dd8-7000-8000-000000000001";
     for legacy_id in [verified_id, "018e390d-4dd8-7000-8000-000000000002"] {
-        let request = LaunchFirecrackerRequest {
+        let request = FirecrackerLaunch {
             sandbox_id: legacy_id.into(),
             verified_runtime: Some(VerifiedRuntimeLaunch {
                 sandbox_id: verified_id.into(),

@@ -1,12 +1,11 @@
-//! Transitional transport conversion; runtime dispatch rejects unknown adapters
+//! Firecracker host-adapter input. Runtime dispatch rejects unknown adapters
 //! before acquiring execution ownership or creating a process.
 //!
 //! Generic launches always carry the sandbox identity at the top level. Protected
 //! launches repeat that same identity in `verified_runtime`; disagreement is a
-//! refusal. Only the legacy encoding clears the top-level identity, to make an
-//! older supervisor refuse protection it cannot acknowledge.
+//! refusal.
 
-use crate::proto::{LaunchFirecrackerRequest, LaunchRuntimeRequest};
+use crate::proto::LaunchRuntimeRequest;
 use pplx_space_execution_common::proto::RuntimeKind;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,7 +20,7 @@ pub enum LaunchContractError {
     IdentityMismatch,
 }
 
-impl TryFrom<LaunchRuntimeRequest> for LaunchFirecrackerRequest {
+impl TryFrom<LaunchRuntimeRequest> for FirecrackerLaunch {
     type Error = LaunchContractError;
 
     fn try_from(request: LaunchRuntimeRequest) -> Result<Self, Self::Error> {
@@ -62,10 +61,10 @@ impl TryFrom<LaunchRuntimeRequest> for LaunchFirecrackerRequest {
     }
 }
 
-impl TryFrom<LaunchFirecrackerRequest> for LaunchRuntimeRequest {
+impl TryFrom<FirecrackerLaunch> for LaunchRuntimeRequest {
     type Error = LaunchContractError;
 
-    fn try_from(request: LaunchFirecrackerRequest) -> Result<Self, Self::Error> {
+    fn try_from(request: FirecrackerLaunch) -> Result<Self, Self::Error> {
         if request.verified_runtime.is_some() && !request.sandbox_id.is_empty() {
             return Err(LaunchContractError::DualSandboxIdentities);
         }
@@ -94,3 +93,23 @@ impl TryFrom<LaunchFirecrackerRequest> for LaunchRuntimeRequest {
 
 #[cfg(test)]
 mod tests;
+
+/// Validated by the FC adapter before process ownership is acquired. This is
+/// host implementation data, not a second wire contract.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FirecrackerLaunch {
+    pub sandbox_id: String,
+    pub execution_id: String,
+    pub jailer_bin: String,
+    pub firecracker_bin: String,
+    pub chroot_base_dir: String,
+    pub ns_path: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub fc_config_path: String,
+    pub fc_log_path: String,
+    pub fc_console_path: String,
+    pub fc_metrics_path: String,
+    pub cgroup_limits: Option<crate::proto::CgroupLimits>,
+    pub verified_runtime: Option<crate::proto::VerifiedRuntimeLaunch>,
+}

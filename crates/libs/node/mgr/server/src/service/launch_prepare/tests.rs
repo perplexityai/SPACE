@@ -943,7 +943,7 @@ async fn launch_identity_is_checked_before_rpc_and_acknowledgement_before_accept
                     request.verified_runtime.unwrap().environment_reference,
                     reference.to_string()
                 );
-                Ok(proto::LaunchFirecrackerResponse {
+                Ok(proto::LaunchRuntimeResponse {
                     pid: 0,
                     accepted_environment_reference: accepted.clone(),
                 })
@@ -960,7 +960,7 @@ async fn launch_identity_is_checked_before_rpc_and_acknowledgement_before_accept
         let result = service
             .launch_admitted_runtime(
                 &lease.sandbox_id,
-                proto::LaunchFirecrackerRequest {
+                pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch {
                     sandbox_id: if dual_identity {
                         lease.sandbox_id.clone()
                     } else {
