@@ -2606,3 +2606,5 @@ async fn connect_resumes_after_an_output_gap_only_when_asked() {
     );
     shut_down(&service).await;
 }
+
+mod recovery;

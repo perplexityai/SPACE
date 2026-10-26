@@ -256,3 +256,44 @@ It is not required to host the execution service under the embedding contract.
 The proposed support profile, ownership contract, and implementation acceptance
 criteria are in the [embedding RFC](../../../../../docs/space/rfcs/2026-10-06-guest-execution-embedding.md).
 It is a proposal; the requirements above describe current behavior.
+
+## Recovery starts
+
+Native hosts can opt into request-bound starts using `StartRequest.recovery`.
+Recovery starts are disabled at construction. The host first calls
+`configure_process_recovery(Some(activation))` with a `ProcessRecoveryToken`
+supplied from outside any memory snapshot, then obtains `instance_id`,
+`activation_id` and `idempotency_retention` from `process_execution_info()`.
+The request uses contract version 1, both expected IDs, a required idempotency
+key and the command inside `RecoveryStart`; the legacy `command` stays empty.
+
+Same-key retries replay the original launch before account lookup, mutable
+configuration or caller-assigned process-ID collision checks. A different
+supplied request is `InvalidArgument`; mixing legacy and recovery starts under
+one key is `FailedPrecondition`. Environment map order is immaterial, but omitted
+values and explicit defaults are distinct. Recovery environment entries must be
+valid; legacy sanitization is unchanged. Only a fixed-size digest is retained,
+not another copy of the command or environment. Recovery `Started` events carry
+the engine instance and a process incarnation, preventing a retained key from
+attaching to a later reuse of the same process ID.
+
+Before capturing memory, await `configure_process_recovery(None)`. This waits
+for admitted recovery starts to publish their outcomes, including starts whose
+callers disconnected. If it fails or is cancelled, do not take the snapshot.
+After restoring memory, install a fresh externally supplied activation before
+accepting recovery requests. Repeating an activation without a restore is
+idempotent. Legacy calls are unaffected by this gate.
+
+Keep the original key, request and expected IDs when retrying, and bound retries
+from the first attempt by the advertised retention window. Output and process
+records can expire or be evicted before the key; a retry then reports the
+existing lagged-output or expired-replay error instead of starting again.
+Changing an expected ID or key after an uncertain result can run new work.
+These tokens are lifetime fences, not authorization credentials.
+
+The daemon, host and sandbox-manager paths do not yet expose recovery starts:
+their lifecycle handshake and forwarding are separate work. They filter out
+`process_recovery_start`; legacy calls keep their existing defaults. An older
+service sees no legacy command in a recovery request and rejects it before
+launching. Fenced reconnect/control requests and mutation receipts remain
+separate extensions in the process recovery RFC.

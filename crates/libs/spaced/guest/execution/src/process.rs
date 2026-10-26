@@ -6,7 +6,9 @@ use crate::idempotency::{
 };
 use crate::identity::GuestAccount;
 use dashmap::DashMap;
-use pplx_space_common_core::types::{GuestUserName, Pii, ProcessCommand, ProcessId, ProcessSignal};
+use pplx_space_common_core::types::{
+    GuestUserName, Pii, ProcessCommand, ProcessId, ProcessRecoveryToken, ProcessSignal,
+};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -226,10 +228,22 @@ impl ProcessSupervision {
     }
 }
 
+struct RecoveryLaunch {
+    fence: pplx_space_spaced_guest_protocol::recovery::RecoveryFence,
+    // Retained through launch and key publication, even after the caller leaves.
+    _activation: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+struct RecoveryStartAdmission {
+    reservation: crate::idempotency::IdempotencyReservation,
+    launch: RecoveryLaunch,
+}
+
 /// An admitted start from `begin` until its process is published. The start's
 /// tracked owner task runs it, so it completes even if the request goes away.
 struct ProcessLaunch {
     command: Command,
+    recovery_launch: Option<RecoveryLaunch>,
     prepared_pty: Option<PreparedPty>,
     stdin_enabled: bool,
     /// What `list` reports; the pid is filled in once the child exists.
@@ -320,6 +334,7 @@ impl SpawnThread {
 
 /// A published process: what its start answers with, and its supervision.
 struct LaunchedProcess {
+    recovery_incarnation: Option<ProcessRecoveryToken>,
     pid: u32,
     started: ProcessEvent,
     cursor: ProcessJournalCursor,
@@ -329,19 +344,28 @@ struct LaunchedProcess {
 impl ProcessLaunch {
     /// Publish the process and settle the start's idempotent operation with
     /// the outcome, so a same-key retry replays it.
-    async fn run(self, operation: IdempotencyOperation) -> Result<LaunchedProcess, Status> {
+    async fn run(mut self, operation: IdempotencyOperation) -> Result<LaunchedProcess, Status> {
         let process_id = self.process_id.clone();
-        let launched = self.publish().await;
+        let recovery_launch = self.recovery_launch.take();
+        let launched = self.publish(recovery_launch.is_some()).await;
         operation.complete(match &launched {
-            Ok(_) => Ok(IdempotencyRecord::ProcessStarted { process_id }),
+            Ok(launched) => Ok(match launched.recovery_incarnation {
+                Some(incarnation) => IdempotencyRecord::RecoveryProcessStarted {
+                    process_id,
+                    incarnation,
+                },
+                None => IdempotencyRecord::ProcessStarted { process_id },
+            }),
             Err(status) => Err(status.clone()),
         });
+        drop(recovery_launch);
         launched
     }
 
-    async fn publish(self) -> Result<LaunchedProcess, Status> {
+    async fn publish(self, recovery_start: bool) -> Result<LaunchedProcess, Status> {
         let ProcessLaunch {
             command,
+            recovery_launch: _,
             prepared_pty,
             stdin_enabled,
             mut info,
@@ -430,13 +454,24 @@ impl ProcessLaunch {
                 return Err(map_io_error(error));
             }
         };
-        let started = match process_started_event(&process_id, Some(pid)) {
+        let mut started = match process_started_event(&process_id, Some(pid)) {
             Ok(started) => started,
             Err(status) => {
                 terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
                 return Err(status);
             }
         };
+        let recovery_incarnation = recovery_start.then(ProcessRecoveryToken::new);
+        if let Some(incarnation) = recovery_incarnation
+            && let Some(
+                pplx_space_spaced_guest_protocol::proto::operations::process_event::Event::Started(
+                    event,
+                ),
+            ) = started.event.as_mut()
+        {
+            event.instance_id = Some(inner.recovery.instance.to_string());
+            event.process_incarnation = Some(incarnation.to_string());
+        }
         info.pid = pid;
         let record = Arc::new(ProcessRecord::new(
             started.clone(),
@@ -499,6 +534,7 @@ impl ProcessLaunch {
             registry: inner.processes.clone(),
         };
         Ok(LaunchedProcess {
+            recovery_incarnation,
             pid,
             started,
             cursor,
@@ -2035,6 +2071,7 @@ fn process_started_event(process_id: &ProcessId, pid: Option<u32>) -> Result<Pro
             pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Started(
                 pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessStarted {
                     start_time: Some(start_time),
+                    ..Default::default()
                 },
             ),
         ),
@@ -2351,6 +2388,38 @@ fn process_exit_event(
     }
 }
 
+impl ExecutionService {
+    fn replay_started(
+        &self,
+        result: Result<IdempotencyRecord, Status>,
+    ) -> Result<Response<<Self as Process>::StartStream>, Status> {
+        let (process_id, expected) = match result? {
+            IdempotencyRecord::ProcessStarted { process_id } => (process_id, None),
+            IdempotencyRecord::RecoveryProcessStarted {
+                process_id,
+                incarnation,
+            } => (process_id, Some(incarnation)),
+        };
+        let replay = self
+            .inner
+            .processes
+            .replay(&process_id, Some(0), false, false)
+            .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
+        if let Some(expected) = expected {
+            let (ProcessReplay::Running { started, .. } | ProcessReplay::Completed { started, .. }) =
+                &replay;
+            let actual = match &started.event {
+                Some(pplx_space_spaced_guest_protocol::proto::operations::process_event::Event::Started(event)) => event.process_incarnation.as_deref(),
+                _ => None,
+            };
+            if actual != Some(expected.to_string().as_str()) {
+                return Err(Status::failed_precondition("process replay state expired"));
+            }
+        }
+        Ok(Response::new(replay_process_event_stream(replay)))
+    }
+}
+
 #[tonic::async_trait]
 impl Process for ExecutionService {
     type StartStream =
@@ -2373,7 +2442,59 @@ impl Process for ExecutionService {
         let ingress = request
             .extensions_mut()
             .remove::<pplx_space_common_grpc::RequestPermit>();
-        let request = request.into_inner();
+        let mut request = request.into_inner();
+        // Legacy validation and identity-collision precedence remain unchanged.
+        // Recovery binding precedes account lookup and mutable launch defaults.
+        let mut ingress = ingress;
+        let recovery = if request.recovery.is_some() {
+            let permit = crate::payload::acquire(
+                &self.inner.process_payload_slots,
+                4,
+                pplx_space_metrics::payload::Budget::GuestProcess,
+                ingress.take(),
+            )?;
+            let retained = permit.clone();
+            let (returned, fence, binding) = self
+                .inner
+                .process_tasks
+                .spawn_blocking(move || {
+                    let _permit = retained;
+                    let fence =
+                        pplx_space_spaced_guest_protocol::recovery::validate_start(&request)?
+                            .expect("recovery envelope present");
+                    let binding = crate::recovery::binding(&request);
+                    Ok::<_, Status>((request, fence, binding))
+                })
+                .await
+                .map_err(|_| Status::internal("recovery start validation task failed"))??;
+            request = returned;
+            ingress = Some(permit);
+            let activation = self.inner.recovery.launches.clone().read_owned().await;
+            self.inner.recovery.check(fence)?;
+            let key = require_idempotency_key(request.idempotency_key.clone(), "process_start")?;
+            let lookup = self.inner.idempotency.reserve_bound(key, binding).await?;
+            self.inner.recovery.check(fence)?;
+            let reservation = match lookup {
+                IdempotencyLookup::Reserved(reservation) => reservation,
+                IdempotencyLookup::Completed(result) => return self.replay_started(result),
+            };
+            request.command = std::mem::take(
+                &mut request
+                    .recovery
+                    .as_mut()
+                    .expect("validated envelope")
+                    .command,
+            );
+            Some(RecoveryStartAdmission {
+                reservation,
+                launch: RecoveryLaunch {
+                    fence,
+                    _activation: activation,
+                },
+            })
+        } else {
+            None
+        };
         let process_command =
             ProcessCommand::new(request.command).map_err(invalid_argument_status)?;
         let requested_cwd = request.cwd;
@@ -2526,26 +2647,17 @@ impl Process for ExecutionService {
             command.stderr(std::process::Stdio::piped());
         }
 
-        let reservation = match self
-            .inner
-            .idempotency
-            .reserve_or_get(idempotency_key)
-            .await?
-        {
-            IdempotencyLookup::Completed(Ok(IdempotencyRecord::ProcessStarted { process_id })) => {
-                // A lost Start response may hide both identity and earlier output.
-                // Recover the original stream, rather than attaching at its tail.
-                let replay = self
-                    .inner
-                    .processes
-                    .replay(&process_id, Some(0), false, false)
-                    .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
-                return Ok(Response::new(
-                    replay_process_event_stream(replay) as Self::StartStream
-                ));
-            }
-            IdempotencyLookup::Completed(Err(status)) => return Err(status),
-            IdempotencyLookup::Reserved(reservation) => reservation,
+        let (reservation, recovery_launch) = match recovery {
+            Some(admission) => (admission.reservation, Some(admission.launch)),
+            None => match self
+                .inner
+                .idempotency
+                .reserve_or_get(idempotency_key)
+                .await?
+            {
+                IdempotencyLookup::Reserved(reservation) => (reservation, None),
+                IdempotencyLookup::Completed(result) => return self.replay_started(result),
+            },
         };
 
         let process_reservation = self.inner.processes.reserve()?;
@@ -2568,6 +2680,9 @@ impl Process for ExecutionService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::execution::require_running(&self.inner.shutdown)?;
+        if let Some(recovery) = &recovery_launch {
+            self.inner.recovery.check(recovery.fence)?;
+        }
         // Re-claim the identity inside the gate. The check at the top of this
         // handler is reachable across suspension points, so on its own it would
         // let two starts carrying the same assigned id both pass and have the
@@ -2590,6 +2705,7 @@ impl Process for ExecutionService {
         let request_lifetime = _start_admission.request_lifetime();
         let launch = ProcessLaunch {
             command,
+            recovery_launch,
             prepared_pty,
             stdin_enabled,
             info: ProcessInfo {
@@ -2619,6 +2735,7 @@ impl Process for ExecutionService {
             // and a same-key retry replays it.
             match launch.run(operation).await {
                 Ok(LaunchedProcess {
+                    recovery_incarnation: _,
                     pid,
                     started,
                     cursor,

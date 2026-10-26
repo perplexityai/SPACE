@@ -19,6 +19,7 @@ pub mod proto {
 
 pub mod filesystem_limits;
 pub mod process_limits;
+pub mod recovery;
 pub mod validate;
 pub mod wire;
 pub use validate::*;

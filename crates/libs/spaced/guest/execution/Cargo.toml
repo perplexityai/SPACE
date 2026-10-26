@@ -17,6 +17,7 @@ otel = ["telemetry", "pplx-space-common-svc/otel"]
 datadog = ["otel", "pplx-space-common-svc/datadog"]
 
 [dependencies]
+aws-lc-rs = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { version = "0.3" }
 globset = { workspace = true }
