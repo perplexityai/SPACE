@@ -37,12 +37,15 @@ def command_attach_after_pause(test: NativeHardeningFixture) -> None:
     test.wait_operation(str(pause.require(202).get("operation_id")))
     test.wait_sandbox(sandbox_id, "paused")
 
+    # Attach twice: the conflict is final, so a retry gets it again rather
+    # than a retryable answer on either attach.
     attaches = []
-    for _ in range(2):
+    test.context.record("attaches", attaches)
+    for attempt in range(2):
         events = test.events(command.body, timeout=30)
         attaches.append({"status": events.status, "error": events.body.get("error")})
-    test.context.record("attaches", attaches)
-    test.context.verify(
-        _not_running(sandbox_id, events),
-        "an attach to a paused sandbox the command cannot wake was not a final conflict",
-    )
+        test.context.verify(
+            _not_running(sandbox_id, events),
+            "an attach to a paused sandbox the command cannot wake was not a final conflict",
+            attempt=attempt,
+        )
