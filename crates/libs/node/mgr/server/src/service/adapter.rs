@@ -48,6 +48,26 @@ async fn observe_rpc<T>(
 
 #[tonic::async_trait]
 impl NodeManager for NodeManagerService {
+    type OpenGuestChannelStream = super::guest_control::ChannelStream;
+    async fn request_guest_shutdown(
+        &self,
+        request: Request<crate::proto::RequestGuestShutdownRequest>,
+    ) -> Result<Response<crate::proto::RequestGuestShutdownResponse>, Status> {
+        NodeManagerService::request_guest_shutdown(self, request).await
+    }
+    async fn probe_guest_service(
+        &self,
+        request: Request<crate::proto::ProbeGuestServiceRequest>,
+    ) -> Result<Response<crate::proto::ProbeGuestServiceResponse>, Status> {
+        NodeManagerService::probe_guest_service(self, request).await
+    }
+    async fn open_guest_channel(
+        &self,
+        request: Request<tonic::Streaming<crate::proto::OpenGuestChannelRequest>>,
+    ) -> Result<Response<Self::OpenGuestChannelStream>, Status> {
+        NodeManagerService::open_guest_channel(self, request).await
+    }
+
     async fn list_device_parents(
         &self,
         request: Request<crate::proto::ListDeviceParentsRequest>,
@@ -84,6 +104,7 @@ impl NodeManager for NodeManagerService {
         Ok(Response::new(
             crate::proto::GetExecutionCapabilitiesResponse {
                 exclusive_devices_v1: self.device_pool.enabled(),
+                firmware_guests_v1: cfg!(all(target_os = "linux", target_arch = "x86_64")),
             },
         ))
     }

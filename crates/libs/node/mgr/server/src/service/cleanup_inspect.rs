@@ -618,6 +618,8 @@ impl NodeManagerService {
             .cleanup_device_allocations(typed_sandbox_id, execution)
             .await?;
 
+        self.stop_guest_dhcp(sandbox_id).await?;
+
         // 6. Release network slot
         if info.is_some() {
             self.pool.release(sandbox_id).map_err(|error| {

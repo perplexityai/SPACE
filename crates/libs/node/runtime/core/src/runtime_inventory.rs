@@ -1237,7 +1237,7 @@ impl RuntimeInventory {
                 });
             }
         }
-        if !restoring {
+        if !restoring && binding.is_none() {
             let boot_role = boot_component_role();
             let requested_kernel = requested.and_then(|metadata| {
                 metadata.component(ArtifactComponentKind::Kernel, Some(&boot_role))

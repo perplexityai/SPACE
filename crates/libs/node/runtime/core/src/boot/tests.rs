@@ -2,8 +2,8 @@ use super::*;
 use pplx_space_common_core::types::{BalloonDevice, TokenBucket};
 use serde_json::{Value, json};
 
-fn input() -> LinuxBoot<'static> {
-    LinuxBoot {
+fn input() -> GuestBoot<'static> {
+    GuestBoot {
         guest: GuestPlatform {
             os: GuestOperatingSystem::Linux,
             architecture: Arch::Aarch64,
@@ -28,7 +28,7 @@ fn input() -> LinuxBoot<'static> {
         huge_pages: false,
         console: false,
         builder: false,
-        initramfs: false,
+        source: BootSource::LinuxDirect { initramfs: false },
     }
 }
 
@@ -154,7 +154,12 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
 #[test]
 fn standalone_admission_rejects_extra_devices_and_host_paths() {
     let text = configuration(RuntimeKind::CloudHypervisor, &input()).unwrap();
-    validate_standalone(RuntimeKind::CloudHypervisor, &text, false).unwrap();
+    validate_standalone(
+        RuntimeKind::CloudHypervisor,
+        &text,
+        BootSource::LinuxDirect { initramfs: false },
+    )
+    .unwrap();
     let original: Value = serde_json::from_str(&text).unwrap();
     for (pointer, replacement) in [
         ("/payload/kernel", json!("/etc/shadow")),
@@ -168,13 +173,25 @@ fn standalone_admission_rejects_extra_devices_and_host_paths() {
         let mut config = original.clone();
         *config.pointer_mut(pointer).unwrap() = replacement;
         assert!(
-            validate_standalone(RuntimeKind::CloudHypervisor, &config.to_string(), false).is_err(),
+            validate_standalone(
+                RuntimeKind::CloudHypervisor,
+                &config.to_string(),
+                BootSource::LinuxDirect { initramfs: false }
+            )
+            .is_err(),
             "{pointer}"
         );
     }
     let mut extra = original;
     extra["devices"] = json!([{ "path": "/dev/vfio/3" }]);
-    assert!(validate_standalone(RuntimeKind::CloudHypervisor, &extra.to_string(), false).is_err());
+    assert!(
+        validate_standalone(
+            RuntimeKind::CloudHypervisor,
+            &extra.to_string(),
+            BootSource::LinuxDirect { initramfs: false }
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -231,10 +248,26 @@ fn initramfs_configuration_must_match_the_resolved_boot_contract() {
     }
     for initramfs in [false, true] {
         let mut boot = input();
-        boot.initramfs = initramfs;
+        boot.source = BootSource::LinuxDirect { initramfs };
         let text = configuration(RuntimeKind::CloudHypervisor, &boot).unwrap();
-        validate_standalone(RuntimeKind::CloudHypervisor, &text, initramfs).unwrap();
-        assert!(validate_standalone(RuntimeKind::CloudHypervisor, &text, !initramfs).is_err());
+        validate_standalone(
+            RuntimeKind::CloudHypervisor,
+            &text,
+            BootSource::LinuxDirect {
+                initramfs: initramfs,
+            },
+        )
+        .unwrap();
+        assert!(
+            validate_standalone(
+                RuntimeKind::CloudHypervisor,
+                &text,
+                BootSource::LinuxDirect {
+                    initramfs: !initramfs
+                }
+            )
+            .is_err()
+        );
         let mut config: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             config["payload"]["cmdline"]
@@ -253,16 +286,26 @@ fn initramfs_configuration_must_match_the_resolved_boot_contract() {
                 let mut changed = config.clone();
                 changed["payload"]["cmdline"] = json!(args);
                 assert!(
-                    validate_standalone(RuntimeKind::CloudHypervisor, &changed.to_string(), true)
-                        .is_err()
+                    validate_standalone(
+                        RuntimeKind::CloudHypervisor,
+                        &changed.to_string(),
+                        BootSource::LinuxDirect { initramfs: true }
+                    )
+                    .is_err()
                 );
             }
         }
         for path in [json!("/etc/shadow"), json!("../initrd.img"), Value::Null] {
             config["payload"]["initramfs"] = path;
             assert!(
-                validate_standalone(RuntimeKind::CloudHypervisor, &config.to_string(), initramfs)
-                    .is_err()
+                validate_standalone(
+                    RuntimeKind::CloudHypervisor,
+                    &config.to_string(),
+                    BootSource::LinuxDirect {
+                        initramfs: initramfs
+                    }
+                )
+                .is_err()
             );
         }
         if initramfs {
@@ -293,9 +336,24 @@ fn exclusive_devices_are_injected_from_assignments_without_accepting_configured_
     let runtime = RuntimeKind::CloudHypervisor;
     let base = configuration(runtime, &input()).unwrap();
     let resources = crate::catalog::DeviceResourceLimits::for_test(1024, 256);
-    let injected =
-        with_exclusive_devices(runtime, &base, false, &devices, resources, 1280).unwrap();
-    with_exclusive_devices(runtime, &base, false, &devices, resources, 1279).unwrap_err();
+    let injected = with_exclusive_devices(
+        runtime,
+        &base,
+        BootSource::LinuxDirect { initramfs: false },
+        &devices,
+        resources,
+        1280,
+    )
+    .unwrap();
+    with_exclusive_devices(
+        runtime,
+        &base,
+        BootSource::LinuxDirect { initramfs: false },
+        &devices,
+        resources,
+        1279,
+    )
+    .unwrap_err();
     let mut injected: Value = serde_json::from_str(&injected).unwrap();
     assert_eq!(
         injected["devices"][0]["path"],
@@ -317,7 +375,7 @@ fn exclusive_devices_are_injected_from_assignments_without_accepting_configured_
         with_exclusive_devices(
             runtime,
             &supplied.to_string(),
-            false,
+            BootSource::LinuxDirect { initramfs: false },
             &devices,
             resources,
             1280,
@@ -325,14 +383,64 @@ fn exclusive_devices_are_injected_from_assignments_without_accepting_configured_
         .unwrap_err();
     }
     let (_, non_pci) = decode_execution("", Some(&input_devices("mdev:opaque"))).unwrap();
-    with_exclusive_devices(runtime, &base, false, &non_pci.unwrap(), resources, 1280).unwrap_err();
+    with_exclusive_devices(
+        runtime,
+        &base,
+        BootSource::LinuxDirect { initramfs: false },
+        &non_pci.unwrap(),
+        resources,
+        1280,
+    )
+    .unwrap_err();
     with_exclusive_devices(
         RuntimeKind::Firecracker,
         &base,
-        false,
+        BootSource::LinuxDirect { initramfs: false },
         &devices,
         resources,
         1280,
     )
     .unwrap_err();
+}
+
+#[test]
+fn firmware_boot_keeps_linux_inputs_out_of_the_device_model() {
+    let mut boot = input();
+    boot.guest = GuestPlatform {
+        os: GuestOperatingSystem::Windows,
+        architecture: Arch::X86_64,
+    };
+    boot.source = BootSource::Uefi;
+    let text = configuration(RuntimeKind::CloudHypervisor, &boot).unwrap();
+    validate_standalone(RuntimeKind::CloudHypervisor, &text, BootSource::Uefi).unwrap();
+    let config: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(config["payload"], json!({"firmware": "/firmware.fd"}));
+    assert_eq!(config["cpus"]["kvm_hyperv"], true);
+    for (field, value) in [
+        ("kernel", json!("/vmlinux.bin")),
+        ("cmdline", json!("root=/dev/vda")),
+        ("initramfs", json!("/initrd.img")),
+        ("firmware", json!("/etc/shadow")),
+    ] {
+        let mut changed = config.clone();
+        changed["payload"][field] = value;
+        validate_standalone(
+            RuntimeKind::CloudHypervisor,
+            &changed.to_string(),
+            BootSource::Uefi,
+        )
+        .unwrap_err();
+    }
+    validate_standalone(
+        RuntimeKind::CloudHypervisor,
+        &text,
+        BootSource::LinuxDirect { initramfs: false },
+    )
+    .unwrap_err();
+    configuration(RuntimeKind::Firecracker, &boot).unwrap_err();
+    boot.builder = true;
+    configuration(RuntimeKind::CloudHypervisor, &boot).unwrap_err();
+    boot.builder = false;
+    boot.guest.os = GuestOperatingSystem::Linux;
+    configuration(RuntimeKind::CloudHypervisor, &boot).unwrap_err();
 }

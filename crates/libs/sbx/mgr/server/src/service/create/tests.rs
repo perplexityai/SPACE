@@ -142,6 +142,7 @@ async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoi
     crate::db::insert_sandbox(
         &conn,
         crate::db::InsertSandboxParams {
+            guest_image: None,
             device_requirements: None,
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
