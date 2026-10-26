@@ -1050,7 +1050,11 @@ fn each_runtime_root_is_scanned_with_its_own_layout() {
     let mut roots = roots(dir.path());
     release(&roots, "v1.15.1");
     let other = dir.path().join("vendor/cloud-hypervisor");
-    std::fs::create_dir_all(other.join("v48.0")).unwrap();
+    write_mode(
+        &other.join("v54.0/bin/cloud-hypervisor"),
+        &elf_header(ELF_MACHINE_AARCH64),
+        0o755,
+    );
     roots.runtime_releases.push(RuntimeInstallationRoot::new(
         RuntimeKind::CloudHypervisor,
         &other,
@@ -1063,21 +1067,15 @@ fn each_runtime_root_is_scanned_with_its_own_layout() {
         ArtifactStatus::Valid
     );
     let origin = ArtifactOrigin::runtime_release(RuntimeKind::CloudHypervisor);
-    let unknown = find(&scan, origin, "v48.0");
-    assert_eq!(unknown.status, ArtifactStatus::Unsupported, "{unknown:?}");
+    let installed = find(&scan, origin, "v54.0");
+    assert_eq!(installed.status, ArtifactStatus::Valid, "{installed:?}");
+    assert_eq!(installed.architecture, Some(Arch::Aarch64));
+    assert_eq!(installed.state_format, None);
     assert_eq!(
-        unknown.version,
+        installed.version,
         Some(ScannedVersion::Runtime(
-            RuntimeVersion::parse("48.0").unwrap()
+            RuntimeVersion::parse("54.0").unwrap()
         ))
-    );
-    assert!(
-        unknown
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("cloud-hypervisor"),
-        "{unknown:?}"
     );
     assert!(
         scan.roots
@@ -1179,9 +1177,8 @@ fn the_known_releases_are_the_ones_with_a_state_format() {
     let known = (layout.known_releases)();
     assert!(known.contains(&"1.15.1"), "{known:?}");
     for release in known {
-        (layout.state_format)(&RuntimeVersion::parse(release).unwrap()).unwrap();
+        (layout.state_format.unwrap())(&RuntimeVersion::parse(release).unwrap()).unwrap();
     }
-    assert!(ReleaseLayout::of(RuntimeKind::CloudHypervisor).is_none());
 }
 
 #[test]
