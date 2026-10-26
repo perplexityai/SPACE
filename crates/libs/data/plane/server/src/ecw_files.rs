@@ -230,6 +230,9 @@ pub(super) async fn read_file(
     headers: HeaderMap,
     Query(query): Query<FileReadQueryE2b>,
 ) -> Result<Response, EcwProxyError> {
+    // A download holds no stream permit, yet a scale-in cuts it; count it
+    // until its body ends or its client goes away.
+    let in_flight = state.ingress_requests.track();
     let route = resolve_ecw_envd_route(&state, &headers).await?;
     let user = extract_query_user(query.username.as_deref())?;
     // Before the read reaches the guest, so a refused download costs nothing.
@@ -263,6 +266,8 @@ pub(super) async fn read_file(
 
     let mut bytes_read = 0usize;
     let stream = stream.map(move |chunk| {
+        // Keeps the guard alive with the body, which drops this closure.
+        let _counted = &in_flight;
         let chunk = chunk.map_err(|status| std::io::Error::other(status.to_string()))?;
         bytes_read = checked_file_content_len(bytes_read, chunk.data.len())
             .map_err(|err| std::io::Error::other(err.message))?;
@@ -284,6 +289,8 @@ pub(super) async fn write_file(
     Query(query): Query<FileWritePathQueryE2b>,
     body: Body,
 ) -> Result<Json<Vec<FileWriteInfoE2b>>, EcwProxyError> {
+    // An upload holds no stream permit; it counts while this handler reads it.
+    let _in_flight = state.ingress_requests.track();
     let route = resolve_ecw_envd_route(&state, &headers).await?;
     let content_type = headers
         .get(header::CONTENT_TYPE)

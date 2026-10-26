@@ -68,6 +68,10 @@ spec:
           args:
             - --shutdown-grace-secs
             - {{ .Values.shutdownGraceSeconds | quote }}
+            {{- with .Values.internalPort }}
+            - --internal-listen
+            - "0.0.0.0:{{ . }}"
+            {{- end }}
           env:
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
@@ -110,6 +114,11 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+            {{- with .Values.internalPort }}
+            - name: internal
+              containerPort: {{ . }}
+              protocol: TCP
+            {{- end }}
           # Leave the entry Services' endpoints before SIGTERM stops the
           # listener (values.yaml).
           lifecycle:

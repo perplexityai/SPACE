@@ -908,6 +908,7 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         attach_deadline: Duration::from_secs(1),
         unauthenticated: Arc::new(UnauthenticatedUpgradeLimiter::new(1)),
         attached_streams: Arc::new(AttachedStreamLimiter::new(4, 4, 4)),
+        ingress_requests: Arc::default(),
         uploads: None,
         upload_tracker: Arc::default(),
         native_sessions: Arc::new(NativeSessionAttachLimiter::default()),
@@ -2454,6 +2455,7 @@ async fn service_port_ingress_proxy_fails_closed_for_every_open_error() {
             route.clone(),
             ecw_service_proxy_request(),
             Err(open_error),
+            state.ingress_requests.track(),
         )
         .await
         .expect_err("ingress open errors fail closed");
@@ -2511,6 +2513,7 @@ async fn service_port_ingress_transport_open_error_resets_cached_route_and_chann
             reason: ServicePortIngressOpenReason::OpenError,
             transport_status: Some(transport_status),
         }),
+        state.ingress_requests.track(),
     )
     .await
     .expect_err("transport failure still fails closed");
@@ -4120,7 +4123,15 @@ async fn ecw_ingress_does_not_replay_after_upstream_accepts_request_bytes() {
         .uri("/mutate")
         .body(Body::from("unique-write"))
         .unwrap();
-    let result = ecw_service_ingress_proxy_with_io(state.clone(), target, route, request, io).await;
+    let result = ecw_service_ingress_proxy_with_io(
+        state.clone(),
+        target,
+        route,
+        request,
+        io,
+        state.ingress_requests.track(),
+    )
+    .await;
     result.unwrap_err();
     accepted.await.unwrap();
     state.upgrade_tasks.close();
@@ -4164,9 +4175,16 @@ async fn ecw_ingress_marks_relayed_sandbox_429_as_sandbox_service() {
         upstream
     });
     let request = Request::get("/").body(Body::empty()).unwrap();
-    let response = ecw_service_ingress_proxy_with_io(state.clone(), target, route, request, io)
-        .await
-        .unwrap();
+    let response = ecw_service_ingress_proxy_with_io(
+        state.clone(),
+        target,
+        route,
+        request,
+        io,
+        state.ingress_requests.track(),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         response.extensions().get::<TooManyRequestsReason>(),

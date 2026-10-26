@@ -4,16 +4,12 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::Api;
 use kube::api::{Patch, PatchParams};
-use kube::runtime::{
-    WatchStreamExt,
-    reflector::{self, Store},
-    watcher,
-};
+use kube::runtime::reflector::Store;
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     NodeLabelState, NodeLocalComponent, NodeServicesReady, ReconcilerConfig, ServicePod,
@@ -76,46 +72,20 @@ impl KubernetesReadinessBackend {
     /// the configured components, so the watch carries the DaemonSet pods only
     /// — not the sandbox pods, which are far more numerous and already
     /// reflected elsewhere.
-    pub fn spawn(substrate: Arc<KubernetesSubstrate>, config: &ReconcilerConfig) -> Self {
+    pub fn spawn(
+        substrate: Arc<KubernetesSubstrate>,
+        config: &ReconcilerConfig,
+        cancel: CancellationToken,
+    ) -> Self {
         let client = substrate.k8s.client.clone();
         let namespace = node_service_namespace();
         let api: Api<Pod> = Api::namespaced(client, &namespace);
-        let watcher_config = watcher::Config::default().labels(&component_selector(config));
-        let (store, writer) = reflector::store::<Pod>();
-        let stream =
-            reflector::reflector(writer, watcher::watcher(api, watcher_config)).default_backoff();
-        tokio::spawn(async move {
-            futures_util::pin_mut!(stream);
-            while let Some(event) = stream.next().await {
-                if let Err(error) = event {
-                    tracing::warn!(reflector = "node-local service pods", %error, "watcher error");
-                }
-            }
-            tracing::warn!(
-                reflector = "node-local service pods",
-                "watcher stream ended"
-            );
-        });
-
-        let pods_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ready_flag = pods_ready.clone();
-        let ready_store = store.clone();
-        tokio::spawn(async move {
-            match ready_store.wait_until_ready().await {
-                Ok(()) => {
-                    ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    tracing::info!(
-                        pod_count = ready_store.len(),
-                        "node-local service pod reflector initial sync complete"
-                    );
-                }
-                Err(error) => tracing::warn!(
-                    %error,
-                    "node-local service pod reflector writer dropped before initial sync; \
-                     readiness stays false until the process restarts"
-                ),
-            }
-        });
+        let (store, pods_ready) = crate::pod::spawn_labeled_pod_reflector(
+            api,
+            &component_selector(config),
+            "node-local service pods",
+            cancel,
+        );
 
         tracing::info!(%namespace, "node-local service pod reflector started");
         Self {
