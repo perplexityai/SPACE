@@ -63,6 +63,7 @@ async fn direct_refusal_off_its_node_releases_on_the_first_drive() {
                     "cluster-api rejected begin_artifact_backup (FailedPrecondition): retired",
                 ),
                 superseded_generation: Some(generation(GENERATION)),
+                refuses_artifact: true,
             },
             staged,
         );

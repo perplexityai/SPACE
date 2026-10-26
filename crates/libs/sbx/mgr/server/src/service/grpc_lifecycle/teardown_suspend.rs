@@ -191,6 +191,7 @@ pub(super) fn teardown_artifact_backup_status(
         ArtifactBackupSubmissionError::Begin {
             error,
             superseded_generation,
+            ..
         } => (
             error.kind() == pplx_space_common_jobs::JobFailureKind::Permanent,
             *superseded_generation,

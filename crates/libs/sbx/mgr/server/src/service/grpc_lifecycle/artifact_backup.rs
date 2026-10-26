@@ -1301,6 +1301,7 @@ fn artifact_backup_submission_status(
         ArtifactBackupSubmissionError::Begin {
             superseded_generation: Some(generation),
             ref error,
+            ..
         } => pplx_space_node_api_client::cluster::backup_execution_superseded_status(
             format!("{context}: {error}"),
             generation,

@@ -461,6 +461,7 @@ where
 /// How the fake vol-mgr's transfers stand when the worker asks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Transfers {
+    SubmissionUnavailable,
     Running,
     Completed,
     /// As vol-mgr reports a transfer whose retries ran out during an
@@ -497,7 +498,10 @@ impl FakeVolumeManager {
             async move {
                 Ok::<_, std::convert::Infallible>(match method.as_str() {
                     "SubmitPushFile" => {
-                        answer(request, |_: vol::PushFileRequest| {
+                        answer(request, move |_: vol::PushFileRequest| {
+                            if transfers == Transfers::SubmissionUnavailable {
+                                return Err(Status::unavailable("volume manager is handing off"));
+                            }
                             Ok(vol::SubmitTransferResponse {
                                 job_id: JobId::new().to_string(),
                             })
@@ -507,7 +511,9 @@ impl FakeVolumeManager {
                     "GetTransferJob" => {
                         answer(request, move |request: vol::GetTransferJobRequest| {
                             let (status, error) = match transfers {
-                                Transfers::Running => (vol::TransferJobStatus::Running, None),
+                                Transfers::SubmissionUnavailable | Transfers::Running => {
+                                    (vol::TransferJobStatus::Running, None)
+                                }
                                 Transfers::Completed => (vol::TransferJobStatus::Completed, None),
                                 Transfers::Failed => (
                                     vol::TransferJobStatus::Failed,
@@ -632,7 +638,7 @@ async fn suspended_after_node_local_upload(
             &sandbox,
             artifact_id,
             snapshot_dir.to_str().unwrap(),
-            SuspendSnapshotFormat::Full,
+            Some(SuspendSnapshotFormat::Full),
         )
         .await;
     match upload {
@@ -1014,4 +1020,135 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
         }
     }
     super::retired_teardown_tests::drain(&service).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn published_suspend_handoff_outage_retries_without_quarantine_or_runtime_release() {
+    use super::retired_teardown_tests::{drain, with_cluster_api};
+    use crate::db::CleanupCompletion;
+    use crate::service::cleanup::SynchronousCleanupRequest;
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    with_cluster_api(BackupControlPlane::default(), async || {
+        let volume_manager = FakeVolumeManager::serve(Transfers::SubmissionUnavailable);
+        let scratch = tempfile::tempdir().unwrap();
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Suspending);
+        let artifact = LocalArtifactId::new();
+        let path = scratch.path().join("snapshot");
+        crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+            &path,
+            &id,
+            artifact,
+            b"latest-capture",
+        );
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let runtime_live = live.clone();
+        let mut service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                volume_manager_socket_path: volume_manager.socket.clone(),
+                sandbox_runtime_live: Arc::new(move |_| runtime_live.load(Ordering::SeqCst)),
+                ..SandboxManagerServiceOptions::for_test_in(scratch.path())
+            },
+        );
+        service.snapshot_upload_config = Some(Arc::new(
+            crate::snapshot_upload::SnapshotUploadConfig::from_uri(
+                "s3://test-bucket/prefix?region=us-east-1",
+            )
+            .unwrap(),
+        ));
+        let sandbox = service.lookup_sandbox(&id).unwrap();
+        service
+            .prepare_node_local_suspend_cleanup(
+                &sandbox,
+                artifact,
+                path.to_str().unwrap(),
+                SuspendSnapshotFormat::Full,
+                &crate::retained_source::RetainedSourceVerdicts::default(),
+            )
+            .await
+            .expect_err("live plaintext handoff outage must roll back");
+        let paused = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(paused.state, SandboxState::Paused);
+        assert_eq!(paused.current_local_artifact_id, Some(artifact));
+        assert_eq!(paused.cleanup_completion, None);
+        // A later attempt with no runtime must retain cleanup-owned retries.
+        live.store(false, Ordering::SeqCst);
+        crate::db::begin_suspend(&service.db.lock().unwrap(), &id).unwrap();
+        let sandbox = service.lookup_sandbox(&id).unwrap();
+        service
+            .prepare_node_local_suspend_cleanup(
+                &sandbox,
+                artifact,
+                path.to_str().unwrap(),
+                SuspendSnapshotFormat::Full,
+                &crate::retained_source::RetainedSourceVerdicts::default(),
+            )
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt = || {
+            let calls = calls.clone();
+            service.run_cleanup_to_completion_with_node_dispatch_and_admission(
+                SynchronousCleanupRequest {
+                    sandbox_id: &id,
+                    uuid8: "capture1",
+                    keep_filesystem: true,
+                    context: "published suspend handoff",
+                    completion: CleanupCompletion::MarkSuspended,
+                    published_artifact: None,
+                    immediate_kill: true,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                },
+                None,
+                None,
+                || async { Ok(()) },
+                move |_| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+        };
+        attempt()
+            .await
+            .expect_err("handoff unavailable must retain runtime and retry");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let retained = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(retained.state, SandboxState::CleanupRequired);
+        assert_eq!(retained.current_local_artifact_id, Some(artifact));
+        assert_eq!(
+            retained.cleanup_completion,
+            Some(CleanupCompletion::MarkSuspended)
+        );
+        assert!(
+            crate::db::current_quarantine_reason_wire_value(&service.db.lock().unwrap(), &id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            uploads(&service, &id).len(),
+            1,
+            "the durable upload owns the retry"
+        );
+        *volume_manager.transfers.lock().unwrap() = Transfers::Completed;
+        attempt().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            SandboxState::Suspended
+        );
+        assert_eq!(
+            uploads(&service, &id).len(),
+            1,
+            "retry reuses this artifact's upload"
+        );
+        drain(&service).await;
+    })
+    .await;
 }

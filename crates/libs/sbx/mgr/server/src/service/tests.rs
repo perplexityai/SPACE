@@ -12910,39 +12910,6 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
-    async fn node_local_backup_fence_failure_preserves_runtime_and_rolls_back_to_paused() {
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
-        let generation = ExecutionGeneration::new(2).unwrap();
-        crate::db::update_runtime_fields(
-            &conn,
-            sandbox_id.parse().unwrap(),
-            runtime_fields(generation, 7),
-        )
-        .unwrap();
-        let local_artifact_id = LocalArtifactId::new();
-        let service = service_with_runtime_probe(conn, true);
-        let begin_failure = super::grpc_lifecycle::artifact_backup_fence_status(
-            "ClusterApi BeginArtifactBackup unavailable".to_string(),
-        );
-
-        let returned = service
-            .require_node_local_backup_handoff(&sandbox_id, local_artifact_id, Err(begin_failure))
-            .expect_err("failed Begin must stop before runtime finalization");
-
-        assert_eq!(returned.code(), tonic::Code::Internal);
-        let row = service.lookup_sandbox(&sandbox_id).unwrap();
-        assert_eq!(row.state, SandboxState::Paused);
-        assert_eq!(row.pid, Some(std::process::id()));
-        assert_eq!(
-            row.space_api_route_identity.execution_generation,
-            Some(generation)
-        );
-        assert!(row.current_local_artifact_id.is_none());
-    }
-
-    #[tokio::test]
     async fn deduplicated_artifact_backup_returns_the_durable_jobs_attempt_id() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
