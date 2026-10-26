@@ -40,6 +40,9 @@ impl ArtifactPublisher for FaultPublisher {
         };
         if self.break_cleanup.load(Ordering::SeqCst) {
             let namespace = match artifact {
+                NodeArtifactRef::Boot(_) => {
+                    panic!("fault fixture only injects kernel/release cleanup errors")
+                }
                 NodeArtifactRef::Kernel(..) => "firecracker/kernels",
                 NodeArtifactRef::Release(..) => "firecracker/releases",
             };
@@ -120,6 +123,7 @@ impl Fixture {
         publisher: Arc<FaultPublisher>,
     ) -> ExecutorParts {
         ExecutorParts {
+            boot_source: None,
             kernels_root: base.join("node/kernels"),
             staging: base.join("staging"),
             limits: LIMITS,

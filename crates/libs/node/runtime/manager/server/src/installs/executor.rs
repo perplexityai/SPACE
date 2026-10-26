@@ -29,6 +29,7 @@ pub(crate) struct InstallExecutor {
 
 pub(crate) struct ExecutorParts {
     pub(crate) kernels_root: PathBuf,
+    pub(crate) boot_source: Option<PathBuf>,
     pub(crate) staging: PathBuf,
     pub(crate) limits: InstallLimits,
     pub(crate) host_arch: Arch,
@@ -40,6 +41,7 @@ pub(crate) struct ExecutorParts {
 
 pub(super) struct ExecutorContext {
     pub(super) kernels_root: PathBuf,
+    pub(super) boot_source: Option<PathBuf>,
     pub(super) staging: PathBuf,
     pub(super) limits: InstallLimits,
     pub(super) host_arch: Arch,
@@ -63,6 +65,7 @@ impl InstallExecutor {
     pub(super) fn new(parts: ExecutorParts, db: Arc<Mutex<Connection>>) -> Self {
         let ExecutorParts {
             kernels_root,
+            boot_source,
             staging,
             limits,
             host_arch,
@@ -74,6 +77,7 @@ impl InstallExecutor {
         Self {
             context: Arc::new(ExecutorContext {
                 kernels_root,
+                boot_source,
                 staging,
                 limits,
                 host_arch,
@@ -99,6 +103,13 @@ impl InstallExecutor {
 
     pub(super) fn target(&self, artifact: &NodeArtifactRef) -> Result<PathBuf, JobError> {
         match artifact {
+            NodeArtifactRef::Boot(identity) => Ok(self
+                .context
+                .kernels_root
+                .with_file_name("boot-artifacts")
+                .join(
+                    pplx_space_node_runtime_core::artifact_store::boot_artifact_directory(identity),
+                )),
             NodeArtifactRef::Kernel(version, digest) => Ok(self.context.kernels_root.join(
                 managed_kernel_directory(version.artifact_version(), *digest),
             )),
@@ -117,6 +128,11 @@ impl InstallExecutor {
 
     fn staged_root(&self, request: &InstallOperation, job_id: JobId) -> Option<PathBuf> {
         let namespace = match request {
+            InstallOperation::InstallBootArtifact { pin } => {
+                pplx_space_node_runtime_core::artifact_store::boot_artifact_staging(
+                    pin.identity().kind,
+                )
+            }
             InstallOperation::InstallKernel { kernel } => kernel_staging(kernel.line.runtime),
             InstallOperation::InstallRelease { release, .. } => {
                 release_staging(release.release.kind)
@@ -135,6 +151,8 @@ impl InstallExecutor {
     /// catalog cannot silently change an already accepted install request.
     fn expected_digest(request: &InstallOperation) -> Digest {
         match request {
+            InstallOperation::InstallBootArtifact { pin } => pin.identity().digest,
+            InstallOperation::UninstallBootArtifact { identity } => identity.digest,
             InstallOperation::InstallKernel { kernel } => kernel.digest,
             InstallOperation::UninstallKernel { digest, .. }
             | InstallOperation::InstallRelease { digest, .. }
@@ -159,6 +177,25 @@ impl InstallExecutor {
             Ok(_) => {}
         }
         let found = match artifact {
+            NodeArtifactRef::Boot(identity) => {
+                let catalog = self
+                    .context
+                    .pins
+                    .catalog()
+                    .map_err(|error| permanent(&error))?;
+                let pin = catalog
+                    .boot_artifact(identity, self.context.host_arch)
+                    .filter(|pin| pin.size() <= self.context.limits.max_bytes)
+                    .ok_or_else(|| {
+                        JobError::permanent("boot artifact is not pinned within the install limit")
+                    })?;
+                staging::image_digests(
+                    &target.join(pplx_space_node_runtime_core::artifact_store::BOOT_ARTIFACT_IMAGE),
+                    pin.size(),
+                )
+                .map(|digests| digests.sha256)
+                .map_err(|error| permanent(&error))?
+            }
             NodeArtifactRef::Kernel(version, _) => {
                 let catalog = self
                     .context
@@ -230,6 +267,11 @@ impl InstallExecutor {
                 let root = staged
                     .ok_or_else(|| JobError::permanent("install has no staging directory"))?;
                 let prepared_digest = match request {
+                    InstallOperation::InstallBootArtifact { pin } => {
+                        self.prepare_boot_artifact(pin, root, cancellation).await?;
+                        received = pin.size();
+                        pin.identity().digest
+                    }
                     InstallOperation::InstallKernel { kernel } => {
                         let digest = self
                             .prepare_kernel(

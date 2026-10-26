@@ -35,13 +35,14 @@ nix = { workspace = true, features = ["user"] }
 reqwest = { workspace = true, optional = true }
 rusqlite = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
+semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }
 tar = { workspace = true }
-tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tonic = { workspace = true }
