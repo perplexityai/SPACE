@@ -55,13 +55,13 @@ where
 {
     loop {
         match inspect().await {
-            Ok(observed) => match observed.fc_pid {
+            Ok(observed) => match observed.runtime_pid {
                 Some(current) if current != pid => {
                     return Err(tonic::Status::aborted(
                         "build VM execution changed during shutdown",
                     ));
                 }
-                Some(_) if !observed.fc_alive => return Ok(()),
+                Some(_) if !observed.runtime_alive => return Ok(()),
                 // Missing identity is unknown, not evidence of a dead VM.
                 _ => {}
             },

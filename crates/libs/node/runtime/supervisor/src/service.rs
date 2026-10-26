@@ -437,6 +437,34 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
         .await
     }
 
+    async fn launch_runtime(
+        &self,
+        request: Request<pplx_space_node_runtime_core::proto::LaunchRuntimeRequest>,
+    ) -> Result<Response<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse>, Status> {
+        self.authorize_peer(&request, "LaunchRuntime")?;
+        let caller = Some(execution::pin_caller(&request)?);
+        let request =
+            LaunchFirecrackerRequest::try_from(request.into_inner()).map_err(|error| {
+                pplx_space_node_runtime_core::launch_admission::admission_refusal(
+                    Status::failed_precondition(error.to_string()),
+                )
+            })?;
+        let service = self.clone();
+        self.run_owned_operation(async move {
+            let response = service
+                .launch_firecracker_owned(request, caller)
+                .await?
+                .into_inner();
+            Ok(Response::new(
+                pplx_space_node_runtime_core::proto::LaunchRuntimeResponse {
+                    pid: response.pid,
+                    accepted_environment_reference: response.accepted_environment_reference,
+                },
+            ))
+        })
+        .await
+    }
+
     async fn launch_firecracker(
         &self,
         request: Request<LaunchFirecrackerRequest>,
