@@ -1,0 +1,20 @@
+--- a/vmm/src/vm_config.rs
++++ b/vmm/src/vm_config.rs
+@@ -875,7 +875,8 @@
+         let Some(path) = self.path.as_deref() else {
+             return Ok(());
+         };
+-        let device_path = fs::read_link(path).map_err(LandlockError::OpenPath)?;
++        let device_path = fs::read_link(path.join("iommu_group"))
++            .map_err(LandlockError::OpenPath)?;
+         let iommu_group = device_path.file_name();
+         let iommu_group_str = iommu_group
+             .ok_or(LandlockError::InvalidPath)?
+@@ -885,6 +886,7 @@
+         let mut vfio_group_path = PathBuf::from("/dev/vfio");
+         vfio_group_path.push(iommu_group_str);
+         landlock.add_rule_with_access(&vfio_group_path, "rw")?;
++        landlock.add_rule_with_access(path, "r")?;
+ 
+         Ok(())
+     }
