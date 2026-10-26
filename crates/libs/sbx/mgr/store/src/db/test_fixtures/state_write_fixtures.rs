@@ -715,6 +715,7 @@ pub fn with_sandbox_params<T>(
     let env = BTreeMap::new();
     let lifecycle = AutoLifecyclePolicy::disabled();
     let mut params = InsertSandboxParams {
+        guest_image: None,
         device_requirements: None,
         id,
         uuid8: &uuid8,

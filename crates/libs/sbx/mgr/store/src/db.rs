@@ -726,6 +726,7 @@ pub mod fixture {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                guest_image: None,
                 device_requirements: None,
                 id,
                 uuid8: &uuid8,

@@ -47,7 +47,7 @@ impl InitialEnvironment {
             runtime_ordering_key: semver::Version::parse(self.release.release.version.as_str())?,
             initial_reference: Some(definition.reference()),
             release: self.release.clone(),
-            kernel: self.kernel.clone(),
+            kernel: Some(self.kernel.clone()),
             boot_artifacts: Vec::new(),
             exclusive_device_profiles: Vec::new(),
             definition,
@@ -131,7 +131,7 @@ fn definition_from_pins(
 #[derive(Clone, Debug)]
 pub struct CompiledEnvironment {
     release: PinnedRelease,
-    kernel: PinnedKernel,
+    kernel: Option<PinnedKernel>,
     boot_artifacts: Vec<super::PinnedBootArtifact>,
     exclusive_device_profiles: Vec<super::ExclusiveDeviceProfile>,
     definition: EnvironmentDefinition,
@@ -164,7 +164,7 @@ impl CompiledEnvironment {
                     .reference(),
             ),
             release,
-            kernel,
+            kernel: Some(kernel),
             boot_artifacts: Vec::new(),
             exclusive_device_profiles: Vec::new(),
             definition,
@@ -253,7 +253,7 @@ impl CompiledEnvironment {
                 runtime_ordering_key,
                 initial_reference: Some(initial_reference),
                 release: release.clone(),
-                kernel: kernel_pin.clone(),
+                kernel: Some(kernel_pin.clone()),
                 boot_artifacts: Vec::new(),
                 exclusive_device_profiles: Vec::new(),
                 definition,
@@ -264,7 +264,73 @@ impl CompiledEnvironment {
         .collect::<Result<_, CatalogError>>()?;
         environments.push(Self::cloud_hypervisor(architecture)?);
         environments.push(Self::cloud_hypervisor_signed_boot()?);
+        environments.push(Self::cloud_hypervisor_windows()?);
         Ok(environments)
+    }
+
+    fn cloud_hypervisor_windows() -> Result<Self, CatalogError> {
+        let catalog = RuntimeCatalog::compiled()?;
+        let release = catalog
+            .releases(RuntimeKind::CloudHypervisor, Arch::X86_64)
+            .find(|pin| pin.release.version.as_str() == "54.0")
+            .ok_or_else(|| CatalogError::Compiled {
+                entry: "CH Windows UEFI".into(),
+                field: "runtime pin",
+                value: "54.0",
+            })?
+            .clone();
+        let firmware = super::uefi::firmware()?;
+        let definition = (|| -> Result<_, CompiledEnvironmentDefinitionError> {
+            let host = HostPlatform {
+                os: HostOperatingSystem::Linux,
+                architecture: Arch::X86_64,
+            };
+            let boot_contract =
+                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_UEFI_BOOT_CONTRACT
+                    .parse()?;
+            let machine_contract =
+                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_WINDOWS_MACHINE_CONTRACT
+                    .parse()?;
+            let spec = EnvironmentSpec {
+                host,
+                guest: GuestPlatform {
+                    os: GuestOperatingSystem::Windows,
+                    architecture: Arch::X86_64,
+                },
+                runtime: RuntimeBinding::ManagedRelease(ManagedRuntimeRelease {
+                    runtime: release.release.clone(),
+                    digest: release.digest(),
+                    target: host,
+                    layout: RuntimePayloadLayout::CatalogReleaseV1,
+                }),
+                backend: HypervisorBackend::Kvm,
+                boot: BootProfile::ArtifactsV1 {
+                    contract: boot_contract,
+                    artifacts: vec![BootArtifact::new(
+                        "firmware".parse()?,
+                        firmware.identity().clone(),
+                        "edk2-fd".parse()?,
+                    )],
+                },
+                isolation: IsolationClass::HardwareVm,
+                compatibility: ExecutionCompatibilityProfile::RuntimeV1 {
+                    contract: machine_contract,
+                    state_format: None,
+                },
+            };
+            Ok(EnvironmentDefinition::new(spec.try_into()?))
+        })()?;
+        Ok(Self {
+            runtime_ordering_key: semver::Version::new(54, 0, 0),
+            initial_reference: None,
+            release,
+            kernel: None,
+            boot_artifacts: vec![firmware],
+            exclusive_device_profiles: Vec::new(),
+            definition,
+            memory_state: false,
+            name: "ch-54.0-windows-uefi",
+        })
     }
 
     fn cloud_hypervisor_signed_boot() -> Result<Self, CatalogError> {
@@ -313,7 +379,7 @@ impl CompiledEnvironment {
             runtime_ordering_key: semver::Version::new(54, 0, 0),
             initial_reference: None,
             release,
-            kernel,
+            kernel: Some(kernel),
             boot_artifacts: vec![initramfs],
             // Qualification never changes the immutable boot-artifact identity.
             exclusive_device_profiles: {
@@ -356,7 +422,7 @@ impl CompiledEnvironment {
             runtime_ordering_key: semver::Version::new(54, 0, 0),
             initial_reference: None,
             release,
-            kernel,
+            kernel: Some(kernel),
             boot_artifacts: Vec::new(),
             exclusive_device_profiles: Vec::new(),
             definition,
@@ -398,8 +464,8 @@ impl CompiledEnvironment {
     pub fn release(&self) -> &PinnedRelease {
         &self.release
     }
-    pub fn kernel(&self) -> &PinnedKernel {
-        &self.kernel
+    pub fn kernel(&self) -> Option<&PinnedKernel> {
+        self.kernel.as_ref()
     }
     /// File pins supplement the descriptor's identities with publication sizes.
     /// Roles and formats come from the descriptor, never from installation paths.
@@ -408,7 +474,7 @@ impl CompiledEnvironment {
         identity: &ComponentIdentity,
     ) -> Option<&super::PinnedBootArtifact> {
         self.boot_artifacts.iter().find(|pin| {
-            pin.identity() == identity && pin.architecture() == self.kernel.architecture
+            pin.identity() == identity && pin.architecture() == self.release.architecture
         })
     }
 
