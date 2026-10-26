@@ -57,8 +57,11 @@ priority = 10
 # Tests that need more than an ordinary user, and tests whose root path differs
 # from their unprivileged one. GitHub CI runs `not group(privileged)` as an
 # unprivileged user without a Docker socket, and this group as root in a
-# separate --privileged container (ci/scripts/run-rust-checks.sh
-# tests-unprivileged / tests-privileged).
+# separate --privileged --cgroupns private container with writable cgroup v2
+# at /sys/fs/cgroup (ci/scripts/run-rust-checks.sh tests-unprivileged /
+# tests-privileged). The embedding probe additionally requires
+# SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS=1. Docker-socket containers are siblings
+# of the test container; their host paths and cgroup namespace are not its own.
 #
 # Keep one clause per line. Before any test runs, the unprivileged step checks
 # that every clause matches at least one test and that each test it matches is

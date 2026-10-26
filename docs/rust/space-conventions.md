@@ -448,7 +448,11 @@ The GitHub Rust test job runs the whole workspace, ignored tests included
 `privileged` (`.config/nextest.toml`) runs as an unprivileged user with no
 capabilities, no Docker socket and no host network; the runner starts its
 Postgres and Redis. The group then runs from the same build as root in a
-`--privileged` container with the host's Docker socket.
+`--privileged --cgroupns private` container with the host's Docker socket and
+a writable cgroup v2 mount at `/sys/fs/cgroup`. The embedding probe requires
+`SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS=1` and creates only its own subtree.
+Containers started through the socket are siblings on the Docker host: do not
+interpret their cgroup paths as paths inside the test container's namespace.
 
 A test belongs in that group when it needs root, CAP_SYS_ADMIN, loop devices,
 a relaxed seccomp profile, or its own containers. So does a test whose root

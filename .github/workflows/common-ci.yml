@@ -806,7 +806,7 @@ jobs:
             --user root
             --privileged
             --cgroupns private
-            --env SPACE_TEST_EXECUTION_CGROUP_ROOT=/sys/fs/cgroup
+            --env SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS=1
             --volume /var/run/docker.sock:/var/run/docker.sock
             --volume "${GITHUB_WORKSPACE}:/workspace"
             --volume "${SPACE_CI_CARGO_REGISTRY}:/usr/local/cargo/registry"

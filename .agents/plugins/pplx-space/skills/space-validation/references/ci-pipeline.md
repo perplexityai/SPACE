@@ -74,8 +74,12 @@ every clause of the group's filter to match at least one test, all of them in
 the group; it catches a renamed test, a typo, or another override taking the
 test first, each of which would otherwise move a test to the unprivileged half
 silently. It cannot find a privileged test that no clause names.
-`tests-privileged` then runs `group(privileged)` as root in a `--privileged`
-container with the Docker socket but still no host network, from the first
+`tests-privileged` then runs `group(privileged)` as root in a
+`--privileged --cgroupns private` container with writable cgroup v2 at
+`/sys/fs/cgroup`, the Docker socket and no host network. The embedding probe
+requires `SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS=1`; it creates and cleans only
+its own subtree. Containers started through the socket are siblings on the
+Docker host, not children of this cgroup namespace. It runs from the first
 step's binaries through nextest's `--binaries-metadata` and
 `--cargo-metadata`, so it compiles nothing. It first confirms it selects the
 tests the first step listed, runs the M1 generator check, and returns any

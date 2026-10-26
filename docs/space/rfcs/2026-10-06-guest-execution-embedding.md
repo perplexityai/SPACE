@@ -3,8 +3,8 @@
 **Status: proposal.** Reuse SPACE's process/filesystem implementation inside an
 independently isolated application, without guest listeners or daemon startup.
 The [execution crate README](../../../crates/libs/spaced/guest/execution/README.md)
-describes implemented behavior. The initial profile has implementation and
-acceptance coverage; see [Implementation coverage](#implementation-coverage).
+describes implemented behavior. [Implementation coverage](#implementation-coverage)
+maps the initial profile's guarantees to checks and their evidence limits.
 That does not establish stable Rust APIs or validate downstream packaging.
 
 ## Decisions requested
@@ -121,15 +121,19 @@ Keep daemon policy differences explicit within the same identity implementation.
 ### Shutdown and ownership
 
 The caller keeps a Tokio runtime with I/O, timers and process support alive
-through drain, and must not reap library-owned children itself. Define compatible
-`SIGCHLD` handling explicitly: Tokio's fallback/orphan reaping can install a
+through drain. Caller reapers wait only on caller-owned PIDs; they must not use
+`waitpid(-1, ...)` or reap library-owned children. A notification-only `SIGCHLD`
+handler installed before Tokio signal initialization is supported alongside
+Tokio subscribers. Do not replace that arrangement, ignore/block `SIGCHLD` or
+set `SA_NOCLDWAIT` while the service or cleanup is alive. Tokio can install a
 [process-wide handler](https://docs.rs/tokio/1.53.1/tokio/signal/unix/struct.Signal.html#caveats)
 that outlives the service. Signal-handler neutrality is not promised.
 
 Order operation registration with admission closure: **running → closing → drained**.
 Closing rejects every new operation, including reads, mutations, watches and
-environment updates, without cancelling admitted finite operations. Passive
-worker watches retire with recoverable `Unavailable` at close; Direct watches
+environment updates, without cancelling admitted finite operations. Long-lived
+filesystem `watch` streams have no natural completion: worker-backed streams
+retire with recoverable `Unavailable` at close; Direct streams
 retire quietly during drain or cancellation. Explicit
 cancellation or a drain deadline requests abortive cleanup; caller cancellation
 propagates into the service, never from the service into its caller. Repeated
@@ -148,6 +152,8 @@ not every descendant. Detached/redirected descendants can survive and keep writi
 after successful drain; **the caller must tear down its isolation boundary**.
 Placement alone is not containment. Never kill unrelated host processes. Preserve
 Linux's atomic close-on-exec PTY allocation alongside unrelated application spawns.
+Caller-supplied placement handles must be opened atomically close-on-exec before
+concurrent spawning; `ExecutionCgroups::new` does not establish that precondition.
 Dropping a service handle is not proof of cleanup.
 
 ## Acceptance and rollout
@@ -184,7 +190,9 @@ owning acceptance checks, rather than a second implementation of the contract:
 | Restricted child identity, unchanged host authority | [Identity probes](../../../crates/apps/spaced/guest/worker/tests/embedding/identity.rs): IDs, groups, capabilities, PTYs, privilege-gaining executables and directory traversal; the [entrypoint](../../../crates/apps/spaced/guest/worker/tests/embedding.rs) also rejects dispatch after threads start. |
 | Native operations and bounded admission | [Ingress tests](../../../crates/libs/spaced/guest/execution/src/filesystem/router/ingress_tests.rs), [process tests](../../../crates/libs/spaced/guest/execution/src/process/tests.rs) and the embedding host: payload limits, shared permits, uploads, environment updates and cancellation. |
 | Admission closure and retained cleanup ownership | [Execution tests](../../../crates/libs/spaced/guest/execution/src/execution/tests.rs) and [router tests](../../../crates/libs/spaced/guest/execution/src/filesystem/router/tests.rs): every closed entrypoint, admitted work, incomplete/repeated drain and interrupted streams. |
-| Caller placement and final teardown | [Boundary probe](../../../crates/apps/spaced/guest/worker/tests/embedding/boundary.rs): real workload/worker cgroups, unrelated children, descriptor inheritance and a surviving descendant cleaned up by the caller. |
+| Placement before exec and final teardown | [Placement tests](../../../crates/libs/spaced/guest/execution/src/placement/tests.rs) authenticate the placement writer as a forked child even when exec fails. The [boundary probe](../../../crates/apps/spaced/guest/worker/tests/embedding/boundary.rs) checks real cgroup membership, descendant inheritance and caller teardown. |
+| Concurrent descriptor inheritance | [Startup probe](../../../crates/apps/spaced/guest/worker/tests/embedding/boundary/descriptors.rs): repeated unrelated execs during fresh PTY and identity-worker startup; the boundary fixture checks the caller's close-on-exec placement-handle precondition. |
+| Runtime and signal ownership | [Caller handler](../../../crates/apps/spaced/guest/worker/tests/embedding/sigchld.rs) installed before Tokio; the boundary probe observes both handlers and retains PID-specific caller reaping across service drain. |
 
 The [README](../../../crates/libs/spaced/guest/execution/README.md) specifies the
 privileged probe's disposable environment and fail-closed prerequisites. Routine

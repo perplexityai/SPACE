@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use pplx_space_common_core::types::GuestUserName;
@@ -21,8 +21,22 @@ use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
+#[path = "boundary/descriptors.rs"]
+mod descriptors;
+
+fn print_descriptors() {
+    for fd in std::fs::read_dir("/proc/self/fd").expect("child descriptors") {
+        let target = std::fs::read_link(fd.expect("descriptor").path()).expect("descriptor target");
+        println!("{}", target.display());
+    }
+}
+
 pub(super) fn probe() -> bool {
     match std::env::args().nth(1).as_deref() {
+        Some("--descriptor-probe") => {
+            print_descriptors();
+            true
+        }
         Some("--detached-probe") => {
             // A new process group with no inherited output is deliberately outside
             // the completed leader's supervision. The caller owns its containment.
@@ -42,11 +56,7 @@ pub(super) fn probe() -> bool {
             true
         }
         Some("--unrelated-probe") => {
-            for fd in std::fs::read_dir("/proc/self/fd").expect("child descriptors") {
-                let target =
-                    std::fs::read_link(fd.expect("descriptor").path()).expect("descriptor target");
-                println!("{}", target.display());
-            }
+            print_descriptors();
             println!("ready");
             let mut input = String::new();
             std::io::stdin()
@@ -67,11 +77,10 @@ impl Boundary {
     pub(super) fn new() -> Self {
         // Opt-in is deliberate: never discover a host cgroup and mutate it.
         // CI supplies the root of a disposable container's private namespace.
-        let parent = std::env::var_os("SPACE_TEST_EXECUTION_CGROUP_ROOT")
-            .expect("set SPACE_TEST_EXECUTION_CGROUP_ROOT in a disposable cgroup namespace");
         assert_eq!(
-            std::fs::canonicalize(parent).expect("delegated cgroup root"),
-            Path::new("/sys/fs/cgroup"),
+            std::env::var("SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS").as_deref(),
+            Ok("1"),
+            "set SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS=1 in a disposable private cgroup namespace",
         );
         assert_eq!(
             std::fs::read_to_string("/proc/self/cgroup").expect("host placement"),
@@ -85,9 +94,6 @@ impl Boundary {
         for leaf in ["workloads", "filesystem"] {
             std::fs::create_dir(boundary.root.join(leaf)).expect("create leaf cgroup");
         }
-        // Reap the deliberately orphaned fixture ourselves, not an arbitrary PID 1.
-        // This is test-host setup before Tokio or any service exists.
-        nix::sys::prctl::set_child_subreaper(true).expect("fixture subreaper");
         boundary
     }
 
@@ -103,23 +109,24 @@ impl Boundary {
 
     fn placement(&self) -> Arc<ExecutionCgroups> {
         let open = |leaf: &str| -> File {
-            OpenOptions::new()
+            let handle = OpenOptions::new()
                 .write(true)
                 .open(self.root.join(leaf).join("cgroup.procs"))
-                .expect("placement descriptor")
+                .expect("placement descriptor");
+            assert!(
+                nix::fcntl::FdFlag::from_bits_retain(
+                    nix::fcntl::fcntl(&handle, nix::fcntl::FcntlArg::F_GETFD).unwrap()
+                )
+                .contains(nix::fcntl::FdFlag::FD_CLOEXEC),
+                "caller must supply atomically close-on-exec placement handles"
+            );
+            handle
         };
         Arc::new(ExecutionCgroups::new(open("workloads"), open("filesystem")))
     }
 
-    pub(super) async fn run(&self) {
-        let artifact = tempfile::tempdir().expect("probe directory");
-        std::fs::set_permissions(artifact.path(), std::fs::Permissions::from_mode(0o755))
-            .expect("searchable probe directory");
-        let probe = artifact.path().join("probe");
-        tokio::fs::copy(std::env::current_exe().expect("test executable"), &probe)
-            .await
-            .expect("probe artifact");
-        let service = ExecutionService::with_cgroups(
+    fn service(&self) -> ExecutionService {
+        ExecutionService::with_cgroups(
             CancellationToken::new(),
             ExecutionServiceConfig {
                 default_operation_user: GuestUserName::parse("nobody").expect("account"),
@@ -131,7 +138,19 @@ impl Boundary {
             },
             Some(self.placement()),
         )
-        .expect("placed service");
+        .expect("placed service")
+    }
+
+    pub(super) async fn run(&self, child_signals: &mut tokio::signal::unix::Signal) {
+        let artifact = tempfile::tempdir().expect("probe directory");
+        std::fs::set_permissions(artifact.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("searchable probe directory");
+        let probe = artifact.path().join("probe");
+        tokio::fs::copy(std::env::current_exe().expect("test executable"), &probe)
+            .await
+            .expect("probe artifact");
+        descriptors::during_startup(self, &probe).await;
+        let service = self.service();
         service
             .filesystem_service()
             .stat_info(tonic::Request::new(StatRequest {
@@ -165,7 +184,7 @@ impl Boundary {
         assert_eq!(
             self.members("workloads").len(),
             1,
-            "workload placed before exec"
+            "workload placed before publication"
         );
         let mut unrelated = tokio::process::Command::new(&probe)
             .arg("--unrelated-probe")
@@ -217,6 +236,40 @@ impl Boundary {
         }
         assert!(exited);
 
+        // An exited child is still the caller's to reap. Keep its status pending
+        // while the service drains its own children.
+        while child_signals.recv().now_or_never() == Some(Some(())) {}
+        let notifications = super::sigchld::notifications();
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .spawn()
+            .expect("unrelated exited child");
+        let exited_pid = exited_child.id();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = tokio::fs::read_to_string(format!("/proc/{exited_pid}/status"))
+                    .await
+                    .expect("unreaped caller child");
+                if status.lines().any(|line| line.starts_with("State:\tZ")) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("caller child exits before drain");
+        tokio::time::timeout(Duration::from_secs(3), child_signals.recv())
+            .await
+            .expect("Tokio receives SIGCHLD")
+            .expect("signal subscription remains open");
+        assert!(
+            super::sigchld::notifications() > notifications,
+            "the caller's preinstalled SIGCHLD handler must still receive notifications"
+        );
+
+        // Only this scenario needs orphan adoption. Earlier startup and signal
+        // checks must retain the embedding host's ordinary reparenting behavior.
+        nix::sys::prctl::set_child_subreaper(true).expect("fixture subreaper");
         let mut events = service
             .start(tonic::Request::new(StartRequest {
                 command: vec![probe.display().to_string(), "--detached-probe".into()],
@@ -252,27 +305,6 @@ impl Boundary {
             [descendant],
             "descendant inherits workload placement"
         );
-        // An exited child is still the caller's to reap. Keep its status pending
-        // while the service drains its own children.
-        let mut exited_child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "exit 23"])
-            .kill_on_drop(true)
-            .spawn()
-            .expect("unrelated exited child");
-        let exited_pid = exited_child.id().expect("exited child pid");
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let status = tokio::fs::read_to_string(format!("/proc/{exited_pid}/status"))
-                    .await
-                    .expect("unreaped caller child");
-                if status.lines().any(|line| line.starts_with("State:\tZ")) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("caller child exits before drain");
         service.close();
         service.drain().await.expect("leaders and workers drained");
         assert!(self.members("filesystem").is_empty(), "worker exited");
@@ -298,9 +330,9 @@ impl Boundary {
                 .is_none()
         );
         assert_eq!(
-            exited_child
-                .wait()
+            tokio::task::spawn_blocking(move || exited_child.wait())
                 .await
+                .expect("caller reaper task")
                 .expect("caller reaps exited child")
                 .code(),
             Some(23)
@@ -321,6 +353,7 @@ impl Boundary {
         })
         .await
         .expect("descendant teardown deadline");
+        nix::sys::prctl::set_child_subreaper(false).expect("restore ordinary reparenting");
         assert!(self.members("workloads").is_empty());
         assert_eq!(
             std::fs::read_to_string("/proc/self/cgroup").expect("host placement"),

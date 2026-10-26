@@ -182,8 +182,9 @@ impl ExecutionService {
     /// Close admission through every existing handle without cancelling admitted
     /// work. This is idempotent; admitted operations other than worker watches
     /// can finish, including uploads and filesystem mutations.
-    /// Worker watches retire with recoverable `Unavailable` at close; Direct
-    /// watches retire during drain or cancellation. Send required process input,
+    /// Long-lived filesystem `watch` streams have no natural completion. Worker
+    /// streams retire with recoverable `Unavailable` at close; Direct streams
+    /// retire quietly during drain or cancellation. Send required process input,
     /// close stdin and send signals before closing admission: control calls are
     /// refused afterward. Use [`Self::cancel`] to request abortive shutdown.
     pub fn close(&self) {

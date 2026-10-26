@@ -23,6 +23,13 @@ pub struct ExecutionCgroups {
 }
 
 impl ExecutionCgroups {
+    /// Retain caller-owned placement handles without changing host placement.
+    ///
+    /// Both handles must be opened atomically with close-on-exec before any
+    /// concurrent spawn (for example, with Rust's `File::options`). This
+    /// constructor does not validate or change their descriptor flags. Callers
+    /// must not clear close-on-exec through another reference to either handle:
+    /// otherwise unrelated execs can inherit authority to move cgroup members.
     pub fn new(workloads_procs: File, filesystem_procs: File) -> Self {
         Self {
             workloads_procs: Arc::new(workloads_procs),

@@ -31,7 +31,8 @@ Read only the references that match the task:
   read `references/load-testing.md` if supplied with this skill; otherwise use
   the deployment's load-testing runbook. Confirm its target, monitoring, abort,
   and cleanup procedures before launching load.
-- Buildkite pipelines, dynamic upload, CI test inventory, or CI images:
+- Buildkite pipelines, dynamic upload, CI test inventory, privileged-container
+  cgroup namespaces, or CI images:
   [CI pipeline](references/ci-pipeline.md).
 
 Targeted tests are for iteration. Use the owning domain skill's final validation

@@ -13,6 +13,9 @@ mod incompatible;
 #[cfg(target_os = "linux")]
 #[path = "embedding/linux.rs"]
 mod linux;
+#[cfg(target_os = "linux")]
+#[path = "embedding/sigchld.rs"]
+mod sigchld;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -54,17 +57,26 @@ fn main() {
         .status()
         .expect("threaded worker probe");
     assert!(threaded.success(), "late worker dispatch must fail closed");
+    let _caller_handler = sigchld::CallerHandler::install();
     let boundary = boundary::Boundary::new();
     identity::prepare_host();
     tokio::runtime::Runtime::new()
         .expect("runtime")
         .block_on(async move {
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                linux::run().await;
-                boundary.run().await;
-            })
+            // Exercise coexistence even on Linux kernels where process waiting
+            // can use pidfds without Tokio's SIGCHLD fallback.
+            let mut child_signals =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+                    .expect("Tokio SIGCHLD subscription");
+            tokio::time::timeout(std::time::Duration::from_secs(30), linux::run())
+                .await
+                .expect("embedding deadline");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                boundary.run(&mut child_signals),
+            )
             .await
-            .expect("embedding deadline");
+            .expect("embedding boundary deadline");
         });
 }
 

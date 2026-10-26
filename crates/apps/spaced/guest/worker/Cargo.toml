@@ -31,10 +31,10 @@ pplx-space-common-core = { workspace = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
 pplx-space-test-env = { workspace = true }
 futures-util = "0.3"
-nix = { workspace = true, features = ["user", "fs", "process"] }
+nix = { workspace = true, features = ["user", "fs", "process", "signal"] }
 rustix = { workspace = true, features = ["fs", "thread"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
