@@ -319,6 +319,24 @@ impl RuntimeInventory {
                         false,
                         false,
                     );
+                    if let Some((_, _, format)) = environment
+                        .definition()
+                        .descriptor()
+                        .spec()
+                        .boot
+                        .components()
+                        .find(|(_, component, _)| component.digest == kernel.sha256)
+                    {
+                        installation.metadata.format = Some(format.parse().map_err(
+                            |source: pplx_space_common_core::types::ArtifactFormatParseError| {
+                                RuntimeInventoryError::InvalidStaticIdentifier {
+                                    field: "boot format",
+                                    value: format.to_owned(),
+                                    reason: source.to_string(),
+                                }
+                            },
+                        )?);
+                    }
                     installation.integrity = image.integrity;
                     Ok::<_, RuntimeInventoryError>(installation)
                 })();
