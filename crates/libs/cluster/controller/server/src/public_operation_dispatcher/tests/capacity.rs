@@ -629,6 +629,59 @@ async fn an_organizations_limit_holds_only_while_another_organization_waits() ->
 }
 
 #[tokio::test]
+async fn work_run_as_it_was_created_holds_no_slot_under_the_limit() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let busy_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    // Two creates the API claimed as it created them and runs itself.
+    for target_id in ["sbx_inline_create_0", "sbx_inline_create_1"] {
+        let created = store
+            .create_claimed_operation(pplx_space_api::public_operations::CreatePublicOperation {
+                org_id: busy_org,
+                actor_user_id: None,
+                api_product: ApiProduct::Native,
+                kind: OperationKind::CreateSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(target_id),
+                payload_json: serde_json::json!({}),
+                idempotency: None,
+                traceparent: None,
+            })
+            .await?;
+        assert!(matches!(
+            created,
+            pplx_space_api::public_operations::CreateClaimedPublicOperationResult::Claimed { .. }
+        ));
+    }
+    let pause = queue_all(
+        &store,
+        busy_org,
+        &[(OperationKind::PauseSandbox, "sbx_busy_pause")],
+    )
+    .await?[0];
+    let other_create = queue_all(
+        &store,
+        other_org,
+        &[(OperationKind::CreateSandbox, "sbx_other_org_create")],
+    )
+    .await?[0];
+    let limits = ClaimLimits {
+        per_org_non_teardown: Some(org_limit(2, 64)),
+        ..ClaimLimits::any(64)
+    };
+
+    // The inline creates hold no dispatcher slot, so the pause is within
+    // its organization's limit though another organization waits.
+    let mut expected = vec![pause, other_create];
+    expected.sort();
+    assert_eq!(claim_with(&store, limits).await?, expected);
+    Ok(())
+}
+
+#[tokio::test]
 async fn one_organizations_held_work_leaves_slots_for_another() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
