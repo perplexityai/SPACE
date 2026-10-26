@@ -691,6 +691,8 @@ pub(crate) enum NormalizeTemplateManifestError {
     Manifest(#[from] pplx_space_common_core::types::TemplateManifestSchemaError),
     #[error("template metadata and manifest execution metadata disagree")]
     ExecutionMismatch,
+    #[error("template metadata and manifest guest image contracts disagree")]
+    GuestImageMismatch,
 }
 
 /// Register keeps the digest-addressed manifest. Metadata refresh cannot change
@@ -707,7 +709,7 @@ fn validate_retained_environment_binding(
         .execution_metadata()
         .map_err(|error| Status::invalid_argument(error.to_string()))?
         .and_then(|execution| execution.environment());
-    if retained != incoming {
+    if retained != incoming || manifest.guest_image != metadata.guest_image {
         return Err(Status::already_exists(
             "rootfs digest already has a different environment binding; retain the release unchanged",
         ));
@@ -729,6 +731,9 @@ pub(crate) fn normalize_template_manifest(
     manifest.content_hash = content_hash.to_string();
     let metadata_execution = metadata.execution_metadata()?;
     let manifest_execution = manifest.execution_metadata()?;
+    if manifest.execution.is_some() && manifest.guest_image != metadata.guest_image {
+        return Err(NormalizeTemplateManifestError::GuestImageMismatch);
+    }
     if let (Some(metadata_execution), Some(manifest_execution)) =
         (metadata_execution, manifest_execution)
         && metadata_execution != manifest_execution
@@ -736,6 +741,10 @@ pub(crate) fn normalize_template_manifest(
         return Err(NormalizeTemplateManifestError::ExecutionMismatch);
     }
     if let Some(execution) = metadata_execution {
+        if manifest.guest_image.is_none() && metadata.guest_image.is_some() {
+            manifest.guest_image = metadata.guest_image;
+            manifest.set_execution_metadata(execution.clone());
+        }
         if manifest.runtime.is_empty() {
             manifest.runtime = execution.runtime().kind.alias().to_string();
         }
@@ -2450,6 +2459,68 @@ fn validate_guest_documents(
         manifest
             .execution_metadata()
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if manifest.guest_image != metadata.guest_image {
+            return Err(Status::failed_precondition(
+                "template guest contracts disagree",
+            ));
+        }
     }
     Ok(metadata)
+}
+
+impl TemplateManagerService {
+    async fn require_local_firmware_consumer(&self) -> Result<(), Status> {
+        let capabilities = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut client = pplx_space_sbx_mgr_client::connect()
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+            client
+                .get_execution_capabilities(sbx_proto::GetExecutionCapabilitiesRequest {})
+                .await
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("firmware guest capability check timed out"))??
+        .into_inner();
+        if !capabilities.firmware_guests_v1 {
+            return Err(Status::failed_precondition(
+                "local standalone sandbox-manager firmware support required",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl TemplateManagerService {
+    /// Settings can precede a build; once present, use the persisted manifest.
+    async fn template_guest_image(
+        &self,
+        template: &str,
+    ) -> Result<Option<pplx_space_common_core::types::guest_image::GuestImageContract>, Status>
+    {
+        let db = Arc::clone(&self.db);
+        let template = template.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+            let (_, hash) = match Self::resolve_template(&conn, &template, "", "latest") {
+                Ok(value) => value,
+                Err(error) if error.code() == tonic::Code::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let build = crate::db::get_build(&conn, &template, &hash)
+                .map_err(|error| Status::internal(error.to_string()))?
+                .ok_or_else(|| Status::not_found("template build disappeared"))?;
+            let manifest: pplx_space_common_core::types::TemplateManifest =
+                serde_json::from_str(&build.manifest_json).map_err(|error| {
+                    Status::failed_precondition(format!("invalid template manifest: {error}"))
+                })?;
+            manifest
+                .execution_metadata()
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            Ok(manifest.guest_image)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("template manifest lookup: {error}")))?
+    }
 }

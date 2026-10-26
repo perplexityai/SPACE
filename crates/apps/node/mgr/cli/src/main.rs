@@ -15,6 +15,7 @@ use pplx_space_node_mgr_client::proto::{
 const FACET_SANDBOX_DESIRED_STATE: &str = "sandbox-desired-state";
 
 mod devices;
+mod guest_channel;
 #[cfg(test)]
 mod tests;
 
@@ -130,6 +131,8 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Connect to an execution-fenced guest TCP port or serial console (operator only).
+    GuestChannel(guest_channel::Args),
     /// Inspect and administer node-local device ownership (operator only).
     Devices {
         #[command(subcommand)]
@@ -317,6 +320,9 @@ async fn run(cli: Cli) -> Result<(), String> {
         })?;
 
     match cli.command {
+        Commands::GuestChannel(args) => guest_channel::run(&mut client, args)
+            .await
+            .map_err(|error| error.to_string())?,
         Commands::Devices { command } => devices::run(&mut client, command)
             .await
             .map_err(|error| error.to_string())?,

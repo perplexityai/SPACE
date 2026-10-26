@@ -235,6 +235,7 @@ struct GuestHealthGaugeValue {
 
 #[derive(Clone)]
 pub struct SidecarInfo {
+    pub guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
     pub node_execution_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
     pub sandbox_id: String,
     pub uid: Option<u32>,
@@ -249,6 +250,7 @@ pub struct SidecarInfo {
 
 fn sidecar_info_from_row(row: &crate::db::SandboxRow) -> SidecarInfo {
     SidecarInfo {
+        guest_image: row.guest_image,
         node_execution_id: row.node_execution_id,
         sandbox_id: row.id.clone(),
         uid: row.uid,
@@ -1386,7 +1388,8 @@ async fn sidecar_loop(
             }
 
             // Restart dead sidecars and finish partially committed replacements.
-            if !spaced_alive
+            if info.guest_image.expects_agent()
+                && !spaced_alive
                 && info.uid.is_some()
                 && info.vsock_uds_path.is_some()
                 && restart_queue.schedule(SidecarRestartRequest::SpacedHost(info.clone()))
@@ -2302,7 +2305,17 @@ async fn probe_composed_health(
     restored_guests: &crate::vm_diagnostics::RestoredGuests,
 ) -> ComposedProbeResult {
     let firecracker = probe_firecracker_health(sandbox_id, lifecycle, node_manager);
-    let spaced_host = probe_spaced_host_health(sandbox_id);
+    let spaced_host = async {
+        if info.guest_image.expects_agent() {
+            probe_spaced_host_health(sandbox_id).await
+        } else {
+            health_observation(
+                Instant::now(),
+                HealthProbeOutcome::NotApplicable,
+                "guest image has no agent",
+            )
+        }
+    };
     let spaced_guest = probe_spaced_guest_health(info, lifecycle, restored_guests);
     let net_gateway = probe_net_gateway_health(sandbox_id);
     let (firecracker, spaced_host, spaced_guest, net_gateway) =
@@ -2410,11 +2423,15 @@ async fn probe_spaced_guest_health(
     restored_guests: &crate::vm_diagnostics::RestoredGuests,
 ) -> HealthObservation {
     let started = Instant::now();
-    if lifecycle == Some(crate::state::SandboxState::Paused) {
+    if !info.guest_image.expects_agent() || lifecycle == Some(crate::state::SandboxState::Paused) {
         return health_observation(
             started,
             HealthProbeOutcome::NotApplicable,
-            "guest vCPUs are paused",
+            if info.guest_image.expects_agent() {
+                "guest vCPUs are paused"
+            } else {
+                "guest image has no SPACE guest agent"
+            },
         );
     }
     let Some(vsock_uds_path) = info.vsock_uds_path.as_deref() else {
@@ -2850,13 +2867,24 @@ fn classify_composed_health(
     });
     let mut insufficient_current_evidence = false;
     for component in required {
-        let applicable_samples = health
+        let mut current_samples = health
             .health_components
             .get(component)
             .observations
             .iter()
             .rev()
             .filter(|sample| sample.lifecycle_epoch == health.lifecycle_epoch)
+            .peekable();
+        if matches!(
+            component,
+            HealthComponent::SpacedHost | HealthComponent::SpacedGuest
+        ) && current_samples
+            .peek()
+            .is_some_and(|sample| sample.outcome == HealthProbeOutcome::NotApplicable)
+        {
+            continue;
+        }
+        let applicable_samples = current_samples
             .take_while(|sample| sample.outcome != HealthProbeOutcome::NotApplicable)
             .count();
         if applicable_samples < HEALTH_FAILURE_THRESHOLD {

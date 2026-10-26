@@ -30,6 +30,7 @@ pub trait RuntimeControl: Send + Sync {
     fn state(&self) -> ControlFuture<'_, VmState>;
     /// Configure and boot a newly launched idle runtime; never replay after uncertainty.
     fn boot<'a>(&'a self, configuration: &'a str) -> ControlFuture<'a, ()>;
+    fn request_guest_shutdown(&self) -> ControlFuture<'_, ()>;
     fn pause(&self) -> ControlFuture<'_, ()>;
     fn resume(&self) -> ControlFuture<'_, ()>;
 }
@@ -63,6 +64,14 @@ impl RuntimeControl for crate::fc_api::FcApiClient {
             Err(ControlError::UnsupportedOperation {
                 runtime: RuntimeKind::Firecracker,
                 operation: "API cold boot",
+            })
+        })
+    }
+    fn request_guest_shutdown(&self) -> ControlFuture<'_, ()> {
+        Box::pin(async {
+            Err(ControlError::UnsupportedOperation {
+                runtime: RuntimeKind::Firecracker,
+                operation: "guest shutdown",
             })
         })
     }

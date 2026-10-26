@@ -238,6 +238,7 @@ impl TestSandboxInsert {
         user: &'a SandboxOwner,
     ) -> InsertSandboxParams<'a> {
         InsertSandboxParams {
+            guest_image: None,
             device_requirements: None,
             id: &self.id,
             uuid8,
