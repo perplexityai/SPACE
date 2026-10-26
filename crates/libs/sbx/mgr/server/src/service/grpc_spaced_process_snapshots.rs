@@ -91,16 +91,17 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        if operation.recovery.is_some() {
-            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
-                pplx_space_common_grpc::GuestCapability::ProcessRecoveryStart,
-                "process recovery routing is unsupported",
-            ));
-        }
-        if operation.command.is_empty() {
+        let recovery = pplx_space_spaced_common::recovery::validate_start(operation)?.is_some();
+        if !recovery && operation.command.is_empty() {
             return Err(Status::invalid_argument("command is required"));
         }
-        let command_arg0 = operation.command.first().cloned().unwrap_or_default();
+        let command_arg0 = operation
+            .recovery
+            .as_ref()
+            .map_or(&operation.command, |request| &request.command)
+            .first()
+            .cloned()
+            .unwrap_or_default();
         let sandbox = match self
             .ensure_active_for_authorized_guest_activity(
                 &route_auth,
@@ -129,7 +130,11 @@ impl SandboxManagerService {
         };
         route_auth.authorize_sandbox(&sandbox)?;
         let identity_token = self.route_stream_identity_token(&sandbox)?;
-        let client = match self.connect_spaced_host(&sandbox).await {
+        let client = match if recovery {
+            self.connect_recovery_host(&sandbox, &route_auth).await
+        } else {
+            self.connect_spaced_host(&sandbox).await
+        } {
             Ok(client) => client,
             Err(error) => {
                 emit_sandbox_event(
@@ -146,8 +151,12 @@ impl SandboxManagerService {
                 return Err(error);
             }
         };
-        let options = start_process_options(operation)?;
-        let start = client.start_process_stream_with_options(options);
+        let start = if recovery {
+            futures_util::future::Either::Left(client.recovery_start(operation.clone()))
+        } else {
+            let options = start_process_options(operation)?;
+            futures_util::future::Either::Right(client.start_process_stream_with_options(options))
+        };
         use super::restart_admission::GuestStartOutcome;
         let stream = match super::restart_admission::abandon_start_if_caller_cancelled(start).await
         {
@@ -209,13 +218,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        if operation.recovery.is_some() {
-            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
-                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
-                "process recovery routing is unsupported",
-            ));
-        }
-        if operation.process_id.is_empty() {
+        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+            &operation.process_id,
+            operation.recovery.as_ref(),
+        )?
+        .is_some();
+        if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
         let sandbox = self
@@ -230,7 +238,11 @@ impl SandboxManagerService {
             .await?;
         route_auth.authorize_sandbox(&sandbox)?;
         let identity_token = self.route_stream_identity_token(&sandbox)?;
-        let client = self.connect_spaced_host(&sandbox).await?;
+        let client = if recovery {
+            self.connect_recovery_host(&sandbox, &route_auth).await?
+        } else {
+            self.connect_spaced_host(&sandbox).await?
+        };
         let stream = connect_process_stream(&client, operation).await?;
         // A reconnected foreground stream is the same liveness signal as the
         // original one (and reconnecting starts a fresh presence cap — by
@@ -310,13 +322,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        if operation.recovery.is_some() {
-            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
-                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
-                "process recovery routing is unsupported",
-            ));
-        }
-        if operation.process_id.is_empty() {
+        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+            &operation.process_id,
+            operation.recovery.as_ref(),
+        )?
+        .is_some();
+        if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
         let signal = operation.signal;
@@ -333,10 +344,18 @@ impl SandboxManagerService {
             )
             .await?;
         route_auth.authorize_sandbox(&sandbox)?;
-        let client = self.connect_spaced_host(&sandbox).await?;
-        client
-            .send_signal(operation.process_id.clone(), signal)
-            .await?;
+        let client = if recovery {
+            self.connect_recovery_host(&sandbox, &route_auth).await?
+        } else {
+            self.connect_spaced_host(&sandbox).await?
+        };
+        if recovery {
+            client.recovery_send_signal(operation.clone()).await?;
+        } else {
+            client
+                .send_signal(operation.process_id.clone(), signal)
+                .await?;
+        }
         Ok(Response::new(SpacedSendSignalResponse {}))
     }
 
@@ -357,13 +376,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        if operation.recovery.is_some() {
-            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
-                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
-                "process recovery routing is unsupported",
-            ));
-        }
-        if operation.process_id.is_empty() {
+        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+            &operation.process_id,
+            operation.recovery.as_ref(),
+        )?
+        .is_some();
+        if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
         let sandbox = self
@@ -376,10 +394,18 @@ impl SandboxManagerService {
             )
             .await?;
         route_auth.authorize_sandbox(&sandbox)?;
-        let client = self.connect_spaced_host(&sandbox).await?;
-        client
-            .send_input(operation.process_id.clone(), operation.data.clone())
-            .await?;
+        let client = if recovery {
+            self.connect_recovery_host(&sandbox, &route_auth).await?
+        } else {
+            self.connect_spaced_host(&sandbox).await?
+        };
+        if recovery {
+            client.recovery_send_input(operation.clone()).await?;
+        } else {
+            client
+                .send_input(operation.process_id.clone(), operation.data.clone())
+                .await?;
+        }
         Ok(Response::new(SpacedSendInputResponse {}))
     }
 
@@ -400,13 +426,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        if operation.recovery.is_some() {
-            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
-                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
-                "process recovery routing is unsupported",
-            ));
-        }
-        if operation.process_id.is_empty() {
+        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+            &operation.process_id,
+            operation.recovery.as_ref(),
+        )?
+        .is_some();
+        if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
         let sandbox = self
@@ -419,8 +444,16 @@ impl SandboxManagerService {
             )
             .await?;
         route_auth.authorize_sandbox(&sandbox)?;
-        let client = self.connect_spaced_host(&sandbox).await?;
-        client.close_stdin(operation.process_id.clone()).await?;
+        let client = if recovery {
+            self.connect_recovery_host(&sandbox, &route_auth).await?
+        } else {
+            self.connect_spaced_host(&sandbox).await?
+        };
+        if recovery {
+            client.recovery_close_stdin(operation.clone()).await?;
+        } else {
+            client.close_stdin(operation.process_id.clone()).await?;
+        }
         Ok(Response::new(SpacedCloseStdinResponse {}))
     }
 
@@ -441,13 +474,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        if operation.recovery.is_some() {
-            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
-                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
-                "process recovery routing is unsupported",
-            ));
-        }
-        if operation.process_id.is_empty() {
+        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+            &operation.process_id,
+            operation.recovery.as_ref(),
+        )?
+        .is_some();
+        if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
         let size = operation
@@ -463,10 +495,18 @@ impl SandboxManagerService {
             )
             .await?;
         route_auth.authorize_sandbox(&sandbox)?;
-        let client = self.connect_spaced_host(&sandbox).await?;
-        client
-            .resize_pty(operation.process_id.clone(), size)
-            .await?;
+        let client = if recovery {
+            self.connect_recovery_host(&sandbox, &route_auth).await?
+        } else {
+            self.connect_spaced_host(&sandbox).await?
+        };
+        if recovery {
+            client.recovery_resize_pty(operation.clone()).await?;
+        } else {
+            client
+                .resize_pty(operation.process_id.clone(), size)
+                .await?;
+        }
         Ok(Response::new(SpacedResizePtyResponse {}))
     }
 

@@ -142,8 +142,8 @@ use crate::proto::{
     SpacedOpenLoopbackBridgeRequest, SpacedOpenLoopbackBridgeResponse, SpacedPingGuestRequest,
     SpacedPingGuestResponse, SpacedProcessConnected, SpacedProcessEvent, SpacedProcessExit,
     SpacedProcessExited, SpacedProcessInfo, SpacedProcessOutput, SpacedProcessOutputGap,
-    SpacedProcessSignaled, SpacedProcessStarted, SpacedProcessTimedOut, SpacedProcessUnknown,
-    SpacedReadRequest, SpacedRemoveRequest, SpacedRemoveResponse, SpacedRemoveWatcherRequest,
+    SpacedProcessSignaled, SpacedProcessTimedOut, SpacedProcessUnknown, SpacedReadRequest,
+    SpacedRemoveRequest, SpacedRemoveResponse, SpacedRemoveWatcherRequest,
     SpacedRemoveWatcherResponse, SpacedRenameRequest, SpacedRenameResponse, SpacedResizePtyRequest,
     SpacedResizePtyResponse, SpacedSendInputRequest, SpacedSendInputResponse,
     SpacedSendSignalRequest, SpacedSendSignalResponse, SpacedStartProcessRequest,
@@ -1977,6 +1977,7 @@ pub(crate) use network_runtime::{
 };
 pub(crate) mod gateway_identity;
 mod ingress_protection;
+mod process_recovery;
 mod reconcile;
 mod recovery;
 mod recovery_cross_node;

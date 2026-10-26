@@ -8,6 +8,7 @@ fn empty_config_resolves_to_the_service_defaults() {
         .expect("an empty config is always valid");
     let defaults = SpacedHostServiceConfig::default();
 
+    assert_eq!(resolved.process_recovery_activation, None);
     assert_eq!(resolved.socket_path, defaults.socket_path);
     assert_eq!(
         resolved.host_control_socket_path,
@@ -66,7 +67,9 @@ fn uds_bridge_flags_replace_both_bridge_directions() {
 
 #[test]
 fn vsock_uds_builds_the_firecracker_connector_and_wins_over_the_uds_flags() {
+    let activation = pplx_space_common_core::types::ProcessRecoveryToken::new();
     let resolved = resolve_service_config(SpacedHostRunConfig {
+        process_recovery_activation: Some(activation),
         vsock_uds: Some(PathBuf::from("/tmp/fc.vsock")),
         firecracker_pid: Some(4242),
         firecracker_uid: Some(1000),
@@ -76,6 +79,7 @@ fn vsock_uds_builds_the_firecracker_connector_and_wins_over_the_uds_flags() {
         ..SpacedHostRunConfig::default()
     })
     .expect("a complete Firecracker peer is valid");
+    assert_eq!(resolved.process_recovery_activation, Some(activation));
 
     assert_eq!(
         resolved.bridge_host_socket_path,

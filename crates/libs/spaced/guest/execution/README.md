@@ -336,12 +336,15 @@ existing lagged-output or expired-replay error instead of starting again.
 Changing an expected ID or key after an uncertain result can run new work.
 These tokens are lifetime fences, not authorization credentials.
 
-The daemon, host and sandbox-manager paths do not yet expose recovery starts:
-their lifecycle handshake and forwarding are separate work. They filter out
-`process_recovery_start`; legacy calls keep their existing defaults. An older
-service sees no legacy command in a recovery request and rejects it before
-launching. Fenced reconnect/control requests and mutation receipts remain
-separate extensions in the process recovery RFC.
+The sandbox-manager and host forward recovery requests without converting them
+to legacy requests or implicitly retrying starts or mutations. Discover support
+through sandbox-manager readiness before choosing this encoding. The host
+advertises recovery only after the manager confirms activation under snapshot
+exclusion. Node-manager supplies the current execution identity at host launch;
+restore changes it, while a sidecar restart or resident pause/resume retains it.
+Older peers and hosts without activation configuration do not advertise support.
+An older service sees no legacy command and rejects the request before launching.
+Legacy calls keep their existing defaults.
 
 ## Fenced process handles
 
@@ -364,8 +367,8 @@ Disabling recovery interrupts blocked recovery controls before waiting for their
 leases; it does not wait for read streams or legacy calls. Version 1 adds fencing
 only: a cancelled write may have delivered a prefix, and input or signals must
 not be automatically retried. Version-2 mutation receipts are described below.
-The daemon routing path still filters `process_recovery_handles` until its
-activation handshake and forwarding support are implemented.
+The routed path advertises `process_recovery_handles` only after activation;
+reconnect and control requests preserve the complete handle end to end.
 
 ## Sequenced process mutations
 
@@ -407,5 +410,6 @@ never a sequence-only unknown outcome.
 A next-sequence signal cannot overtake a pending input. To terminate a process
 with blocked input, use version-1 fenced `SendSignal(SIGKILL)` without a sequence,
 or the legacy kill operation where only a legacy ID is available. These controls
-remain outside sequence ordering; callers must coordinate any mixing. Daemon routing still filters this capability until
-its activation handshake and forwarding are implemented.
+remain outside sequence ordering; callers must coordinate any mixing. Routed
+mutations preserve the sequence and receipt status; callers own retries and
+must retain the original handle and payload.

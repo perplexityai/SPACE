@@ -2395,6 +2395,7 @@ table inet space {
             pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         ];
 
+        let execution = pplx_space_common_core::types::SandboxActivationAttemptId::new();
         let prepared = prepare_sidecar_launch_args(
             pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
             sandbox_id,
@@ -2402,6 +2403,7 @@ table inet space {
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(runtime_pid).unwrap(),
                 sandbox_uid,
+                Some(execution),
             )),
         )
         .unwrap();
@@ -2423,6 +2425,37 @@ table inet space {
             .unwrap(),
             sandbox_uid.to_string()
         );
+        assert_eq!(
+            require_launch_arg(
+                &prepared,
+                pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+                "--process-recovery-activation"
+            )
+            .unwrap(),
+            execution.to_string()
+        );
+        for extra in [
+            vec![
+                "--process-recovery-activation".to_string(),
+                execution.to_string(),
+            ],
+            vec![format!("--process-recovery-activation={execution}")],
+        ] {
+            let mut overridden = args.clone();
+            overridden.extend(extra);
+            let error = prepare_sidecar_launch_args(
+                pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+                sandbox_id,
+                &overridden,
+                Some(ExpectedSpacedHostPeer::new(
+                    LinuxPid::try_from_u32(runtime_pid).unwrap(),
+                    sandbox_uid,
+                    Some(execution),
+                )),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        }
     }
 
     #[test]
@@ -2450,6 +2483,7 @@ table inet space {
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(4_242).unwrap(),
                 10_042,
+                None,
             )),
         )
         .expect_err("node-manager must reject a caller-selected Firecracker peer");
@@ -2484,6 +2518,7 @@ table inet space {
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(runtime_pid).unwrap(),
                 sandbox_uid,
+                None,
             )),
         )
         .expect_err("node-manager must reject an equals-form override");

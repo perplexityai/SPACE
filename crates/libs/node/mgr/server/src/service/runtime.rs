@@ -485,7 +485,8 @@ impl NodeManagerService {
         let _cgroup_guard = self
             .lock_sandbox_sidecar_cgroup_launch(&req.sandbox_id)
             .await;
-        self.check_execution(&req.sandbox_id, req.execution_fence.as_ref(), false)?;
+        let execution =
+            self.check_execution(&req.sandbox_id, req.execution_fence.as_ref(), false)?;
         let lease = self
             .pool
             .get(&req.sandbox_id)
@@ -511,8 +512,13 @@ impl NodeManagerService {
             let expected_spaced_host_peer = (req.program
                 == pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN)
                 .then(|| {
-                    registered_firecracker_pid(Path::new(RUN_DIR), &req.sandbox_id)
-                        .map(|pid| ExpectedSpacedHostPeer::new(pid, sandbox_uid))
+                    registered_firecracker_pid(Path::new(RUN_DIR), &req.sandbox_id).map(|pid| {
+                        ExpectedSpacedHostPeer::new(
+                            pid,
+                            sandbox_uid,
+                            execution.map(|fence| fence.current()),
+                        )
+                    })
                 })
                 .transpose()
                 .inspect_err(|error| {

@@ -42,10 +42,7 @@ pub(in crate::service) fn process_event_to_spaced(
         .event
         .ok_or_else(|| Status::internal("spaced host returned process event without payload"))?;
     let event_payload = match host_event {
-        HostEvent::Started(started) => SpacedEvent::Started(SpacedProcessStarted {
-            start_time: started.start_time,
-            ..Default::default()
-        }),
+        HostEvent::Started(started) => SpacedEvent::Started(started),
         HostEvent::Connected(connected) => SpacedEvent::Connected(SpacedProcessConnected {
             output_cursor: connected.output_cursor,
             resume_after_output_gap: connected.resume_after_output_gap,

@@ -292,10 +292,14 @@ can rearm the existing activation once the VM is running. Disk-only flushing als
 quiesces recovery and requires rearming. Barriers are ordering tokens, not access
 credentials; host metadata calls retain their existing peer authorization.
 
-These metadata endpoints do not yet enable routed recovery operations. Hosts
-without activation configuration and older guests retain the existing path;
-recovery capabilities remain filtered until lifecycle ownership and every process
-adapter are wired end to end.
+Node-manager derives the host's activation from the accepted execution fence,
+including sidecar restarts; callers cannot override it through launch arguments.
+The sandbox manager rearms lazily on readiness or a recovery call. It acquires
+the existing snapshot artifact lock, reloads and authorizes a Started sandbox,
+attests its current host, and holds the lock through activation confirmation.
+A paused or transitioning VM cannot rearm. Host capabilities remain filtered
+until the guest confirms the launch-bound activation. Hosts without activation
+configuration and older guests retain the existing path.
 
 ### Deduplicate process mutations
 
@@ -348,9 +352,10 @@ receiving that result, but cannot infer rollback or claim exactly-once execution
 Ship contracts in dependency order: discovery, recovery Start with key binding,
 fenced reconnect/control handles, then mutation receipts. A path advertises its
 capability only after its affected adapters and lifecycle boundary implement
-the contract. The native Start foundation may ship first;
-the daemon routing path filters its capability until the external activation
-handshake and forwarding are implemented.
+the contract. Native support can ship before routed support; the routed path
+advertises recovery only after its external activation handshake completes.
+Adapters preserve envelopes and do not implicitly retry dispatched recovery
+starts or mutations; the caller owns the retry deadline and ordering.
 A client must discover support before selecting the recovery encoding; absent
 or filtered capabilities select the existing path only for new work. Never
 translate an uncertain recovery retry into a legacy request.
