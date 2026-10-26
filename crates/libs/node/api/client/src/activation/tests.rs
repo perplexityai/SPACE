@@ -19,7 +19,11 @@ async fn unconfigured_activation_preserves_startup_and_refuses_only_delegated_wa
     );
     // Unconfigured is unknown, never "nothing can wake it".
     let error = client
-        .queue_implicit_wake(SandboxId::new(), Duration::from_secs(1))
+        .queue_implicit_wake(
+            SandboxId::new(),
+            ImplicitWakeActivity::Access,
+            Duration::from_secs(1),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unavailable);
@@ -36,7 +40,11 @@ impl IngressActivation for PrepareOnly {
 #[tokio::test]
 async fn an_owner_that_cannot_queue_a_wake_answers_unknown() {
     let error = PrepareOnly
-        .queue_implicit_wake(SandboxId::new(), Duration::from_secs(1))
+        .queue_implicit_wake(
+            SandboxId::new(),
+            ImplicitWakeActivity::Access,
+            Duration::from_secs(1),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unimplemented);

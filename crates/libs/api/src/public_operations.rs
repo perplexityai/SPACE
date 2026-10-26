@@ -647,6 +647,7 @@ impl PublicOperationStore {
             target_id,
             payload_json,
             traceparent,
+            None,
         )
         .await
     }
@@ -659,12 +660,19 @@ impl PublicOperationStore {
     /// wake is queued behind that one. A caller's `:wake` joins it by the same
     /// rule while it is still queued
     /// ([`PublicOperationAdmission::create_or_join_active_wake`]).
+    ///
+    /// A new wake records `marker` as the path template of an idempotency
+    /// record of its own, read back by [`Self::system_operation_marker`]: the
+    /// one place an operation row's existing shape can carry it, since the
+    /// payload is the plain `:wake` payload every controller accepts. The
+    /// record's key is fresh, so no request replays it.
     pub async fn create_or_join_active_sandbox_wake(
         &self,
         org_id: OrgId,
         target_id: &str,
         payload_json: serde_json::Value,
         traceparent: Option<String>,
+        marker: OperationPathTemplate,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
         self.create_or_join_active_sandbox_operation(
             org_id,
@@ -672,7 +680,27 @@ impl PublicOperationStore {
             target_id,
             payload_json,
             traceparent,
+            Some(marker),
         )
+        .await
+    }
+
+    /// The path template [`Self::create_or_join_active_sandbox_wake`] marked
+    /// an operation with, or `None` for an operation created without one, or
+    /// whose record has expired.
+    pub async fn system_operation_marker(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, String>(sql!(
+            "SELECT path_template
+               FROM public_idempotency_records
+              WHERE operation_id = $1
+              ORDER BY created_at, id
+              LIMIT 1"
+        ))
+        .bind(operation_id.as_uuid())
+        .fetch_optional(&self.pool)
         .await
     }
 
@@ -687,6 +715,7 @@ impl PublicOperationStore {
         target_id: &str,
         payload_json: serde_json::Value,
         traceparent: Option<String>,
+        marker: Option<OperationPathTemplate>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_active_sandbox_operation(&mut tx, org_id, kind, target_id).await?;
@@ -718,6 +747,17 @@ impl PublicOperationStore {
                 OperationId::from_uuid(operation_id),
             ));
         }
+        let marker_key = IdempotencyKey::parse(format!("system-{}", Uuid::now_v7()))
+            .expect("a generated idempotency key is valid");
+        let marker_fingerprint =
+            RequestFingerprint::parse(hex::encode(Sha256::digest(payload_json.to_string())))
+                .expect("a SHA-256 digest is a request fingerprint");
+        let idempotency = marker.map(|path_template| CreatePublicOperationIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template,
+            key: &marker_key,
+            request_fingerprint: &marker_fingerprint,
+        });
         let (result, superseded) = create_operation_tx(
             &mut tx,
             CreatePublicOperation {
@@ -730,7 +770,7 @@ impl PublicOperationStore {
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(target_id),
                 payload_json,
-                idempotency: None,
+                idempotency,
                 traceparent,
             },
         )

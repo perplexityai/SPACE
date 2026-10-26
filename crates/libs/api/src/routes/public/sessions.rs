@@ -145,7 +145,13 @@ pub async fn create_process_session(
     )
     .await?;
     if admission == CommandAdmission::AdmitAndWake {
-        enqueue_command_wake(&state.pool, org.id, sandbox_id).await?;
+        enqueue_implicit_wake(
+            &state.pool,
+            org.id,
+            sandbox_id,
+            ExecutionActivityKind::Command,
+        )
+        .await?;
     }
 
     Ok((StatusCode::CREATED, Json(session)))
@@ -180,7 +186,13 @@ pub async fn create_command(
     )
     .await?;
     if admission == CommandAdmission::AdmitAndWake {
-        enqueue_command_wake(&state.pool, org.id, sandbox_id).await?;
+        enqueue_implicit_wake(
+            &state.pool,
+            org.id,
+            sandbox_id,
+            ExecutionActivityKind::Command,
+        )
+        .await?;
     }
 
     // Streaming is negotiated after the create, so validation, owner scope,
@@ -218,7 +230,18 @@ fn command_admission(
     lifecycle: SandboxLifecycle,
     policy: &AutoLifecyclePolicy,
 ) -> CommandAdmission {
-    let wakes = ExecutionActivityKind::Command.allows_implicit_wake(policy);
+    activity_admission(ExecutionActivityKind::Command, lifecycle, policy)
+}
+
+/// [`command_admission`] for a session that will do `activity` once the
+/// sandbox runs: a reattach to a process that already started, or a file
+/// watch, is access, which wakes only on `access`.
+fn activity_admission(
+    activity: ExecutionActivityKind,
+    lifecycle: SandboxLifecycle,
+    policy: &AutoLifecyclePolicy,
+) -> CommandAdmission {
+    let wakes = activity.allows_implicit_wake(policy);
     match lifecycle {
         // A checkpoint returns the sandbox to the state it left, and the
         // node's command wake waits it out; a paused result is refused there.
@@ -276,15 +299,17 @@ fn sandbox_lifecycle(sandbox: &Sandbox) -> Result<SandboxLifecycle, PublicApiErr
 /// when no attach can reach it. The operation runs through the dispatcher
 /// like a `:wake`, after any lifecycle operation queued before it, as the
 /// system (no actor) rather than the caller, and only if the sandbox's wake
-/// policy still allows a command wake when it runs. A sandbox still pausing or suspending
-/// refuses the activation for now; the operation retries until it settles.
+/// policy still allows `activity` to wake it when it runs. A sandbox still
+/// pausing or suspending refuses the activation for now; the operation
+/// retries until it settles.
 ///
 /// Called for a replayed session too, so a retry heals a wake that failed to
 /// queue after its session was created.
-async fn enqueue_command_wake(
+async fn enqueue_implicit_wake(
     pool: &sqlx::PgPool,
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
+    activity: ExecutionActivityKind,
 ) -> Result<(), PublicApiError> {
     let payload = SandboxLifecycleOperationPayload {
         sandbox_id,
@@ -298,27 +323,31 @@ async fn enqueue_command_wake(
             &sandbox_id.to_string(),
             payload,
             crate::public_operations::request_traceparent(),
+            crate::public_sandbox_operations::implicit_wake_marker(activity),
         )
         .await?;
     Ok(())
 }
 
 /// Queue, or join, the wake an existing session on `sandbox` waits for, when
-/// the sandbox is at rest and its wake policy lets a command wake it, as for
-/// a new one. For the session route resolver, whose attach found the sandbox
-/// with no node: answers whether the attach should keep waiting. A sandbox
-/// that is running or heading there again since the resolver looked needs no
-/// wake and keeps waiting too; only one nothing can wake answers no.
-pub(crate) async fn queue_command_wake(
+/// the sandbox is at rest and its wake policy lets the session's `activity`
+/// wake it, as the node will judge that activity. For the session route
+/// resolver, whose attach found the sandbox with no node: answers whether
+/// the attach should keep waiting. A sandbox that is running or heading there
+/// again since the resolver looked needs no wake and keeps waiting too; only
+/// one nothing can wake for `activity` answers no.
+pub(crate) async fn queue_implicit_wake(
     pool: &sqlx::PgPool,
     sandbox: &Sandbox,
+    activity: ExecutionActivityKind,
 ) -> Result<bool, PublicApiError> {
     let lifecycle = sandbox_lifecycle(sandbox)?;
-    match command_admission(lifecycle, &sandbox.auto_lifecycle.0) {
+    match activity_admission(activity, lifecycle, &sandbox.auto_lifecycle.0) {
         CommandAdmission::Admit => Ok(true),
         CommandAdmission::Refuse => Ok(false),
         CommandAdmission::AdmitAndWake => {
-            enqueue_command_wake(pool, sandbox.org_id, PublicSandboxId::from(sandbox.id)).await?;
+            let sandbox_id = PublicSandboxId::from(sandbox.id);
+            enqueue_implicit_wake(pool, sandbox.org_id, sandbox_id, activity).await?;
             Ok(true)
         }
     }

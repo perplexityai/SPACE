@@ -1,6 +1,6 @@
 //! Bounded, authenticated delegation to the existing lifecycle API.
 use crate::proto::{
-    PrepareIngressRequest, QueueImplicitWakeRequest,
+    ImplicitWakeActivity, PrepareIngressRequest, QueueImplicitWakeRequest,
     ingress_activation_api_client::IngressActivationApiClient,
 };
 use pplx_space_bearer_token::{SpaceBearerToken, insert_space_bearer_token};
@@ -21,14 +21,16 @@ pub trait IngressActivation: Send + Sync {
     async fn prepare(&self, sandbox_id: SandboxId, timeout: Duration) -> Result<(), Status>;
 
     /// Queue, or join, the wake a session on a sandbox at rest waits for,
-    /// when the sandbox's wake policy lets a command wake it; never waits for
-    /// it to finish. `Ok(true)`: keep waiting, a wake is queued or running or
-    /// the sandbox no longer needs one. `Ok(false)`: nothing can wake it.
-    /// `Err`: unknown, including an owner that does not offer this, which the
-    /// caller must treat as "keep waiting", never as "nothing can wake it".
+    /// when the sandbox's wake policy lets the session's `activity` wake it;
+    /// never waits for it to finish. `Ok(true)`: keep waiting, a wake is
+    /// queued or running or the sandbox no longer needs one. `Ok(false)`:
+    /// nothing can wake it for that activity. `Err`: unknown, including an
+    /// owner that does not offer this, which the caller must treat as "keep
+    /// waiting", never as "nothing can wake it".
     async fn queue_implicit_wake(
         &self,
         _sandbox_id: SandboxId,
+        _activity: ImplicitWakeActivity,
         _timeout: Duration,
     ) -> Result<bool, Status> {
         Err(Status::unimplemented("implicit wake is not offered"))
@@ -98,6 +100,7 @@ impl IngressActivation for RemoteIngressActivation {
     async fn queue_implicit_wake(
         &self,
         sandbox_id: SandboxId,
+        activity: ImplicitWakeActivity,
         budget: Duration,
     ) -> Result<bool, Status> {
         let client = self
@@ -109,6 +112,7 @@ impl IngressActivation for RemoteIngressActivation {
         }
         let mut request = Request::new(QueueImplicitWakeRequest {
             sandbox_id: sandbox_id.to_string(),
+            activity: activity as i32,
         });
         request.set_timeout(budget);
         insert_space_bearer_token(request.metadata_mut(), SpaceBearerToken::ClusterApi)

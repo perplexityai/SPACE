@@ -24,6 +24,7 @@ use pplx_space_common_svc::space_api_route_ed25519::{
 use pplx_space_common_svc::types::{ReconcileReason, ReconcileRef};
 use pplx_space_metrics::internal_api::EcwCredentialVerificationResult;
 use pplx_space_node_api_client::WorkerApiClient;
+use pplx_space_node_api_client::proto::ImplicitWakeActivity;
 use pplx_space_public_api::SessionKind;
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;

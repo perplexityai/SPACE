@@ -847,46 +847,84 @@ mod not_running {
         Ok(())
     }
 
+    /// The activity marker on each wake operation for `sandbox_id`.
+    async fn wake_markers(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+    ) -> TestDbResult<Vec<Option<String>>> {
+        Ok(sqlx::query_scalar(sql!(
+            "SELECT record.path_template
+               FROM public_operations operation
+               LEFT JOIN public_idempotency_records record
+                 ON record.operation_id = operation.operation_id
+              WHERE operation.kind = 'wake_sandbox' AND operation.target_id = $1
+              ORDER BY operation.requested_at, operation.operation_id"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_all(&fixture.db.pool)
+        .await?)
+    }
+
     #[tokio::test]
     async fn an_attach_on_a_sandbox_at_rest_queues_the_wake_its_policy_allows() -> TestDbResult<()>
     {
+        use crate::controllers::substrate::ExecutionActivityKind::{Access, Command};
         let fixture = fixture().await?;
-        for (lifecycle, wake_on, queued) in [
-            ("suspended", &["access"][..], true),
-            ("paused", &["command"], true),
-            ("suspended", &[], false),
-            ("stopped", &["command"], false),
+        let for_command = Some("system:implicit-wake:command");
+        let for_access = Some("system:implicit-wake:access");
+        for (lifecycle, wake_on, activity, queued, marker) in [
+            ("suspended", &["access"][..], Access, true, for_access),
+            ("suspended", &["access"], Command, true, for_command),
+            ("suspended", &["command"], Command, true, for_command),
+            // A reattach to a process that already started, or a file watch,
+            // is access, which a `command` policy does not wake for.
+            ("suspended", &["command"], Access, false, None),
+            ("paused", &["command"], Access, false, None),
+            ("paused", &["command"], Command, true, for_command),
+            ("suspended", &[], Command, false, None),
+            ("stopped", &["command"], Command, false, None),
             // Running or heading there since the resolver looked: no wake,
             // but the attach keeps waiting.
-            ("started", &["access"], true),
-            ("restoring", &[], true),
+            ("started", &["access"], Access, true, None),
+            ("restoring", &[], Access, true, None),
         ] {
             let sandbox_id = sandbox(&fixture, lifecycle, wake_on).await?;
             let stored =
                 crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
                     .await?
                     .expect("seeded sandbox");
+            let case = format!("{lifecycle} {wake_on:?} {activity:?}");
             for _ in 0..2 {
                 assert_eq!(
-                    queue_command_wake(&fixture.db.pool, &stored)
+                    queue_implicit_wake(&fixture.db.pool, &stored, activity)
                         .await
                         .map_err(|e| format!("{e:?}"))?,
                     queued,
-                    "{lifecycle} {wake_on:?}"
+                    "{case}"
                 );
             }
-            let woken = queued && !matches!(lifecycle, "started" | "restoring");
-            let expected = if woken {
-                vec![(None, "native".to_string())]
-            } else {
-                Vec::new()
-            };
+            let expected: Vec<_> = marker.map(str::to_owned).into_iter().map(Some).collect();
             assert_eq!(
-                wakes(&fixture, sandbox_id).await?,
+                wake_markers(&fixture, sandbox_id).await?,
                 expected,
-                "{lifecycle} {wake_on:?}"
+                "{case}"
             );
+            if marker.is_some() {
+                assert_eq!(
+                    wakes(&fixture, sandbox_id).await?,
+                    vec![(None, "native".to_string())]
+                );
+            }
         }
+
+        // A new command's wake is a command's.
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        let (status, _, body) = command(&fixture, sandbox_id, "commands").await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            wake_markers(&fixture, sandbox_id).await?,
+            vec![for_command.map(str::to_owned)]
+        );
         Ok(())
     }
 }

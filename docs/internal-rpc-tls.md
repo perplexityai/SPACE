@@ -137,8 +137,9 @@ source layout; update the declaration together with changes to that behavior.
 `space-api-svc`, using its existing lifecycle controller. The same service
 serves `IngressActivationApi/QueueImplicitWake`, which the session route
 resolver calls to queue, or join, the wake a data-plane session on a sandbox at
-rest waits for, when the sandbox's wake policy allows it; it never waits for
-the wake. Configure
+rest waits for, when the sandbox's wake policy allows what the session will
+do: start a command or terminal (`command` or `access`), or reconnect to a
+process or watch files (`access`). It never waits for the wake. Configure
 `SPACE_INGRESS_ACTIVATION_LISTEN` on the API deployments that serve it. When
 unset, the API continues serving its existing HTTP surface without an activation
 listener. The local Kind chart exposes this listener on port 9801.

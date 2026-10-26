@@ -3,6 +3,7 @@ use super::*;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::activation::IngressActivation;
+use pplx_space_node_api_client::proto::ImplicitWakeActivity;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
@@ -38,8 +39,12 @@ trait AccessBackend: Send + Sync {
     async fn reachable(&self, id: SandboxId) -> Result<bool, Status>;
     async fn access(&self, id: SandboxId) -> Result<AccessOutcome, Status>;
     /// Queue, or join, the system wake a session on the sandbox waits for,
-    /// when it is at rest and its wake policy lets a command wake it.
-    async fn queue_command_wake(&self, id: SandboxId) -> Result<bool, Status>;
+    /// when it is at rest and its wake policy lets `activity` wake it.
+    async fn queue_implicit_wake(
+        &self,
+        id: SandboxId,
+        activity: ExecutionActivityKind,
+    ) -> Result<bool, Status>;
 }
 
 /// Detached request waiters cannot create unbounded accepted activation tasks.
@@ -101,14 +106,18 @@ pub(crate) fn ingress_activation(
 
 #[tonic::async_trait]
 impl AccessBackend for StoredAccess {
-    async fn queue_command_wake(&self, id: SandboxId) -> Result<bool, Status> {
+    async fn queue_implicit_wake(
+        &self,
+        id: SandboxId,
+        activity: ExecutionActivityKind,
+    ) -> Result<bool, Status> {
         let Some(sandbox) = fetch_sandbox(&self.pool, id)
             .await
             .map_err(|error| Status::internal(error.to_string()))?
         else {
             return Ok(false);
         };
-        crate::routes::public::sessions::queue_command_wake(&self.pool, &sandbox)
+        crate::routes::public::sessions::queue_implicit_wake(&self.pool, &sandbox, activity)
             .await
             .map_err(|error| {
                 Status::unavailable(format!("could not queue the command wake: {error:?}"))
@@ -242,11 +251,24 @@ fn validate_access(lifecycle: SandboxLifecycle, access_wake: bool) -> Result<(),
 
 #[tonic::async_trait]
 impl IngressActivation for Activator {
-    async fn queue_implicit_wake(&self, id: SandboxId, _timeout: Duration) -> Result<bool, Status> {
+    async fn queue_implicit_wake(
+        &self,
+        id: SandboxId,
+        activity: ImplicitWakeActivity,
+        _timeout: Duration,
+    ) -> Result<bool, Status> {
         if self.owners.shutdown.is_cancelled() {
             return Err(Status::unavailable("ingress activation is shutting down"));
         }
-        self.backend.queue_command_wake(id).await
+        let activity = match activity {
+            ImplicitWakeActivity::Command => ExecutionActivityKind::Command,
+            // Unspecified, as from a resolver that does not name it, is the
+            // stricter rule.
+            ImplicitWakeActivity::Access | ImplicitWakeActivity::Unspecified => {
+                ExecutionActivityKind::Access
+            }
+        };
+        self.backend.queue_implicit_wake(id, activity).await
     }
 
     async fn prepare(&self, id: SandboxId, timeout: Duration) -> Result<(), Status> {
