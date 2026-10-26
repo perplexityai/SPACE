@@ -1390,7 +1390,10 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
                 })))
             };
             let started = event(spaced_process_event::Event::Started(
-                pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
+                pplx_space_sbx_mgr_client::operations::ProcessStarted {
+                    start_time: None,
+                    ..Default::default()
+                },
             ));
             let output = tokio_stream::wrappers::UnboundedReceiverStream::new(
                 stdout_rx
@@ -2017,7 +2020,10 @@ async fn spawn_backend_failure_fake(
                     process_id,
                     pid: Some(42),
                     event: Some(spaced_process_event::Event::Started(
-                        pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
+                        pplx_space_sbx_mgr_client::operations::ProcessStarted {
+                            start_time: None,
+                            ..Default::default()
+                        },
                     )),
                 })
             };
@@ -2258,7 +2264,10 @@ enum FakeOpen {
 
 fn started() -> FakeReply {
     FakeReply::Event(spaced_process_event::Event::Started(
-        pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
+        pplx_space_sbx_mgr_client::operations::ProcessStarted {
+            start_time: None,
+            ..Default::default()
+        },
     ))
 }
 

@@ -47,6 +47,7 @@ mod identity_policy;
 mod payload;
 mod placement;
 mod process;
+mod recovery;
 mod worker_executable;
 pub use execution::{
     CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig, ProcessRetention,

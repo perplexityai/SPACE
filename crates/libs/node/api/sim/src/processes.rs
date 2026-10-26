@@ -283,6 +283,7 @@ fn event_stream(process: &SimProcess, mode: ConnectMode) -> SimProcessEventStrea
         ConnectMode::Start { background } => {
             let started = sbx::spaced_process_event::Event::Started(sbx::SpacedProcessStarted {
                 start_time: None,
+                ..Default::default()
             });
             if background {
                 return Box::pin(tokio_stream::iter(vec![Ok(event(

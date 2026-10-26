@@ -503,6 +503,7 @@ async fn readiness_requires_a_supported_guest_and_preserves_legacy_support() {
                         "process_output_gap_resume".into(),
                         "future_capability".into(),
                     ],
+                    ..Default::default()
                 },
             );
         let bridge_task = ReadyWaitGuest {

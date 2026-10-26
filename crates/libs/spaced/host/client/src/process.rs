@@ -81,6 +81,7 @@ impl SpacedHostClient {
                             pty,
                             clean_env,
                             process_id,
+                            recovery: None,
                         })
                         .await
                         .map(Response::into_inner)

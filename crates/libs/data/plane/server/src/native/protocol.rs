@@ -20,6 +20,7 @@ pub(crate) fn process_start_request(
                 request.command
             };
             Ok(StartRequest {
+                recovery: None,
                 command,
                 cwd: request.cwd,
                 env: std::collections::BTreeMap::<String, String>::from(request.env)
@@ -41,6 +42,7 @@ pub(crate) fn process_start_request(
                 serde_json::from_str::<CreateProcessRequest>(&attached.adapter_state_json)
                     .map_err(StreamBridgeError::InvalidAdapterState)?;
             Ok(StartRequest {
+                recovery: None,
                 command: request.command,
                 cwd: request.cwd,
                 env: std::collections::BTreeMap::<String, String>::from(request.env)

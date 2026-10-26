@@ -136,7 +136,7 @@ pub struct ExecutionService {
 }
 
 pub(super) struct ExecutionServiceInner {
-    instance_id: uuid::Uuid,
+    pub(super) recovery: crate::recovery::RecoveryState,
     pub(super) shutdown: CancellationToken,
     pub(super) lifecycle: crate::lifecycle::Lifecycle,
     drain_gate: Mutex<()>,
@@ -158,19 +158,61 @@ pub(super) struct ExecutionServiceInner {
 impl ExecutionService {
     /// Describe this in-memory execution service, before starting any process.
     /// Clones share the identity; reconstructing the service creates a new one.
-    /// A memory snapshot preserves it, so callers must also bind handles to the
-    /// sandbox they address. This observation alone does not fence any request.
+    /// A memory snapshot preserves it. Recovery starts must carry both this
+    /// instance and the external activation, and callers must bind handles to
+    /// the sandbox they address. Discovery alone does not fence legacy calls.
     pub fn process_execution_info(
         &self,
     ) -> pplx_space_spaced_guest_protocol::proto::operations::ProcessExecutionInfo {
         pplx_space_spaced_guest_protocol::proto::operations::ProcessExecutionInfo {
-            instance_id: self.inner.instance_id.to_string(),
+            instance_id: self.inner.recovery.instance.to_string(),
+            activation_id: self
+                .inner
+                .recovery
+                .activation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .map(|id| id.to_string()),
+            idempotency_retention: Some(
+                prost_types::Duration::try_from(self.inner.recovery.idempotency)
+                    .expect("validated retention"),
+            ),
             capabilities: vec![
                 pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume
                     .as_str()
                     .to_owned(),
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryStart
+                    .as_str()
+                    .to_owned(),
             ],
         }
+    }
+
+    /// Enable recovery with an epoch supplied from outside this service's memory,
+    /// or disable it before taking a memory snapshot. Recovery is disabled at
+    /// construction. Disabling waits for admitted recovery starts to publish
+    /// their outcomes; cancellation of this future leaves the prior state intact.
+    /// A restored service must be
+    /// given a fresh epoch before admitting recovery calls. Repeating the same
+    /// epoch is idempotent. Legacy operations are unaffected.
+    pub async fn configure_process_recovery(
+        &self,
+        activation: Option<pplx_space_common_core::types::ProcessRecoveryToken>,
+    ) -> Result<(), Status> {
+        let _operation = self.inner.lifecycle.admit()?;
+        let _launches = self.inner.recovery.launches.write().await;
+        let _gate = self
+            .inner
+            .start_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self
+            .inner
+            .recovery
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = activation;
+        Ok(())
     }
 
     /// Construct a service with the caller's filesystem execution configuration.
@@ -224,7 +266,12 @@ impl ExecutionService {
             .validate(config.filesystem_execution)?;
         Ok(Self {
             inner: Arc::new(ExecutionServiceInner {
-                instance_id: uuid::Uuid::now_v7(),
+                recovery: crate::recovery::RecoveryState {
+                    instance: pplx_space_common_core::types::ProcessRecoveryToken::new(),
+                    activation: std::sync::Mutex::new(None),
+                    launches: Arc::new(tokio::sync::RwLock::new(())),
+                    idempotency: config.process_retention.idempotency,
+                },
                 lifecycle: filesystem.lifecycle.clone(),
                 drain_gate: Mutex::new(()),
                 shutdown,

@@ -604,7 +604,10 @@ async fn spawn_fake_backend(
         pid: Some(42),
         event: Some(
             pplx_space_sbx_mgr_client::proto::spaced_process_event::Event::Started(
-                pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
+                pplx_space_sbx_mgr_client::operations::ProcessStarted {
+                    start_time: None,
+                    ..Default::default()
+                },
             ),
         ),
     }
