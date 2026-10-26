@@ -1,4 +1,5 @@
 mod cgroups;
+mod contained_launcher;
 mod execution_store;
 mod inventory;
 mod os;
