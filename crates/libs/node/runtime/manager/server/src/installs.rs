@@ -43,7 +43,8 @@ pub(crate) use operations::{
 };
 pub use operations::{InstallLimits, OpenInstallerError};
 pub(crate) use publisher::{DirectoryCatalog, NodeManagerPublisher, PinSource};
-pub(crate) use release::ReleaseContext;
+pub use release::ReleaseConfigurationError;
+pub(crate) use release::{ReleaseContext, ReleaseSources};
 pub use release_source::{
     FIRECRACKER_RELEASE_SOURCE, ReleaseArchiveMember, ReleaseChunks, ReleasePayload, ReleaseSource,
     ReleaseSourceError, ReleaseUrl, ReleaseUrlParseError, VerifiableRelease,

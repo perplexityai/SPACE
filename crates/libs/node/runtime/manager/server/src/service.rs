@@ -62,7 +62,7 @@ pub struct RuntimeManagerService {
     /// Where available kernels are listed from and installs download from.
     kernel_source: Option<Arc<dyn KernelSource>>,
     pins: Option<Arc<dyn crate::installs::PinSource>>,
-    releases: Option<crate::installs::ReleaseContext>,
+    releases: crate::installs::ReleaseSources,
     /// Present unless the service runs list-only.
     installer: Option<Installer>,
 }
@@ -90,7 +90,7 @@ impl RuntimeManagerService {
             kernel_source: None,
             installer: None,
             pins: None,
-            releases: None,
+            releases: Default::default(),
         }
     }
 
@@ -104,7 +104,7 @@ impl RuntimeManagerService {
     pub(crate) fn with_catalog(
         mut self,
         pins: Arc<dyn crate::installs::PinSource>,
-        releases: Option<crate::installs::ReleaseContext>,
+        releases: crate::installs::ReleaseSources,
     ) -> Self {
         self.pins = Some(pins);
         self.releases = releases;
@@ -364,7 +364,7 @@ impl RuntimeManager for RuntimeManagerService {
             .chain(
                 self.roots
                     .managed_releases
-                    .as_ref()
+                    .iter()
                     .map(|root| root.path.clone()),
             )
             .chain(self.roots.managed_kernels.clone())
@@ -463,10 +463,9 @@ impl RuntimeManager for RuntimeManagerService {
         let artifacts = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let mut artifacts = Vec::new();
-            if kinds.runtimes
-                && let Some(releases) = releases
-            {
+            if kinds.runtimes {
                 for pin in catalog.releases(runtime, architecture) {
+                    let Some(releases) = releases.get(pin.release.kind) else { continue; };
                     if line.is_some_and(|line| {
                         pin.release.version.as_str().parse::<ReleaseLine>().ok()
                             != Some(line.release)
