@@ -140,10 +140,8 @@ impl Boundary {
                 .open(self.root.join(leaf).join("cgroup.procs"))
                 .expect("placement descriptor");
             assert!(
-                nix::fcntl::FdFlag::from_bits_retain(
-                    nix::fcntl::fcntl(&handle, nix::fcntl::FcntlArg::F_GETFD).unwrap()
-                )
-                .contains(nix::fcntl::FdFlag::FD_CLOEXEC),
+                FdFlag::from_bits_retain(fcntl(&handle, FcntlArg::F_GETFD).unwrap())
+                    .contains(FdFlag::FD_CLOEXEC),
                 "caller must supply atomically close-on-exec placement handles"
             );
             handle
@@ -208,8 +206,8 @@ impl Boundary {
             .expect("started")
             .expect("started response");
         assert_eq!(
-            self.members("workloads").len(),
-            1,
+            self.members("workloads"),
+            [started.pid.expect("workload pid")],
             "workload placed before publication"
         );
         let mut unrelated = tokio::process::Command::new(&probe)
@@ -231,18 +229,7 @@ impl Boundary {
             if target == "ready" {
                 break;
             }
-            assert!(
-                !target.starts_with("/dev/pts/") && target != "/dev/ptmx",
-                "PTY leaked: {target}"
-            );
-            assert!(
-                !target.ends_with("/cgroup.procs"),
-                "placement handle leaked: {target}"
-            );
-            assert!(
-                !target.starts_with("socket:"),
-                "worker channel leaked: {target}"
-            );
+            descriptors::assert_isolated(&target);
         }
         assert!(!self.members("workloads").contains(&unrelated_pid));
         assert!(!self.members("filesystem").contains(&unrelated_pid));

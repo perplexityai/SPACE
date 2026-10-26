@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::StreamExt;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
@@ -11,20 +11,28 @@ use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
 
 struct UnrelatedSpawns {
     stop: Arc<AtomicBool>,
-    count: Arc<AtomicUsize>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<usize>>,
+}
+
+pub(super) fn assert_isolated(target: &str) {
+    assert!(
+        !target.starts_with("/dev/pts/") && target != "/dev/ptmx",
+        "PTY inherited: {target}"
+    );
+    assert!(
+        !target.ends_with("/cgroup.procs") && !target.starts_with("socket:"),
+        "placement or worker descriptor inherited: {target}"
+    );
 }
 
 impl UnrelatedSpawns {
     fn start(probe: &Path) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let count = Arc::new(AtomicUsize::new(0));
         let child_stop = stop.clone();
-        let child_count = count.clone();
         let probe = probe.to_owned();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::spawn(move || {
-            ready_tx.send(()).expect("parent waits for spawner");
+            let mut count = 0;
             while !child_stop.load(Ordering::Relaxed) {
                 let output = Command::new(&probe)
                     .arg("--descriptor-probe")
@@ -35,37 +43,31 @@ impl UnrelatedSpawns {
                     .expect("concurrent caller spawn");
                 assert!(output.status.success());
                 for target in std::str::from_utf8(&output.stdout).unwrap().lines() {
-                    assert!(
-                        !target.starts_with("/dev/pts/") && target != "/dev/ptmx",
-                        "PTY inherited during startup: {target}"
-                    );
-                    assert!(
-                        !target.ends_with("/cgroup.procs") && !target.starts_with("socket:"),
-                        "placement or worker descriptor inherited during startup: {target}"
-                    );
+                    assert_isolated(target);
                 }
-                child_count.fetch_add(1, Ordering::Relaxed);
+                count += 1;
+                if count == 1 {
+                    ready_tx.send(()).expect("parent waits for first exec");
+                }
             }
+            count
         });
-        ready_rx.recv().expect("spawner started");
+        ready_rx.recv().expect("spawner completed its first exec");
         Self {
             stop,
-            count,
             thread: Some(thread),
         }
     }
 
     fn finish(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.thread
+        let count = self
+            .thread
             .take()
             .unwrap()
             .join()
             .expect("unrelated spawn checks");
-        assert!(
-            self.count.load(Ordering::Relaxed) > 1,
-            "must exercise repeated unrelated execs"
-        );
+        assert!(count > 1, "must exercise repeated unrelated execs");
     }
 }
 
