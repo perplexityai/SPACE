@@ -685,7 +685,7 @@ impl SandboxManagerService {
             let fc_create_started_at = std::time::Instant::now();
             self.ensure_teardown_suspend_owner_for_durability(&sandbox.id, durability)?;
             if let Err(e) = node_client
-                .capture_runtime_state(pplx_space_execution_common::proto::RuntimeKind::Firecracker, crate::service::snapshot_capture::bind(CaptureVmStateRequest {
+                .capture_vm_state(crate::service::snapshot_capture::bind(CaptureVmStateRequest {
                     execution_fence: sandbox.node_execution_fence(),
                     sandbox_id: sandbox.id.clone(),
                     artifacts: crate::service::snapshot_capture::artifacts(),
