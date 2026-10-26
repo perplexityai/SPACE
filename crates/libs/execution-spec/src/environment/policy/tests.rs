@@ -46,3 +46,23 @@ fn stored_policy_requires_valid_schema_references_and_default() {
         }
     }
 }
+
+#[test]
+fn legacy_default_can_coexist_with_explicit_compiled_environments() {
+    let reference = format!("sha256:{}", "33".repeat(32));
+    let value: ExecutionPolicyObservation = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "allowed_environment_references": [reference],
+        "default_environment_reference": null,
+        "legacy_unbound_allowed": true,
+    }))
+    .unwrap();
+    assert_eq!(value.allowed_environment_references().len(), 1);
+    assert!(value.default_environment_reference().is_none());
+    assert!(value.legacy_unbound_allowed());
+    assert_eq!(
+        serde_json::from_value::<ExecutionPolicyObservation>(serde_json::to_value(&value).unwrap())
+            .unwrap(),
+        value
+    );
+}

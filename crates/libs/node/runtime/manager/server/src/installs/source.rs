@@ -158,6 +158,8 @@ impl FromStr for KernelVersion {
             None => (value, None),
         };
         let numeric_parts = release
+            .strip_suffix('+')
+            .unwrap_or(release)
             .split('.')
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
         let plain_variant = variant.is_none_or(|variant| {
@@ -216,12 +218,14 @@ impl KernelVersion {
     }
 
     /// The kernel release without the variant: `5.10.245` for
-    /// `5.10.245-no-acpi`. What the image's own banner names.
+    /// `5.10.245-no-acpi`. Strip the build's trailing `+` as the image
+    /// banner scanner does; the install identity and digest remain unchanged.
     pub fn release(&self) -> &str {
         let version = self.as_str();
         version
             .split_once('-')
             .map_or(version, |(release, _)| release)
+            .trim_end_matches('+')
     }
 }
 
@@ -304,7 +308,7 @@ pub struct SourceKernel {
     pub line: RuntimeLine,
     pub architecture: Arch,
     /// The object itself: its key is the URI's key prefix.
-    pub location: StorageUri,
+    pub location: KernelLocation,
     pub size: u64,
     /// The published MD5, when the entity tag is one.
     pub md5: Option<ContentMd5>,
@@ -335,30 +339,87 @@ pub struct VerifiableKernel {
     pub version: KernelVersion,
     pub line: RuntimeLine,
     pub architecture: Arch,
-    #[serde(with = "storage_uri_text")]
-    pub location: StorageUri,
+    pub location: KernelLocation,
     pub size: u64,
     pub md5: Option<ContentMd5>,
 }
 
-/// `StorageUri` in its `s3://` text form, which round-trips through parsing.
-pub(super) mod storage_uri_text {
-    use pplx_space_common_core::types::StorageUri;
+/// Transport location encoded as text in durable jobs. Existing S3 jobs retain
+/// their wire representation; HTTPS locations carry their own validated type.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum KernelLocation {
+    S3(StorageUri),
+    Https(super::release_source::ReleaseUrl),
+}
 
-    pub(in crate::installs) fn serialize<S: serde::Serializer>(
-        uri: &StorageUri,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(uri)
-    }
-
-    pub(in crate::installs) fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<StorageUri, D::Error> {
-        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
-        text.parse().map_err(serde::de::Error::custom)
+#[derive(Debug, thiserror::Error)]
+pub enum KernelLocationError {
+    #[error(transparent)]
+    S3(#[from] pplx_space_common_core::types::StorageUriParseError),
+    #[error(transparent)]
+    Https(#[from] super::release_source::ReleaseUrlParseError),
+}
+impl std::str::FromStr for KernelLocation {
+    type Err = KernelLocationError;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.starts_with("https://") {
+            Ok(Self::Https(text.parse()?))
+        } else {
+            Ok(Self::S3(text.parse()?))
+        }
     }
 }
+impl TryFrom<String> for KernelLocation {
+    type Error = KernelLocationError;
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        text.parse()
+    }
+}
+impl From<StorageUri> for KernelLocation {
+    fn from(uri: StorageUri) -> Self {
+        Self::S3(uri)
+    }
+}
+impl From<KernelLocation> for String {
+    fn from(uri: KernelLocation) -> String {
+        uri.to_string()
+    }
+}
+impl std::fmt::Display for KernelLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::S3(uri) => uri.fmt(f),
+            Self::Https(uri) => uri.fmt(f),
+        }
+    }
+}
+
+/// Routes source operations by artifact provider. Installation and selection
+/// have separate catalogs; registering a source does not approve execution.
+#[derive(Clone, Default)]
+pub(crate) struct KernelSources(Vec<std::sync::Arc<dyn KernelSource>>);
+impl KernelSources {
+    pub(crate) fn insert(
+        &mut self,
+        source: std::sync::Arc<dyn KernelSource>,
+    ) -> Result<(), DuplicateKernelSource> {
+        if self.get(source.runtime()).is_some() {
+            return Err(DuplicateKernelSource(source.runtime()));
+        }
+        self.0.push(source);
+        Ok(())
+    }
+    pub(crate) fn get(&self, runtime: RuntimeKind) -> Option<&std::sync::Arc<dyn KernelSource>> {
+        self.0.iter().find(|source| source.runtime() == runtime)
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("more than one kernel source for {0}")]
+pub struct DuplicateKernelSource(RuntimeKind);
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -366,29 +427,33 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// transport's own error as the cause.
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
+    #[error(transparent)]
+    Https(#[from] super::release_source::ReleaseSourceError),
+    #[error("no kernel source for {0}")]
+    MissingSource(RuntimeKind),
     #[error("listing {location} failed")]
     List {
-        location: Box<StorageUri>,
+        location: Box<KernelLocation>,
         #[source]
         source: BoxError,
     },
     #[error("downloading {location} failed")]
     Download {
-        location: Box<StorageUri>,
+        location: Box<KernelLocation>,
         #[source]
         source: BoxError,
     },
     #[error("{location} did not answer within {}s", after.as_secs())]
     TimedOut {
-        location: Box<StorageUri>,
+        location: Box<KernelLocation>,
         after: Duration,
     },
     #[error("{location} is not an object in this source")]
-    Foreign { location: Box<StorageUri> },
+    Foreign { location: Box<KernelLocation> },
     /// The listing ran past what a kernel line holds.
     #[error("listing {location} passed {limit} entries; refusing a listing that large")]
     ListingTooLarge {
-        location: Box<StorageUri>,
+        location: Box<KernelLocation>,
         limit: usize,
     },
 }
@@ -402,7 +467,7 @@ pub type ByteChunks = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, SourceError
 #[async_trait::async_trait]
 pub trait KernelSource: Send + Sync {
     /// The source's root, for listings and records.
-    fn root(&self) -> &StorageUri;
+    fn root(&self) -> KernelLocation;
 
     /// The runtime whose kernels the source publishes. Callers ask only
     /// for its lines.

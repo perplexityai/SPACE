@@ -351,7 +351,10 @@ pub(super) fn execution_inventory(
         .iter()
         .filter(|entry| !entry.is_initial() && policy.allows(entry.definition().reference()))
     {
-        if let Err(error) = inventory.include_environment(&store, environment, &paths.kernels) {
+        let environment_store = artifact_store(&paths.store, environment.release().release.kind)?;
+        if let Err(error) =
+            inventory.include_environment(&environment_store, environment, &paths.kernels)
+        {
             tracing::warn!(%error, "environment inventory unavailable; retaining other bindings");
         }
     }

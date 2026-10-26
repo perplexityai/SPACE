@@ -22,7 +22,9 @@ pub enum ExecutionPolicyObservationError {
     Duplicate(EnvironmentReference),
     #[error("execution policy default {0} is outside its allowlist")]
     DefaultNotAllowed(EnvironmentReference),
-    #[error("execution policy with allowed environments requires a default")]
+    #[error(
+        "execution policy with allowed environments requires a compiled or permitted legacy default"
+    )]
     MissingDefault,
 }
 
@@ -48,7 +50,7 @@ impl ExecutionPolicyObservation {
                     reference,
                 ));
             }
-            None if !unique.is_empty() => {
+            None if !unique.is_empty() && !legacy_unbound_allowed => {
                 return Err(ExecutionPolicyObservationError::MissingDefault);
             }
             _ => {}
