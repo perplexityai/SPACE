@@ -310,7 +310,7 @@ impl NodeManagerService {
             .await?;
         let firecracker_bin = resolved_execution
             .runtime_files
-            .path(RuntimeFileRole::FirecrackerBinary)
+            .path(RuntimeFileRole::RuntimeExecutable)
             .ok_or_else(|| {
                 Status::failed_precondition("resolved Firecracker runtime is missing firecracker")
             })?
@@ -318,7 +318,7 @@ impl NodeManagerService {
             .to_string();
         let jailer_bin = resolved_execution
             .runtime_files
-            .path(RuntimeFileRole::JailerBinary)
+            .path(RuntimeFileRole::LauncherExecutable)
             .ok_or_else(|| {
                 Status::failed_precondition("resolved Firecracker runtime is missing jailer")
             })?

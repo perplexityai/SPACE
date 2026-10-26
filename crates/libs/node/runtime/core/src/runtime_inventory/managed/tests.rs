@@ -139,7 +139,7 @@ fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
     assert_eq!(
         from_baked
             .runtime_files
-            .path(RuntimeFileRole::FirecrackerBinary)
+            .path(RuntimeFileRole::RuntimeExecutable)
             .unwrap(),
         baked.join("firecracker")
     );
@@ -266,7 +266,7 @@ fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
     assert_eq!(
         selected
             .runtime_files
-            .path(RuntimeFileRole::FirecrackerBinary)
+            .path(RuntimeFileRole::RuntimeExecutable)
             .unwrap(),
         fixture.release_path("1.15.1", 1).join("bin/firecracker")
     );
@@ -675,7 +675,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
             assert_eq!(
                 legacy
                     .runtime_files
-                    .path(RuntimeFileRole::FirecrackerBinary),
+                    .path(RuntimeFileRole::RuntimeExecutable),
                 Some(legacy_bin.join("firecracker").as_path())
             );
             if mode == ExecutionSelectionMode::PersistedStateRestore {
@@ -715,7 +715,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     assert_eq!(
         resolved
             .runtime_files
-            .path(RuntimeFileRole::FirecrackerBinary),
+            .path(RuntimeFileRole::RuntimeExecutable),
         Some(
             fixture
                 .release_path("1.17.0", 7)
