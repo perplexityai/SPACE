@@ -41,6 +41,9 @@ pub fn guest_vlan_packets(packets: u64) {
     gauge("node_mgr.guest_vlan_packets", packets as f64, &[]);
 }
 
+/// Lifecycle admission uses the serving method name. Restore admission is tagged
+/// `RestoreVmState`; include the former `LoadSnapshot` label while upgrading nodes.
+/// The `LOAD_SNAPSHOT` configuration suffix remains stable independently of metrics.
 pub fn lifecycle_rejected(method: &'static str, reason: &'static str) {
     counter(
         "node_mgr.lifecycle.rejected",

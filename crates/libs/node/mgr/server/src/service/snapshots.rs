@@ -188,19 +188,11 @@ fn chmod_path(path: &str, mode: u32) -> Result<(), Status> {
 }
 
 impl NodeManagerService {
-    pub(super) async fn get_firecracker_vm_state(
+    pub(super) async fn get_vm_state(
         &self,
-        request: Request<GetFirecrackerVmStateRequest>,
-    ) -> Result<Response<GetFirecrackerVmStateResponse>, Status> {
-        self.authorize_peer(&request, "GetFirecrackerVmState", ALLOW_NODE_STATUS)?;
-        self.get_firecracker_vm_state_after_authorization(request)
-            .await
-    }
-
-    pub(super) async fn get_firecracker_vm_state_after_authorization(
-        &self,
-        request: Request<GetFirecrackerVmStateRequest>,
-    ) -> Result<Response<GetFirecrackerVmStateResponse>, Status> {
+        request: Request<GetVmStateRequest>,
+    ) -> Result<Response<GetVmStateResponse>, Status> {
+        self.authorize_peer(&request, "GetVmState", ALLOW_NODE_STATUS)?;
         let sandbox_id = request
             .get_ref()
             .sandbox_id
@@ -218,16 +210,16 @@ impl NodeManagerService {
         })?;
         let state = match state {
             pplx_space_node_runtime_core::fc_api::FirecrackerVmState::NotStarted => {
-                crate::proto::FirecrackerVmState::NotStarted
+                crate::proto::VmState::NotStarted
             }
             pplx_space_node_runtime_core::fc_api::FirecrackerVmState::Running => {
-                crate::proto::FirecrackerVmState::Running
+                crate::proto::VmState::Running
             }
             pplx_space_node_runtime_core::fc_api::FirecrackerVmState::Paused => {
-                crate::proto::FirecrackerVmState::Paused
+                crate::proto::VmState::Paused
             }
         };
-        Ok(Response::new(GetFirecrackerVmStateResponse {
+        Ok(Response::new(GetVmStateResponse {
             state: state.into(),
         }))
     }
@@ -283,20 +275,11 @@ impl NodeManagerService {
         .await
     }
 
-    pub(super) async fn create_snapshot(
+    pub(super) async fn capture_firecracker_state(
         &self,
-        request: Request<CreateSnapshotRequest>,
-    ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        self.authorize_peer(&request, "CreateSnapshot", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
-        self.create_snapshot_after_authorization(request).await
-    }
-
-    pub(super) async fn create_snapshot_after_authorization(
-        &self,
-        request: Request<CreateSnapshotRequest>,
-    ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        let mut request = request;
-        let selected_environment = environment::normalize(request.get_mut())?;
+        request: Request<FirecrackerCapture>,
+    ) -> Result<Response<CaptureVmStateResponse>, Status> {
+        let selected_environment = request.get_ref().environment_reference;
         validate_sandbox_id(&request.get_ref().sandbox_id)?;
         let sandbox_id = request.get_ref().sandbox_id.clone();
         let service = self.clone();
@@ -343,8 +326,8 @@ impl NodeManagerService {
 
     async fn create_snapshot_inner(
         &self,
-        request: Request<CreateSnapshotRequest>,
-    ) -> Result<Response<CreateSnapshotResponse>, Status> {
+        request: Request<FirecrackerCapture>,
+    ) -> Result<Response<CaptureVmStateResponse>, Status> {
         let req = request.get_ref();
         validate_sandbox_id(&req.sandbox_id)?;
 
@@ -447,7 +430,7 @@ impl NodeManagerService {
             elapsed_ms = total_started.elapsed().as_millis(),
             "node snapshot create complete"
         );
-        Ok(Response::new(CreateSnapshotResponse {}))
+        Ok(Response::new(CaptureVmStateResponse {}))
     }
 
     /// BYOK snapshot create: bind-mount the already-mounted encrypted volume
@@ -461,7 +444,7 @@ impl NodeManagerService {
         &self,
         sandbox_id: &str,
         mount_dir: &str,
-    ) -> Result<Response<CreateSnapshotResponse>, Status> {
+    ) -> Result<Response<CaptureVmStateResponse>, Status> {
         let typed_sandbox_id = sandbox_id
             .parse::<SandboxId>()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -597,21 +580,13 @@ impl NodeManagerService {
             mount_dir,
             "encrypted snapshot written (vmstate+memory compressed+encrypted at t0)"
         );
-        Ok(Response::new(CreateSnapshotResponse {}))
+        Ok(Response::new(CaptureVmStateResponse {}))
     }
 
-    pub(super) async fn load_snapshot(
+    pub(super) async fn restore_firecracker_state(
         &self,
-        request: Request<LoadSnapshotRequest>,
-    ) -> Result<Response<LoadSnapshotResponse>, Status> {
-        self.authorize_peer(&request, "LoadSnapshot", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
-        self.load_snapshot_after_authorization(request).await
-    }
-
-    pub(super) async fn load_snapshot_after_authorization(
-        &self,
-        request: Request<LoadSnapshotRequest>,
-    ) -> Result<Response<LoadSnapshotResponse>, Status> {
+        request: Request<FirecrackerRestore>,
+    ) -> Result<Response<RestoreVmStateResponse>, Status> {
         validate_sandbox_id(&request.get_ref().sandbox_id)?;
         let sandbox_id = request.get_ref().sandbox_id.clone();
         let service = self.clone();
@@ -631,8 +606,8 @@ impl NodeManagerService {
 
     async fn load_snapshot_inner(
         &self,
-        request: Request<LoadSnapshotRequest>,
-    ) -> Result<Response<LoadSnapshotResponse>, Status> {
+        request: Request<FirecrackerRestore>,
+    ) -> Result<Response<RestoreVmStateResponse>, Status> {
         let req = request.get_ref();
         validate_sandbox_id(&req.sandbox_id)?;
         // Validate before either path stages the jail or re-owns the snapshot
@@ -693,7 +668,7 @@ impl NodeManagerService {
                 &fc_mem_file_path,
             )
             .await?;
-            return Ok(Response::new(LoadSnapshotResponse {}));
+            return Ok(Response::new(RestoreVmStateResponse {}));
         }
 
         let paths = crate::runtime_paths::RuntimePaths::firecracker().load_snapshot_paths(
@@ -742,7 +717,7 @@ impl NodeManagerService {
             &fc_mem_file_path,
         )
         .await?;
-        Ok(Response::new(LoadSnapshotResponse {}))
+        Ok(Response::new(RestoreVmStateResponse {}))
     }
 
     /// Shared tail of the load-snapshot paths (plaintext source_dir and BYOK
