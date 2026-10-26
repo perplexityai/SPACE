@@ -3,6 +3,7 @@ pub mod boot;
 pub mod cgroup;
 pub mod cgroup_paths;
 pub mod control;
+pub mod device_sanitization;
 pub mod fc_api;
 #[cfg(feature = "host-runtime")]
 pub mod gateway_launch;
