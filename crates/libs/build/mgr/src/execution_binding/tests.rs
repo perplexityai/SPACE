@@ -290,3 +290,62 @@ async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
     .unwrap();
     assert_eq!(other.create_environment(), definition.reference());
 }
+
+#[test]
+fn standalone_seed_records_its_kernel_without_inventing_snapshot_support() {
+    use pplx_space_execution_common::environment::{
+        CLOUD_HYPERVISOR_BOOT_CONTRACT, CLOUD_HYPERVISOR_MACHINE_CONTRACT,
+    };
+    let fc = BuildExecutionBinding::from_response(None, fixture()).unwrap();
+    let mut spec = fc.definition.descriptor().spec().clone();
+    spec.host.architecture = Arch::Aarch64;
+    spec.guest.architecture = Arch::Aarch64;
+    let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
+    release.runtime.kind = RuntimeKind::CloudHypervisor;
+    release.runtime.version = "54.0".parse().unwrap();
+    release.target = spec.host;
+    spec.boot = BootProfile::ArtifactsV1 {
+        contract: CLOUD_HYPERVISOR_BOOT_CONTRACT.parse().unwrap(),
+        artifacts: vec![BootArtifact::new(
+            "boot".parse().unwrap(),
+            ComponentIdentity {
+                kind: ArtifactComponentKind::Kernel,
+                version: "7.2.8+".parse().unwrap(),
+                digest: Digest::sha256([3; 32]),
+            },
+            "linux-image".parse().unwrap(),
+        )],
+    };
+    spec.compatibility = ExecutionCompatibilityProfile::RuntimeV1 {
+        contract: CLOUD_HYPERVISOR_MACHINE_CONTRACT.parse().unwrap(),
+        state_format: None,
+    };
+    let definition = EnvironmentDefinition::new(spec.try_into().unwrap());
+    let execution = definition.execution_requirements().unwrap();
+    let binding = BuildExecutionBinding::from_response(
+        None,
+        ResolveExecutionEnvironmentResponse {
+            definition: Some((&definition).into()),
+            execution: Some((&execution).into()),
+            accepted_selection: 0,
+        },
+    )
+    .unwrap();
+    binding.check_scratch_requirements(Arch::Aarch64).unwrap();
+    let mut command = tokio::process::Command::new("true");
+    binding.configure_scratch(&mut command, None).unwrap();
+    let vars: std::collections::BTreeMap<_, _> = command
+        .as_std()
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.unwrap().to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(vars["SPACE_SEED_RUNTIME"], "cloud-hypervisor");
+    assert_eq!(vars["SPACE_SEED_KERNEL_FORMAT"], "linux-image");
+    assert_eq!(vars["SPACE_SEED_STATE_FORMAT"], "");
+    assert_eq!(vars["SPACE_SEED_STATE_FORMAT_VERSION"], "");
+}
