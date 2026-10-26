@@ -7244,6 +7244,7 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
     Ok(())
 }
 
+mod activating_routes;
 mod backup_generation_fence;
 mod execution_currency;
 mod publication;
