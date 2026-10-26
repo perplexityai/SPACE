@@ -15,6 +15,16 @@ pub(crate) struct Config {
     pub cgroup: PathBuf,
     pub output: PathBuf,
     pub arguments: Vec<String>,
+    pub devices: Option<DeviceContainment>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeviceContainment {
+    pub environment: pplx_space_common_core::types::EnvironmentReference,
+    pub execution: pplx_space_execution_common::devices::DeviceExecution,
+    /// Reserved host-memory budget, including the qualified VMM/IOMMU overhead.
+    pub locked_memory_bytes: u64,
 }
 
 #[cfg(not(target_os = "linux"))]

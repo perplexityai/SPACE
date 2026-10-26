@@ -3003,6 +3003,7 @@ impl DirectSubstrate {
                     let boot_mode = direct_create_boot_mode(request.template_ref.boot_mode)?;
                     let create_response = client
                         .create_sandbox(pplx_space_sbx_mgr_client::proto::CreateRequest {
+                            device_create: None,
                             environment: None,
                             template: request.template_ref.template.as_str().to_string(),
                             owner: request.actor.sandbox_owner.to_string(),

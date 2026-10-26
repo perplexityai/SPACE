@@ -49,6 +49,46 @@ async fn observe_rpc<T>(
 
 #[tonic::async_trait]
 impl NodeManager for NodeManagerService {
+    async fn list_device_parents(
+        &self,
+        request: Request<crate::proto::ListDeviceParentsRequest>,
+    ) -> Result<Response<crate::proto::ListDeviceParentsResponse>, Status> {
+        NodeManagerService::list_device_parents(self, request).await
+    }
+    async fn enroll_device_parent(
+        &self,
+        request: Request<crate::proto::EnrollDeviceParentRequest>,
+    ) -> Result<Response<crate::proto::EnrollDeviceParentResponse>, Status> {
+        NodeManagerService::enroll_device_parent(self, request).await
+    }
+    async fn requalify_device_parent(
+        &self,
+        request: Request<crate::proto::RequalifyDeviceParentRequest>,
+    ) -> Result<Response<crate::proto::RequalifyDeviceParentResponse>, Status> {
+        NodeManagerService::requalify_device_parent(self, request).await
+    }
+    async fn retire_device_parent(
+        &self,
+        request: Request<crate::proto::RetireDeviceParentRequest>,
+    ) -> Result<Response<crate::proto::RetireDeviceParentResponse>, Status> {
+        NodeManagerService::retire_device_parent(self, request).await
+    }
+    async fn get_execution_capabilities(
+        &self,
+        request: Request<crate::proto::GetExecutionCapabilitiesRequest>,
+    ) -> Result<Response<crate::proto::GetExecutionCapabilitiesResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "GetExecutionCapabilities",
+            ALLOW_NODE_ADMIN_OR_SBXMGR,
+        )?;
+        Ok(Response::new(
+            crate::proto::GetExecutionCapabilitiesResponse {
+                exclusive_devices_v1: self.device_pool.enabled(),
+            },
+        ))
+    }
+
     async fn validate_gateway_caller(
         &self,
         request: Request<crate::proto::ValidateGatewayCallerRequest>,

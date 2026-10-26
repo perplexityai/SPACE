@@ -438,6 +438,7 @@ fn disk_artifact_meta() -> (
                 disk_io_max_bandwidth_mib_per_sec: None,
             },
             sandbox: Some(crate::snapshot_upload::SnapshotSandbox {
+                device_requirements: None,
                 owner: "user:019f8000-0000-7000-8000-000000000003".to_string(),
                 snapshots_enabled: true,
                 process_env: std::collections::BTreeMap::new(),

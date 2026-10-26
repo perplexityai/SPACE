@@ -406,6 +406,9 @@ message CreateRequest {
   // Older callers omit these and receive the platform defaults.
   optional uint64 disk_io_max_operations_per_sec = 28;
   optional uint64 disk_io_max_bandwidth_mib_per_sec = 29;
+  // Mutually exclusive with environment, runtime and template. Old peers lack
+  // the required runtime and must refuse before creating a CPU-only sandbox.
+  DeviceCreateInput device_create = 31;
 }
 
 message CreateResponse {
@@ -421,6 +424,7 @@ message CreateResponse {
   bool reused_existing = 8;
   // Present when create also activated or returned an already-active runtime.
   optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 9;
+  optional string accepted_device_requirements_digest = 11;
 }
 
 message StartRequest {
@@ -688,6 +692,7 @@ message SandboxInfo {
   // artifact matches the disk. A time from any other machine isn't
   // comparable. Absent means unknown, not old: older nodes never set it.
   optional google.protobuf.Timestamp current_local_artifact_created_at = 58;
+  space.execution.v1.DeviceRequirements device_requirements = 59;
 }
 
 enum SandboxHealthStatus {
@@ -1772,9 +1777,15 @@ message GetExecutionCapabilitiesRequest {}
 message GetExecutionCapabilitiesResponse {
   // Protocol support only; each exact environment still requires admission.
   bool environment_selection = 1;
+  bool exclusive_devices_v1 = 2;
 }
 
 message EnvironmentCreateInput {
   string reference = 1;
   string template = 2;
+}
+
+message DeviceCreateInput {
+  EnvironmentCreateInput environment = 1;
+  space.execution.v1.DeviceRequirements requirements = 2;
 }
