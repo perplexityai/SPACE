@@ -1,12 +1,13 @@
 //! Durable metadata stored beside a sandbox's node-local files.
 
 use super::{ContentHash, ExecutionMetadata, SandboxId, TemplateName, VcpuCount};
-use pplx_space_execution_spec::devices::DeviceRequirements;
+use pplx_space_execution_spec::{devices::DeviceRequirements, guest_image::GuestImageContract};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Current sandbox `metadata.json` schema version.
 pub const SANDBOX_ARTIFACT_METADATA_VERSION: u32 = 2;
 const DEVICE_ARTIFACT_METADATA_VERSION: u32 = 3;
+const GUEST_ARTIFACT_METADATA_VERSION: u32 = 4;
 
 /// Metadata stored at the sandbox cache root beside `instance/` and `snapshots/`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -23,6 +24,8 @@ pub struct SandboxArtifactMetadata {
     pub cpu_budget: Option<VcpuCount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_requirements: Option<DeviceRequirements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guest_image: Option<GuestImageContract>,
 }
 
 impl SandboxArtifactMetadata {
@@ -40,6 +43,7 @@ impl SandboxArtifactMetadata {
             content_hash,
             cpu_budget: None,
             device_requirements: None,
+            guest_image: None,
         }
     }
 
@@ -55,9 +59,19 @@ impl SandboxArtifactMetadata {
     /// A version change makes readers predating device ownership refuse this
     /// artifact instead of restoring its disk as a CPU-only sandbox.
     pub fn with_device_requirements(mut self, requirements: DeviceRequirements) -> Self {
-        self.schema_version = DEVICE_ARTIFACT_METADATA_VERSION;
+        self.schema_version = self.schema_version.max(DEVICE_ARTIFACT_METADATA_VERSION);
         self.device_requirements = Some(requirements);
         self
+    }
+
+    pub fn with_guest_image(mut self, image: GuestImageContract) -> Self {
+        self.schema_version = GUEST_ARTIFACT_METADATA_VERSION;
+        self.guest_image = Some(image);
+        self
+    }
+
+    pub fn guest_image(&self) -> GuestImageContract {
+        self.guest_image.unwrap_or_default()
     }
 
     pub fn device_requirements(&self) -> Option<&DeviceRequirements> {
@@ -77,6 +91,8 @@ struct SandboxArtifactMetadataWire {
     cpu_budget: Option<VcpuCount>,
     #[serde(default)]
     device_requirements: Option<DeviceRequirements>,
+    #[serde(default)]
+    guest_image: Option<GuestImageContract>,
 }
 
 impl<'de> Deserialize<'de> for SandboxArtifactMetadata {
@@ -85,7 +101,9 @@ impl<'de> Deserialize<'de> for SandboxArtifactMetadata {
         D: Deserializer<'de>,
     {
         let wire = SandboxArtifactMetadataWire::deserialize(deserializer)?;
-        let expected_version = if wire.device_requirements.is_some() {
+        let expected_version = if wire.guest_image.is_some() {
+            GUEST_ARTIFACT_METADATA_VERSION
+        } else if wire.device_requirements.is_some() {
             DEVICE_ARTIFACT_METADATA_VERSION
         } else {
             SANDBOX_ARTIFACT_METADATA_VERSION
@@ -104,6 +122,7 @@ impl<'de> Deserialize<'de> for SandboxArtifactMetadata {
             content_hash: wire.content_hash,
             cpu_budget: wire.cpu_budget,
             device_requirements: wire.device_requirements,
+            guest_image: wire.guest_image,
         })
     }
 }

@@ -249,6 +249,7 @@ fn insert_created_row(
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: None,
             device_requirements: None,
             id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
@@ -806,7 +807,10 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         wire.environment = None;
         // The disk may have been built by an older consumer of the same
         // kernel. The sandbox must keep the newly selected exact consumer.
-        if environment.kernel().version.as_str() == "6.1.155" {
+        if environment
+            .kernel()
+            .is_some_and(|kernel| kernel.version.as_str() == "6.1.155")
+        {
             wire.runtime.as_mut().unwrap().version = "1.15.1".into();
             wire.state_format.as_mut().unwrap().version = "9.0.0".into();
         }
