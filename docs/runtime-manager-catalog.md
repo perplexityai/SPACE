@@ -200,3 +200,37 @@ lost-reply retry, runtime-manager restart/outage and host reboot, verify:
 
 This acceptance requires Linux/KVM and deployment evidence; source review and
 syntax checks do not establish continuity on existing nodes.
+
+## Cloud Hypervisor installation
+
+On Linux/x86_64 and Linux/arm64, the compiled catalog includes the upstream Cloud
+Hypervisor v54.0 static executables. Each download and installed-file SHA-256 pin
+names the same bytes; the catalog also carries its fs-verity measurement (SHA-256,
+4096-byte blocks, no salt). The upstream asset digest verifies transfer
+consistency, not independent build provenance. Source:
+[Cloud Hypervisor v54.0](https://github.com/cloud-hypervisor/cloud-hypervisor/releases/tag/v54.0).
+
+After upgrading node-manager and runtime-manager, local operators can use:
+
+```sh
+space-rtmgr runtimes available --runtime cloud-hypervisor
+space-rtmgr runtimes install cloud-hypervisor-54.0
+space-rtmgr list --kind runtime --wide
+space-rtmgr runtimes uninstall cloud-hypervisor-54.0
+```
+
+The managed release is published under `/space/vendor/artifacts/cloud-hypervisor`,
+independently of Firecracker's store. Runtime-manager's
+`--cloud-hypervisor-release-source` can point at a mirror with the same release
+asset layout; it cannot change the compiled pins. An unsupported architecture
+reports no available pinned release. Omitting `--runtime` from `runtimes available`
+lists Firecracker releases; pass `--runtime cloud-hypervisor` to list CH.
+
+Installation does not add a runnable environment, change defaults, or qualify
+any guest kernel, snapshot format or GPU. Diagnostics report the installed CH
+binary without a fake jailer or memory-state format. Template and sandbox
+execution require the CH adapter and a qualified environment separately.
+
+Upgrade both artifact services before submitting CH installs. An older
+node-manager lacks the pin and refuses publication. Such a failed operation
+must be resubmitted after the upgrade; existing Firecracker work is unaffected.

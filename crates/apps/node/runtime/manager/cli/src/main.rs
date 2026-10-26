@@ -61,9 +61,8 @@ enum Command {
         #[command(subcommand)]
         command: KernelsCommand,
     },
-    /// List, install, and uninstall runtime releases. An install never
-    /// changes the release new sandboxes boot on: that is the release root's
-    /// `default` alias.
+    /// List, install, and uninstall runtime releases. Installation does not
+    /// change the node's execution policy or qualify a runtime for execution.
     Runtimes {
         #[command(subcommand)]
         command: RuntimesCommand,
@@ -155,9 +154,12 @@ enum KernelsCommand {
 
 #[derive(Subcommand)]
 enum RuntimesCommand {
-    /// List the releases this build can install, and whether each is on
-    /// this node.
+    /// List installable releases for one runtime and whether each is on this
+    /// node. Defaults to Firecracker; use --runtime cloud-hypervisor for CH.
     Available {
+        /// Runtime family or release line, such as fc or cloud-hypervisor-54.0.
+        #[arg(long, value_parser = parse_runtime)]
+        runtime: Option<RuntimeArg>,
         /// Print the response as JSON.
         #[arg(long)]
         json: bool,
@@ -222,7 +224,9 @@ fn parse_runtime(value: &str) -> Result<RuntimeArg, String> {
             })
         })
         .ok_or_else(|| {
-            format!("'{value}' is not a runtime; expected fc, or fc-<version> such as fc-1.15")
+            format!(
+                "'{value}' is not a runtime; expected a family such as fc or cloud-hypervisor, or a release such as cloud-hypervisor-54.0"
+            )
         })
 }
 
@@ -236,7 +240,9 @@ struct ReleaseArg {
 fn parse_release(value: &str) -> Result<ReleaseArg, String> {
     let runtime = parse_runtime(value)?;
     let version = runtime.version.ok_or_else(|| {
-        format!("'{value}' names no release; expected fc-<version> such as fc-1.16.2")
+        format!(
+            "'{value}' names no release; expected <runtime>-<version>, such as fc-1.16.2 or cloud-hypervisor-54.0"
+        )
     })?;
     let version = RuntimeVersion::parse(version.strip_prefix('v').unwrap_or(&version))
         .map_err(|error| format!("'{value}' names no release: {error}"))?;
@@ -484,8 +490,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
         },
         Command::Runtimes { command } => match command {
-            RuntimesCommand::Available { json } => {
-                let response = available(&mut client, true, None, None).await?;
+            RuntimesCommand::Available { runtime, json } => {
+                let response = available(&mut client, true, None, runtime.as_ref()).await?;
                 show_available(&response, json)
             }
             RuntimesCommand::Install {
