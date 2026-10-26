@@ -976,6 +976,46 @@ async fn events_stream_does_not_refuse_a_pty_session_whose_sandbox_is_missing() 
     assert!(!fake.called("/SpacedStartProcess"), "nothing was started");
 }
 
+/// The node's `sandbox_not_running` refusal tells the client to wake or
+/// start the sandbox. The attach that follows the hint, even within the
+/// route cache's lifetime, asks the resolver again rather than reusing the
+/// route that was refused, so a start queued since can hold it.
+#[tokio::test]
+async fn an_attach_after_a_not_running_refusal_resolves_its_route_again() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_process_fake(
+        session_id,
+        FakeRoute::unbound(),
+        None,
+        Arc::new(|_, _| {
+            vec![FakeReply::Refuse(
+                pplx_space_common_grpc::mark_sandbox_not_running(
+                    tonic::Status::failed_precondition("synthetic refusal"),
+                    "stopped",
+                ),
+            )]
+        }),
+    )
+    .await;
+    let state = fake_state(&fake.endpoint).await;
+    let lookups = || {
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with("/ResolveDataPlaneSessionRoute"))
+            .count()
+    };
+    for attach in 1..=2 {
+        let response = get_session_events(&state, session_id, None).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "attach {attach}");
+        assert_eq!(lookups(), attach, "attach {attach} asked the resolver");
+    }
+}
+
 /// When the worker cannot say whether the session's process exists, the
 /// attach is answered as retryable rather than refused.
 #[tokio::test]

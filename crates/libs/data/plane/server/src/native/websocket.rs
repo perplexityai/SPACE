@@ -546,6 +546,7 @@ pub(crate) async fn bridge_process_session(
     let mut stream = match initial {
         Ok((_client, initial)) => initial,
         Err(error) => {
+            forget_route_of_refused_sandbox(&state.route_cache, session_id, &error);
             let _ =
                 send_server_frame(&mut sink, &stream_start_error_frame(&error, sandbox_id)).await;
             let _ = sink.close().await;
@@ -862,6 +863,7 @@ pub(crate) async fn bridge_file_watch_session(
     let (_client, mut stream) = match opened {
         Ok(opened) => opened,
         Err(error) => {
+            forget_route_of_refused_sandbox(&state.route_cache, session_id, &error);
             let _ = send_server_frame(
                 &mut sink,
                 &stream_start_error_frame(&error, attached.sandbox_id),

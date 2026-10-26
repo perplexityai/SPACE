@@ -223,6 +223,22 @@ fn sandbox_not_running(
     Some(SandboxNotRunning::new(sandbox_id, &state))
 }
 
+/// After the node refuses work because the sandbox is not running, forget the
+/// session's cached route: the answer tells the client to wake or start the
+/// sandbox, and the attach that follows that hint must reach the resolver,
+/// which holds the route while the activation it queued is on its way.
+pub(super) fn forget_route_of_refused_sandbox(
+    route_cache: &RouteCache,
+    session_id: DataPlaneSessionId,
+    error: &StreamBridgeError,
+) {
+    if let StreamBridgeError::BackendStatus(status) = error
+        && pplx_space_common_grpc::sandbox_not_running_state(status).is_some()
+    {
+        route_cache.forget_native_session(session_id);
+    }
+}
+
 pub(super) fn process_stream_start_http_error(
     error: &StreamBridgeError,
     sandbox_id: SandboxId,

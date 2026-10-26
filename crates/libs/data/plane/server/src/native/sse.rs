@@ -156,6 +156,7 @@ pub(crate) async fn session_events(
                 (attached, ProcessInput::Closed)
             };
             let stream_shutdown_token = state.stream_shutdown_token.clone();
+            let route_cache = Arc::clone(&state.route_cache);
             let opened = before_stream_deadline(
                 &stream_shutdown_token,
                 ProcessSseState::new(
@@ -194,6 +195,7 @@ pub(crate) async fn session_events(
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start process event stream");
+                    forget_route_of_refused_sandbox(&route_cache, session_id, &error);
                     return process_stream_start_http_error(&error, sandbox_id);
                 }
             }
