@@ -5488,7 +5488,7 @@ pub(crate) mod service_tests {
                 &db,
                 &sandbox_id,
                 Err(Status::new(failure, "guest setup failed")),
-                Some(FirecrackerVmState::Paused),
+                Some(VmState::Paused),
             )
             .expect_err("failed guest setup must reach the caller");
 
@@ -5503,7 +5503,7 @@ pub(crate) mod service_tests {
 
     #[test]
     fn resident_resume_env_failure_quarantines_without_confirmed_pause_rollback() {
-        for rollback_vm_state in [Some(FirecrackerVmState::Running), None] {
+        for rollback_vm_state in [Some(VmState::Running), None] {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Resuming);
@@ -5533,16 +5533,8 @@ pub(crate) mod service_tests {
     #[test]
     fn resident_resume_rpc_failure_uses_observed_firecracker_state() {
         for (vm_state, expected_state, should_continue) in [
-            (
-                Some(FirecrackerVmState::Running),
-                SandboxState::Resuming,
-                true,
-            ),
-            (
-                Some(FirecrackerVmState::Paused),
-                SandboxState::Paused,
-                false,
-            ),
+            (Some(VmState::Running), SandboxState::Resuming, true),
+            (Some(VmState::Paused), SandboxState::Paused, false),
             (None, SandboxState::Quarantined, false),
         ] {
             let conn = crate::db::test_conn();
@@ -14685,17 +14677,17 @@ pub(crate) mod service_tests {
 
     #[tokio::test(start_paused = true)]
     async fn startup_resident_recovery_preserves_runtime_and_requires_resume_setup() {
-        use crate::runtime_reconciliation::FirecrackerVmStateObservation as Observation;
+        use crate::runtime_reconciliation::VmStateObservation as Observation;
         for state in [SandboxState::Resuming, SandboxState::Checkpointing] {
             for (observations, runtime, setup_ok, expected) in [
                 (
-                    vec![Some(FirecrackerVmState::Running); 3],
+                    vec![Some(VmState::Running); 3],
                     true,
                     true,
                     SandboxState::Started,
                 ),
                 (
-                    vec![Some(FirecrackerVmState::Paused); 3],
+                    vec![Some(VmState::Paused); 3],
                     true,
                     true,
                     if state == SandboxState::Checkpointing {
@@ -14705,7 +14697,7 @@ pub(crate) mod service_tests {
                     },
                 ),
                 (
-                    vec![Some(FirecrackerVmState::NotStarted); 3],
+                    vec![Some(VmState::NotStarted); 3],
                     true,
                     true,
                     SandboxState::Quarantined,
@@ -14713,9 +14705,9 @@ pub(crate) mod service_tests {
                 (vec![None; 3], true, true, SandboxState::Quarantined),
                 (
                     vec![
-                        Some(FirecrackerVmState::Running),
-                        Some(FirecrackerVmState::Paused),
-                        Some(FirecrackerVmState::Running),
+                        Some(VmState::Running),
+                        Some(VmState::Paused),
+                        Some(VmState::Running),
                     ],
                     true,
                     true,
@@ -14723,7 +14715,7 @@ pub(crate) mod service_tests {
                 ),
                 (vec![], false, true, SandboxState::Quarantined),
                 (
-                    vec![Some(FirecrackerVmState::Running); 3],
+                    vec![Some(VmState::Running); 3],
                     true,
                     false,
                     SandboxState::Quarantined,
@@ -14817,7 +14809,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test(start_paused = true)]
     async fn startup_resident_recovery_does_not_persist_peer_error_payloads() {
-        use crate::runtime_reconciliation::FirecrackerVmStateObservation as Observation;
+        use crate::runtime_reconciliation::VmStateObservation as Observation;
         use tracing_subscriber::prelude::*;
         const PAYLOAD: &str = "guest-controlled-secret-and-forged-event";
         for probe_fails in [false, true] {
@@ -14837,7 +14829,7 @@ pub(crate) mod service_tests {
                         if probe_fails {
                             Observation::Unobservable(PAYLOAD.into())
                         } else {
-                            Observation::Observed(FirecrackerVmState::Running)
+                            Observation::Observed(VmState::Running)
                         }
                     },
                     |_| async { Err(Status::unavailable(PAYLOAD)) },
@@ -14872,7 +14864,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test(start_paused = true)]
     async fn startup_resident_recovery_rejects_changed_identity_and_cleanup_ownership() {
-        use crate::runtime_reconciliation::FirecrackerVmStateObservation as Observation;
+        use crate::runtime_reconciliation::VmStateObservation as Observation;
         for replace_pid in [false, true] {
             let conn = crate::db::test_conn();
             let id = SandboxId::new().to_string();
@@ -14898,7 +14890,7 @@ pub(crate) mod service_tests {
                             )
                             .unwrap();
                         }
-                        async { Observation::Observed(FirecrackerVmState::Running) }
+                        async { Observation::Observed(VmState::Running) }
                     },
                     |_| async { panic!("checkpoint recovery must not configure resume") },
                 )
@@ -14919,11 +14911,11 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn startup_recovery_heals_definitive_pause_and_quarantines_ambiguity() {
-        use crate::runtime_reconciliation::FirecrackerVmStateObservation;
+        use crate::runtime_reconciliation::VmStateObservation;
 
         for (observed, expected) in [
-            (FirecrackerVmState::Running, SandboxState::Started),
-            (FirecrackerVmState::Paused, SandboxState::Paused),
+            (VmState::Running, SandboxState::Started),
+            (VmState::Paused, SandboxState::Paused),
         ] {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
@@ -14937,7 +14929,7 @@ pub(crate) mod service_tests {
                     let probe_count = Arc::clone(&probe_count);
                     move |_| {
                         probe_count.fetch_add(1, Ordering::Relaxed);
-                        async move { FirecrackerVmStateObservation::Observed(observed) }
+                        async move { VmStateObservation::Observed(observed) }
                     }
                 })
                 .await
@@ -14965,12 +14957,7 @@ pub(crate) mod service_tests {
         let service = SandboxManagerService::for_test(conn);
         let row = service.lookup_sandbox(&sandbox_id).unwrap();
         let observations = Arc::new(Mutex::new(
-            [
-                FirecrackerVmState::Running,
-                FirecrackerVmState::Paused,
-                FirecrackerVmState::Running,
-            ]
-            .into_iter(),
+            [VmState::Running, VmState::Paused, VmState::Running].into_iter(),
         ));
 
         let record = service
@@ -14978,7 +14965,7 @@ pub(crate) mod service_tests {
                 let observations = Arc::clone(&observations);
                 move |_| {
                     let observed = observations.lock().unwrap().next().unwrap();
-                    async move { FirecrackerVmStateObservation::Observed(observed) }
+                    async move { VmStateObservation::Observed(observed) }
                 }
             })
             .await
@@ -15371,8 +15358,8 @@ pub(crate) mod service_tests {
 
     #[tokio::test(start_paused = true)]
     async fn paused_recovery_never_claims_lost_memory_was_resumed() {
-        use crate::runtime_reconciliation::FirecrackerVmStateObservation as Observation;
-        use FirecrackerVmState::{NotStarted, Paused, Running};
+        use crate::runtime_reconciliation::VmStateObservation as Observation;
+        use VmState::{NotStarted, Paused, Running};
         // None = absent, Some(false) = resolving symlink, Some(true) = ELOOP.
         for pid_witness in [None, Some(false), Some(true)] {
             for (observations, stays_paused) in [

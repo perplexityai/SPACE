@@ -13,6 +13,7 @@ impl NodeManagerService {
     pub(super) async fn resolve_compatible_environment(
         &self,
         request: Compatible,
+        definition_schema: u32,
     ) -> Result<ResolveExecutionEnvironmentResponse, Status> {
         let (Compatible::ColdBootSource(execution) | Compatible::RestoreSource(execution)) =
             &request;
@@ -46,7 +47,11 @@ impl NodeManagerService {
             );
         }
         Ok(ResolveExecutionEnvironmentResponse {
-            definition: Some(definition.into()),
+            definition: Some(
+                definition
+                    .for_peer(definition_schema)
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?,
+            ),
             execution: Some((&selected.execution).into()),
             accepted_selection: acknowledgement as i32,
         })

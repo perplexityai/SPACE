@@ -906,7 +906,7 @@ fn protected_launch_admission_preserves_binding_and_restore_rules() {
 }
 
 #[tokio::test]
-async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
+async fn launch_identity_is_checked_before_rpc_and_acknowledgement_before_acceptance() {
     use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
     use pplx_space_node_runtime_core::proto;
     use std::sync::{
@@ -919,21 +919,25 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
             .definition()
             .unwrap()
             .reference();
-    for accepted in [
-        reference.to_string(),
-        String::new(),
-        format!("sha256:{}", "ff".repeat(32)),
+    for (dual_identity, accepted) in [
+        (false, reference.to_string()),
+        (false, String::new()),
+        (false, format!("sha256:{}", "ff".repeat(32))),
+        (true, reference.to_string()),
     ] {
         let (mut service, lease) = allocated_service().await;
         let fence =
             super::super::tests::service_tests::bind_test_execution(&service, &lease.sandbox_id);
         let stops = Arc::new(AtomicUsize::new(0));
         let stop_calls = stops.clone();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launch_calls = launches.clone();
         let sandbox_id = lease.sandbox_id.clone();
         let expected_execution = fence.execution_id.clone();
         let matches = accepted == reference.to_string();
         service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
             launch: Some(Arc::new(move |request| {
+                launch_calls.fetch_add(1, Ordering::SeqCst);
                 assert!(request.sandbox_id.is_empty());
                 assert_eq!(
                     request.verified_runtime.unwrap().environment_reference,
@@ -957,7 +961,13 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
             .launch_admitted_runtime(
                 &lease.sandbox_id,
                 proto::LaunchFirecrackerRequest {
+                    sandbox_id: if dual_identity {
+                        lease.sandbox_id.clone()
+                    } else {
+                        String::new()
+                    },
                     execution_id: fence.execution_id,
+                    jailer_bin: "/runtime/bin/jailer".into(),
                     verified_runtime: Some(proto::VerifiedRuntimeLaunch {
                         sandbox_id: lease.sandbox_id.clone(),
                         environment_reference: reference.to_string(),
@@ -969,12 +979,18 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
                 },
             )
             .await;
-        if matches {
+        if dual_identity {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+        } else if matches {
             result.unwrap();
         } else {
             assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
         }
-        assert_eq!(stops.load(Ordering::SeqCst), usize::from(!matches));
+        assert_eq!(launches.load(Ordering::SeqCst), usize::from(!dual_identity));
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            usize::from(!dual_identity && !matches)
+        );
         assert!(
             service
                 .pool

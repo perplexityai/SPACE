@@ -2820,8 +2820,7 @@ impl SandboxManagerService {
     /// [`BeforeStopFlush`].
     async fn resume_paused_vm_before_flush(&self, sandbox_id: &str) -> Result<(), StopFlushError> {
         let id = SandboxId::from_str(sandbox_id).map_err(StopFlushError::SandboxId)?;
-        let state =
-            crate::firecracker_via_nodemgr::get_firecracker_vm_state(id, &self.node_manager).await;
+        let state = crate::runtime_via_nodemgr::get_vm_state(id, &self.node_manager).await;
         if let Err(error) = &state {
             tracing::debug!(%sandbox_id, %error, "VM state unreadable before the stop flush");
         }
@@ -2909,13 +2908,13 @@ pub(super) enum BeforeStopFlush {
 
 impl BeforeStopFlush {
     pub(super) fn for_vm_state(
-        state: Option<pplx_space_node_runtime_core::fc_api::FirecrackerVmState>,
+        state: Option<pplx_space_node_runtime_core::vm_state::VmState>,
     ) -> Self {
-        use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+        use pplx_space_node_runtime_core::vm_state::VmState;
         match state {
-            Some(FirecrackerVmState::Running) | None => Self::Flush,
-            Some(FirecrackerVmState::Paused) => Self::ResumeThenFlush,
-            Some(FirecrackerVmState::NotStarted) => Self::NotRunning,
+            Some(VmState::Running) | None => Self::Flush,
+            Some(VmState::Paused) => Self::ResumeThenFlush,
+            Some(VmState::NotStarted) => Self::NotRunning,
         }
     }
 }
