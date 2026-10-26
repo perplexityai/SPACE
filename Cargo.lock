@@ -4838,6 +4838,7 @@ dependencies = [
  "kube",
  "log",
  "oci-spec",
+ "percent-encoding",
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
  "pplx-space-cluster-pool",
