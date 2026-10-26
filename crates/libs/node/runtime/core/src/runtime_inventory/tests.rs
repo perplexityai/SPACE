@@ -156,17 +156,17 @@ fn installation(release: &str, state: &str) -> RuntimeInstallation {
             os: GuestOperatingSystem::Linux,
             architecture: host_arch().unwrap(),
         },
-        state_format: StateFormatIdentity {
+        state_format: Some(StateFormatIdentity {
             format: StateFormatName::parse(FIRECRACKER_STATE_FORMAT).unwrap(),
             version: StateFormatVersion::parse(state).unwrap(),
-        },
+        }),
         files: RuntimeInstallationFiles::new([
             (
-                RuntimeFileRole::FirecrackerBinary,
+                RuntimeFileRole::RuntimeExecutable,
                 PathBuf::from(format!("/{release}/firecracker")),
             ),
             (
-                RuntimeFileRole::JailerBinary,
+                RuntimeFileRole::LauncherExecutable,
                 PathBuf::from(format!("/{release}/jailer")),
             ),
         ]),
@@ -200,7 +200,7 @@ fn requested(
     ExecutionMetadata::new(
         installation.runtime,
         installation.guest,
-        Some(installation.state_format),
+        installation.state_format,
         components,
     )
     .unwrap()
@@ -745,7 +745,15 @@ fn discovery_does_not_execute_firecracker_binaries() {
     .unwrap();
 
     assert_eq!(inventory.runtimes[0].runtime.version.as_str(), "1.15.1");
-    assert_eq!(inventory.runtimes[0].state_format.version.as_str(), "9.0.0");
+    assert_eq!(
+        inventory.runtimes[0]
+            .state_format
+            .as_ref()
+            .unwrap()
+            .version
+            .as_str(),
+        "9.0.0"
+    );
     assert!(!firecracker_marker.exists());
     assert!(!jailer_marker.exists());
 }
@@ -1440,4 +1448,57 @@ fn compatible_fallback_orders_versions_and_refuses_equal_ranked_identities() {
             }
         }
     }
+}
+
+#[test]
+fn cold_only_runtime_has_no_launcher_or_snapshot_claims() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("bin")).unwrap();
+    std::fs::write(
+        root.path().join("bin/cloud-hypervisor"),
+        b"synthetic verified payload",
+    )
+    .unwrap();
+    let driver = cloud_hypervisor::CloudHypervisorDriver;
+    let installation = driver
+        .inspect_installation(
+            root.path().to_owned(),
+            RuntimeVersion::parse("54.0").unwrap(),
+        )
+        .unwrap();
+    assert!(
+        installation
+            .files
+            .path(RuntimeFileRole::RuntimeExecutable)
+            .is_some()
+    );
+    assert!(
+        installation
+            .files
+            .path(RuntimeFileRole::LauncherExecutable)
+            .is_none()
+    );
+    let source = ExecutionMetadata::new(
+        installation.runtime.clone(),
+        installation.guest,
+        None,
+        vec![],
+    )
+    .unwrap();
+    let bound = source
+        .clone()
+        .with_environment(EnvironmentReference::new(Digest::sha256([31; 32])));
+    for (mode, requested, allowed) in [
+        (ExecutionSelectionMode::NewColdBoot, &bound, true),
+        (ExecutionSelectionMode::ExistingColdBoot, &bound, true),
+        (ExecutionSelectionMode::PersistedStateRestore, &bound, false),
+        (ExecutionSelectionMode::NewColdBoot, &source, false),
+    ] {
+        assert_eq!(
+            driver.can_execute(&installation, requested, mode).unwrap(),
+            allowed
+        );
+    }
+    let reported = inventory(vec![installation]).to_proto();
+    assert!(reported.runtimes[0].state_formats.is_empty());
 }
