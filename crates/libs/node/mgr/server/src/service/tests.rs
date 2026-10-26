@@ -678,7 +678,11 @@ pub(super) mod service_tests {
                 assets: vacant.join("assets"),
                 kernels: vacant.join("kernels"),
                 store: crate::config::ArtifactStorePaths {
-                    releases: vacant.join("store/releases"),
+                    releases: [(
+                        pplx_space_common_core::types::RuntimeKind::Firecracker,
+                        vacant.join("store/releases"),
+                    )]
+                    .into(),
                     kernels: vacant.join("store/kernels"),
                     staging: vacant.join("staging"),
                     catalog: vacant.join("catalog"),
@@ -752,7 +756,11 @@ pub(super) mod service_tests {
         }
         std::fs::create_dir(&assets).unwrap();
         let store = crate::config::ArtifactStorePaths {
-            releases: root.path().join("store/releases"),
+            releases: [(
+                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                root.path().join("store/releases"),
+            )]
+            .into(),
             kernels: root.path().join("store/kernels"),
             staging: root.path().join("staging"),
             catalog: root.path().join("catalog"),
