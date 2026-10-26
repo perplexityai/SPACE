@@ -138,7 +138,11 @@ enum IsolationClass {
 
 enum RuntimePayloadLayout {
   RUNTIME_PAYLOAD_LAYOUT_UNSPECIFIED = 0;
+  // Legacy schema-1 encoding only. Keep its number and meaning immutable.
   RUNTIME_PAYLOAD_LAYOUT_FIRECRACKER_RELEASE_V1 = 1;
+  // The trusted artifact catalog owns executable roles and file layout.
+  // Archive formats, paths, and per-runtime binary counts are not wire contracts.
+  RUNTIME_PAYLOAD_LAYOUT_CATALOG_RELEASE_V1 = 2;
 }
 
 message ManagedRuntimeRelease {
@@ -168,10 +172,27 @@ message EnvironmentComponent {
 
 message BootProfile {
   oneof profile {
+    // Legacy schema-1 encoding.
     LinuxDirectBootV1 linux_direct_v1 = 1;
+    ArtifactBootProfileV1 artifacts_v1 = 2;
   }
 }
 
+// Runtime-neutral boot inputs. The versioned contract names immutable boot
+// semantics implemented by the adapter; it never names a node-local path.
+message ArtifactBootProfileV1 {
+  string contract = 1;
+  repeated BootArtifact artifacts = 2;
+}
+
+message BootArtifact {
+  // Unique within this boot profile; e.g. boot, firmware, or system-disk.
+  string role = 1;
+  EnvironmentComponent component = 2;
+  string format = 3;
+}
+
+// Legacy schema-1 encoding only, retained for existing identities and peers.
 message FirecrackerSnapshotCompatibilityV1 {
   StateFormatIdentity state_format = 1;
 }
@@ -179,7 +200,17 @@ message FirecrackerSnapshotCompatibilityV1 {
 message ExecutionCompatibilityProfile {
   oneof profile {
     FirecrackerSnapshotCompatibilityV1 firecracker_snapshot_v1 = 1;
+    RuntimeCompatibilityV1 runtime_v1 = 2;
   }
+}
+
+message RuntimeCompatibilityV1 {
+  // Immutable machine/device ABI contract, qualified by the trusted catalog.
+  // Adding an approved replacement does not change this identifier.
+  string contract = 1;
+  // Absent means this environment has no memory-state contract. It does not
+  // mean unknown or a default format. Presence alone does not grant restore.
+  StateFormatIdentity state_format = 2;
 }
 
 message EnvironmentDescriptor {

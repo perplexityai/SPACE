@@ -65,7 +65,7 @@ pub(super) fn test_health() -> SandboxHealth {
         guest_healthy: true,
         guest_ready: false,
         consecutive_guest_probe_failures: 0,
-        firecracker_alive: true,
+        runtime_alive: true,
         vsock_raw_ping_ok: false,
         spaced_host_alive: true,
         netgtw_alive: false,
@@ -354,7 +354,7 @@ async fn watchdog_with_committed_gateway(
     {
         let mut state = watchdog.state.lock().await;
         let health = state.get_mut(sandbox_id).expect("sandbox health");
-        health.firecracker_alive = true;
+        health.runtime_alive = true;
         health.netgtw_git_sha = Some("sha-old".to_string());
         health.netgtw_identity_profile_version = Some(1);
         health.netgtw_route_verification_key_generation = Some(7);
@@ -698,7 +698,7 @@ async fn gateway_stats_are_fenced_to_the_observed_process() {
             .get_health(SANDBOX_ID)
             .await
             .expect("sandbox health")
-            .firecracker_alive,
+            .runtime_alive,
         "the normal observation fixture must represent a live VM"
     );
     assert!(observe_live_gateway(&watchdog, SANDBOX_ID, OLD_PID).await);
@@ -770,7 +770,7 @@ async fn gateway_stats_are_fenced_to_the_observed_process() {
         health.netgtw_tls_interception_mode,
         NetGatewayTlsInterceptionMode::Off
     );
-    health.firecracker_alive = false;
+    health.runtime_alive = false;
     drop(state);
 
     assert!(
@@ -881,7 +881,7 @@ fn guest_health_classifier_uses_firecracker_and_guest_path() {
     );
 
     let mut unreachable = test_health();
-    unreachable.firecracker_alive = false;
+    unreachable.runtime_alive = false;
     assert_eq!(
         classify_guest_health(GuestHealthProbe::from(&unreachable)),
         GuestHealthCategory::Unreachable
@@ -923,7 +923,7 @@ fn guest_health_counts_bucket_rows_by_lifecycle_and_health() {
     degraded.guest_healthy = false;
     health.insert("started-degraded".to_string(), degraded);
     let mut unreachable = test_health();
-    unreachable.firecracker_alive = false;
+    unreachable.runtime_alive = false;
     health.insert("paused-unreachable".to_string(), unreachable);
     let health_snapshot = health
         .iter()
@@ -933,7 +933,7 @@ fn guest_health_counts_bucket_rows_by_lifecycle_and_health() {
     let counts = guest_health_gauge_counts(&rows, &health_snapshot, |sandbox_id| {
         assert_eq!(sandbox_id, "started-missing");
         GuestHealthProbe {
-            firecracker_alive: true,
+            runtime_alive: true,
             guest_healthy: false,
             spaced_host_alive: true,
             consecutive_guest_probe_failures: GUEST_HEALTH_FAILURE_THRESHOLD,
@@ -1224,7 +1224,7 @@ fn firecracker_api_failure_does_not_change_process_liveness() {
     );
 
     assert!(
-        health.firecracker_alive,
+        health.runtime_alive,
         "API reachability must not become destructive process-liveness evidence"
     );
 }
