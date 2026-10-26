@@ -12624,6 +12624,7 @@ type GetExecutionCapabilitiesResponse struct {
 	// Protocol support only; each exact environment still requires admission.
 	EnvironmentSelection bool `protobuf:"varint,1,opt,name=environment_selection,json=environmentSelection,proto3" json:"environment_selection,omitempty"`
 	ExclusiveDevicesV1   bool `protobuf:"varint,2,opt,name=exclusive_devices_v1,json=exclusiveDevicesV1,proto3" json:"exclusive_devices_v1,omitempty"`
+	FirmwareGuestsV1     bool `protobuf:"varint,3,opt,name=firmware_guests_v1,json=firmwareGuestsV1,proto3" json:"firmware_guests_v1,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -12668,6 +12669,13 @@ func (x *GetExecutionCapabilitiesResponse) GetEnvironmentSelection() bool {
 func (x *GetExecutionCapabilitiesResponse) GetExclusiveDevicesV1() bool {
 	if x != nil {
 		return x.ExclusiveDevicesV1
+	}
+	return false
+}
+
+func (x *GetExecutionCapabilitiesResponse) GetFirmwareGuestsV1() bool {
+	if x != nil {
+		return x.FirmwareGuestsV1
 	}
 	return false
 }
@@ -13912,10 +13920,11 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"6\n" +
 	"\x18WaitTemplateAppsResponse\x12\x1a\n" +
 	"\bwarnings\x18\x01 \x03(\tR\bwarnings\"!\n" +
-	"\x1fGetExecutionCapabilitiesRequest\"\x89\x01\n" +
+	"\x1fGetExecutionCapabilitiesRequest\"\xb7\x01\n" +
 	" GetExecutionCapabilitiesResponse\x123\n" +
 	"\x15environment_selection\x18\x01 \x01(\bR\x14environmentSelection\x120\n" +
-	"\x14exclusive_devices_v1\x18\x02 \x01(\bR\x12exclusiveDevicesV1\"R\n" +
+	"\x14exclusive_devices_v1\x18\x02 \x01(\bR\x12exclusiveDevicesV1\x12,\n" +
+	"\x12firmware_guests_v1\x18\x03 \x01(\bR\x10firmwareGuestsV1\"R\n" +
 	"\x16EnvironmentCreateInput\x12\x1c\n" +
 	"\treference\x18\x01 \x01(\tR\treference\x12\x1a\n" +
 	"\btemplate\x18\x02 \x01(\tR\btemplate\"\xb3\x01\n" +
