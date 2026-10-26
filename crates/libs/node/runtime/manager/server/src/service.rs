@@ -60,7 +60,7 @@ pub struct RuntimeManagerService {
     audit_identity: AuditIdentity,
     peer_authorizer: UdsPeerAuthorizer,
     /// Where available kernels are listed from and installs download from.
-    kernel_source: Option<Arc<dyn KernelSource>>,
+    kernel_source: crate::installs::source::KernelSources,
     pins: Option<Arc<dyn crate::installs::PinSource>>,
     releases: crate::installs::ReleaseSources,
     /// Present unless the service runs list-only.
@@ -87,7 +87,7 @@ impl RuntimeManagerService {
                 SERVICE_NAME.as_str(),
                 [UdsPeerAccount::with_linux_user(users::SPACE_NODECTL)],
             ),
-            kernel_source: None,
+            kernel_source: Default::default(),
             installer: None,
             pins: None,
             releases: Default::default(),
@@ -95,8 +95,11 @@ impl RuntimeManagerService {
     }
 
     /// List available kernels from `source`.
-    pub(crate) fn with_kernel_source(mut self, source: Arc<dyn KernelSource>) -> Self {
-        self.kernel_source = Some(source);
+    pub(crate) fn with_kernel_source(
+        mut self,
+        source: crate::installs::source::KernelSources,
+    ) -> Self {
+        self.kernel_source = source;
         self
     }
 
@@ -125,8 +128,11 @@ impl RuntimeManagerService {
         })
     }
 
-    fn kernel_source(&self) -> Result<&Arc<dyn KernelSource>, Status> {
-        self.kernel_source.as_ref().ok_or_else(|| {
+    fn kernel_source(
+        &self,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+    ) -> Result<&Arc<dyn KernelSource>, Status> {
+        self.kernel_source.get(runtime).ok_or_else(|| {
             Status::failed_precondition("the runtime manager has no kernel source configured")
         })
     }
@@ -435,12 +441,7 @@ impl RuntimeManager for RuntimeManagerService {
             .map_err(|error| Status::failed_precondition(describe(&error)))?;
         let mut offered = Vec::new();
         if kinds.kernels {
-            let source = self.kernel_source()?;
-            if source.runtime() != runtime {
-                return Err(Status::failed_precondition(
-                    "no component adapter for this runtime",
-                ));
-            }
+            let source = self.kernel_source(runtime)?;
             let mut lines = match line {
                 Some(line) => vec![line],
                 None => catalog
