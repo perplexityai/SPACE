@@ -36,9 +36,8 @@ async fn get_vm_state_inner(
         WireVmState::NotStarted => Ok(VmState::NotStarted),
         WireVmState::Running => Ok(VmState::Running),
         WireVmState::Paused => Ok(VmState::Paused),
-        WireVmState::Unspecified | WireVmState::Shutdown => {
-            Err(RuntimeStateReadError::UnsupportedState(response.state))
-        }
+        WireVmState::Shutdown => Ok(VmState::Shutdown),
+        WireVmState::Unspecified => Err(RuntimeStateReadError::UnsupportedState(response.state)),
     }
 }
 
