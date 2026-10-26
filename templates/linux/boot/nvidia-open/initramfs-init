@@ -1,0 +1,40 @@
+#!/bin/busybox sh
+set -eu
+export PATH=/bin
+/bin/busybox --install -s /bin
+fail() {
+    echo "GPU boot preparation failed: $*" >/dev/console
+    # A failed trusted boot must not continue with template-provided modules.
+    reboot -f
+    exit 1
+}
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+root_device=
+for argument in $(cat /proc/cmdline); do
+    case "$argument" in root=*) root_device=${argument#root=} ;; esac
+done
+case "$root_device" in /dev/vd[a-z]|/dev/vd[a-z][0-9]) ;; *) fail 'unsupported root device' ;; esac
+# Template builds boot the same environment without leasing hardware. Device
+# admission owns assignment; a GPU-bearing boot must load the trusted modules.
+has_gpu=false
+for device in /sys/bus/pci/devices/*; do
+    [ "$(cat "$device/vendor")" = 0x10de ] || continue
+    case "$(cat "$device/class")" in 0x03*) has_gpu=true ;; esac
+done
+if "$has_gpu"; then
+    insmod /modules/nvidia.ko || fail 'NVIDIA module refused'
+    insmod /modules/nvidia-uvm.ko uvm_disable_hmm=1 || fail 'NVIDIA UVM module refused'
+fi
+# Root discovery is bounded; virtual block enumeration can complete after init.
+remaining=100
+until mount -t ext4 -o rw "$root_device" /newroot; do
+    remaining=$((remaining - 1))
+    [ "$remaining" -gt 0 ] || fail 'root disk unavailable'
+    sleep 0.1
+done
+mount --move /dev /newroot/dev
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+exec switch_root /newroot /sbin/init

@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+FROM ubuntu:24.04@sha256:a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc AS tools
+
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+RUN test "$TARGETARCH" = amd64 \
+    && apt-get -o Acquire::Retries=5 update --error-on=any \
+    && apt-get install -y --no-install-recommends \
+        bc binutils bison build-essential busybox-static ca-certificates cpio curl \
+        dwarves flex git kmod libelf-dev libssl-dev openssl python3 xz-utils \
+        nvidia-firmware-580-580.178.04=580.178.04-0ubuntu0.24.04.1 \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM tools AS source
+ENV KERNEL_VERSION=6.1.155 \
+    NVIDIA_VERSION=580.178.04 \
+    KBUILD_BUILD_USER=space \
+    KBUILD_BUILD_HOST=gpu-kernel-builder
+WORKDIR /build
+RUN git init linux \
+    && git -C linux remote add origin https://github.com/amazonlinux/linux.git \
+    && git -C linux fetch --depth 1 origin 069c93d2b7bddda87c472453c38c450faf86f999 \
+    && git -C linux checkout --detach FETCH_HEAD \
+    && test "$(git -C linux rev-parse HEAD)" = 069c93d2b7bddda87c472453c38c450faf86f999 \
+    && git -C linux show -s --format=%ct HEAD > source-date-epoch \
+    && rm -rf linux/.git
+RUN curl --fail --location --retry 5 -o base.config \
+        https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155.config \
+    && echo '024b2aae62fe7131f9a9ab80f27619c882c0a37265dd105adae01d2867bef7c3  base.config' | sha256sum --check --strict \
+    && curl --fail --location --retry 5 -o nvidia.tar.gz \
+        https://codeload.github.com/NVIDIA/open-gpu-kernel-modules/tar.gz/refs/tags/580.178.04 \
+    && echo 'f30d4c20feda9f570a69084573a72423067e1e2d46c50ca58c391664872a9e01  nvidia.tar.gz' | sha256sum --check --strict \
+    && mkdir nvidia \
+    && tar -xzf nvidia.tar.gz -C nvidia --strip-components=1 \
+    && rm nvidia.tar.gz
+
+FROM source AS build
+ARG BUILD_JOBS=16
+COPY gpu.config gpu-module-kconfig.patch build-source-bundle.sh initramfs-init /build/
+# The private signing key is generated, used and deleted in this single layer.
+RUN --mount=type=tmpfs,target=/signing \
+    BUILD_JOBS="$BUILD_JOBS" bash /build/build-source-bundle.sh
+
+FROM scratch AS export
+COPY --from=build /output/ /
