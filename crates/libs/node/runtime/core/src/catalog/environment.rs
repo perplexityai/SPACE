@@ -8,6 +8,12 @@ use super::{CatalogError, InitialEnvironment, PinnedKernel, PinnedRelease, Runti
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompiledEnvironmentDefinitionError {
+    #[error(transparent)]
+    Contract(#[from] ExecutionContractIdParseError),
+    #[error(transparent)]
+    Role(#[from] ArtifactComponentRoleParseError),
+    #[error(transparent)]
+    Format(#[from] ArtifactFormatParseError),
     #[error("no supported compiled environment descriptor for architecture {0}")]
     UnsupportedArchitecture(Arch),
     #[error("invalid compiled environment descriptor: {0}")]
@@ -39,7 +45,7 @@ impl InitialEnvironment {
         let definition = self.definition()?;
         Ok(CompiledEnvironment {
             runtime_ordering_key: semver::Version::parse(self.release.release.version.as_str())?,
-            initial_reference: definition.reference(),
+            initial_reference: Some(definition.reference()),
             release: self.release.clone(),
             kernel: self.kernel.clone(),
             definition,
@@ -128,7 +134,7 @@ pub struct CompiledEnvironment {
     memory_state: bool,
     name: &'static str,
     runtime_ordering_key: semver::Version,
-    initial_reference: EnvironmentReference,
+    initial_reference: Option<EnvironmentReference>,
 }
 
 impl CompiledEnvironment {
@@ -142,11 +148,13 @@ impl CompiledEnvironment {
         let definition = definition_from_pins(&release, &kernel, state_version).unwrap();
         Self {
             runtime_ordering_key: semver::Version::parse(release.release.version.as_str()).unwrap(),
-            initial_reference: InitialEnvironment::for_architecture(release.architecture)
-                .unwrap()
-                .definition()
-                .unwrap()
-                .reference(),
+            initial_reference: Some(
+                InitialEnvironment::for_architecture(release.architecture)
+                    .unwrap()
+                    .definition()
+                    .unwrap()
+                    .reference(),
+            ),
             release,
             kernel,
             definition,
@@ -181,8 +189,8 @@ impl CompiledEnvironment {
     /// Build an owned catalog for startup validation and qualification tests.
     /// Repeated execution lookups use `cached_for_architecture` instead.
     pub fn for_architecture(architecture: Arch) -> Result<Vec<Self>, CatalogError> {
-        if architecture != Arch::X86_64 {
-            return Ok(Vec::new());
+        if architecture == Arch::Aarch64 {
+            return Ok(vec![Self::cloud_hypervisor(architecture)?]);
         }
         let catalog = RuntimeCatalog::compiled()?;
         let initial_reference = InitialEnvironment::for_architecture(architecture)?
@@ -191,7 +199,7 @@ impl CompiledEnvironment {
             .reference();
         // Complete bindings are approved independently of downloadable release pins.
         // Memory-state compatibility must be qualified before it is advertised.
-        [
+        let mut environments: Vec<Self> = [
             (
                 "e0",
                 "1.15.1",
@@ -233,7 +241,7 @@ impl CompiledEnvironment {
                 .map_err(CatalogError::EnvironmentDefinition)?;
             Ok(Self {
                 runtime_ordering_key,
-                initial_reference,
+                initial_reference: Some(initial_reference),
                 release: release.clone(),
                 kernel: kernel_pin.clone(),
                 definition,
@@ -241,11 +249,44 @@ impl CompiledEnvironment {
                 name,
             })
         })
-        .collect()
+        .collect::<Result<_, CatalogError>>()?;
+        environments.push(Self::cloud_hypervisor(architecture)?);
+        Ok(environments)
+    }
+
+    fn cloud_hypervisor(architecture: Arch) -> Result<Self, CatalogError> {
+        let catalog = RuntimeCatalog::compiled()?;
+        let missing = || CatalogError::MissingEnvironmentPins {
+            runtime: "54.0",
+            kernel: "7.2.8+",
+        };
+        let release = catalog
+            .releases(RuntimeKind::CloudHypervisor, architecture)
+            .find(|pin| pin.release.version.as_str() == "54.0")
+            .ok_or_else(missing)?
+            .clone();
+        let kernel = catalog
+            .all_kernels(architecture)
+            .find(|pin| {
+                pin.runtime == RuntimeKind::CloudHypervisor && pin.version.as_str() == "7.2.8+"
+            })
+            .ok_or_else(missing)?
+            .clone();
+        let definition = standalone_definition(&release, &kernel)
+            .map_err(CatalogError::EnvironmentDefinition)?;
+        Ok(Self {
+            runtime_ordering_key: semver::Version::new(54, 0, 0),
+            initial_reference: None,
+            release,
+            kernel,
+            definition,
+            memory_state: false,
+            name: "ch-54.0-linux-7.2.8",
+        })
     }
 
     pub fn is_initial(&self) -> bool {
-        self.definition.reference() == self.initial_reference
+        Some(self.definition.reference()) == self.initial_reference
     }
 
     pub(crate) fn runtime_ordering_key(&self) -> &semver::Version {
@@ -272,3 +313,55 @@ impl CompiledEnvironment {
 
 #[cfg(test)]
 mod tests;
+
+use pplx_space_execution_common::environment::{
+    CLOUD_HYPERVISOR_BOOT_CONTRACT, CLOUD_HYPERVISOR_MACHINE_CONTRACT,
+};
+
+fn standalone_definition(
+    release: &PinnedRelease,
+    kernel: &PinnedKernel,
+) -> Result<EnvironmentDefinition, CompiledEnvironmentDefinitionError> {
+    let host = HostPlatform {
+        os: HostOperatingSystem::Linux,
+        architecture: release.architecture,
+    };
+    Ok(EnvironmentDefinition::new(
+        EnvironmentSpec {
+            host,
+            guest: GuestPlatform {
+                os: GuestOperatingSystem::Linux,
+                architecture: kernel.architecture,
+            },
+            runtime: RuntimeBinding::ManagedRelease(ManagedRuntimeRelease {
+                runtime: release.release.clone(),
+                digest: release.digest(),
+                target: host,
+                layout: RuntimePayloadLayout::CatalogReleaseV1,
+            }),
+            backend: HypervisorBackend::Kvm,
+            boot: BootProfile::ArtifactsV1 {
+                contract: CLOUD_HYPERVISOR_BOOT_CONTRACT.parse()?,
+                artifacts: vec![BootArtifact::new(
+                    "boot".parse()?,
+                    ComponentIdentity {
+                        kind: ArtifactComponentKind::Kernel,
+                        version: kernel.version.clone(),
+                        digest: kernel.sha256,
+                    },
+                    match kernel.architecture {
+                        Arch::Aarch64 => "linux-image",
+                        Arch::X86_64 => "vmlinux",
+                    }
+                    .parse()?,
+                )],
+            },
+            isolation: IsolationClass::HardwareVm,
+            compatibility: ExecutionCompatibilityProfile::RuntimeV1 {
+                contract: CLOUD_HYPERVISOR_MACHINE_CONTRACT.parse()?,
+                state_format: None,
+            },
+        }
+        .try_into()?,
+    ))
+}
