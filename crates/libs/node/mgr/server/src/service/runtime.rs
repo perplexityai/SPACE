@@ -153,23 +153,48 @@ impl NodeManagerService {
 
     pub(super) async fn allocate(
         &self,
-        request: Request<AllocateRequest>,
+        mut request: Request<AllocateRequest>,
     ) -> Result<Response<AllocateResponse>, Status> {
         self.authorize_peer(&request, "Allocate", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
-        validate_sandbox_id(&request.get_ref().sandbox_id)?;
+        let (sandbox, requirements) = pplx_space_execution_common::devices::decode_allocation(
+            &request.get_ref().sandbox_id,
+            request.get_ref().device_allocation.as_ref(),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let preferences = requirements
+            .as_ref()
+            .map(|required| self.device_allocation_preferences(required))
+            .transpose()?;
+        if requirements.is_some() {
+            if request.get_ref().sandbox_cgroup_memory_mib == 0 {
+                return Err(Status::invalid_argument(
+                    "device allocation requires an explicit host-memory reservation",
+                ));
+            }
+            self.require_supervisor_devices().await?;
+        }
+        request.get_mut().sandbox_id = sandbox.to_string();
         // Claim before admission can queue. Cleanup must not retire an
         // execution while an accepted allocation can still bind it later.
         let claim = self
             .wait_for_sandbox_work(&request.get_ref().sandbox_id)
             .await?;
         let service = self.clone();
-        self.run_claimed_sandbox_work(claim, async move { service.allocate_inner(request).await })
-            .await
+        self.run_claimed_sandbox_work(claim, async move {
+            service
+                .allocate_inner(request, requirements, preferences)
+                .await
+        })
+        .await
     }
 
     async fn allocate_inner(
         &self,
         request: Request<AllocateRequest>,
+        requirements: Option<pplx_space_execution_spec::devices::DeviceRequirements>,
+        preferences: Option<
+            std::collections::BTreeMap<pplx_space_execution_spec::devices::DeviceProfile, u32>,
+        >,
     ) -> Result<Response<AllocateResponse>, Status> {
         let caller = super::execution_fence::pin_caller(
             &request,
@@ -224,6 +249,16 @@ impl NodeManagerService {
         // applying new-VM admission.
         let _cgroup_guard = self.lock_sandbox_cgroups(sandbox_id).await;
         super::execution_fence::check_caller(caller.as_ref())?;
+        // A CPU-only replay cannot drop device requirements from an unresolved
+        // predecessor, even when its network slot has already disappeared.
+        if requirements.is_none() {
+            let pool = self.pool.clone();
+            self.off_runtime("check CPU allocation device ownership", move || {
+                pool.ensure_no_device_allocations(typed_sandbox_id)
+                    .map_err(super::device_admission::device_store_status)
+            })
+            .await?;
+        }
         self.bind_execution_for_allocation(sandbox_id, req.execution_fence.as_ref())
             .await?;
         let allocation = if self
@@ -387,6 +422,47 @@ impl NodeManagerService {
                 return Err(status);
             }
         };
+        let devices = if let Some(requirements) = requirements {
+            let preferences = preferences
+                .ok_or_else(|| Status::internal("device qualification preferences missing"))?;
+            let fence = self
+                .check_execution(sandbox_id, req.execution_fence.as_ref(), false)?
+                .ok_or_else(|| Status::failed_precondition("device execution identity missing"))?;
+            let owner = crate::slot_pool::devices::DeviceOwner::new(
+                typed_sandbox_id,
+                fence.current(),
+                info.generation,
+            );
+            let pool = self.pool.clone();
+            let device_pool = self.device_pool.clone();
+            Some(
+                self.off_runtime("reserve exclusive devices", move || {
+                    let boot = crate::slot_pool::devices::HostBootId::current()
+                        .map_err(super::device_admission::device_store_status)?;
+                    let allocations = pool
+                        .reserve_device_parents(
+                            owner,
+                            boot,
+                            &requirements,
+                            &preferences,
+                            |parent| device_pool.check(parent, boot).is_ok(),
+                        )
+                        .map_err(super::device_admission::device_store_status)?;
+                    let devices = pplx_space_execution_common::devices::DeviceExecution::new(
+                        pplx_space_execution_common::devices::requirements_digest(&requirements),
+                        allocations
+                            .into_iter()
+                            .map(|a| a.assignment().clone())
+                            .collect(),
+                    )
+                    .map_err(|error| Status::data_loss(error.to_string()))?;
+                    Ok(devices.acknowledgement())
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
         let net = NetId::from_slot_info(&info);
         if info.pod_netns.is_none() {
             tracing::warn!(
@@ -428,6 +504,7 @@ impl NodeManagerService {
         let ns_path = info.ns_path();
 
         Ok(Response::new(AllocateResponse {
+            devices,
             slot: info.slot,
             namespace: ns_name,
             namespace_path: ns_path,

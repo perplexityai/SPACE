@@ -653,6 +653,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             let resp = client
                 .allocate(AllocateRequest {
+                    device_allocation: None,
                     execution_fence: Some(execution_fence.unwrap_or_else(unbound_execution_fence)),
                     sandbox_id: sandbox_id.clone(),
                     netns_path: None,

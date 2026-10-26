@@ -1038,6 +1038,7 @@ impl SandboxManagerService {
             }
         };
         Ok(SandboxInfo {
+            device_requirements: sandbox.device_requirements.as_ref().map(Into::into),
             sandbox_id: sandbox.id.clone(),
             template: Some(sandbox.template.clone()),
             lifecycle: Some(crate::proto::SandboxLifecycleState::from(observed_state) as i32),
