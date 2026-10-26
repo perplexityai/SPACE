@@ -1875,22 +1875,19 @@ impl SandboxManagerService {
                 .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
             let phase = Instant::now();
             node_client
-                .capture_runtime_state(
-                    pplx_space_execution_common::proto::RuntimeKind::Firecracker,
-                    crate::service::snapshot_capture::bind(
-                        CaptureVmStateRequest {
-                            execution_fence: sandbox.node_execution_fence(),
-                            sandbox_id: sandbox.id.clone(),
-                            artifacts: crate::service::snapshot_capture::artifacts(),
-                            storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
-                                directory: Some(staging_dir.clone()),
-                                encrypted_volume_mount: None,
-                            }),
-                            environment_reference: None,
-                        },
-                        sandbox.execution_metadata.as_ref(),
-                    ),
-                )
+                .capture_vm_state(crate::service::snapshot_capture::bind(
+                    CaptureVmStateRequest {
+                        execution_fence: sandbox.node_execution_fence(),
+                        sandbox_id: sandbox.id.clone(),
+                        artifacts: crate::service::snapshot_capture::artifacts(),
+                        storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
+                            directory: Some(staging_dir.clone()),
+                            encrypted_volume_mount: None,
+                        }),
+                        environment_reference: None,
+                    },
+                    sandbox.execution_metadata.as_ref(),
+                ))
                 .await
                 .map_err(|error| {
                     Status::internal(format!("create template base snapshot: {error}"))

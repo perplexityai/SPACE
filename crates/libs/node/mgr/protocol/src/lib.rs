@@ -38,5 +38,3 @@ impl proto::CacheDiskStatus {
         }
     }
 }
-
-pub mod vm_state;

@@ -3,7 +3,7 @@ use crate::proto::{ArtifactIntegrityRequirement, CgroupLimits, VerifiedRuntimeLa
 
 #[test]
 fn launch_conversion_preserves_verified_identity_isolation_and_limits() {
-    let original = LaunchFirecrackerRequest {
+    let original = FirecrackerLaunch {
         execution_id: "execution".into(),
         jailer_bin: "/runtime/bin/jailer".into(),
         firecracker_bin: "/runtime/bin/firecracker".into(),
@@ -35,13 +35,13 @@ fn launch_conversion_preserves_verified_identity_isolation_and_limits() {
         original.verified_runtime.as_ref().unwrap().sandbox_id
     );
     assert_eq!(
-        LaunchFirecrackerRequest::try_from(generic.clone()).unwrap(),
+        FirecrackerLaunch::try_from(generic.clone()).unwrap(),
         original
     );
     let mut conflict = generic;
     conflict.sandbox_id = "another-sandbox".into();
     assert!(matches!(
-        LaunchFirecrackerRequest::try_from(conflict),
+        FirecrackerLaunch::try_from(conflict),
         Err(LaunchContractError::IdentityMismatch)
     ));
 }
