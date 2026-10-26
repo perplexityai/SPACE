@@ -1195,7 +1195,9 @@ fn bound_cold_boot_uses_the_recorded_runtime_and_never_the_node_default() {
 fn compatible_selection_preserves_exact_before_fallback() {
     use crate::catalog::CompiledEnvironment;
     use crate::selection::{self, CompatibleSelection, ExecutionPolicy};
-    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let mut catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    // These scenarios exercise Firecracker snapshot-format qualification.
+    catalog.retain(|entry| entry.release().release.kind == RuntimeKind::Firecracker);
     let source = catalog[0].definition().execution_requirements().unwrap();
     let all = "e0,fc-1.17.0-linux-6.1.155,fc-1.17.0-linux-6.18.44";
     for exact_installed in [true, false] {
@@ -1266,6 +1268,8 @@ fn restore_falls_back_after_revocation_without_boot_files() {
     use crate::catalog::CompiledEnvironment;
     use crate::selection::{self, CompatibleSelection, ExecutionPolicy};
     let mut catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    // These scenarios exercise Firecracker snapshot-format qualification.
+    catalog.retain(|entry| entry.release().release.kind == RuntimeKind::Firecracker);
     let source = catalog[0].definition().execution_requirements().unwrap();
     // Synthetic qualification proves a patch release is eligible because its
     // declared profile matches, not because its version happens to be newer.
@@ -1323,6 +1327,8 @@ fn transient_exact_source_failure_never_selects_another_consumer() {
     use crate::catalog::CompiledEnvironment;
     use crate::selection::{self, CompatibleSelection, ExecutionPolicy, SelectionError};
     let mut catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    // These scenarios exercise Firecracker snapshot-format qualification.
+    catalog.retain(|entry| entry.release().release.kind == RuntimeKind::Firecracker);
     let source = catalog[0].definition().execution_requirements().unwrap();
     let mut release = catalog[0].release().clone();
     release.release.version = "1.15.2".parse().unwrap();
@@ -1501,4 +1507,71 @@ fn cold_only_runtime_has_no_launcher_or_snapshot_claims() {
     }
     let reported = inventory(vec![installation]).to_proto();
     assert!(reported.runtimes[0].state_formats.is_empty());
+}
+
+#[test]
+fn cold_boot_resolves_every_authenticated_boot_input() {
+    let reference = EnvironmentReference::new(Digest::sha256([9; 32]));
+    let mut runtime = installation("54.0", "1");
+    runtime.runtime.kind = RuntimeKind::CloudHypervisor;
+    runtime.state_format = None;
+    let kernel = kernel("6.8.0", 1, false, false);
+    let initramfs = ArtifactComponentInstallation {
+        metadata: ArtifactComponentMetadata {
+            kind: ArtifactComponentKind::Initrd,
+            role: Some("initramfs".parse().unwrap()),
+            version: Some("6.8.0".parse().unwrap()),
+            digest: Some(Digest::sha256([2; 32])),
+            format: Some("cpio".parse().unwrap()),
+        },
+        path: PathBuf::from("/boot-assets/initrd.img"),
+        default_for_new: false,
+        legacy_default: false,
+        integrity: ExecutionSourceIntegrity::CatalogSha256,
+    };
+    let requested = ExecutionMetadata::new(
+        runtime.runtime.clone(),
+        runtime.guest,
+        None,
+        vec![kernel.metadata.clone(), initramfs.metadata.clone()],
+    )
+    .unwrap()
+    .with_environment(reference);
+    for initramfs_present in [true, false] {
+        let mut inventory = inventory(Vec::new());
+        let mut components = vec![kernel.clone()];
+        if initramfs_present {
+            components.push(initramfs.clone());
+        }
+        inventory.environments.insert(
+            reference,
+            InstalledEnvironment {
+                runtime: Ok(runtime.clone()),
+                components: Ok(components),
+            },
+        );
+        let result = inventory.resolve(
+            Some(&requested),
+            RuntimeKind::CloudHypervisor,
+            ExecutionSelectionMode::ExistingColdBoot,
+        );
+        if initramfs_present {
+            let resolved = result.unwrap();
+            assert_eq!(resolved.components.len(), 2);
+            let selected = resolved
+                .component(
+                    ArtifactComponentKind::Initrd,
+                    initramfs.metadata.role.as_ref(),
+                )
+                .unwrap();
+            assert_eq!(selected.path, initramfs.path);
+            assert_eq!(selected.metadata, initramfs.metadata);
+            assert_eq!(selected.integrity, ExecutionSourceIntegrity::CatalogSha256);
+        } else {
+            assert!(matches!(
+                result,
+                Err(RuntimeInventoryError::NoCompatibleComponent(_))
+            ));
+        }
+    }
 }

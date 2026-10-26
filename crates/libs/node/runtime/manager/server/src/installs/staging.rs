@@ -11,7 +11,7 @@ use std::os::unix::fs::{
 use std::path::{Path, PathBuf};
 
 use md5::Md5;
-use pplx_space_common_core::types::{Arch, ArtifactVersion, Digest};
+use pplx_space_common_core::types::{Arch, ArtifactVersion, Digest, RuntimeKind};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{self, ElfProbe};
 use pplx_space_node_runtime_core::runtime_inventory::kernel_release::KernelReleaseScanner;
 use sha2::{Digest as _, Sha256};
@@ -67,32 +67,82 @@ pub(crate) enum ImageDigestError {
 const ARM64_IMAGE_MAGIC: &[u8; 4] = b"ARMd";
 const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
 
-/// Whether `path` is a boot image a microVM runtime loads on `architecture`: an
-/// ELF `vmlinux` on x86_64, the Linux `Image` format on aarch64. Reads only
-/// the header.
-pub(super) fn is_boot_image(path: &Path, architecture: Arch) -> Result<bool, StagingError> {
+/// Header recognition is runtime-specific, not execution qualification. The
+/// complete file still has to match its content pin before publication.
+pub(super) fn is_boot_image(
+    path: &Path,
+    architecture: Arch,
+    runtime: RuntimeKind,
+) -> Result<bool, StagingError> {
+    if !matches!(
+        runtime,
+        RuntimeKind::Firecracker | RuntimeKind::CloudHypervisor
+    ) {
+        return Ok(false);
+    }
     let inspect = |error| StagingError::new("inspect", path, error);
     match architecture {
-        Arch::X86_64 => Ok(matches!(
-            diagnostic::probe_elf_file(path).map_err(inspect)?,
-            ElfProbe::Elf {
-                architecture: Some(Arch::X86_64)
+        Arch::X86_64 => {
+            if matches!(
+                diagnostic::probe_elf_file(path).map_err(inspect)?,
+                ElfProbe::Elf {
+                    architecture: Some(Arch::X86_64)
+                }
+            ) {
+                return Ok(true);
             }
-        )),
-        Arch::Aarch64 => {
-            let mut header = [0u8; ARM64_IMAGE_MAGIC_OFFSET + 4];
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-                .open(path)
-                .map_err(inspect)?;
-            match file.read_exact(&mut header) {
-                Ok(()) => Ok(header.get(ARM64_IMAGE_MAGIC_OFFSET..) == Some(ARM64_IMAGE_MAGIC)),
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-                Err(error) => Err(inspect(error)),
+            if runtime == RuntimeKind::CloudHypervisor {
+                is_x86_bzimage(path)
+            } else {
+                Ok(false)
             }
         }
+        Arch::Aarch64 => {
+            let mut header = [0u8; ARM64_IMAGE_MAGIC_OFFSET + 4];
+            Ok(read_boot_header(path, &mut header)?.is_some()
+                && header.get(ARM64_IMAGE_MAGIC_OFFSET..) == Some(ARM64_IMAGE_MAGIC))
+        }
     }
+}
+
+fn read_boot_header(path: &Path, header: &mut [u8]) -> Result<Option<u64>, StagingError> {
+    let inspect = |error| StagingError::new("inspect", path, error);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(inspect)?;
+    let metadata = file.metadata().map_err(inspect)?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    match file.read_exact(header) {
+        Ok(()) => Ok(Some(metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(error) => Err(inspect(error)),
+    }
+}
+
+fn is_x86_bzimage(path: &Path) -> Result<bool, StagingError> {
+    // Linux x86 boot protocol 2.12 introduced XLF_KERNEL_64. Require the
+    // explicit 64-bit entry flag rather than treating every HdrS image as x86_64.
+    // https://docs.kernel.org/arch/x86/boot.html
+    let mut header = [0u8; 0x238];
+    let Some(size) = read_boot_header(path, &mut header)? else {
+        return Ok(false);
+    };
+    let word = |offset| -> Option<u16> {
+        let bytes = header.get(offset..offset + 2)?;
+        Some(u16::from_le_bytes(bytes.try_into().ok()?))
+    };
+    let setup_sectors = header.get(0x1f1).copied().unwrap_or(0);
+    let setup_sectors = if setup_sectors == 0 { 4 } else { setup_sectors };
+    Ok(word(0x1fe) == Some(0xaa55)
+        && header.get(0x202..0x206) == Some(b"HdrS")
+        && word(0x206).is_some_and(|version| version >= 0x020c)
+        && header.get(0x211).is_some_and(|flags| flags & 1 != 0)
+        && word(0x236).is_some_and(|flags| flags & 1 != 0)
+        && size > (u64::from(setup_sectors) + 1) * 512)
 }
 
 /// The digests of one image.
@@ -114,6 +164,7 @@ pub(super) struct FinishedImage {
 /// release banner as it grows.
 pub(super) struct StagedImage {
     file: std::fs::File,
+    image: PathBuf,
     md5: Md5,
     sha256: Sha256,
     release: KernelReleaseScanner,
@@ -124,6 +175,21 @@ impl StagedImage {
     /// Create the staged kernel directory `staged` inside `staged_root`, both
     /// private, and the empty image inside it.
     pub(super) fn create(staged_root: &Path, staged: &Path) -> Result<Self, StagingError> {
+        Self::create_named(staged_root, staged, KERNEL_IMAGE)
+    }
+
+    pub(super) fn create_boot_artifact(
+        staged_root: &Path,
+        staged: &Path,
+    ) -> Result<Self, StagingError> {
+        Self::create_named(
+            staged_root,
+            staged,
+            pplx_space_node_runtime_core::artifact_store::BOOT_ARTIFACT_IMAGE,
+        )
+    }
+
+    fn create_named(staged_root: &Path, staged: &Path, name: &str) -> Result<Self, StagingError> {
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
         builder
@@ -132,7 +198,7 @@ impl StagedImage {
         builder
             .create(staged)
             .map_err(|error| StagingError::new("create", staged, error))?;
-        let image = staged.join(KERNEL_IMAGE);
+        let image = staged.join(name);
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -141,6 +207,7 @@ impl StagedImage {
             .map_err(|error| StagingError::new("create", &image, error))?;
         Ok(Self {
             file,
+            image,
             md5: Md5::new(),
             sha256: Sha256::new(),
             release: KernelReleaseScanner::new(),
@@ -166,7 +233,7 @@ impl StagedImage {
     /// Flush the image to disk, make it and its directory readable, and
     /// return what was learned while writing it.
     pub(super) fn finish(self, staged: &Path) -> Result<FinishedImage, StagingError> {
-        let image = staged.join(KERNEL_IMAGE);
+        let image = self.image;
         self.file
             .sync_all()
             .map_err(|error| StagingError::new("sync", &image, error))?;

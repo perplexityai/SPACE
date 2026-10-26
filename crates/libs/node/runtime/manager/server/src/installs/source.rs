@@ -51,11 +51,20 @@ impl FromStr for ReleaseLine {
     type Err = ReleaseLineParseError;
 
     /// Accepts a line (`1.15`) or a release (`1.15.1`), with or without `v`.
+    /// A stable release's build metadata identifies different pinned bytes,
+    /// but not a different kernel source line. Prereleases remain excluded.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let invalid = || ReleaseLineParseError(value.to_string());
         let digits =
             |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
         let unprefixed = value.strip_prefix('v').unwrap_or(value);
+        if unprefixed.contains('+') {
+            let release = semver::Version::parse(unprefixed).map_err(|_| invalid())?;
+            if !release.pre.is_empty() {
+                return Err(invalid());
+            }
+            return Ok(Self::new(release.major, release.minor));
+        }
         let mut parts = unprefixed.split('.');
         let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
             return Err(invalid());
@@ -217,14 +226,14 @@ impl KernelVersion {
         &self.0
     }
 
-    /// The kernel release without the variant: `5.10.245` for
-    /// `5.10.245-no-acpi`. Strip the build's trailing `+` as the image
-    /// banner scanner does; the install identity and digest remain unchanged.
+    /// The banner release preserves kernel LOCALVERSION suffixes. Only the
+    /// historical source label `-no-acpi` is not part of its kernel's banner.
+    /// Strip a trailing `+` as the scanner does; the artifact identity is unchanged.
     pub fn release(&self) -> &str {
         let version = self.as_str();
         version
-            .split_once('-')
-            .map_or(version, |(release, _)| release)
+            .strip_suffix("-no-acpi")
+            .unwrap_or(version)
             .trim_end_matches('+')
     }
 }
@@ -351,10 +360,13 @@ pub struct VerifiableKernel {
 pub enum KernelLocation {
     S3(StorageUri),
     Https(super::release_source::ReleaseUrl),
+    Local(super::local_source::LocalSourcePath),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum KernelLocationError {
+    #[error(transparent)]
+    Local(#[from] super::local_source::LocalSourcePathError),
     #[error(transparent)]
     S3(#[from] pplx_space_common_core::types::StorageUriParseError),
     #[error(transparent)]
@@ -363,7 +375,9 @@ pub enum KernelLocationError {
 impl std::str::FromStr for KernelLocation {
     type Err = KernelLocationError;
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        if text.starts_with("https://") {
+        if text.starts_with("file:") {
+            Ok(Self::Local(text.parse()?))
+        } else if text.starts_with("https://") {
             Ok(Self::Https(text.parse()?))
         } else {
             Ok(Self::S3(text.parse()?))
@@ -391,6 +405,7 @@ impl std::fmt::Display for KernelLocation {
         match self {
             Self::S3(uri) => uri.fmt(f),
             Self::Https(uri) => uri.fmt(f),
+            Self::Local(path) => path.fmt(f),
         }
     }
 }

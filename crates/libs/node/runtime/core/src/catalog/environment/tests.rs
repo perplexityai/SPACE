@@ -71,7 +71,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         .map(|entry| entry.definition().reference())
         .collect();
     assert_eq!(references.len(), environments.len());
-    assert_eq!(environments.len(), 4);
+    assert_eq!(environments.len(), 5);
     for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
         ("1.15.1", "6.1.155", "9.0.0", true),
         ("1.17.0", "6.18.44", "12.0.0", true),
@@ -130,6 +130,37 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
     assert_ne!(x86_ch.definition().reference(), ch.definition().reference());
     let defaults = crate::selection::ExecutionPolicy::parse(None, None, &environments).unwrap();
     assert!(!defaults.allows(x86_ch.definition().reference()));
+    let signed_boot = &environments[4];
+    assert!(!defaults.allows(signed_boot.definition().reference()));
+    assert!(!signed_boot.supports_memory_state());
+    assert!(signed_boot.exclusive_device_profiles().is_empty());
+    assert_ne!(signed_boot.release().digest(), x86_ch.release().digest());
+    let execution = signed_boot.definition().execution_requirements().unwrap();
+    let initramfs = execution
+        .components()
+        .iter()
+        .find(|component| component.kind == ArtifactComponentKind::Initrd)
+        .unwrap();
+    assert_eq!(initramfs.role.as_ref().unwrap().as_str(), "initramfs");
+    // The signed modules and kernel are one boot contract. Retaining the
+    // environment reference cannot excuse omission of its initramfs.
+    let incomplete = ExecutionMetadata::new(
+        execution.runtime().clone(),
+        execution.guest(),
+        None,
+        execution
+            .components()
+            .iter()
+            .filter(|component| component.kind != ArtifactComponentKind::Initrd)
+            .cloned()
+            .collect(),
+    )
+    .unwrap()
+    .with_environment(signed_boot.definition().reference());
+    assert!(matches!(
+        signed_boot.definition().check_execution(&incomplete),
+        Err(pplx_space_execution_common::environment::EnvironmentBindingError::BootComponents)
+    ));
 }
 
 #[test]
@@ -153,4 +184,43 @@ fn initial_identity_and_legacy_restore_do_not_depend_on_display_name() {
     policy
         .check_execution(&historical, ExecutionSelectionMode::PersistedStateRestore)
         .unwrap();
+}
+
+#[cfg(feature = "artifact-store")]
+impl CompiledEnvironment {
+    pub(crate) fn with_boot_artifact_for_test(
+        mut self,
+        pin: crate::catalog::PinnedBootArtifact,
+        role: ArtifactComponentRole,
+        format: ArtifactFormat,
+    ) -> Self {
+        let mut spec = self.definition.descriptor().spec().clone();
+        let BootProfile::ArtifactsV1 { artifacts, .. } = &mut spec.boot else {
+            panic!("test extension requires a runtime-neutral descriptor");
+        };
+        artifacts.push(BootArtifact::new(role, pin.identity().clone(), format));
+        self.definition = EnvironmentDefinition::new(spec.try_into().unwrap());
+        self.boot_artifacts.push(pin);
+        self
+    }
+}
+
+#[test]
+fn device_development_profile_is_confined_to_the_hardened_boot_environment() {
+    let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let mut profiled = 0;
+    for environment in environments {
+        for profile in environment.exclusive_device_profiles() {
+            profiled += 1;
+            assert_eq!(
+                environment.name(),
+                "ch-54.0-linux-6.1.155-nvidia-580.178.04"
+            );
+            assert_eq!(profile.hardware().guest_visible_devices(), 1);
+            assert!(
+                matches!(&environment.definition().descriptor().spec().boot, BootProfile::ArtifactsV1 { artifacts, .. } if artifacts.len() == 2)
+            );
+        }
+    }
+    assert_eq!(profiled, usize::from(cfg!(feature = "gpu-development")));
 }
