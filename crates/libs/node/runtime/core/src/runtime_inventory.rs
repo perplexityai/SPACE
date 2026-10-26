@@ -358,6 +358,8 @@ pub enum RuntimeInventoryError {
     },
     #[error("kernel read returned {read} bytes for a {len}-byte buffer")]
     InvalidKernelReadBuffer { read: usize, len: usize },
+    #[error("compiled environment has no auxiliary boot-file pin for {0:?}")]
+    MissingBootArtifactPin(pplx_space_common_core::types::ComponentIdentity),
     #[error("no installed artifact component matches {0:?}")]
     NoCompatibleComponent(ArtifactComponentMetadata),
     #[error("no {selection} {kind} component is installed")]
@@ -429,6 +431,7 @@ impl RuntimeInventoryError {
             | Self::InvalidExecutionMetadata(_)
             | Self::UnknownFirecrackerSnapshotFormat(_)
             | Self::IncompleteInstallation { .. }
+            | Self::MissingBootArtifactPin(_)
             | Self::NoCompatibleComponent(_)
             | Self::NoDefaultComponent { .. }
             | Self::NoCompatibleRuntime { .. }
@@ -1227,6 +1230,11 @@ impl RuntimeInventory {
                         RuntimeInventoryError::NoCompatibleComponent(component.clone())
                     })?;
                 resolved_components.push(installed.metadata.clone());
+                selected_components.push(ResolvedArtifactComponent {
+                    metadata: installed.metadata.clone(),
+                    path: installed.path.clone(),
+                    integrity: installed.integrity,
+                });
             }
         }
         if !restoring {
@@ -1261,12 +1269,12 @@ impl RuntimeInventory {
             })?;
             if requested_kernel.is_none() {
                 resolved_components.push(kernel.metadata.clone());
+                selected_components.push(ResolvedArtifactComponent {
+                    metadata: kernel.metadata.clone(),
+                    path: kernel.path.clone(),
+                    integrity: kernel.integrity,
+                });
             }
-            selected_components.push(ResolvedArtifactComponent {
-                metadata: kernel.metadata.clone(),
-                path: kernel.path.clone(),
-                integrity: kernel.integrity,
-            });
         }
         let execution = ExecutionMetadata::new(
             selected_runtime.runtime.clone(),

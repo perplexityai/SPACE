@@ -74,6 +74,8 @@ impl InitialEnvironment {
             initial_reference: Some(definition.reference()),
             release: self.release.clone(),
             kernel: self.kernel.clone(),
+            boot_artifacts: Vec::new(),
+            exclusive_device_profiles: Vec::new(),
             definition,
             memory_state: true,
             name: "e0",
@@ -170,6 +172,8 @@ const CERTIFIED_UPGRADE_EDGES: &[(&str, &str)] = &[
 pub struct CompiledEnvironment {
     release: PinnedRelease,
     kernel: PinnedKernel,
+    boot_artifacts: Vec<super::PinnedBootArtifact>,
+    exclusive_device_profiles: Vec<super::ExclusiveDeviceProfile>,
     definition: EnvironmentDefinition,
     memory_state: bool,
     name: &'static str,
@@ -186,7 +190,11 @@ impl CompiledEnvironment {
         state_version: &'static str,
         memory_state: bool,
     ) -> Self {
-        let definition = definition_from_pins(&release, &kernel, state_version).unwrap();
+        let definition = if release.release.kind == RuntimeKind::CloudHypervisor {
+            standalone_definition(&release, &kernel).unwrap()
+        } else {
+            definition_from_pins(&release, &kernel, state_version).unwrap()
+        };
         Self {
             runtime_ordering_key: semver::Version::parse(release.release.version.as_str()).unwrap(),
             initial_reference: Some(
@@ -198,6 +206,8 @@ impl CompiledEnvironment {
             ),
             release,
             kernel,
+            boot_artifacts: Vec::new(),
+            exclusive_device_profiles: Vec::new(),
             definition,
             memory_state,
             name: "synthetic",
@@ -286,6 +296,8 @@ impl CompiledEnvironment {
                 initial_reference: Some(initial_reference),
                 release: release.clone(),
                 kernel: kernel_pin.clone(),
+                boot_artifacts: Vec::new(),
+                exclusive_device_profiles: Vec::new(),
                 definition,
                 memory_state,
                 name,
@@ -294,8 +306,75 @@ impl CompiledEnvironment {
         })
         .collect::<Result<_, CatalogError>>()?;
         environments.push(Self::cloud_hypervisor(architecture)?);
+        environments.push(Self::cloud_hypervisor_signed_boot()?);
         record_upgrade_edges(&mut environments, CERTIFIED_UPGRADE_EDGES);
         Ok(environments)
+    }
+
+    fn cloud_hypervisor_signed_boot() -> Result<Self, CatalogError> {
+        use super::gpu_boot;
+        let catalog = RuntimeCatalog::compiled()?;
+        let missing = || CatalogError::MissingEnvironmentPins {
+            runtime: gpu_boot::RUNTIME_VERSION,
+            kernel: gpu_boot::KERNEL_VERSION,
+        };
+        let release = catalog
+            .releases(RuntimeKind::CloudHypervisor, Arch::X86_64)
+            .find(|pin| pin.release.version.as_str() == gpu_boot::RUNTIME_VERSION)
+            .ok_or_else(missing)?
+            .clone();
+        let kernel = catalog
+            .all_kernels(Arch::X86_64)
+            .find(|pin| pin.version.as_str() == gpu_boot::KERNEL_VERSION)
+            .ok_or_else(missing)?
+            .clone();
+        let initramfs = gpu_boot::initramfs()?;
+        let definition = (|| -> Result<_, CompiledEnvironmentDefinitionError> {
+            let base = standalone_definition(&release, &kernel)?;
+            let mut spec = base.descriptor().spec().clone();
+            spec.boot = BootProfile::ArtifactsV1 {
+                contract: CLOUD_HYPERVISOR_BOOT_CONTRACT.parse()?,
+                artifacts: vec![
+                    BootArtifact::new(
+                        "boot".parse()?,
+                        ComponentIdentity {
+                            kind: ArtifactComponentKind::Kernel,
+                            version: kernel.version.clone(),
+                            digest: kernel.sha256,
+                        },
+                        "linux-bzimage".parse()?,
+                    ),
+                    BootArtifact::new(
+                        "initramfs".parse()?,
+                        initramfs.identity().clone(),
+                        "linux-initramfs".parse()?,
+                    ),
+                ],
+            };
+            Ok(EnvironmentDefinition::new(spec.try_into()?))
+        })()?;
+        Ok(Self {
+            runtime_ordering_key: semver::Version::new(54, 0, 0),
+            initial_reference: None,
+            release,
+            kernel,
+            boot_artifacts: vec![initramfs],
+            // Qualification never changes the immutable boot-artifact identity.
+            exclusive_device_profiles: {
+                #[cfg(feature = "gpu-development")]
+                {
+                    vec![super::development_t4_profile()?]
+                }
+                #[cfg(not(feature = "gpu-development"))]
+                {
+                    Vec::new()
+                }
+            },
+            definition,
+            memory_state: false,
+            name: "ch-54.0-linux-6.1.155-nvidia-580.178.04",
+            upgrade_targets: Vec::new(),
+        })
     }
 
     fn cloud_hypervisor(architecture: Arch) -> Result<Self, CatalogError> {
@@ -323,11 +402,31 @@ impl CompiledEnvironment {
             initial_reference: None,
             release,
             kernel,
+            boot_artifacts: Vec::new(),
+            exclusive_device_profiles: Vec::new(),
             definition,
             memory_state: false,
             name: "ch-54.0-linux-7.2.8",
             upgrade_targets: Vec::new(),
         })
+    }
+
+    pub fn exclusive_device_profiles(&self) -> &[super::ExclusiveDeviceProfile] {
+        &self.exclusive_device_profiles
+    }
+
+    pub fn exclusive_device_resources(
+        &self,
+        execution: &pplx_space_execution_common::devices::DeviceExecution,
+    ) -> Result<super::DeviceResourceLimits, super::DeviceProfileError> {
+        super::device_profile::resources(&self.exclusive_device_profiles, execution)
+    }
+
+    pub fn exclusive_device_requirement_resources(
+        &self,
+        requirements: &pplx_space_execution_spec::devices::DeviceRequirements,
+    ) -> Result<super::DeviceResourceLimits, super::DeviceProfileError> {
+        super::device_profile::requirement_resources(&self.exclusive_device_profiles, requirements)
     }
 
     pub fn is_initial(&self) -> bool {
@@ -348,6 +447,17 @@ impl CompiledEnvironment {
     pub fn kernel(&self) -> &PinnedKernel {
         &self.kernel
     }
+    /// File pins supplement the descriptor's identities with publication sizes.
+    /// Roles and formats come from the descriptor, never from installation paths.
+    pub fn boot_artifact(
+        &self,
+        identity: &ComponentIdentity,
+    ) -> Option<&super::PinnedBootArtifact> {
+        self.boot_artifacts.iter().find(|pin| {
+            pin.identity() == identity && pin.architecture() == self.kernel.architecture
+        })
+    }
+
     pub fn supports_memory_state(&self) -> bool {
         self.memory_state
             && self
