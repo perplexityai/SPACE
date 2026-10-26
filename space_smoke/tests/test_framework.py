@@ -204,6 +204,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "network_policy.v1_udp_respects_ip_allow",
                 "network_policy.v1_udp_respects_ip_deny",
                 "network_policy.v1_wildcard_domain_allow",
+                "node.gpu_sandbox_lifecycle",
                 "node.runtime_crash_preserves_disk",
                 "node.runtime_survives_manager_restarts",
             ],
