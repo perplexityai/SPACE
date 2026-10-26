@@ -572,6 +572,7 @@ fn org_limit(contended: u32, uncontended: u32) -> OrgSlotLimit {
     OrgSlotLimit {
         contended: NonZeroU32::new(contended).expect("a positive limit"),
         uncontended: NonZeroU32::new(uncontended).expect("a positive limit"),
+        headroom: 0,
     }
 }
 
@@ -682,6 +683,77 @@ async fn one_organizations_held_work_leaves_slots_for_another() -> TestResult {
         wait_for_state(&db.pool, create, OperationState::Succeeded).await?;
     }
     assert_eq!(executor.max_running.load(Ordering::SeqCst), 4);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_organization_alone_leaves_its_headroom_of_the_free_slots() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let holding_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let busy_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let late_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let mut creates = queue_all(
+        &store,
+        holding_org,
+        &[(OperationKind::CreateSandbox, "sbx_holding_create")],
+    )
+    .await?;
+    let executor = HeldWork::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        ReconcilerConfig {
+            delete_reserved_slots: 0,
+            non_delete_reserved_slots: 0,
+            org_slot_limit: NonZeroU32::new(2),
+            org_slot_headroom: 1,
+            ..fast_loop_config(4)
+        },
+        store.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    // Another organization already holds a slot when the busy one queues.
+    wait_for_running(&executor, 1).await?;
+    let targets = (0..4)
+        .map(|index| format!("sbx_bursting_create_{index}"))
+        .collect::<Vec<_>>();
+    creates.extend(
+        queue_all(
+            &store,
+            busy_org,
+            &targets
+                .iter()
+                .map(|target_id| (OperationKind::CreateSandbox, target_id.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .await?,
+    );
+    // Nothing else waits, so it may pass its cap, but only up to leaving
+    // one of the three free slots free.
+    wait_for_running(&executor, 3).await?;
+
+    let late_create = queue_all(
+        &store,
+        late_org,
+        &[(OperationKind::CreateSandbox, "sbx_late_create")],
+    )
+    .await?[0];
+    wait_for_running(&executor, 4).await?;
+    assert_eq!(
+        operation_state(&db.pool, late_create).await?,
+        OperationState::Running.as_str()
+    );
+
+    executor.release.cancel();
+    creates.push(late_create);
+    for create in creates {
+        wait_for_state(&db.pool, create, OperationState::Succeeded).await?;
+    }
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
     Ok(())

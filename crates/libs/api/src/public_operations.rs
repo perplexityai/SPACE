@@ -1320,6 +1320,11 @@ pub struct OrgSlotLimit {
     pub contended: NonZeroU32,
     /// While no other organization does; at least `contended`.
     pub uncontended: NonZeroU32,
+    /// While no other organization does, how many of the claim's
+    /// `non_teardown` limit, the free slots open to other work, an
+    /// organization past `contended` leaves untaken, so work another
+    /// organization submits later can start.
+    pub headroom: u32,
 }
 
 impl ClaimLimits {
@@ -1753,6 +1758,8 @@ async fn claim_operations(
     // teardowns running under a live claim while another organization has
     // such work due, or more than `$16` while none has: `org_slots` counts
     // the ones it holds and, in claim order, the ones this claim would add.
+    // While none has, an organization past `$15` also leaves `$17` of the
+    // claim's `$12` untaken, so that many free slots stay free.
     // That rank needs a window, which cannot share a level with `FOR
     // UPDATE`, so `picked_other` locks the chosen rows by key and re-checks
     // that each is still claimable.
@@ -1835,6 +1842,7 @@ async fn claim_operations(
                     GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
                     candidate.claim_token <> '' AS reclaimed,
                     candidate.started_at IS NULL AS first_start,
+                    COALESCE(org_live.live, 0) AS org_held,
                     COALESCE(org_live.live, 0) + ROW_NUMBER() OVER (
                         PARTITION BY candidate.org_id
                         ORDER BY candidate.next_attempt_at, candidate.requested_at, candidate.operation_id
@@ -1864,7 +1872,7 @@ async fn claim_operations(
                         WHERE any_other.org_id <> (SELECT org_id FROM other_candidates LIMIT 1)
                     )
                     THEN $15
-                    ELSE $16
+                    ELSE GREATEST($15, LEAST($16, other.org_held + $12 - $17))
                 END
              ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
              LIMIT $12
@@ -1980,6 +1988,12 @@ async fn claim_operations(
             .limits
             .per_org_non_teardown
             .map_or(0, |limit| i64::from(limit.uncontended.get())),
+    )
+    .bind(
+        input
+            .limits
+            .per_org_non_teardown
+            .map_or(0, |limit| i64::from(limit.headroom)),
     )
     .fetch_all(&mut *tx)
     .await?;
