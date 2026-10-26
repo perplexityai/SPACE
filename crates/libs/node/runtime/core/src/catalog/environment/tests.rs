@@ -71,7 +71,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         .map(|entry| entry.definition().reference())
         .collect();
     assert_eq!(references.len(), environments.len());
-    assert_eq!(environments.len(), 5);
+    assert_eq!(environments.len(), 6);
     for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
         ("1.15.1", "6.1.155", "9.0.0", true),
         ("1.17.0", "6.18.44", "12.0.0", true),
@@ -91,7 +91,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         );
         assert_eq!(
             requirements.components()[0].digest,
-            Some(environment.kernel().sha256)
+            Some(environment.kernel().unwrap().sha256)
         );
         assert_eq!(environment.supports_memory_state(), memory_state);
     }
@@ -108,7 +108,10 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
     assert!(!ch.supports_memory_state());
     let execution = ch.definition().execution_requirements().unwrap();
     assert!(execution.state_format().is_none());
-    assert_eq!(execution.components()[0].digest, Some(ch.kernel().sha256));
+    assert_eq!(
+        execution.components()[0].digest,
+        Some(ch.kernel().unwrap().sha256)
+    );
     let policy = crate::selection::ExecutionPolicy::parse(None, None, &arm).unwrap();
     assert!(policy.default_reference().is_none());
     assert!(policy.legacy_unbound_allowed());
@@ -223,4 +226,34 @@ fn device_development_profile_is_confined_to_the_hardened_boot_environment() {
         }
     }
     assert_eq!(profiled, usize::from(cfg!(feature = "gpu-development")));
+}
+
+#[test]
+fn firmware_environment_has_no_kernel_and_is_not_a_default_or_snapshot_loader() {
+    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let entry = catalog
+        .iter()
+        .find(|e| e.name() == "ch-54.0-windows-uefi")
+        .unwrap();
+    let execution = entry.definition().execution_requirements().unwrap();
+    assert!(entry.kernel().is_none());
+    assert!(!entry.supports_memory_state());
+    assert_eq!(execution.guest().os, GuestOperatingSystem::Windows);
+    assert!(execution.state_format().is_none());
+    assert_eq!(execution.components().len(), 1);
+    assert_eq!(
+        execution.components()[0].kind,
+        ArtifactComponentKind::Firmware
+    );
+    assert_eq!(
+        crate::boot::BootSource::from_execution(&execution).unwrap(),
+        crate::boot::BootSource::Uefi
+    );
+    let policy = crate::selection::ExecutionPolicy::parse(None, None, &catalog).unwrap();
+    assert!(!policy.allows(entry.definition().reference()));
+    let wire = pplx_space_execution_common::proto::EnvironmentDefinition::from(entry.definition());
+    assert_eq!(
+        EnvironmentDefinition::try_from(&wire).unwrap(),
+        *entry.definition()
+    );
 }
