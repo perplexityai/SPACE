@@ -30,3 +30,28 @@ fn only_tagged_admission_rejections_change_the_existing_error_contract() {
         assert_eq!(supervisor_launch_status(error).code(), expected);
     }
 }
+
+#[test]
+fn implemented_runtime_errors_never_authorize_legacy_replay() {
+    use tonic::Code;
+    for code in [
+        Code::Unimplemented,
+        Code::InvalidArgument,
+        Code::FailedPrecondition,
+        Code::Unavailable,
+        Code::DeadlineExceeded,
+        Code::Internal,
+        Code::Cancelled,
+    ] {
+        let status = runtime_operation_status(Status::new(code, "operation failed"));
+        assert_eq!(status.message(), "operation failed");
+        assert_eq!(
+            status.code(),
+            if code == Code::Unimplemented {
+                Code::FailedPrecondition
+            } else {
+                code
+            },
+        );
+    }
+}

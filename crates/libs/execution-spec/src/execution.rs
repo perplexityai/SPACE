@@ -110,6 +110,11 @@ identifier_type!(
     "artifact component role"
 );
 identifier_type!(ArtifactFormat, ArtifactFormatParseError, "artifact format");
+identifier_type!(
+    ExecutionContractId,
+    ExecutionContractIdParseError,
+    "execution contract"
+);
 
 /// Operating system presented inside the sandbox boundary.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
