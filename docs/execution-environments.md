@@ -1034,6 +1034,45 @@ collection require a separate reference-aware operation; recipe omission alone
 never grants deletion authority.
 
 
+### Auxiliary boot-file installation
+
+Initramfs (`initrd`) and firmware use the existing component install/remove RPCs
+and durable runtime-manager jobs. A root-owned catalog entry in `boot_artifacts`
+contains `identity` (kind, version, full SHA-256 digest), `architecture` and exact
+`size`. A pin permits verified publication, not execution: a qualified environment
+must separately name the component and its boot role.
+
+For offline delivery, configure `space-rtmgr-svc --boot-artifacts-source DIR`.
+Each source file is `DIR/<kind>-<version>--<12-hex-digest-prefix>/image`.
+Runtime-manager reads only regular files, copies within the configured byte and
+idle limits, and checks the full catalog digest before asking node-manager to
+publish. Node-manager checks its own pins and publishes into the `boot-artifacts`
+sibling of its kernel store. The source is not an execution directory and is
+never modified by the installer. A missing source is retried within the job's
+attempt budget; corrupt bytes or a changed pin refuse publication.
+
+Use `space-rtmgr components available --kind initrd` (or `firmware`) and
+`space-rtmgr components install --kind initrd VERSION sha256:DIGEST`.
+Normal inventory listing includes these files and their measured digests;
+a runtime compatibility filter cannot claim auxiliary-file compatibility without
+an environment qualification. Directory prefixes are locators, not identity
+checks. Both services need the matching catalog before installation. Older
+node-managers refuse unsupported component kinds, leaving the install failed
+rather than publishing unverified content. Replay after a lost publication reply
+re-verifies existing bytes and does not require the source to remain present.
+
+For a compiled environment, node-manager resolves every declared auxiliary boot
+input against its own pin and copies it into the execution cache. Missing or
+corrupt inputs withdraw that binding; watching both source and cache paths allows
+publication or repair to trigger rediscovery. fs-verity remains preferred when a
+measurement pin is available. Otherwise cache publication checks SHA-256, and the
+CH launch path hashes the opened file again before linking that inode into the
+jail. No auxiliary file receives a legacy/unverified execution fallback.
+
+Kernel installation recognizes x86-64 ELF and arm64 Linux Image inputs for the
+existing adapters. CH additionally accepts a 64-bit Linux bzImage header; that
+recognition does not qualify an environment or relax the full content pin.
+
 ## Runtime control transport
 
 Environment descriptors and runtime control have separate contracts. Generic
@@ -1128,8 +1167,53 @@ the existing fenced sandbox teardown path; boot mutations are never replayed.
 
 The initial path supports local cold creation, start, stop and delete. It refuses
 memory snapshots, restore, pools, pause/resume, automatic suspend/pause, ballooning,
-huge pages and live disk-I/O ceiling updates. GPU assignment is not implemented.
+huge pages and live disk-I/O ceiling updates. Device assignment is restricted to
+the explicitly authorized standalone development path described below.
 Template finalization requires acknowledged Stop before copying the rootfs.
+
+Device cleanup preserves a separate durable stop barrier in the supervisor's
+versioned execution journal. It refuses delayed device launches for the stopped
+activation, including a launch whose intent had not yet been written. A later
+activation needs a new execution identity. Node-manager retains launch exclusion
+and proves runtime termination before discharging device claims. On Linux it
+also opens the pinned VFIO groups exclusively, retaining those descriptors through
+slot and execution retirement. An occupied or unverifiable group keeps ownership
+unresolved. Without a qualified reuse procedure, successful cleanup marks the
+allocation released and its parent quarantined; stopping a sandbox does not
+create reusable GPU capacity.
+
+The optional `gpu-development` build enables one reset-only T4 experiment.
+`SPACE_GPU_DEVELOPMENT_AUTHORIZATION` must name the authorized member and current
+host boot ID, and the signed boot environment must be allowed separately.
+Enrollment still begins quarantined. Operator requalification queues the explicit
+reset procedure; it does not accept a caller's claim that hardware is clean.
+Normal builds reject this authorization and expose no development device profile.
+
+For that scoped experiment, release atomically discharges the sandbox allocation
+and queues the parent in `sanitizing`. Sandbox stop does not wait for the pool
+worker. The worker proves holder absence under an exclusive VFIO group hold,
+checks the enrolled identity and reset domain, performs and checks the explicit
+reset, then drops its descriptors before recording evidence and making capacity
+ready. An event wakes the worker, with a ten-second reconciliation backstop.
+Failure or ambiguous ownership cannot return capacity to ready. Reset-only
+development evidence is not proof of memory erasure or cross-tenant reuse safety.
+
+Device preparation binds the stopped-disk metadata's canonical requirements to
+the admitted execution. Missing or different requirements are refused before
+filesystem publication; a stopped disk retains its requirements rather than the
+previous worker's device assignments. Admission also compares live PCI identifiers,
+sysfs device inodes and topology observations with persisted enrollment before
+attachment. These same-boot observations detect changes; they are not stable
+hardware identities, firmware attestations or proof that a reset domain is safe.
+An observation mismatch requires requalification and cannot grant clean capacity.
+
+Device-bearing executions reserve the full guest RAM plus the environment's
+qualified device overhead before allocation. Node admission retains the remaining
+reservation while device ownership is unresolved, including before VFIO pins RAM;
+it does not apply the elastic VM growth discount. The reservation accounts for
+memory already charged to the VM cgroup. Admission rechecks ownership committed
+after its observation, so concurrent allocation cannot miss a new device holding.
+
 Future runtime adapters own their boot and control implementation; the shared
 lifecycle retains selection, execution identity, resource fences and cleanup.
 

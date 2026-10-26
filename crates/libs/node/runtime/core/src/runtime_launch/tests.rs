@@ -11,6 +11,7 @@ fn launch_conversion_preserves_verified_identity_isolation_and_limits() {
         pids_max: Some(64),
     };
     let request = LaunchRuntimeRequest {
+        device_execution: None,
         sandbox_id: id.into(),
         execution_id: "018e390d-4dd8-7000-8000-000000000002".into(),
         runtime: RuntimeKind::Firecracker as i32,
@@ -66,6 +67,13 @@ fn launch_conversion_preserves_verified_identity_isolation_and_limits() {
             Err(LaunchContractError::Sandbox(_) | LaunchContractError::Execution(_))
         ));
     }
+    let mut device = request.clone();
+    device.device_execution =
+        Some(pplx_space_execution_common::proto::DeviceExecutionInput::default());
+    assert!(matches!(
+        FirecrackerLaunch::try_from(device),
+        Err(LaunchContractError::UnsupportedDevices)
+    ));
     for sandbox_id in ["", "another-sandbox"] {
         let mut conflict = request.clone();
         conflict.sandbox_id = sandbox_id.into();

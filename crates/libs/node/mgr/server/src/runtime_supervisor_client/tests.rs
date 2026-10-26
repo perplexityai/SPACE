@@ -346,6 +346,13 @@ fn refused(rpc: &str) -> Status {
 
 #[tonic::async_trait]
 impl proto::runtime_supervisor_server::RuntimeSupervisor for RefusingRuntimeSupervisor {
+    async fn get_execution_capabilities(
+        &self,
+        _request: Request<proto::GetExecutionCapabilitiesRequest>,
+    ) -> Result<Response<proto::GetExecutionCapabilitiesResponse>, Status> {
+        Err(refused("GetExecutionCapabilities"))
+    }
+
     async fn bind_execution(
         &self,
         _request: Request<proto::BindExecutionRequest>,
@@ -453,6 +460,7 @@ impl StubRuntimeSupervisor {
             return Err(Status::internal("firecracker launch failed"));
         }
         Ok(Response::new(proto::LaunchRuntimeResponse {
+            devices: None,
             accepted_environment_reference: String::new(),
             pid: STUB_LAUNCH_PID,
         }))
@@ -461,6 +469,15 @@ impl StubRuntimeSupervisor {
 
 #[tonic::async_trait]
 impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervisor {
+    async fn get_execution_capabilities(
+        &self,
+        _request: Request<proto::GetExecutionCapabilitiesRequest>,
+    ) -> Result<Response<proto::GetExecutionCapabilitiesResponse>, Status> {
+        Ok(Response::new(proto::GetExecutionCapabilitiesResponse {
+            exclusive_devices_v1: false,
+        }))
+    }
+
     async fn bind_execution(
         &self,
         _request: Request<proto::BindExecutionRequest>,
@@ -489,6 +506,7 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
             .await?
             .into_inner();
         Ok(Response::new(proto::LaunchRuntimeResponse {
+            devices: None,
             pid: response.pid,
             accepted_environment_reference: response.accepted_environment_reference,
         }))

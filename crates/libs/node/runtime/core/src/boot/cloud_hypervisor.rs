@@ -47,10 +47,20 @@ pub(super) fn configuration(input: &LinuxBoot<'_>) -> Result<Value, BootConfigEr
         Arch::Aarch64 => "ttyAMA0",
         Arch::X86_64 => "ttyS0",
     };
+    let mut payload = object([
+        ("kernel", json!("/vmlinux.bin")),
+        (
+            "cmdline",
+            json!(super::command_line(input, "net.ifnames=0", "", console)),
+        ),
+    ]);
+    if input.initramfs {
+        payload.insert("initramfs".into(), json!("/initrd.img"));
+    }
     Ok(json!({
         "cpus": { "boot_vcpus": input.cpus.get(), "max_vcpus": input.cpus.get() },
         "memory": { "size": bytes, "shared": false, "hugepages": false, "thp": false },
-        "payload": { "kernel": "/vmlinux.bin", "cmdline": super::command_line(input, "net.ifnames=0", "", console) },
+        "payload": payload,
         "disks": [disk], "net": [net],
         "vsock": { "cid": input.guest_cid.get(), "socket": "/v.sock" },
         "serial": { "mode": if input.console { "Tty" } else { "Off" } },
@@ -62,11 +72,31 @@ pub(super) fn configuration(input: &LinuxBoot<'_>) -> Result<Value, BootConfigEr
 /// Node-manager admits only the device model this adapter constructs. The
 /// control API accepts host paths and additional devices, so tenant-authored
 /// configuration must never expand this model or disable its confinement.
-pub(super) fn validate(configuration: &str) -> Result<(), BootConfigError> {
+pub(super) fn validate(configuration: &str, initramfs: bool) -> Result<(), BootConfigError> {
     let value: Value = serde_json::from_str(configuration)?;
     let fields = value
         .as_object()
         .ok_or(BootConfigError::Invalid("expected boot object"))?;
+    let expected_initramfs = initramfs.then(|| json!("/initrd.img"));
+    if value.pointer("/payload/initramfs") != expected_initramfs.as_ref() {
+        return Err(BootConfigError::Invalid(
+            "initramfs differs from the execution contract",
+        ));
+    }
+    if initramfs
+        && !value
+            .pointer("/payload/cmdline")
+            .and_then(Value::as_str)
+            .is_some_and(|args| {
+                args.split_whitespace()
+                    .filter(|arg| arg.starts_with("module.sig_enforce="))
+                    .eq(["module.sig_enforce=1"])
+            })
+    {
+        return Err(BootConfigError::Invalid(
+            "initramfs requires module signature enforcement",
+        ));
+    }
     const ALLOWED: &[&str] = &[
         "cpus",
         "memory",
@@ -91,7 +121,7 @@ pub(super) fn validate(configuration: &str) -> Result<(), BootConfigError> {
         ));
     }
     for (name, allowed) in [
-        ("payload", &["kernel", "cmdline"][..]),
+        ("payload", &["kernel", "cmdline", "initramfs"][..]),
         ("cpus", &["boot_vcpus", "max_vcpus"][..]),
         ("memory", &["size", "shared", "hugepages", "thp"][..]),
         ("vsock", &["cid", "socket"][..]),

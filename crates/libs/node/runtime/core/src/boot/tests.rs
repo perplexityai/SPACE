@@ -28,6 +28,7 @@ fn input() -> LinuxBoot<'static> {
         huge_pages: false,
         console: false,
         builder: false,
+        initramfs: false,
     }
 }
 
@@ -153,7 +154,7 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
 #[test]
 fn standalone_admission_rejects_extra_devices_and_host_paths() {
     let text = configuration(RuntimeKind::CloudHypervisor, &input()).unwrap();
-    validate_standalone(RuntimeKind::CloudHypervisor, &text).unwrap();
+    validate_standalone(RuntimeKind::CloudHypervisor, &text, false).unwrap();
     let original: Value = serde_json::from_str(&text).unwrap();
     for (pointer, replacement) in [
         ("/payload/kernel", json!("/etc/shadow")),
@@ -167,11 +168,171 @@ fn standalone_admission_rejects_extra_devices_and_host_paths() {
         let mut config = original.clone();
         *config.pointer_mut(pointer).unwrap() = replacement;
         assert!(
-            validate_standalone(RuntimeKind::CloudHypervisor, &config.to_string()).is_err(),
+            validate_standalone(RuntimeKind::CloudHypervisor, &config.to_string(), false).is_err(),
             "{pointer}"
         );
     }
     let mut extra = original;
     extra["devices"] = json!([{ "path": "/dev/vfio/3" }]);
-    assert!(validate_standalone(RuntimeKind::CloudHypervisor, &extra.to_string()).is_err());
+    assert!(validate_standalone(RuntimeKind::CloudHypervisor, &extra.to_string(), false).is_err());
+}
+
+#[test]
+fn initramfs_configuration_must_match_the_resolved_boot_contract() {
+    use pplx_space_common_core::types::{Digest, RuntimeIdentity};
+    let component = ArtifactComponentMetadata {
+        kind: ArtifactComponentKind::Initrd,
+        role: Some("initramfs".parse().unwrap()),
+        version: Some("1".parse().unwrap()),
+        digest: Some(Digest::sha256([42; 32])),
+        format: Some("cpio".parse().unwrap()),
+    };
+    for (runtime, role, digest, accepted) in [
+        (
+            RuntimeKind::CloudHypervisor,
+            "initramfs",
+            component.digest,
+            true,
+        ),
+        (
+            RuntimeKind::CloudHypervisor,
+            "boot",
+            component.digest,
+            false,
+        ),
+        (RuntimeKind::CloudHypervisor, "initramfs", None, false),
+        (
+            RuntimeKind::Firecracker,
+            "initramfs",
+            component.digest,
+            false,
+        ),
+    ] {
+        let execution = ExecutionMetadata::new(
+            RuntimeIdentity {
+                kind: runtime,
+                version: "1".parse().unwrap(),
+            },
+            input().guest,
+            None,
+            vec![ArtifactComponentMetadata {
+                role: Some(role.parse().unwrap()),
+                digest,
+                ..component.clone()
+            }],
+        )
+        .unwrap();
+        let selected = initramfs_component(&execution);
+        if accepted {
+            assert_eq!(selected.unwrap(), Some(&component));
+        } else {
+            assert!(matches!(selected, Err(BootConfigError::Invalid(_))));
+        }
+    }
+    for initramfs in [false, true] {
+        let mut boot = input();
+        boot.initramfs = initramfs;
+        let text = configuration(RuntimeKind::CloudHypervisor, &boot).unwrap();
+        validate_standalone(RuntimeKind::CloudHypervisor, &text, initramfs).unwrap();
+        assert!(validate_standalone(RuntimeKind::CloudHypervisor, &text, !initramfs).is_err());
+        let mut config: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            config["payload"]["cmdline"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .any(|argument| argument == "module.sig_enforce=1"),
+            initramfs,
+        );
+        if initramfs {
+            for args in [
+                "root=/dev/vda",
+                "module.sig_enforce=0",
+                "module.sig_enforce=1 module.sig_enforce=0",
+            ] {
+                let mut changed = config.clone();
+                changed["payload"]["cmdline"] = json!(args);
+                assert!(
+                    validate_standalone(RuntimeKind::CloudHypervisor, &changed.to_string(), true)
+                        .is_err()
+                );
+            }
+        }
+        for path in [json!("/etc/shadow"), json!("../initrd.img"), Value::Null] {
+            config["payload"]["initramfs"] = path;
+            assert!(
+                validate_standalone(RuntimeKind::CloudHypervisor, &config.to_string(), initramfs)
+                    .is_err()
+            );
+        }
+        if initramfs {
+            assert!(matches!(
+                configuration(RuntimeKind::Firecracker, &boot),
+                Err(BootConfigError::UnsupportedFeature { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn exclusive_devices_are_injected_from_assignments_without_accepting_configured_host_paths() {
+    use pplx_space_common_core::types::{Digest, SandboxActivationAttemptId, SandboxId};
+    use pplx_space_execution_common::{devices::decode_execution, proto};
+    let input_devices = |locator: &str| proto::DeviceExecutionInput {
+        sandbox_id: SandboxId::new().to_string(),
+        requirements_digest: Digest::sha256([1; 32]).to_string(),
+        assignments: vec![proto::ExclusiveDeviceAssignment {
+            lease_id: SandboxActivationAttemptId::new().to_string(),
+            parent_id: SandboxActivationAttemptId::new().to_string(),
+            profile: "compute".into(),
+            host_device_ids: vec![locator.into()],
+        }],
+    };
+    let (_, devices) = decode_execution("", Some(&input_devices("pci:0000:02:00.0"))).unwrap();
+    let devices = devices.unwrap();
+    let runtime = RuntimeKind::CloudHypervisor;
+    let base = configuration(runtime, &input()).unwrap();
+    let resources = crate::catalog::DeviceResourceLimits::for_test(1024, 256);
+    let injected =
+        with_exclusive_devices(runtime, &base, false, &devices, resources, 1280).unwrap();
+    with_exclusive_devices(runtime, &base, false, &devices, resources, 1279).unwrap_err();
+    let mut injected: Value = serde_json::from_str(&injected).unwrap();
+    assert_eq!(
+        injected["devices"][0]["path"],
+        "/sys/bus/pci/devices/0000:02:00.0"
+    );
+    assert_eq!(injected["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(injected["landlock_enable"], true);
+    injected.as_object_mut().unwrap().remove("devices");
+    assert_eq!(injected, serde_json::from_str::<Value>(&base).unwrap());
+    for value in [
+        json!({"devices":[{"path":"/unassigned/device"}]}),
+        json!({"landlock_enable":false}),
+        json!({"memory":{"size":1073741824,"shared":false,"hugepages":true,"thp":false}}),
+    ] {
+        let mut supplied: Value = serde_json::from_str(&base).unwrap();
+        for (key, value) in value.as_object().unwrap() {
+            supplied[key] = value.clone();
+        }
+        with_exclusive_devices(
+            runtime,
+            &supplied.to_string(),
+            false,
+            &devices,
+            resources,
+            1280,
+        )
+        .unwrap_err();
+    }
+    let (_, non_pci) = decode_execution("", Some(&input_devices("mdev:opaque"))).unwrap();
+    with_exclusive_devices(runtime, &base, false, &non_pci.unwrap(), resources, 1280).unwrap_err();
+    with_exclusive_devices(
+        RuntimeKind::Firecracker,
+        &base,
+        false,
+        &devices,
+        resources,
+        1280,
+    )
+    .unwrap_err();
 }

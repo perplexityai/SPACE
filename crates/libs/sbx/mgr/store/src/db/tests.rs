@@ -1444,6 +1444,7 @@ fn restore_adopt_insert_binds_volume_encryption() {
         volume_encryption: bool,
     ) -> InsertSandboxParams<'a> {
         InsertSandboxParams {
+            device_requirements: None,
             id,
             uuid8,
             state: SandboxState::Restoring,
@@ -1527,6 +1528,7 @@ fn restore_adoption_clears_obsolete_auto_lifecycle_delete_block() {
     let env = BTreeMap::new();
     let lifecycle = AutoLifecyclePolicy::disabled();
     let restore_params = || InsertSandboxParams {
+        device_requirements: None,
         id: &sandbox_id_string,
         uuid8: &uuid8,
         state: SandboxState::Restoring,
@@ -1549,6 +1551,7 @@ fn restore_adoption_clears_obsolete_auto_lifecycle_delete_block() {
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            device_requirements: None,
             id: &sandbox_id_string,
             uuid8: &uuid8,
             state: SandboxState::Created,
