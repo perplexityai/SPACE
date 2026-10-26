@@ -228,4 +228,8 @@ message EnvironmentDefinition {
   // SHA-256 over versioned canonical semantic fields, not protobuf wire bytes.
   string reference = 2;
   EnvironmentDescriptor descriptor = 3;
+  // Canonical identity encoding, independent of the transport schema. Zero
+  // retains the historical rule: use schema_version. A schema-2 representation
+  // may carry identity 1 only when it exactly represents the legacy contract.
+  uint32 identity_schema_version = 4;
 }

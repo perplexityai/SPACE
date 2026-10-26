@@ -1046,20 +1046,17 @@ fn pause_failed_recovery_requires_two_matching_firecracker_states() {
         observation
     };
     let mut health = test_health();
-    health.health_components.push(
-        HealthComponent::Firecracker,
-        observation(FirecrackerVmState::Running),
-    );
+    health
+        .health_components
+        .push(HealthComponent::Firecracker, observation(VmState::Running));
     assert_eq!(pause_failed_recovery_target(&health, 0), None);
-    health.health_components.push(
-        HealthComponent::Firecracker,
-        observation(FirecrackerVmState::Paused),
-    );
+    health
+        .health_components
+        .push(HealthComponent::Firecracker, observation(VmState::Paused));
     assert_eq!(pause_failed_recovery_target(&health, 0), None);
-    health.health_components.push(
-        HealthComponent::Firecracker,
-        observation(FirecrackerVmState::Paused),
-    );
+    health
+        .health_components
+        .push(HealthComponent::Firecracker, observation(VmState::Paused));
     assert_eq!(
         pause_failed_recovery_target(&health, 0),
         Some(crate::db::PauseFailedRecoveryTarget::Paused)
@@ -1067,7 +1064,7 @@ fn pause_failed_recovery_requires_two_matching_firecracker_states() {
 }
 
 async fn pause_failed_recovery_fixture(
-    firecracker_state: FirecrackerVmState,
+    firecracker_state: VmState,
 ) -> (
     crate::db::SharedConnection,
     Arc<SnapshotScheduler>,
@@ -1134,7 +1131,7 @@ async fn pause_failed_recovery_fixture(
 #[tokio::test]
 async fn pause_failed_recovery_applies_node_side_effects() {
     let (db, snapshot_scheduler, auto_lifecycle, lifecycle_epochs, sandbox_id) =
-        pause_failed_recovery_fixture(FirecrackerVmState::Paused).await;
+        pause_failed_recovery_fixture(VmState::Paused).await;
     reconcile_pause_failed_quarantine(
         &db,
         snapshot_scheduler.as_ref(),
@@ -1172,7 +1169,7 @@ async fn pause_failed_recovery_applies_node_side_effects() {
 #[tokio::test]
 async fn pause_failed_recovery_revalidates_epoch_after_artifact_lock() {
     let (db, snapshot_scheduler, auto_lifecycle, lifecycle_epochs, sandbox_id) =
-        pause_failed_recovery_fixture(FirecrackerVmState::Paused).await;
+        pause_failed_recovery_fixture(VmState::Paused).await;
     let sandbox_id_string = sandbox_id.to_string();
     let artifact_guard = auto_lifecycle
         .artifact_lock(&sandbox_id_string)
@@ -1253,7 +1250,7 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
     health.health_observed_at = Some(SystemTime::now());
     health.consecutive_guest_probe_failures = 2;
     let mut paused = sample(HealthProbeOutcome::Success);
-    paused.firecracker_state = Some(FirecrackerVmState::Paused);
+    paused.firecracker_state = Some(VmState::Paused);
     health
         .health_components
         .push(HealthComponent::Firecracker, paused);
@@ -1421,7 +1418,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
     )])));
     for _ in 0..HEALTH_SUCCESS_THRESHOLD {
         let mut firecracker = sample(HealthProbeOutcome::Success);
-        firecracker.firecracker_state = Some(FirecrackerVmState::Running);
+        firecracker.firecracker_state = Some(VmState::Running);
         apply_composed_health_result(
             &state,
             &db,
