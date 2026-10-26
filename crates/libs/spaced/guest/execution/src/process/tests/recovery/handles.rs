@@ -4,7 +4,7 @@ use pplx_space_spaced_guest_protocol::{
     recovery::RecoveryReason,
 };
 
-async fn running(service: &ExecutionService, pty: bool) -> RecoveryHandle {
+pub(super) async fn running(service: &ExecutionService, pty: bool) -> RecoveryHandle {
     let mut request = recovery_request(service, "controlled").await;
     request
         .recovery
@@ -37,6 +37,7 @@ async fn running(service: &ExecutionService, pty: bool) -> RecoveryHandle {
         .expect("start prefix");
     RecoveryHandle {
         contract_version: 1,
+        sequence: None,
         expected_instance_id: started.instance_id.expect("instance"),
         expected_activation_id: activation,
         process_id: event.process_id,
@@ -59,7 +60,7 @@ async fn connect(
     .await
 }
 
-async fn output(service: &ExecutionService, handle: RecoveryHandle) -> Vec<u8> {
+pub(super) async fn output(service: &ExecutionService, handle: RecoveryHandle) -> Vec<u8> {
     let mut events = connect(service, handle)
         .await
         .expect("connect")
@@ -209,7 +210,7 @@ async fn every_fenced_entrypoint_rejects_stale_or_ambiguous_handles_before_effec
                 (tonic::Code::NotFound, None)
             }
             4 => {
-                handle.contract_version = 2;
+                handle.contract_version = 3;
                 (
                     tonic::Code::FailedPrecondition,
                     Some(RecoveryReason::UnsupportedContract),

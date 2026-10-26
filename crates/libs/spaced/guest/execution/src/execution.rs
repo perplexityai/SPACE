@@ -187,6 +187,9 @@ impl ExecutionService {
                 pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles
                     .as_str()
                     .to_owned(),
+                pplx_space_common_grpc::GuestCapability::ProcessMutationReceipts
+                    .as_str()
+                    .to_owned(),
             ],
         }
     }

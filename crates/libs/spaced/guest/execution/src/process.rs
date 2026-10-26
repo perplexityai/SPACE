@@ -16,6 +16,7 @@ use std::{collections::VecDeque, io};
 use tokio::io::AsyncRead;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+mod mutations;
 mod pty;
 mod recovery;
 use pty::PtyIo;
@@ -668,7 +669,7 @@ struct ProcessRecord {
     // RPCs can retain a completed record beyond registry eviction.
     _record_slot: OwnedSemaphorePermit,
     started: ProcessEvent,
-    recovery_identity: Option<recovery::RecoveryIdentity>,
+    recovery: Option<recovery::RecoveryRecord>,
     /// What `list` reports, without `env`.
     info: ProcessInfo,
     /// Up to 64 KiB, kept apart from `info` so a finished record can drop it
@@ -719,7 +720,7 @@ impl ProcessRecord {
         Self {
             _record_slot: reservation.record_slot,
             started,
-            recovery_identity,
+            recovery: recovery_identity.map(recovery::RecoveryRecord::new),
             info,
             env: std::sync::Mutex::new(env),
             input,
@@ -2803,6 +2804,7 @@ impl Process for ExecutionService {
         )?;
         let request = request.into_inner();
         let address = ProcessAddress::parse(request.process_id, request.recovery)?;
+        address.require_unsequenced()?;
         let resume_after_output_gap = request.resume_after_output_gap.unwrap_or(false);
         // Validate the field for wire compatibility, but do not turn it into a
         // total stream-lifetime deadline here. ECW and native callers own
@@ -2872,17 +2874,44 @@ impl Process for ExecutionService {
 
     async fn send_signal(
         &self,
-        request: Request<SendSignalRequest>,
+        mut request: Request<SendSignalRequest>,
     ) -> Result<Response<SendSignalResponse>, Status> {
         let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
+        let payload = if request
+            .get_ref()
+            .recovery
+            .as_ref()
+            .is_some_and(|handle| handle.contract_version == 2)
+        {
+            Some(crate::payload::admit(
+                &mut request,
+                &self.inner.process_payload_slots,
+                1,
+                pplx_space_metrics::payload::Budget::GuestProcess,
+                pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+            )?)
+        } else {
+            None
+        };
         let request = request.into_inner();
         let address = ProcessAddress::parse(request.process_id, request.recovery)?;
         let signal =
             ProcessSignal::try_from_i32(request.signal).map_err(invalid_argument_status)?;
+        if let Some(sequence) = address.sequence() {
+            self.mutate_process(
+                address,
+                sequence,
+                mutations::Mutation::Signal(signal),
+                payload.expect("sequenced mutation has admission"),
+                _operation,
+            )
+            .await?;
+            return Ok(Response::new(SendSignalResponse {}));
+        }
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let handle = &target.record;
@@ -2922,6 +2951,17 @@ impl Process for ExecutionService {
             std::mem::take(&mut request.process_id),
             request.recovery.take(),
         )?;
+        if let Some(sequence) = address.sequence() {
+            self.mutate_process(
+                address,
+                sequence,
+                mutations::Mutation::Input(request),
+                _admission,
+                _operation,
+            )
+            .await?;
+            return Ok(Response::new(SendInputResponse {}));
+        }
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let record = &target.record;
@@ -2937,15 +2977,42 @@ impl Process for ExecutionService {
 
     async fn close_stdin(
         &self,
-        request: Request<CloseStdinRequest>,
+        mut request: Request<CloseStdinRequest>,
     ) -> Result<Response<CloseStdinResponse>, Status> {
         let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
+        let payload = if request
+            .get_ref()
+            .recovery
+            .as_ref()
+            .is_some_and(|handle| handle.contract_version == 2)
+        {
+            Some(crate::payload::admit(
+                &mut request,
+                &self.inner.process_payload_slots,
+                1,
+                pplx_space_metrics::payload::Budget::GuestProcess,
+                pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+            )?)
+        } else {
+            None
+        };
         let request = request.into_inner();
         let address = ProcessAddress::parse(request.process_id, request.recovery)?;
+        if let Some(sequence) = address.sequence() {
+            self.mutate_process(
+                address,
+                sequence,
+                mutations::Mutation::Close,
+                payload.expect("sequenced mutation has admission"),
+                _operation,
+            )
+            .await?;
+            return Ok(Response::new(CloseStdinResponse {}));
+        }
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let record = &target.record;
@@ -2969,6 +3036,7 @@ impl Process for ExecutionService {
         )?;
         let request = request.into_inner();
         let address = ProcessAddress::parse(request.process_id, request.recovery)?;
+        address.require_unsequenced()?;
         let size = request
             .size
             .ok_or_else(|| Status::invalid_argument("pty size is required"))?;
