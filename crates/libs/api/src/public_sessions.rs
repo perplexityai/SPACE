@@ -90,25 +90,13 @@ impl PublicSessionStore {
         }
     }
 
-    pub async fn create_session(
-        &self,
-        input: CreatePublicSession<'_>,
-    ) -> Result<PublicSession, PublicSessionStoreError> {
-        match self
-            .create_session_admitted(input, || Ok::<(), std::convert::Infallible>(()))
-            .await?
-        {
-            Ok(session) => Ok(session),
-            Err(never) => match never {},
-        }
-    }
-
-    /// [`Self::create_session`], refusing a new session when `admit` does.
+    /// Create a session, or replay the one this idempotency key created;
+    /// a new session only when `admit` allows it.
     ///
     /// `admit` runs only after the idempotency lookup misses, so a retry of a
     /// request that already created its session replays it even if the state
     /// `admit` judges has changed since.
-    pub async fn create_session_admitted<E>(
+    pub async fn create_session<E>(
         &self,
         input: CreatePublicSession<'_>,
         admit: impl FnOnce() -> Result<(), E>,

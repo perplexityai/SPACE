@@ -337,7 +337,7 @@ pub(crate) async fn create_command_session(
         &request_json,
     );
     let session = store
-        .create_session_admitted(
+        .create_session(
             CreatePublicSession {
                 org_id,
                 actor_user_id: Some(actor_user_id),
@@ -661,7 +661,7 @@ async fn create_session(
 ) -> Result<PublicSession, PublicApiError> {
     let store = state.public_session_store();
     store
-        .create_session_admitted(
+        .create_session(
             CreatePublicSession {
                 org_id: input.org_id,
                 actor_user_id: Some(input.actor_user_id),
