@@ -107,7 +107,7 @@ fn roots(base: &Path) -> ScanRoots {
         )],
         vendor_kernels: base.join("vendor/kernels"),
         managed_kernels: None,
-        managed_releases: None,
+        managed_releases: Vec::new(),
         cache_kernels: base.join("cache/firecracker/kernels"),
         cache_legacy_assets: base.join("cache/firecracker/assets"),
         runtime_aliases: vec![base.join("bin/firecracker"), base.join("bin/jailer")],
@@ -1143,10 +1143,10 @@ fn the_runtime_managers_release_root_is_scanned_once_beside_the_images() {
         0o755,
     );
     write_mode(&bin.join("jailer"), &elf_header(ELF_MACHINE_X86_64), 0o755);
-    roots.managed_releases = Some(RuntimeInstallationRoot::new(
+    roots.managed_releases = vec![RuntimeInstallationRoot::new(
         RuntimeKind::Firecracker,
         &managed,
-    ));
+    )];
 
     let listed = |scan: &ArtifactScan| {
         let mut paths: Vec<_> = scan
@@ -1188,7 +1188,7 @@ fn managed_release_identity_is_measured_without_catalog_pins_and_respects_limits
     release(&roots, "v9.9.9");
     let external = run(&roots);
     assert_eq!(find(&external, FC_RELEASE, "v9.9.9").digest, None);
-    roots.managed_releases = Some(roots.runtime_releases[0].clone());
+    roots.managed_releases = vec![roots.runtime_releases[0].clone()];
     let expected = crate::catalog::release_digest([
         ("bin/firecracker", sha256(&elf_header(ELF_MACHINE_X86_64))),
         ("bin/jailer", sha256(&elf_header(ELF_MACHINE_X86_64))),
@@ -1248,7 +1248,7 @@ fn filtered_listings_retain_the_other_kinds_bounded_digest_cache() {
     let dir = tempfile::tempdir().unwrap();
     let mut roots = roots(dir.path());
     release(&roots, "v1.16.2");
-    roots.managed_releases = Some(roots.runtime_releases[0].clone());
+    roots.managed_releases = vec![roots.runtime_releases[0].clone()];
     write(
         &roots.cache_kernels.join("6.1.155/vmlinux.bin"),
         &kernel_image(b"kernel"),
@@ -1283,5 +1283,58 @@ fn filtered_listings_retain_the_other_kinds_bounded_digest_cache() {
                 .all(|artifact| artifact.digest.is_some())
         );
         assert_eq!(cache.len(), 3);
+    }
+}
+
+#[test]
+fn managed_runtime_roots_keep_same_version_releases_and_failures_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = roots(dir.path());
+    release(&roots, "v1.15.1");
+    let fc = roots.runtime_releases[0].clone();
+    let ch =
+        RuntimeInstallationRoot::new(RuntimeKind::CloudHypervisor, dir.path().join("managed/ch"));
+    let binary = ch.path.join("v1.15.1/bin/cloud-hypervisor");
+    write_mode(&binary, &elf_header(ELF_MACHINE_X86_64), 0o755);
+    // A duplicate external root must not create duplicate managed entries.
+    roots.runtime_releases.push(ch.clone());
+    roots.managed_releases = vec![fc, ch];
+    for damaged in [false, true] {
+        if damaged {
+            std::fs::remove_file(&binary).unwrap();
+        }
+        let scan = run(&roots);
+        let runtimes: Vec<_> = scan
+            .artifacts
+            .iter()
+            .filter(|artifact| matches!(artifact.origin.kind, ArtifactKind::Runtime(_)))
+            .collect();
+        assert_eq!(runtimes.len(), 2);
+        let fc = runtimes
+            .iter()
+            .find(|artifact| {
+                artifact.origin.kind == ArtifactKind::Runtime(RuntimeKind::Firecracker)
+            })
+            .unwrap();
+        let ch = runtimes
+            .iter()
+            .find(|artifact| {
+                artifact.origin.kind == ArtifactKind::Runtime(RuntimeKind::CloudHypervisor)
+            })
+            .unwrap();
+        assert_eq!(fc.status, ArtifactStatus::Valid);
+        assert!(fc.digest.is_some());
+        assert_eq!(
+            ch.status,
+            if damaged {
+                ArtifactStatus::Incomplete
+            } else {
+                ArtifactStatus::Valid
+            }
+        );
+        if !damaged {
+            assert!(ch.digest.is_some());
+            assert_ne!(fc.digest, ch.digest);
+        }
     }
 }
