@@ -365,6 +365,57 @@ mod not_running {
         Ok(())
     }
 
+    /// The sandbox's active operations in the dispatcher's order: kind, actor.
+    async fn queue(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+    ) -> TestDbResult<Vec<(String, Option<Uuid>)>> {
+        Ok(sqlx::query_as(sql!(
+            "SELECT kind, actor_user_id
+               FROM public_operations
+              WHERE target_type = 'sandbox' AND target_id = $1
+                AND state IN ('queued', 'running')
+              ORDER BY requested_at, operation_id"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_all(&fixture.db.pool)
+        .await?)
+    }
+
+    #[tokio::test]
+    async fn a_command_behind_a_queued_suspend_queues_its_own_wake() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        for action in ["wake", "suspend"] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/sandboxes/{sandbox_id}:{action}"))
+                .header("authorization", format!("Bearer {KEY}"))
+                .header("idempotency-key", Uuid::now_v7().to_string())
+                .body(Body::empty())?;
+            let response = fixture.app.clone().oneshot(request).await?;
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{action}");
+        }
+        let caller = Some(SEED_USER_ID);
+
+        // Joining the caller's wake would run it before the suspend and leave
+        // the sandbox suspended for the command.
+        let (status, _, body) = command(&fixture, sandbox_id, "commands").await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let expected = vec![
+            ("wake_sandbox".to_string(), caller),
+            ("suspend_sandbox".to_string(), caller),
+            ("wake_sandbox".to_string(), None),
+        ];
+        assert_eq!(queue(&fixture, sandbox_id).await?, expected);
+
+        // Nothing is queued behind that wake, so the next command joins it.
+        let (status, _, body) = command(&fixture, sandbox_id, "process-sessions").await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(queue(&fixture, sandbox_id).await?, expected);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_replayed_request_answers_as_it_did_before_the_sandbox_suspended() -> TestDbResult<()>
     {
