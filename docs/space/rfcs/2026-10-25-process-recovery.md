@@ -265,6 +265,38 @@ old fences. New public recovery command sessions require a running sandbox and
 do not enqueue a wake; callers explicitly resume or restore, then discover the
 execution for new work. Legacy command wake policy is unchanged.
 
+### Snapshot activation handshake
+
+The guest starts with recovery disabled. `WaitReady` supplies an opaque barrier;
+`ActivateProcessRecovery` accepts an external activation only against that exact
+barrier. Repeating the activation is idempotent. Changing it requires quiescence.
+The existing `FlushFilesystems` RPC invalidates the barrier and disables recovery
+before waiting for admitted effects. Disabling interrupts blocked recovery writes
+and waits for their owners to publish terminal receipts before flushing. This also protects snapshot
+preparation by older hosts. A delayed activation against an earlier barrier is
+refused. Cancelling a flush does not release activation exclusion while its
+blocking filesystem work still runs.
+
+A host configured with an external activation starts quiesced. Its `WaitReady`
+returns a separate host barrier; `ResumeProcessRecovery` accepts that barrier and
+installs only the launch-configured activation. Preparation and ordinary guest
+flushes invalidate the host barrier. A restarted host creates a new barrier while
+retaining the resident VM's activation. Lost replies leave the host quiesced until
+a confirmed retry. Neither readiness polling nor clock synchronization activates
+recovery automatically.
+
+The lifecycle owner must exclude snapshot preparation and capture while resuming
+recovery, and must choose a fresh external activation after every actual memory
+restore. Resident pause/resume, checkpoint completion and failed-capture rollback
+can rearm the existing activation once the VM is running. Disk-only flushing also
+quiesces recovery and requires rearming. Barriers are ordering tokens, not access
+credentials; host metadata calls retain their existing peer authorization.
+
+These metadata endpoints do not yet enable routed recovery operations. Hosts
+without activation configuration and older guests retain the existing path;
+recovery capabilities remain filtered until lifecycle ownership and every process
+adapter are wired end to end.
+
 ### Deduplicate process mutations
 
 SendInput, CloseStdin and SendSignal share one ordered sequence per recovery

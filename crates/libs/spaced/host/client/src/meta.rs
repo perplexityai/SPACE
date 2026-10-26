@@ -47,6 +47,24 @@ impl SpacedHostClient {
         .await
     }
 
+    /// Rearm recovery only while the lifecycle owner excludes snapshot capture.
+    /// The barrier comes from this host's latest WaitReady response. The host
+    /// bounds readiness and activation together to 20 seconds.
+    pub async fn resume_process_recovery(
+        &self,
+        expected_barrier: pplx_space_common_core::types::ProcessRecoveryToken,
+    ) -> Result<(), tonic::Status> {
+        self.call_meta_once("resume_process_recovery", |mut client| async move {
+            client
+                .resume_process_recovery(proto::ResumeProcessRecoveryRequest {
+                    expected_barrier_id: expected_barrier.to_string(),
+                })
+                .await
+        })
+        .await
+        .map(|_: proto::ResumeProcessRecoveryResponse| ())
+    }
+
     pub async fn configure_process_env(
         &self,
         env: std::collections::HashMap<String, String>,

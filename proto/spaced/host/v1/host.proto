@@ -12,6 +12,8 @@ service Meta {
   rpc PingGuest(PingGuestRequest) returns (PingGuestResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
+  // Lifecycle owner only: rearm after a settled start or resident resume.
+  rpc ResumeProcessRecovery(ResumeProcessRecoveryRequest) returns (ResumeProcessRecoveryResponse);
   rpc ConfigureProcessEnv(ConfigureProcessEnvRequest) returns (ConfigureProcessEnvResponse);
   rpc NotifyResume(NotifyResumeRequest) returns (NotifyResumeResponse);
   // Flush guest storage while keeping bridge connections available for a running VM.
@@ -95,7 +97,14 @@ message WaitReadyResponse {
   // Identity from the same guest observation that established readiness.
   VersionInfo guest_version = 4;
   space.spaced.operations.v1.ProcessExecutionInfo process_execution = 5;
+  // Present when this host needs lifecycle authorization to activate recovery.
+  optional string process_recovery_barrier_id = 6;
 }
+
+// The caller must exclude snapshot preparation/capture while resuming. It may
+// not choose the activation: that is fixed by the host launch configuration.
+message ResumeProcessRecoveryRequest { string expected_barrier_id = 1; }
+message ResumeProcessRecoveryResponse {}
 
 message ConfigureProcessEnvRequest {
   map<string, string> env = 1;

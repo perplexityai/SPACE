@@ -459,6 +459,9 @@ impl SpacedHostService {
         };
         Self {
             inner: Arc::new(SpacedHostServiceInner {
+                process_recovery: config
+                    .process_recovery_activation
+                    .map(crate::recovery::RecoveryLifecycle::new),
                 shutdown,
                 socket_path: config.socket_path,
                 bridge_host_socket_path: config.bridge_host_socket_path,

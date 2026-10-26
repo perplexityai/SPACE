@@ -48,7 +48,7 @@ async fn mounted_authorization_precedes_decoding_even_for_new_methods() {
             },
         );
         let mut service = HostAuthorizationLayer(host).layer(unchecked);
-        for method in ["Ping", "FutureMethod"] {
+        for method in ["Ping", "ResumeProcessRecovery", "FutureMethod"] {
             let request = http::Request::builder()
                 .uri(format!("/space.spaced.host.v1.Meta/{method}"))
                 .body(ProbeBody(body_polls.clone()))
@@ -60,10 +60,10 @@ async fn mounted_authorization_precedes_decoding_even_for_new_methods() {
                 assert_eq!(response.headers()["grpc-status"], "16");
             }
         }
-        assert_eq!(calls.load(Ordering::SeqCst), if disabled { 2 } else { 0 });
+        assert_eq!(calls.load(Ordering::SeqCst), if disabled { 3 } else { 0 });
         assert_eq!(
             body_polls.load(Ordering::SeqCst),
-            if disabled { 2 } else { 0 }
+            if disabled { 3 } else { 0 }
         );
     }
 }

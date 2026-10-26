@@ -543,6 +543,16 @@ impl Process for MockBridgeGuest {
 
 #[tonic::async_trait]
 impl Meta for MockBridgeGuest {
+    async fn activate_process_recovery(
+        &self,
+        _: Request<pplx_space_spaced_common::proto::bridge_guest::ActivateProcessRecoveryRequest>,
+    ) -> Result<
+        Response<pplx_space_spaced_common::proto::bridge_guest::ActivateProcessRecoveryResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented("older guest"))
+    }
+
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse::default()))
     }
@@ -552,6 +562,7 @@ impl Meta for MockBridgeGuest {
         _request: Request<WaitReadyRequest>,
     ) -> Result<Response<WaitReadyResponse>, Status> {
         Ok(Response::new(WaitReadyResponse {
+            process_recovery_barrier_id: None,
             process_execution: None,
             ready: self.ready,
             guest_uptime: self.ready.then_some(prost_types::Duration {
