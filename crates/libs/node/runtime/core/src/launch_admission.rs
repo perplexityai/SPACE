@@ -1,4 +1,4 @@
-//! Distinguish a protected launch admission refusal from other supervisor failures.
+//! Preserve runtime admission failures without authorizing transitional RPC replay.
 use tonic::Status;
 
 const FAILURE: &str = "space-runtime-launch-failure";
@@ -29,6 +29,21 @@ pub fn supervisor_launch_status(error: Status) -> Status {
         error
     } else {
         Status::internal(format!("runtime-supervisor launch failed: {error}"))
+    }
+}
+
+/// Unimplemented is reserved for a missing transport method, so a transitional
+/// client may fall back only when no operation reached this implementation.
+pub fn runtime_operation_status(status: Status) -> Status {
+    if status.code() == tonic::Code::Unimplemented {
+        Status::with_details_and_metadata(
+            tonic::Code::FailedPrecondition,
+            status.message(),
+            status.details().to_vec().into(),
+            status.metadata().clone(),
+        )
+    } else {
+        status
     }
 }
 

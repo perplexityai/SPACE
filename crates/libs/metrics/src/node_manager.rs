@@ -77,6 +77,8 @@ pub fn lifecycle_released(method: &'static str, started: Instant) {
 
 /// Waiter outcomes are separate from mutation completion: abandoning a gRPC
 /// request does not cancel tracked host work.
+/// `method` names the serving RPC, including CaptureVmState/RestoreVmState on
+/// generic snapshot routes and CreateSnapshot/LoadSnapshot on legacy routes.
 pub fn rpc_wait_finished(method: &'static str, outcome: &'static str, started: Instant) {
     let tags = [tag("method", method), tag("outcome", outcome)];
     counter("node_mgr.rpc_wait.outcome", 1, &tags);

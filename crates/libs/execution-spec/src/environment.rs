@@ -6,8 +6,8 @@
 use std::{fmt, str::FromStr};
 
 use super::{
-    Arch, ComponentIdentity, Digest, DigestParseError, GuestPlatform, RuntimeIdentity,
-    StateFormatIdentity,
+    Arch, ArtifactComponentRole, ArtifactFormat, ComponentIdentity, Digest, DigestParseError,
+    ExecutionContractId, GuestPlatform, RuntimeIdentity, StateFormatIdentity,
 };
 
 macro_rules! vocabulary {
@@ -43,7 +43,10 @@ vocabulary!(#[derive(Ord, PartialOrd)] HostOperatingSystem, HostOperatingSystemP
 });
 vocabulary!(#[derive(Ord, PartialOrd)] HypervisorBackend, HypervisorBackendParseError, { Kvm => "kvm" });
 vocabulary!(IsolationClass, IsolationClassParseError, { HardwareVm => "hardware_vm" });
-vocabulary!(#[derive(Ord, PartialOrd)] RuntimePayloadLayout, RuntimePayloadLayoutParseError, { FirecrackerReleaseV1 => "firecracker_release_v1" });
+vocabulary!(#[derive(Ord, PartialOrd)] RuntimePayloadLayout, RuntimePayloadLayoutParseError, {
+    FirecrackerReleaseV1 => "firecracker_release_v1",
+    CatalogReleaseV1 => "catalog_release_v1",
+});
 
 /// OS and architecture of the machine executing host-side runtime code.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -89,7 +92,71 @@ pub enum RuntimeBinding {
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BootProfile {
-    LinuxDirectV1 { kernel: ComponentIdentity },
+    LinuxDirectV1 {
+        kernel: ComponentIdentity,
+    },
+    ArtifactsV1 {
+        contract: ExecutionContractId,
+        /// May be empty when the contract needs no separate boot files. The
+        /// catalog and runtime adapter validate the contract's required inputs.
+        artifacts: Vec<BootArtifact>,
+    },
+}
+
+/// One immutable boot input. Its role, format and bytes are independent of
+/// download packaging and the adapter's host-local paths.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootArtifact {
+    role: ArtifactComponentRole,
+    component: ComponentIdentity,
+    format: ArtifactFormat,
+}
+
+impl BootArtifact {
+    pub fn new(
+        role: ArtifactComponentRole,
+        component: ComponentIdentity,
+        format: ArtifactFormat,
+    ) -> Self {
+        Self {
+            role,
+            component,
+            format,
+        }
+    }
+    pub fn role(&self) -> &ArtifactComponentRole {
+        &self.role
+    }
+    pub fn component(&self) -> &ComponentIdentity {
+        &self.component
+    }
+    pub fn format(&self) -> &ArtifactFormat {
+        &self.format
+    }
+}
+
+impl BootProfile {
+    pub const LINUX_DIRECT_ROLE: &'static str = "boot";
+    pub const LINUX_DIRECT_FORMAT: &'static str = "vmlinux";
+
+    pub fn components(&self) -> impl Iterator<Item = (&str, &ComponentIdentity, &str)> {
+        let (direct, artifacts): (_, &[BootArtifact]) = match self {
+            Self::LinuxDirectV1 { kernel } => (
+                Some((Self::LINUX_DIRECT_ROLE, kernel, Self::LINUX_DIRECT_FORMAT)),
+                &[],
+            ),
+            Self::ArtifactsV1 { artifacts, .. } => (None, artifacts),
+        };
+        direct.into_iter().chain(artifacts.iter().map(|artifact| {
+            (
+                artifact.role.as_str(),
+                &artifact.component,
+                artifact.format.as_str(),
+            )
+        }))
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -99,7 +166,22 @@ pub enum BootProfile {
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionCompatibilityProfile {
-    FirecrackerSnapshotV1 { state_format: StateFormatIdentity },
+    FirecrackerSnapshotV1 {
+        state_format: StateFormatIdentity,
+    },
+    RuntimeV1 {
+        contract: ExecutionContractId,
+        state_format: Option<StateFormatIdentity>,
+    },
+}
+
+impl ExecutionCompatibilityProfile {
+    pub fn state_format(&self) -> Option<&StateFormatIdentity> {
+        match self {
+            Self::FirecrackerSnapshotV1 { state_format } => Some(state_format),
+            Self::RuntimeV1 { state_format, .. } => state_format.as_ref(),
+        }
+    }
 }
 
 /// Inputs to a descriptor. All fields are required; no absent OS or runtime
@@ -124,6 +206,10 @@ pub enum EnvironmentDescriptorError {
         target: HostPlatform,
         host: HostPlatform,
     },
+    #[error("KVM requires a Linux host, got {0}")]
+    KvmHost(HostOperatingSystem),
+    #[error("KVM requires the guest architecture {guest} to match the host {host}")]
+    KvmArchitecture { host: Arch, guest: Arch },
     #[error(
         "the implemented boot/backend/compatibility profiles require Firecracker on Linux with a same-architecture Linux guest"
     )]
@@ -132,6 +218,10 @@ pub enum EnvironmentDescriptorError {
     BootComponent,
     #[error("the Firecracker compatibility profile requires firecracker-snapshot state")]
     StateFormat,
+    #[error("legacy and runtime-neutral environment profiles cannot be mixed")]
+    MixedProfiles,
+    #[error("duplicate boot artifact role {0}")]
+    DuplicateBootRole(ArtifactComponentRole),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,7 +236,7 @@ impl EnvironmentDescriptor {
 impl TryFrom<EnvironmentSpec> for EnvironmentDescriptor {
     type Error = EnvironmentDescriptorError;
 
-    fn try_from(spec: EnvironmentSpec) -> Result<Self, Self::Error> {
+    fn try_from(mut spec: EnvironmentSpec) -> Result<Self, Self::Error> {
         use super::{
             ArtifactComponentKind, FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, RuntimeKind,
         };
@@ -157,21 +247,54 @@ impl TryFrom<EnvironmentSpec> for EnvironmentDescriptor {
                 host: spec.host,
             });
         }
+        match spec.backend {
+            HypervisorBackend::Kvm if spec.host.os != HostOperatingSystem::Linux => {
+                return Err(EnvironmentDescriptorError::KvmHost(spec.host.os));
+            }
+            HypervisorBackend::Kvm if spec.guest.architecture != spec.host.architecture => {
+                return Err(EnvironmentDescriptorError::KvmArchitecture {
+                    host: spec.host.architecture,
+                    guest: spec.guest.architecture,
+                });
+            }
+            HypervisorBackend::Kvm => {}
+        }
+        match (&release.layout, &mut spec.boot, &spec.compatibility) {
+            (
+                RuntimePayloadLayout::CatalogReleaseV1,
+                BootProfile::ArtifactsV1 { artifacts, .. },
+                ExecutionCompatibilityProfile::RuntimeV1 { .. },
+            ) => {
+                artifacts.sort_by(|a, b| a.role.cmp(&b.role));
+                for (left, right) in artifacts.iter().zip(artifacts.iter().skip(1)) {
+                    if left.role == right.role {
+                        return Err(EnvironmentDescriptorError::DuplicateBootRole(
+                            left.role.clone(),
+                        ));
+                    }
+                }
+                // Structural validation is not qualification. Only the trusted
+                // catalog and an implementing adapter may authorize a contract.
+                return Ok(Self(spec));
+            }
+            (
+                RuntimePayloadLayout::FirecrackerReleaseV1,
+                BootProfile::LinuxDirectV1 { kernel },
+                ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format },
+            ) => {
+                if kernel.kind != ArtifactComponentKind::Kernel {
+                    return Err(EnvironmentDescriptorError::BootComponent);
+                }
+                if state_format.format.as_str() != FIRECRACKER_STATE_FORMAT {
+                    return Err(EnvironmentDescriptorError::StateFormat);
+                }
+            }
+            _ => return Err(EnvironmentDescriptorError::MixedProfiles),
+        }
         if release.runtime.kind != RuntimeKind::Firecracker
-            || spec.host.os != HostOperatingSystem::Linux
             || spec.guest.os != GuestOperatingSystem::Linux
-            || spec.guest.architecture != spec.host.architecture
         {
             return Err(EnvironmentDescriptorError::UnsupportedCombination);
-        }
-        let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
-        if kernel.kind != ArtifactComponentKind::Kernel {
-            return Err(EnvironmentDescriptorError::BootComponent);
-        }
-        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-            &spec.compatibility;
-        if state_format.format.as_str() != FIRECRACKER_STATE_FORMAT {
-            return Err(EnvironmentDescriptorError::StateFormat);
         }
         Ok(Self(spec))
     }

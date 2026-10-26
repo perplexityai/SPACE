@@ -876,9 +876,9 @@ impl SandboxManagerService {
         // Read cached guest uptime from DB
         let uptime = sandbox.guest_uptime_secs.map(format_uptime);
 
-        let firecracker_alive = health
+        let runtime_alive = health
             .as_ref()
-            .map(|health| health.firecracker_alive)
+            .map(|health| health.runtime_alive)
             .unwrap_or(pid_alive);
         let spaced_host_alive = health
             .as_ref()
@@ -1056,7 +1056,7 @@ impl SandboxManagerService {
                 &self.auto_lifecycle_runtime_state(&sandbox).public_status(),
             )),
             failure_reason: sandbox.failure_reason.clone(),
-            firecracker_alive,
+            firecracker_alive: runtime_alive,
             spaced_host_alive,
             netgtw_alive,
             vsock_raw_ping_ok,

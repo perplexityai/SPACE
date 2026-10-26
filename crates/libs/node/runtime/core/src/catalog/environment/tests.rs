@@ -131,3 +131,37 @@ fn initial_identity_and_legacy_restore_do_not_depend_on_display_name() {
         .check_execution(&historical, ExecutionSelectionMode::PersistedStateRestore)
         .unwrap();
 }
+
+#[test]
+fn memory_state_requires_qualification_and_a_declared_format() {
+    for (qualified, has_format, supported) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let mut entry = InitialEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .compiled_environment()
+            .unwrap();
+        let mut spec = entry.definition.descriptor().spec().clone();
+        let state_format = has_format.then(|| spec.compatibility.state_format().unwrap().clone());
+        let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
+        release.layout = RuntimePayloadLayout::CatalogReleaseV1;
+        spec.boot = BootProfile::ArtifactsV1 {
+            contract: "test-boot-v1".parse().unwrap(),
+            artifacts: vec![],
+        };
+        spec.compatibility = ExecutionCompatibilityProfile::RuntimeV1 {
+            contract: "test-machine-v1".parse().unwrap(),
+            state_format,
+        };
+        entry.definition = EnvironmentDefinition::new(spec.try_into().unwrap());
+        entry.memory_state = qualified;
+        assert_eq!(
+            entry.supports_memory_state(),
+            supported,
+            "qualified={qualified}, has_format={has_format}"
+        );
+    }
+}

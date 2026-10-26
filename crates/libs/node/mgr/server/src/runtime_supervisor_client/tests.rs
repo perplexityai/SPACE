@@ -373,6 +373,12 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for RefusingRuntimeSupe
     ) -> Result<Response<proto::RetireExecutionResponse>, Status> {
         Err(refused("RetireExecution"))
     }
+    async fn launch_runtime(
+        &self,
+        _request: Request<proto::LaunchRuntimeRequest>,
+    ) -> Result<Response<proto::LaunchRuntimeResponse>, Status> {
+        Err(refused("LaunchRuntime"))
+    }
     async fn launch_firecracker(
         &self,
         _request: Request<proto::LaunchFirecrackerRequest>,
@@ -469,6 +475,27 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
         _request: Request<proto::RetireExecutionRequest>,
     ) -> Result<Response<proto::RetireExecutionResponse>, Status> {
         Ok(Response::new(proto::RetireExecutionResponse {}))
+    }
+    async fn launch_runtime(
+        &self,
+        request: Request<proto::LaunchRuntimeRequest>,
+    ) -> Result<Response<proto::LaunchRuntimeResponse>, Status> {
+        let (metadata, extensions, request) = request.into_parts();
+        let request = request.try_into().map_err(
+            |error: pplx_space_node_runtime_core::runtime_launch::LaunchContractError| {
+                pplx_space_node_runtime_core::launch_admission::admission_refusal(
+                    Status::failed_precondition(error.to_string()),
+                )
+            },
+        )?;
+        let response = self
+            .launch_firecracker(Request::from_parts(metadata, extensions, request))
+            .await?
+            .into_inner();
+        Ok(Response::new(proto::LaunchRuntimeResponse {
+            pid: response.pid,
+            accepted_environment_reference: response.accepted_environment_reference,
+        }))
     }
     async fn launch_firecracker(
         &self,

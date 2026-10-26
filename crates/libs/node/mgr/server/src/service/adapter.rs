@@ -1,5 +1,6 @@
 use super::*;
 use crate::proto::{CloneCapabilitiesRequest, CloneCapabilitiesResponse};
+use pplx_space_node_runtime_core::launch_admission::runtime_operation_status;
 use tracing::Instrument as _;
 
 struct RpcWait {
@@ -274,6 +275,74 @@ impl NodeManager for NodeManagerService {
         request: Request<ResumeSandboxRequest>,
     ) -> Result<Response<ResumeSandboxResponse>, Status> {
         NodeManagerService::resume_sandbox(self, request).await
+    }
+
+    async fn get_vm_state(
+        &self,
+        request: Request<crate::proto::GetVmStateRequest>,
+    ) -> Result<Response<crate::proto::GetVmStateResponse>, Status> {
+        self.authorize_peer(&request, "GetVmState", ALLOW_NODE_STATUS)?;
+        let response = NodeManagerService::get_firecracker_vm_state_after_authorization(
+            self,
+            request.map(|input| GetFirecrackerVmStateRequest {
+                sandbox_id: input.sandbox_id,
+            }),
+        )
+        .await
+        .map_err(runtime_operation_status)?
+        .into_inner();
+        Ok(Response::new(crate::proto::GetVmStateResponse {
+            state: match response.state() {
+                crate::proto::FirecrackerVmState::NotStarted => crate::proto::VmState::NotStarted,
+                crate::proto::FirecrackerVmState::Running => crate::proto::VmState::Running,
+                crate::proto::FirecrackerVmState::Paused => crate::proto::VmState::Paused,
+                crate::proto::FirecrackerVmState::Unspecified => {
+                    return Err(Status::internal("runtime returned no VM state"));
+                }
+            } as i32,
+        }))
+    }
+
+    async fn capture_vm_state(
+        &self,
+        request: Request<crate::proto::CaptureVmStateRequest>,
+    ) -> Result<Response<crate::proto::CaptureVmStateResponse>, Status> {
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        observe_rpc("CaptureVmState", sandbox_id, async {
+            self.authorize_peer(&request, "CaptureVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+            let (metadata, extensions, input) = request.into_parts();
+            let input = CreateSnapshotRequest::try_from(input)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            NodeManagerService::create_snapshot_after_authorization(
+                self,
+                Request::from_parts(metadata, extensions, input),
+            )
+            .await
+            .map_err(runtime_operation_status)?;
+            Ok(Response::new(crate::proto::CaptureVmStateResponse {}))
+        })
+        .await
+    }
+
+    async fn restore_vm_state(
+        &self,
+        request: Request<crate::proto::RestoreVmStateRequest>,
+    ) -> Result<Response<crate::proto::RestoreVmStateResponse>, Status> {
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        observe_rpc("RestoreVmState", sandbox_id, async {
+            self.authorize_peer(&request, "RestoreVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+            let (metadata, extensions, input) = request.into_parts();
+            let input = LoadSnapshotRequest::try_from(input)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            NodeManagerService::load_snapshot_after_authorization(
+                self,
+                Request::from_parts(metadata, extensions, input),
+            )
+            .await
+            .map_err(runtime_operation_status)?;
+            Ok(Response::new(crate::proto::RestoreVmStateResponse {}))
+        })
+        .await
     }
 
     async fn get_firecracker_vm_state(
