@@ -69,8 +69,8 @@ const OTHER_RESERVED_SLOTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_OTHER_
 const DEFAULT_ORG_SLOT_LIMIT: u32 = 8;
 const ORG_SLOT_LIMIT_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_LIMIT";
 /// While no other organization has work waiting, one organization may go
-/// past its limit, but leaves this many of the slots open to other work
-/// free, so another organization's work that arrives later can start
+/// past its limit, but leaves this many of the free slots open to other
+/// work free, so another organization's work that arrives later can start
 /// without waiting for the first one's executions to end.
 const DEFAULT_ORG_SLOT_HEADROOM: u32 = 2;
 const ORG_SLOT_HEADROOM_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_HEADROOM";
@@ -439,6 +439,7 @@ pub async fn run<E>(
         OrgSlotLimit {
             contended,
             uncontended: NonZeroU32::new(uncontended).map_or(contended, |u| u.max(contended)),
+            headroom: u32::try_from(config.org_slot_headroom).unwrap_or(u32::MAX),
         }
     });
     let mut claim_backoff_until: Option<Instant> = None;
