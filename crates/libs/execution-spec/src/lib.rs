@@ -23,6 +23,7 @@ pub mod devices;
 pub mod disk_io;
 pub mod environment;
 pub mod execution;
+pub mod guest_image;
 pub mod host_cpu;
 pub mod runtime;
 
