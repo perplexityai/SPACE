@@ -2240,13 +2240,16 @@ version = "1.0.23"
 criteria = "safe-to-deploy"
 
 [[exemptions.zstd]]
-version = "0.14.0"
+version = "0.14.3"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0391. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.zstd-safe]]
-version = "8.0.0"
+version = "8.2.0"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0398 and RUSTSEC-2026-0403. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.zstd-sys]]
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0410. Bundled zstd remains at 1.5.7. No imported audit covers this version; this is not an independent audit."
