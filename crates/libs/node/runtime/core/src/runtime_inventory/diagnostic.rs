@@ -309,7 +309,8 @@ pub enum ArtifactStatus {
     Invalid,
     /// The entry's name is not a version this layout recognizes.
     Unrecognized,
-    /// A well-formed release this build has no state-format mapping for.
+    /// No release layout is known, or the layout requires a state-format
+    /// mapping this build does not have for the release.
     Unsupported,
 }
 
@@ -362,7 +363,8 @@ pub struct ScannedArtifact {
     pub version_source: Option<VersionSource>,
     /// From the ELF header of the runtime's binary or the kernel image.
     pub architecture: Option<Arch>,
-    /// From the known-release map; `None` when the release is not in it.
+    /// A qualified memory-state format, when this runtime and release have one.
+    /// `None` also covers runtimes whose installation needs no state format.
     pub state_format: Option<StateFormatIdentity>,
     /// SHA-256 of the kernel image, or the aggregate release digest of a managed
     /// runtime's named binaries. Execution-root runtimes are not hashed.
@@ -1301,17 +1303,19 @@ pub fn probe_elf_file(path: &Path) -> std::io::Result<ElfProbe> {
     probe_elf(&mut open_nonblocking(path)?)
 }
 
+/// Resolve a runtime release's qualified memory-state format.
+pub type StateFormatResolver = fn(&RuntimeVersion) -> Result<StateFormatIdentity, String>;
+
 /// What one runtime's release directory holds.
 pub struct ReleaseLayout {
     /// Binaries under the release directory, all required. The first is the
     /// runtime's own and names the release's architecture.
     pub binaries: &'static [&'static str],
-    /// The persisted-state format a release writes, or why it has none the
-    /// scan knows.
-    pub state_format: fn(&RuntimeVersion) -> Result<StateFormatIdentity, String>,
-    /// Every release this build has a state-format mapping for. The execution
-    /// inventory refuses a node carrying any other, so these are the only
-    /// releases that may be installed.
+    /// A qualified persisted-state format, when SPACE supports memory state
+    /// for this runtime. A valid installation need not support snapshots.
+    pub state_format: Option<StateFormatResolver>,
+    /// Releases that may be pinned by the catalog. Recognizing a directory's
+    /// layout alone does not qualify that release for installation or execution.
     pub known_releases: fn() -> Vec<&'static str>,
 }
 
@@ -1320,7 +1324,8 @@ impl ReleaseLayout {
     pub fn of(runtime: RuntimeKind) -> Option<&'static Self> {
         match runtime {
             RuntimeKind::Firecracker => Some(&FIRECRACKER_RELEASE_LAYOUT),
-            RuntimeKind::CloudHypervisor | RuntimeKind::Gvisor => None,
+            RuntimeKind::CloudHypervisor => Some(&CLOUD_HYPERVISOR_RELEASE_LAYOUT),
+            RuntimeKind::Gvisor => None,
         }
     }
 }
@@ -1329,8 +1334,15 @@ impl ReleaseLayout {
 /// known-release map gives.
 const FIRECRACKER_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
     binaries: &["bin/firecracker", "bin/jailer"],
-    state_format: firecracker_state_format,
+    state_format: Some(firecracker_state_format),
     known_releases: firecracker_known_releases,
+};
+
+const CLOUD_HYPERVISOR_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
+    binaries: &["bin/cloud-hypervisor"],
+    state_format: None,
+    // Discovery recognizes installed bytes without approving new installs.
+    known_releases: Vec::new,
 };
 
 fn firecracker_known_releases() -> Vec<&'static str> {
@@ -1411,8 +1423,12 @@ fn inspect_runtime_release(
         }
     }
 
-    match (layout.state_format)(&version) {
-        Ok(state_format) => artifact.state_format = Some(state_format),
+    match layout
+        .state_format
+        .map(|format| format(&version))
+        .transpose()
+    {
+        Ok(state_format) => artifact.state_format = state_format,
         Err(detail) => {
             artifact.status = ArtifactStatus::Unsupported;
             artifact.detail = Some(detail);
