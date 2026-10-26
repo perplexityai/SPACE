@@ -50,41 +50,6 @@ fn restored_nocow_file_remains_reflink_compatible() {
     assert_eq!(std::fs::read(&dst).unwrap(), original);
 }
 
-#[test]
-fn verified_launch_cannot_be_decoded_as_an_executable_legacy_request() {
-    use prost::Message;
-    #[derive(Clone, PartialEq, Message)]
-    struct LegacyLaunch {
-        #[prost(string, tag = "1")]
-        sandbox_id: String,
-        #[prost(string, tag = "2")]
-        jailer_bin: String,
-        #[prost(string, tag = "3")]
-        firecracker_bin: String,
-    }
-    let request = super::proto::LaunchFirecrackerRequest {
-        verified_runtime: Some(super::proto::VerifiedRuntimeLaunch {
-            sandbox_id: "0198dc20-05be-7000-8000-000000000001".into(),
-            environment_reference:
-                "sha256:3168c96b5719ce62543ae53e6641a4eb80416a9f01e5585f6f76c3c70111fa0b".into(),
-            integrity_requirement:
-                super::proto::ArtifactIntegrityRequirement::AuthenticatedImmutableSources.into(),
-        }),
-        ..Default::default()
-    };
-    let legacy = LegacyLaunch::decode(request.encode_to_vec().as_slice()).unwrap();
-    legacy
-        .sandbox_id
-        .parse::<pplx_space_common_core::types::SandboxId>()
-        .unwrap_err();
-    assert!(legacy.jailer_bin.is_empty());
-    assert!(legacy.firecracker_bin.is_empty());
-    assert_eq!(
-        super::proto::LaunchFirecrackerRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
-        request
-    );
-}
-
 /// Sealing tests require an explicitly disposable btrfs filesystem and root
 /// for authenticated inode linking. CI must never count an unsupported skip.
 pub(crate) fn verity_test_directory() -> Option<tempfile::TempDir> {

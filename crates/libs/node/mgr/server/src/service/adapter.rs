@@ -281,26 +281,9 @@ impl NodeManager for NodeManagerService {
         &self,
         request: Request<crate::proto::GetVmStateRequest>,
     ) -> Result<Response<crate::proto::GetVmStateResponse>, Status> {
-        self.authorize_peer(&request, "GetVmState", ALLOW_NODE_STATUS)?;
-        let response = NodeManagerService::get_firecracker_vm_state_after_authorization(
-            self,
-            request.map(|input| GetFirecrackerVmStateRequest {
-                sandbox_id: input.sandbox_id,
-            }),
-        )
-        .await
-        .map_err(runtime_operation_status)?
-        .into_inner();
-        Ok(Response::new(crate::proto::GetVmStateResponse {
-            state: match response.state() {
-                crate::proto::FirecrackerVmState::NotStarted => crate::proto::VmState::NotStarted,
-                crate::proto::FirecrackerVmState::Running => crate::proto::VmState::Running,
-                crate::proto::FirecrackerVmState::Paused => crate::proto::VmState::Paused,
-                crate::proto::FirecrackerVmState::Unspecified => {
-                    return Err(Status::internal("runtime returned no VM state"));
-                }
-            } as i32,
-        }))
+        NodeManagerService::get_vm_state(self, request)
+            .await
+            .map_err(runtime_operation_status)
     }
 
     async fn capture_vm_state(
@@ -311,9 +294,8 @@ impl NodeManager for NodeManagerService {
         observe_rpc("CaptureVmState", sandbox_id, async {
             self.authorize_peer(&request, "CaptureVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
             let (metadata, extensions, input) = request.into_parts();
-            let input = CreateSnapshotRequest::try_from(input)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            NodeManagerService::create_snapshot_after_authorization(
+            let input = crate::snapshot_request::FirecrackerCapture::try_from(input)?;
+            NodeManagerService::capture_firecracker_state(
                 self,
                 Request::from_parts(metadata, extensions, input),
             )
@@ -332,9 +314,8 @@ impl NodeManager for NodeManagerService {
         observe_rpc("RestoreVmState", sandbox_id, async {
             self.authorize_peer(&request, "RestoreVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
             let (metadata, extensions, input) = request.into_parts();
-            let input = LoadSnapshotRequest::try_from(input)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            NodeManagerService::load_snapshot_after_authorization(
+            let input = crate::snapshot_request::FirecrackerRestore::try_from(input)?;
+            NodeManagerService::restore_firecracker_state(
                 self,
                 Request::from_parts(metadata, extensions, input),
             )
@@ -342,39 +323,6 @@ impl NodeManager for NodeManagerService {
             .map_err(runtime_operation_status)?;
             Ok(Response::new(crate::proto::RestoreVmStateResponse {}))
         })
-        .await
-    }
-
-    async fn get_firecracker_vm_state(
-        &self,
-        request: Request<GetFirecrackerVmStateRequest>,
-    ) -> Result<Response<GetFirecrackerVmStateResponse>, Status> {
-        NodeManagerService::get_firecracker_vm_state(self, request).await
-    }
-
-    async fn create_snapshot(
-        &self,
-        request: Request<CreateSnapshotRequest>,
-    ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        let sandbox_id = request.get_ref().sandbox_id.clone();
-        observe_rpc(
-            "CreateSnapshot",
-            sandbox_id,
-            NodeManagerService::create_snapshot(self, request),
-        )
-        .await
-    }
-
-    async fn load_snapshot(
-        &self,
-        request: Request<LoadSnapshotRequest>,
-    ) -> Result<Response<LoadSnapshotResponse>, Status> {
-        let sandbox_id = request.get_ref().sandbox_id.clone();
-        observe_rpc(
-            "LoadSnapshot",
-            sandbox_id,
-            NodeManagerService::load_snapshot(self, request),
-        )
         .await
     }
 

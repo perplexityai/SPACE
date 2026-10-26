@@ -64,9 +64,15 @@ impl NodeManagerService {
             "ResolveExecutionEnvironment",
             super::ALLOW_NODE_STATUS,
         )?;
-        self.require_verified_environment_layout().await?;
         let request = request.into_inner();
-        let definition_schema = request.definition_schema_version;
+        if request.definition_schema_version
+            < pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION
+        {
+            return Err(Status::failed_precondition(
+                "generic environment schema 2 is required",
+            ));
+        }
+        self.require_verified_environment_layout().await?;
         if let Some(compatible) = request.compatible {
             if request.reference.is_some() {
                 return Err(Status::invalid_argument(
@@ -74,7 +80,7 @@ impl NodeManagerService {
                 ));
             }
             return self
-                .resolve_compatible_environment(compatible, definition_schema)
+                .resolve_compatible_environment(compatible)
                 .await
                 .map(Response::new);
         }
@@ -106,11 +112,7 @@ impl NodeManagerService {
         Ok(Response::new(
             crate::proto::ResolveExecutionEnvironmentResponse {
                 accepted_selection: 0,
-                definition: Some(
-                    definition
-                        .for_peer(definition_schema)
-                        .map_err(|error| Status::failed_precondition(error.to_string()))?,
-                ),
+                definition: Some((&definition).into()),
                 execution: Some((&execution).into()),
             },
         ))

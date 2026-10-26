@@ -36,8 +36,6 @@ pub enum EnvironmentDecodeError {
     SchemaMismatch { claimed: u32, expected: u32 },
     #[error("generic profile cannot represent the requested historical identity")]
     IdentityEncoding,
-    #[error("peer cannot decode this environment definition")]
-    UnsupportedPeer,
     #[error("invalid execution contract: {0}")]
     Contract(#[from] ExecutionContractIdParseError),
     #[error("invalid boot artifact role: {0}")]
@@ -191,8 +189,10 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
         let spec = value.descriptor.spec();
         let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
         Self {
-            schema_version: value.schema_version(),
-            identity_schema_version: if value.identity_schema_version() == value.schema_version() {
+            schema_version: RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION,
+            identity_schema_version: if value.identity_schema_version()
+                == RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION
+            {
                 0
             } else {
                 value.identity_schema_version()
@@ -207,14 +207,7 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
                             runtime: Some((&release.runtime).into()),
                             digest: release.digest.to_string(),
                             target: Some(release.target.into()),
-                            layout: match release.layout {
-                                RuntimePayloadLayout::FirecrackerReleaseV1 => {
-                                    proto::RuntimePayloadLayout::FirecrackerReleaseV1
-                                }
-                                RuntimePayloadLayout::CatalogReleaseV1 => {
-                                    proto::RuntimePayloadLayout::CatalogReleaseV1
-                                }
-                            } as i32,
+                            layout: proto::RuntimePayloadLayout::CatalogReleaseV1 as i32,
                         },
                     )),
                 }),
@@ -234,10 +227,7 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
 impl TryFrom<&proto::EnvironmentDefinition> for EnvironmentDefinition {
     type Error = EnvironmentDecodeError;
     fn try_from(value: &proto::EnvironmentDefinition) -> Result<Self, Self::Error> {
-        if !matches!(
-            value.schema_version,
-            ENVIRONMENT_SCHEMA_VERSION | RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION
-        ) {
+        if value.schema_version != RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION {
             return Err(EnvironmentDecodeError::UnsupportedSchema(
                 value.schema_version,
             ));
@@ -265,9 +255,6 @@ impl TryFrom<&proto::EnvironmentDefinition> for EnvironmentDefinition {
                 digest: release.digest.parse()?,
                 target: required(release.target.as_ref(), "release target")?.try_into()?,
                 layout: match proto::RuntimePayloadLayout::try_from(release.layout) {
-                    Ok(proto::RuntimePayloadLayout::FirecrackerReleaseV1) => {
-                        RuntimePayloadLayout::FirecrackerReleaseV1
-                    }
                     Ok(proto::RuntimePayloadLayout::CatalogReleaseV1) => {
                         RuntimePayloadLayout::CatalogReleaseV1
                     }

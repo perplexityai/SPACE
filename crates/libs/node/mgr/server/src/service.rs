@@ -28,17 +28,16 @@ use crate::proto::{
     BtrfsEncodeSnapshotRootfsSendRequest, BtrfsEncodeSnapshotRootfsSendResponse,
     BtrfsFinalizeTemplateSubvolumeRequest, BtrfsFinalizeTemplateSubvolumeResponse,
     BtrfsReceiveInstanceRequest, BtrfsReceiveInstanceResponse, CaptureSandboxEndpointProofRequest,
-    CleanupSandboxRequest, CleanupSandboxResponse, CloneSandboxRequest, CloneSandboxResponse,
-    CompletePreparedRootfsRequest, CompletePreparedRootfsResponse, CreateBtrfsSnapshotRequest,
-    CreateBtrfsSnapshotResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    DeleteBtrfsSnapshotRequest, DeleteBtrfsSnapshotResponse, DeleteCacheArtifactRequest,
-    DeleteCacheArtifactResponse, DenyPortRequest, DenyPortResponse, ExposePortRequest,
-    ExposePortResponse, GetDiskUsageRequest, GetDiskUsageResponse, GetExecutionInventoryRequest,
-    GetFirecrackerVmStateRequest, GetFirecrackerVmStateResponse, InspectSandboxRequest,
-    InspectSandboxResponse, LaunchRequest, LaunchResponse, LaunchSandboxRequest,
-    LaunchSandboxResponse, ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
-    ListNetworkLeasesRequest, ListNetworkLeasesResponse, ListOrphanCandidatesRequest,
-    ListOrphanCandidatesResponse, LoadSnapshotRequest, LoadSnapshotResponse, MissingDiskUsageId,
+    CaptureVmStateResponse, CleanupSandboxRequest, CleanupSandboxResponse, CloneSandboxRequest,
+    CloneSandboxResponse, CompletePreparedRootfsRequest, CompletePreparedRootfsResponse,
+    CreateBtrfsSnapshotRequest, CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotRequest,
+    DeleteBtrfsSnapshotResponse, DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+    DenyPortRequest, DenyPortResponse, ExposePortRequest, ExposePortResponse, GetDiskUsageRequest,
+    GetDiskUsageResponse, GetExecutionInventoryRequest, GetVmStateRequest, GetVmStateResponse,
+    InspectSandboxRequest, InspectSandboxResponse, LaunchRequest, LaunchResponse,
+    LaunchSandboxRequest, LaunchSandboxResponse, ListBtrfsSnapshotsRequest,
+    ListBtrfsSnapshotsResponse, ListNetworkLeasesRequest, ListNetworkLeasesResponse,
+    ListOrphanCandidatesRequest, ListOrphanCandidatesResponse, MissingDiskUsageId,
     MissingDiskUsageReason, NetworkLease, NetworkPoolConfigInfo, NetworkPoolStatusRequest,
     NetworkPoolStatusResponse, NetworkProtocol, NodeResourceStatusRequest,
     NodeResourceStatusResponse, PauseSandboxRequest, PauseSandboxResponse,
@@ -49,13 +48,13 @@ use crate::proto::{
     PublishArtifactResponse, ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
     ReleaseRequest, ReleaseResponse, RemoveArtifactRequest, RemoveArtifactResponse,
     RepairNetworkPoolRequest, RepairNetworkPoolResponse, ReservePreparedRootfsRequest,
-    ReservePreparedRootfsResponse, ResumeSandboxRequest, ResumeSandboxResponse,
-    RollbackBtrfsSnapshotRequest, RollbackBtrfsSnapshotResponse, SandboxEndpointProof,
-    SetNetworkPoolConfigRequest, SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest,
-    SetNetworkPoolDrainResponse, StopProcessRequest, StopProcessResponse, SyncGuestRequest,
-    SyncGuestResponse, UnexposePortRequest, UnexposePortResponse, UpdateCgroupRequest,
-    UpdateCgroupResponse, ValidateSandboxEndpointProofRequest,
-    ValidateSandboxEndpointProofResponse,
+    ReservePreparedRootfsResponse, RestoreVmStateResponse, ResumeSandboxRequest,
+    ResumeSandboxResponse, RollbackBtrfsSnapshotRequest, RollbackBtrfsSnapshotResponse,
+    SandboxEndpointProof, SetNetworkPoolConfigRequest, SetNetworkPoolConfigResponse,
+    SetNetworkPoolDrainRequest, SetNetworkPoolDrainResponse, StopProcessRequest,
+    StopProcessResponse, SyncGuestRequest, SyncGuestResponse, UnexposePortRequest,
+    UnexposePortResponse, UpdateCgroupRequest, UpdateCgroupResponse,
+    ValidateSandboxEndpointProofRequest, ValidateSandboxEndpointProofResponse,
 };
 use crate::slot_pool::{
     ActiveLeaseMemoryReservationError, AllocateSlotError, NETWORK_POOL_SCHEMA_VERSION, NetworkPool,
@@ -726,8 +725,10 @@ mod snapshots;
 #[cfg(test)]
 mod tests;
 pub(crate) mod trusted_paths;
-mod validation;
+pub(crate) mod validation;
 
 pub(crate) use cleanup_helpers::RetainedCacheCleanupError;
 pub(crate) use cleanup_helpers::neutralize_retained_cache_owned_by_uid;
 use network_helpers::*;
+
+use crate::snapshot_request::{FirecrackerCapture, FirecrackerRestore};

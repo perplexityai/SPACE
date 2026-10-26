@@ -13,7 +13,7 @@ fn unknown_lifecycle_cannot_become_dead_or_missing_probe_evidence() {
                 sandboxes: vec![sbx_proto::SandboxInfo {
                     sandbox_id: id.to_string(),
                     lifecycle,
-                    firecracker_alive: runtime_alive,
+                    runtime_alive,
                     ..Default::default()
                 }],
                 missing_ids: vec![missing.to_string()],
@@ -993,7 +993,7 @@ fn the_node_answer_is_never_a_false_all_clear() {
 
     let watchdog = node_reported_artifact_from_info(
         stopped(SandboxInfo {
-            firecracker_alive: true,
+            runtime_alive: true,
             ..SandboxInfo::default()
         }),
         sandbox_id,

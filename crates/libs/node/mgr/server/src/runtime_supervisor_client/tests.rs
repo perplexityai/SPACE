@@ -21,10 +21,7 @@ async fn retries_rpc_across_supervisor_socket_replacement() {
     )
     .await;
     let client = supervisor_test_client(socket_path.clone(), connect_count.clone());
-    client
-        .launch_firecracker(proto::LaunchFirecrackerRequest::default())
-        .await
-        .unwrap();
+    client.launch_runtime(launch_request()).await.unwrap();
     stop_supervisor_server(predecessor).await;
     std::fs::remove_file(&socket_path).unwrap();
     let successor_socket_path = socket_path.clone();
@@ -38,10 +35,7 @@ async fn retries_rpc_across_supervisor_socket_replacement() {
         .await
     });
 
-    let response = client
-        .launch_firecracker(proto::LaunchFirecrackerRequest::default())
-        .await
-        .unwrap();
+    let response = client.launch_runtime(launch_request()).await.unwrap();
 
     assert_eq!(response.into_inner().pid, STUB_LAUNCH_PID);
     assert_eq!(predecessor_calls.load(Ordering::SeqCst), 1);
@@ -73,11 +67,7 @@ async fn replays_rpc_raced_by_graceful_predecessor_shutdown() {
 
     let inflight = {
         let client = client.clone();
-        tokio::spawn(async move {
-            client
-                .launch_firecracker(proto::LaunchFirecrackerRequest::default())
-                .await
-        })
+        tokio::spawn(async move { client.launch_runtime(launch_request()).await })
     };
     let entered_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while predecessor_calls.load(Ordering::SeqCst) == 0 {
@@ -96,11 +86,7 @@ async fn replays_rpc_raced_by_graceful_predecessor_shutdown() {
 
     let raced = {
         let client = client.clone();
-        tokio::spawn(async move {
-            client
-                .launch_firecracker(proto::LaunchFirecrackerRequest::default())
-                .await
-        })
+        tokio::spawn(async move { client.launch_runtime(launch_request()).await })
     };
 
     // Let the predecessor finish draining and exit, then bring up the
@@ -137,10 +123,7 @@ async fn does_not_retry_server_returned_error() {
     .await;
     let client = supervisor_test_client(socket_path, Arc::new(AtomicUsize::new(0)));
 
-    let status = client
-        .launch_firecracker(proto::LaunchFirecrackerRequest::default())
-        .await
-        .unwrap_err();
+    let status = client.launch_runtime(launch_request()).await.unwrap_err();
 
     assert_eq!(status.code(), tonic::Code::Internal);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -257,7 +240,9 @@ pub(crate) type UpdateCgroupReply = Arc<
 >;
 
 pub(crate) type LaunchReply = Arc<
-    dyn Fn(proto::LaunchFirecrackerRequest) -> Result<proto::LaunchFirecrackerResponse, Status>
+    dyn Fn(
+            pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch,
+        ) -> Result<proto::LaunchRuntimeResponse, Status>
         + Send
         + Sync,
 >;
@@ -379,12 +364,7 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for RefusingRuntimeSupe
     ) -> Result<Response<proto::LaunchRuntimeResponse>, Status> {
         Err(refused("LaunchRuntime"))
     }
-    async fn launch_firecracker(
-        &self,
-        _request: Request<proto::LaunchFirecrackerRequest>,
-    ) -> Result<Response<proto::LaunchFirecrackerResponse>, Status> {
-        Err(refused("LaunchFirecracker"))
-    }
+
     async fn launch_sidecar(
         &self,
         _request: Request<proto::LaunchSidecarRequest>,
@@ -413,9 +393,8 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for RefusingRuntimeSupe
 
 #[derive(Clone)]
 struct StubRuntimeSupervisor {
-    implements_runtime_launch: bool,
-    launch_firecracker_calls: Arc<AtomicUsize>,
-    reject_launch_firecracker: bool,
+    launch_runtime_calls: Arc<AtomicUsize>,
+    reject_launch_runtime: bool,
     launch_gate: Option<Arc<tokio::sync::Notify>>,
     stop_status: tonic::Code,
     /// When set, stop fails with `stop_status` this many times, then succeeds.
@@ -426,9 +405,8 @@ struct StubRuntimeSupervisor {
 impl StubRuntimeSupervisor {
     fn counting(calls: Arc<AtomicUsize>) -> Self {
         Self {
-            implements_runtime_launch: true,
-            launch_firecracker_calls: calls,
-            reject_launch_firecracker: false,
+            launch_runtime_calls: calls,
+            reject_launch_runtime: false,
             launch_gate: None,
             stop_status: tonic::Code::Unimplemented,
             stop_failures: None,
@@ -438,9 +416,8 @@ impl StubRuntimeSupervisor {
 
     fn rejecting(calls: Arc<AtomicUsize>) -> Self {
         Self {
-            implements_runtime_launch: true,
-            launch_firecracker_calls: calls,
-            reject_launch_firecracker: true,
+            launch_runtime_calls: calls,
+            reject_launch_runtime: true,
             launch_gate: None,
             stop_status: tonic::Code::Unimplemented,
             stop_failures: None,
@@ -452,14 +429,33 @@ impl StubRuntimeSupervisor {
     /// so a graceful shutdown drains around it.
     fn gated(calls: Arc<AtomicUsize>, gate: Arc<tokio::sync::Notify>) -> Self {
         Self {
-            implements_runtime_launch: true,
-            launch_firecracker_calls: calls,
-            reject_launch_firecracker: false,
+            launch_runtime_calls: calls,
+            reject_launch_runtime: false,
             launch_gate: Some(gate),
             stop_status: tonic::Code::Unimplemented,
             stop_failures: None,
             script: SupervisorScript::default(),
         }
+    }
+
+    async fn launch_native(
+        &self,
+        request: Request<pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch>,
+    ) -> Result<Response<proto::LaunchRuntimeResponse>, Status> {
+        self.launch_runtime_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(reply) = &self.script.launch {
+            return reply(request.into_inner()).map(Response::new);
+        }
+        if let Some(gate) = &self.launch_gate {
+            gate.notified().await;
+        }
+        if self.reject_launch_runtime {
+            return Err(Status::internal("firecracker launch failed"));
+        }
+        Ok(Response::new(proto::LaunchRuntimeResponse {
+            accepted_environment_reference: String::new(),
+            pid: STUB_LAUNCH_PID,
+        }))
     }
 }
 
@@ -484,43 +480,17 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
         &self,
         request: Request<proto::LaunchRuntimeRequest>,
     ) -> Result<Response<proto::LaunchRuntimeResponse>, Status> {
-        if !self.implements_runtime_launch {
-            return Err(Status::unimplemented("unknown method"));
-        }
         let (metadata, extensions, request) = request.into_parts();
-        let request = request.try_into().map_err(
-            |error: pplx_space_node_runtime_core::runtime_launch::LaunchContractError| {
-                pplx_space_node_runtime_core::launch_admission::admission_refusal(
-                    Status::failed_precondition(error.to_string()),
-                )
-            },
-        )?;
+        let request = request
+            .try_into()
+            .map_err(pplx_space_node_runtime_core::launch_admission::launch_contract_status)?;
         let response = self
-            .launch_firecracker(Request::from_parts(metadata, extensions, request))
+            .launch_native(Request::from_parts(metadata, extensions, request))
             .await?
             .into_inner();
         Ok(Response::new(proto::LaunchRuntimeResponse {
             pid: response.pid,
             accepted_environment_reference: response.accepted_environment_reference,
-        }))
-    }
-    async fn launch_firecracker(
-        &self,
-        request: Request<proto::LaunchFirecrackerRequest>,
-    ) -> Result<Response<proto::LaunchFirecrackerResponse>, Status> {
-        self.launch_firecracker_calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(reply) = &self.script.launch {
-            return reply(request.into_inner()).map(Response::new);
-        }
-        if let Some(gate) = &self.launch_gate {
-            gate.notified().await;
-        }
-        if self.reject_launch_firecracker {
-            return Err(Status::internal("firecracker launch failed"));
-        }
-        Ok(Response::new(proto::LaunchFirecrackerResponse {
-            accepted_environment_reference: String::new(),
-            pid: STUB_LAUNCH_PID,
         }))
     }
 
@@ -623,45 +593,15 @@ fn server_returned_codes_are_never_refused_before_transmission() {
     assert!(!is_request_refused_before_transmission(&status));
 }
 
-#[tokio::test]
-async fn launch_admission_is_consistent_across_supervisor_versions() {
-    use pplx_space_node_runtime_core::launch_admission::supervisor_launch_status;
-    let sandbox_id = "018e390d-4dd8-7000-8000-000000000001";
-    for (identity, launcher, valid) in [
-        (sandbox_id, Some("/runtime/bin/jailer"), true),
-        ("another-sandbox", Some("/runtime/bin/jailer"), false),
-        (sandbox_id, None, false),
-        (sandbox_id, Some(""), false),
-    ] {
-        let mut refusals = Vec::new();
-        for implements_runtime_launch in [true, false] {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let mut stub = StubRuntimeSupervisor::counting(calls.clone());
-            stub.implements_runtime_launch = implements_runtime_launch;
-            let client = in_process_client(stub);
-            let result = client
-                .launch_runtime(proto::LaunchRuntimeRequest {
-                    sandbox_id: identity.into(),
-                    runtime: pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32,
-                    launcher_binary: launcher.map(str::to_owned),
-                    verified_runtime: Some(proto::VerifiedRuntimeLaunch {
-                        sandbox_id: sandbox_id.into(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-                .await;
-            if valid {
-                assert_eq!(result.unwrap().into_inner().pid, STUB_LAUNCH_PID);
-            } else {
-                let status = supervisor_launch_status(result.unwrap_err());
-                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-                refusals.push(status.message().to_owned());
-            }
-            assert_eq!(calls.load(Ordering::SeqCst), usize::from(valid));
-        }
-        if !valid {
-            assert_eq!(refusals[0], refusals[1]);
-        }
+fn launch_request() -> proto::LaunchRuntimeRequest {
+    proto::LaunchRuntimeRequest {
+        runtime: pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32,
+        launcher_binary: Some("/synthetic/jailer".into()),
+        sandbox_id: "018e390d-4dd8-7000-8000-000000000001".into(),
+        execution_id: "018e390d-4dd8-7000-8000-000000000002".into(),
+        runtime_binary: "/synthetic/firecracker".into(),
+        workspace_root: "/synthetic/jails".into(),
+        network_namespace: "/synthetic/netns".into(),
+        ..Default::default()
     }
 }

@@ -697,10 +697,8 @@ impl SandboxManagerService {
                 },
                 sandbox.execution_metadata.as_ref(),
             );
-            let execution = sandbox.execution_metadata.as_ref();
-            let runtime = crate::service::snapshot_capture::runtime(execution);
             if let Err(e) = node_client
-                .capture_runtime_state(runtime, request)
+                .capture_vm_state(request)
                 .await
             {
                 let reason = format!("snapshot failed: {e}");
