@@ -221,40 +221,150 @@ async fn a_route_refresh_refuses_a_sandbox_that_started_restoring()
     Ok(())
 }
 
-#[tokio::test]
-async fn a_route_is_at_rest_only_when_nothing_is_about_to_place_the_sandbox()
--> pplx_space_db_test_fixtures::TestDbResult<()> {
+/// Rest a sandbox in `lifecycle` with no node, as a pause, stop or suspend
+/// leaves it, with only an operation of `kind` in `state` for it, if any.
+async fn rest_sandbox(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: SandboxLifecycle,
+    operation: Option<(&str, &str)>,
+) -> Result<(), sqlx::Error> {
     use pplx_space_common_core::sql;
-    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-    let pool = &db.pool;
-    let sandbox_id = SandboxId::new();
     let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
-    let org_id = OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID);
-
-    assert!(!route_at_rest(pool, org_id, sandbox_id, SandboxLifecycle::Restoring).await);
-    assert!(!route_at_rest(pool, org_id, sandbox_id, SandboxLifecycle::Started).await);
-    assert!(route_at_rest(pool, org_id, sandbox_id, SandboxLifecycle::Suspended).await);
-
-    for (state, at_rest) in [("queued", false), ("running", false), ("succeeded", true)] {
-        sqlx::query(sql!("DELETE FROM public_operations WHERE target_id = $1"))
-            .bind(&target_id)
-            .execute(pool)
-            .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = $2, placement = 'unplaced', active_node_id = NULL, target_node_id = NULL
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(lifecycle.as_str())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!("DELETE FROM public_operations WHERE target_id = $1"))
+        .bind(&target_id)
+        .execute(pool)
+        .await?;
+    if let Some((kind, state)) = operation {
         sqlx::query(sql!(
             "INSERT INTO public_operations (operation_id, org_id, kind, target_type, target_id, state)
-             VALUES ($1, $2, 'wake_sandbox', 'sandbox', $3, $4)"
+             VALUES ($1, $2, $3, 'sandbox', $4, $5)"
         ))
         .bind(uuid::Uuid::now_v7())
         .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+        .bind(kind)
         .bind(&target_id)
         .bind(state)
         .execute(pool)
         .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_route_is_at_rest_only_when_nothing_is_about_to_place_the_sandbox()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use SandboxLifecycle::{Paused, Restoring, Started, Stopped, Suspended};
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let org_id = OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID);
+    crate::tests::insert_data_plane_worker_node(pool, node_id, "10.0.0.46").await?;
+    crate::tests::insert_data_plane_active_sandbox(pool, sandbox_id, node_id).await?;
+
+    assert_eq!(route_at_rest(pool, org_id, SandboxId::new()).await, None);
+    for lifecycle in [Restoring, Started] {
+        rest_sandbox(pool, sandbox_id, lifecycle, None).await?;
         assert_eq!(
-            route_at_rest(pool, org_id, sandbox_id, SandboxLifecycle::Suspended).await,
+            route_at_rest(pool, org_id, sandbox_id).await,
+            None,
+            "{lifecycle:?}"
+        );
+    }
+    rest_sandbox(pool, sandbox_id, Suspended, None).await?;
+    assert_eq!(
+        route_at_rest(pool, org_id, sandbox_id).await,
+        Some(Suspended)
+    );
+
+    for (state, at_rest) in [
+        ("queued", None),
+        ("running", None),
+        ("succeeded", Some(Suspended)),
+    ] {
+        rest_sandbox(pool, sandbox_id, Suspended, Some(("wake_sandbox", state))).await?;
+        assert_eq!(
+            route_at_rest(pool, org_id, sandbox_id).await,
             at_rest,
             "with a {state} wake"
         );
     }
+
+    // Each action that brings the sandbox back to running, queued before the
+    // dispatcher claims it and moves the lifecycle: a client that follows a
+    // stopped sandbox's `:start` hint and attaches at once waits for it.
+    for (lifecycle, kind) in [
+        (Stopped, "start_sandbox"),
+        (Suspended, "restore_sandbox"),
+        (Suspended, "resume_sandbox"),
+        (Paused, "resume_sandbox"),
+        (Suspended, "wake_sandbox"),
+    ] {
+        rest_sandbox(pool, sandbox_id, lifecycle, Some((kind, "queued"))).await?;
+        assert_eq!(
+            route_at_rest(pool, org_id, sandbox_id).await,
+            None,
+            "{lifecycle:?} with a queued {kind}"
+        );
+    }
+    // An operation that leaves it at rest gives it no node.
+    rest_sandbox(pool, sandbox_id, Stopped, Some(("stop_sandbox", "queued"))).await?;
+    assert_eq!(route_at_rest(pool, org_id, sandbox_id).await, Some(Stopped));
+    Ok(())
+}
+
+/// The resolver reads the route row, then the pending activations. A wake
+/// that finishes in between must not leave the row's old lifecycle paired
+/// with "nothing is coming": the lifecycle is read again with the operations.
+#[tokio::test]
+async fn a_wake_finishing_after_the_route_row_was_read_leaves_the_route_retryable()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_common_core::sql;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let session_id = format!("term_{}", uuid::Uuid::now_v7());
+    crate::tests::insert_data_plane_worker_node(pool, node_id, "10.0.0.47").await?;
+    crate::tests::insert_data_plane_active_sandbox(pool, sandbox_id, node_id).await?;
+    crate::tests::insert_data_plane_session(pool, &session_id, sandbox_id).await?;
+    rest_sandbox(
+        pool,
+        sandbox_id,
+        SandboxLifecycle::Suspended,
+        Some(("wake_sandbox", "running")),
+    )
+    .await?;
+    let row = route_rows::fetch_route_row(pool, &session_id, None).await?;
+    assert_eq!(row.sandbox_lifecycle, SandboxLifecycle::Suspended);
+
+    // The wake places the sandbox and succeeds.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'started', placement = 'placed', active_node_id = $2, target_node_id = $2
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations SET state = 'succeeded' WHERE target_id = $1"
+    ))
+    .bind(pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string())
+    .execute(pool)
+    .await?;
+
+    assert_eq!(route_at_rest(pool, row.org_id, row.sandbox_id).await, None);
     Ok(())
 }

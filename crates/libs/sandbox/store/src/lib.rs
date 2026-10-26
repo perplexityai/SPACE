@@ -505,27 +505,46 @@ pub async fn restore_owner_active(
     .unwrap_or(false))
 }
 
-/// Whether a wake operation is queued or running for the org's sandbox, named
-/// by its operation `target_id`: observation only, it never claims the work.
-pub async fn wake_operation_active(
+/// A sandbox's stored lifecycle and whether something is about to activate it.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct SandboxActivationObservation {
+    /// The stored value, a `String` as on [`SandboxRecord::lifecycle`].
+    pub lifecycle: String,
+    /// An operation that brings the sandbox back to running (start, resume,
+    /// restore or wake) is queued or running for it.
+    pub activation_pending: bool,
+}
+
+/// Observe the org's sandbox's lifecycle and pending activation, the sandbox
+/// also named by its operation `target_id`. One statement, so an activation
+/// that finishes meanwhile is seen with the lifecycle it left behind, never
+/// as an old lifecycle with no activation coming. `None` when the org has no
+/// such sandbox. Observation only: it never claims the work.
+pub async fn activation_observation(
     executor: impl sqlx::PgExecutor<'_>,
-    org_id: pplx_space_common_core::types::OrgId,
+    org_id: OrgId,
+    sandbox_id: SandboxId,
     target_id: &str,
-) -> Result<bool, SandboxStoreError> {
-    Ok(sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-             SELECT 1
-               FROM public_operations
-              WHERE org_id = $1
-                AND target_type = 'sandbox'
-                AND target_id = $2
-                AND kind = 'wake_sandbox'
-                AND state IN ('queued', 'running')
-         )"
+) -> Result<Option<SandboxActivationObservation>, SandboxStoreError> {
+    Ok(sqlx::query_as::<_, SandboxActivationObservation>(sql!(
+        "SELECT s.lifecycle,
+                EXISTS (
+                    SELECT 1
+                      FROM public_operations
+                     WHERE org_id = s.org_id
+                       AND target_type = 'sandbox'
+                       AND target_id = $3
+                       AND kind IN ('start_sandbox', 'resume_sandbox', 'restore_sandbox', 'wake_sandbox')
+                       AND state IN ('queued', 'running')
+                ) AS activation_pending
+           FROM sandboxes s
+          WHERE s.id = $1
+            AND s.org_id = $2"
     ))
+    .bind(sandbox_id)
     .bind(org_id)
     .bind(target_id)
-    .fetch_one(executor)
+    .fetch_optional(executor)
     .await?)
 }
 

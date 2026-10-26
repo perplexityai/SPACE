@@ -81,7 +81,6 @@ pub(crate) async fn resolve_session_route(
         let restoring = row.sandbox_lifecycle == SandboxLifecycle::Restoring;
         let unplaced =
             row.sandbox_active_node_id.is_none() || resolve_backend_endpoint(&row).is_none();
-        let lifecycle = row.sandbox_lifecycle;
         let org_id = row.org_id;
         let result = async {
             refuse_restoring_route(row.sandbox_lifecycle)?;
@@ -213,14 +212,16 @@ pub(crate) async fn resolve_session_route(
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
-        let error = if !ingress
-            && error.code() == tonic::Code::FailedPrecondition
-            && unplaced
-            && route_at_rest(pool, org_id, sandbox_id, lifecycle).await
-        {
-            pplx_space_common_grpc::mark_session_route_at_rest(error, sandbox_id, lifecycle)
+        let at_rest = if !ingress && error.code() == tonic::Code::FailedPrecondition && unplaced {
+            route_at_rest(pool, org_id, sandbox_id).await
         } else {
-            error
+            None
+        };
+        let error = match at_rest {
+            Some(lifecycle) => {
+                pplx_space_common_grpc::mark_session_route_at_rest(error, sandbox_id, lifecycle)
+            }
+            None => error,
         };
         let Some(owner) = activation
             .filter(|_| !activated && (restoring || activation_may_repair(ingress, &error)))
@@ -244,16 +245,31 @@ pub(crate) async fn resolve_session_route(
     }
 }
 
-/// Whether nothing is about to give the session's sandbox a node: it is not
-/// heading to running and no wake is queued or running for it. A failed read
-/// answers no, which keeps the attach retryable as it always was.
+/// The sandbox's lifecycle when nothing is about to give the session's
+/// sandbox a node: it is not heading to running and no start, resume, restore
+/// or wake is queued or running for it. The lifecycle is read again with the
+/// operations, so one that just finished is not paired with the state it left.
+/// A failed read answers `None`, which keeps the attach retryable as it always
+/// was.
 pub(super) async fn route_at_rest(
     pool: &sqlx::PgPool,
     org_id: OrgId,
     sandbox_id: SandboxId,
-    lifecycle: SandboxLifecycle,
-) -> bool {
-    if matches!(
+) -> Option<SandboxLifecycle> {
+    let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
+    let observed = match pplx_space_sandbox_store::activation_observation(
+        pool, org_id, sandbox_id, &target_id,
+    )
+    .await
+    {
+        Ok(observed) => observed?,
+        Err(error) => {
+            tracing::warn!(%sandbox_id, %error, "could not read pending wakes for a session route");
+            return None;
+        }
+    };
+    let lifecycle = observed.lifecycle.parse::<SandboxLifecycle>().ok()?;
+    let heading_to_running = matches!(
         lifecycle,
         SandboxLifecycle::Started
             | SandboxLifecycle::Creating
@@ -261,17 +277,8 @@ pub(super) async fn route_at_rest(
             | SandboxLifecycle::Resuming
             | SandboxLifecycle::Restoring
             | SandboxLifecycle::Checkpointing
-    ) {
-        return false;
-    }
-    let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
-    match pplx_space_sandbox_store::wake_operation_active(pool, org_id, &target_id).await {
-        Ok(active) => !active,
-        Err(error) => {
-            tracing::warn!(%sandbox_id, %error, "could not read pending wakes for a session route");
-            false
-        }
-    }
+    );
+    (!heading_to_running && !observed.activation_pending).then_some(lifecycle)
 }
 
 pub(super) fn space_api_route_token_for_session(
