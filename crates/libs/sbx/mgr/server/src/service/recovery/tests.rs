@@ -71,6 +71,7 @@ pub(in crate::service) fn insert_suspended_test_sandbox(conn: &crate::db::Connec
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: None,
             device_requirements: None,
             id,
             uuid8: &uuid8,

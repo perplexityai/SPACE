@@ -28,6 +28,11 @@ fn import_header_execution_metadata(
             "import runtime does not match execution metadata",
         ));
     }
+    if execution.guest().os == pplx_space_common_core::types::GuestOperatingSystem::Windows {
+        return Err(Status::failed_precondition(
+            "firmware sandbox import and cross-node transfer are unsupported",
+        ));
+    }
     Ok(execution)
 }
 
@@ -369,6 +374,11 @@ impl SandboxManagerService {
         };
         let sandbox = self.lookup_sandbox(&id)?;
 
+        if sandbox.guest_image != Default::default() {
+            return Err(Status::failed_precondition(
+                "firmware sandboxes cannot be exported or distributed",
+            ));
+        }
         // This stream's import header cannot preserve device requirements.
         if sandbox.device_requirements.is_some() {
             return Err(Status::failed_precondition(
@@ -674,6 +684,7 @@ impl SandboxManagerService {
             &db,
             crate::db::transfer::ImportReservation {
                 params: crate::db::InsertSandboxParams {
+                    guest_image: None,
                     device_requirements: None,
                     id: sandbox_id,
                     uuid8: &uuid8,

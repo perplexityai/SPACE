@@ -215,6 +215,7 @@ impl RecoveredSandboxRowFields {
     ) -> R {
         let template_hash = self.template_hash.map(|hash| hash.to_string());
         bind(crate::db::InsertSandboxParams {
+            guest_image: None,
             device_requirements: self.device_requirements.as_ref(),
             id,
             uuid8,

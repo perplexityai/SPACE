@@ -8,10 +8,18 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
     let id = SandboxId::new().to_string();
     let runtime_label = SandboxRuntimeLabel::parse("abcdef12").unwrap();
     let owner = SandboxOwner::parse("row-owner").unwrap();
+    let image = pplx_space_execution_spec::guest_image::GuestImageContract::new(
+        pplx_space_execution_spec::guest_image::GuestDiskLayout::OpaqueRawDisk,
+        pplx_space_execution_spec::guest_image::GuestReadiness::TcpService {
+            port: std::num::NonZeroU16::new(3389).unwrap(),
+        },
+        pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1,
+    );
     let env = BTreeMap::from([("KEY".to_owned(), "value".to_owned())]);
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            guest_image: Some(&image),
             device_requirements: None,
             id: &id,
             uuid8: &runtime_label,
@@ -56,11 +64,12 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
                     restore_origin, restore_phase, restore_storage_uri,
                     space_api_route_substrate_kind, space_api_route_activation_attempt_id,
                     spaced_endpoint_proof_json, disk_io_max_operations_per_sec,
-                    disk_io_max_bandwidth_mib_per_sec, node_execution_id, device_requirements_json, id
+                    disk_io_max_bandwidth_mib_per_sec, node_execution_id, device_requirements_json, guest_image_contract_json, id
                FROM sandboxes WHERE id = ?1",
         )
         .unwrap();
     let row = statement.query_row([&id], row_to_sandbox).unwrap();
+    assert_eq!(row.guest_image, image);
     assert_eq!(row.id, id);
     assert_eq!(row.uuid8, runtime_label);
     assert_eq!(row.state, SandboxState::Stopped);
@@ -98,6 +107,7 @@ fn absent_or_malformed_counters_fail_closed_instead_of_decoding_zero() {
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            guest_image: None,
             device_requirements: None,
             id: &id,
             uuid8: &SandboxRuntimeLabel::parse("abcdef12").unwrap(),
@@ -202,6 +212,7 @@ fn device_requirements_persist_and_corruption_cannot_become_cpu_only() {
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            guest_image: None,
             device_requirements: Some(&requirements),
             id: &id,
             uuid8: &SandboxRuntimeLabel::parse("abcdef12").unwrap(),
