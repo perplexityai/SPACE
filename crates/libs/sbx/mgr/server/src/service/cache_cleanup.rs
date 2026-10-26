@@ -574,6 +574,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
                 crate::db::insert_quarantined_sandbox_in_transaction(
                     conn,
                     crate::db::InsertSandboxParams {
+                        guest_image: None,
                         device_requirements: None,
                         id: &sandbox_id_string,
                         uuid8: &uuid8,
@@ -612,6 +613,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: None,
             device_requirements: None,
             id: &sandbox_id_string,
             uuid8: &uuid8,
