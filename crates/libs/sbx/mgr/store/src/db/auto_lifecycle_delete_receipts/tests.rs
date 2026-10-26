@@ -36,6 +36,7 @@ fn insert_sandbox(conn: &Connection, sandbox_id: SandboxId) -> AutoLifecycleDele
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            device_requirements: None,
             id: &sandbox_id.to_string(),
             uuid8: &runtime_label,
             state: crate::state::SandboxState::Started,

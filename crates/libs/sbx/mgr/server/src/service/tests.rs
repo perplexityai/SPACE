@@ -678,6 +678,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                device_requirements: None,
                 id: &sandbox_id_string,
                 uuid8: &uuid8,
                 state: SandboxState::Paused,
@@ -2192,6 +2193,7 @@ pub(crate) mod service_tests {
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
+                    device_requirements: None,
                     id: &sandbox_id_string,
                     uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
                     state: SandboxState::Creating,
@@ -4029,6 +4031,7 @@ pub(crate) mod service_tests {
             crate::db::insert_sandbox(
                 conn,
                 crate::db::InsertSandboxParams {
+                    device_requirements: None,
                     id,
                     uuid8: &uuid8,
                     state,
@@ -4825,6 +4828,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             &conn,
             crate::db::InsertSandboxParams {
+                device_requirements: None,
                 id: &sandbox_id,
                 uuid8: &uuid8,
                 state: SandboxState::Paused,
@@ -4966,6 +4970,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             &conn,
             crate::db::InsertSandboxParams {
+                device_requirements: None,
                 id: &sandbox_id,
                 uuid8: &uuid8,
                 state: SandboxState::Paused,
@@ -5384,6 +5389,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             &conn,
             crate::db::InsertSandboxParams {
+                device_requirements: None,
                 id: &sandbox_id,
                 uuid8: &uuid8,
                 state: SandboxState::Paused,
@@ -7163,6 +7169,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                device_requirements: None,
                 id,
                 uuid8: &uuid8,
                 state,
@@ -13720,6 +13727,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                device_requirements: None,
                 id,
                 uuid8: &uuid8,
                 state,

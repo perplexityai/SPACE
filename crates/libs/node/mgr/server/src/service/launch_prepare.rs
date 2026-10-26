@@ -5,6 +5,9 @@ use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::host::linux::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
 use pplx_space_common_core::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
 use pplx_space_common_core::types::RuntimeKind;
+use pplx_space_execution_common::devices::{
+    DeviceExecution, decode_execution, validate_execution_acknowledgement,
+};
 use pplx_space_node_runtime_core::proto::{ArtifactIntegrityRequirement, VerifiedRuntimeLaunch};
 use pplx_space_node_runtime_core::runtime_inventory::{
     ExecutionSelectionMode, ExecutionSourceIntegrity, RuntimeFileRole, boot_component_role,
@@ -22,6 +25,9 @@ impl NodeManagerService {
         sandbox_id: &str,
         request: pplx_space_node_runtime_core::proto::LaunchRuntimeRequest,
     ) -> Result<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse, Status> {
+        let (_, expected_devices) =
+            decode_execution(&request.sandbox_id, request.device_execution.as_ref())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let expected_environment = request
             .verified_runtime
             .as_ref()
@@ -32,6 +38,10 @@ impl NodeManagerService {
             .await
             .map_err(pplx_space_node_runtime_core::launch_admission::supervisor_launch_status)?
             .into_inner();
+        validate_execution_acknowledgement(expected_devices.as_ref(), launched.devices.as_ref())
+            .map_err(|error| {
+                Status::failed_precondition(format!("supervisor device acknowledgement: {error}"))
+            })?;
         if expected_environment
             .is_some_and(|reference| launched.accepted_environment_reference != reference)
         {
@@ -151,6 +161,7 @@ fn parse_execution_selection_mode(value: i32) -> Result<ExecutionSelectionMode, 
 fn sandbox_metadata_json(
     req: &PrepareSandboxRequest,
     execution: pplx_space_common_core::types::ExecutionMetadata,
+    devices: Option<&DeviceExecution>,
 ) -> Result<Vec<u8>, Status> {
     use std::str::FromStr;
 
@@ -158,47 +169,53 @@ fn sandbox_metadata_json(
         ContentHash, ORPHANED_SANDBOX_TEMPLATE, SandboxArtifactMetadata, SandboxId, TemplateName,
     };
 
-    if !req.metadata_json.is_empty() {
+    let sandbox_id = SandboxId::from_str(&req.sandbox_id)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let metadata = if !req.metadata_json.is_empty() {
         let mut metadata: SandboxArtifactMetadata = serde_json::from_str(&req.metadata_json)
             .map_err(|error| {
                 Status::invalid_argument(format!("invalid sandbox metadata: {error}"))
             })?;
-        let sandbox_id = SandboxId::from_str(&req.sandbox_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         if metadata.sandbox_id != sandbox_id {
             return Err(Status::invalid_argument(
                 "sandbox metadata id does not match request",
             ));
         }
         metadata.execution = execution;
-        return serde_json::to_vec_pretty(&metadata)
-            .map_err(|error| Status::internal(format!("serialize sandbox metadata: {error}")));
+        metadata
+    } else {
+        let template = req
+            .artifact_template
+            .as_deref()
+            .or(req.template.as_deref())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(ORPHANED_SANDBOX_TEMPLATE);
+        let template = TemplateName::parse(template)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let content_hash = req
+            .content_hash
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(ContentHash::from_str)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        SandboxArtifactMetadata::new(sandbox_id, execution, template, content_hash)
+    };
+    // Stopped disks retain requirements, not the old host's assignments. Bind
+    // that durable contract to this activation before publishing any files.
+    match (metadata.device_requirements(), devices) {
+        (None, None) => {}
+        (Some(requirements), Some(devices))
+            if pplx_space_execution_common::devices::requirements_digest(requirements)
+                == devices.requirements_digest() => {}
+        _ => {
+            return Err(Status::invalid_argument(
+                "sandbox metadata device requirements do not match admitted execution",
+            ));
+        }
     }
-
-    let sandbox_id = SandboxId::from_str(&req.sandbox_id)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let template = req
-        .artifact_template
-        .as_deref()
-        .or(req.template.as_deref())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(ORPHANED_SANDBOX_TEMPLATE);
-    let template = TemplateName::parse(template)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let content_hash = req
-        .content_hash
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(ContentHash::from_str)
-        .transpose()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    serde_json::to_vec_pretty(&SandboxArtifactMetadata::new(
-        sandbox_id,
-        execution,
-        template,
-        content_hash,
-    ))
-    .map_err(|error| Status::internal(format!("serialize sandbox metadata: {error}")))
+    serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| Status::internal(format!("serialize sandbox metadata: {error}")))
 }
 
 fn write_sandbox_metadata_atomic(path: &Path, contents: &[u8]) -> Result<(), Status> {
@@ -266,14 +283,19 @@ fn log_resolved_execution(
 impl NodeManagerService {
     pub(super) async fn launch_sandbox(
         &self,
-        request: Request<LaunchSandboxRequest>,
+        mut request: Request<LaunchSandboxRequest>,
     ) -> Result<Response<LaunchSandboxResponse>, Status> {
         self.authorize_peer(&request, "LaunchSandbox", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
-        let sandbox_id = request.get_ref().sandbox_id.clone();
-        validate_sandbox_id(&sandbox_id)?;
+        let (sandbox, devices) = decode_execution(
+            &request.get_ref().sandbox_id,
+            request.get_ref().device_execution.as_ref(),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let sandbox_id = sandbox.to_string();
+        request.get_mut().sandbox_id = sandbox_id.clone();
         let service = self.clone();
         self.run_owned_sandbox_work(&sandbox_id, async move {
-            service.launch_sandbox_inner(request).await
+            service.launch_sandbox_inner(request, devices).await
         })
         .await
     }
@@ -281,6 +303,7 @@ impl NodeManagerService {
     async fn launch_sandbox_inner(
         &self,
         request: Request<LaunchSandboxRequest>,
+        devices: Option<DeviceExecution>,
     ) -> Result<Response<LaunchSandboxResponse>, Status> {
         let req = request.get_ref();
         let sandbox_id = &req.sandbox_id;
@@ -295,6 +318,11 @@ impl NodeManagerService {
         let (runtime, requested_runtime) =
             parse_runtime_request(&req.runtime, req.requested_execution.as_ref())?;
         let selection_mode = parse_execution_selection_mode(req.execution_selection_mode)?;
+        if devices.is_some() && req.snapshot_restore {
+            return Err(Status::failed_precondition(
+                "device memory restore is not supported",
+            ));
+        }
         if req.snapshot_restore != (selection_mode == ExecutionSelectionMode::PersistedStateRestore)
         {
             return Err(Status::invalid_argument(
@@ -304,6 +332,10 @@ impl NodeManagerService {
         let resolved_execution = self
             .resolve_bound_execution(requested_runtime.as_ref(), runtime, selection_mode)
             .await?;
+        let device_resources = super::device_admission::device_environment_resources(
+            resolved_execution.environment,
+            devices.as_ref(),
+        )?;
         let firecracker_bin = resolved_execution
             .runtime_files
             .path(RuntimeFileRole::RuntimeExecutable)
@@ -328,12 +360,39 @@ impl NodeManagerService {
             .acquire(crate::lifecycle_limiter::LifecycleMethod::LaunchSandbox)
             .await?;
         let _cgroup_guard = self.lock_sandbox_vm_cgroup_launch(sandbox_id).await;
-        self.check_execution(sandbox_id, req.execution_fence.as_ref(), false)?;
+        let execution_fence =
+            self.check_execution(sandbox_id, req.execution_fence.as_ref(), false)?;
         let lease = self
             .pool
             .get(sandbox_id)
             .map_err(slot_store_status)?
             .ok_or_else(|| Status::not_found("sandbox not allocated"))?;
+        self.validate_devices_for_execution(&lease, execution_fence, devices.as_ref())
+            .await?;
+        let device_budget = if let Some(resources) = device_resources {
+            let budget = self.launch_cgroup_limits(req).memory_mib.ok_or_else(|| {
+                Status::failed_precondition("device execution requires a finite memory budget")
+            })?;
+            resources
+                .locked_memory_bytes(budget)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            let recorded = self
+                .pool
+                .get_record(sandbox_id)
+                .map_err(slot_store_status)?
+                .and_then(|record| record.memory_reservation_mib)
+                .ok_or_else(|| {
+                    Status::failed_precondition("device execution lacks its memory reservation")
+                })?;
+            if budget > recorded {
+                return Err(Status::failed_precondition(
+                    "device memory budget exceeds reserved host capacity",
+                ));
+            }
+            Some((resources, budget))
+        } else {
+            None
+        };
         let sandbox_uid =
             validate_sandbox_uid_gid(sandbox_id, req.uid, req.gid, lease.sandbox_uid)?;
         let ns_path = lease.ns_path();
@@ -350,6 +409,21 @@ impl NodeManagerService {
                         Status::failed_precondition("resolved runtime is missing its boot kernel")
                     })?,
             )
+        };
+
+        let boot_initramfs = if req.snapshot_restore {
+            None
+        } else {
+            pplx_space_node_runtime_core::boot::initramfs_component(&resolved_execution.execution)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?
+                .map(|metadata| {
+                    resolved_execution
+                        .component(metadata.kind, metadata.role.as_ref())
+                        .ok_or_else(|| {
+                            Status::failed_precondition("resolved runtime is missing its initramfs")
+                        })
+                })
+                .transpose()?
         };
 
         // Jailer chroot base on btrfs so hard-links to rootfs work (same filesystem).
@@ -378,6 +452,47 @@ impl NodeManagerService {
             })
             .await?;
         if let Some(pid) = existing_pid {
+            if let Some(devices) = &devices {
+                let reference = resolved_execution
+                    .environment
+                    .ok_or_else(|| Status::failed_precondition("device environment missing"))?;
+                let response = self
+                    .launch_admitted_runtime(
+                        sandbox_id,
+                        pplx_space_node_runtime_core::proto::LaunchRuntimeRequest {
+                            device_execution: Some(devices.input(sandbox_id.parse().map_err(
+                                |e| Status::invalid_argument(format!("sandbox id: {e}")),
+                            )?)),
+                            execution_id: execution_fence
+                                .ok_or_else(|| {
+                                    Status::failed_precondition("device execution missing")
+                                })?
+                                .current()
+                                .to_string(),
+                            runtime:
+                                pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor
+                                    as i32,
+                            verified_runtime: Some(VerifiedRuntimeLaunch {
+                                sandbox_id: sandbox_id.to_owned(),
+                                environment_reference: reference.to_string(),
+                                integrity_requirement:
+                                    ArtifactIntegrityRequirement::AuthenticatedImmutableSources
+                                        .into(),
+                            }),
+                            // Adoption reads the journal before launch-only inputs. If
+                            // the VM disappeared, absent source/budget makes spawn fail.
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                if response.pid != pid.get().get() {
+                    return Err(Status::unavailable(
+                        "resident device runtime identity changed",
+                    ));
+                }
+                self.transition_device_launch(&lease, execution_fence, devices, true)
+                    .await?;
+            }
             self.adopt_validated_lease(sandbox_id, &lease)?;
             self.pool
                 .set_pid(sandbox_id, pid.get().get())
@@ -406,6 +521,7 @@ impl NodeManagerService {
                     .await?;
             }
             return Ok(Response::new(LaunchSandboxResponse {
+                devices: devices.as_ref().map(DeviceExecution::acknowledgement),
                 pid: pid.get().get(),
                 api_socket_path: control_socket.display().to_string(),
                 resolved_execution: Some((&resolved_execution.execution).into()),
@@ -499,8 +615,6 @@ impl NodeManagerService {
             .map_err(|e| Status::internal(format!("cannot copy config into jail: {e}")))?;
         }
 
-        let kernel_dst = format!("{jail_root}/vmlinux.bin");
-
         // Chown jail root to sandbox UID (--no-dereference to avoid symlink
         // attacks). A partial chown leaves root-owned files in the jail, so
         // refuse the launch rather than boot a sandbox on an inconsistent jail.
@@ -515,19 +629,19 @@ impl NodeManagerService {
         .await?;
 
         // Snapshot restore starts Firecracker idle, then loads persisted VM
-        // state through the API socket. Only cold boot needs a kernel file in
-        // the jail root. It is linked after the chown above: the hard link
-        // shares the cache kernel's inode with every other jail, so chowning
-        // it would let this sandbox's Firecracker rewrite the kernel later
-        // cold boots load. The root-owned 0644 image is readable as it is.
-        if let Some(kernel) = boot_kernel {
-            let kernel_src = kernel.path.clone();
+        // state through the API socket. Cold-boot inputs are linked after
+        // chown: their root-owned inodes are shared with the authenticated
+        // cache and must never be handed to the sandbox UID.
+        for (component, name) in [(boot_kernel, "vmlinux.bin"), (boot_initramfs, "initrd.img")] {
+            let Some(component) = component else { continue };
+            let source = component.path.clone();
+            let destination = PathBuf::from(&jail_root).join(name);
             use pplx_space_node_runtime_core::authenticated_source::{
                 AuthenticatedFile, Authentication,
             };
-            let authentication = match kernel.integrity {
+            let authentication = match component.integrity {
                 ExecutionSourceIntegrity::FsVerity => Some(Authentication::FsVerity(
-                    kernel
+                    component
                         .metadata
                         .digest
                         .map(pplx_space_node_runtime_core::catalog::compiled_verity_digest)
@@ -536,14 +650,14 @@ impl NodeManagerService {
                         .flatten()
                         .ok_or_else(|| {
                             Status::failed_precondition(
-                                "sealed boot kernel has no trusted measurement",
+                                "sealed boot component has no trusted measurement",
                             )
                         })?,
                 )),
                 ExecutionSourceIntegrity::CatalogSha256 if standalone => Some(
-                    Authentication::CatalogSha256(kernel.metadata.digest.ok_or_else(|| {
+                    Authentication::CatalogSha256(component.metadata.digest.ok_or_else(|| {
                         Status::failed_precondition(
-                            "authenticated boot kernel has no catalog digest",
+                            "authenticated boot component has no catalog digest",
                         )
                     })?),
                 ),
@@ -554,23 +668,25 @@ impl NodeManagerService {
             spawn_lifecycle_blocking(&_lifecycle_permit, move || {
                 if let Some(authentication) = authentication {
                     let file =
-                        AuthenticatedFile::open(&kernel_src, authentication).map_err(|error| {
+                        AuthenticatedFile::open(&source, authentication).map_err(|error| {
                             if error.is_transient() {
                                 Status::internal(error.to_string())
                             } else {
                                 Status::failed_precondition(error.to_string())
                             }
                         })?;
-                    file.link_to(std::path::Path::new(&kernel_dst))
+                    file.link_to(&destination)
                 } else {
-                    std::fs::hard_link(&kernel_src, &kernel_dst)
+                    std::fs::hard_link(&source, &destination)
                 }
                 .map_err(|error| {
-                    Status::internal(format!("cannot hard-link kernel into jail: {error}"))
+                    Status::internal(format!(
+                        "cannot hard-link boot component into jail: {error}"
+                    ))
                 })
             })
             .await
-            .map_err(|e| Status::internal(format!("link kernel task failed: {e}")))??;
+            .map_err(|e| Status::internal(format!("link boot component task failed: {e}")))??;
         }
 
         // For snapshot restore: start FC idle (no config, just API socket)
@@ -636,14 +752,31 @@ impl NodeManagerService {
                 self.standalone_configuration(
                     runtime,
                     PathBuf::from(format!("{jail_root}/vm-config.json")),
+                    boot_initramfs.is_some(),
+                    devices.clone(),
+                    device_budget,
                 )
                 .await?,
             )
         } else {
             None
         };
+        if let Some(devices) = &devices {
+            self.transition_device_launch(&lease, execution_fence, devices, false)
+                .await?;
+        }
+        let typed_sandbox_id = sandbox_id
+            .parse()
+            .map_err(|error| Status::invalid_argument(format!("sandbox identity: {error}")))?;
         let request = pplx_space_node_runtime_core::proto::LaunchRuntimeRequest {
-            sandbox_id: sandbox_id.to_string(),
+            device_execution: devices
+                .as_ref()
+                .map(|devices| devices.input(typed_sandbox_id)),
+            sandbox_id: if devices.is_some() {
+                String::new()
+            } else {
+                sandbox_id.to_string()
+            },
             execution_id: req
                 .execution_fence
                 .as_ref()
@@ -664,6 +797,10 @@ impl NodeManagerService {
         };
         let launched = self.launch_admitted_runtime(sandbox_id, request).await?;
         let fc_pid = launched.pid;
+        if let Some(devices) = &devices {
+            self.transition_device_launch(&lease, execution_fence, devices, true)
+                .await?;
+        }
         if let Err(error) = self.pool.set_pid(sandbox_id, fc_pid) {
             tracing::error!(
                 sandbox_id,
@@ -773,6 +910,7 @@ impl NodeManagerService {
         }
 
         Ok(Response::new(LaunchSandboxResponse {
+            devices: devices.as_ref().map(DeviceExecution::acknowledgement),
             pid: fc_pid,
             api_socket_path,
             resolved_execution: Some((&resolved_execution.execution).into()),
@@ -781,14 +919,19 @@ impl NodeManagerService {
 
     pub(super) async fn prepare_sandbox(
         &self,
-        request: Request<PrepareSandboxRequest>,
+        mut request: Request<PrepareSandboxRequest>,
     ) -> Result<Response<PrepareSandboxResponse>, Status> {
         self.authorize_peer(&request, "PrepareSandbox", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
-        let sandbox_id = request.get_ref().sandbox_id.clone();
-        validate_sandbox_id(&sandbox_id)?;
+        let (sandbox, devices) = decode_execution(
+            &request.get_ref().sandbox_id,
+            request.get_ref().device_execution.as_ref(),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let sandbox_id = sandbox.to_string();
+        request.get_mut().sandbox_id = sandbox_id.clone();
         let service = self.clone();
         self.run_owned_sandbox_work(&sandbox_id, async move {
-            service.prepare_sandbox_inner(request).await
+            service.prepare_sandbox_inner(request, devices).await
         })
         .await
     }
@@ -796,6 +939,7 @@ impl NodeManagerService {
     async fn prepare_sandbox_inner(
         &self,
         request: Request<PrepareSandboxRequest>,
+        devices: Option<DeviceExecution>,
     ) -> Result<Response<PrepareSandboxResponse>, Status> {
         let req = request.get_ref();
         let sandbox_id = &req.sandbox_id;
@@ -811,8 +955,16 @@ impl NodeManagerService {
         let runtime_installation = self
             .resolve_bound_execution(requested_runtime.as_ref(), runtime, selection_mode)
             .await?;
+        super::device_admission::device_environment_resources(
+            runtime_installation.environment,
+            devices.as_ref(),
+        )?;
         log_resolved_execution("prepare", sandbox_id, &runtime_installation.execution);
-        let sandbox_metadata = sandbox_metadata_json(req, runtime_installation.execution.clone())?;
+        let sandbox_metadata = sandbox_metadata_json(
+            req,
+            runtime_installation.execution.clone(),
+            devices.as_ref(),
+        )?;
         let lifecycle_permit = self
             .lifecycle_limiter
             .acquire(crate::lifecycle_limiter::LifecycleMethod::PrepareSandbox)
@@ -820,7 +972,10 @@ impl NodeManagerService {
         let ownership = self
             .acquire_preparation_ownership(sandbox_id, req.uid, lifecycle_permit)
             .await?;
-        self.check_execution(sandbox_id, req.execution_fence.as_ref(), false)?;
+        let execution_fence =
+            self.check_execution(sandbox_id, req.execution_fence.as_ref(), false)?;
+        self.validate_devices_for_execution(&ownership.lease, execution_fence, devices.as_ref())
+            .await?;
         let uid = ownership.lease.sandbox_uid;
         let cache_paths = prepare_sandbox_cache_paths(sandbox_id);
         let cache_dir = cache_paths.instance_dir;
@@ -1006,6 +1161,7 @@ impl NodeManagerService {
         .await?;
 
         Ok(Response::new(PrepareSandboxResponse {
+            devices: devices.as_ref().map(DeviceExecution::acknowledgement),
             cache_dir,
             run_dir,
             rootfs_path,

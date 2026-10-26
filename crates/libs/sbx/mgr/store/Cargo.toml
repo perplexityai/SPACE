@@ -38,6 +38,7 @@ uuid = { workspace = true, features = ["v7"] }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 pplx-space-sqlite = { workspace = true }

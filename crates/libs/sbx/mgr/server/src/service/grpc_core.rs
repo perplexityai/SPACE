@@ -186,7 +186,26 @@ impl SandboxManagerService {
     ) -> Result<Response<CreateResponse>, Status> {
         let peer = self.authorize_peer(&request, "Create", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
         let mut request = request;
+        let device_requirements = super::validation::normalize_device_input(request.get_mut())?;
+        if device_requirements.is_some() {
+            if self.node_managed_by.is_some() {
+                return Err(Status::failed_precondition(
+                    "device creation is available only on standalone nodes",
+                ));
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let mut node = connect_node(&self.node_manager)
+                    .await
+                    .map_err(|error| Status::unavailable(error.to_string()))?;
+                super::devices::require_node_support(&mut node).await
+            })
+            .await
+            .map_err(|_| Status::deadline_exceeded("device admission timed out"))??;
+        }
         let environment = super::validation::normalize_environment_input(request.get_mut())?;
+        let device_digest = device_requirements
+            .as_ref()
+            .map(pplx_space_execution_common::devices::requirements_digest);
         let span = tracing::info_span!("sbxmgr.create", template = %request.get_ref().template);
         let publish_node_state = !should_skip_node_publish(&request);
         let mut result = async move {
@@ -219,6 +238,11 @@ impl SandboxManagerService {
                 request.get_mut().runtime = release.runtime.kind.alias().to_owned();
                 Some(selected)
             } else { None };
+            if device_requirements.is_some() && verified.as_ref().is_none_or(|selected|
+                selected.execution.runtime().kind != pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+            ) {
+                return Err(Status::failed_precondition("the selected runtime does not support exclusive devices"));
+            }
             let req = request.get_ref();
             let template = &req.template;
             let runtime = &req.runtime;
@@ -338,6 +362,7 @@ impl SandboxManagerService {
                     let log_path = format!("{RUN_DIR}/{}/fc.log", sbx_id);
                     let namespace = format!("sns-{}", sandbox.uuid8);
                     return Ok(Response::new(CreateResponse {
+                        accepted_device_requirements_digest: None,
                         environment: None,
                         sandbox_id: sbx_id,
                         pid: sandbox.pid,
@@ -368,6 +393,10 @@ impl SandboxManagerService {
                     resolved_template.content_hash.as_deref(),
                 )?;
                 if let Some(mut existing) = self.lookup_requested_sandbox(requested_id)? {
+                    if existing.device_requirements.as_ref() != device_requirements.as_ref() {
+                        return Err(Status::already_exists("requested sandbox has different immutable device requirements"));
+                    }
+
                     let identity = super::activation_support::space_api_route_identity_from_create_request(req)?;
                     super::activation_support::validate_route_identity_sandbox(&identity, &existing.id)?;
                     let requested = RequestedSandboxCreateSpec {
@@ -504,6 +533,7 @@ impl SandboxManagerService {
             }
 
             self.create_with_id(CreateWithIdArgs {
+                device_requirements: device_requirements.as_ref(),
                 req,
                 sandbox_owner: &sandbox_owner,
                 effective_mode,
@@ -526,6 +556,8 @@ impl SandboxManagerService {
         .await;
         if let Ok(response) = result.as_mut() {
             response.get_mut().environment = environment.map(|reference| reference.to_string());
+            response.get_mut().accepted_device_requirements_digest =
+                device_digest.map(|digest| digest.to_string());
         }
         if publish_node_state && let Ok(response) = result.as_ref() {
             mark_sandbox_dirty(&self.db, &response.get_ref().sandbox_id);

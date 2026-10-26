@@ -54,6 +54,12 @@ impl NodeManagerService {
         &self,
         runtime: pplx_space_common_core::types::RuntimeKind,
         path: PathBuf,
+        initramfs: bool,
+        devices: Option<pplx_space_execution_common::devices::DeviceExecution>,
+        device_budget: Option<(
+            pplx_space_node_runtime_core::catalog::DeviceResourceLimits,
+            u64,
+        )>,
     ) -> Result<String, Status> {
         self.off_runtime("read runtime boot configuration", move || {
             let (parent, name) = super::artifact_fs::parent(&path)?;
@@ -69,9 +75,29 @@ impl NodeManagerService {
             }
             let text =
                 String::from_utf8(bytes).map_err(|e| Status::invalid_argument(e.to_string()))?;
-            pplx_space_node_runtime_core::boot::validate_standalone(runtime, &text)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            Ok(text)
+            match (devices, device_budget) {
+                (Some(devices), Some((resources, reserved_memory_mib))) => {
+                    pplx_space_node_runtime_core::boot::with_exclusive_devices(
+                        runtime,
+                        &text,
+                        initramfs,
+                        &devices,
+                        resources,
+                        reserved_memory_mib,
+                    )
+                    .map_err(|e| Status::invalid_argument(e.to_string()))
+                }
+                (None, None) => {
+                    pplx_space_node_runtime_core::boot::validate_standalone(
+                        runtime, &text, initramfs,
+                    )
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                    Ok(text)
+                }
+                _ => Err(Status::internal(
+                    "device assignment and resource qualification disagree",
+                )),
+            }
         })
         .await
     }

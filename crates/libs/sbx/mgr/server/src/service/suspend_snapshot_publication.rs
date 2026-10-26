@@ -190,6 +190,7 @@ pub(super) struct StagedSuspendSnapshotArtifact {
 }
 
 pub(super) struct RecoveredSandboxRowFields {
+    pub(super) device_requirements: Option<pplx_space_execution_spec::devices::DeviceRequirements>,
     pub(super) template: TemplateName,
     pub(super) template_hash: Option<ContentHash>,
     pub(super) user: SandboxOwner,
@@ -214,6 +215,7 @@ impl RecoveredSandboxRowFields {
     ) -> R {
         let template_hash = self.template_hash.map(|hash| hash.to_string());
         bind(crate::db::InsertSandboxParams {
+            device_requirements: self.device_requirements.as_ref(),
             id,
             uuid8,
             state,
@@ -546,6 +548,7 @@ pub(super) fn recovered_sandbox_row_fields(
         ),
     };
     Ok(RecoveredSandboxRowFields {
+        device_requirements: metadata.device_requirements()?.cloned(),
         template: TemplateName::parse(metadata.source.template_id.clone())?,
         template_hash: metadata
             .source

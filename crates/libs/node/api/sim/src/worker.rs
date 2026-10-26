@@ -267,6 +267,7 @@ fn sim_lifecycle(label: &str) -> sbx::SandboxLifecycleState {
 
 fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxInfo {
     sbx::SandboxInfo {
+        device_requirements: None,
         lifecycle: Some(sim_lifecycle(&rec.status) as i32),
         sandbox_id: rec.sandbox_id.clone(),
         template: Some(rec.template.clone()),
@@ -467,6 +468,11 @@ impl WorkerApi for SimWorkerApiService {
         &self,
         request: Request<sbx::CreateRequest>,
     ) -> Result<Response<sbx::CreateResponse>, Status> {
+        if request.get_ref().device_create.is_some() {
+            return Err(Status::failed_precondition(
+                "device creation is not enabled through worker routing",
+            ));
+        }
         let req = request.into_inner();
         let sandbox_id = req
             .sandbox_id
@@ -521,6 +527,7 @@ impl WorkerApi for SimWorkerApiService {
                 .map_err(map_state_error)?;
         }
         Ok(Response::new(sbx::CreateResponse {
+            accepted_device_requirements_digest: None,
             environment: None,
             sandbox_id,
             pid: None,
