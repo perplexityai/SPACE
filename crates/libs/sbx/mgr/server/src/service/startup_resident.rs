@@ -188,7 +188,7 @@ impl SandboxManagerService {
                     Ok(VmState::Paused) => {
                         detail = "startup checkpoint pause has no durable lifecycle origin".into();
                     }
-                    Ok(VmState::NotStarted) => {
+                    Ok(VmState::NotStarted | VmState::Shutdown) => {
                         detail = "Firecracker reported NotStarted; resident memory is unavailable"
                             .into();
                     }
