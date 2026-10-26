@@ -65,7 +65,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         .map(|entry| entry.definition().reference())
         .collect();
     assert_eq!(references.len(), environments.len());
-    assert_eq!(environments.len(), 3);
+    assert_eq!(environments.len(), 4);
     for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
         ("1.15.1", "6.1.155", "9.0.0", true),
         ("1.17.0", "6.18.44", "12.0.0", true),
@@ -94,11 +94,36 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         environments[1].definition().reference().to_string(),
         "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4"
     );
-    assert!(
-        CompiledEnvironment::for_architecture(Arch::Aarch64)
-            .unwrap()
-            .is_empty()
-    );
+    let arm = CompiledEnvironment::for_architecture(Arch::Aarch64).unwrap();
+    assert_eq!(arm.len(), 1);
+    let ch = &arm[0];
+    assert_eq!(ch.release().release.kind, RuntimeKind::CloudHypervisor);
+    assert!(!ch.is_initial());
+    assert!(!ch.supports_memory_state());
+    let execution = ch.definition().execution_requirements().unwrap();
+    assert!(execution.state_format().is_none());
+    assert_eq!(execution.components()[0].digest, Some(ch.kernel().sha256));
+    let policy = crate::selection::ExecutionPolicy::parse(None, None, &arm).unwrap();
+    assert!(policy.default_reference().is_none());
+    assert!(policy.legacy_unbound_allowed());
+    assert!(!policy.allows(ch.definition().reference()));
+    let enabled =
+        crate::selection::ExecutionPolicy::parse(Some(ch.name()), Some(ch.name()), &arm).unwrap();
+    enabled
+        .check_execution(
+            &execution,
+            crate::runtime_inventory::ExecutionSelectionMode::NewColdBoot,
+        )
+        .unwrap();
+    let x86_ch = &environments[3];
+    assert_eq!(x86_ch.release().release.kind, RuntimeKind::CloudHypervisor);
+    assert!(!x86_ch.supports_memory_state());
+    let x86_execution = x86_ch.definition().execution_requirements().unwrap();
+    assert_eq!(x86_execution.guest().architecture, Arch::X86_64);
+    assert!(x86_execution.state_format().is_none());
+    assert_ne!(x86_ch.definition().reference(), ch.definition().reference());
+    let defaults = crate::selection::ExecutionPolicy::parse(None, None, &environments).unwrap();
+    assert!(!defaults.allows(x86_ch.definition().reference()));
 }
 
 #[test]

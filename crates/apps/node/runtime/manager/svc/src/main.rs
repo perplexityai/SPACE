@@ -196,7 +196,10 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
                 deadline: Duration::from_secs(cli.scan_deadline_secs),
             },
             list_admission_timeout: Duration::from_secs(cli.list_admission_timeout_secs),
-            kernel_source: Some(KernelSourceConfig::S3(cli.kernel_source)),
+            kernel_sources: vec![
+                KernelSourceConfig::S3(cli.kernel_source),
+                KernelSourceConfig::CloudHypervisor,
+            ],
             catalog_dir: cli.catalog_dir,
             releases: vec![
                 RuntimeManagerReleaseConfig {
