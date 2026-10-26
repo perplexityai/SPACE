@@ -28,6 +28,7 @@ fn candidate(
         node_name: Some("node-a".to_string()),
         routable_execution: true,
         activation_abandoned: false,
+        activation_attempt_held: true,
         pod_fence: RetireFence::NoExecution,
     }
 }
@@ -44,46 +45,39 @@ fn unroutable_candidate(
 }
 
 /// A crashed create whose VM came up is failed and retired once its
-/// activation is abandoned, but only if its execution never became routable.
-/// A routable one defers to its node's activation-completion receipt, and so
-/// does any alive create without an abandoned activation. Neither is ever
-/// converged or hydrated.
+/// activation is abandoned, unless a completion receipt can still finish it:
+/// a routable execution that still holds its attempt defers to its node's
+/// activation-completion receipt. One whose owner gave the activation up
+/// holds no attempt, so it fails routable or not. An alive create without an
+/// abandoned activation always defers. None is ever converged or hydrated.
 #[test]
-fn an_alive_abandoned_create_fails_only_if_it_never_became_routable() {
-    for (activation_abandoned, routable_execution, expected) in [
-        (true, false, SweepAction::FailAndRetire),
-        (
-            true,
-            true,
-            SweepAction::Defer {
-                reason: DeferReason::AliveNotConvergeable,
-            },
-        ),
-        (
-            false,
-            false,
-            SweepAction::Defer {
-                reason: DeferReason::AliveNotConvergeable,
-            },
-        ),
-        (
-            false,
-            true,
-            SweepAction::Defer {
-                reason: DeferReason::AliveNotConvergeable,
-            },
-        ),
-    ] {
-        let create = SweepCandidate {
-            activation_abandoned,
-            routable_execution,
-            ..candidate(SandboxLifecycle::Creating, false, None)
-        };
-        assert_eq!(
-            decide(&create, ProbeVerdict::AliveOnNode),
-            expected,
-            "abandoned {activation_abandoned}, routable {routable_execution}"
-        );
+fn an_alive_abandoned_create_fails_unless_a_receipt_can_finish_it() {
+    let defer = SweepAction::Defer {
+        reason: DeferReason::AliveNotConvergeable,
+    };
+    for activation_abandoned in [true, false] {
+        for routable_execution in [true, false] {
+            for activation_attempt_held in [true, false] {
+                let expected =
+                    if activation_abandoned && !(routable_execution && activation_attempt_held) {
+                        SweepAction::FailAndRetire
+                    } else {
+                        defer
+                    };
+                let create = SweepCandidate {
+                    activation_abandoned,
+                    routable_execution,
+                    activation_attempt_held,
+                    ..candidate(SandboxLifecycle::Creating, false, None)
+                };
+                assert_eq!(
+                    decide(&create, ProbeVerdict::AliveOnNode),
+                    expected,
+                    "abandoned {activation_abandoned}, routable {routable_execution}, \
+                     attempt held {activation_attempt_held}"
+                );
+            }
+        }
     }
 }
 

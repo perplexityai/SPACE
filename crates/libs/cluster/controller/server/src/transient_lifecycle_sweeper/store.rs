@@ -30,7 +30,7 @@ use super::classify::{ExecutionRoutability, ProbeObservation};
 use super::probe::{ProbeNodeError, SweepCandidate};
 use super::{
     CommandReadyPendingCandidate, FailGuard, FailedCleanupCandidate, FirstActivation,
-    RevertedToSuspended, SweepSink,
+    RevertedToSuspended, SweepSink, is_activation_owned,
 };
 use pplx_space_api::controllers::substrate::AbandonedRestoreRetirement;
 
@@ -104,17 +104,33 @@ pub(super) const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
 /// that window spares a create that may still finish, and this row is already
 /// `failed`, so its create can't. An owner that finds its row failed rolls the
 /// create back and deletes the sandbox.
+///
+/// An execution that never reached `running` and whose last owner gave up its
+/// activation without dispatching it counts too: it holds no attempt, but
+/// keeps the expiry `give_up_activation_attempt_best_effort` cut to when it
+/// gave up, so it reads as abandoned once that passes. A start that adopts a
+/// crashed create's row and fails before its wake leaves this shape when it
+/// never recorded the pod as running. A finished activation clears its expiry
+/// along with its attempt, so it can't take this shape, and an execution with
+/// no lease at all (a non-blocking warm-pool adoption never takes one) counts
+/// as finished. A start that found the pod up records it first
+/// (`ensure_pod_exists` moves the execution to `running`), and a `running`
+/// execution counts as finished here: the sweep still fails that row (no
+/// attempt is left for a completion receipt to finish it), but if its retire
+/// doesn't complete, the repair below can put it back to `started`.
 pub(super) const LIST_FAILED_ACTIVE_EXECUTIONS_SQL: &str = sql!(
     "SELECT s.id, e.k8s_node_name, e.pod_name, e.activation_attempt_id, e.generation,
             NULLIF(BTRIM(e.pod_uid), '') AS pod_uid, e.route_activation_id,
             COALESCE(
                 e.state IN ('creating', 'created')
-                    AND e.activation_attempt_id IS NOT NULL,
+                    AND (e.activation_attempt_id IS NOT NULL
+                         OR e.activation_attempt_expires_at IS NOT NULL),
                 FALSE
             ) AS first_activation_unfinished,
             COALESCE(
                 e.state IN ('creating', 'created')
-                    AND e.activation_attempt_id IS NOT NULL
+                    AND (e.activation_attempt_id IS NOT NULL
+                         OR e.activation_attempt_expires_at IS NOT NULL)
                     AND e.activation_attempt_expires_at < NOW(),
                 FALSE
             ) AS first_activation_abandoned
@@ -136,12 +152,14 @@ pub(super) const LIST_FAILED_ACTIVE_EXECUTIONS_SQL: &str = sql!(
 pub(super) const FIRST_ACTIVATION_SQL: &str = sql!(
     "SELECT COALESCE(
                 e.state IN ('creating', 'created')
-                    AND e.activation_attempt_id IS NOT NULL,
+                    AND (e.activation_attempt_id IS NOT NULL
+                         OR e.activation_attempt_expires_at IS NOT NULL),
                 FALSE
             ) AS first_activation_unfinished,
             COALESCE(
                 e.state IN ('creating', 'created')
-                    AND e.activation_attempt_id IS NOT NULL
+                    AND (e.activation_attempt_id IS NOT NULL
+                         OR e.activation_attempt_expires_at IS NOT NULL)
                     AND e.activation_attempt_expires_at < NOW(),
                 FALSE
             ) AS first_activation_abandoned
@@ -172,11 +190,14 @@ pub(super) const NOTE_FAILED_CLEANUP_ATTEMPT_SQL: &str = sql!(
 /// runtime as started. This path does not reconstruct placement metadata.
 ///
 /// It never repairs a sandbox whose first activation never finished (the
-/// execution never reached `running` and still holds an activation attempt).
-/// The sweep fails a create in that state on purpose when it never became
-/// routable; putting it back to `started` would hand out a sandbox its create request
-/// never returned, and for any activation a `started` row with no pod IP to
-/// reach it at.
+/// execution never reached `running` and still holds an activation attempt,
+/// or was given up by its last owner: no attempt, but a give-up expiry; see
+/// [`LIST_FAILED_ACTIVE_EXECUTIONS_SQL`]). The sweep fails a create in that
+/// state on purpose when it never became routable; putting it back to
+/// `started` would hand out a sandbox its create request never returned, and
+/// for any activation a `started` row with no pod IP to reach it at. This
+/// refusal doesn't cover an execution with no lease at all, whatever its
+/// state, so such a row is repaired like any other.
 /// Bind order: `$1` = sandbox id, `$2` = [`SubstrateKind::Kubernetes`] (see
 /// [`failed_active_execution_scope`]).
 pub(super) const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
@@ -193,7 +214,8 @@ pub(super) const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
             AND e.active
             AND NOT (
                 e.state IN ('creating', 'created')
-                AND e.activation_attempt_id IS NOT NULL
+                AND (e.activation_attempt_id IS NOT NULL
+                     OR e.activation_attempt_expires_at IS NOT NULL)
             )
      )
    RETURNING s.id"
@@ -306,15 +328,8 @@ const SWEEP_CANDIDATE_BATCH: i64 = 100;
 ///    Aging either form to `failed` would clear the marker before redrive can
 ///    continue. A marked suspend with no recoverable state still ages out.
 ///
-/// 3. The `creating` arm spares a row whose active execution carries an
-///    activation-attempt lease that hasn't been expired for a full age window.
-///    That lease is the create's owner. Its TTL outlives any single
-///    API-to-node call but not necessarily a whole create, which makes several
-///    in a row, so expiry alone doesn't prove the request is gone; a full age
-///    window after it does, the way the restore lease is treated above. An
-///    owner that finds its row already failed rolls the create back and
-///    deletes the sandbox. A lease with no expiry counts as live, so an
-///    unexpected shape spares the row rather than exposing it.
+/// 3. Every activation-owned lifecycle ([`is_activation_owned`]) spares a
+///    row while its owner may still be alive; see [`activation_owner_guard`].
 fn evacuation_guards(lifecycle: SandboxLifecycle) -> String {
     let recoverable_snapshot_guard = if lifecycle == SandboxLifecycle::Suspending {
         let recoverable = recoverable_suspend_snapshot_exists("sandboxes");
@@ -337,24 +352,55 @@ fn evacuation_guards(lifecycle: SandboxLifecycle) -> String {
     } else {
         ""
     };
-    let create_owner_guard = if lifecycle == SandboxLifecycle::Creating {
-        r#"
+    let owner_guard = if is_activation_owned(lifecycle) {
+        activation_owner_guard("$3")
+    } else {
+        String::new()
+    };
+    format!(
+        "AND (sandboxes.evacuation_restore_target IS NULL OR sandboxes.lifecycle = 'suspending')
+            AND sandboxes.lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT){restore_lease_quiet_guard}{recoverable_snapshot_guard}{owner_guard}"
+    )
+}
+
+/// Spare a row whose active execution's activation-attempt lease is live, or
+/// ended less than a full age window ago. `age_param` names the statement's
+/// age-threshold bind.
+///
+/// That lease is the owner of every activation-owned lifecycle
+/// ([`is_activation_owned`]): the create, start, resume, wake or restore
+/// driving the row, or a start running on a `pausing` or `checkpointing`
+/// row. Its TTL outlives any single API-to-node call but not
+/// necessarily a whole activation, which makes several in a row, so expiry
+/// alone doesn't prove the request is gone; a full age window after it does,
+/// the way the restore lease is treated. An owner that finds its row already
+/// failed rolls the create back and deletes the sandbox, and a wake that finds
+/// it converged or reverted has lost its own transition. A lease with no
+/// expiry counts as live, so an unexpected shape spares the row rather than
+/// exposing it.
+///
+/// The expiry is read whether or not an attempt still holds it. An owner that
+/// gives up an activation it never dispatched clears its attempt but cuts the
+/// expiry to the time it gave up (`give_up_activation_attempt_best_effort`),
+/// and the row it leaves behind still waits out the window from then. An
+/// execution with neither an attempt nor an expiry (one whose activation
+/// finished, or that never took an attempt) has nothing to wait for.
+///
+/// Every CAS that applies this takes the sandbox row lock first (see
+/// [`LOCK_SANDBOX_ROW_SQL`]); the candidate select only lists, so it needn't.
+fn activation_owner_guard(age_param: &str) -> String {
+    format!(
+        "
                 AND NOT EXISTS (
                     SELECT 1
                       FROM sandbox_k8s_executions owner
                      WHERE owner.sandbox_id = sandboxes.id
                        AND owner.active
-                       AND owner.activation_attempt_id IS NOT NULL
-                       AND (owner.activation_attempt_expires_at IS NULL
-                            OR owner.activation_attempt_expires_at >=
-                               NOW() - make_interval(secs => $3::BIGINT))
-                )"#
-    } else {
-        ""
-    };
-    format!(
-        "AND (sandboxes.evacuation_restore_target IS NULL OR sandboxes.lifecycle = 'suspending')
-            AND sandboxes.lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT){restore_lease_quiet_guard}{recoverable_snapshot_guard}{create_owner_guard}"
+                       AND (owner.activation_attempt_expires_at >=
+                               NOW() - make_interval(secs => {age_param}::BIGINT)
+                            OR (owner.activation_attempt_id IS NOT NULL
+                                AND owner.activation_attempt_expires_at IS NULL))
+                )"
     )
 }
 
@@ -609,9 +655,8 @@ pub(crate) fn list_aged_transient_query(lifecycle: SandboxLifecycle) -> String {
                 e.generation,
                 ({routable_execution}) AS routable_execution,
                 COALESCE(
-                    e.activation_attempt_id IS NOT NULL
-                        AND e.activation_attempt_expires_at <
-                            NOW() - make_interval(secs => $3::BIGINT),
+                    e.activation_attempt_expires_at <
+                        NOW() - make_interval(secs => $3::BIGINT),
                     FALSE
                 ) AS activation_abandoned
            FROM sandboxes
@@ -636,15 +681,22 @@ pub(crate) fn list_aged_transient_query(lifecycle: SandboxLifecycle) -> String {
 /// expiry. The lifecycle clock protects legacy NULL-lease writers; retained
 /// expiry is the independent activity clock for newer writers.
 ///
-/// [`FailGuard::NeverRoutable`] also requires that no routable execution
-/// backs the row (`running` with a pod IP), so it fails only a create that
-/// never became routable.
+/// [`FailGuard::NoPendingReceipt`] also requires that the row's active
+/// execution isn't both routable (`running` with a pod IP) and holding an
+/// activation attempt, the state in which a completion receipt can still move
+/// it to `started`.
 pub(crate) fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> String {
     let guards = evacuation_guards(lifecycle);
     let routable_guard = match guard {
         FailGuard::Aged => String::new(),
-        FailGuard::NeverRoutable => format!(
-            "\n            AND NOT {}",
+        FailGuard::NoPendingReceipt => format!(
+            "\n            AND NOT ({} AND EXISTS (\
+             \n                SELECT 1\
+             \n                  FROM sandbox_k8s_executions held\
+             \n                 WHERE held.sandbox_id = sandboxes.id\
+             \n                   AND held.active\
+             \n                   AND held.activation_attempt_id IS NOT NULL\
+             \n            ))",
             routable_k8s_execution_exists("sandboxes")
         ),
     };
@@ -659,19 +711,34 @@ pub(crate) fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard
     )
 }
 
-/// Lock a `creating` row before its fail CAS re-checks the owner. Bind order:
+/// Lock an activation-owned row before a CAS re-checks its owner. Bind order:
 /// `$1` = sandbox id.
 ///
-/// The fail CAS checks the owner with a subquery on the execution, and every
-/// activation-attempt assignment (`assign_activation_attempt_in`'s callers)
-/// locks the sandbox row without changing it before it writes a new lease
-/// there. A fail `UPDATE` that waits on that lock
-/// goes ahead on its original snapshot once the lock is released, so it would
-/// fail a create a new owner had just claimed. Taking the lock first, in the
-/// fail's own transaction, makes the CAS read a snapshot that includes any
-/// such claim.
+/// The fail, converge and revert CASes check the owner with a subquery on the
+/// execution ([`activation_owner_guard`]), and every activation-attempt
+/// assignment (`assign_activation_attempt_in`'s callers) locks the sandbox row
+/// without changing it before it writes a new lease there. An `UPDATE` that
+/// waits on that lock goes ahead on its original snapshot once the lock is
+/// released, so it would act on a row a new owner had just claimed. Taking the
+/// lock first, in the CAS's own transaction, makes the CAS read a snapshot
+/// that includes any such claim.
 pub(crate) const LOCK_SANDBOX_ROW_SQL: &str =
     sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE");
+
+/// Begin a transaction holding the sandbox row lock, for a CAS whose owner
+/// check must see any activation attempt claimed while it waited for the row
+/// (see [`LOCK_SANDBOX_ROW_SQL`]).
+async fn begin_locked(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(LOCK_SANDBOX_ROW_SQL)
+        .bind(sandbox_id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
 
 /// Put an aged-out row back, bound to the fail CAS's own write.
 pub(crate) fn undo_fail_aged_candidate_query() -> String {
@@ -710,8 +777,16 @@ pub(crate) fn undo_fail_aged_candidate_query() -> String {
 /// threshold). The wake target is a contract that a routable execution exists
 /// *at flip time*; if the execution changed underneath, the CAS claims
 /// nothing and the in-flight wake keeps ownership of the row.
+///
+/// It also repeats the select's [`activation_owner_guard`]. Materialization
+/// sets the restore lease and the wake's activation attempt to the same
+/// ownership window, so the two usually end together, but the restore-lease
+/// clause above lets a row whose restore lease was cleared through, and the
+/// attempt is still the wake's. Converging under a live wake would make its
+/// own `restoring -> started` CAS lose.
 pub(crate) fn converge_restoring_query() -> String {
     let routable_execution = routable_execution_or_non_k8s("sandboxes", "$5");
+    let owner_guard = activation_owner_guard("$2");
     format!(
         "UPDATE sandboxes
         SET lifecycle = $4
@@ -720,7 +795,7 @@ pub(crate) fn converge_restoring_query() -> String {
         AND lifecycle_changed_at < NOW() - make_interval(secs => $2::BIGINT)
         AND (restore_lease_expires_at IS NULL
              OR restore_lease_expires_at < NOW() - make_interval(secs => $2::BIGINT))
-        AND {routable_execution}
+        AND {routable_execution}{owner_guard}
         AND id = $3
       RETURNING id"
     )
@@ -752,9 +827,13 @@ pub(crate) fn converge_restoring_query() -> String {
 ///   suspended restore selects.
 ///
 /// It also clears `placement_changed_at` (see
-/// [`SweepSink::revert_to_suspended`]).
+/// [`SweepSink::revert_to_suspended`]), and repeats the select's
+/// [`activation_owner_guard`], for the same reason as
+/// [`converge_restoring_query`]: a row whose restore lease was cleared may
+/// still have a live wake's activation attempt.
 pub(crate) fn revert_to_suspended_query() -> String {
     let ready_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
+    let owner_guard = activation_owner_guard("$3");
     format!(
         "UPDATE sandboxes
             SET lifecycle = 'suspended',
@@ -765,7 +844,7 @@ pub(crate) fn revert_to_suspended_query() -> String {
             AND lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT)
             AND (restore_lease_expires_at IS NULL
                  OR restore_lease_expires_at < NOW() - make_interval(secs => $3::BIGINT))
-            AND ({ready_snapshot})
+            AND ({ready_snapshot}){owner_guard}
             AND id = $4
           RETURNING {LIFECYCLE_WRITE_TOKEN}"
     )
@@ -777,6 +856,7 @@ pub(crate) fn revert_to_suspended_query() -> String {
 /// under the candidate's fence, refusing a pod that came up since.
 pub(crate) fn revert_to_suspended_lifecycle_only_query() -> String {
     let ready_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
+    let owner_guard = activation_owner_guard("$3");
     format!(
         "UPDATE sandboxes
             SET lifecycle = 'suspended'
@@ -786,7 +866,7 @@ pub(crate) fn revert_to_suspended_lifecycle_only_query() -> String {
             AND lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT)
             AND (restore_lease_expires_at IS NULL
                  OR restore_lease_expires_at < NOW() - make_interval(secs => $3::BIGINT))
-            AND ({ready_snapshot})
+            AND ({ready_snapshot}){owner_guard}
             AND id = $4
           RETURNING {LIFECYCLE_WRITE_TOKEN}"
     )
@@ -1160,6 +1240,7 @@ impl SweepSink for SubstrateSweepSink {
                                 None
                             }
                         });
+                let activation_attempt_held = row.activation_attempt_id.is_some();
                 let pod_fence = candidate_pod_fence_with_observation(
                     row.id,
                     row.pod_name,
@@ -1180,6 +1261,7 @@ impl SweepSink for SubstrateSweepSink {
                     node_name: row.k8s_node_name,
                     routable_execution: row.routable_execution,
                     activation_abandoned: row.activation_abandoned,
+                    activation_attempt_held,
                     pod_fence,
                 }
             })
@@ -1304,6 +1386,7 @@ impl SweepSink for SubstrateSweepSink {
         age: PositiveDuration,
     ) -> Result<bool, sqlx::Error> {
         let managed_by = self.substrate.managed_by();
+        let mut tx = begin_locked(&self.pool, sandbox_id).await?;
         let claimed = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
             converge_restoring_query()
         )))
@@ -1312,8 +1395,9 @@ impl SweepSink for SubstrateSweepSink {
         .bind(sandbox_id)
         .bind(target.as_str())
         .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(claimed.is_some())
     }
 
@@ -1442,16 +1526,10 @@ impl SweepSink for SubstrateSweepSink {
             .bind(lifecycle.to_string())
             .bind(Self::age_secs_bind(age))
             .bind(sandbox_id);
-        if lifecycle != SandboxLifecycle::Creating {
+        if !is_activation_owned(lifecycle) {
             return fail.fetch_optional(&self.pool).await;
         }
-        // See `LOCK_SANDBOX_ROW_SQL`: the owner check must see any activation
-        // attempt claimed while this waited for the row.
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(LOCK_SANDBOX_ROW_SQL)
-            .bind(sandbox_id)
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = begin_locked(&self.pool, sandbox_id).await?;
         let token = fail.fetch_optional(&mut *tx).await?;
         tx.commit().await?;
         Ok(token)

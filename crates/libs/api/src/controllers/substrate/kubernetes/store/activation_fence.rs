@@ -255,6 +255,51 @@ impl K8sStore {
         }
     }
 
+    /// Give up an activation attempt whose Wake was never dispatched, after
+    /// the activation failed.
+    ///
+    /// Clears the attempt like [`Self::release_finished_activation_attempt_best_effort`],
+    /// so the next activation claims the execution at once rather than
+    /// joining work nobody is doing, but keeps `activation_attempt_expires_at`
+    /// as the time ownership ended: now, or the lease's own expiry if that
+    /// already passed. The row may still be in the lifecycle its owner was
+    /// moving it out of, say a start that adopted a crashed create's
+    /// `creating` row and failed. Nothing else moves such a row on, and the
+    /// transient-lifecycle sweeper reads that clock to tell an owner that
+    /// gave up from one that may still be running; with the expiry cleared
+    /// too, it would leave such a row alone for good while its VM is alive.
+    /// The kept expiry stays until the next attempt overwrites it; nothing
+    /// but the sweeper reads it without an attempt.
+    pub(in crate::controllers::substrate::kubernetes) async fn give_up_activation_attempt_best_effort(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: SandboxActivationAttemptId,
+    ) {
+        if let Err(error) = sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = NULL,
+                    activation_attempt_expires_at = LEAST(activation_attempt_expires_at, NOW()),
+                    activation_attempt_target_state = NULL
+              WHERE sandbox_id = $1 AND generation = $2 AND active
+                AND activation_attempt_id = $3"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(generation)
+        .bind(activation_attempt_id)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                generation,
+                %activation_attempt_id,
+                %error,
+                "failed to give up unfinished activation; lease expiry will allow recovery"
+            );
+        }
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn abandon_activation_attempt_superseded_by_suspend(
         &self,
         sandbox_id: SandboxId,

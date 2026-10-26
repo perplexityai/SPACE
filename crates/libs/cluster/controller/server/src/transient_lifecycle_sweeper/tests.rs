@@ -803,6 +803,7 @@ fn candidate(lifecycle: SandboxLifecycle) -> SweepCandidate {
         node_name: Some("node-a".to_string()),
         routable_execution: true,
         activation_abandoned: false,
+        activation_attempt_held: true,
         pod_fence: pod_fence(),
     }
 }
@@ -2577,6 +2578,7 @@ fn f5_only_an_observed_pod_yields_a_verifiable_fence() {
 // R — Postgres-backed sink (drift safety + trigger semantics)
 // -----------------------------------------------------------------
 
+mod activation_owner;
 mod crashed_create;
 
 mod postgres_backed {

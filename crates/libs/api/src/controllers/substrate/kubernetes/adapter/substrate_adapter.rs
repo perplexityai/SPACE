@@ -994,7 +994,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     // re-enter recovery instead of joining this abandoned lease.
                     if let Some((attempt_id, generation)) = activation_assignment.assigned() {
                         self.store
-                            .release_finished_activation_attempt_best_effort(
+                            .give_up_activation_attempt_best_effort(
                                 sandbox_id, generation, attempt_id,
                             )
                             .await;
@@ -1104,7 +1104,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         && let Some((attempt_id, generation)) = owned_attempt
                     {
                         self.store
-                            .release_finished_activation_attempt_best_effort(
+                            .give_up_activation_attempt_best_effort(
                                 sandbox_id, generation, attempt_id,
                             )
                             .await;

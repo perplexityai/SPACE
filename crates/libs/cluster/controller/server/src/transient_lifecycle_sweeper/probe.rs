@@ -65,14 +65,22 @@ pub struct SweepCandidate {
     /// assert `started` without it (the wake path's fresh-pod refusal wedges
     /// a `started` gen≥2 row that lacks restore context).
     pub routable_execution: bool,
-    /// Whether the active execution's activation-attempt lease has been
-    /// expired for a full age window: the request that claimed the execution
-    /// is gone and nothing else will finish its activation. The candidate
-    /// select never lists a `creating` row whose lease is live or expired
-    /// more recently than that, so for `creating` this is what tells a
-    /// crashed create from one whose attempt was already released. The fail
-    /// CAS re-checks the owner.
+    /// Whether the active execution's activation-attempt lease ended a full
+    /// age window ago, whether it expired or its owner gave it up: the request
+    /// that claimed the execution is gone and nothing else will finish its
+    /// activation. The candidate select never lists an activation-owned row
+    /// ([`super::is_activation_owned`]) whose lease ended more recently than
+    /// that, and `classify::decide` reads this only for an alive `creating`
+    /// row, where it tells a gone owner from an execution with no lease
+    /// left (one that never took one, or whose activation finished). The
+    /// fail, converge and revert CASes re-check the owner.
     pub activation_abandoned: bool,
+    /// Whether the active execution holds an activation attempt. Only a held
+    /// attempt can be completed by the node's activation-completion receipt,
+    /// which matches on the attempt id; an owner that gave its activation up
+    /// clears the attempt and keeps only the expiry, so an abandoned row
+    /// without one has nothing left that could finish it.
+    pub activation_attempt_held: bool,
     /// What the candidate select observed of the active execution, passed back
     /// to the retire so it acts only on what this sweep saw — including when
     /// what it saw was *no* execution, which the retire must re-prove rather
