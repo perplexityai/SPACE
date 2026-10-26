@@ -266,18 +266,7 @@ impl RuntimeInventory {
                     })
             })
             .cloned();
-        let shared_kernel = self
-            .components
-            .iter()
-            .find(|entry| entry.default_for_new && entry.metadata.digest == Some(kernel.sha256))
-            .cloned();
-        let kernel_root = store
-            .kernels_root()
-            .join(managed_kernel_directory(&kernel.version, kernel.sha256));
-        let mut watched = vec![
-            kernel_root.join(KERNEL_IMAGE),
-            ArtifactStore::execution_kernel_path(cache_parent, kernel),
-        ];
+        let mut watched = Vec::new();
         for binary in &release.binaries {
             watched.push(release_root.join(binary.path));
             watched.push(sealed_release_root.join(binary.path));
@@ -302,66 +291,88 @@ impl RuntimeInventory {
                 })
             }
         };
-        let component = match shared_kernel {
-            Some(kernel) => Ok(kernel),
-            None => {
-                let component = (|| {
-                    let source = kernel_root.join(KERNEL_IMAGE);
-                    let image = kernel_from_source(
-                        store,
-                        kernel,
-                        KernelSource::Store(&source),
-                        cache_parent,
-                    )?;
-                    watched.push(image.path.clone());
-                    let mut installation = kernel_installation(
-                        kernel_metadata(kernel.version.clone(), kernel.sha256)?,
-                        image.path,
-                        false,
-                        false,
-                    );
-                    if let Some((_, _, format)) = environment
-                        .definition()
-                        .descriptor()
-                        .spec()
-                        .boot
-                        .components()
-                        .find(|(_, component, _)| component.digest == kernel.sha256)
-                    {
-                        installation.metadata.format = Some(format.parse().map_err(
-                            |source: pplx_space_common_core::types::ArtifactFormatParseError| {
-                                RuntimeInventoryError::InvalidStaticIdentifier {
-                                    field: "boot format",
-                                    value: format.to_owned(),
-                                    reason: source.to_string(),
-                                }
-                            },
-                        )?);
+        let component = kernel
+            .map(|kernel| {
+                let shared_kernel = self
+                    .components
+                    .iter()
+                    .find(|entry| {
+                        entry.default_for_new && entry.metadata.digest == Some(kernel.sha256)
+                    })
+                    .cloned();
+                let kernel_root = store
+                    .kernels_root()
+                    .join(managed_kernel_directory(&kernel.version, kernel.sha256));
+                watched.push(kernel_root.join(KERNEL_IMAGE));
+                watched.push(ArtifactStore::execution_kernel_path(cache_parent, kernel));
+                match shared_kernel {
+                    Some(kernel) => Ok(kernel),
+                    None => {
+                        let component = (|| {
+                            let source = kernel_root.join(KERNEL_IMAGE);
+                            let image = kernel_from_source(
+                                store,
+                                kernel,
+                                KernelSource::Store(&source),
+                                cache_parent,
+                            )?;
+                            watched.push(image.path.clone());
+                            let mut installation = kernel_installation(
+                                kernel_metadata(kernel.version.clone(), kernel.sha256)?,
+                                image.path,
+                                false,
+                                false,
+                            );
+                            if let Some((_, _, format)) = environment
+                                .definition()
+                                .descriptor()
+                                .spec()
+                                .boot
+                                .components()
+                                .find(|(_, component, _)| component.digest == kernel.sha256)
+                            {
+                                let parsed_format = format.parse().map_err(
+                                    |source: pplx_space_common_core::types::ArtifactFormatParseError| {
+                                        RuntimeInventoryError::InvalidStaticIdentifier {
+                                            field: "boot format",
+                                            value: format.to_owned(),
+                                            reason: source.to_string(),
+                                        }
+                                    },
+                                )?;
+                                installation.metadata.format = Some(parsed_format);
+                            }
+                            installation.integrity = image.integrity;
+                            Ok::<_, RuntimeInventoryError>(installation)
+                        })();
+                        component.map_err(|error| {
+                            tracing::warn!(%error, "environment kernel unavailable");
+                            let error = self.binding_error(error);
+                            self.unavailable.push(UnavailableArtifact::Kernel {
+                                digest: kernel.sha256,
+                                legacy: false,
+                                error: error.clone(),
+                            });
+                            error
+                        })
                     }
-                    installation.integrity = image.integrity;
-                    Ok::<_, RuntimeInventoryError>(installation)
-                })();
-                component.map_err(|error| {
-                    tracing::warn!(%error, "environment kernel unavailable");
-                    let error = self.binding_error(error);
-                    self.unavailable.push(UnavailableArtifact::Kernel {
-                        digest: kernel.sha256,
-                        legacy: false,
-                        error: error.clone(),
-                    });
-                    error
-                })
-            }
-        };
+                }
+            })
+            .transpose();
         let auxiliary =
             self.environment_boot_artifacts(store, environment, cache_parent, &mut watched);
         // A failed managed binding cannot remove or borrow a legacy installation.
         // Keep a failed entry too, so explicit requests cannot fall back to it.
         let installed = InstalledEnvironment {
-            runtime,
+            runtime: runtime.map(|mut runtime| {
+                runtime.guest = environment.definition().descriptor().spec().guest;
+                runtime
+            }),
             components: component.and_then(|component| {
                 auxiliary.map(|mut components| {
-                    components.insert(0, component);
+                    if let Some(component) = component {
+                        components.insert(0, component);
+                    }
                     components
                 })
             }),
