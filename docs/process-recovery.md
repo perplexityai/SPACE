@@ -1,5 +1,7 @@
 # Recovering process clients
 
+[Documentation](../README.md)
+
 Recovery is an explicit mode of the native command API. Existing commands,
 terminal sessions and ECW calls keep their existing behavior. The wire contract
 is in `pplx-space-public-api::recovery`; the
