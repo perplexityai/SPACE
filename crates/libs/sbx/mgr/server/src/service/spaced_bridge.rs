@@ -122,6 +122,7 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         policy: SpacedEndpointProofPolicy,
     ) -> Result<pplx_space_spaced_host_client::SpacedHostClient, Status> {
+        super::guest_image::require_agent(sandbox)?;
         use pplx_space_metrics::sandbox::worker::{
             SpacedEndpointAttestationResult, spaced_endpoint_attestation,
         };
