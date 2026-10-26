@@ -109,10 +109,15 @@ impl InstallExecutor {
             tokio::task::spawn_blocking(move || StagedImage::create(&created_root, &created))
                 .await??;
 
+        let source = self
+            .context()
+            .source
+            .get(kernel.line.runtime)
+            .ok_or(SourceError::MissingSource(kernel.line.runtime))?;
         let chunks = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(DownloadError::Cancelled),
-            opened = self.context().source.open(kernel) => opened?,
+            opened = source.open(kernel) => opened?,
         };
         let image = staged.join(KERNEL_IMAGE);
         writer = super::transfer::receive(

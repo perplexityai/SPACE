@@ -45,8 +45,20 @@ fn anything_else_is_not_a_line() {
 
 #[test]
 fn kernel_versions_are_the_names_the_source_uses() {
-    for value in ["6.1.155", "5.10.245-no-acpi"] {
-        assert_eq!(value.parse::<KernelVersion>().unwrap().to_string(), value);
+    for (value, banner) in [
+        ("6.1.155", "6.1.155+"),
+        ("5.10.245-no-acpi", "5.10.245"),
+        ("7.2.8+", "7.2.8+"),
+    ] {
+        let version = value.parse::<KernelVersion>().unwrap();
+        assert_eq!(version.to_string(), value);
+        let image = format!("Linux version {banner} (builder@host) #1\n");
+        let observed =
+            pplx_space_node_runtime_core::runtime_inventory::kernel_release::kernel_release(
+                image.as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(version.release(), observed.as_str());
     }
 }
 
@@ -134,5 +146,24 @@ fn a_download_request_preserves_optional_transfer_evidence() {
             serde_json::from_value::<VerifiableKernel>(json).unwrap(),
             request
         );
+    }
+}
+
+#[test]
+fn kernel_locations_preserve_durable_strings_and_reject_other_schemes() {
+    for text in [
+        "s3://artifacts.test/kernels/image?region=us-east-1",
+        "https://artifacts.example.test/kernels/Image-arm64",
+    ] {
+        let location: KernelLocation = text.parse().unwrap();
+        let encoded = serde_json::to_value(&location).unwrap();
+        assert_eq!(encoded, serde_json::Value::String(text.to_owned()));
+        assert_eq!(
+            serde_json::from_value::<KernelLocation>(encoded).unwrap(),
+            location
+        );
+    }
+    for text in ["file:///etc/passwd", "http://artifacts.example.test/kernel"] {
+        text.parse::<KernelLocation>().unwrap_err();
     }
 }
