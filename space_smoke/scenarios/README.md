@@ -117,3 +117,15 @@ Auto-kill (both the omitted/default lifecycle and explicit
 registered. The SPACE ECW API does not currently support those behaviors as
 dependable client contracts. Add their scenarios when that support is
 available; until then they must not make the smoke suite fail.
+
+## Standalone Windows lifecycle
+
+`node.windows_sandbox_lifecycle` requires the same explicit node identity and
+pinned template/environment inputs as the recovery scenario, with
+`SPACE_SMOKE_NODE_RECOVERY=firmware-lifecycle`. It creates a task-owned Windows
+sandbox, checks RDP NLA negotiation through the fenced operator channel, then
+stops/starts and deletes that sandbox. Agent refusal before wake is covered by
+the sandbox-manager guest-image tests. The scenario neither
+restarts managers nor allocates devices, so other authorized sandboxes may stay
+running. RDP negotiation does not establish authenticated interactive access;
+that remains a separate image acceptance check.
