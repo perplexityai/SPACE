@@ -125,10 +125,11 @@ impl Fixture {
             limits: LIMITS,
             host_arch: crate::installs::host_arch().unwrap(),
             source,
-            releases: Some(ReleaseContext {
+            releases: super::super::release::ReleaseSources::new(vec![ReleaseContext {
                 root: base.join("node/firecracker"),
                 source: releases,
-            }),
+            }])
+            .unwrap(),
             publisher,
             pins,
         }
