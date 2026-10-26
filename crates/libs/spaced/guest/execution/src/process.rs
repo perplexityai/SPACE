@@ -17,7 +17,9 @@ use tokio::io::AsyncRead;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 mod pty;
+mod recovery;
 use pty::PtyIo;
+use recovery::{ProcessAddress, TargetState};
 
 const DEFAULT_LOGIN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_PTY_ROWS: u32 = 24;
@@ -347,7 +349,9 @@ impl ProcessLaunch {
     async fn run(mut self, operation: IdempotencyOperation) -> Result<LaunchedProcess, Status> {
         let process_id = self.process_id.clone();
         let recovery_launch = self.recovery_launch.take();
-        let launched = self.publish(recovery_launch.is_some()).await;
+        let launched = self
+            .publish(recovery_launch.as_ref().map(|launch| launch.fence))
+            .await;
         operation.complete(match &launched {
             Ok(launched) => Ok(match launched.recovery_incarnation {
                 Some(incarnation) => IdempotencyRecord::RecoveryProcessStarted {
@@ -362,7 +366,10 @@ impl ProcessLaunch {
         launched
     }
 
-    async fn publish(self, recovery_start: bool) -> Result<LaunchedProcess, Status> {
+    async fn publish(
+        self,
+        recovery_fence: Option<pplx_space_spaced_guest_protocol::recovery::RecoveryFence>,
+    ) -> Result<LaunchedProcess, Status> {
         let ProcessLaunch {
             command,
             recovery_launch: _,
@@ -461,7 +468,11 @@ impl ProcessLaunch {
                 return Err(status);
             }
         };
-        let recovery_incarnation = recovery_start.then(ProcessRecoveryToken::new);
+        let recovery_identity = recovery_fence.map(|fence| recovery::RecoveryIdentity {
+            activation: fence.activation,
+            incarnation: ProcessRecoveryToken::new(),
+        });
+        let recovery_incarnation = recovery_identity.map(|identity| identity.incarnation);
         if let Some(incarnation) = recovery_incarnation
             && let Some(
                 pplx_space_spaced_guest_protocol::proto::operations::process_event::Event::Started(
@@ -475,6 +486,7 @@ impl ProcessLaunch {
         info.pid = pid;
         let record = Arc::new(ProcessRecord::new(
             started.clone(),
+            recovery_identity,
             info,
             input,
             signal_handle,
@@ -656,6 +668,7 @@ struct ProcessRecord {
     // RPCs can retain a completed record beyond registry eviction.
     _record_slot: OwnedSemaphorePermit,
     started: ProcessEvent,
+    recovery_identity: Option<recovery::RecoveryIdentity>,
     /// What `list` reports, without `env`.
     info: ProcessInfo,
     /// Up to 64 KiB, kept apart from `info` so a finished record can drop it
@@ -667,8 +680,36 @@ struct ProcessRecord {
 }
 
 impl ProcessRecord {
+    fn replay(
+        &self,
+        output_cursor: Option<u64>,
+        from_oldest_retained: bool,
+        resume_after_output_gap: bool,
+    ) -> ProcessReplay {
+        if output_cursor.is_none()
+            && let Some(exit) = self.journal.exit()
+        {
+            return ProcessReplay::Completed {
+                started: self.started.clone(),
+                exit,
+            };
+        }
+        ProcessReplay::Running {
+            started: self.started.clone(),
+            cursor: self.journal.cursor(
+                output_cursor,
+                from_oldest_retained,
+                resume_after_output_gap.then(|| OutputGapResume {
+                    process_id: self.started.process_id.clone(),
+                    pid: self.started.pid,
+                }),
+            ),
+        }
+    }
+
     fn new(
         started: ProcessEvent,
+        recovery_identity: Option<recovery::RecoveryIdentity>,
         mut info: ProcessInfo,
         input: ProcessInput,
         signal_handle: ProcessSignalHandle,
@@ -678,6 +719,7 @@ impl ProcessRecord {
         Self {
             _record_slot: reservation.record_slot,
             started,
+            recovery_identity,
             info,
             env: std::sync::Mutex::new(env),
             input,
@@ -1785,6 +1827,7 @@ impl ProcessRegistry {
         Some(record)
     }
 
+    #[cfg(test)]
     fn get_running(&self, process_id: &ProcessId) -> Option<Arc<ProcessRecord>> {
         let record = self.get_record(process_id)?;
         if record.journal.is_completed() {
@@ -1801,25 +1844,7 @@ impl ProcessRegistry {
         resume_after_output_gap: bool,
     ) -> Option<ProcessReplay> {
         let record = self.get_record(process_id)?;
-        if output_cursor.is_none()
-            && let Some(exit) = record.journal.exit()
-        {
-            return Some(ProcessReplay::Completed {
-                started: record.started.clone(),
-                exit,
-            });
-        }
-        Some(ProcessReplay::Running {
-            started: record.started.clone(),
-            cursor: record.journal.cursor(
-                output_cursor,
-                from_oldest_retained,
-                resume_after_output_gap.then(|| OutputGapResume {
-                    process_id: record.started.process_id.clone(),
-                    pid: record.started.pid,
-                }),
-            ),
-        })
+        Some(record.replay(output_cursor, from_oldest_retained, resume_after_output_gap))
     }
 
     /// Removes completed records whose retention has ended. One task at most:
@@ -2777,23 +2802,20 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
+        let address = ProcessAddress::parse(request.process_id, request.recovery)?;
         let resume_after_output_gap = request.resume_after_output_gap.unwrap_or(false);
         // Validate the field for wire compatibility, but do not turn it into a
         // total stream-lifetime deadline here. ECW and native callers own
         // their outer stream budgets; enforcing the same value again in the
         // guest can truncate a healthy, continuously producing process.
         validate_optional_timeout(request.timeout)?;
-        let replay = self
-            .inner
-            .processes
-            .replay(
-                &process_id,
-                request.output_cursor,
-                request.resume_from_oldest_retained,
-                request.resume_after_output_gap.unwrap_or(false),
-            )
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let target = self.select_process(address, TargetState::Retained).await?;
+        let process_id = &target.id;
+        let replay = target.record.replay(
+            request.output_cursor,
+            request.resume_from_oldest_retained,
+            request.resume_after_output_gap.unwrap_or(false),
+        );
         let pid = match &replay {
             ProcessReplay::Running { started, .. } | ProcessReplay::Completed { started, .. } => {
                 started.pid
@@ -2804,7 +2826,7 @@ impl Process for ExecutionService {
                 let output_cursor = request.output_cursor.map(|_| cursor.next_sequence);
                 process_event_stream_with_prefix(
                     vec![process_connected_event(
-                        &process_id,
+                        process_id,
                         pid,
                         output_cursor,
                         resume_after_output_gap,
@@ -2858,14 +2880,12 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
+        let address = ProcessAddress::parse(request.process_id, request.recovery)?;
         let signal =
             ProcessSignal::try_from_i32(request.signal).map_err(invalid_argument_status)?;
-        let handle = self
-            .inner
-            .processes
-            .get_running(&process_id)
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let target = self.select_process(address, TargetState::Running).await?;
+        let process_id = &target.id;
+        let handle = &target.record;
         let kill = signal.as_i32() == libc::SIGKILL;
         match handle.signal_handle.signal(signal) {
             Ok(()) => {}
@@ -2898,13 +2918,13 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let mut request = request.into_inner();
-        let process_id = ProcessId::parse(std::mem::take(&mut request.process_id))
-            .map_err(invalid_argument_status)?;
-        let record = self
-            .inner
-            .processes
-            .get_running(&process_id)
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let address = ProcessAddress::parse(
+            std::mem::take(&mut request.process_id),
+            request.recovery.take(),
+        )?;
+        let target = self.select_process(address, TargetState::Running).await?;
+        let process_id = &target.id;
+        let record = &target.record;
         record.write_stdin(&request.data).await?;
         tracing::debug!(
             command = "bridge_guest_process_send_input",
@@ -2925,12 +2945,10 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
-        let record = self
-            .inner
-            .processes
-            .get_running(&process_id)
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let address = ProcessAddress::parse(request.process_id, request.recovery)?;
+        let target = self.select_process(address, TargetState::Running).await?;
+        let process_id = &target.id;
+        let record = &target.record;
         record.close_stdin().await?;
         tracing::debug!(
             command = "bridge_guest_process_close_stdin",
@@ -2950,15 +2968,13 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
+        let address = ProcessAddress::parse(request.process_id, request.recovery)?;
         let size = request
             .size
             .ok_or_else(|| Status::invalid_argument("pty size is required"))?;
-        let record = self
-            .inner
-            .processes
-            .get_running(&process_id)
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let target = self.select_process(address, TargetState::Running).await?;
+        let process_id = &target.id;
+        let record = &target.record;
         record.resize_pty(size)?;
         tracing::debug!(
             command = "bridge_guest_process_resize_pty",

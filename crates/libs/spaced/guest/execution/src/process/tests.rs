@@ -58,6 +58,7 @@ async fn pty_close_stdin_rejects_without_disabling_input() {
     let result = Process::close_stdin(
         &service,
         Request::new(CloseStdinRequest {
+            recovery: None,
             process_id: started.process_id.clone(),
         }),
     )
@@ -65,6 +66,7 @@ async fn pty_close_stdin_rejects_without_disabling_input() {
     let input = Process::send_input(
         &service,
         Request::new(SendInputRequest {
+            recovery: None,
             process_id: started.process_id,
             data: b"still-open\n".to_vec(),
         }),
@@ -235,6 +237,7 @@ async fn process_payload_admission_rejects_before_decode_and_releases_at_headers
         let process_id = started.process_id.clone();
         writes.push(tokio::spawn(async move {
             let request = SendInputRequest {
+                recovery: None,
                 process_id,
                 data: b"a".to_vec(),
             };
@@ -254,6 +257,7 @@ async fn process_payload_admission_rejects_before_decode_and_releases_at_headers
     .unwrap();
     let rejected = client
         .send_input(SendInputRequest {
+            recovery: None,
             process_id: started.process_id.clone(),
             data: b"rejected".to_vec(),
         })
@@ -266,6 +270,7 @@ async fn process_payload_admission_rejects_before_decode_and_releases_at_headers
     }
     client
         .close_stdin(CloseStdinRequest {
+            recovery: None,
             process_id: started.process_id,
         })
         .await
@@ -762,6 +767,7 @@ async fn kill_reaped_process_releases_stalled_output_and_capacity() {
     let missing = Process::send_signal(
         &service,
         Request::new(SendSignalRequest {
+            recovery: None,
             process_id: started.process_id.clone(),
             signal: libc::SIGTERM,
         }),
@@ -773,6 +779,7 @@ async fn kill_reaped_process_releases_stalled_output_and_capacity() {
     let result = Process::send_signal(
         &service,
         Request::new(SendSignalRequest {
+            recovery: None,
             process_id: started.process_id,
             signal: libc::SIGKILL,
         }),
@@ -1762,6 +1769,7 @@ async fn a_completed_process_exit_stays_connectable_until_its_retention_ends() {
         Process::connect_process(
             &service,
             Request::new(ConnectProcessRequest {
+                recovery: None,
                 resume_after_output_gap: None,
                 process_id: process_id.into(),
                 timeout: None,
@@ -1912,6 +1920,7 @@ async fn a_completed_process_releases_its_output_after_the_idempotency_window() 
     let events = Process::connect_process(
         &service,
         Request::new(ConnectProcessRequest {
+            recovery: None,
             resume_after_output_gap: None,
             process_id: process_id.into(),
             timeout: None,
@@ -2053,6 +2062,7 @@ async fn a_write_in_flight_at_exit_closes_stdin_when_it_returns() {
     Process::send_signal(
         &service,
         Request::new(SendSignalRequest {
+            recovery: None,
             process_id: started.process_id,
             signal: libc::SIGKILL,
         }),
@@ -2228,6 +2238,7 @@ async fn native_process_payloads_obey_message_limits_before_lookup_or_spawn() {
     let input = Process::send_input(
         &service,
         Request::new(SendInputRequest {
+            recovery: None,
             process_id: "sbxps_2f1c9a4e-0000-7000-8000-000000000002".into(),
             data: oversized,
         }),

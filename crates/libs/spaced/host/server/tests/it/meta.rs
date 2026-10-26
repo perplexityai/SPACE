@@ -496,6 +496,8 @@ async fn readiness_requires_a_supported_guest_and_preserves_legacy_support() {
                     capabilities: vec![
                         "process_output_gap_resume".into(),
                         "future_capability".into(),
+                        "process_recovery_start".into(),
+                        "process_recovery_handles".into(),
                     ],
                     ..Default::default()
                 },

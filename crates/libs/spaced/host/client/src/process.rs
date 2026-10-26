@@ -16,6 +16,7 @@ pub(super) fn connect_process_request(
     resume_after_output_gap: bool,
 ) -> ConnectProcessRequest {
     ConnectProcessRequest {
+        recovery: None,
         process_id: process_id.as_str().to_string(),
         timeout: timeout.map(proto_duration),
         output_cursor,
@@ -193,6 +194,7 @@ impl SpacedHostClient {
         let mut client = self.process.clone();
         client
             .send_signal(SendSignalRequest {
+                recovery: None,
                 process_id: process_id.as_str().to_string(),
                 signal: signal.as_i32(),
             })
@@ -207,7 +209,11 @@ impl SpacedHostClient {
         process_id: String,
         data: Vec<u8>,
     ) -> Result<proto::SendInputResponse, tonic::Status> {
-        let mut request = proto::SendInputRequest { process_id, data };
+        let mut request = proto::SendInputRequest {
+            recovery: None,
+            process_id,
+            data,
+        };
         let process_id = ProcessId::parse(std::mem::take(&mut request.process_id))
             .map_err(invalid_argument_status)?;
         request.process_id = process_id.as_str().to_string();
@@ -225,6 +231,7 @@ impl SpacedHostClient {
         let mut client = self.process.clone();
         client
             .close_stdin(proto::CloseStdinRequest {
+                recovery: None,
                 process_id: process_id.as_str().to_string(),
             })
             .await
@@ -242,6 +249,7 @@ impl SpacedHostClient {
             async move {
                 client
                     .resize_pty(proto::ResizePtyRequest {
+                        recovery: None,
                         process_id: process_id.as_str().to_string(),
                         size: Some(size),
                     })

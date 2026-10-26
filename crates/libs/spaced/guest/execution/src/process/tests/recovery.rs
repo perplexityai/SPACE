@@ -219,3 +219,5 @@ async fn recovery_snapshot_barrier_settles_cancelled_start_before_disabling() {
     service.cancel();
     service.drain().await.unwrap();
 }
+
+mod handles;

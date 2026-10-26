@@ -683,6 +683,7 @@ async fn stop_and_kill_end_the_sandbox_processes_before_a_restart() {
             .spaced_connect_process(Request::new(sbx::SpacedConnectProcessRequest {
                 sandbox_id: sandbox_id.into(),
                 operation: Some(ops::ConnectProcessRequest {
+                    recovery: None,
                     process_id: process_id.clone(),
                     timeout: None,
                     output_cursor: None,
@@ -781,6 +782,7 @@ async fn process_rpcs_reject_missing_or_empty_payloads_like_production() {
         svc.spaced_send_signal(Request::new(sbx::SpacedSendSignalRequest {
             sandbox_id: "sbx-v".into(),
             operation: Some(ops::SendSignalRequest {
+                recovery: None,
                 process_id: "sim-proc-1000".into(),
                 signal: 0,
             }),

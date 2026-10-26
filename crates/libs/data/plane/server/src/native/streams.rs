@@ -350,6 +350,7 @@ pub(crate) async fn connect_process_stream(
         SpacedConnectProcessRequest {
             sandbox_id: sandbox_id.to_string(),
             operation: Some(ConnectProcessRequest {
+                recovery: None,
                 process_id: process_id.to_string(),
                 timeout: None,
                 output_cursor,

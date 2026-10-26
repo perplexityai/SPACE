@@ -184,6 +184,9 @@ impl ExecutionService {
                 pplx_space_common_grpc::GuestCapability::ProcessRecoveryStart
                     .as_str()
                     .to_owned(),
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles
+                    .as_str()
+                    .to_owned(),
             ],
         }
     }
@@ -191,10 +194,10 @@ impl ExecutionService {
     /// Enable recovery with an epoch supplied from outside this service's memory,
     /// or disable it before taking a memory snapshot. Recovery is disabled at
     /// construction. Disabling waits for admitted recovery starts to publish
-    /// their outcomes; cancellation of this future leaves the prior state intact.
-    /// A restored service must be
-    /// given a fresh epoch before admitting recovery calls. Repeating the same
-    /// epoch is idempotent. Legacy operations are unaffected.
+    /// their outcomes and for admitted control calls to finish. It does not wait
+    /// for read streams. Cancelling this future leaves the prior state intact.
+    /// A restored service must receive a fresh epoch before recovery calls.
+    /// Repeating the same epoch is idempotent. Legacy operations are unaffected.
     pub async fn configure_process_recovery(
         &self,
         activation: Option<pplx_space_common_core::types::ProcessRecoveryToken>,

@@ -7368,6 +7368,7 @@ dependencies = [
  "pplx-space-spaced-build",
  "prost",
  "prost-types",
+ "thiserror 2.0.20",
  "tokio",
  "tonic",
  "tonic-prost",

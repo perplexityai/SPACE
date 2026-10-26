@@ -20,9 +20,7 @@ pub fn validate_start(request: &StartRequest) -> Result<Option<RecoveryFence>, S
         return Ok(None);
     };
     if recovery.contract_version != START_CONTRACT_VERSION {
-        return Err(Status::failed_precondition(
-            "unsupported process recovery contract version",
-        ));
+        return Err(RecoveryReason::UnsupportedContract.into_status());
     }
     if !request.command.is_empty() {
         return Err(Status::invalid_argument(
@@ -62,4 +60,106 @@ pub fn validate_start(request: &StartRequest) -> Result<Option<RecoveryFence>, S
             .map_err(invalid_argument_status)?;
     }
     Ok(Some(fence))
+}
+
+/// Stable reason attached to a failed recovery fence. Tokens are not credentials.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryReason {
+    UnsupportedContract,
+    EngineRestarted,
+    ActivationChanged,
+    ProcessReplaced,
+}
+
+impl RecoveryReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedContract => "unsupported_contract",
+            Self::EngineRestarted => "engine_restarted",
+            Self::ActivationChanged => "activation_changed",
+            Self::ProcessReplaced => "process_replaced",
+        }
+    }
+    pub fn into_status(self) -> Status {
+        let message = match self {
+            Self::UnsupportedContract => "unsupported process recovery contract version",
+            Self::EngineRestarted => "execution engine restarted",
+            Self::ActivationChanged => "execution activation changed or recovery is disabled",
+            Self::ProcessReplaced => "process incarnation changed",
+        };
+        let mut status = Status::failed_precondition(message);
+        status.metadata_mut().insert(
+            RECOVERY_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(self.as_str()),
+        );
+        status
+    }
+    pub fn from_status(status: &Status) -> Option<Self> {
+        status
+            .metadata()
+            .get(RECOVERY_REASON_METADATA_KEY)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    }
+}
+impl std::fmt::Display for RecoveryReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("unknown process recovery reason")]
+pub struct ParseRecoveryReason;
+impl std::str::FromStr for RecoveryReason {
+    type Err = ParseRecoveryReason;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "unsupported_contract" => Self::UnsupportedContract,
+            "engine_restarted" => Self::EngineRestarted,
+            "activation_changed" => Self::ActivationChanged,
+            "process_replaced" => Self::ProcessReplaced,
+            _ => return Err(ParseRecoveryReason),
+        })
+    }
+}
+pub const RECOVERY_REASON_METADATA_KEY: &str = "space-process-recovery-reason";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessHandle {
+    pub fence: RecoveryFence,
+    pub process_id: ProcessId,
+    pub incarnation: ProcessRecoveryToken,
+}
+
+/// Version 1 fences calls but does not deduplicate input, close or signals.
+/// Missing envelopes select legacy validation; a recovery request must leave
+/// the legacy ID empty so an older peer cannot silently execute it unfenced.
+pub fn validate_handle(
+    legacy_id: &str,
+    recovery: Option<&crate::proto::operations::RecoveryHandle>,
+) -> Result<Option<ProcessHandle>, Status> {
+    let Some(recovery) = recovery else {
+        return Ok(None);
+    };
+    if recovery.contract_version != 1 {
+        return Err(RecoveryReason::UnsupportedContract.into_status());
+    }
+    if !legacy_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "legacy and recovery process handles are mutually exclusive",
+        ));
+    }
+    Ok(Some(ProcessHandle {
+        fence: RecoveryFence {
+            instance: ProcessRecoveryToken::parse(&recovery.expected_instance_id)
+                .map_err(invalid_argument_status)?,
+            activation: ProcessRecoveryToken::parse(&recovery.expected_activation_id)
+                .map_err(invalid_argument_status)?,
+        },
+        process_id: ProcessId::parse(&recovery.process_id).map_err(invalid_argument_status)?,
+        incarnation: ProcessRecoveryToken::parse(&recovery.process_incarnation)
+            .map_err(invalid_argument_status)?,
+    }))
 }

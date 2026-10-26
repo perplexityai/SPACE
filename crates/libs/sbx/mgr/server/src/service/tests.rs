@@ -16240,6 +16240,7 @@ pub(crate) mod service_tests {
             sandbox_id: sandbox_id.to_string(),
             operation: Some(
                 pplx_space_spaced_common::proto::operations::ConnectProcessRequest {
+                    recovery: None,
                     process_id: "process".to_string(),
                     timeout: None,
                     output_cursor: Some(7),

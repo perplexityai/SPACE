@@ -11,6 +11,10 @@ fn main() -> anyhow::Result<()> {
             ".space.spaced.operations.v1.SendInputRequest",
             "#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]",
         )
+        .type_attribute(
+            ".space.spaced.operations.v1.RecoveryHandle",
+            "#[derive(zeroize::Zeroize)]",
+        )
         .skip_debug([".space.spaced.operations.v1.SendInputRequest"])
         .bytes(".space.spaced.operations.v1.FileChunk.data");
     pplx_space_common_proto_build::compile_protos(

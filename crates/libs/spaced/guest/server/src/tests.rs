@@ -347,6 +347,7 @@ async fn daemon_payload_adapters_reuse_transport_admission() {
                 .code(),
             _ => process_client
                 .send_input(SendInputRequest {
+                    recovery: None,
                     process_id: String::new(),
                     data: vec![],
                 })
