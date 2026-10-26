@@ -6608,6 +6608,7 @@ dependencies = [
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
  "prost",
+ "thiserror 2.0.20",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

@@ -3,8 +3,13 @@ use super::*;
 fn observed(definition: &EnvironmentDefinition) -> ExecutionMetadata {
     let spec = definition.descriptor().spec();
     let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
-    let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
-    let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } = &spec.compatibility;
+    let BootProfile::LinuxDirectV1 { kernel } = &spec.boot else {
+        panic!("expected schema-1 fixture")
+    };
+    let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } = &spec.compatibility
+    else {
+        panic!("expected schema-1 fixture")
+    };
     ExecutionMetadata::new(
         release.runtime.clone(),
         spec.guest,

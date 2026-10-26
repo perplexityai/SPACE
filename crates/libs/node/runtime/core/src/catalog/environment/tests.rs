@@ -134,14 +134,12 @@ fn initial_identity_and_legacy_restore_do_not_depend_on_display_name() {
 
 const E1: &str = "fc-1.17.0-linux-6.1.155";
 const E2: &str = "fc-1.17.0-linux-6.18.44";
-
 fn find<'a>(environments: &'a [CompiledEnvironment], name: &str) -> &'a CompiledEnvironment {
     environments
         .iter()
         .find(|entry| entry.name() == name)
         .unwrap()
 }
-
 #[test]
 fn compiled_upgrade_edges_are_e0_to_e1_and_back() {
     let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
@@ -177,7 +175,6 @@ fn compiled_upgrade_edges_are_e0_to_e1_and_back() {
             .is_empty()
     );
 }
-
 #[test]
 fn upgrade_edges_that_break_the_cold_boot_rules_are_rejected() {
     let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
@@ -211,7 +208,6 @@ fn upgrade_edges_that_break_the_cold_boot_rules_are_rejected() {
         assert_eq!(matched, expected, "{edges:?}");
     }
 }
-
 #[test]
 fn an_invalid_edge_table_withdraws_every_edge_but_no_environment() {
     let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
@@ -236,4 +232,37 @@ fn an_invalid_edge_table_withdraws_every_edge_but_no_environment() {
         entries[0].upgrade_targets(),
         [entries[1].definition().reference()]
     );
+}
+#[test]
+fn memory_state_requires_qualification_and_a_declared_format() {
+    for (qualified, has_format, supported) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let mut entry = InitialEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .compiled_environment()
+            .unwrap();
+        let mut spec = entry.definition.descriptor().spec().clone();
+        let state_format = has_format.then(|| spec.compatibility.state_format().unwrap().clone());
+        let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
+        release.layout = RuntimePayloadLayout::CatalogReleaseV1;
+        spec.boot = BootProfile::ArtifactsV1 {
+            contract: "test-boot-v1".parse().unwrap(),
+            artifacts: vec![],
+        };
+        spec.compatibility = ExecutionCompatibilityProfile::RuntimeV1 {
+            contract: "test-machine-v1".parse().unwrap(),
+            state_format,
+        };
+        entry.definition = EnvironmentDefinition::new(spec.try_into().unwrap());
+        entry.memory_state = qualified;
+        assert_eq!(
+            entry.supports_memory_state(),
+            supported,
+            "qualified={qualified}, has_format={has_format}"
+        );
+    }
 }

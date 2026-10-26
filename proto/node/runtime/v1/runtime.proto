@@ -1,10 +1,13 @@
 syntax = "proto3";
 package space.node.runtime.v1;
 
+import "execution/v1/execution.proto";
+
 service RuntimeSupervisor {
   // Every mutation requires explicit execution identity; no unfenced mode.
   rpc BindExecution(BindExecutionRequest) returns (BindExecutionResponse);
   rpc RetireExecution(RetireExecutionRequest) returns (RetireExecutionResponse);
+  rpc LaunchRuntime(LaunchRuntimeRequest) returns (LaunchRuntimeResponse);
   rpc LaunchFirecracker(LaunchFirecrackerRequest) returns (LaunchFirecrackerResponse);
   rpc LaunchSidecar(LaunchSidecarRequest) returns (LaunchSidecarResponse);
   rpc StopProcess(StopProcessRequest) returns (StopProcessResponse);
@@ -134,3 +137,30 @@ message UpdateCgroupRequest {
 }
 
 message UpdateCgroupResponse {}
+
+// Node-local host adapter input. Runtime identity, not an executable basename,
+// selects the adapter. Locators supply no trust or artifact identity.
+message LaunchRuntimeRequest {
+  // Required even for protected launches; must match verified_runtime.sandbox_id
+  // when verified_runtime is present. Only the legacy launch encoding omits it.
+  string sandbox_id = 1;
+  string execution_id = 2;
+  space.execution.v1.RuntimeKind runtime = 3;
+  string runtime_binary = 4;
+  // Optional containment executable; direct VMM adapters do not need one.
+  optional string launcher_binary = 5;
+  string workspace_root = 6;
+  string network_namespace = 7;
+  uint32 uid = 8;
+  uint32 gid = 9;
+  string configuration_path = 10;
+  string log_path = 11;
+  string console_path = 12;
+  string metrics_path = 13;
+  CgroupLimits resource_limits = 14;
+  VerifiedRuntimeLaunch verified_runtime = 15;
+}
+message LaunchRuntimeResponse {
+  uint32 pid = 1;
+  string accepted_environment_reference = 2;
+}

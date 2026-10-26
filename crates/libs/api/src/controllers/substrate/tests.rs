@@ -8,12 +8,12 @@ fn unknown_lifecycle_cannot_become_dead_or_missing_probe_evidence() {
     let id = Uuid::now_v7();
     let missing = Uuid::now_v7();
     for lifecycle in [Some(0), Some(-1), Some(19), None] {
-        for firecracker_alive in [false, true] {
+        for runtime_alive in [false, true] {
             let states = observed_sandbox_states(sbx_proto::StateResponse {
                 sandboxes: vec![sbx_proto::SandboxInfo {
                     sandbox_id: id.to_string(),
                     lifecycle,
-                    firecracker_alive,
+                    firecracker_alive: runtime_alive,
                     ..Default::default()
                 }],
                 missing_ids: vec![missing.to_string()],

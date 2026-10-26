@@ -39,9 +39,7 @@ impl EnvironmentDefinition {
         if execution.runtime() != &release.runtime || execution.guest() != spec.guest {
             return Err(EnvironmentBindingError::RuntimeOrGuest);
         }
-        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-            &spec.compatibility;
-        if execution.state_format() != Some(state_format) {
+        if execution.state_format() != spec.compatibility.state_format() {
             return Err(EnvironmentBindingError::StateFormat);
         }
         Ok(())
@@ -54,20 +52,30 @@ impl EnvironmentDefinition {
     ) -> Result<ExecutionMetadata, EnvironmentRequirementsError> {
         let spec = self.descriptor().spec();
         let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
-        let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
-        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-            &spec.compatibility;
-        Ok(ExecutionMetadata::new(
-            release.runtime.clone(),
-            spec.guest,
-            Some(state_format.clone()),
-            vec![ArtifactComponentMetadata {
+        let components = match &spec.boot {
+            BootProfile::LinuxDirectV1 { kernel } => vec![ArtifactComponentMetadata {
                 kind: kernel.kind,
                 version: Some(kernel.version.clone()),
                 digest: Some(kernel.digest),
-                role: Some("boot".parse()?),
-                format: Some("vmlinux".parse()?),
+                role: Some(BootProfile::LINUX_DIRECT_ROLE.parse()?),
+                format: Some(BootProfile::LINUX_DIRECT_FORMAT.parse()?),
             }],
+            BootProfile::ArtifactsV1 { artifacts, .. } => artifacts
+                .iter()
+                .map(|artifact| ArtifactComponentMetadata {
+                    kind: artifact.component().kind,
+                    version: Some(artifact.component().version.clone()),
+                    digest: Some(artifact.component().digest),
+                    role: Some(artifact.role().clone()),
+                    format: Some(artifact.format().clone()),
+                })
+                .collect(),
+        };
+        Ok(ExecutionMetadata::new(
+            release.runtime.clone(),
+            spec.guest,
+            spec.compatibility.state_format().cloned(),
+            components,
         )?
         .with_environment(self.reference()))
     }
@@ -121,18 +129,27 @@ impl EnvironmentDefinition {
         execution: &ExecutionMetadata,
     ) -> Result<(), EnvironmentBindingError> {
         let spec = self.descriptor().spec();
-        let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
-        let [observed] = execution.components() else {
+        let required = spec.boot.components();
+        if execution.components().len() != spec.boot.components().count() {
             return Err(EnvironmentBindingError::BootComponents);
-        };
-        if observed.kind != kernel.kind
-            || observed.digest != Some(kernel.digest)
-            || !observed
-                .role
-                .as_ref()
-                .is_some_and(|role| role.as_str() == "boot")
-        {
-            return Err(EnvironmentBindingError::BootComponents);
+        }
+        let strict_format = matches!(spec.boot, BootProfile::ArtifactsV1 { .. });
+        for (role, component, format) in required {
+            if !execution.components().iter().any(|observed| {
+                observed.kind == component.kind
+                    && observed.digest == Some(component.digest)
+                    && observed
+                        .role
+                        .as_ref()
+                        .is_some_and(|observed| observed.as_str() == role)
+                    && (!strict_format
+                        || observed
+                            .format
+                            .as_ref()
+                            .is_some_and(|observed| observed.as_str() == format))
+            }) {
+                return Err(EnvironmentBindingError::BootComponents);
+            }
         }
         Ok(())
     }

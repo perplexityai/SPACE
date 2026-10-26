@@ -9,7 +9,7 @@ identifies bytes; an environment reference identifies a particular combination
 of bytes and execution requirements. Neither reference implies that those bytes
 are installed, usable, or approved for execution on a node.
 
-This first contract supports the compiled **E0** definition: Linux/x86_64 host,
+The original schema-1 contract describes the compiled **E0** definition: Linux/x86_64 host,
 KVM, Firecracker 1.15.1, Linux/x86_64 guest, kernel 6.1.155, a hardware VM boundary,
 and Firecracker snapshot format 9.0.0. The runtime digest covers the pinned
 Firecracker and jailer binaries, not their download archive.
@@ -27,35 +27,68 @@ selection are separate operations.
 | `HostPlatform` | Host OS family plus architecture. Policy cohorts must use both. Linux, Windows and macOS are distinguishable identities, not claims that this build implements their execution adapters. |
 | `GuestPlatform` | Existing guest OS family plus architecture. It is independent of the host. Distribution/release, image provenance and mutable boot state remain template/sandbox concerns. |
 | `RuntimeBinding` | A tagged provider reference. Schema 1 implements only `ManagedRelease`, with an exact binary digest and host target. A host facility must get a distinct provider when its adapter is implemented; it must not be represented by an invented installable artifact. |
-| `BootProfile` | Versioned adapter semantics and immutable boot components. `LinuxDirectV1` names a required guest kernel, targeted at the descriptor's guest platform. The root filesystem comes from the template. Firmware/disk boot and mutable NVRAM are not encoded speculatively. |
-| Backend, payload layout, isolation | Typed vocabularies with only KVM, the Firecracker release layout, and a hardware VM boundary implemented. Isolation classes are categories for allowed-class policy, never a numeric ranking. Unknown/unspecified values are unsupported. |
-| `ExecutionCompatibilityProfile` | Versioned adapter interpretation of compatibility requirements. `FirecrackerSnapshotV1` retains the current `StateFormatIdentity` meaning. It does not promise that arbitrary Firecracker versions can restore each other's snapshots. Machine/device compatibility and per-operation capabilities belong to their first adapter consumer. |
+| `BootProfile` | Schema 2 uses `ArtifactsV1`: a versioned boot contract identifier and immutable inputs with unique roles, kinds, formats, versions and digests. It does not prescribe a kernel, a particular guest OS, or executable filenames. Schema 1 retains `LinuxDirectV1`. Template rootfs and mutable per-VM state keep their existing owners. |
+| Backend, payload layout, isolation | Backend and isolation describe mechanisms rather than runtime brands. Schema 2 uses `CatalogReleaseV1`: the trusted catalog owns binary roles and file layout, including single-binary releases. Download packaging and local paths are not wire contracts. The Firecracker layout remains only for schema-1 compatibility. Unknown/unspecified enum values are unsupported. |
+| `ExecutionCompatibilityProfile` | Schema 2 uses `RuntimeV1`: an immutable machine/device contract identifier and an optional `StateFormatIdentity`. Absence explicitly means no memory-state contract; presence is a format requirement, not permission to restore. Schema 1 retains `FirecrackerSnapshotV1`. Approved replacements and per-operation capabilities remain catalog/adapter policy. |
 
 Schema 1 describes the existing SPACE Firecracker direct-boot adapter. Its
 command-line construction and device configuration remain adapter-owned; CPU,
 memory, disks, and guest userspace remain workload/template inputs. Any future
-environment-selectable boot or device configuration must participate in a new
-profile/schema identity before it can affect execution. Adding a field that
-changes boot or restore meaning while preserving the old reference is invalid.
+environment-selectable boot or device configuration must participate in the
+profile identity before it can affect execution. Schema-2 contracts are data:
+adding a runtime that uses the existing managed-artifact mechanisms requires no
+runtime-specific protobuf arm. Its adapter implements the boot and machine
+contracts, and its catalog qualifies exact artifacts. A genuinely new shared
+concept, such as a host-provided runtime facility, still requires its own model;
+it must not masquerade as a managed release with invented artifacts.
+
+Contract identifiers are bounded validated identifiers (for example a versioned
+adapter ABI name), not free-form JSON, filenames or executable commands. New
+semantics require a new contract identifier and therefore a new environment
+reference. Adding a qualified replacement does not change an existing contract.
+Readers preserve unsupported contracts as descriptions; execution admission
+requires a reference in the node's trusted catalog and an implementing adapter.
+No generic parser infers support from a name or matches arbitrary state versions.
 
 Structural decoding and execution approval are separate:
 
 1. `EnvironmentDescriptor::try_from` requires complete fields and consistent
-   host, runtime target, guest and implemented profiles. It currently rejects
-   non-Firecracker/non-Linux combinations, rather than pretending the existing
-   profile describes them.
+   host target and profiles, rejecting mixed schema-1/schema-2 profiles and
+   duplicate boot roles. The legacy profile remains Firecracker/Linux-specific;
+   the schema-2 envelope is runtime-neutral. Structural acceptance does not
+   certify a host/guest combination or implement its named contracts.
 2. `EnvironmentDefinition` computes the content reference. Wire/document readers
    recompute it and reject a mismatched claimed reference.
-3. `InitialEnvironment::resolve_definition` resolves only the compiled E0
-   reference. A well-formed candidate descriptor or approved downloadable
-   artifact does not expand that set. Existing aarch64 installation pins retain
-   their old meaning; production qualification covers only the x86_64 E0 descriptor.
+3. The compiled environment catalog resolves qualified definitions. A
+   well-formed candidate descriptor or approved downloadable artifact does not
+   expand that set. This protocol extension adds no new qualified environments,
+   installable artifacts or execution adapters.
 4. Execution consumers must separately verify node usability and allowed
    selection. No caller may turn successful decoding into execution permission.
 
 No source URL, cache/vendor path, environment variable, operator label, observed
 health, enforcement mode, or installation job revision is part of this identity.
 Local source/path configuration cannot become a second selection authority.
+
+## Runtime-neutral encoding and rollout
+
+Schema-1 Firecracker wire fields, JSON documents, canonical bytes and references
+remain unchanged. The legacy fields stay readable and writable for those
+identities; they are not templates for adding new runtimes.
+
+Schema 2 uses the generic release, boot and compatibility profiles together.
+Boot artifacts are canonicalized by unique role. Every artifact's kind, version,
+digest and format, both contract identifiers, and the presence/value of memory
+state participate in the digest. A kernel-free boot profile is representable;
+its adapter still has to implement it. Synthetic round-trip and canonical
+fixtures exercise the wire shape without qualifying a runtime.
+
+Old schema-1 peers reject schema 2 before interpreting its fields. A new reader
+also rejects a schema-2 shape marked as schema 1 and vice versa. Upgrade readers
+before enabling a catalog entry that uses schema 2; ordinary schema-1 work is
+unchanged in either deployment order. Never retry an unsupported schema as an
+unbound or default environment. The existing exact-reference acknowledgement
+remains required.
 
 ## Persisted-state provenance and restore compatibility
 
@@ -955,3 +988,42 @@ It must keep required installations separate from allowed/default execution
 policy and retain compatibility checks at node admission. Retirement and garbage
 collection require a separate reference-aware operation; recipe omission alone
 never grants deletion authority.
+
+
+## Runtime control transport
+
+Environment descriptors and runtime control have separate contracts. Generic
+`LaunchRuntime`, `GetVmState`, `CaptureVmState` and `RestoreVmState` routes cover
+supervisor process launch, resident state, capture and restore. State artifacts
+are named by the qualified runtime profile; the wire format does not require a
+Firecracker snapshot. The FC adapter requires exactly `machine-state` and
+`memory`, and retains the existing path validation, execution fences, encrypted
+volume ownership and restore admission.
+
+`VmStateStorage.directory` and `VmStateStorage.encrypted_volume_mount` are a
+narrow exception to node-manager's rule that new RPCs take domain identifiers
+and derive host paths. These two fields preserve the existing snapshot storage
+contract through the transport migration and remain after legacy routes retire.
+They retain peer authorization, execution fences, sandbox-scoped canonical-root
+validation, and pinned or otherwise authenticated filesystem handling. They do
+not authorize arbitrary host paths or establish a precedent for new path fields.
+
+Prepare/launch at node-manager, pause/resume, cleanup, resource updates, artifact
+installation and guest reporting already use shared method shapes. Configuration
+payloads remain adapter-owned. Diagnostic fields name the runtime process,
+isolation root and outputs rather than a particular VMM. Their protobuf field
+numbers and types are unchanged; generated clients and JSON field names use the
+new runtime terminology. JSON consumers must regenerate with the migration.
+
+The supervisor is a node-local host adapter interface. Its Linux isolation and
+resource inputs describe the host, not the guest OS. An optional containment
+executable supports jailer-based and direct VMM adapters; source locators cannot
+supply trust or replace the requested execution identity. This does not claim a
+Windows or macOS host adapter exists.
+
+During migration the servers retain old routes. Updated FC clients use generic
+routes and may fall back only when the peer does not implement the new method;
+transport failures and runtime refusals never trigger a second mutation. Other
+runtimes must not use FC fallback. Deploy the new readers and FC callers across
+all participating services and rollback images before retiring the old routes.
+Persisted environment JSON/canonical compatibility is independent and remains.

@@ -307,6 +307,13 @@ impl CompiledEnvironment {
     }
     pub fn supports_memory_state(&self) -> bool {
         self.memory_state
+            && self
+                .definition
+                .descriptor()
+                .spec()
+                .compatibility
+                .state_format()
+                .is_some()
     }
     pub fn definition(&self) -> &EnvironmentDefinition {
         &self.definition

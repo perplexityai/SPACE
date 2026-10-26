@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, future::Future, time::Duration};
 
 use futures_util::{StreamExt, stream};
 use pplx_space_common_core::types::{
-    Arch, BootProfile, DigestParseError, EnvironmentReference, HostPlatform, RuntimeBinding,
+    Arch, DigestParseError, EnvironmentReference, HostPlatform, RuntimeBinding,
 };
 use pplx_space_node_api_client::proto::{
     GetNodeRuntimeDesiredStateRequest, GetNodeRuntimeDesiredStateResponse, NodeRole,
@@ -199,23 +199,24 @@ impl InstallationPlan {
             };
             let spec = environment.definition().descriptor().spec();
             let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
-            let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
-            let required = [
-                runtime::artifact_identity::Artifact::Runtime(runtime::RuntimeArtifactIdentity {
+            let required = std::iter::once(runtime::artifact_identity::Artifact::Runtime(
+                runtime::RuntimeArtifactIdentity {
                     kind: pplx_space_execution_common::proto::RuntimeKind::from(
                         release.runtime.kind,
                     ) as i32,
                     version: release.runtime.version.to_string(),
                     digest: release.digest.to_string(),
-                }),
+                },
+            ))
+            .chain(spec.boot.components().map(|(_, component, _)| {
                 runtime::artifact_identity::Artifact::Component(runtime::ComponentIdentity {
                     kind: pplx_space_execution_common::proto::ArtifactComponentKind::from(
-                        kernel.kind,
+                        component.kind,
                     ) as i32,
-                    version: kernel.version.to_string(),
-                    digest: kernel.digest.to_string(),
-                }),
-            ];
+                    version: component.version.to_string(),
+                    digest: component.digest.to_string(),
+                })
+            }));
             for artifact in required {
                 let identity = runtime::ArtifactIdentity {
                     artifact: Some(artifact),

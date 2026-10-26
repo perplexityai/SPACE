@@ -8,6 +8,7 @@ use pplx_space_common_core::types::{ProcessSignal, SandboxId};
 use pplx_space_common_svc::{UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use pplx_space_node_runtime_core::cgroup::{self, CgroupLimits};
 use pplx_space_node_runtime_core::launch;
+use pplx_space_node_runtime_core::launch_admission::runtime_operation_status;
 use pplx_space_node_runtime_core::proto::runtime_supervisor_server::RuntimeSupervisor;
 use pplx_space_node_runtime_core::proto::{
     LaunchFirecrackerRequest, LaunchFirecrackerResponse, LaunchSidecarRequest,
@@ -435,6 +436,35 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
             ))
         })
         .await
+    }
+
+    async fn launch_runtime(
+        &self,
+        request: Request<pplx_space_node_runtime_core::proto::LaunchRuntimeRequest>,
+    ) -> Result<Response<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse>, Status> {
+        self.authorize_peer(&request, "LaunchRuntime")?;
+        let caller = Some(execution::pin_caller(&request)?);
+        let request =
+            LaunchFirecrackerRequest::try_from(request.into_inner()).map_err(|error| {
+                pplx_space_node_runtime_core::launch_admission::admission_refusal(
+                    Status::failed_precondition(error.to_string()),
+                )
+            })?;
+        let service = self.clone();
+        self.run_owned_operation(async move {
+            let response = service
+                .launch_firecracker_owned(request, caller)
+                .await?
+                .into_inner();
+            Ok(Response::new(
+                pplx_space_node_runtime_core::proto::LaunchRuntimeResponse {
+                    pid: response.pid,
+                    accepted_environment_reference: response.accepted_environment_reference,
+                },
+            ))
+        })
+        .await
+        .map_err(runtime_operation_status)
     }
 
     async fn launch_firecracker(
