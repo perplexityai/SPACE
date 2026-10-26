@@ -4,6 +4,47 @@ package space.execution.v1;
 
 option go_package = "github.com/perplexityai/SPACE/shim/proto/execution/v1;executionv1";
 
+// A compiled qualification profile, not an arbitrary host path or PCI address.
+message DeviceRequirement {
+  string profile = 1;
+  uint32 count = 2;
+  // Exactly one of profile or this set. All count allocations use one selected
+  // profile. Alternatives are unordered; preference belongs to the host catalog.
+  repeated string compatible_profiles = 3;
+}
+
+message DeviceRequirements {
+  repeated DeviceRequirement entries = 1;
+}
+
+// Node-owned assignment of an indivisible reset/isolation unit. Clients never
+// choose these identifiers; the host adapter revalidates enrolled identities.
+message ExclusiveDeviceAssignment {
+  string lease_id = 1;
+  string profile = 2;
+  repeated string host_device_ids = 3;
+  // Durable node enrollment identity, separate from a host device locator.
+  string parent_id = 4;
+}
+
+message DeviceAllocationInput {
+  string sandbox_id = 1;
+  DeviceRequirements requirements = 2;
+}
+
+// Device work carries its required identity here and leaves the legacy sandbox
+// identity empty. Old peers must reject the missing identity before any effect.
+message DeviceExecutionInput {
+  string sandbox_id = 1;
+  string requirements_digest = 2;
+  repeated ExclusiveDeviceAssignment assignments = 3;
+}
+
+message DeviceAcknowledgement {
+  string requirements_digest = 1;
+  repeated ExclusiveDeviceAssignment assignments = 2;
+}
+
 enum RuntimeKind {
   RUNTIME_KIND_UNSPECIFIED = 0;
   RUNTIME_KIND_FIRECRACKER = 1;
