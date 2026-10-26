@@ -1,4 +1,4 @@
-//! Firecracker's release archives, read from its GitHub releases.
+//! Runtime release payloads from bounded HTTPS GitHub downloads.
 
 use super::release_source::{ReleaseArchiveMember, ReleasePayload};
 
@@ -15,7 +15,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// GitHub answers a release download with a redirect to its object storage.
 const MAX_REDIRECTS: usize = 5;
 
+#[derive(Clone, Copy)]
+pub(crate) enum GitHubRuntime {
+    Firecracker,
+    CloudHypervisor,
+}
+
 pub(crate) struct GitHubReleaseSource {
+    runtime: GitHubRuntime,
     /// The release download base, such as
     /// [`super::release_source::FIRECRACKER_RELEASE_SOURCE`].
     base: ReleaseUrl,
@@ -27,7 +34,10 @@ pub(crate) struct GitHubReleaseSource {
 pub struct GitHubReleaseSourceError(#[source] reqwest::Error);
 
 impl GitHubReleaseSource {
-    pub(crate) fn new(base: ReleaseUrl) -> Result<Self, GitHubReleaseSourceError> {
+    pub(crate) fn new(
+        runtime: GitHubRuntime,
+        base: ReleaseUrl,
+    ) -> Result<Self, GitHubReleaseSourceError> {
         // Redirects stay on HTTPS: `holds` vets only the first location.
         let client = reqwest::Client::builder()
             .https_only(true)
@@ -36,7 +46,11 @@ impl GitHubReleaseSource {
             .user_agent(concat!("space-rtmgr/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(GitHubReleaseSourceError)?;
-        Ok(Self { base, client })
+        Ok(Self {
+            runtime,
+            base,
+            client,
+        })
     }
 
     fn holds(&self, archive: &ReleaseUrl) -> bool {
@@ -57,7 +71,7 @@ impl GitHubReleaseSource {
         let span = tracing::info_span!(
             "http.client",
             otel.kind = "client",
-            otel.name = "GET release archive",
+            otel.name = "GET runtime release",
             otel.status_code = tracing::field::Empty,
             otel.status_description = tracing::field::Empty,
             "operation.name" = "http.client",
@@ -96,7 +110,10 @@ impl GitHubReleaseSource {
 #[async_trait::async_trait]
 impl ReleaseSource for GitHubReleaseSource {
     fn runtime(&self) -> RuntimeKind {
-        RuntimeKind::Firecracker
+        match self.runtime {
+            GitHubRuntime::Firecracker => RuntimeKind::Firecracker,
+            GitHubRuntime::CloudHypervisor => RuntimeKind::CloudHypervisor,
+        }
     }
 
     fn root(&self) -> &ReleaseUrl {
@@ -105,24 +122,35 @@ impl ReleaseSource for GitHubReleaseSource {
 
     fn archive(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleaseUrl {
         let version = release.version.as_str();
-        self.base.join(&format!("v{version}")).join(&format!(
-            "firecracker-v{version}-{}.tgz",
-            architecture.as_str()
-        ))
+        let asset = match self.runtime {
+            GitHubRuntime::Firecracker => format!("firecracker-v{version}-{architecture}.tgz"),
+            GitHubRuntime::CloudHypervisor => match architecture {
+                Arch::X86_64 => "cloud-hypervisor-static".to_owned(),
+                Arch::Aarch64 => "cloud-hypervisor-static-aarch64".to_owned(),
+            },
+        };
+        self.base.join(&format!("v{version}")).join(&asset)
     }
 
     fn payload(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleasePayload {
-        let version = release.version.as_str();
-        ReleasePayload::TarGz {
-            members: ["firecracker", "jailer"]
-                .into_iter()
-                .map(|binary| ReleaseArchiveMember {
-                    binary: format!("bin/{binary}"),
-                    member: format!(
-                        "release-v{version}-{architecture}/{binary}-v{version}-{architecture}"
-                    ),
-                })
-                .collect(),
+        match self.runtime {
+            GitHubRuntime::CloudHypervisor => ReleasePayload::Executable,
+            GitHubRuntime::Firecracker => {
+                let version = release.version.as_str();
+                ReleasePayload::TarGz {
+                    members: ["firecracker", "jailer"]
+                        .into_iter()
+                        .map(|binary| {
+                            let directory = format!("release-v{version}-{architecture}");
+                            let executable = format!("{binary}-v{version}-{architecture}");
+                            ReleaseArchiveMember {
+                                binary: format!("bin/{binary}"),
+                                member: format!("{directory}/{executable}"),
+                            }
+                        })
+                        .collect(),
+                }
+            }
         }
     }
 
