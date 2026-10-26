@@ -2,7 +2,9 @@
 //! not approve an environment for execution or its memory-state operations.
 
 use pplx_space_common_core::types::*;
-use pplx_space_execution_common::environment::EnvironmentDefinition;
+use pplx_space_execution_common::environment::{
+    EnvironmentBindingError, EnvironmentDefinition, EnvironmentRequirementsError,
+};
 
 use super::{CatalogError, InitialEnvironment, PinnedKernel, PinnedRelease, RuntimeCatalog};
 
@@ -18,6 +20,30 @@ pub enum CompiledEnvironmentDefinitionError {
     StateFormat(#[from] StateFormatNameParseError),
     #[error("invalid compiled state format version: {0}")]
     StateFormatVersion(#[from] StateFormatVersionParseError),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("compiled upgrade edge {from} -> {to} is invalid")]
+struct UpgradeEdgeError {
+    from: &'static str,
+    to: &'static str,
+    #[source]
+    problem: UpgradeEdgeProblem,
+}
+
+/// Why a compiled upgrade edge can't be certified.
+#[derive(Debug, thiserror::Error)]
+enum UpgradeEdgeProblem {
+    #[error("an endpoint is not a compiled environment")]
+    UnknownEnvironment,
+    #[error("the edge is listed more than once")]
+    Duplicate,
+    #[error("the runtime is unchanged")]
+    RuntimeUnchanged,
+    #[error("the source's execution requirements are invalid")]
+    SourceRequirements(#[source] EnvironmentRequirementsError),
+    #[error("the target fails the cold-boot source check")]
+    NotColdBootCompatible(#[source] EnvironmentBindingError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +69,7 @@ impl InitialEnvironment {
             definition,
             memory_state: true,
             name: "e0",
+            upgrade_targets: Vec::new(),
         })
     }
 
@@ -116,6 +143,19 @@ fn definition_from_pins(
     Ok(EnvironmentDefinition::new(descriptor))
 }
 
+/// Certified cold-boot upgrade edges between compiled environments, by name.
+/// Listing a pair here is the certification; if any listed pair breaks these
+/// rules, the catalog withdraws every edge. An edge changes the runtime, and
+/// its target must pass the environment-level cold-boot source check: the same
+/// runtime kind, guest platform and kernel bytes. The state format may differ,
+/// because a cold boot carries no memory. Keeping memory needs a separate
+/// memory-edge certification.
+const CERTIFIED_UPGRADE_EDGES: &[(&str, &str)] = &[
+    ("e0", "fc-1.17.0-linux-6.1.155"),
+    // The reverse lets the upgrade drill exercise both directions.
+    ("fc-1.17.0-linux-6.1.155", "e0"),
+];
+
 /// A complete approved binding, including the operations qualified for it.
 /// Installing an artifact alone never adds an entry to this catalog.
 #[derive(Clone, Debug)]
@@ -127,6 +167,7 @@ pub struct CompiledEnvironment {
     name: &'static str,
     runtime_ordering_key: semver::Version,
     initial_reference: EnvironmentReference,
+    upgrade_targets: Vec<EnvironmentReference>,
 }
 
 impl CompiledEnvironment {
@@ -150,6 +191,7 @@ impl CompiledEnvironment {
             definition,
             memory_state,
             name: "synthetic",
+            upgrade_targets: Vec::new(),
         }
     }
 
@@ -189,7 +231,7 @@ impl CompiledEnvironment {
             .reference();
         // Complete bindings are approved independently of downloadable release pins.
         // Memory-state compatibility must be qualified before it is advertised.
-        [
+        let mut environments = [
             (
                 "e0",
                 "1.15.1",
@@ -237,9 +279,12 @@ impl CompiledEnvironment {
                 definition,
                 memory_state,
                 name,
+                upgrade_targets: Vec::new(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, CatalogError>>()?;
+        record_upgrade_edges(&mut environments, CERTIFIED_UPGRADE_EDGES);
+        Ok(environments)
     }
 
     pub fn is_initial(&self) -> bool {
@@ -266,6 +311,73 @@ impl CompiledEnvironment {
     pub fn definition(&self) -> &EnvironmentDefinition {
         &self.definition
     }
+    /// Environments this one can be cold-boot upgraded to, in certification
+    /// order. Filled only in a catalog from `for_architecture` (and so
+    /// `cached_for_architecture`); an entry built
+    /// alone, such as `InitialEnvironment::compiled_environment`, has none.
+    pub fn upgrade_targets(&self) -> &[EnvironmentReference] {
+        &self.upgrade_targets
+    }
+}
+
+/// Edges are optional metadata, so an invalid table withdraws every edge and
+/// never an environment: no node publishes part of a table. Tests reject an
+/// invalid compiled table before it ships.
+fn record_upgrade_edges(
+    environments: &mut [CompiledEnvironment],
+    edges: &[(&'static str, &'static str)],
+) {
+    if let Err(error) = certify_upgrade_edges(environments, edges) {
+        tracing::warn!(
+            error = %error,
+            error.debug = ?error,
+            "withdrawing every compiled upgrade edge"
+        );
+        for entry in environments {
+            entry.upgrade_targets.clear();
+        }
+    }
+}
+
+/// Check every edge against the cold-boot rules and record it on its source.
+fn certify_upgrade_edges(
+    environments: &mut [CompiledEnvironment],
+    edges: &[(&'static str, &'static str)],
+) -> Result<(), UpgradeEdgeError> {
+    for &(from, to) in edges {
+        let invalid = |problem| UpgradeEdgeError { from, to, problem };
+        let find = |name| {
+            environments
+                .iter()
+                .find(|entry: &&CompiledEnvironment| entry.name == name)
+                .ok_or_else(|| invalid(UpgradeEdgeProblem::UnknownEnvironment))
+        };
+        let (source, target) = (find(from)?, find(to)?);
+        if source.definition.descriptor().spec().runtime
+            == target.definition.descriptor().spec().runtime
+        {
+            return Err(invalid(UpgradeEdgeProblem::RuntimeUnchanged));
+        }
+        let source_execution = source
+            .definition
+            .execution_requirements()
+            .map_err(|error| invalid(UpgradeEdgeProblem::SourceRequirements(error)))?;
+        target
+            .definition
+            .check_cold_boot_source(&source_execution)
+            .map_err(|error| invalid(UpgradeEdgeProblem::NotColdBootCompatible(error)))?;
+        let target_reference = target.definition.reference();
+        let source = environments
+            .iter_mut()
+            .find(|entry| entry.name == from)
+            .ok_or_else(|| invalid(UpgradeEdgeProblem::UnknownEnvironment))?;
+        let targets = &mut source.upgrade_targets;
+        if targets.contains(&target_reference) {
+            return Err(invalid(UpgradeEdgeProblem::Duplicate));
+        }
+        targets.push(target_reference);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

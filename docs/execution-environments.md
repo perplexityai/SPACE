@@ -854,6 +854,29 @@ mutate the only rollback disk. Retention is not permission to restore a revoked
 runtime. Retire the checkpoint through a durable lifecycle operation before later
 object garbage collection, never by deleting S3 vmstate and editing lifecycle rows.
 
+Moving an existing sandbox to another runtime with the same kernel by cold boot
+discards its memory, so it needs everything above whether or not the state
+format changes; E0 → Firecracker 1.17.0 / Linux 6.1.155 also changes it, from
+9.0.0 to 12.0.0. The compiled catalog records which of these same-kernel
+cold-boot moves are certified, as upgrade edges. `CERTIFIED_UPGRADE_EDGES` in
+`crates/libs/node/runtime/core/src/catalog/environment.rs` lists them, and
+`CompiledEnvironment::upgrade_targets` exposes each environment's targets.
+Listing a pair is the certification decision. An edge must change the runtime,
+and its target must pass the environment-level cold-boot source check
+(`check_cold_boot_source`): the same runtime kind, guest platform and a single
+boot component with the same kernel bytes. The state format may differ,
+because a cold boot loads no memory. A kernel upgrade has no edge and needs its
+own qualification. If any listed edge breaks these rules, names an unknown
+environment or repeats, the catalog withdraws every edge, logs a warning and
+keeps every environment; tests reject such a table before it ships. Two edges
+are certified: E0 → Firecracker 1.17.0 / Linux 6.1.155, and its reverse for an
+upgrade drill. No edge reaches or leaves 1.17.0 / 6.18.44, whose kernel
+differs. Nothing consumes the edges yet. Compatible cold-boot selection for a
+new sandbox or build, described above, uses the same check and doesn't consult
+edges. An edge doesn't replace the consent, fencing and preserved pair above,
+doesn't move work, and doesn't permit a restore: it carries no memory and
+doesn't qualify a loader.
+
 ### Node runtime provisioning
 
 The whole-node `runtime-provisioning` facet reads
