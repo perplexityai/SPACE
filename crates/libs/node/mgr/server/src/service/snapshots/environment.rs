@@ -6,7 +6,7 @@ use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
 use std::io::Read;
 
 pub(super) fn normalize(
-    request: &mut crate::proto::CreateSnapshotRequest,
+    request: &mut crate::snapshot_request::FirecrackerCapture,
 ) -> Result<Option<EnvironmentReference>, Status> {
     let Some(input) = request.environment.as_ref() else {
         return Ok(None);
