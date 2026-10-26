@@ -8,6 +8,8 @@ pub enum VmState {
     NotStarted,
     Running,
     Paused,
+    /// The VMM remains resident but the guest has shut down.
+    Shutdown,
 }
 
 impl VmState {
@@ -16,6 +18,7 @@ impl VmState {
             Self::NotStarted => "Not started",
             Self::Running => "Running",
             Self::Paused => "Paused",
+            Self::Shutdown => "Shutdown",
         }
     }
 }
