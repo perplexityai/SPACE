@@ -61,16 +61,38 @@ fn classify_auto_lifecycle_touch_response(
     }
 }
 
+/// Whether a runtime exists that must receive a new timeout deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimeoutExecutionAction {
-    StoredOnly,
-    StoredOnlyAfterLock,
-    ResetRuntime,
+enum RuntimePresence {
+    /// Created, Paused or Suspended: no runtime to tell; only the stored
+    /// policy matters.
+    Absent,
+    /// Started with execution evidence: the runtime receives the deadline.
+    Present,
+    /// A concurrent activation can change the answer: Started without
+    /// execution evidence, or mid-transition. Only a read taken under the
+    /// sandbox row lock can decide it.
+    Unknown,
 }
 
-impl TimeoutExecutionAction {
-    fn from_execution(
+impl RuntimePresence {
+    /// Presence from an unlocked read. `Unknown` sends the caller to the
+    /// locked path.
+    fn unlocked(
         execution: &sandbox_store::AutoLifecycleExecution,
+    ) -> Result<Self, ControllerError> {
+        Self::classify(execution, false)
+    }
+
+    /// Presence from a read taken under the sandbox row lock, where an
+    /// activation's claim is visible. Never returns `Unknown`.
+    fn locked(execution: &sandbox_store::AutoLifecycleExecution) -> Result<Self, ControllerError> {
+        Self::classify(execution, true)
+    }
+
+    fn classify(
+        execution: &sandbox_store::AutoLifecycleExecution,
+        locked: bool,
     ) -> Result<Self, ControllerError> {
         let lifecycle = execution
             .lifecycle
@@ -80,22 +102,25 @@ impl TimeoutExecutionAction {
             })?;
         match lifecycle {
             SandboxLifecycle::Created | SandboxLifecycle::Paused | SandboxLifecycle::Suspended => {
-                Ok(Self::StoredOnly)
+                Ok(Self::Absent)
             }
-            SandboxLifecycle::Started => {
-                if execution.proves_no_execution() {
-                    Ok(Self::StoredOnlyAfterLock)
-                } else {
-                    Ok(Self::ResetRuntime)
-                }
+            // Only the row lock makes an absence proof hold against a
+            // concurrent activation claim.
+            SandboxLifecycle::Started if execution.proves_no_execution() => {
+                Ok(if locked { Self::Absent } else { Self::Unknown })
             }
+            SandboxLifecycle::Started => Ok(Self::Present),
+            // Mid-transition, an unlocked read can see a stale execution
+            // generation; the locked read sees the activation's claim.
             SandboxLifecycle::Creating
             | SandboxLifecycle::Starting
             | SandboxLifecycle::Restoring
             | SandboxLifecycle::Resuming
             | SandboxLifecycle::Pausing
             | SandboxLifecycle::Suspending
-            | SandboxLifecycle::Checkpointing => Ok(Self::ResetRuntime),
+            | SandboxLifecycle::Checkpointing => {
+                Ok(if locked { Self::Present } else { Self::Unknown })
+            }
             SandboxLifecycle::Stopping
             | SandboxLifecycle::Stopped
             | SandboxLifecycle::Deleting
@@ -665,21 +690,21 @@ impl SandboxController {
                 .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
             let current_policy = execution.policy.0.clone().normalized();
             // An unchanged policy needs no persistence. Only bypass the lock
-            // when the runtime decision does not rely on execution absence:
-            // Started without ownership evidence must still serialize with
-            // activation acquisition and read its claim after taking the lock.
+            // when runtime presence is already known: an `Unknown` answer must
+            // serialize with activation acquisition and read its claim after
+            // taking the lock.
             let unchanged = crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs)
                 .normalized()
                 == current_policy
                 && expected_policy
                     .is_none_or(|expected| expected.clone().normalized() == current_policy);
-            let action = TimeoutExecutionAction::from_execution(&execution);
-            let (execution, action, tx) = if unchanged
+            let presence = RuntimePresence::unlocked(&execution);
+            let (execution, presence, tx) = if unchanged
                 && matches!(
-                    action,
-                    Ok(TimeoutExecutionAction::StoredOnly | TimeoutExecutionAction::ResetRuntime)
+                    presence,
+                    Ok(RuntimePresence::Absent | RuntimePresence::Present)
                 ) {
-                (execution, action?, None)
+                (execution, presence?, None)
             } else {
                 let mut tx = pool
                     .begin()
@@ -701,8 +726,8 @@ impl SandboxController {
                     .await
                     .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
                     .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
-                let action = TimeoutExecutionAction::from_execution(&execution)?;
-                (execution, action, Some(tx))
+                let presence = RuntimePresence::locked(&execution)?;
+                (execution, presence, Some(tx))
             };
             let current_policy = execution.policy.0.normalized();
             if expected_policy
@@ -722,12 +747,14 @@ impl SandboxController {
                     .await
                     .map_err(|error| db_contention_error("commit timeout intent", &error))?;
             }
-            match action {
-                TimeoutExecutionAction::StoredOnly
-                | TimeoutExecutionAction::StoredOnlyAfterLock => {
-                    return Ok(AccessIdleTimeoutOutcome::StoredOnly);
+            match presence {
+                RuntimePresence::Absent => return Ok(AccessIdleTimeoutOutcome::StoredOnly),
+                RuntimePresence::Present => {}
+                RuntimePresence::Unknown => {
+                    return Err(ControllerError::internal(
+                        "locked timeout read left runtime presence unknown",
+                    ));
                 }
-                TimeoutExecutionAction::ResetRuntime => {}
             }
             // Only an identified execution is eligible for bounded readiness
             // observation. Missing identity alone cannot authorize a new wake.

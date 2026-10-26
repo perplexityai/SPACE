@@ -209,46 +209,60 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
             );
         }
     }
-    // Absence must serialize with activation acquisition, even when the
-    // Kubernetes sandbox's policy is already unchanged.
-    let sandbox = seed_sandbox(&db.pool, &actor).await?;
-    sqlx::query(sql!(
-        "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
-    ))
-    .bind(sandbox.id)
-    .bind(sqlx::types::Json(&policy))
-    .execute(&db.pool)
-    .await?;
-    let ownership = pplx_space_sandbox_store::auto_lifecycle_execution(&db.pool, sandbox.id)
-        .await?
-        .ok_or("seeded sandbox missing")?;
-    assert!(ownership.proves_no_execution());
-    let mut holder = db.pool.begin().await?;
-    sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+    // Unknown runtime presence must serialize with activation acquisition,
+    // even when the policy is already unchanged: a Kubernetes sandbox whose
+    // record proves no execution, and one mid-transition.
+    for lifecycle in ["started", "starting"] {
+        let sandbox = seed_sandbox(&db.pool, &actor).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = $2, auto_lifecycle_json = $3 WHERE id = $1"
+        ))
         .bind(sandbox.id)
-        .execute(&mut *holder)
+        .bind(lifecycle)
+        .bind(sqlx::types::Json(&policy))
+        .execute(&db.pool)
         .await?;
-    let result = controller
-        .set_access_idle_timeout(
-            &db.pool,
-            &sandbox,
-            90,
-            prost_types::Timestamp {
-                seconds: 1_800_000_000,
-                nanos: 0,
-            },
-            tokio::time::Instant::now() + Duration::from_millis(500),
-            Some(&policy),
-        )
-        .await;
-    holder.rollback().await?;
-    let error = result.expect_err("execution absence must still wait for the row lock");
-    assert_eq!(error.status().as_u16(), 503);
-    assert!(
-        error
-            .to_string()
-            .contains("sandbox deadline update expired")
-    );
+        let ownership = pplx_space_sandbox_store::auto_lifecycle_execution(&db.pool, sandbox.id)
+            .await?
+            .ok_or("seeded sandbox missing")?;
+        assert!(ownership.proves_no_execution());
+        let mut holder = db.pool.begin().await?;
+        sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+            .bind(sandbox.id)
+            .execute(&mut *holder)
+            .await?;
+        let result = controller
+            .set_access_idle_timeout(
+                &db.pool,
+                &sandbox,
+                90,
+                prost_types::Timestamp {
+                    seconds: 1_800_000_000,
+                    nanos: 0,
+                },
+                tokio::time::Instant::now() + Duration::from_millis(500),
+                Some(&policy),
+            )
+            .await;
+        holder.rollback().await?;
+        let error = match result {
+            Ok(outcome) => {
+                return Err(format!(
+                    "{lifecycle}: unknown runtime presence must still wait for the row lock, \
+                     got {outcome:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.status().as_u16(), 503, "{lifecycle}");
+        assert!(
+            error
+                .to_string()
+                .contains("sandbox deadline update expired"),
+            "{lifecycle}: {error}"
+        );
+    }
     Ok(())
 }
 
