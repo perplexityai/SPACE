@@ -140,7 +140,7 @@ async fn delete_behind_a_create_in_backoff(
     let claim = claim_all(store).await?;
     assert_eq!(claimed_ids(&claim), vec![create]);
     let delete = create_op(store, org_id, OperationKind::DeleteSandbox, target_id).await?;
-    assert!(
+    assert_eq!(
         store
             .release_claimed_operation(ReleaseClaimedPublicOperation {
                 claim_token: claim.claim_token.clone(),
@@ -149,8 +149,10 @@ async fn delete_behind_a_create_in_backoff(
                 retry_after: Duration::from_secs(300),
                 count_attempt: true,
                 undo_first_start: false,
+                cancel_if_superseded: false,
             })
-            .await?
+            .await?,
+        ReleasedClaim::Requeued
     );
     Ok(delete)
 }
@@ -353,6 +355,7 @@ async fn claim_holds_back_operations_behind_their_sandboxs_live_or_earlier_work(
             retry_after: Duration::from_secs(300),
             count_attempt: true,
             undo_first_start: false,
+            cancel_if_superseded: false,
         })
         .await?;
     assert!(claimed_ids(&claim_all(&store).await?).is_empty());
@@ -432,6 +435,7 @@ async fn delete_supersedes_backed_off_work_but_not_a_pending_create() -> TestRes
             retry_after: Duration::from_secs(300),
             count_attempt: true,
             undo_first_start: false,
+            cancel_if_superseded: false,
         })
         .await?;
     assert_eq!(claimed_ids(&claim_all(&store).await?), vec![delete]);
@@ -476,8 +480,8 @@ async fn stale_claim_recovery_keeps_the_sandboxs_order() -> TestResult {
     assert_eq!(operation.attempts, 2);
     assert_eq!(operation.claim_generation, 2);
     // The old claim is fenced off.
-    assert!(
-        !store
+    assert_eq!(
+        store
             .release_claimed_operation(ReleaseClaimedPublicOperation {
                 claim_token: first_claim.claim_token.clone(),
                 operation_id: first,
@@ -485,8 +489,10 @@ async fn stale_claim_recovery_keeps_the_sandboxs_order() -> TestResult {
                 retry_after: Duration::from_secs(1),
                 count_attempt: true,
                 undo_first_start: false,
+                cancel_if_superseded: false,
             })
-            .await?
+            .await?,
+        ReleasedClaim::Lost
     );
     assert_eq!(
         operation_state(&db.pool, later).await?,
@@ -1005,5 +1011,172 @@ async fn a_create_mid_attempt_when_a_delete_arrives_ends_canceled_instead_of_ret
         operation_state(&db.pool, delete).await?,
         OperationState::Succeeded.as_str()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_create_handed_back_after_its_delete_arrives_ends_canceled() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let handed_back = create_op(
+        &store,
+        org_id,
+        OperationKind::CreateSandbox,
+        "sbx_handed_back_create",
+    )
+    .await?;
+    let still_executing = create_op(
+        &store,
+        org_id,
+        OperationKind::CreateSandbox,
+        "sbx_still_executing_create",
+    )
+    .await?;
+    let claim = claim_all(&store).await?;
+    // Each delete arrives while its create is claimed, so it cannot cancel it.
+    let delete = create_op(
+        &store,
+        org_id,
+        OperationKind::DeleteSandbox,
+        "sbx_handed_back_create",
+    )
+    .await?;
+    create_op(
+        &store,
+        org_id,
+        OperationKind::DeleteSandbox,
+        "sbx_still_executing_create",
+    )
+    .await?;
+    for operation in claim.operations {
+        // The second create's own earlier execution still runs here, so
+        // canceling it would let its delete start under that execution.
+        let executing_here = operation.id == still_executing;
+        hand_back_busy_key(
+            store.clone(),
+            claim.claim_token.clone(),
+            operation,
+            BUSY_KEY_RETRY_AFTER,
+            executing_here,
+        )
+        .await;
+    }
+
+    assert_superseded(&store, org_id, handed_back, delete).await?;
+    assert_eq!(
+        operation_state(&db.pool, still_executing).await?,
+        OperationState::Queued.as_str()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_delete_waits_for_a_claim_holding_its_create_and_cancels_what_it_left_queued()
+-> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let create = create_op(
+        &store,
+        org_id,
+        OperationKind::CreateSandbox,
+        "sbx_create_a_claim_considered",
+    )
+    .await?;
+    // A claim has the create locked as a candidate, and will drop it.
+    let mut claim = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT operation_id FROM public_operations WHERE operation_id = $1 FOR UPDATE"
+    ))
+    .bind(create.as_uuid())
+    .execute(&mut *claim)
+    .await?;
+    let requested = tokio::spawn({
+        let store = store.clone();
+        async move {
+            create_op(
+                &store,
+                org_id,
+                OperationKind::DeleteSandbox,
+                "sbx_create_a_claim_considered",
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!requested.is_finished(), "the delete waits for the claim");
+
+    claim.rollback().await?;
+    let delete = tokio::time::timeout(Duration::from_secs(5), requested).await???;
+    assert_superseded(&store, org_id, create, delete).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_create_released_while_its_delete_commits_ends_canceled() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(4).await?
+    else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let create = create_op(
+        &store,
+        org_id,
+        OperationKind::CreateSandbox,
+        "sbx_released_meanwhile",
+    )
+    .await?;
+    let claim = claim_all(&store).await?;
+    // The delete is requested, but not yet committed, when the attempt ends.
+    let mut requesting = db.pool.begin().await?;
+    let (requested, _superseded) = pplx_space_api::public_operations::create_operation_tx(
+        &mut requesting,
+        pplx_space_api::public_operations::CreatePublicOperation {
+            org_id,
+            actor_user_id: None,
+            api_product: ApiProduct::Native,
+            kind: OperationKind::DeleteSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some("sbx_released_meanwhile"),
+            payload_json: serde_json::json!({}),
+            idempotency: None,
+            traceparent: None,
+        },
+    )
+    .await?;
+    let pplx_space_api::public_operations::CreatePublicOperationResult::Created(delete) = requested
+    else {
+        panic!("expected a created delete, got {requested:?}");
+    };
+    let released = tokio::spawn({
+        let store = store.clone();
+        let claim_token = claim.claim_token.clone();
+        async move {
+            store
+                .release_claimed_operation(ReleaseClaimedPublicOperation {
+                    claim_token,
+                    operation_id: create,
+                    progress_message: "sandbox pod is not ready".to_string(),
+                    retry_after: Duration::from_secs(1),
+                    count_attempt: true,
+                    undo_first_start: false,
+                    cancel_if_superseded: true,
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!released.is_finished(), "the release waits for the delete");
+
+    requesting.commit().await?;
+    let released = tokio::time::timeout(Duration::from_secs(5), released).await???;
+    assert_eq!(released, ReleasedClaim::Superseded { delete_id: delete });
+    assert_superseded(&store, org_id, create, delete).await?;
     Ok(())
 }

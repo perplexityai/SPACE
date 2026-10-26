@@ -11,7 +11,7 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
 
     use crate::public_operations::{
         ApiProduct, ClaimLimits, ClaimPublicOperations, CreateClaimedPublicOperationResult,
-        CreatePublicOperation, PublicOperationStore, ReleaseClaimedPublicOperation,
+        CreatePublicOperation, PublicOperationStore, ReleaseClaimedPublicOperation, ReleasedClaim,
     };
 
     let db = pg_test_db().await?;
@@ -78,7 +78,7 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
     assert_eq!(result.state, OperationState::Queued);
     // Reclaim through the dispatcher's store API to inspect what the next
     // executor receives, without selecting a capture on the test's behalf.
-    assert!(
+    assert_eq!(
         store
             .release_claimed_operation(ReleaseClaimedPublicOperation {
                 claim_token,
@@ -87,8 +87,10 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
                 retry_after: Duration::ZERO,
                 count_attempt: false,
                 undo_first_start: false,
+                cancel_if_superseded: false,
             })
-            .await?
+            .await?,
+        ReleasedClaim::Requeued
     );
     let resumed = store
         .claim_operations(ClaimPublicOperations {

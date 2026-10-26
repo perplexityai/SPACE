@@ -963,7 +963,7 @@ async fn release_claimed_operation_requeues_with_backoff() -> TestResult {
         })
         .await?;
 
-    assert!(
+    assert_eq!(
         store
             .release_claimed_operation(ReleaseClaimedPublicOperation {
                 claim_token: claim.claim_token,
@@ -973,8 +973,10 @@ async fn release_claimed_operation_requeues_with_backoff() -> TestResult {
                 retry_after: Duration::from_millis(300_500),
                 count_attempt: true,
                 undo_first_start: false,
+                cancel_if_superseded: false,
             })
-            .await?
+            .await?,
+        ReleasedClaim::Requeued
     );
     let delay_secs: f64 = sqlx::query_scalar(sql!(
         "SELECT EXTRACT(EPOCH FROM next_attempt_at - updated_at)::DOUBLE PRECISION
@@ -1027,7 +1029,7 @@ async fn backpressure_release_rolls_back_claim_attempt() -> TestResult {
     assert_eq!(claim.operations[0].attempts, 1);
 
     // A backpressure release rolls that increment back.
-    assert!(
+    assert_eq!(
         store
             .release_claimed_operation(ReleaseClaimedPublicOperation {
                 claim_token: claim.claim_token,
@@ -1036,8 +1038,10 @@ async fn backpressure_release_rolls_back_claim_attempt() -> TestResult {
                 retry_after: Duration::ZERO,
                 count_attempt: false,
                 undo_first_start: false,
+                cancel_if_superseded: false,
             })
-            .await?
+            .await?,
+        ReleasedClaim::Requeued
     );
 
     // Re-claim: attempts goes 0 -> 1, not 1 -> 2, proving the rollback so a

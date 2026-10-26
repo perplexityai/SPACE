@@ -17,7 +17,7 @@ pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, Tick
 use pplx_space_api::public_operations::{
     ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, OrgSlotLimit, PublicOperationClaim,
     PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
-    TEARDOWN_KINDS,
+    ReleasedClaim, TEARDOWN_KINDS,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
@@ -527,7 +527,8 @@ pub async fn run<E>(
                             if let Some(key) = &key
                                 && let Some(&running) = busy_keys.get(key)
                             {
-                                let retry_after = if running == operation.id {
+                                let executing_here = running == operation.id;
+                                let retry_after = if executing_here {
                                     stale_reclaim_retry_after
                                 } else {
                                     BUSY_KEY_RETRY_AFTER
@@ -537,6 +538,7 @@ pub async fn run<E>(
                                     claim.claim_token.clone(),
                                     operation,
                                     retry_after,
+                                    executing_here,
                                 ));
                                 continue;
                             }
@@ -631,11 +633,14 @@ fn finish_execution(
 
 /// Requeue an operation this process cannot start because another of its
 /// key's operations is still executing here, without charging an attempt.
+/// A create a later delete supersedes ends canceled instead, unless its own
+/// earlier execution, which lost the claim, is what still executes here.
 async fn hand_back_busy_key(
     store: PublicOperationStore,
     claim_token: String,
     operation: ClaimedPublicOperation,
     retry_after: Duration,
+    executing_here: bool,
 ) {
     tracing::warn!(
         operation_id = %operation.id,
@@ -644,7 +649,7 @@ async fn hand_back_busy_key(
         "public-operation-dispatcher claimed an operation whose sandbox is still executing \
          locally; handing it back"
     );
-    if let Err(error) = store
+    match store
         .release_claimed_operation(ReleaseClaimedPublicOperation {
             claim_token,
             operation_id: operation.id,
@@ -652,15 +657,30 @@ async fn hand_back_busy_key(
             retry_after,
             count_attempt: false,
             undo_first_start: operation.is_first_start(),
+            cancel_if_superseded: !executing_here,
         })
         .await
     {
-        tracing::warn!(
+        Ok(ReleasedClaim::Superseded { delete_id }) => {
+            // Not an execution, so counted as a cancel at enqueue is.
+            pplx_space_metrics::operations::completed(
+                operation.api_product.as_str(),
+                operation.kind.as_str(),
+                OperationState::Canceled.as_str(),
+            );
+            tracing::info!(
+                operation_id = %operation.id,
+                delete_operation_id = %delete_id,
+                "public create canceled instead of handed back: a later delete supersedes it"
+            );
+        }
+        Ok(ReleasedClaim::Requeued | ReleasedClaim::Lost) => {}
+        Err(error) => tracing::warn!(
             operation_id = %operation.id,
             error = %error,
             "public-operation-dispatcher could not hand back a busy-key claim; \
              it becomes claimable once the claim goes stale"
-        );
+        ),
     }
 }
 
