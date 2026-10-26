@@ -301,6 +301,7 @@ impl SandboxManagerService {
                 .filter(|value| !value.is_empty());
             let auto_lifecycle =
                 self.resolve_create_auto_lifecycle_policy(req, &resolved_template, pool_template)?;
+            super::validation::validate_runtime_lifecycle_policy(resolved_template.execution.runtime().kind, &auto_lifecycle)?;
             let auto_lifecycle_authority = if req.auto_lifecycle.is_some() {
                 crate::db::PolicyAuthority::try_from(req.auto_lifecycle_authority)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?
