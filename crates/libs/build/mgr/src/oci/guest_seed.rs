@@ -29,27 +29,16 @@ pub enum GuestSeedError {
     InvalidFile,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct GuestSeeds(BTreeMap<String, BTreeMap<String, TemplateReference>>);
 
 impl GuestSeeds {
     pub fn from_env() -> Result<Self, GuestSeedError> {
         match std::env::var(ENV) {
-            Ok(value) => Self::parse(Some(&value)),
+            Ok(value) => serde_json::from_str(&value).map_err(GuestSeedError::Configuration),
             Err(std::env::VarError::NotPresent) => Ok(Self::default()),
             Err(error) => Err(GuestSeedError::Environment(error)),
         }
-    }
-
-    fn parse(value: Option<&str>) -> Result<Self, GuestSeedError> {
-        value.map_or_else(
-            || Ok(Self::default()),
-            |value| {
-                serde_json::from_str(value)
-                    .map(Self)
-                    .map_err(GuestSeedError::Configuration)
-            },
-        )
     }
 
     /// The API pins the stock seed before dispatch, so match its name across
@@ -69,20 +58,16 @@ impl GuestSeeds {
         let Some(release) = read_os_release(root)? else {
             return Ok(base.clone());
         };
-        let mut id = None;
-        let mut version = None;
-        for line in release.lines() {
-            let Some((key, value)) = line.trim().split_once('=') else {
-                continue;
-            };
-            match key {
-                "ID" => id = identity_value(value),
-                "VERSION_ID" => version = identity_value(value),
-                _ => {}
-            }
-        }
-        Ok(id
-            .zip(version)
+        let value = |key| {
+            release
+                .lines()
+                .rev()
+                .filter_map(|line| line.trim().split_once('='))
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| identity_value(value))
+        };
+        Ok(value("ID")
+            .zip(value("VERSION_ID"))
             .and_then(|(id, version)| self.0.get(id)?.get(version))
             .unwrap_or(base)
             .clone())

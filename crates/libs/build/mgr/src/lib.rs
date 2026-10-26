@@ -639,59 +639,9 @@ impl TemplateBuilder {
         template_id: &str,
         job_id: &JobId,
     ) -> Result<BuildOutcome, BuildError> {
-        let seeds = if matches!(prepared.recipe().origin, Origin::FromOciImage { .. }) {
-            oci::GuestSeeds::from_env()?
-        } else {
-            oci::GuestSeeds::default()
-        };
-        let mut mounted_image = match &prepared.recipe().origin {
-            Origin::FromOciImage {
-                base, reference, ..
-            } if seeds.applies_to(base) => Some(
-                oci::mount(oci::OciMountRequest {
-                    cache_dir: Path::new(
-                        pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR,
-                    )
-                    .join("builds/oci"),
-                    reference: reference.clone(),
-                })
-                .await
-                .map_err(oci::OciImageAssemblyError::from)?,
-            ),
-            _ => None,
-        };
-        let result = self
-            .build_prepared_with_image(
-                recipe_label,
-                prepared,
-                template_id,
-                job_id,
-                &seeds,
-                &mut mounted_image,
-            )
-            .await;
-        // Assembly normally consumes the mount. Errors before assembly must
-        // release the same image and its storage reservation as well.
-        if let Some(image) = mounted_image
-            && let Err(error) = image.unmount().await
-        {
-            if result.is_ok() {
-                return Err(oci::OciImageAssemblyError::from(error).into());
-            }
-            tracing::warn!(%error, "OCI image cleanup after seed selection failed");
-        }
-        result
-    }
-
-    async fn build_prepared_with_image(
-        &self,
-        recipe_label: &str,
-        prepared: PreparedRecipe,
-        template_id: &str,
-        job_id: &JobId,
-        seeds: &oci::GuestSeeds,
-        mounted_image: &mut Option<oci::OciRootfs>,
-    ) -> Result<BuildOutcome, BuildError> {
+        // OciRootfs owns cleanup on early return or cancellation. Successful
+        // assembly consumes this same mount and explicitly awaits its unmount.
+        let mut mounted_image = None;
         let recipe = prepared.recipe();
         let (base, base_raw, oci_image) = match &recipe.origin {
             Origin::FromScratch { .. } => {
@@ -710,9 +660,22 @@ impl TemplateBuilder {
                 base_raw,
                 reference,
             } => {
-                let selected = match mounted_image.as_ref() {
-                    Some(image) => seeds.select(image.path(), base)?,
-                    None => base.clone(),
+                let seeds = oci::GuestSeeds::from_env()?;
+                let selected = if seeds.applies_to(base) {
+                    let image = oci::mount(oci::OciMountRequest {
+                        cache_dir: Path::new(
+                            pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR,
+                        )
+                        .join("builds/oci"),
+                        reference: reference.clone(),
+                    })
+                    .await
+                    .map_err(oci::OciImageAssemblyError::from)?;
+                    let selected = seeds.select(image.path(), base)?;
+                    mounted_image = Some(image);
+                    selected
+                } else {
+                    base.clone()
                 };
                 let selected_raw = if selected == *base {
                     base_raw.clone()

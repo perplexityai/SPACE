@@ -1,14 +1,20 @@
 use super::*;
 
 fn configured() -> GuestSeeds {
-    GuestSeeds::parse(Some(r#"{"ubuntu":{"24.04":"seed-noble:validated"}}"#)).unwrap()
+    serde_json::from_str(r#"{"ubuntu":{"24.04":"seed-noble:validated"}}"#).unwrap()
+}
+
+fn selected(root: &Path, base: &str) -> String {
+    configured()
+        .select(root, &base.parse().unwrap())
+        .unwrap()
+        .to_string()
 }
 
 #[test]
 fn selects_only_the_configured_os_and_release() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("etc")).unwrap();
-    let base = "seed".parse().unwrap();
     for (contents, expected) in [
         ("ID=ubuntu\nVERSION_ID=24.04\n", "seed-noble:validated"),
         ("ID=ubuntu\nVERSION_ID=\"24.04\"\n", "seed-noble:validated"),
@@ -30,25 +36,18 @@ fn selects_only_the_configured_os_and_release() {
         ),
     ] {
         fs::write(root.path().join("etc/os-release"), contents).unwrap();
-        assert_eq!(
-            configured().select(root.path(), &base).unwrap().to_string(),
-            expected,
-            "{contents}"
-        );
+        assert_eq!(selected(root.path(), "seed"), expected, "{contents}");
     }
     fs::write(
         root.path().join("etc/os-release"),
         "ID=ubuntu\nVERSION_ID=24.04\n",
     )
     .unwrap();
-    let pinned = "seed@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        .parse()
-        .unwrap();
     assert_eq!(
-        configured()
-            .select(root.path(), &pinned)
-            .unwrap()
-            .to_string(),
+        selected(
+            root.path(),
+            "seed@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
         "seed-noble:validated"
     );
 }
@@ -57,8 +56,7 @@ fn selects_only_the_configured_os_and_release() {
 fn disabled_configuration_and_explicit_bases_do_not_inspect_the_image() {
     let missing = Path::new("/nonexistent-guest-seed-test-root");
     let base = "seed".parse().unwrap();
-    for config in [None, Some("{}")] {
-        let seeds = GuestSeeds::parse(config).unwrap();
+    for seeds in [GuestSeeds::default(), serde_json::from_str("{}").unwrap()] {
         assert_eq!(seeds.select(missing, &base).unwrap(), base);
     }
     for raw in [
@@ -82,10 +80,7 @@ fn os_release_precedence_and_missing_identity() {
         "ID=ubuntu\nVERSION_ID=24.04\n",
     )
     .unwrap();
-    assert_eq!(
-        configured().select(root.path(), &base).unwrap().to_string(),
-        "seed-noble:validated"
-    );
+    assert_eq!(selected(root.path(), "seed"), "seed-noble:validated");
     fs::create_dir(root.path().join("etc")).unwrap();
     fs::write(
         root.path().join("etc/os-release"),
@@ -115,7 +110,7 @@ fn resolves_image_symlinks_without_reading_host_paths() {
     ] {
         symlink(target, &link).unwrap();
         assert_eq!(
-            configured().select(root.path(), &base).unwrap().to_string(),
+            selected(root.path(), "seed"),
             "seed-noble:validated",
             "{target}"
         );
@@ -124,10 +119,7 @@ fn resolves_image_symlinks_without_reading_host_paths() {
     // Directory symlinks also resolve relative to the image root.
     fs::remove_dir(root.path().join("etc")).unwrap();
     symlink("/usr/lib", root.path().join("etc")).unwrap();
-    assert_eq!(
-        configured().select(root.path(), &base).unwrap().to_string(),
-        "seed-noble:validated"
-    );
+    assert_eq!(selected(root.path(), "seed"), "seed-noble:validated");
     fs::remove_file(root.path().join("etc")).unwrap();
     fs::create_dir(root.path().join("etc")).unwrap();
     fs::remove_file(root.path().join("usr/lib/os-release")).unwrap();
@@ -151,10 +143,7 @@ fn resolves_image_symlinks_without_reading_host_paths() {
 #[test]
 fn rejects_invalid_config_and_oversized_identity_files() {
     for value in ["", "[]", r#"{"ubuntu":{"24.04":"../seed"}}"#] {
-        assert!(matches!(
-            GuestSeeds::parse(Some(value)),
-            Err(GuestSeedError::Configuration(_))
-        ));
+        serde_json::from_str::<GuestSeeds>(value).expect_err("invalid seed configuration");
     }
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("etc")).unwrap();
