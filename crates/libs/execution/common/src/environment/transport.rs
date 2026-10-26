@@ -49,24 +49,6 @@ impl EnvironmentDefinition {
         canonical_descriptor(self.legacy_descriptor.as_ref().unwrap_or(&self.descriptor))
     }
 
-    /// Serve old readers only when this identity has an exact old representation.
-    pub fn for_peer(
-        &self,
-        supported_schema: u32,
-    ) -> Result<proto::EnvironmentDefinition, EnvironmentDecodeError> {
-        if supported_schema >= RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION {
-            return Ok(self.into());
-        }
-        if self.schema_version() == ENVIRONMENT_SCHEMA_VERSION {
-            return Ok(self.into());
-        }
-        let legacy = self
-            .legacy_descriptor
-            .as_ref()
-            .ok_or(EnvironmentDecodeError::UnsupportedPeer)?;
-        Ok((&Self::new(legacy.clone())).into())
-    }
-
     pub(super) fn from_representation(
         descriptor: EnvironmentDescriptor,
         schema: u32,

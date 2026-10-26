@@ -99,7 +99,7 @@ fn runtime_neutral_golden_and_schema_boundary() {
         wire.schema_version = if wire.schema_version == 1 { 2 } else { 1 };
         assert!(matches!(
             EnvironmentDefinition::try_from(&wire),
-            Err(EnvironmentDecodeError::SchemaMismatch { .. })
+            Err(EnvironmentDecodeError::UnsupportedSchema(1))
         ));
     }
 }
@@ -150,7 +150,7 @@ fn boot_inputs_do_not_require_a_linux_guest_or_kernel() {
 }
 
 #[test]
-fn incomplete_or_mixed_portable_profiles_are_refused() {
+fn incomplete_portable_profiles_are_refused() {
     for mut spec in [
         super::super::tests::e0().descriptor().spec().clone(),
         portable_spec(RuntimeKind::CloudHypervisor),
@@ -206,24 +206,15 @@ fn incomplete_or_mixed_portable_profiles_are_refused() {
             .unwrap()
             .profile
             .as_mut()
-            .unwrap()
-        else {
-            panic!("portable fixture")
-        };
+            .unwrap();
         mutate(boot);
         EnvironmentDefinition::try_from(&wire).unwrap_err();
     }
     let mut wire = proto::EnvironmentDefinition::from(&definition);
-    wire.descriptor.as_mut().unwrap().compatibility =
-        proto::EnvironmentDefinition::from(&super::super::tests::e0())
-            .descriptor
-            .unwrap()
-            .compatibility;
+    wire.descriptor.as_mut().unwrap().compatibility = None;
     assert!(matches!(
         EnvironmentDefinition::try_from(&wire),
-        Err(EnvironmentDecodeError::Descriptor(
-            EnvironmentDescriptorError::MixedProfiles
-        ))
+        Err(EnvironmentDecodeError::Missing("compatibility"))
     ));
 }
 

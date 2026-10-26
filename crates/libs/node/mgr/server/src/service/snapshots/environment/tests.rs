@@ -1,10 +1,10 @@
 use super::*;
-use crate::proto::{CreateSnapshotRequest, EnvironmentSnapshotInput};
+use crate::snapshot_request::{FirecrackerCapture, SnapshotEnvironment};
 
 #[test]
 fn selected_snapshot_identity_rejects_conflicts_and_malformed_values() {
     let id = SandboxId::new();
-    let input = EnvironmentSnapshotInput {
+    let input = SnapshotEnvironment {
         sandbox_id: id.to_string(),
         reference: format!("sha256:{}", "01".repeat(32)),
     };
@@ -13,7 +13,7 @@ fn selected_snapshot_identity_rejects_conflicts_and_malformed_values() {
         (id.to_string(), Some(input.clone()), false),
         (
             String::new(),
-            Some(EnvironmentSnapshotInput {
+            Some(SnapshotEnvironment {
                 sandbox_id: "invalid".into(),
                 ..input.clone()
             }),
@@ -21,7 +21,7 @@ fn selected_snapshot_identity_rejects_conflicts_and_malformed_values() {
         ),
         (
             String::new(),
-            Some(EnvironmentSnapshotInput {
+            Some(SnapshotEnvironment {
                 reference: "invalid".into(),
                 ..input.clone()
             }),
@@ -29,7 +29,7 @@ fn selected_snapshot_identity_rejects_conflicts_and_malformed_values() {
         ),
         (id.to_string(), None, true),
     ] {
-        let mut request = CreateSnapshotRequest {
+        let mut request = FirecrackerCapture {
             sandbox_id: legacy,
             environment: selected,
             ..Default::default()
