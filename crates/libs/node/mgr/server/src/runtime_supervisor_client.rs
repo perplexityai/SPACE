@@ -7,7 +7,7 @@
 //! refusing connections provably never reached a server, so replaying it is
 //! safe for every supervisor RPC, idempotent or not. Statuses a server returned
 //! and mid-stream transport breaks are never replayed — those may have
-//! executed. (LaunchFirecracker/LaunchSidecar are additionally idempotent
+//! executed. (LaunchRuntime/LaunchSidecar are additionally idempotent
 //! through pidfile re-adoption, but the retry class must not be widened on
 //! that basis.)
 
@@ -318,42 +318,8 @@ impl RuntimeSupervisorLazyClient {
         }
     }
 
-    pub async fn launch_runtime(
-        &self,
-        request: proto::LaunchRuntimeRequest,
-    ) -> Result<tonic::Response<proto::LaunchRuntimeResponse>, Status> {
-        let result = self
-            .call_unary(
-                "launch_runtime",
-                request.clone(),
-                |mut client, request| async move { client.launch_runtime(request).await },
-            )
-            .await;
-        match result {
-            Err(status)
-                if status.code() == tonic::Code::Unimplemented
-                    && request.runtime
-                        == pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32 =>
-            {
-                let legacy = request.try_into().map_err(
-                    |error: pplx_space_node_runtime_core::runtime_launch::LaunchContractError| {
-                        pplx_space_node_runtime_core::launch_admission::admission_refusal(
-                            Status::failed_precondition(error.to_string()),
-                        )
-                    },
-                )?;
-                let response = self.launch_firecracker(legacy).await?.into_inner();
-                Ok(tonic::Response::new(proto::LaunchRuntimeResponse {
-                    pid: response.pid,
-                    accepted_environment_reference: response.accepted_environment_reference,
-                }))
-            }
-            result => result,
-        }
-    }
-
     runtime_supervisor_lazy_unary_methods! {
-        launch_firecracker, proto::LaunchFirecrackerRequest, proto::LaunchFirecrackerResponse;
+        launch_runtime, proto::LaunchRuntimeRequest, proto::LaunchRuntimeResponse;
         launch_sidecar, proto::LaunchSidecarRequest, proto::LaunchSidecarResponse;
         stop_sandbox_runtime, proto::StopSandboxRuntimeRequest, proto::StopSandboxRuntimeResponse;
         bind_execution, proto::BindExecutionRequest, proto::BindExecutionResponse;

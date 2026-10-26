@@ -107,7 +107,7 @@ pub(super) fn observed_sandbox_states(
                 continue;
             }
         };
-        let state = if info.firecracker_alive {
+        let state = if info.runtime_alive {
             ObservedSandboxState::VmAlive { node_status }
         } else if info.current_local_artifact_id.is_some() {
             ObservedSandboxState::DormantWithArtifact { node_status }

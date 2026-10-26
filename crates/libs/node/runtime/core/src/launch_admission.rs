@@ -47,5 +47,20 @@ pub fn runtime_operation_status(status: Status) -> Status {
     }
 }
 
+/// Classify malformed transport contracts before execution ownership or spawn.
+pub fn launch_contract_status(error: crate::runtime_launch::LaunchContractError) -> Status {
+    let status = match &error {
+        crate::runtime_launch::LaunchContractError::InvalidEnvironmentReference(_)
+        | crate::runtime_launch::LaunchContractError::Sandbox(_)
+        | crate::runtime_launch::LaunchContractError::Execution(_)
+        | crate::runtime_launch::LaunchContractError::Path { .. }
+        | crate::runtime_launch::LaunchContractError::NulPath(_) => {
+            Status::invalid_argument(error.to_string())
+        }
+        _ => Status::failed_precondition(error.to_string()),
+    };
+    admission_refusal(status)
+}
+
 #[cfg(test)]
 mod tests;

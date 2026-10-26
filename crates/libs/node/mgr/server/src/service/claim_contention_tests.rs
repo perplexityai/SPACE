@@ -303,12 +303,16 @@ fn waiting_work_rpcs() -> [Case; 9] {
             admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
-            rpc: "LoadSnapshot",
+            rpc: "RestoreVmState",
             call: |service, sandbox_id| {
                 Box::pin(async move {
                     service
-                        .load_snapshot(root(LoadSnapshotRequest {
+                        .restore_vm_state(root(crate::proto::RestoreVmStateRequest {
                             sandbox_id,
+                            artifacts: crate::snapshot_request::tests::artifacts(
+                                "/vmstate".into(),
+                                "/memory".into(),
+                            ),
                             ..Default::default()
                         }))
                         .await
@@ -318,12 +322,16 @@ fn waiting_work_rpcs() -> [Case; 9] {
             admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
-            rpc: "CreateSnapshot",
+            rpc: "CaptureVmState",
             call: |service, sandbox_id| {
                 Box::pin(async move {
                     service
-                        .create_snapshot(root(CreateSnapshotRequest {
+                        .capture_vm_state(root(crate::proto::CaptureVmStateRequest {
                             sandbox_id,
+                            artifacts: crate::snapshot_request::tests::artifacts(
+                                "/vmstate".into(),
+                                "/memory".into(),
+                            ),
                             ..Default::default()
                         }))
                         .await
@@ -575,7 +583,7 @@ async fn startup_rpcs_overlap_startup_work_and_proceed_once_cleanup_releases() {
     // for PrepareSandbox and LoadSnapshot.
     for case in waiting_work_rpcs()
         .into_iter()
-        .filter(|case| !matches!(case.rpc, "PrepareSandbox" | "LoadSnapshot"))
+        .filter(|case| !matches!(case.rpc, "PrepareSandbox" | "RestoreVmState"))
     {
         let service = service_for_unit_tests().await;
         let sandbox_id = SandboxId::new().to_string();
@@ -651,7 +659,7 @@ async fn in_flight_launch_or_snapshot_load_admits_concurrent_startup_rpcs() {
         admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
     };
     let prepare = case("PrepareSandbox");
-    let load = case("LoadSnapshot");
+    let load = case("RestoreVmState");
     let release = release();
 
     for (in_flight, family, overlapping) in [

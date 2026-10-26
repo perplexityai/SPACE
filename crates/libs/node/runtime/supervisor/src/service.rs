@@ -11,9 +11,9 @@ use pplx_space_node_runtime_core::launch;
 use pplx_space_node_runtime_core::launch_admission::runtime_operation_status;
 use pplx_space_node_runtime_core::proto::runtime_supervisor_server::RuntimeSupervisor;
 use pplx_space_node_runtime_core::proto::{
-    LaunchFirecrackerRequest, LaunchFirecrackerResponse, LaunchSidecarRequest,
-    LaunchSidecarResponse, StopProcessRequest, StopProcessResponse, StopSandboxRuntimeRequest,
-    StopSandboxRuntimeResponse, UpdateCgroupRequest, UpdateCgroupResponse,
+    LaunchRuntimeResponse, LaunchSidecarRequest, LaunchSidecarResponse, StopProcessRequest,
+    StopProcessResponse, StopSandboxRuntimeRequest, StopSandboxRuntimeResponse,
+    UpdateCgroupRequest, UpdateCgroupResponse,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -444,12 +444,8 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
     ) -> Result<Response<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse>, Status> {
         self.authorize_peer(&request, "LaunchRuntime")?;
         let caller = Some(execution::pin_caller(&request)?);
-        let request =
-            LaunchFirecrackerRequest::try_from(request.into_inner()).map_err(|error| {
-                pplx_space_node_runtime_core::launch_admission::admission_refusal(
-                    Status::failed_precondition(error.to_string()),
-                )
-            })?;
+        let request = FirecrackerLaunch::try_from(request.into_inner())
+            .map_err(pplx_space_node_runtime_core::launch_admission::launch_contract_status)?;
         let service = self.clone();
         self.run_owned_operation(async move {
             let response = service
@@ -465,20 +461,6 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
         })
         .await
         .map_err(runtime_operation_status)
-    }
-
-    async fn launch_firecracker(
-        &self,
-        request: Request<LaunchFirecrackerRequest>,
-    ) -> Result<Response<LaunchFirecrackerResponse>, Status> {
-        self.authorize_peer(&request, "LaunchFirecracker")?;
-        let caller = Some(execution::pin_caller(&request)?);
-        let request = request.into_inner();
-        let service = self.clone();
-        self.run_owned_operation(
-            async move { service.launch_firecracker_owned(request, caller).await },
-        )
-        .await
     }
 
     async fn launch_sidecar(
@@ -650,9 +632,9 @@ impl RuntimeSupervisorService {
 
     async fn launch_firecracker_owned(
         &self,
-        req: LaunchFirecrackerRequest,
+        req: FirecrackerLaunch,
         caller: Option<launch::ProcessHandle>,
-    ) -> Result<Response<LaunchFirecrackerResponse>, Status> {
+    ) -> Result<Response<LaunchRuntimeResponse>, Status> {
         self.launch_firecracker_with(req, caller, |id, root| async move {
             self.adopt_firecracker(id, &root).await
         })
@@ -661,20 +643,19 @@ impl RuntimeSupervisorService {
 
     async fn launch_firecracker_with<F>(
         &self,
-        mut req: LaunchFirecrackerRequest,
+        req: FirecrackerLaunch,
         caller: Option<launch::ProcessHandle>,
         adopt: impl FnOnce(SandboxId, String) -> F,
-    ) -> Result<Response<LaunchFirecrackerResponse>, Status>
+    ) -> Result<Response<LaunchRuntimeResponse>, Status>
     where
         F: std::future::Future<Output = Result<Option<u32>, Status>>,
     {
-        let environment = crate::verified_launch::decode_environment_reference(&mut req)
-            .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
+        let environment = req.environment_reference;
         let accepted_environment_reference = environment
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        let sandbox_id = parse_sandbox_id(&req.sandbox_id)?;
+        let sandbox_id = req.sandbox_id;
         let launch_key = (sandbox_id, FIRECRACKER_LAUNCH_LOCK.to_string());
         let launch_lock = self.launch_lock(launch_key.clone());
         let launch_guard = await_runtime_lock(launch_lock.lock()).await?;
@@ -682,7 +663,7 @@ impl RuntimeSupervisorService {
         let runtime_guard = await_runtime_lock(runtime_lock.read()).await?;
         execution::check_caller(caller.as_ref())?;
         let execution = self
-            .check_execution(sandbox_id, &req.execution_id, None, false)
+            .check_parsed_execution(sandbox_id, req.execution_id, None, false)
             .await?;
         let result = async {
             let sandbox_id = launch_key.0;
@@ -690,8 +671,8 @@ impl RuntimeSupervisorService {
                 cgroup::validate_cgroup_update(limits.vcpu_count, limits.memory_mib, limits.pids_max)
                     .map_err(cgroup_update_error_to_status)?;
             }
-            if let Some(pid) = adopt(sandbox_id, req.chroot_base_dir.clone()).await? {
-                return Ok(Response::new(LaunchFirecrackerResponse {
+            if let Some(pid) = adopt(sandbox_id, req.chroot_base_dir.as_str().to_owned()).await? {
+                return Ok(Response::new(LaunchRuntimeResponse {
                     pid,
                     accepted_environment_reference: accepted_environment_reference.clone(),
                 }));
@@ -725,16 +706,16 @@ impl RuntimeSupervisorService {
                 let _blocking_slot = blocking_slot;
                 launch::launch_via_jailer(launch::JailerLaunch {
                     sandbox_id: &launch_sandbox_id.to_string(),
-                    jailer: opened.as_ref().map_or(launch::JailerExecutable::LegacyPath(&req.jailer_bin), |files| launch::JailerExecutable::Sealed(&files.jailer)),
+                    jailer: opened.as_ref().map_or(launch::JailerExecutable::LegacyPath(req.jailer_bin.as_str()), |files| launch::JailerExecutable::Sealed(&files.jailer)),
                     firecracker_bin: opened.as_ref().map_or(req.firecracker_bin.as_str(), |files| files.firecracker_path.as_str()),
-                    chroot_base_dir: &req.chroot_base_dir,
-                    ns_path: &req.ns_path,
+                    chroot_base_dir: req.chroot_base_dir.as_str(),
+                    ns_path: req.ns_path.as_str(),
                     uid: req.uid,
                     gid: req.gid,
-                    fc_config_path: &req.fc_config_path,
-                    fc_log_path: &req.fc_log_path,
-                    fc_metrics_path: &req.fc_metrics_path,
-                    fc_console_path: &req.fc_console_path,
+                    fc_config_path: req.fc_config_path.as_ref().map_or("", |path| path.as_str()),
+                    fc_log_path: req.fc_log_path.as_ref().map_or("", |path| path.as_str()),
+                    fc_metrics_path: req.fc_metrics_path.as_ref().map_or("", |path| path.as_str()),
+                    fc_console_path: req.fc_console_path.as_ref().map_or("", |path| path.as_str()),
                     cgroup_limits: &cgroup_limits,
                 })
             })
@@ -777,7 +758,7 @@ impl RuntimeSupervisorService {
                 "runtime supervisor launched firecracker"
             );
 
-            Ok(Response::new(LaunchFirecrackerResponse {
+            Ok(Response::new(LaunchRuntimeResponse {
                 pid,
                 accepted_environment_reference: accepted_environment_reference.clone(),
             }))
@@ -1192,3 +1173,5 @@ fn require_sidecar_identity(pid: u32, program: &str, uid: u32, gid: u32) -> Resu
         )),
     }
 }
+
+use pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch;

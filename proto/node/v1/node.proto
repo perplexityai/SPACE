@@ -56,7 +56,7 @@ service NodeManager {
   rpc StopProcess(StopProcessRequest) returns (StopProcessResponse);
 
   // Launch a sandbox using the specified runtime.
-  // fc: Firecracker via jailer (chroot, PID ns, mount ns, cgroup, privilege drop).
+  // The selected adapter owns isolation, boot preparation and process launch.
   // Caller must have already called Allocate (for network) and PrepareSandbox (for filesystem).
   rpc LaunchSandbox(LaunchSandboxRequest) returns (LaunchSandboxResponse);
 
@@ -116,14 +116,6 @@ service NodeManager {
   rpc GetVmState(GetVmStateRequest) returns (GetVmStateResponse);
   rpc CaptureVmState(CaptureVmStateRequest) returns (CaptureVmStateResponse);
   rpc RestoreVmState(RestoreVmStateRequest) returns (RestoreVmStateResponse);
-  // Read the Firecracker VM state without granting the caller access to the
-  // privileged Firecracker API socket.
-  rpc GetFirecrackerVmState(GetFirecrackerVmStateRequest)
-      returns (GetFirecrackerVmStateResponse);
-  // Create a full snapshot. VM must be paused first.
-  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
-  // Load a snapshot into a fresh Firecracker instance.
-  rpc LoadSnapshot(LoadSnapshotRequest) returns (LoadSnapshotResponse);
 
   // Create a read-only btrfs snapshot of a sandbox's instance subvolume.
   rpc CreateBtrfsSnapshot(CreateBtrfsSnapshotRequest) returns (CreateBtrfsSnapshotResponse);
@@ -200,7 +192,7 @@ service NodeManager {
   // calling service never passes arbitrary host paths to nodemgr.
 
   // Create the canonical template digest dir as a btrfs subvolume at
-  // /space/cache/firecracker/templates/<name>/<content_hash>. Returned
+  // the node-owned template root. Returned
   // RW so callers can write files into it before finalizing. Errors:
   // `AlreadyExists` if the path is already populated; `Internal` if
   // the `btrfs subvolume create` ioctl fails for any other reason.
@@ -311,7 +303,7 @@ service NodeManager {
   // `<cache>/<sandbox_id>/instance/rootfs.ext4`, with the COW at
   // `<cache>/<sandbox_id>/instance/cow.luks`. Format-vs-open is decided
   // from on-disk state (whether the COW is already a LUKS container).
-  // The returned `mapper_path` is the rootfs drive's Firecracker
+  // The returned `mapper_path` is the runtime adapter's rootfs
   // `path_on_host`. Idempotent on the sandbox. Teardown has no RPC: the
   // device stack is released by node-manager's own sandbox cleanup.
   rpc PrepareEncryptedRootfs(PrepareEncryptedRootfsRequest)
@@ -360,13 +352,11 @@ message GetExecutionInventoryRequest {}
 
 message ResolveExecutionEnvironmentRequest {
   // Highest definition schema understood, including its identity encoding.
-  // Zero requests the legacy representation. This changes encoding, never selection.
+  // Values below 2 are unsupported. This changes encoding, never selection.
   uint32 definition_schema_version = 5;
   // Omission requests the configured default. A supplied reference must match an
   // approved environment exactly; it never changes the node default.
   optional string reference = 1;
-  reserved 2;
-  reserved "template_build";
   // Mutually exclusive with reference. This read-only request selects a complete
   // binding; callers persist it and use exact admission for all effectful calls.
   // An old peer ignores this oneof. Require the matching response acknowledgement
@@ -379,8 +369,6 @@ message ResolveExecutionEnvironmentRequest {
 
 enum ExecutionEnvironmentSelection {
   EXECUTION_ENVIRONMENT_SELECTION_UNSPECIFIED = 0;
-  reserved 1;
-  reserved "EXECUTION_ENVIRONMENT_SELECTION_TEMPLATE_BUILD";
   EXECUTION_ENVIRONMENT_SELECTION_COLD_BOOT = 2;
   EXECUTION_ENVIRONMENT_SELECTION_RESTORE = 3;
 }
@@ -676,8 +664,8 @@ message PrepareSandboxRequest {
 }
 
 message PrepareSandboxResponse {
-  string cache_dir = 1;          // /space/cache/firecracker/sandboxes/{id}/instance
-  string run_dir = 2;            // /space/run/firecracker/sandboxes/{id}
+  string cache_dir = 1;          // node-owned sandbox instance directory
+  string run_dir = 2;            // node-owned sandbox runtime directory
   string rootfs_path = 3;        // full path to CoW rootfs
   string config_path = 4;        // full path to vm-config.json
   string log_path = 5;           // full path to the adapter log
@@ -726,7 +714,7 @@ message CleanupSandboxRequest {
   // release. Node-manager continues retained-cache neutralization and slot
   // recycling asynchronously; the old slot is not reusable until that finishes.
   bool return_after_slot_release = 5;
-  // If true, skip the Firecracker SIGTERM grace period and send SIGKILL
+  // If true, skip the runtime termination grace period and send SIGKILL
   // immediately. Used after suspend snapshots are durable, where graceful guest
   // shutdown is not part of the lifecycle contract.
   bool immediate_kill = 6;
@@ -798,7 +786,7 @@ message InspectSandboxResponse {
   bool rootfs_exists = 48;          // cache_dir/instance/rootfs.ext4
   bool runtime_pid_link_exists = 49;  // run_dir/fc.pid -> /proc/{pid}
   bool spaced_host_pid_symlink_exists = 55; // run_dir/space-spaced-host-svc.pid
-  bool runtime_pidfile_exists = 56;     // jail_root/firecracker.pid
+  bool runtime_pidfile_exists = 56;     // adapter-owned pidfile
   bool netgtw_pid_symlink_exists = 57;      // run_dir/space-netgtw-svc.pid
   bool nft_ns_redirect_exists = 58;         // nftables REDIRECT on tap0 in namespace
   bool nft_ns_forward_drop_exists = 59;     // nftables forward DROP on tap0 in namespace
@@ -866,7 +854,7 @@ message ListOrphanCandidatesResponse {
   repeated string orphaned_run_dirs = 3;
   repeated string orphaned_cache_dirs = 4;
   repeated string orphaned_nft_rules = 5; // Root network namespace only.
-  repeated string orphaned_processes = 6; // "PID:sandbox_id" for untracked firecracker/jailer processes
+  repeated string orphaned_processes = 6; // "PID:sandbox_id" for untracked runtime processes
   string next_page_token = 7;
   // True only on the last page of a scan with no missing/error evidence.
   // This is a live walk, NOT an atomic snapshot or permission to delete.
@@ -894,64 +882,6 @@ message ResumeSandboxRequest {
   ExecutionFence execution_fence = 2;
 }
 message ResumeSandboxResponse {}
-
-message GetFirecrackerVmStateRequest {
-  string sandbox_id = 1;
-}
-
-enum FirecrackerVmState {
-  FIRECRACKER_VM_STATE_UNSPECIFIED = 0;
-  FIRECRACKER_VM_STATE_NOT_STARTED = 1;
-  FIRECRACKER_VM_STATE_RUNNING = 2;
-  FIRECRACKER_VM_STATE_PAUSED = 3;
-}
-
-message GetFirecrackerVmStateResponse {
-  FirecrackerVmState state = 1;
-}
-
-message CreateSnapshotRequest {
-  string sandbox_id = 1;
-  string snapshot_path = 2;  // chroot-relative path for vmstate
-  string mem_file_path = 3;  // chroot-relative path for memory
-  optional string dest_dir = 4; // host-absolute dir to copy snapshot files to after creation
-  // BYOK encrypted snapshot: host-absolute mount point of an already-mounted
-  // encrypted btrfs(compress-force=zstd)-over-dm-crypt volume. When set, the
-  // jailed Firecracker writes vmstate+memory directly into this volume (bind-
-  // mounted into the jail), so they land compressed+encrypted from t0 — no
-  // plaintext copy and `dest_dir` is ignored.
-  optional string snapshot_volume_mount_dir = 5;
-  ExecutionFence execution_fence = 6;
-  // Bound non-default captures leave sandbox_id empty. Older nodes must reject
-  // the missing legacy identity before capture, including encrypted teardown.
-  EnvironmentSnapshotInput environment = 7;
-}
-message CreateSnapshotResponse {}
-
-message EnvironmentSnapshotInput {
-  string sandbox_id = 1;
-  string reference = 2;
-}
-
-message LoadSnapshotRequest {
-  string sandbox_id = 1;
-  string snapshot_path = 2;  // chroot-relative path for vmstate
-  string mem_file_path = 3;  // chroot-relative path for memory
-  optional string source_dir = 4; // host-absolute dir to copy snapshot files from into jail
-  // BYOK encrypted snapshot: host-absolute mount point of the already-mounted,
-  // decrypted encrypted snapshot volume holding vmstate+memory. When set, FC
-  // loads directly from this volume (bind-mounted into the jail) and
-  // `source_dir` is ignored.
-  optional string snapshot_volume_mount_dir = 7;
-  ExecutionFence execution_fence = 8;
-  // The sandbox's rootfs rate limit. A snapshot carries the drive limiter of
-  // the VM it was taken from, which can be a template or pool VM with other
-  // limits, so node-manager applies this after loading and before the VM
-  // resumes, and fails the load if it cannot. Unset keeps the snapshot's
-  // limiter, as for a builder VM, which has none.
-  optional DriveRateLimit rootfs_rate_limit = 9;
-}
-message LoadSnapshotResponse {}
 
 // Runtime-neutral disk I/O token buckets; adapters reject unsupported limits.
 message DriveRateLimit {
@@ -1231,7 +1161,7 @@ message PrepareEncryptedRootfsRequest {
 }
 
 message PrepareEncryptedRootfsResponse {
-  // /dev/mapper/<composite> for Firecracker path_on_host.
+  // /dev/mapper/<composite> for the runtime root disk.
   string mapper_path = 1;
 }
 
@@ -1241,7 +1171,7 @@ message PrepareSnapshotRootfsRequest {
 }
 
 message PrepareSnapshotRootfsResponse {
-  // /dev/mapper/<composite> for Firecracker path_on_host — the same shape
+  // /dev/mapper/<composite> for the runtime root disk — the same shape
   // PrepareEncryptedRootfs returns, so the caller's boot path is identical.
   string mapper_path = 1;
 }

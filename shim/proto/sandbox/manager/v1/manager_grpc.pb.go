@@ -235,7 +235,7 @@ type SandboxManagerClient interface {
 	// Notify sbx-manager that a template's network policy changed on this node.
 	TemplateNetworkPolicyUpdated(ctx context.Context, in *TemplateNetworkPolicyUpdatedRequest, opts ...grpc.CallOption) (*TemplateNetworkPolicyUpdatedResponse, error)
 	// Deliberately cycle (kill + relaunch in place) one sandbox's net-gateway
-	// sidecar while the Firecracker VM keeps running. Gateways keep their
+	// sidecar while the VM keeps running. Gateways keep their
 	// launch-time binary until cycled, so this is the operator path for
 	// retiring gateways left running a pre-deploy binary. Synchronous and
 	// single-sandbox; batching, rate-limiting, and dry-run live in the caller
@@ -1312,7 +1312,7 @@ type SandboxManagerServer interface {
 	// Notify sbx-manager that a template's network policy changed on this node.
 	TemplateNetworkPolicyUpdated(context.Context, *TemplateNetworkPolicyUpdatedRequest) (*TemplateNetworkPolicyUpdatedResponse, error)
 	// Deliberately cycle (kill + relaunch in place) one sandbox's net-gateway
-	// sidecar while the Firecracker VM keeps running. Gateways keep their
+	// sidecar while the VM keeps running. Gateways keep their
 	// launch-time binary until cycled, so this is the operator path for
 	// retiring gateways left running a pre-deploy binary. Synchronous and
 	// single-sandbox; batching, rate-limiting, and dry-run live in the caller

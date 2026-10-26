@@ -30,7 +30,7 @@ fn require_path(actual: &str, expected: PathBuf) -> Result<(), Status> {
     Ok(())
 }
 
-pub(super) fn canonical_sandbox_id(raw: &str) -> Result<SandboxId, Status> {
+pub(crate) fn canonical_sandbox_id(raw: &str) -> Result<SandboxId, Status> {
     let id: SandboxId = raw.parse().map_err(path_error)?;
     if raw != id.to_string() {
         return Err(Status::invalid_argument(
