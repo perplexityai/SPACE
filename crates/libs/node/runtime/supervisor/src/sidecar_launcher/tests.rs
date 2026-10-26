@@ -88,3 +88,31 @@ async fn close_before_prepare_is_not_success() {
         .expect_err("silent launcher exit must fail closed");
     assert!(error.contains("read sidecar launcher outcome"));
 }
+
+#[tokio::test]
+async fn contained_launch_requires_actual_runtime_identity_and_confirmed_exec() {
+    let mut prefix = vec![RUNTIME_PID_TAG];
+    prefix.extend_from_slice(&42_u32.to_be_bytes());
+    let mut success = prefix.clone();
+    success.push(PREPARED_TAG);
+    let mut failed_exec = success.clone();
+    failed_exec.extend(encoded_error("exec refused"));
+    for (bytes, expected) in [
+        (success, Some(42)),
+        (prefix, None),
+        (failed_exec, None),
+        (vec![PREPARED_TAG], None),
+        (encoded_error("namespace setup refused"), None),
+        (vec![RUNTIME_PID_TAG, 0, 0, 0, 1, PREPARED_TAG], None),
+    ] {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(&bytes).await.unwrap();
+        drop(writer);
+        match expected {
+            Some(pid) => assert_eq!(read_contained_outcome(&mut reader).await.unwrap(), pid),
+            None => {
+                read_contained_outcome(&mut reader).await.unwrap_err();
+            }
+        }
+    }
+}
