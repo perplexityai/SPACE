@@ -1801,3 +1801,5 @@ fn valid_domain_label(label: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+pub mod slot_dhcp;

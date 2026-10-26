@@ -176,7 +176,7 @@ pub(super) struct RuntimeActivatedEvent<'a> {
     pub(super) sandbox_id: &'a str,
     pub(super) boot_type: &'static str,
     pub(super) pid: u32,
-    pub(super) spaced_host_pid: u32,
+    pub(super) spaced_host_pid: Option<u32>,
     pub(super) net_gateway_pid: u32,
     pub(super) sandbox_uid: u32,
     pub(super) network_slot: u32,
@@ -223,7 +223,6 @@ pub(super) fn emit_runtime_activated_event(event: RuntimeActivatedEvent<'_>) {
         .boot_type(event.boot_type)
         .restore_provenance(restore_provenance)
         .pid(event.pid.to_string())
-        .spaced_host_pid(event.spaced_host_pid.to_string())
         .net_gateway_pid(event.net_gateway_pid.to_string())
         .sandbox_uid(event.sandbox_uid.to_string())
         .network_slot(event.network_slot.to_string())
@@ -241,6 +240,9 @@ pub(super) fn emit_runtime_activated_event(event: RuntimeActivatedEvent<'_>) {
             pplx_space_events::SandboxEventBoolField::VolumeEncryption,
             event.volume_encryption,
         );
+    if let Some(pid) = event.spaced_host_pid {
+        details = details.spaced_host_pid(pid.to_string());
+    }
     if let Some(vcpu) = event.vcpu {
         details = details.vcpu(vcpu.to_string());
     }
@@ -593,7 +595,7 @@ fn checkpoint_start_response_for_live_runtime(
     if existing.uid.is_none()
         || existing.slot.is_none()
         || existing.guest_cid.is_none()
-        || existing.spaced_host_pid.is_none()
+        || (existing.guest_image.expects_agent() && existing.spaced_host_pid.is_none())
         || existing.netgtw_pid.is_none()
         || existing.api_socket_path.is_none()
     {
@@ -970,15 +972,26 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
             .unwrap_or("<unhashed>"),
         &resolved_template.arch,
     )?;
-    reject_incompatible_template_spaced_compatibility(
-        &sandbox.template,
-        resolved_template
-            .content_hash
-            .as_deref()
-            .unwrap_or("<unhashed>"),
-        resolved_template.spaced_version.as_deref(),
-        resolved_template.spaced_compatibility_family.as_deref(),
-    )?;
+    let image_path = std::path::PathBuf::from(&resolved_template.template_dir);
+    let image = tokio::task::spawn_blocking(move || super::guest_image::read_contract(&image_path))
+        .await
+        .map_err(|error| Status::internal(format!("read guest image task: {error}")))??;
+    if image != sandbox.guest_image {
+        return Err(Status::failed_precondition(
+            "template guest contract differs from persisted sandbox",
+        ));
+    }
+    if sandbox.guest_image.expects_agent() {
+        reject_incompatible_template_spaced_compatibility(
+            &sandbox.template,
+            resolved_template
+                .content_hash
+                .as_deref()
+                .unwrap_or("<unhashed>"),
+            resolved_template.spaced_version.as_deref(),
+            resolved_template.spaced_compatibility_family.as_deref(),
+        )?;
+    }
 
     Ok(SandboxPrepareSource {
         template: Some(sandbox.template.clone()),

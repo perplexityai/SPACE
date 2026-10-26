@@ -37,6 +37,7 @@ mod boot_artifact;
 pub use boot_artifact::{BOOT_ARTIFACT_IMAGE, BootArtifactPinError, PinnedBootArtifact};
 mod environment;
 pub(crate) mod gpu_boot;
+mod uefi;
 mod verity;
 pub use environment::{
     CompiledEnvironment, CompiledEnvironmentDefinitionError, ResolveEnvironmentError,
@@ -699,6 +700,7 @@ impl RuntimeCatalog {
             });
         }
         catalog.boot_artifacts.push(gpu_boot::initramfs()?);
+        catalog.boot_artifacts.push(uefi::firmware()?);
         Ok(catalog)
     }
 
