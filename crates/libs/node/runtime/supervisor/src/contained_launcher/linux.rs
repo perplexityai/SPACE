@@ -41,6 +41,8 @@ enum Error {
     },
     #[error("authenticate executable: {0}")]
     Authentication(tonic::Status),
+    #[error("inspect assigned VFIO devices: {0}")]
+    Vfio(#[from] pplx_space_node_runtime_core::vfio::VfioError),
 }
 fn io(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     move |source| Error::Io { operation, source }
@@ -93,6 +95,26 @@ fn prepare_and_exec(config: &Config, stream: &mut UnixStream) -> Result<(), Erro
         config.executable_source,
     )
     .map_err(Error::Authentication)?;
+    let vfio = config
+        .devices
+        .as_ref()
+        .map(|devices| {
+            if devices.locked_memory_bytes == 0 {
+                return Err(Error::Invalid(
+                    "VFIO requires a reserved locked-memory budget",
+                ));
+            }
+            let architecture = pplx_space_node_runtime_core::runtime_inventory::host_arch()
+                .map_err(|_| Error::Invalid("unsupported device host architecture"))?;
+            let catalog = pplx_space_node_runtime_core::catalog::CompiledEnvironment::cached_for_architecture(architecture)
+                .map_err(|_| Error::Invalid("invalid compiled device catalog"))?;
+            let environment = catalog.iter().find(|entry| entry.definition().reference() == devices.environment)
+                .ok_or(Error::Invalid("unknown device environment"))?;
+            let pinned = pplx_space_node_runtime_core::vfio::PinnedVfio::inspect(&devices.execution)?;
+            pinned.check_profile_assignments(&devices.execution, environment.exclusive_device_profiles())?;
+            Ok(pinned)
+        })
+        .transpose()?;
     let network = File::options()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -139,11 +161,28 @@ fn prepare_and_exec(config: &Config, stream: &mut UnixStream) -> Result<(), Erro
     }
     drop(root);
     let root = contained_root;
+    if let Some(vfio) = &vfio {
+        project_vfio_sysfs(&root, vfio)?;
+    }
     nix::unistd::fchdir(&root).map_err(sys("enter pinned isolation root"))?;
     nix::unistd::chroot(".").map_err(sys("confine filesystem"))?;
     nix::unistd::chdir("/").map_err(sys("enter contained root"))?;
     drop(root);
     prepare_devices(config.uid, config.gid)?;
+    if let Some(vfio) = vfio {
+        prepare_vfio_nodes(&vfio, config.uid, config.gid)?;
+        // Drop all host path descriptors before fork/privilege drop. Only the
+        // read-only device projection and selected character nodes remain.
+        drop(vfio);
+    }
+    if let Some(devices) = &config.devices {
+        nix::sys::resource::setrlimit(
+            nix::sys::resource::Resource::RLIMIT_MEMLOCK,
+            devices.locked_memory_bytes,
+            devices.locked_memory_bytes,
+        )
+        .map_err(sys("set reserved VFIO memory-lock budget"))?;
+    }
     // Pin the runner before fork. PID 1 in the child namespace cannot see its
     // outside parent with getppid(), so a pidfd closes the PDEATHSIG setup race.
     // SAFETY: pidfd_open takes only scalar arguments and returns an owned fd.
@@ -251,6 +290,103 @@ fn prepare_and_exec(config: &Config, stream: &mut UnixStream) -> Result<(), Erro
         .write_all(&[crate::sidecar_launcher::PREPARED_TAG])
         .map_err(io("report contained launch ready"))?;
     exec(executable, &config.arguments)
+}
+
+/// Project only assigned PCI directories. No host sysfs root or parent bridge
+/// is exposed. Fresh directories reject stale symlinks in the isolation root.
+fn project_vfio_sysfs(
+    root: &File,
+    vfio: &pplx_space_node_runtime_core::vfio::PinnedVfio,
+) -> Result<(), Error> {
+    use nix::mount::{MsFlags, mount};
+    let base = std::path::PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+    for directory in [
+        "sys",
+        "sys/bus",
+        "sys/bus/pci",
+        "sys/bus/pci/devices",
+        "sys/kernel",
+        "sys/kernel/iommu_groups",
+    ] {
+        std::fs::create_dir(base.join(directory))
+            .map_err(io("create private VFIO sysfs directory"))?;
+    }
+    let mut groups = std::collections::BTreeSet::new();
+    for device in vfio.devices() {
+        if groups.insert(device.group()) {
+            std::fs::create_dir(base.join(format!("sys/kernel/iommu_groups/{}", device.group())))
+                .map_err(io("create private IOMMU group directory"))?;
+        }
+        let destination = base.join(format!("sys/bus/pci/devices/{}", device.address()));
+        std::fs::create_dir(&destination).map_err(io("create assigned PCI mountpoint"))?;
+        // Bind sources, like the isolation root, must belong to this mount
+        // namespace. The earlier descriptor pins identity in the host tree.
+        let path = std::fs::canonicalize(device.address().sysfs_path())
+            .map_err(io("resolve assigned PCI sysfs in mount namespace"))?;
+        let source_directory = File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(io("open assigned PCI sysfs in mount namespace"))?;
+        let original = device
+            .directory()
+            .metadata()
+            .map_err(io("inspect pinned PCI sysfs"))?;
+        let current = source_directory
+            .metadata()
+            .map_err(io("inspect namespace PCI sysfs"))?;
+        if (original.dev(), original.ino()) != (current.dev(), current.ino()) {
+            return Err(Error::Invalid(
+                "assigned PCI sysfs changed during namespace setup",
+            ));
+        }
+        let source = format!("/proc/self/fd/{}", source_directory.as_raw_fd());
+        mount(
+            Some(source.as_str()),
+            &destination,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(sys("project assigned PCI sysfs"))?;
+        mount(
+            None::<&str>,
+            &destination,
+            None::<&str>,
+            MsFlags::MS_BIND
+                | MsFlags::MS_REMOUNT
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NODEV
+                | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        )
+        .map_err(sys("protect assigned PCI sysfs"))?;
+    }
+    Ok(())
+}
+
+fn prepare_vfio_nodes(
+    vfio: &pplx_space_node_runtime_core::vfio::PinnedVfio,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Error> {
+    std::fs::create_dir("/dev/vfio").map_err(io("create private VFIO device directory"))?;
+    for (path, source) in vfio.nodes() {
+        let metadata = source
+            .metadata()
+            .map_err(io("inspect pinned VFIO character node"))?;
+        mknod(
+            path,
+            SFlag::S_IFCHR,
+            Mode::from_bits_truncate(0o600),
+            metadata.rdev(),
+        )
+        .map_err(sys("create assigned VFIO character node"))?;
+        nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .map_err(sys("assign private VFIO character node"))?;
+    }
+    Ok(())
 }
 
 fn drop_privileges(uid: u32, gid: u32) -> Result<(), Error> {

@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use crate::memory_admission::ActiveLeaseMemoryReservation;
+use crate::memory_admission::{ActiveLeaseMemoryReservation, MemoryReservationMode};
 use crate::net::{self, NetId, SlotInfo};
 pub use crate::node_state_sync::{NodeCtlNodeStatusDirtySink, NodeStatusDirtySink};
 
@@ -284,6 +284,8 @@ impl fmt::Display for LeaseKind {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SlotStoreError {
+    #[error(transparent)]
+    Devices(#[from] devices::DeviceStoreError),
     #[error("network slot database lock poisoned")]
     LockPoisoned,
     #[error("network lease setup or recovery for {0} is incomplete; retry allocation")]
@@ -305,6 +307,8 @@ pub enum SlotStoreError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolOpenError {
+    #[error("cannot recover exclusive device ownership: {0}")]
+    Devices(#[from] devices::DeviceStoreError),
     #[error("network pool startup was cancelled")]
     StartupCancelled,
     #[error("network pool startup task failed: {0}")]
@@ -496,6 +500,8 @@ pub struct NewLeaseMemoryReservation {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ActiveLeaseMemoryReservationError {
+    #[error("cannot observe device memory ownership: {0}")]
+    Devices(#[from] devices::DeviceStoreError),
     #[error("active lease memory reservation database lock is poisoned")]
     LockPoisoned,
     #[error("failed to query active lease memory reservations: {0}")]
@@ -754,6 +760,7 @@ impl NetworkPool {
             validation_transient_failures: DashMap::new(),
             node_status_dirty,
         });
+        pool.recover_device_boot()?;
         pool.enqueue_pending_resets()?;
         spawn_worker(pool.clone(), job_rx);
         pool.nudge_topup();
@@ -1554,6 +1561,8 @@ impl NetworkPool {
                 .lock()
                 .map_err(|error| format!("slot pool db lock poisoned: {error}"))?;
             let tx = conn.transaction().map_err(|e| e.to_string())?;
+            devices::admission::ensure_no_holders(&tx, sandbox_id)
+                .map_err(|error| error.to_string())?;
             let Some(record) =
                 query_current_lease_by_sandbox(&tx, sandbox_id).map_err(|e| e.to_string())?
             else {
@@ -1649,11 +1658,19 @@ impl NetworkPool {
                             sandbox_id: parsed_sandbox_id,
                         },
                     )?;
+                    let mode = match devices::admission::ensure_no_holders(&conn, &sandbox_id) {
+                        Ok(()) => MemoryReservationMode::Elastic,
+                        Err(devices::DeviceStoreError::OutstandingAllocations) => {
+                            MemoryReservationMode::FullyReserved
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     Ok(ActiveLeaseMemoryReservation {
                         slot_id,
                         sandbox_id: parsed_sandbox_id,
                         generation,
                         memory_reservation_mib,
+                        mode,
                     })
                 },
             )
@@ -2015,6 +2032,7 @@ fn retire_stale_pod_namespace_lease(
 #[cfg(test)]
 mod claim_contention_tests;
 mod db;
+pub mod devices;
 mod execution;
 mod liveness;
 #[cfg(test)]

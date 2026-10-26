@@ -369,6 +369,13 @@ impl SandboxManagerService {
         };
         let sandbox = self.lookup_sandbox(&id)?;
 
+        // This stream's import header cannot preserve device requirements.
+        if sandbox.device_requirements.is_some() {
+            return Err(Status::failed_precondition(
+                "device-bearing sandboxes require a device-aware transfer contract",
+            ));
+        }
+
         // Reject export of a running sandbox — rootfs is being mutated
         if !matches!(
             sandbox.state,
@@ -667,6 +674,7 @@ impl SandboxManagerService {
             &db,
             crate::db::transfer::ImportReservation {
                 params: crate::db::InsertSandboxParams {
+                    device_requirements: None,
                     id: sandbox_id,
                     uuid8: &uuid8,
                     state: SandboxState::Creating,

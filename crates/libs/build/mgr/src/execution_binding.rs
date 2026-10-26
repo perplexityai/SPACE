@@ -253,9 +253,10 @@ impl BuildExecutionBinding {
         else {
             return Err(BuildExecutionBindingError::ScratchProfile);
         };
-        let [boot] = artifacts.as_slice() else {
-            return Err(BuildExecutionBindingError::ScratchProfile);
-        };
+        let boot = artifacts
+            .iter()
+            .find(|artifact| artifact.role().as_str() == "boot")
+            .ok_or(BuildExecutionBindingError::ScratchProfile)?;
         let ExecutionCompatibilityProfile::RuntimeV1 {
             contract: machine,
             state_format,
@@ -263,30 +264,48 @@ impl BuildExecutionBinding {
         else {
             return Err(BuildExecutionBindingError::ScratchProfile);
         };
-        let (expected_boot, expected_machine, expected_format) = match self.execution.runtime().kind
-        {
-            pplx_space_common_core::types::RuntimeKind::Firecracker => (
-                FIRECRACKER_BOOT_CONTRACT,
-                FIRECRACKER_MACHINE_CONTRACT,
-                "vmlinux",
-            ),
-            pplx_space_common_core::types::RuntimeKind::CloudHypervisor => (
-                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_BOOT_CONTRACT,
-                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_MACHINE_CONTRACT,
-                match self.execution.guest().architecture {
-                    pplx_space_common_core::types::Arch::Aarch64 => "linux-image",
-                    pplx_space_common_core::types::Arch::X86_64 => "vmlinux",
-                },
-            ),
-            _ => return Err(BuildExecutionBindingError::ScratchProfile),
-        };
+        let (expected_boot, expected_machine, kernel_formats): (_, _, &[&str]) =
+            match self.execution.runtime().kind {
+                pplx_space_common_core::types::RuntimeKind::Firecracker => (
+                    FIRECRACKER_BOOT_CONTRACT,
+                    FIRECRACKER_MACHINE_CONTRACT,
+                    &["vmlinux"],
+                ),
+                pplx_space_common_core::types::RuntimeKind::CloudHypervisor => (
+                    pplx_space_execution_common::environment::CLOUD_HYPERVISOR_BOOT_CONTRACT,
+                    pplx_space_execution_common::environment::CLOUD_HYPERVISOR_MACHINE_CONTRACT,
+                    match self.execution.guest().architecture {
+                        pplx_space_common_core::types::Arch::Aarch64 => &["linux-image"],
+                        pplx_space_common_core::types::Arch::X86_64 => {
+                            &["vmlinux", "linux-bzimage"]
+                        }
+                    },
+                ),
+                _ => return Err(BuildExecutionBindingError::ScratchProfile),
+            };
         if contract.as_str() != expected_boot
             || machine.as_str() != expected_machine
-            || boot.role().as_str() != "boot"
-            || boot.format().as_str() != expected_format
+            || !kernel_formats.contains(&boot.format().as_str())
             || boot.component().kind != pplx_space_common_core::types::ArtifactComponentKind::Kernel
         {
             return Err(BuildExecutionBindingError::ScratchProfile);
+        }
+        // Scratch builds create a disk without attaching a device. Every boot
+        // input still belongs in its binding so later activation cannot omit
+        // a required initramfs or substitute another module bundle.
+        for artifact in artifacts
+            .iter()
+            .filter(|artifact| artifact.role().as_str() != "boot")
+        {
+            if self.execution.runtime().kind
+                != pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+                || artifact.role().as_str() != "initramfs"
+                || artifact.component().kind
+                    != pplx_space_common_core::types::ArtifactComponentKind::Initrd
+                || artifact.format().as_str() != "linux-initramfs"
+            {
+                return Err(BuildExecutionBindingError::ScratchProfile);
+            }
         }
         let kernel = boot.component();
         if pin.is_some_and(|pin| pin.version != kernel.version || pin.digest != kernel.digest) {
@@ -309,6 +328,10 @@ impl BuildExecutionBinding {
         command.env("SPACE_SEED_KERNEL_FORMAT", boot.format().as_str());
         command.env("SPACE_SEED_KERNEL_VERSION", kernel.version.as_str());
         command.env("SPACE_SEED_KERNEL_DIGEST", kernel.digest.to_string());
+        command.env(
+            "SPACE_SEED_BOOT_COMPONENTS",
+            serde_json::to_string(self.execution.components())?,
+        );
         Ok(())
     }
 
@@ -369,6 +392,7 @@ pub(super) fn configure_legacy_scratch(
     );
     command.env_remove("SPACE_SEED_KERNEL_VERSION");
     command.env_remove("SPACE_SEED_KERNEL_DIGEST");
+    command.env_remove("SPACE_SEED_BOOT_COMPONENTS");
     if let Some(pin) = pin {
         command.env("SPACE_SEED_KERNEL_VERSION", pin.version.as_str());
         command.env("SPACE_SEED_KERNEL_DIGEST", pin.digest.to_string());
