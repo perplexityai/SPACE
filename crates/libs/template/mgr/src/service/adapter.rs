@@ -2,6 +2,23 @@ use super::*;
 
 #[tonic::async_trait]
 impl TemplateManager for TemplateManagerService {
+    async fn get_execution_capabilities(
+        &self,
+        request: Request<crate::proto::GetExecutionCapabilitiesRequest>,
+    ) -> Result<Response<crate::proto::GetExecutionCapabilitiesResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "GetExecutionCapabilities",
+            ALLOW_TEMPLATE_OPERATOR,
+        )?;
+        Ok(Response::new(
+            crate::proto::GetExecutionCapabilitiesResponse {
+                firmware_guests_v1: cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                    && self.require_local_firmware_consumer().await.is_ok(),
+            },
+        ))
+    }
+
     async fn create_pool(
         &self,
         request: Request<CreatePoolRequest>,

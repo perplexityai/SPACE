@@ -896,3 +896,16 @@ mod native;
 
 #[cfg(test)]
 mod tests;
+
+/// Create a connected descriptor in the lease's namespace, with a bounded
+/// connect. Call on the blocking host-work executor, never a Tokio worker.
+pub(crate) fn guest_tcp_stream(
+    ns: &str,
+    port: std::num::NonZeroU16,
+) -> io::Result<std::net::TcpStream> {
+    native::guest_tcp_stream(ns, port)
+}
+
+pub(crate) fn guest_dhcp_socket(ns: &str) -> io::Result<std::net::UdpSocket> {
+    native::guest_dhcp_socket(ns)
+}

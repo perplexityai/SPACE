@@ -188,6 +188,7 @@ const MAX_CACHE_ARTIFACT_DELETES: usize = 4;
 
 #[derive(Clone)]
 pub struct NodeManagerService {
+    guest_networks: std::sync::Arc<guest_network::GuestNetworks>,
     device_pool: device_pool::DevicePool,
     pool: std::sync::Arc<NetworkPool>,
     peer_authorizer: UdsPeerAuthorizer,
@@ -373,6 +374,7 @@ impl NodeManagerService {
         let device_pool = device_pool::DevicePool::new(settings.device_development);
         device_pool.start(pool.clone(), task_tracker.clone());
         Ok(Self {
+            guest_networks: Default::default(),
             device_pool,
             pool,
             peer_authorizer: node_peer_authorizer(),
@@ -746,3 +748,7 @@ use network_helpers::*;
 use crate::snapshot_request::{FirecrackerCapture, FirecrackerRestore};
 
 mod runtime_control;
+
+mod guest_control;
+
+mod guest_network;

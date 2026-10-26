@@ -912,6 +912,8 @@ impl NodeManagerService {
             stop_sandbox_runtime_with_supervisor(self, sandbox_id, false, None).await?;
         }
 
+        self.stop_guest_dhcp(sandbox_id).await?;
+
         let info = self.pool.release(sandbox_id).map_err(|error| {
             SandboxEvent::new(
                 typed_sandbox_id,
