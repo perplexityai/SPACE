@@ -63,7 +63,6 @@ use recipe::{CopyPayload, GuestKernelPin, Origin, PackageManager, Recipe, Step};
 use ssh::SshSession;
 use vm::TEMPLATE_DIR;
 
-const DEFAULT_UBUNTU_APT_MIRROR: &str = "https://archive.ubuntu.com/ubuntu";
 const UBUNTU_APT_MIRROR_ENV: &str = "SPACE_UBUNTU_APT_MIRROR";
 /// Foreground, *blocking* flush run over SSH before the guest is torn down.
 /// `sync` returns only after buffered writes are committed, so the build's last
@@ -1878,10 +1877,18 @@ fn scratch_output_permission_targets(output_dir: &Path) -> Result<Vec<PathBuf>, 
 }
 
 fn configure_guest_apt_mirror(ssh: &SshSession) -> Result<(), SshError> {
-    let mirror = std::env::var(UBUNTU_APT_MIRROR_ENV)
-        .unwrap_or_else(|_| DEFAULT_UBUNTU_APT_MIRROR.to_string());
-    let mirror = shell_quote(&mirror);
-    let cmd = format!(
+    let configured = std::env::var(UBUNTU_APT_MIRROR_ENV).ok();
+    let Some(cmd) = guest_apt_mirror_command(configured.as_deref()) else {
+        return Ok(());
+    };
+    ssh.exec(&cmd, "root", &StepEnvironment::default())
+}
+
+fn guest_apt_mirror_command(configured: Option<&str>) -> Option<String> {
+    // Seed creation configures its own mirror. Inherited roots own their source
+    // transport and trust setup, so only an explicit operator setting overrides it.
+    let mirror = shell_quote(configured?);
+    Some(format!(
         "set -euo pipefail\n\
          mirror={mirror}\n\
          if [ -x /usr/local/sbin/space-configure-apt-mirror ]; then\n\
@@ -1894,8 +1901,7 @@ fn configure_guest_apt_mirror(ssh: &SshSession) -> Result<(), SshError> {
              sed -i -E \"s#https?://(archive|security)\\.ubuntu\\.com/ubuntu/?#$mirror#g\" $files\n\
            fi\n\
          fi"
-    );
-    ssh.exec(&cmd, "root", &StepEnvironment::default())
+    ))
 }
 
 /// Execute a single build step.
@@ -2460,3 +2466,6 @@ mod tar_symlink_tests;
 
 #[cfg(test)]
 mod env_expansion_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod apt_mirror_tests;

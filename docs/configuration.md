@@ -188,7 +188,7 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_BUILD_MANAGER_AUTH_ALLOWED_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_BUILD_EXPORT_<NAME>` | unset = not exported | Opt a value into recipe `env_refs` as guest variable `NAME`; see [build environment exports](../templates/firecracker/seed/README.md#build-environment-exports). |
 | `SPACE_BUILDER_ECR_REPOSITORIES` | unset | JSON. |
-| `SPACE_UBUNTU_APT_MIRROR` | `https://archive.ubuntu.com/ubuntu` | |
+| `SPACE_UBUNTU_APT_MIRROR` | preserve base sources when building from an image or template; `https://archive.ubuntu.com/ubuntu` when creating a seed | An explicit value rewrites Ubuntu archive/security sources during the build. Without it, inherited sources keep their transport and trust requirements, including in builds derived from older or custom templates. |
 
 Direct/systemd deployments can publish API-submitted template builds without
 Kubernetes projected credentials. Generate a separate random publisher secret
