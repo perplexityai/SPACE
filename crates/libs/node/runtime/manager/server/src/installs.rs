@@ -15,16 +15,21 @@
 //! - [`staging`]: private staging and hashing.
 //! - [`store`]: durable mutation intent and per-job results.
 
+mod boot_artifact;
 mod executor;
 #[cfg(feature = "github")]
 mod github;
 #[cfg(feature = "github")]
 pub(crate) mod https_kernel;
 mod kernel;
+pub(crate) mod local_source;
 mod operations;
 mod publisher;
 mod release;
 mod release_source;
+pub use local_source::{
+    LocalArtifactFeed, LocalArtifactFeedError, LocalSourcePath, LocalSourcePathError,
+};
 #[cfg(feature = "s3")]
 mod s3;
 pub(crate) mod source;
@@ -49,8 +54,8 @@ pub use release::ReleaseConfigurationError;
 pub(crate) use release::{ReleaseContext, ReleaseSources};
 pub use release_source::{
     CLOUD_HYPERVISOR_RELEASE_SOURCE, FIRECRACKER_RELEASE_SOURCE, ReleaseArchiveMember,
-    ReleaseChunks, ReleasePayload, ReleaseSource, ReleaseSourceError, ReleaseUrl,
-    ReleaseUrlParseError, VerifiableRelease,
+    ReleaseChunks, ReleaseLocation, ReleaseLocationError, ReleasePayload, ReleaseSource,
+    ReleaseSourceError, ReleaseUrl, ReleaseUrlParseError, VerifiableRelease,
 };
 #[cfg(feature = "s3")]
 pub(crate) use s3::S3KernelSource;

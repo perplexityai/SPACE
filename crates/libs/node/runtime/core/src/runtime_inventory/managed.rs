@@ -4,6 +4,7 @@ use crate::artifact_store::{
     release_directory,
 };
 use crate::catalog::InitialEnvironment;
+use pplx_space_common_core::types::{ArtifactComponentRoleParseError, ArtifactFormatParseError};
 
 impl RuntimeInventory {
     /// Build an executable snapshot from external layouts and the sole managed
@@ -352,11 +353,18 @@ impl RuntimeInventory {
                 })
             }
         };
+        let auxiliary =
+            self.environment_boot_artifacts(store, environment, cache_parent, &mut watched);
         // A failed managed binding cannot remove or borrow a legacy installation.
         // Keep a failed entry too, so explicit requests cannot fall back to it.
         let installed = InstalledEnvironment {
             runtime,
-            components: component.map(|component| vec![component]),
+            components: component.and_then(|component| {
+                auxiliary.map(|mut components| {
+                    components.insert(0, component);
+                    components
+                })
+            }),
         };
         self.environments
             .insert(environment.definition().reference(), installed);
@@ -364,6 +372,86 @@ impl RuntimeInventory {
         self.remember_paths(watched);
         self.fingerprints.extend(previous);
         Ok(())
+    }
+
+    fn environment_boot_artifacts(
+        &mut self,
+        store: &ArtifactStore,
+        environment: &crate::catalog::CompiledEnvironment,
+        cache_parent: &Path,
+        watched: &mut Vec<PathBuf>,
+    ) -> Result<Vec<ArtifactComponentInstallation>, std::sync::Arc<RuntimeInventoryError>> {
+        let mut components = Vec::new();
+        let mut failure = None;
+        for (role, identity, format) in environment
+            .definition()
+            .descriptor()
+            .spec()
+            .boot
+            .components()
+        {
+            if identity.kind == ArtifactComponentKind::Kernel {
+                continue;
+            }
+            // Watch every input even if an earlier one is absent or corrupt, so
+            // publishing or repairing it invalidates the failed binding.
+            let root = store.boot_artifacts_root();
+            let image = root
+                .join(crate::artifact_store::boot_artifact_directory(identity))
+                .join(crate::artifact_store::BOOT_ARTIFACT_IMAGE);
+            watched.extend(image.ancestors().map(Path::to_path_buf));
+            let installed = (|| {
+                let pin = environment.boot_artifact(identity).ok_or_else(|| {
+                    RuntimeInventoryError::MissingBootArtifactPin(identity.clone())
+                })?;
+                let cached = ArtifactStore::execution_boot_artifact_path(cache_parent, pin);
+                watched.extend(cached.ancestors().map(Path::to_path_buf));
+                let staged = boot_artifact_from_source(store, pin, cache_parent)?;
+                Ok::<_, RuntimeInventoryError>(ArtifactComponentInstallation {
+                    metadata: ArtifactComponentMetadata {
+                        kind: identity.kind,
+                        role: Some(role.parse().map_err(
+                            |error: ArtifactComponentRoleParseError| {
+                                RuntimeInventoryError::InvalidStaticIdentifier {
+                                    field: "boot role",
+                                    value: role.to_owned(),
+                                    reason: error.to_string(),
+                                }
+                            },
+                        )?),
+                        version: Some(identity.version.clone()),
+                        digest: Some(identity.digest),
+                        format: Some(format.parse().map_err(
+                            |error: ArtifactFormatParseError| {
+                                RuntimeInventoryError::InvalidStaticIdentifier {
+                                    field: "boot format",
+                                    value: format.to_owned(),
+                                    reason: error.to_string(),
+                                }
+                            },
+                        )?),
+                    },
+                    path: staged.path,
+                    integrity: staged.integrity,
+                    default_for_new: false,
+                    legacy_default: false,
+                })
+            })();
+            match installed {
+                Ok(component) => components.push(component),
+                Err(error) => {
+                    tracing::warn!(%error, "environment boot artifact unavailable");
+                    let error = self.binding_error(error);
+                    if failure.is_none() || error.is_transient() {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(components),
+        }
     }
 
     fn binding_error(
@@ -415,7 +503,7 @@ impl RuntimeInventory {
     fn add_initial_kernel(
         &mut self,
         initial: &InitialEnvironment,
-        staged: StagedKernel,
+        staged: StagedBootFile,
     ) -> Result<(), RuntimeInventoryError> {
         let mut installation = kernel_installation(
             kernel_metadata(initial.kernel().version.clone(), initial.kernel().sha256)?,
@@ -482,9 +570,40 @@ fn runtime_from_source(
     Ok(runtime)
 }
 
-struct StagedKernel {
+struct StagedBootFile {
     path: PathBuf,
     integrity: ExecutionSourceIntegrity,
+}
+
+fn boot_artifact_from_source(
+    store: &ArtifactStore,
+    pin: &crate::catalog::PinnedBootArtifact,
+    cache_parent: &Path,
+) -> Result<StagedBootFile, RuntimeInventoryError> {
+    if crate::catalog::compiled_verity_digest(pin.identity().digest)
+        .map_err(crate::artifact_store::StageExecutionError::Catalog)?
+        .is_some()
+    {
+        match store.stage_sealed_boot_artifact(pin, cache_parent) {
+            Ok(path) => {
+                return Ok(StagedBootFile {
+                    path,
+                    integrity: ExecutionSourceIntegrity::FsVerity,
+                });
+            }
+            Err(error) if error.is_unsupported() => {
+                tracing::warn!(integrity = "catalog-sha256", %error, "boot artifact fs-verity unavailable; using catalog SHA-256 authentication");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let publication = store.stage_boot_artifact(pin, cache_parent)?;
+    Ok(StagedBootFile {
+        path: publication
+            .path
+            .join(crate::artifact_store::BOOT_ARTIFACT_IMAGE),
+        integrity: ExecutionSourceIntegrity::CatalogSha256,
+    })
 }
 
 fn kernel_from_source(
@@ -492,14 +611,14 @@ fn kernel_from_source(
     pin: &crate::catalog::PinnedKernel,
     source: KernelSource<'_>,
     cache_parent: &Path,
-) -> Result<StagedKernel, RuntimeInventoryError> {
+) -> Result<StagedBootFile, RuntimeInventoryError> {
     if crate::catalog::compiled_verity_digest(pin.sha256)
         .map_err(crate::artifact_store::StageExecutionError::Catalog)?
         .is_some()
     {
         match store.stage_sealed_kernel_at(pin, source, cache_parent) {
             Ok(path) => {
-                return Ok(StagedKernel {
+                return Ok(StagedBootFile {
                     path,
                     integrity: ExecutionSourceIntegrity::FsVerity,
                 });
@@ -520,7 +639,7 @@ fn kernel_from_source(
             image.to_owned()
         }
     };
-    Ok(StagedKernel {
+    Ok(StagedBootFile {
         path,
         integrity: ExecutionSourceIntegrity::CatalogSha256,
     })
