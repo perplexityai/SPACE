@@ -212,6 +212,45 @@ impl ArtifactStore {
         Ok(target.join(KERNEL_IMAGE))
     }
 
+    pub fn execution_boot_artifact_path(
+        parent: &Path,
+        pin: &crate::catalog::PinnedBootArtifact,
+    ) -> PathBuf {
+        parent
+            .join("managed/boot-artifacts")
+            .join(boot_artifact_directory(pin.identity()))
+            .join(BOOT_ARTIFACT_IMAGE)
+    }
+
+    pub fn stage_sealed_boot_artifact(
+        &self,
+        pin: &crate::catalog::PinnedBootArtifact,
+        parent: &Path,
+    ) -> Result<PathBuf, StageExecutionError> {
+        let directory = self
+            .boot_artifacts_root()
+            .join(boot_artifact_directory(pin.identity()));
+        let source = SealedSource::Directory {
+            directory: &directory,
+            protection: RootProtection::Store,
+        };
+        let target = Self::execution_boot_artifact_path(parent, pin);
+        source.require_if_uncached(&target)?;
+        self.require_verity_api(parent)?;
+        source.check_if_uncached(&target, self.owner)?;
+        let root = self.prepare_execution_namespace(parent, "boot-artifacts")?;
+        self.stage_sealed_files(
+            &root,
+            &boot_artifact_directory(pin.identity()),
+            source,
+            &[SealedPlan::from_catalog(super::boot_artifact::boot_file(
+                pin,
+            ))?],
+            pin.identity().digest,
+        )
+        .map(|path| path.join(BOOT_ARTIFACT_IMAGE))
+    }
+
     pub(super) fn prepare_execution_namespace(
         &self,
         parent: &Path,
@@ -297,7 +336,8 @@ impl ArtifactStore {
             lock_root(root).map_err(|error| io_publish("lock execution cache", root, error))?;
         clear_root_leftovers(root)
             .map_err(|source| io_publish("clear interrupted execution cache", root, source))?;
-        reclaim_empty_execution_target(&target, files, self.owner)?;
+        let planned_files: Vec<_> = files.iter().map(|plan| plan.file.clone()).collect();
+        reclaim_empty_execution_target(&target, &planned_files, self.owner)?;
         let exists = exists(&target)
             .map_err(|error| io_publish("inspect execution cache", &target, error))?;
         let publication = if exists {
@@ -321,10 +361,7 @@ impl ArtifactStore {
                     root: source_parent,
                     directory: source_name,
                 },
-                &files
-                    .iter()
-                    .map(|plan| plan.file.clone())
-                    .collect::<Vec<_>>(),
+                &planned_files,
                 digest,
                 RootProtection::ExecutionCache,
             )?
@@ -422,9 +459,9 @@ impl ArtifactStore {
 
 // Only an empty planned directory skeleton is disposable. Never unlink an
 // existing file, follow a symlink, or descend into an unexpected directory.
-fn reclaim_empty_execution_target(
+pub(super) fn reclaim_empty_execution_target(
     target: &Path,
-    files: &[SealedPlan],
+    files: &[PlannedFile],
     owner: u32,
 ) -> Result<(), PublishError> {
     if !exists(target).map_err(|error| io_publish("inspect execution cache", target, error))? {
@@ -432,8 +469,8 @@ fn reclaim_empty_execution_target(
     }
     RootProtection::ExecutionCache.check(target, owner)?;
     let mut directories = std::collections::BTreeSet::from([target.to_owned()]);
-    for plan in files {
-        let path = Path::new(plan.file.path);
+    for file in files {
+        let path = Path::new(file.path);
         for parent in path
             .ancestors()
             .skip(1)

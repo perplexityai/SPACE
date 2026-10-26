@@ -1,6 +1,6 @@
 //! Runtime release payloads from bounded HTTPS GitHub downloads.
 
-use super::release_source::{ReleaseArchiveMember, ReleasePayload};
+use super::release_source::{ReleaseLocation, ReleasePayload};
 
 use std::time::Duration;
 
@@ -53,6 +53,10 @@ impl GitHubReleaseSource {
         })
     }
 
+    pub(super) fn base(&self) -> &ReleaseUrl {
+        &self.base
+    }
+
     fn holds(&self, archive: &ReleaseUrl) -> bool {
         archive
             .as_str()
@@ -64,7 +68,7 @@ impl GitHubReleaseSource {
     async fn send(&self, location: &ReleaseUrl) -> Result<reqwest::Response, ReleaseSourceError> {
         use tracing::Instrument as _;
         let fetch = |source: reqwest::Error| ReleaseSourceError::Fetch {
-            location: location.clone(),
+            location: location.clone().into(),
             source: Box::new(source),
         };
         // The URL is a public release location, never user input.
@@ -116,11 +120,11 @@ impl ReleaseSource for GitHubReleaseSource {
         }
     }
 
-    fn root(&self) -> &ReleaseUrl {
-        &self.base
+    fn root(&self) -> ReleaseLocation {
+        self.base.clone().into()
     }
 
-    fn archive(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleaseUrl {
+    fn archive(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleaseLocation {
         let version = release.version.as_str();
         let asset = match self.runtime {
             GitHubRuntime::Firecracker => format!("firecracker-v{version}-{architecture}.tgz"),
@@ -129,41 +133,28 @@ impl ReleaseSource for GitHubReleaseSource {
                 Arch::Aarch64 => "cloud-hypervisor-static-aarch64".to_owned(),
             },
         };
-        self.base.join(&format!("v{version}")).join(&asset)
+        self.base.join(&format!("v{version}")).join(&asset).into()
     }
 
     fn payload(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleasePayload {
-        match self.runtime {
-            GitHubRuntime::CloudHypervisor => ReleasePayload::Executable,
-            GitHubRuntime::Firecracker => {
-                let version = release.version.as_str();
-                ReleasePayload::TarGz {
-                    members: ["firecracker", "jailer"]
-                        .into_iter()
-                        .map(|binary| {
-                            let directory = format!("release-v{version}-{architecture}");
-                            let executable = format!("{binary}-v{version}-{architecture}");
-                            ReleaseArchiveMember {
-                                binary: format!("bin/{binary}"),
-                                member: format!("{directory}/{executable}"),
-                            }
-                        })
-                        .collect(),
-                }
-            }
-        }
+        super::release_source::release_payload(release, architecture)
     }
 
-    async fn open(&self, archive: &ReleaseUrl) -> Result<ReleaseChunks, ReleaseSourceError> {
-        if !self.holds(archive) {
+    async fn open(&self, archive: &ReleaseLocation) -> Result<ReleaseChunks, ReleaseSourceError> {
+        let ReleaseLocation::Https(archive) = archive else {
             return Err(ReleaseSourceError::Foreign {
                 location: archive.clone(),
+            });
+        };
+        if !self.holds(archive) {
+            return Err(ReleaseSourceError::Foreign {
+                location: archive.clone().into(),
             });
         }
         let response = tokio::time::timeout(REQUEST_TIMEOUT, self.send(archive))
             .await
             .map_err(|_| ReleaseSourceError::TimedOut {
-                location: archive.clone(),
+                location: archive.clone().into(),
                 after: REQUEST_TIMEOUT,
             })??;
         let location = archive.clone();
@@ -177,7 +168,7 @@ impl ReleaseSource for GitHubReleaseSource {
                             .chunk()
                             .await
                             .map_err(|source| ReleaseSourceError::Fetch {
-                                location,
+                                location: location.into(),
                                 source: Box::new(source),
                             })?;
                     Ok(chunk.map(|chunk| (chunk, response)))
