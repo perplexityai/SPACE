@@ -26,5 +26,7 @@ tonic = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-execution-common = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-sbx-mgr-protocol = { workspace = true }

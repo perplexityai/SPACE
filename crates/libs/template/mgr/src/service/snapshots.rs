@@ -51,6 +51,7 @@ fn base_snapshot_create_request(
     snapshot_rootfs_size_mb: Option<u32>,
 ) -> pplx_space_sbx_mgr_client::proto::CreateRequest {
     pplx_space_sbx_mgr_client::proto::CreateRequest {
+        device_create: None,
         environment: None,
         template: template_name.to_string(),
         owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),

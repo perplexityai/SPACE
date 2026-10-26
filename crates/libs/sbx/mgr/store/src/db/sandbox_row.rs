@@ -22,6 +22,7 @@ use crate::state::SandboxState;
 
 #[derive(Clone)]
 pub struct SandboxRow {
+    pub device_requirements: Option<pplx_space_execution_spec::devices::DeviceRequirements>,
     pub node_execution_id: Option<SandboxActivationAttemptId>,
     pub id: String,
     pub uuid8: SandboxRuntimeLabel,
@@ -294,6 +295,14 @@ pub(super) fn row_to_sandbox(row: &rusqlite::Row) -> rusqlite::Result<SandboxRow
             )
         })?;
     Ok(SandboxRow {
+        device_requirements: row
+            .get::<_, Option<String>>("device_requirements_json")?
+            .map(|raw| {
+                serde_json::from_str(&raw).map_err(|error| {
+                    column_error(row, "device_requirements_json", Type::Text, Box::new(error))
+                })
+            })
+            .transpose()?,
         node_execution_id: row
             .get::<_, Option<String>>("node_execution_id")?
             .map(|raw| {

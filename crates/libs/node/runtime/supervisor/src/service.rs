@@ -399,6 +399,21 @@ mod tests;
 
 #[tonic::async_trait]
 impl RuntimeSupervisor for RuntimeSupervisorService {
+    async fn get_execution_capabilities(
+        &self,
+        request: Request<pplx_space_node_runtime_core::proto::GetExecutionCapabilitiesRequest>,
+    ) -> Result<
+        Response<pplx_space_node_runtime_core::proto::GetExecutionCapabilitiesResponse>,
+        Status,
+    > {
+        self.authorize_peer(&request, "GetExecutionCapabilities")?;
+        Ok(Response::new(
+            pplx_space_node_runtime_core::proto::GetExecutionCapabilitiesResponse {
+                exclusive_devices_v1: cfg!(target_os = "linux"),
+            },
+        ))
+    }
+
     async fn bind_execution(
         &self,
         request: Request<pplx_space_node_runtime_core::proto::BindExecutionRequest>,
@@ -467,6 +482,7 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
                 .into_inner();
             Ok(Response::new(
                 pplx_space_node_runtime_core::proto::LaunchRuntimeResponse {
+                    devices: None,
                     pid: response.pid,
                     accepted_environment_reference: response.accepted_environment_reference,
                 },
@@ -605,6 +621,9 @@ impl RuntimeSupervisorService {
                 ));
             }
             store
+                .record_device_intent(sandbox_id, execution, None)
+                .map_err(execution::device_store_status)?;
+            store
                 .record_cpu_budget(sandbox_id, execution, budget)
                 .map_err(|error| {
                     Status::failed_precondition(format!("record CPU launch budget: {error}"))
@@ -685,7 +704,11 @@ impl RuntimeSupervisorService {
                     .map_err(cgroup_update_error_to_status)?;
             }
             if let Some(pid) = adopt(sandbox_id, req.chroot_base_dir.as_str().to_owned()).await? {
+                self.execution_io(move |store| store.check_device_adoption(sandbox_id, execution, None)
+                    .map_err(execution::device_store_status))
+                    .await?;
                 return Ok(Response::new(LaunchRuntimeResponse {
+                    devices: None,
                     pid,
                     accepted_environment_reference: accepted_environment_reference.clone(),
                 }));
@@ -772,6 +795,7 @@ impl RuntimeSupervisorService {
             );
 
             Ok(Response::new(LaunchRuntimeResponse {
+                devices: None,
                 pid,
                 accepted_environment_reference: accepted_environment_reference.clone(),
             }))
@@ -981,13 +1005,14 @@ impl RuntimeSupervisorService {
         let runtime_lock = self.runtime_lock(sandbox_id);
         let runtime_guard = await_runtime_lock(runtime_lock.write_owned()).await?;
         execution::check_caller(caller.as_ref())?;
-        self.check_execution(
-            sandbox_id,
-            &req.execution_id,
-            req.previous_execution_id.as_deref(),
-            true,
-        )
-        .await?;
+        let execution_id = self
+            .check_execution(
+                sandbox_id,
+                &req.execution_id,
+                req.previous_execution_id.as_deref(),
+                true,
+            )
+            .await?;
         // Attempt revocation first even if process cleanup will fail, but a
         // broken evidence store must not prevent termination. Keep exclusion
         // outside the blocking task too: its error or panic must not admit a
@@ -996,17 +1021,21 @@ impl RuntimeSupervisorService {
         let retirement = async {
             let slot = self.acquire_blocking_slot().await?;
             let guard = runtime_guard.clone();
+            let store = self.execution_store.clone();
             tokio::task::spawn_blocking(move || {
                 let _slot = slot;
                 let _guard = guard;
-                retire(sandbox_id)
+                let devices = store
+                    .stop_device_execution(sandbox_id, execution_id)
+                    .map_err(execution::device_store_status);
+                let gateway = retire(sandbox_id).map_err(|error| {
+                    tracing::warn!(%sandbox_id, %error, "gateway authority retirement failed");
+                    Status::unavailable("retire gateway launch authority")
+                });
+                devices.and(gateway)
             })
             .await
-            .map_err(|_| Status::internal("gateway authority retirement task failed"))?
-            .map_err(|error| {
-                tracing::warn!(%sandbox_id, %error, "gateway authority retirement failed");
-                Status::unavailable("retire gateway launch authority")
-            })
+            .map_err(|_| Status::internal("runtime authority retirement task failed"))?
         }
         .await;
         if let Err(error) = &retirement {

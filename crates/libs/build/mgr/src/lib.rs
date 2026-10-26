@@ -508,6 +508,7 @@ fn build_vm_create_request(
     network_policy: &NetworkPolicyV1,
 ) -> CreateRequest {
     let mut request = CreateRequest {
+        device_create: None,
         environment: None,
         template: base_template_name,
         owner: BUILDER_SANDBOX_OWNER.to_string(),

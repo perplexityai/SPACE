@@ -188,6 +188,7 @@ const MAX_CACHE_ARTIFACT_DELETES: usize = 4;
 
 #[derive(Clone)]
 pub struct NodeManagerService {
+    device_pool: device_pool::DevicePool,
     pool: std::sync::Arc<NetworkPool>,
     peer_authorizer: UdsPeerAuthorizer,
     sandbox_cgroup_config: SandboxCgroupConfig,
@@ -302,7 +303,12 @@ impl SandboxCgroupConfig {
 }
 
 fn slot_store_status(error: crate::slot_pool::SlotStoreError) -> Status {
-    Status::unavailable(format!("network slot state unavailable: {error}"))
+    match error {
+        crate::slot_pool::SlotStoreError::Devices(error) => {
+            device_admission::device_store_status(error)
+        }
+        error => Status::unavailable(format!("network slot state unavailable: {error}")),
+    }
 }
 
 impl NodeManagerService {
@@ -364,7 +370,10 @@ impl NodeManagerService {
             std::path::Path::new(CACHE_DIR),
         )
         .with_task_tracker(task_tracker.clone());
+        let device_pool = device_pool::DevicePool::new(settings.device_development);
+        device_pool.start(pool.clone(), task_tracker.clone());
         Ok(Self {
+            device_pool,
             pool,
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config,
@@ -705,6 +714,9 @@ mod claim_contention_tests;
 mod cleanup_helpers;
 mod cleanup_inspect;
 mod control;
+mod device_admin;
+mod device_admission;
+pub(crate) mod device_pool;
 mod disk;
 pub(crate) mod disk_io_ceiling;
 mod encrypted_volumes;
