@@ -20,6 +20,7 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 prost = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
 
@@ -30,3 +31,4 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+serde_json = { workspace = true }
