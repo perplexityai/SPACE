@@ -182,7 +182,13 @@ async fn start_guest_failure_preserves_terminal_status_and_activation_ownership(
             "start",
             None,
             StartReadiness {
-                guest: std::future::ready(Err(Status::new(code, "guest readiness rejected"))),
+                guest: std::future::ready(Err::<
+                    pplx_space_spaced_host_client::proto::WaitReadyResponse,
+                    _,
+                >(Status::new(
+                    code,
+                    "guest readiness rejected",
+                ))),
                 policy: None::<std::future::Ready<Result<(), Status>>>,
             },
         )

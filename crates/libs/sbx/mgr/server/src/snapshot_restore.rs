@@ -1749,6 +1749,14 @@ pub(crate) fn validate_restore_metadata_identity(
     target_sandbox_id: &str,
     expected_source_sandbox_id: &str,
 ) -> Result<(), RestoreError> {
+    if meta.execution.as_ref().is_some_and(|metadata| {
+        metadata.execution().guest().os
+            == pplx_space_common_core::types::GuestOperatingSystem::Windows
+    }) {
+        return Err(RestoreError::Other(
+            "firmware guests do not support snapshot distribution or cross-node restore".to_owned(),
+        ));
+    }
     let expected_identity = if meta.artifact_origin == Some(ArtifactOrigin::Fork) {
         target_sandbox_id
     } else {
