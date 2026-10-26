@@ -29,6 +29,10 @@ pub(crate) enum ExpandedRootfsError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("invalid template metadata schema: {0}")]
+    Schema(#[from] pplx_space_common_core::types::TemplateMetadataSchemaError),
+    #[error("invalid template manifest schema: {0}")]
+    ManifestSchema(#[from] pplx_space_common_core::types::TemplateManifestSchemaError),
     #[error(
         "template rootfs has wrong size for {path}: expected {expected_bytes} bytes, got {actual_bytes} bytes"
     )]
@@ -46,7 +50,9 @@ impl ExpandedRootfsError {
             Self::Command { .. } => "command",
             Self::TooSmall { .. } => "too_small",
             Self::Missing { .. } => "missing",
-            Self::InvalidMetadata { .. } => "invalid_metadata",
+            Self::InvalidMetadata { .. } | Self::Schema(_) | Self::ManifestSchema(_) => {
+                "invalid_metadata"
+            }
             Self::WrongSize { .. } => "wrong_size",
         }
     }
@@ -149,10 +155,16 @@ fn manifest_rootfs_size_bytes(build_dir: &Path) -> Result<Option<u64>, ExpandedR
 pub(crate) fn rootfs_size_mb_from_metadata(
     build_dir: &Path,
 ) -> Result<Option<u32>, ExpandedRootfsError> {
+    Ok(read_metadata(build_dir)?
+        .disk_size_mb
+        .filter(|value| *value > 0))
+}
+
+fn read_metadata(build_dir: &Path) -> Result<TemplateMetadata, ExpandedRootfsError> {
     let metadata_path = build_dir.join("metadata.json");
     let metadata_json = match std::fs::read_to_string(&metadata_path) {
         Ok(metadata_json) => metadata_json,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
         Err(source) => {
             return Err(ExpandedRootfsError::Io {
                 operation: "read metadata",
@@ -167,7 +179,29 @@ pub(crate) fn rootfs_size_mb_from_metadata(
             source,
         }
     })?;
-    Ok(metadata.disk_size_mb.filter(|value| *value > 0))
+    metadata.execution_metadata()?;
+    let manifest_path = build_dir.join("manifest.json");
+    match std::fs::read_to_string(&manifest_path) {
+        Ok(bytes) => {
+            let manifest: TemplateManifest = serde_json::from_str(&bytes).map_err(|source| {
+                ExpandedRootfsError::InvalidMetadata {
+                    path: manifest_path.display().to_string(),
+                    source,
+                }
+            })?;
+            manifest.execution_metadata()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ExpandedRootfsError::Io {
+                operation: "read manifest",
+                path: manifest_path.display().to_string(),
+                source,
+            });
+        }
+    }
+
+    Ok(metadata)
 }
 
 fn expand_rootfs(rootfs_path: &Path, rootfs_size_mb: u32) -> Result<PathBuf, ExpandedRootfsError> {
