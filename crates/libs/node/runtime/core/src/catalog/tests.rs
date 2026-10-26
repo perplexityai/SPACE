@@ -70,13 +70,19 @@ fn compiled_release_layouts_and_initial_pins_are_complete() {
             kind: RuntimeKind::CloudHypervisor,
             version: version.parse().unwrap(),
         };
-        let pin = catalog.release(&release, Arch::Aarch64).unwrap();
-        let [binary] = pin.binaries.as_slice() else {
-            panic!("static release must have one executable");
-        };
-        assert_eq!(binary.path, "bin/cloud-hypervisor");
-        assert_eq!(pin.archive_sha256, binary.sha256);
-        assert!(compiled_verity_digest(binary.sha256).unwrap().is_some());
+        let pins: Vec<_> = [Arch::X86_64, Arch::Aarch64]
+            .into_iter()
+            .filter_map(|architecture| catalog.release(&release, architecture))
+            .collect();
+        assert!(!pins.is_empty());
+        for pin in pins {
+            let [binary] = pin.binaries.as_slice() else {
+                panic!("static release must have one executable");
+            };
+            assert_eq!(binary.path, "bin/cloud-hypervisor");
+            assert_eq!(pin.archive_sha256, binary.sha256);
+            assert!(compiled_verity_digest(binary.sha256).unwrap().is_some());
+        }
     }
     // The image's kernel, pinned as the image build pins it.
     let kernel = catalog
@@ -265,5 +271,57 @@ fn every_qualified_environment_has_pinned_verity_sources() {
                 .unwrap()
                 .is_some()
         );
+        for (_, identity, _) in environment
+            .definition()
+            .descriptor()
+            .spec()
+            .boot
+            .components()
+        {
+            assert!(compiled_verity_digest(identity.digest).unwrap().is_some());
+            if identity.kind != pplx_space_common_core::types::ArtifactComponentKind::Kernel {
+                assert!(environment.boot_artifact(identity).is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn auxiliary_boot_pins_are_typed_and_cannot_conflict() {
+    use pplx_space_common_core::types::{ArtifactComponentKind, ComponentIdentity};
+    let dir = catalog_dir();
+    let identity = ComponentIdentity {
+        kind: ArtifactComponentKind::Initrd,
+        version: "test-bundle".parse().unwrap(),
+        digest: HEX_A.parse().unwrap(),
+    };
+    let pin = PinnedBootArtifact::new(identity.clone(), Arch::X86_64, 4096).unwrap();
+    write(
+        dir.path(),
+        "boot.json",
+        &serde_json::json!({"schema": 1, "boot_artifacts": [pin]}),
+    );
+    let catalog = RuntimeCatalog::load_owned_by(dir.path(), owner(dir.path())).unwrap();
+    assert_eq!(catalog.boot_artifact(&identity, Arch::X86_64), Some(&pin));
+    assert!(catalog.boot_artifact(&identity, Arch::Aarch64).is_none());
+    for (kind, size, digest, conflict) in [
+        ("initrd", 4096, HEX_B, true),
+        ("initrd", 0, HEX_A, false),
+        ("rootfs", 4096, HEX_A, false),
+    ] {
+        write(
+            dir.path(),
+            "other.json",
+            &serde_json::json!({"schema": 1, "boot_artifacts": [{
+                "identity": { "kind": kind, "version": "test-bundle", "digest": digest },
+                "architecture": "x86_64", "size": size,
+            }]}),
+        );
+        let error = RuntimeCatalog::load_owned_by(dir.path(), owner(dir.path())).unwrap_err();
+        if conflict {
+            assert!(matches!(error, CatalogError::Conflict { .. }));
+        } else {
+            assert!(matches!(error, CatalogError::Parse { .. }));
+        }
     }
 }
