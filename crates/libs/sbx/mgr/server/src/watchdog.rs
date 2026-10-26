@@ -518,7 +518,7 @@ impl HealthComponent {
 
     fn as_proto(self) -> i32 {
         match self {
-            Self::Firecracker => crate::proto::SandboxHealthComponent::Firecracker as i32,
+            Self::Firecracker => crate::proto::SandboxHealthComponent::Runtime as i32,
             Self::SpacedHost => crate::proto::SandboxHealthComponent::SpacedHost as i32,
             Self::SpacedGuest => crate::proto::SandboxHealthComponent::SpacedGuest as i32,
             Self::NetGateway => crate::proto::SandboxHealthComponent::NetGateway as i32,

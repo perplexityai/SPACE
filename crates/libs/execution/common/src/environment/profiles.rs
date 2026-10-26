@@ -91,8 +91,13 @@ impl From<&BootProfile> for proto::BootProfile {
         use proto::boot_profile::Profile;
         let profile = match value {
             BootProfile::LinuxDirectV1 { kernel } => {
-                Profile::LinuxDirectV1(proto::LinuxDirectBootV1 {
-                    kernel: Some(kernel.into()),
+                Profile::ArtifactsV1(proto::ArtifactBootProfileV1 {
+                    contract: FIRECRACKER_BOOT_CONTRACT.into(),
+                    artifacts: vec![proto::BootArtifact {
+                        role: BootProfile::LINUX_DIRECT_ROLE.into(),
+                        component: Some(kernel.into()),
+                        format: BootProfile::LINUX_DIRECT_FORMAT.into(),
+                    }],
                 })
             }
             BootProfile::ArtifactsV1 {
@@ -121,9 +126,6 @@ impl TryFrom<&proto::BootProfile> for BootProfile {
     fn try_from(value: &proto::BootProfile) -> Result<Self, Self::Error> {
         use proto::boot_profile::Profile;
         Ok(match required(value.profile.as_ref(), "boot profile")? {
-            Profile::LinuxDirectV1(boot) => Self::LinuxDirectV1 {
-                kernel: required(boot.kernel.as_ref(), "boot kernel")?.try_into()?,
-            },
             Profile::ArtifactsV1(boot) => Self::ArtifactsV1 {
                 contract: boot.contract.parse()?,
                 artifacts: boot
@@ -148,7 +150,8 @@ impl From<&ExecutionCompatibilityProfile> for proto::ExecutionCompatibilityProfi
         Self {
             profile: Some(match value {
                 ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } => {
-                    Profile::FirecrackerSnapshotV1(proto::FirecrackerSnapshotCompatibilityV1 {
+                    Profile::RuntimeV1(proto::RuntimeCompatibilityV1 {
+                        contract: FIRECRACKER_MACHINE_CONTRACT.into(),
                         state_format: Some(state_format.into()),
                     })
                 }
@@ -170,10 +173,6 @@ impl TryFrom<&proto::ExecutionCompatibilityProfile> for ExecutionCompatibilityPr
         use proto::execution_compatibility_profile::Profile;
         Ok(
             match required(value.profile.as_ref(), "compatibility profile")? {
-                Profile::FirecrackerSnapshotV1(profile) => Self::FirecrackerSnapshotV1 {
-                    state_format: required(profile.state_format.as_ref(), "state format")?
-                        .try_into()?,
-                },
                 Profile::RuntimeV1(profile) => Self::RuntimeV1 {
                     contract: profile.contract.parse()?,
                     state_format: profile

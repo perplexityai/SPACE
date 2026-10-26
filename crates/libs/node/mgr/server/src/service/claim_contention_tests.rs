@@ -5,9 +5,10 @@
 //! exclusively. Concurrent startup calls are legitimate, so each case pins
 //! both the refusal and the overlap that must keep succeeding.
 //!
-//! Requests carry no execution fence and no lease, so an admitted call stops
-//! at its first post-claim check, before any host access. That outcome is
-//! distinct from every claim refusal. The CleanupSandbox wrapper inspects the
+//! Requests have no current execution or lease, so an admitted call stops
+//! at its first post-claim check, before any host access. Snapshot requests
+//! carry a syntactically valid fence to reach that ownership check. That outcome
+//! is distinct from every claim refusal. The CleanupSandbox wrapper inspects the
 //! fixed cache root whatever its outcome, so cleanup_inspect::tests pins its
 //! claim through the cleanup operation instead.
 
@@ -303,12 +304,20 @@ fn waiting_work_rpcs() -> [Case; 9] {
             admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
-            rpc: "LoadSnapshot",
+            rpc: "RestoreVmState",
             call: |service, sandbox_id| {
                 Box::pin(async move {
                     service
-                        .load_snapshot(root(LoadSnapshotRequest {
+                        .restore_vm_state(root(crate::proto::RestoreVmStateRequest {
                             sandbox_id,
+                            execution_fence: Some(crate::proto::ExecutionFence {
+                                execution_id: "018e390d-4dd8-7000-8000-000000000002".into(),
+                                ..Default::default()
+                            }),
+                            artifacts: crate::snapshot_request::tests::artifacts(
+                                "/vmstate".into(),
+                                "/memory".into(),
+                            ),
                             ..Default::default()
                         }))
                         .await
@@ -318,12 +327,20 @@ fn waiting_work_rpcs() -> [Case; 9] {
             admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
         },
         Case {
-            rpc: "CreateSnapshot",
+            rpc: "CaptureVmState",
             call: |service, sandbox_id| {
                 Box::pin(async move {
                     service
-                        .create_snapshot(root(CreateSnapshotRequest {
+                        .capture_vm_state(root(crate::proto::CaptureVmStateRequest {
                             sandbox_id,
+                            execution_fence: Some(crate::proto::ExecutionFence {
+                                execution_id: "018e390d-4dd8-7000-8000-000000000002".into(),
+                                ..Default::default()
+                            }),
+                            artifacts: crate::snapshot_request::tests::artifacts(
+                                "/vmstate".into(),
+                                "/memory".into(),
+                            ),
                             ..Default::default()
                         }))
                         .await
@@ -575,7 +592,7 @@ async fn startup_rpcs_overlap_startup_work_and_proceed_once_cleanup_releases() {
     // for PrepareSandbox and LoadSnapshot.
     for case in waiting_work_rpcs()
         .into_iter()
-        .filter(|case| !matches!(case.rpc, "PrepareSandbox" | "LoadSnapshot"))
+        .filter(|case| !matches!(case.rpc, "PrepareSandbox" | "RestoreVmState"))
     {
         let service = service_for_unit_tests().await;
         let sandbox_id = SandboxId::new().to_string();
@@ -651,7 +668,7 @@ async fn in_flight_launch_or_snapshot_load_admits_concurrent_startup_rpcs() {
         admitted: Admitted(tonic::Code::FailedPrecondition, NO_EXECUTION),
     };
     let prepare = case("PrepareSandbox");
-    let load = case("LoadSnapshot");
+    let load = case("RestoreVmState");
     let release = release();
 
     for (in_flight, family, overlapping) in [

@@ -973,22 +973,19 @@ pub async fn do_checkpoint(
         .await);
     }
     if let Err(e) = node_client
-        .capture_runtime_state(
-            crate::service::snapshot_capture::runtime(execution.as_ref()),
-            crate::service::snapshot_capture::bind(
-                CaptureVmStateRequest {
-                    execution_fence: execution_fence.clone(),
-                    sandbox_id: sandbox_id.to_string(),
-                    artifacts: crate::service::snapshot_capture::artifacts(),
-                    storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
-                        directory: Some(snapshot_dir.clone()),
-                        encrypted_volume_mount: None,
-                    }),
-                    environment_reference: None,
-                },
-                execution.as_ref(),
-            ),
-        )
+        .capture_vm_state(crate::service::snapshot_capture::bind(
+            CaptureVmStateRequest {
+                execution_fence: execution_fence.clone(),
+                sandbox_id: sandbox_id.to_string(),
+                artifacts: crate::service::snapshot_capture::artifacts(),
+                storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
+                    directory: Some(snapshot_dir.clone()),
+                    encrypted_volume_mount: None,
+                }),
+                environment_reference: None,
+            },
+            execution.as_ref(),
+        ))
         .await
     {
         return Err(rollback_checkpoint_failure(
@@ -1077,5 +1074,3 @@ use retention::prune_scheduled_snapshots;
 
 #[cfg(test)]
 mod tests;
-
-use pplx_space_node_mgr_client::runtime_control::RuntimeControl;

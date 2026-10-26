@@ -71,6 +71,17 @@ impl RuntimeSupervisorService {
         }
         let requested = parse_execution(requested)?;
         let previous = previous.map(parse_execution).transpose()?;
+        self.check_parsed_execution(sandbox, requested, previous, allow_absent)
+            .await
+    }
+
+    pub(super) async fn check_parsed_execution(
+        &self,
+        sandbox: SandboxId,
+        requested: SandboxActivationAttemptId,
+        previous: Option<SandboxActivationAttemptId>,
+        allow_absent: bool,
+    ) -> Result<SandboxActivationAttemptId, Status> {
         self.execution_io(move |store| {
             let current = store.read(sandbox).map_err(store_status)?;
             match current {

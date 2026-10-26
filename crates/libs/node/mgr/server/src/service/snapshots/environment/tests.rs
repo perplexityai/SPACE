@@ -1,47 +1,4 @@
 use super::*;
-use crate::proto::{CreateSnapshotRequest, EnvironmentSnapshotInput};
-
-#[test]
-fn selected_snapshot_identity_rejects_conflicts_and_malformed_values() {
-    let id = SandboxId::new();
-    let input = EnvironmentSnapshotInput {
-        sandbox_id: id.to_string(),
-        reference: format!("sha256:{}", "01".repeat(32)),
-    };
-    for (legacy, selected, accepted) in [
-        (String::new(), Some(input.clone()), true),
-        (id.to_string(), Some(input.clone()), false),
-        (
-            String::new(),
-            Some(EnvironmentSnapshotInput {
-                sandbox_id: "invalid".into(),
-                ..input.clone()
-            }),
-            false,
-        ),
-        (
-            String::new(),
-            Some(EnvironmentSnapshotInput {
-                reference: "invalid".into(),
-                ..input.clone()
-            }),
-            false,
-        ),
-        (id.to_string(), None, true),
-    ] {
-        let mut request = CreateSnapshotRequest {
-            sandbox_id: legacy,
-            environment: selected,
-            ..Default::default()
-        };
-        let result = normalize(&mut request);
-        assert_eq!(result.is_ok(), accepted);
-        if accepted {
-            assert_eq!(request.sandbox_id, id.to_string());
-        }
-    }
-}
-
 #[tokio::test]
 async fn unapproved_snapshot_environment_is_refused_before_host_io() {
     let service = crate::service::tests::service_tests::service_for_unit_tests().await;

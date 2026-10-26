@@ -19,17 +19,12 @@ impl NodeManagerService {
     async fn launch_admitted_runtime(
         &self,
         sandbox_id: &str,
-        request: pplx_space_node_runtime_core::proto::LaunchFirecrackerRequest,
-    ) -> Result<pplx_space_node_runtime_core::proto::LaunchFirecrackerResponse, Status> {
+        request: pplx_space_node_runtime_core::proto::LaunchRuntimeRequest,
+    ) -> Result<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse, Status> {
         let expected_environment = request
             .verified_runtime
             .as_ref()
             .map(|verified| verified.environment_reference.clone());
-        let request = request.try_into().map_err(
-            |error: pplx_space_node_runtime_core::runtime_launch::LaunchContractError| {
-                Status::invalid_argument(error.to_string())
-            },
-        )?;
         let launched = self
             .runtime_supervisor
             .launch_runtime(request)
@@ -44,12 +39,7 @@ impl NodeManagerService {
                 "supervisor did not acknowledge the verified execution environment",
             ));
         }
-        Ok(
-            pplx_space_node_runtime_core::proto::LaunchFirecrackerResponse {
-                pid: launched.pid,
-                accepted_environment_reference: launched.accepted_environment_reference,
-            },
-        )
+        Ok(launched)
     }
 
     async fn acquire_preparation_ownership(
@@ -574,32 +564,28 @@ impl NodeManagerService {
             integrity_requirement: ArtifactIntegrityRequirement::AuthenticatedImmutableSources
                 .into(),
         });
-        let protected_launch = verified_runtime.is_some();
         let launched = self
             .launch_admitted_runtime(
                 sandbox_id,
-                pplx_space_node_runtime_core::proto::LaunchFirecrackerRequest {
+                pplx_space_node_runtime_core::proto::LaunchRuntimeRequest {
                     execution_id: req
                         .execution_fence
                         .as_ref()
                         .map_or_else(String::new, |fence| fence.execution_id.clone()),
-                    sandbox_id: if protected_launch {
-                        String::new()
-                    } else {
-                        sandbox_id.to_string()
-                    },
-                    jailer_bin,
-                    firecracker_bin,
+                    sandbox_id: sandbox_id.to_string(),
+                    runtime: pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32,
+                    launcher_binary: Some(jailer_bin),
+                    runtime_binary: firecracker_bin,
                     verified_runtime,
-                    chroot_base_dir: chroot_base.clone(),
-                    ns_path: ns_path.clone(),
+                    workspace_root: chroot_base.clone(),
+                    network_namespace: ns_path.clone(),
                     uid: sandbox_uid,
                     gid: sandbox_uid,
-                    fc_config_path: fc_config.to_string(),
-                    fc_log_path: fc_log,
-                    fc_metrics_path: fc_metrics,
-                    fc_console_path: fc_console.clone(),
-                    cgroup_limits: Some(self.launch_cgroup_limits(req)),
+                    configuration_path: fc_config.to_string(),
+                    log_path: fc_log,
+                    metrics_path: fc_metrics,
+                    console_path: fc_console.clone(),
+                    resource_limits: Some(self.launch_cgroup_limits(req)),
                 },
             )
             .await?;

@@ -8,7 +8,6 @@ service RuntimeSupervisor {
   rpc BindExecution(BindExecutionRequest) returns (BindExecutionResponse);
   rpc RetireExecution(RetireExecutionRequest) returns (RetireExecutionResponse);
   rpc LaunchRuntime(LaunchRuntimeRequest) returns (LaunchRuntimeResponse);
-  rpc LaunchFirecracker(LaunchFirecrackerRequest) returns (LaunchFirecrackerResponse);
   rpc LaunchSidecar(LaunchSidecarRequest) returns (LaunchSidecarResponse);
   rpc StopProcess(StopProcessRequest) returns (StopProcessResponse);
   rpc StopSandboxRuntime(StopSandboxRuntimeRequest) returns (StopSandboxRuntimeResponse);
@@ -33,35 +32,9 @@ message CgroupLimits {
   optional uint32 pids_max = 3;
 }
 
-message LaunchFirecrackerRequest {
-  string sandbox_id = 1;
-  // Adapter-local source locators. Under verified_runtime these must name the
-  // compiled release layout; they never supply identity or expected digests.
-  string jailer_bin = 2;
-  string firecracker_bin = 3;
-  string chroot_base_dir = 4;
-  string ns_path = 5;
-  uint32 uid = 6;
-  uint32 gid = 7;
-  string fc_config_path = 8;
-  string fc_log_path = 9;
-  string fc_console_path = 10;
-  CgroupLimits cgroup_limits = 11;
-  string execution_id = 12;
-  // A FIFO inside the jail, relative to its root, that Firecracker writes its
-  // metrics flushes to. Empty means no metrics output: Firecracker would create
-  // a regular file at a missing path, so the caller sets this only after it has
-  // created the FIFO.
-  string fc_metrics_path = 13;
-  // A protected launch carries its identity here and leaves sandbox_id empty.
-  // Old supervisors reject the absent legacy
-  // sandbox_id before acquiring execution ownership or spawning anything.
-  VerifiedRuntimeLaunch verified_runtime = 14;
-}
-
-// Host-neutral admission contract. The environment determines the runtime,
-// host/guest requirements and immutable boot inputs. Host paths and integrity
-// mechanisms are implementation details of the serving execution adapter.
+// Host-neutral integrity contract. The environment determines immutable sources
+// and host/guest requirements. Its sandbox identity must match the launch request;
+// the adapter authenticates sources before starting a new process.
 message VerifiedRuntimeLaunch {
   string sandbox_id = 1;
   string environment_reference = 2;
@@ -74,13 +47,6 @@ enum ArtifactIntegrityRequirement {
   // environment and protected against content mutation while consumed. This
   // does not attest mutable guest disks or resistance to host-root compromise.
   ARTIFACT_INTEGRITY_REQUIREMENT_AUTHENTICATED_IMMUTABLE_SOURCES = 1;
-}
-
-message LaunchFirecrackerResponse {
-  uint32 pid = 1;
-  // Acknowledges admission under the requested integrity contract. Empty for
-  // legacy requests; not a retroactive attestation of an adopted running VM.
-  string accepted_environment_reference = 2;
 }
 
 message PreExecSocket {
@@ -142,7 +108,7 @@ message UpdateCgroupResponse {}
 // selects the adapter. Locators supply no trust or artifact identity.
 message LaunchRuntimeRequest {
   // Required even for protected launches; must match verified_runtime.sandbox_id
-  // when verified_runtime is present. Only the legacy launch encoding omits it.
+  // when verified_runtime is present.
   string sandbox_id = 1;
   string execution_id = 2;
   space.execution.v1.RuntimeKind runtime = 3;

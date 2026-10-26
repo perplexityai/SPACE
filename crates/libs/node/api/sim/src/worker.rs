@@ -291,7 +291,7 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
         quarantine_reason_code: None,
         transition_receipt: None,
         state_degraded: false,
-        firecracker_alive: rec.status == status::RUNNING,
+        runtime_alive: rec.status == status::RUNNING,
         vsock_raw_ping_ok: rec.status == status::RUNNING,
         last_guest_ready_at: None,
         last_guest_heartbeat_at: None,
