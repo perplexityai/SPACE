@@ -221,11 +221,20 @@ validates nor changes their flags. The probe checks that precondition, a
 preinstalled SIGCHLD notification handler, a Tokio signal subscriber, and
 PID-specific caller reaping. A redirected descendant survives drain, then exits
 when the caller tears down its workload cgroup.
+
+The concurrent descriptor check samples unrelated execs during 16 startup
+rounds. It detects leaks only when an exec overlaps the inheritable window; it
+does not guarantee a spawn in each round or detection of microsecond
+open-then-fcntl races. Local negative controls widened the PTY and worker-socket
+windows to 50 ms to verify detection, not to measure detection rates for shorter
+windows.
+
 Run it as root in a disposable container with a private cgroup v2 namespace
 (`--privileged --cgroupns private`) and a writable `/sys/fs/cgroup`. Explicitly
 set `SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS=1` to authorize creation and
 cleanup of a test-owned subtree; the test never moves the host or kills the root
-cgroup. The environment also needs a provisioned `nobody` account,
+cgroup. These prerequisites apply to the whole `embedding` test, including its
+existing identity suite. The environment also needs a provisioned `nobody` account,
 `CAP_NET_RAW` and `CAP_SETFCAP`, and a writable filesystem that supports executable
 set-ID and file capabilities (not `nosuid`), using
 `cargo test -p pplx-space-spaced-guest-worker --test embedding`.

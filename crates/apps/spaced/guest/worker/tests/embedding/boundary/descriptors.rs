@@ -29,7 +29,8 @@ impl UnrelatedSpawns {
                 let output = Command::new(&probe)
                     .arg("--descriptor-probe")
                     .stdin(Stdio::null())
-                    .stderr(Stdio::inherit())
+                    // Exclude caller-owned terminals or sockets from the inventory.
+                    .stderr(Stdio::null())
                     .output()
                     .expect("concurrent caller spawn");
                 assert!(output.status.success());
@@ -82,9 +83,9 @@ impl Drop for UnrelatedSpawns {
 
 pub(super) async fn during_startup(boundary: &super::Boundary, probe: &Path) {
     let unrelated = UnrelatedSpawns::start(probe);
-    // A fresh service forces actual socketpair/worker startup each round. The
-    // independent OS thread execs while both worker and PTY setup run, rather
-    // than starting only after their temporary descriptor windows have closed.
+    // A fresh service forces actual socketpair/worker startup each round. This
+    // samples concurrent execs: a leak is detected only if an exec overlaps its
+    // inheritable window, with no guarantee of overlap in any given round.
     for _ in 0..16 {
         let service = boundary.service();
         let filesystem = service.filesystem_service();
