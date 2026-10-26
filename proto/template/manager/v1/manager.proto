@@ -6,6 +6,7 @@ import "sandbox/manager/v1/manager.proto";
 import "execution/v1/execution.proto";
 
 service TemplateManager {
+  rpc GetExecutionCapabilities(GetExecutionCapabilitiesRequest) returns (GetExecutionCapabilitiesResponse);
   // Create a pool for a template.
   rpc CreatePool(CreatePoolRequest) returns (CreatePoolResponse);
 
@@ -276,3 +277,6 @@ message DeleteTemplateBuildRequest {
 }
 
 message DeleteTemplateBuildResponse {}
+
+message GetExecutionCapabilitiesRequest {}
+message GetExecutionCapabilitiesResponse { bool firmware_guests_v1 = 1; }

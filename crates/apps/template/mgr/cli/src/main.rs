@@ -77,6 +77,12 @@ enum Commands {
         template: String,
         #[arg(long, default_value = "latest")]
         tag: String,
+        /// Require firmware-guest support before submitting an opaque image.
+        #[arg(long)]
+        firmware_guest: bool,
+        /// Prepared build.importing.* directory beneath this template's cache directory.
+        #[arg(long)]
+        staging_dir: Option<String>,
         /// Set the template network policy while registering it.
         #[arg(long)]
         network_policy: Option<NetworkPolicyMode>,
@@ -258,7 +264,23 @@ async fn main() -> anyhow::Result<()> {
             template,
             tag,
             network_policy,
+            firmware_guest,
+            staging_dir,
         } => {
+            if firmware_guest {
+                let capabilities = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.get_execution_capabilities(
+                        pplx_space_template_mgr_client::proto::GetExecutionCapabilitiesRequest {},
+                    ),
+                )
+                .await??
+                .into_inner();
+                anyhow::ensure!(
+                    capabilities.firmware_guests_v1,
+                    "template-manager does not acknowledge standalone firmware guest support"
+                );
+            }
             if network_policy.is_some() {
                 warn_if_inbound_reconciliation_active(FACET_NETWORK_POLICY).await;
             }
@@ -270,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
                         tag: Some(tag),
                     }),
                     network_policy: network_policy.map(NetworkPolicyMode::to_proto),
-                    staging_dir: None,
+                    staging_dir,
                 })
                 .await?;
             let r = resp.into_inner();
