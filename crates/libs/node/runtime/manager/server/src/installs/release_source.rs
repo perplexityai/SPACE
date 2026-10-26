@@ -18,6 +18,10 @@ use super::source::BoxError;
 pub const FIRECRACKER_RELEASE_SOURCE: &str =
     "https://github.com/firecracker-microvm/firecracker/releases/download";
 
+/// Cloud Hypervisor's static executable release downloads.
+pub const CLOUD_HYPERVISOR_RELEASE_SOURCE: &str =
+    "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download";
+
 /// An `https://` URL with a host and no query: a release source's download
 /// base or an archive under it. The path can be extended with
 /// [`ReleaseUrl::join`] without re-parsing.
