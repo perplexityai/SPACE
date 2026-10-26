@@ -238,6 +238,39 @@ fn a_managed_copy_of_the_image_kernel_is_verified_and_removable() {
         0o644
     );
 
+    // A shared directory prefix must never authorize different full bytes.
+    let mut collision = kernel("6.1.155", 8192);
+    let Digest::Sha256(mut bytes) = collision.sha256 else {
+        panic!("kernel pins use SHA-256");
+    };
+    *bytes.last_mut().unwrap() ^= 1;
+    collision.sha256 = Digest::sha256(bytes);
+    assert_eq!(
+        managed_kernel_directory(&collision.version, collision.sha256),
+        published.path.file_name().unwrap().to_str().unwrap()
+    );
+    let error = fixture
+        .store
+        .publish_kernel(&collision, &staged("job-2"))
+        .unwrap_err();
+    assert!(
+        matches!(error, PublishError::ExistingArtifact(_)),
+        "{error}"
+    );
+    fixture
+        .store
+        .verify_kernel_at(&collision, &installed)
+        .unwrap_err();
+    let error = fixture
+        .store
+        .remove_kernel(&collision.version, collision.sha256)
+        .unwrap_err();
+    assert!(
+        matches!(error, RemoveError::IdentityChanged { .. }),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&installed).unwrap(), image);
+
     let version = ArtifactVersion::parse("6.1.155").unwrap();
     assert!(matches!(
         fixture
