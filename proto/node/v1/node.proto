@@ -4,6 +4,13 @@ package space.node.v1;
 import "execution/v1/execution.proto";
 
 service NodeManager {
+  rpc GetExecutionCapabilities(GetExecutionCapabilitiesRequest) returns (GetExecutionCapabilitiesResponse);
+  // Operator-only hardware enrollment and retirement. Enrollment always
+  // quarantines; execution callers cannot claim that a device is clean.
+  rpc ListDeviceParents(ListDeviceParentsRequest) returns (ListDeviceParentsResponse);
+  rpc EnrollDeviceParent(EnrollDeviceParentRequest) returns (EnrollDeviceParentResponse);
+  rpc RequalifyDeviceParent(RequalifyDeviceParentRequest) returns (RequalifyDeviceParentResponse);
+  rpc RetireDeviceParent(RetireDeviceParentRequest) returns (RetireDeviceParentResponse);
   // Publish the concrete runtime releases, state formats, and guest components
   // installed on this node. Compatibility remains runtime-driver-owned.
   rpc GetExecutionInventory(GetExecutionInventoryRequest)
@@ -348,6 +355,75 @@ service NodeManager {
 
 }
 
+enum DeviceParentState {
+  DEVICE_PARENT_STATE_UNSPECIFIED = 0;
+  DEVICE_PARENT_STATE_QUARANTINED = 1;
+  DEVICE_PARENT_STATE_READY = 2;
+  DEVICE_PARENT_STATE_SANITIZING = 3;
+  DEVICE_PARENT_STATE_RETIRED = 4;
+}
+
+message DeviceParentRecord {
+  string parent_id = 1;
+  string profile = 2;
+  repeated string host_device_ids = 3;
+  DeviceParentState state = 4;
+  uint64 revision = 5;
+  string qualification_digest = 6;
+  // Present only when the server supplied a consistent ownership snapshot.
+  // Absent means unknown availability, never free capacity.
+  DeviceParentUsage usage = 7;
+}
+message DeviceParentUsage {
+  // Observed eligibility, not a reservation or request-specific launch guarantee.
+  bool allocatable = 1;
+  repeated DeviceAllocationRecord allocations = 2;
+}
+enum DeviceAllocationState {
+  DEVICE_ALLOCATION_STATE_UNSPECIFIED = 0;
+  DEVICE_ALLOCATION_STATE_RESERVED = 1;
+  DEVICE_ALLOCATION_STATE_ATTACHING = 2;
+  DEVICE_ALLOCATION_STATE_ATTACHED = 3;
+  DEVICE_ALLOCATION_STATE_RELEASING = 4;
+  DEVICE_ALLOCATION_STATE_QUARANTINED = 5;
+}
+message DeviceAllocationRecord {
+  space.execution.v1.ExclusiveDeviceAssignment assignment = 1;
+  DeviceAllocationState state = 2;
+  string execution_id = 3;
+  oneof owner {
+    string sandbox_id = 4;
+    string sanitizer_procedure_digest = 5;
+  }
+}
+message ListDeviceParentsRequest {}
+message ListDeviceParentsResponse {
+  // Bounded active enrollment inventory, including quarantined parents.
+  repeated DeviceParentRecord parents = 1;
+}
+message EnrollDeviceParentRequest {
+  string profile = 1;
+  repeated string host_device_ids = 2;
+}
+message EnrollDeviceParentResponse { DeviceParentRecord parent = 1; }
+message RequalifyDeviceParentRequest {
+  string parent_id = 1;
+  uint64 expected_revision = 2;
+  string qualification_digest = 3;
+}
+message RequalifyDeviceParentResponse {
+  string parent_id = 1;
+  uint64 revision = 2;
+}
+message RetireDeviceParentRequest {
+  string parent_id = 1;
+  uint64 expected_revision = 2;
+}
+message RetireDeviceParentResponse {
+  string parent_id = 1;
+  uint64 revision = 2;
+}
+
 message GetExecutionInventoryRequest {}
 
 message ResolveExecutionEnvironmentRequest {
@@ -436,6 +512,8 @@ message AllocateRequest {
   // Required (non-zero) when the request creates a new lease.
   uint64 sandbox_cgroup_memory_mib = 3;
   ExecutionFence execution_fence = 4;
+  // Required identity for device work; sandbox_id must be empty.
+  space.execution.v1.DeviceAllocationInput device_allocation = 5;
 }
 
 message AllocateResponse {
@@ -450,6 +528,7 @@ message AllocateResponse {
   string slot_label = 9;
   // Slot-derived UID that owns lease-scoped host resources.
   uint32 sandbox_uid = 10;
+  space.execution.v1.DeviceAcknowledgement devices = 11;
 }
 
 message LaunchRequest {
@@ -638,12 +717,15 @@ message LaunchSandboxRequest {
   // still exists as the dm-snapshot origin behind the mapper.
   optional string rootfs_block_device_path = 11;
   ExecutionFence execution_fence = 12;
+  // Required identity for device work; sandbox_id must be empty.
+  space.execution.v1.DeviceExecutionInput device_execution = 13;
 }
 
 message LaunchSandboxResponse {
   uint32 pid = 1;              // Sandbox PID (observed from host)
   string api_socket_path = 2; // Adapter-owned control endpoint; callers must use node-manager for control.
   space.execution.v1.ExecutionMetadata resolved_execution = 3;
+  space.execution.v1.DeviceAcknowledgement devices = 4;
 }
 
 message PrepareSandboxRequest {
@@ -661,6 +743,8 @@ message PrepareSandboxRequest {
   optional string artifact_template = 12;
   optional string content_hash = 13;
   ExecutionFence execution_fence = 14;
+  // Required identity for device work; sandbox_id must be empty.
+  space.execution.v1.DeviceExecutionInput device_execution = 15;
 }
 
 message PrepareSandboxResponse {
@@ -670,6 +754,7 @@ message PrepareSandboxResponse {
   string config_path = 4;        // full path to vm-config.json
   string log_path = 5;           // full path to the adapter log
   space.execution.v1.ExecutionMetadata resolved_execution = 6;
+  space.execution.v1.DeviceAcknowledgement devices = 7;
 }
 
 message ReservePreparedRootfsRequest {
@@ -1363,3 +1448,9 @@ message RestoreVmStateRequest {
   DriveRateLimit rootfs_rate_limit = 5;
 }
 message RestoreVmStateResponse {}
+
+message GetExecutionCapabilitiesRequest {}
+message GetExecutionCapabilitiesResponse {
+  // Protocol support, not availability or qualification of a device profile.
+  bool exclusive_devices_v1 = 1;
+}

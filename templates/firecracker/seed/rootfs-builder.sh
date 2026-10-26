@@ -318,6 +318,7 @@ if [[ -n "$KERNEL_VERSION" ]]; then
 EOF
 )
 fi
+BOOT_COMPONENTS="${SPACE_SEED_BOOT_COMPONENTS:-[${KERNEL_COMPONENT}]}"
 UBUNTU_APT_MIRROR="${SPACE_UBUNTU_APT_MIRROR:-https://archive.ubuntu.com/ubuntu}"
 
 # ── Download Ubuntu Minimal Cloud squashfs ───────────────────────────────────
@@ -925,7 +926,7 @@ cat > "${OUTPUT}/metadata.json" <<EOF
       "architecture": "${ARCH}"
     },
     "state_format": ${STATE_FORMAT_JSON},
-    "components": [${KERNEL_COMPONENT}]
+    "components": ${BOOT_COMPONENTS}
   },
   "id": "${ID}",
   "name": "seed",

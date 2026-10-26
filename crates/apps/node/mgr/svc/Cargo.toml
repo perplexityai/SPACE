@@ -15,6 +15,8 @@ name = "space-nodemgr-svc"
 path = "src/main.rs"
 
 [features]
+# Isolated hardware qualification only; excluded from production builds.
+gpu-development = ["pplx-space-node-mgr/gpu-development"]
 default = []
 otel = [
     "pplx-space-common-svc/otel",
