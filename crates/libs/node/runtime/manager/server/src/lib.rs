@@ -14,12 +14,13 @@ mod service;
 #[cfg(feature = "github")]
 pub use installs::GitHubReleaseSourceError;
 pub use installs::{
-    BoxError, ByteChunks, ContentMd5, ContentMd5ParseError, FIRECRACKER_CI_KERNEL_SOURCE,
-    FIRECRACKER_RELEASE_SOURCE, InstallLimits, KernelSource, KernelVersion,
-    KernelVersionParseError, OpenInstallerError, PrepareStagingError, ReleaseArchiveMember,
-    ReleaseChunks, ReleaseConfigurationError, ReleaseLine, ReleaseLineParseError, ReleasePayload,
-    ReleaseSource, ReleaseSourceError, ReleaseUrl, ReleaseUrlParseError, RuntimeLine, SourceError,
-    SourceKernel, StagingError, StoreError, VerifiableKernel, VerifiableRelease,
+    BoxError, ByteChunks, CLOUD_HYPERVISOR_RELEASE_SOURCE, ContentMd5, ContentMd5ParseError,
+    FIRECRACKER_CI_KERNEL_SOURCE, FIRECRACKER_RELEASE_SOURCE, InstallLimits, KernelSource,
+    KernelVersion, KernelVersionParseError, OpenInstallerError, PrepareStagingError,
+    ReleaseArchiveMember, ReleaseChunks, ReleaseConfigurationError, ReleaseLine,
+    ReleaseLineParseError, ReleasePayload, ReleaseSource, ReleaseSourceError, ReleaseUrl,
+    ReleaseUrlParseError, RuntimeLine, SourceError, SourceKernel, StagingError, StoreError,
+    VerifiableKernel, VerifiableRelease,
 };
 pub use run::{
     DEFAULT_INSTALL_LIMITS, DEFAULT_LIST_ADMISSION_TIMEOUT, DEFAULT_SCAN_LIMITS,
