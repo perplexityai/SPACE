@@ -985,34 +985,50 @@ async fn an_attach_after_a_not_running_refusal_resolves_its_route_again() {
     if !binding_fake_test_process() {
         return;
     }
-    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
-    let fake = spawn_process_fake(
-        session_id,
-        FakeRoute::unbound(),
-        None,
-        Arc::new(|_, _| {
-            vec![FakeReply::Refuse(
-                pplx_space_common_grpc::mark_sandbox_not_running(
-                    tonic::Status::failed_precondition("synthetic refusal"),
-                    "stopped",
-                ),
-            )]
-        }),
-    )
-    .await;
-    let state = fake_state(&fake.endpoint).await;
-    let lookups = || {
-        fake.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|path| path.ends_with("/ResolveDataPlaneSessionRoute"))
-            .count()
-    };
-    for attach in 1..=2 {
-        let response = get_session_events(&state, session_id, None).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT, "attach {attach}");
-        assert_eq!(lookups(), attach, "attach {attach} asked the resolver");
+    for (kind, adapter_state) in [
+        (SessionKind::Process, FakeRoute::unbound().adapter_state),
+        (SessionKind::FileWatch, r#"{"path":"/tmp"}"#),
+    ] {
+        let session_id = DataPlaneSessionId::new_for_kind(kind);
+        let fake = spawn_process_fake(
+            session_id,
+            FakeRoute {
+                adapter_state,
+                ..FakeRoute::unbound()
+            },
+            None,
+            Arc::new(|_, _| {
+                vec![FakeReply::Refuse(
+                    pplx_space_common_grpc::mark_sandbox_not_running(
+                        tonic::Status::failed_precondition("synthetic refusal"),
+                        "stopped",
+                    ),
+                )]
+            }),
+        )
+        .await;
+        let state = fake_state(&fake.endpoint).await;
+        let lookups = || {
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.ends_with("/ResolveDataPlaneSessionRoute"))
+                .count()
+        };
+        for attach in 1..=2 {
+            let response = get_session_events(&state, session_id, None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "{kind:?} attach {attach}"
+            );
+            assert_eq!(
+                lookups(),
+                attach,
+                "{kind:?} attach {attach} asked the resolver"
+            );
+        }
     }
 }
 
@@ -2449,7 +2465,11 @@ async fn spawn_process_fake(
             if path.ends_with("/RecordDataPlaneSessionReconnect") {
                 return crate::tests::grpc_test_response(Vec::new());
             }
-            let open = if path.ends_with("/SpacedStartProcess") {
+            let open = if path.ends_with("/SpacedWatch") {
+                // A file-watch session's watch is answered as a start, so a
+                // test can refuse it.
+                FakeOpen::Start
+            } else if path.ends_with("/SpacedStartProcess") {
                 let body = request.into_body().collect().await.unwrap().to_bytes();
                 let start = SpacedStartProcessRequest::decode(&body[5..]).unwrap();
                 started_stdin
@@ -3447,13 +3467,17 @@ async fn a_sandbox_not_running_refusal_is_a_final_conflict_on_both_transports() 
             }));
         }
         let details = serde_json::Value::Array(details);
-        let response = process_stream_start_http_error(&error, sandbox_id);
-        assert_eq!(response.status(), StatusCode::CONFLICT, "{node_state}");
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"]["code"], "conflict", "{body}");
-        assert_eq!(body["error"]["retryable"], false, "{body}");
-        assert_eq!(body["error"]["details"], details, "{body}");
+        for response in [
+            process_stream_start_http_error(&error, sandbox_id),
+            file_watch_stream_start_http_error(&error, sandbox_id),
+        ] {
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{node_state}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], "conflict", "{body}");
+            assert_eq!(body["error"]["retryable"], false, "{body}");
+            assert_eq!(body["error"]["details"], details, "{body}");
+        }
 
         let frame = serde_json::to_value(stream_start_error_frame(&error, sandbox_id)).unwrap();
         assert_eq!(frame["type"], "error", "{frame}");

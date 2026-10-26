@@ -239,6 +239,28 @@ pub(super) fn forget_route_of_refused_sandbox(
     }
 }
 
+pub(super) fn file_watch_stream_start_http_error(
+    error: &StreamBridgeError,
+    sandbox_id: SandboxId,
+) -> Response {
+    if let Some(response) = backend_refusal_http_error(error) {
+        return response;
+    }
+    // As for a process: the watch cannot open until the caller wakes or
+    // starts the sandbox, so retrying the attach alone would never succeed.
+    if let Some(refusal) = sandbox_not_running(error, sandbox_id) {
+        return refusal.http_error(ResponseOrigin::Node, ResponseKind::BackendStatus);
+    }
+    data_plane_http_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        DataPlaneHttpErrorCode::StreamUnavailable,
+        "file-watch stream is not available",
+        true,
+        ResponseOrigin::Node,
+        ResponseKind::BackendTransport,
+    )
+}
+
 pub(super) fn process_stream_start_http_error(
     error: &StreamBridgeError,
     sandbox_id: SandboxId,
