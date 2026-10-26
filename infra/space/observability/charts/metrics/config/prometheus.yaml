@@ -23,3 +23,26 @@ scrape_configs:
   - job_name: prometheus
     static_configs:
       - targets: [localhost:9090]
+{{- with .Values.scrape.infraMetrics }}
+{{- if .namespace }}
+  # Cluster and host metric sources from the space-infra-metrics release.
+  # Scraped cross-namespace, so the metrics NetworkPolicy needs matching
+  # egress and that release needs this namespace in its scrapePeers.
+  {{- if .kubeStateMetrics }}
+  - job_name: kube-state-metrics
+    static_configs:
+      - targets: [kube-state-metrics.{{ .namespace }}.svc.cluster.local:8080]
+  {{- end }}
+  {{- if .processExporter }}
+  - job_name: process-exporter
+    # DNS discovery over the headless Service, not kubernetes_sd: the A record
+    # already returns one address per DaemonSet pod, so this needs no
+    # ServiceAccount and no cluster-wide read. Prometheus here has neither.
+    dns_sd_configs:
+      - names: [process-exporter.{{ .namespace }}.svc.cluster.local]
+        type: A
+        port: 9256
+        refresh_interval: 30s
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,12 @@
+apiVersion: v2
+name: space-infra-metrics
+description: >-
+  Opt-in cluster and host metric sources scraped by the metrics release:
+  kube-state-metrics for Kubernetes object state and process-exporter for
+  per-process CPU and memory. Neither is an application producer.
+type: application
+version: 0.1.0
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: "file://../common"

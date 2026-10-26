@@ -1,0 +1,10 @@
+profile: kind
+# Kind disables NetworkPolicy, so the policy is not rendered rather than
+# rendered and silently unenforced.
+networkPolicy:
+  enabled: false
+kubeStateMetrics:
+  enabled: true
+processExporter:
+  enabled: true
+  acknowledgeHostPid: true
