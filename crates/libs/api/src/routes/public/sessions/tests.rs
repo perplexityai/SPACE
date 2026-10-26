@@ -917,6 +917,30 @@ mod not_running {
             }
         }
 
+        // A start queued since the resolver looked is about to place a
+        // stopped sandbox: keep waiting, with no wake of its own.
+        let sandbox_id = sandbox(&fixture, "stopped", &["command"]).await?;
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/sandboxes/{sandbox_id}:start"))
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("idempotency-key", Uuid::now_v7().to_string())
+            .body(Body::empty())?;
+        assert_eq!(
+            fixture.app.clone().oneshot(request).await?.status(),
+            StatusCode::ACCEPTED
+        );
+        let stored =
+            crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                .await?
+                .expect("seeded sandbox");
+        assert!(
+            queue_implicit_wake(&fixture.db.pool, &stored, Command)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+        );
+        assert!(wake_markers(&fixture, sandbox_id).await?.is_empty());
+
         // A new command's wake is a command's.
         let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
         let (status, _, body) = command(&fixture, sandbox_id, "commands").await?;

@@ -334,8 +334,9 @@ async fn enqueue_implicit_wake(
 /// wake it, as the node will judge that activity. For the session route
 /// resolver, whose attach found the sandbox with no node: answers whether
 /// the attach should keep waiting. A sandbox that is running or heading there
-/// again since the resolver looked needs no wake and keeps waiting too; only
-/// one nothing can wake for `activity` answers no.
+/// again since the resolver looked needs no wake and keeps waiting too, as
+/// does one a start, resume, restore or wake queued since then is about to
+/// place; only one nothing can wake for `activity` answers no.
 pub(crate) async fn queue_implicit_wake(
     pool: &sqlx::PgPool,
     sandbox: &Sandbox,
@@ -344,7 +345,21 @@ pub(crate) async fn queue_implicit_wake(
     let lifecycle = sandbox_lifecycle(sandbox)?;
     match activity_admission(activity, lifecycle, &sandbox.auto_lifecycle.0) {
         CommandAdmission::Admit => Ok(true),
-        CommandAdmission::Refuse => Ok(false),
+        CommandAdmission::Refuse => {
+            let sandbox_id = PublicSandboxId::from(sandbox.id);
+            let observed = pplx_space_sandbox_store::activation_observation(
+                pool,
+                sandbox.org_id,
+                sandbox.id,
+                &sandbox_id.to_string(),
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(sandbox_id = %sandbox.id, %error, "could not read pending activations");
+                PublicApiError::internal()
+            })?;
+            Ok(observed.is_some_and(|observed| observed.activation_pending))
+        }
         CommandAdmission::AdmitAndWake => {
             let sandbox_id = PublicSandboxId::from(sandbox.id);
             enqueue_implicit_wake(pool, sandbox.org_id, sandbox_id, activity).await?;
