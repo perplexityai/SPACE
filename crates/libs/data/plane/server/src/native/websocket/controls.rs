@@ -60,6 +60,7 @@ where
                 SpacedSendInputRequest {
                     sandbox_id: attached.sandbox_id.to_string(),
                     operation: Some(SendInputRequest {
+                        recovery: None,
                         process_id: process_id.to_string(),
                         data,
                     }),
@@ -108,6 +109,7 @@ where
                 SpacedResizePtyRequest {
                     sandbox_id: attached.sandbox_id.to_string(),
                     operation: Some(ResizePtyRequest {
+                        recovery: None,
                         process_id: process_id.to_string(),
                         size: Some(PtySize {
                             rows: u32::from(rows),
@@ -161,6 +163,7 @@ where
                 SpacedSendSignalRequest {
                     sandbox_id: attached.sandbox_id.to_string(),
                     operation: Some(SendSignalRequest {
+                        recovery: None,
                         process_id: process_id.to_string(),
                         signal,
                     }),
@@ -194,6 +197,7 @@ where
                 SpacedCloseStdinRequest {
                     sandbox_id: attached.sandbox_id.to_string(),
                     operation: Some(CloseStdinRequest {
+                        recovery: None,
                         process_id: process_id.to_string(),
                     }),
                 },

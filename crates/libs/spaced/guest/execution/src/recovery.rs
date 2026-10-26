@@ -1,7 +1,10 @@
 //! Recovery lifetime and fixed-size request binding; no request payload is retained.
 use aws_lc_rs::digest::{Context, SHA256};
 use pplx_space_common_core::types::ProcessRecoveryToken;
-use pplx_space_spaced_guest_protocol::{proto::operations::StartRequest, recovery::RecoveryFence};
+use pplx_space_spaced_guest_protocol::{
+    proto::operations::StartRequest,
+    recovery::{RecoveryFence, RecoveryReason},
+};
 use prost::Message;
 use tonic::Status;
 
@@ -71,7 +74,7 @@ pub(super) struct RecoveryState {
 impl RecoveryState {
     pub(super) fn check(&self, fence: RecoveryFence) -> Result<(), Status> {
         if self.instance != fence.instance {
-            return Err(Status::failed_precondition("execution engine restarted"));
+            return Err(RecoveryReason::EngineRestarted.into_status());
         }
         match *self
             .activation
@@ -82,7 +85,7 @@ impl RecoveryState {
                 "process recovery is temporarily unavailable",
             )),
             Some(current) if current != fence.activation => {
-                Err(Status::failed_precondition("execution activation changed"))
+                Err(RecoveryReason::ActivationChanged.into_status())
             }
             Some(_) => Ok(()),
         }

@@ -93,6 +93,7 @@ pub(super) struct ProcessRecord {
     // RPCs can retain a completed record beyond registry eviction.
     pub(super) _record_slot: OwnedSemaphorePermit,
     pub(super) started: ProcessEvent,
+    pub(super) recovery_identity: Option<recovery::RecoveryIdentity>,
     /// What `list` reports, without `env`.
     pub(super) info: ProcessInfo,
     /// Up to 64 KiB, kept apart from `info` so a finished record can drop it
@@ -104,8 +105,36 @@ pub(super) struct ProcessRecord {
 }
 
 impl ProcessRecord {
+    pub(super) fn replay(
+        &self,
+        output_cursor: Option<u64>,
+        from_oldest_retained: bool,
+        resume_after_output_gap: bool,
+    ) -> ProcessReplay {
+        if output_cursor.is_none()
+            && let Some(exit) = self.journal.exit()
+        {
+            return ProcessReplay::Completed {
+                started: self.started.clone(),
+                exit,
+            };
+        }
+        ProcessReplay::Running {
+            started: self.started.clone(),
+            cursor: self.journal.cursor(
+                output_cursor,
+                from_oldest_retained,
+                resume_after_output_gap.then(|| OutputGapResume {
+                    process_id: self.started.process_id.clone(),
+                    pid: self.started.pid,
+                }),
+            ),
+        }
+    }
+
     pub(super) fn new(
         started: ProcessEvent,
+        recovery_identity: Option<recovery::RecoveryIdentity>,
         mut info: ProcessInfo,
         input: ProcessInput,
         signal_handle: ProcessSignalHandle,
@@ -115,6 +144,7 @@ impl ProcessRecord {
         Self {
             _record_slot: reservation.record_slot,
             started,
+            recovery_identity,
             info,
             env: std::sync::Mutex::new(env),
             input,
@@ -264,6 +294,7 @@ impl ProcessRegistry {
         Some(record)
     }
 
+    #[cfg(test)]
     pub(super) fn get_running(&self, process_id: &ProcessId) -> Option<Arc<ProcessRecord>> {
         let record = self.get_record(process_id)?;
         if record.journal.is_completed() {
@@ -280,25 +311,7 @@ impl ProcessRegistry {
         resume_after_output_gap: bool,
     ) -> Option<ProcessReplay> {
         let record = self.get_record(process_id)?;
-        if output_cursor.is_none()
-            && let Some(exit) = record.journal.exit()
-        {
-            return Some(ProcessReplay::Completed {
-                started: record.started.clone(),
-                exit,
-            });
-        }
-        Some(ProcessReplay::Running {
-            started: record.started.clone(),
-            cursor: record.journal.cursor(
-                output_cursor,
-                from_oldest_retained,
-                resume_after_output_gap.then(|| OutputGapResume {
-                    process_id: record.started.process_id.clone(),
-                    pid: record.started.pid,
-                }),
-            ),
-        })
+        Some(record.replay(output_cursor, from_oldest_retained, resume_after_output_gap))
     }
 
     /// Removes completed records whose retention has ended. One task at most:
