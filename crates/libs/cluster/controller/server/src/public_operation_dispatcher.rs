@@ -378,9 +378,10 @@ pub async fn run<E>(
     // so without this line an over-ceiling setting looks like it took effect.
     let concurrency = config.execution_concurrency.max(1);
     let delete_reserved_slots = config.delete_reserved_slots.min(concurrency - 1);
+    // At least one slot always stays open to teardowns too.
     let non_delete_reserved_slots = config
         .non_delete_reserved_slots
-        .min(concurrency - delete_reserved_slots);
+        .min(concurrency - delete_reserved_slots.max(1));
     tracing::info!(
         execution_concurrency = config.execution_concurrency,
         delete_reserved_slots,
@@ -450,9 +451,16 @@ pub async fn run<E>(
                 }
                 let free_other = other_concurrency.saturating_sub(other_tasks.len());
                 // While other work is due, teardowns leave free the last
-                // slots other work may use, however many it already holds.
+                // slots other work may use, however many it already holds,
+                // but never the free slots owed to teardowns: what is left
+                // of their reservation or, with none, one while none runs.
+                let teardown_tasks = in_flight.len().saturating_sub(other_tasks.len());
+                let owed_to_teardowns = delete_reserved_slots
+                    .max(1)
+                    .saturating_sub(teardown_tasks)
+                    .min(free);
                 let free_teardown_while_other_due =
-                    free - non_delete_reserved_slots.min(free_other.min(free));
+                    free - non_delete_reserved_slots.min(free - owed_to_teardowns);
                 #[cfg(test)]
                 tests::before_claim().await;
                 let started = Instant::now();

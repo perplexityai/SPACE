@@ -473,3 +473,72 @@ async fn a_claim_only_teardowns_could_use_waits_before_the_next() -> TestResult 
     tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_teardown_still_starts_with_no_reservation_and_a_floor_at_every_slot() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let first = queue_all(
+        &store,
+        org_id,
+        &[(OperationKind::CreateSandbox, "sbx_first_held_create")],
+    )
+    .await?[0];
+    let mut operations = queue_all(
+        &store,
+        org_id,
+        &[
+            (OperationKind::DeleteSandbox, "sbx_unreserved_delete"),
+            (OperationKind::CreateSandbox, "sbx_second_held_create"),
+            (OperationKind::CreateSandbox, "sbx_third_held_create"),
+        ],
+    )
+    .await?;
+    let [delete, second, third] = operations[..] else {
+        unreachable!("three operations were queued");
+    };
+    set_due(&db.pool, &operations, false).await?;
+    let executor = HeldWork {
+        hold_teardowns: true,
+        ..HeldWork::default()
+    };
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        ReconcilerConfig {
+            delete_reserved_slots: 0,
+            non_delete_reserved_slots: 3,
+            ..fast_loop_config(3)
+        },
+        store.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    wait_for_running(&executor, 1).await?;
+    set_due(&db.pool, &operations, true).await?;
+
+    // The floor leaves the delete one slot, and the second create the other.
+    wait_for_running(&executor, 3).await?;
+    for (operation, state) in [
+        (delete, OperationState::Running),
+        (second, OperationState::Running),
+        (third, OperationState::Queued),
+    ] {
+        assert_eq!(
+            operation_state(&db.pool, operation).await?,
+            state.as_str(),
+            "{operation}"
+        );
+    }
+
+    executor.release.cancel();
+    operations.push(first);
+    for operation in operations {
+        wait_for_state(&db.pool, operation, OperationState::Succeeded).await?;
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}
