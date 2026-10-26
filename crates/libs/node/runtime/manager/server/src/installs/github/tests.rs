@@ -4,7 +4,11 @@ use super::*;
 use crate::installs::release_source::FIRECRACKER_RELEASE_SOURCE;
 
 fn source() -> GitHubReleaseSource {
-    GitHubReleaseSource::new(FIRECRACKER_RELEASE_SOURCE.parse().unwrap()).unwrap()
+    GitHubReleaseSource::new(
+        GitHubRuntime::Firecracker,
+        FIRECRACKER_RELEASE_SOURCE.parse().unwrap(),
+    )
+    .unwrap()
 }
 
 fn release(version: &str) -> RuntimeIdentity {
@@ -67,4 +71,41 @@ async fn every_compiled_release_pin_matches_its_published_checksum() {
         }
     }
     assert!(checked >= 8, "{checked}");
+}
+
+#[test]
+fn cloud_hypervisor_uses_the_upstream_static_asset_without_a_jailer_or_archive() {
+    use crate::installs::release_source::CLOUD_HYPERVISOR_RELEASE_SOURCE;
+    let source = GitHubReleaseSource::new(
+        GitHubRuntime::CloudHypervisor,
+        CLOUD_HYPERVISOR_RELEASE_SOURCE.parse().unwrap(),
+    )
+    .unwrap();
+    let release = RuntimeIdentity {
+        kind: RuntimeKind::CloudHypervisor,
+        version: "54.0".parse().unwrap(),
+    };
+    for (architecture, asset) in [
+        (Arch::Aarch64, "cloud-hypervisor-static-aarch64"),
+        (Arch::X86_64, "cloud-hypervisor-static"),
+    ] {
+        let location = source.archive(&release, architecture);
+        assert_eq!(
+            location.as_str(),
+            format!(
+                "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/{asset}"
+            )
+        );
+        assert_eq!(
+            source.payload(&release, architecture),
+            ReleasePayload::Executable
+        );
+        assert!(source.holds(&location));
+    }
+    let foreign = FIRECRACKER_RELEASE_SOURCE
+        .parse::<ReleaseUrl>()
+        .unwrap()
+        .join("v1.15.1")
+        .join("firecracker-v1.15.1-aarch64.tgz");
+    assert!(!source.holds(&foreign));
 }
