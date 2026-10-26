@@ -86,6 +86,7 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
                 progress_message: result.progress_message,
                 retry_after: Duration::ZERO,
                 count_attempt: false,
+                undo_first_start: false,
             })
             .await?
     );

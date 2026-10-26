@@ -324,6 +324,7 @@ async fn claim_holds_back_operations_behind_their_sandboxs_live_or_earlier_work(
             progress_message: "retry".to_string(),
             retry_after: Duration::from_secs(300),
             count_attempt: true,
+            undo_first_start: false,
         })
         .await?;
     assert!(claimed_ids(&claim_all(&store).await?).is_empty());
@@ -406,6 +407,7 @@ async fn delete_supersedes_backed_off_work_but_not_a_pending_create() -> TestRes
             progress_message: "deferring restore".to_string(),
             retry_after: Duration::from_secs(300),
             count_attempt: true,
+            undo_first_start: false,
         })
         .await?;
     assert_eq!(claimed_ids(&claim_all(&store).await?), vec![delete]);
@@ -458,6 +460,7 @@ async fn stale_claim_recovery_keeps_the_sandboxs_order() -> TestResult {
                 progress_message: "late".to_string(),
                 retry_after: Duration::from_secs(1),
                 count_attempt: true,
+                undo_first_start: false,
             })
             .await?
     );

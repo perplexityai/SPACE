@@ -534,6 +534,7 @@ async fn hand_back_busy_key(
             progress_message: "waiting for an earlier operation on the same sandbox".to_owned(),
             retry_after,
             count_attempt: false,
+            undo_first_start: operation.is_first_start(),
         })
         .await
     {

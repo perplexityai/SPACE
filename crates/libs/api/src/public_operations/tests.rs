@@ -809,6 +809,7 @@ async fn release_claimed_operation_requeues_with_backoff() -> TestResult {
                 // Sub-second precision is kept, so jitter is not rounded off.
                 retry_after: Duration::from_millis(300_500),
                 count_attempt: true,
+                undo_first_start: false,
             })
             .await?
     );
@@ -871,6 +872,7 @@ async fn backpressure_release_rolls_back_claim_attempt() -> TestResult {
                 progress_message: "cluster admission rate limited".to_string(),
                 retry_after: Duration::ZERO,
                 count_attempt: false,
+                undo_first_start: false,
             })
             .await?
     );

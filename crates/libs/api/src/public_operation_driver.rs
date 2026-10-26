@@ -554,6 +554,7 @@ where
                         // Expected workflow progress and activation admission
                         // waits do not consume the transient-failure budget.
                         count_attempt: !preserve_retry_budget,
+                        undo_first_start: false,
                     })
                     .await?;
                 if updated {

@@ -1352,6 +1352,11 @@ impl ClaimedPublicOperation {
         }
         self.target_id.as_deref()
     }
+
+    /// Whether this claim was the operation's first start.
+    pub fn is_first_start(&self) -> bool {
+        self.age_at_first_claim_secs.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1452,6 +1457,11 @@ pub struct ReleaseClaimedPublicOperation {
     /// `attempts` increment is rolled back so a long limiter wait never
     /// exhausts the budget for a later ordinary error.
     pub count_attempt: bool,
+    /// Whether the claim's start is undone too: `true` for a claim that was
+    /// the operation's first start and handed it back without running it.
+    /// The operation then still reads as never started, so it can expire
+    /// unrun past its deadline.
+    pub undo_first_start: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2118,6 +2128,7 @@ async fn release_claimed_operation(
              progress_message = $4,
              next_attempt_at = NOW() + make_interval(secs => $5::DOUBLE PRECISION),
              attempts = GREATEST(attempts - CASE WHEN $7 THEN 0 ELSE 1 END, 0),
+             started_at = CASE WHEN $8 THEN NULL ELSE started_at END,
              updated_at = NOW()
          WHERE operation_id = $1
            AND claim_token = $2
@@ -2131,6 +2142,7 @@ async fn release_claimed_operation(
     .bind(input.retry_after.as_secs_f64())
     .bind(OperationState::Running.as_str())
     .bind(input.count_attempt)
+    .bind(input.undo_first_start)
     .fetch_optional(&mut *tx)
     .await?;
 

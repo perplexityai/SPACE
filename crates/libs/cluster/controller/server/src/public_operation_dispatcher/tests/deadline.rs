@@ -192,6 +192,52 @@ async fn work_first_claimed_past_its_deadline_expires_unrun_but_started_work_and
 }
 
 #[tokio::test]
+async fn work_handed_back_unrun_at_its_first_claim_still_expires_past_its_deadline() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let pause = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::PauseSandbox,
+        "sbx_handed_back_pause",
+    )
+    .await?;
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limit: 64,
+            claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
+            claimable_kinds: NATIVE_PUBLIC_OPERATION_KINDS,
+        })
+        .await?;
+    let operation = claim
+        .operations
+        .into_iter()
+        .next()
+        .expect("the pause is claimed");
+    // Its sandbox was still executing here, so the dispatcher hands the pause
+    // back without running it.
+    hand_back_busy_key(store.clone(), claim.claim_token, operation, Duration::ZERO).await;
+    backdate_operations(&db.pool, &[pause]).await?;
+    let executor = RecordingExecutor::default();
+    let config = ReconcilerConfig {
+        claim_limit: 64,
+        execution_concurrency: 8,
+        ..ReconcilerConfig::default()
+    };
+
+    let report = tick(&config, &store, &executor).await?;
+
+    assert_eq!((report.expired, report.succeeded), (1, 0), "{report:?}");
+    assert!(executor.ran().is_empty());
+    assert_expired(&store, &db.pool, org_id, pause).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn queued_work_past_its_deadline_expires_though_nothing_claims_it() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
