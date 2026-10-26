@@ -1,3 +1,4 @@
+pub mod boot;
 #[cfg(feature = "host-runtime")]
 pub mod cgroup;
 pub mod cgroup_paths;
