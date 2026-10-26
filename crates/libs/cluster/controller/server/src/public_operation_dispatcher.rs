@@ -427,7 +427,12 @@ pub async fn run<E>(
                     finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
                     claim_backoff_until = None;
                 }
-                pplx_space_metrics::operations::dispatcher_slots(in_flight.len(), concurrency);
+                pplx_space_metrics::operations::dispatcher_slots(
+                    in_flight.len(),
+                    concurrency,
+                    other_tasks.len(),
+                    other_concurrency,
+                );
                 if last_expiry_sweep.is_none_or(|at| at.elapsed() >= EXPIRY_SWEEP_INTERVAL) {
                     last_expiry_sweep = Some(Instant::now());
                     if let Err(error) = expire_overdue_queued_operations(
