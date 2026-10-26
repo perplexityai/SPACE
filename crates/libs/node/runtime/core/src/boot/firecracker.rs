@@ -1,7 +1,7 @@
-use super::{LinuxBoot, object};
+use super::{GuestBoot, object};
 use serde_json::{Value, json};
 
-pub(super) fn configuration(input: &LinuxBoot<'_>) -> Value {
+pub(super) fn configuration(input: &GuestBoot<'_>) -> Value {
     let uart = format!(" 8250.nr_uarts={}", u8::from(input.console));
     let mut drive = object([
         ("drive_id", json!("rootfs")),
