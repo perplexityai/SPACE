@@ -3424,44 +3424,12 @@ async fn a_sandbox_not_running_refusal_is_a_final_conflict_on_both_transports() 
 
 #[tokio::test]
 async fn a_route_that_is_not_ready_names_when_to_attach_again() {
-    use http_body_util::BodyExt;
-
     let response = route_resolution_http_error(RouteResolutionError::SessionNotReady);
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "2");
 
-    // Nothing is about to give an at-rest sandbox a route and none could be
-    // queued: it is not retryable, names no delay, and says how to wake it.
-    let sandbox_id = SandboxId::new();
-    let at_rest = RouteResolutionError::SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest {
-        sandbox_id: Some(sandbox_id),
-        state: Some(pplx_space_common_core::types::SandboxLifecycle::Suspended),
-    });
-    let details = serde_json::json!([
-        {"key": "reason", "value": "sandbox_not_running"},
-        {"key": "state", "value": "suspended"},
-        {"key": "wake", "value": format!("POST /v1/sandboxes/{}:wake", pplx_space_public_api::PublicSandboxId::from(sandbox_id))},
-    ]);
-    let response = route_resolution_http_error(at_rest);
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        response
-            .headers()
-            .get(axum::http::header::RETRY_AFTER)
-            .is_none()
-    );
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["error"]["code"], "not_ready", "{body}");
-    assert_eq!(body["error"]["retryable"], false, "{body}");
-    assert_eq!(body["error"]["details"], details, "{body}");
-    let frame: serde_json::Value =
-        serde_json::from_str(&route_resolution_error_json(at_rest)).unwrap();
-    assert_eq!(frame["details"], details, "{frame}");
-
     for (error, retryable) in [
         (RouteResolutionError::SessionNotReady, true),
-        (at_rest, false),
         (RouteResolutionError::SessionNotFound, false),
         (RouteResolutionError::Forbidden, false),
     ] {
@@ -3470,6 +3438,88 @@ async fn a_route_that_is_not_ready_names_when_to_attach_again() {
         assert_eq!(frame["code"], error.frame_code().as_str(), "{error:?}");
         assert_eq!(frame["retryable"], retryable, "{error:?}");
     }
+}
+
+/// Nothing is about to give an at-rest sandbox a route: the resolver's answer
+/// is the node's refusal to start work on a sandbox not running, on SSE (409
+/// `conflict`, not 503) and in the WebSocket frame, so a client sees one
+/// answer whichever hop noticed.
+#[tokio::test]
+async fn an_at_rest_route_answers_as_the_node_refusal_does() {
+    use http_body_util::BodyExt;
+
+    async fn body(response: Response) -> (StatusCode, Option<String>, serde_json::Value) {
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .map(|value| value.to_str().unwrap().to_owned());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, retry_after, serde_json::from_slice(&body).unwrap())
+    }
+
+    let sandbox_id = SandboxId::new();
+    let public_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id);
+    for (lifecycle, action) in [
+        (
+            pplx_space_common_core::types::SandboxLifecycle::Suspended,
+            "wake",
+        ),
+        (
+            pplx_space_common_core::types::SandboxLifecycle::Stopped,
+            "start",
+        ),
+    ] {
+        let at_rest =
+            RouteResolutionError::SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest {
+                sandbox_id: Some(sandbox_id),
+                state: Some(lifecycle),
+            });
+        let refused =
+            StreamBridgeError::BackendStatus(pplx_space_common_grpc::mark_sandbox_not_running(
+                tonic::Status::failed_precondition("synthetic refusal"),
+                lifecycle.as_str(),
+            ));
+
+        let (status, retry_after, answer) = body(route_resolution_http_error(at_rest)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+        assert_eq!(retry_after, None, "{answer}");
+        let state = lifecycle.as_str();
+        assert_eq!(
+            answer,
+            serde_json::json!({"error": {
+                "code": "conflict",
+                "message": format!("sandbox is {state}, not running"),
+                "retryable": false,
+                "details": [
+                    {"key": "reason", "value": "sandbox_not_running"},
+                    {"key": "state", "value": state},
+                    {"key": "wake", "value": format!("POST /v1/sandboxes/{public_id}:{action}")},
+                ],
+            }})
+        );
+        let node = body(process_stream_start_http_error(&refused, sandbox_id)).await;
+        assert_eq!((status, retry_after, answer), node);
+
+        let frame: serde_json::Value =
+            serde_json::from_str(&route_resolution_error_json(at_rest)).unwrap();
+        assert_eq!(
+            frame,
+            serde_json::to_value(stream_start_error_frame(&refused, sandbox_id)).unwrap()
+        );
+        assert_eq!(frame["code"], "backend_stream_error", "{frame}");
+        assert_eq!(frame["retryable"], false, "{frame}");
+    }
+
+    // A mark that lost its sandbox or state is still final, with no details.
+    let unnamed = RouteResolutionError::SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest {
+        sandbox_id: None,
+        state: None,
+    });
+    let (status, _, answer) = body(route_resolution_http_error(unnamed)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"]["retryable"], false, "{answer}");
+    assert!(answer["error"].get("details").is_none(), "{answer}");
 }
 
 #[tokio::test(start_paused = true)]

@@ -154,7 +154,8 @@ impl RouteResolutionError {
             Self::Unauthenticated => "unauthenticated",
             Self::Forbidden => "forbidden",
             Self::SessionNotFound => "session_not_found",
-            Self::SessionNotReady | Self::SessionAtRest(_) => "session_not_ready",
+            Self::SessionNotReady => "session_not_ready",
+            Self::SessionAtRest(_) => "sandbox_not_running",
             Self::ResolutionFailed => "route_resolution_failed",
             Self::RouteStateInvalid => "route_state_invalid",
         }
@@ -165,7 +166,9 @@ impl RouteResolutionError {
             Self::Unauthenticated => DataPlaneErrorCode::Unauthenticated,
             Self::Forbidden => DataPlaneErrorCode::Forbidden,
             Self::SessionNotFound => DataPlaneErrorCode::SessionNotFound,
-            Self::SessionNotReady | Self::SessionAtRest(_) => DataPlaneErrorCode::SessionNotReady,
+            Self::SessionNotReady => DataPlaneErrorCode::SessionNotReady,
+            // As the node's refusal to start work on a sandbox not running.
+            Self::SessionAtRest(_) => DataPlaneErrorCode::BackendStreamError,
             Self::ResolutionFailed => DataPlaneErrorCode::RouteResolutionFailed,
             Self::RouteStateInvalid => DataPlaneErrorCode::RouteStateInvalid,
         }
@@ -175,9 +178,8 @@ impl RouteResolutionError {
         match self {
             Self::Unauthenticated | Self::Forbidden => (ResponseOrigin::Client, ResponseKind::Auth),
             Self::SessionNotFound => (ResponseOrigin::Client, ResponseKind::Validation),
-            Self::SessionNotReady | Self::SessionAtRest(_) => {
-                (ResponseOrigin::Cluster, ResponseKind::RouteNotReady)
-            }
+            Self::SessionNotReady => (ResponseOrigin::Cluster, ResponseKind::RouteNotReady),
+            Self::SessionAtRest(_) => (ResponseOrigin::Cluster, ResponseKind::RouteUnavailable),
             Self::ResolutionFailed => (ResponseOrigin::Cluster, ResponseKind::RouteResolution),
             Self::RouteStateInvalid => (ResponseOrigin::DataPlane, ResponseKind::Internal),
         }
@@ -189,17 +191,69 @@ impl RouteResolutionError {
 pub(crate) const SESSION_NOT_READY_RETRY_AFTER: std::time::Duration =
     std::time::Duration::from_secs(2);
 
-/// The `sandbox_not_running` details for an at-rest route, as a refusal to
-/// start a command answers them; none when the mark lost its sandbox or state.
-pub(crate) fn at_rest_details(
-    at_rest: pplx_space_common_grpc::SessionRouteAtRest,
-) -> Vec<pplx_space_public_api::PublicErrorDetail> {
-    match (at_rest.sandbox_id, at_rest.state) {
-        (Some(sandbox_id), Some(state)) => pplx_space_public_api::sandbox_not_running_details(
-            pplx_space_public_api::PublicSandboxId::from(sandbox_id),
-            &pplx_space_public_api::SandboxLifecycleState::from(state),
-        ),
-        _ => Vec::new(),
+/// An attach whose sandbox is not running and will not be woken for it:
+/// createCommand's `sandbox_not_running` refusal. The node refusing to start
+/// the work and the resolver finding the route at rest answer it the same
+/// way, so `retryable`, the status and the frame agree whichever hop saw it.
+pub(crate) struct SandboxNotRunning {
+    message: String,
+    details: Vec<pplx_space_public_api::PublicErrorDetail>,
+}
+
+impl SandboxNotRunning {
+    pub(crate) fn new(
+        sandbox_id: SandboxId,
+        state: &pplx_space_public_api::SandboxLifecycleState,
+    ) -> Self {
+        Self {
+            message: format!("sandbox is {}, not running", state.as_str()),
+            details: pplx_space_public_api::sandbox_not_running_details(
+                pplx_space_public_api::PublicSandboxId::from(sandbox_id),
+                state,
+            ),
+        }
+    }
+
+    /// For an at-rest route; with no details when the mark lost its sandbox
+    /// or state.
+    pub(crate) fn at_rest(at_rest: pplx_space_common_grpc::SessionRouteAtRest) -> Self {
+        match (at_rest.sandbox_id, at_rest.state) {
+            (Some(sandbox_id), Some(state)) => Self::new(
+                sandbox_id,
+                &pplx_space_public_api::SandboxLifecycleState::from(state),
+            ),
+            _ => Self {
+                message: "sandbox is not running".to_string(),
+                details: Vec::new(),
+            },
+        }
+    }
+
+    /// The SSE answer: a 409 `conflict`, not retryable.
+    pub(crate) fn http_error(self, origin: ResponseOrigin, kind: ResponseKind) -> Response {
+        observe_data_plane_http_error(StatusCode::CONFLICT, origin, kind);
+        (
+            StatusCode::CONFLICT,
+            Json(DataPlaneHttpErrorEnvelope {
+                error: DataPlaneHttpError {
+                    code: DataPlaneHttpErrorCode::Conflict,
+                    message: self.message,
+                    retryable: false,
+                    details: self.details,
+                },
+            }),
+        )
+            .into_response()
+    }
+
+    /// The WebSocket answer: a `backend_stream_error` frame, not retryable.
+    pub(crate) fn frame(self) -> DataPlaneServerFrame {
+        DataPlaneServerFrame::Error {
+            code: DataPlaneErrorCode::BackendStreamError,
+            message: self.message,
+            retryable: false,
+            details: self.details,
+        }
     }
 }
 
@@ -243,19 +297,7 @@ pub(crate) fn route_resolution_http_error(error: RouteResolutionError) -> Respon
             response
         }
         RouteResolutionError::SessionAtRest(at_rest) => {
-            observe_data_plane_http_error(StatusCode::SERVICE_UNAVAILABLE, origin, kind);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(DataPlaneHttpErrorEnvelope {
-                    error: DataPlaneHttpError {
-                        code: DataPlaneHttpErrorCode::NotReady,
-                        message: "session route is not ready".to_string(),
-                        retryable: false,
-                        details: at_rest_details(at_rest),
-                    },
-                }),
-            )
-                .into_response()
+            SandboxNotRunning::at_rest(at_rest).http_error(origin, kind)
         }
         RouteResolutionError::ResolutionFailed => data_plane_http_error(
             StatusCode::SERVICE_UNAVAILABLE,

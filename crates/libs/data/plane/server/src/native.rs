@@ -772,15 +772,15 @@ pub(super) fn error_json(code: DataPlaneErrorCode) -> String {
 /// The WebSocket frame for a failed route lookup. A route that is not ready
 /// yet, as while a wake places the sandbox, is retryable here as it is on SSE.
 pub(super) fn route_resolution_error_json(error: RouteResolutionError) -> String {
+    if let RouteResolutionError::SessionAtRest(at_rest) = error {
+        return server_frame_json(&SandboxNotRunning::at_rest(at_rest).frame());
+    }
     let code = error.frame_code();
     server_frame_json(&DataPlaneServerFrame::Error {
         message: code.as_str().to_string(),
         code,
         retryable: error == RouteResolutionError::SessionNotReady,
-        details: match error {
-            RouteResolutionError::SessionAtRest(at_rest) => at_rest_details(at_rest),
-            _ => Vec::new(),
-        },
+        details: Vec::new(),
     })
 }
 
