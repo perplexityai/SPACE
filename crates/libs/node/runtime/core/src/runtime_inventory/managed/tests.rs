@@ -584,7 +584,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     std::fs::create_dir_all(&cache).unwrap();
     for (job, kernel, fill) in [
         ("initial", initial.kernel(), 42),
-        ("candidate", environment.kernel(), 44),
+        ("candidate", environment.kernel().unwrap(), 44),
     ] {
         let source = fixture
             .staging
@@ -695,7 +695,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
         }));
         assert!(report.components.iter().any(|entry| {
             entry.component.as_ref().is_some_and(|kernel| {
-                kernel.digest.as_deref() == Some(&environment.kernel().sha256.to_string())
+                kernel.digest.as_deref() == Some(&environment.kernel().unwrap().sha256.to_string())
             })
         }));
     };
@@ -726,7 +726,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     assert_eq!(resolved.execution.runtime(), &environment.release().release);
     assert_eq!(
         resolved.components[0].metadata.digest,
-        Some(environment.kernel().sha256)
+        Some(environment.kernel().unwrap().sha256)
     );
     // Storage reuse is independent of the guest-boot qualification of a pairing.
     // An additional binding must not clear a shared artifact's default flags.
@@ -738,7 +738,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     );
     let shared_runtime = CompiledEnvironment::for_test(
         initial.release().clone(),
-        environment.kernel().clone(),
+        environment.kernel().unwrap().clone(),
         "9.0.0",
         false,
     );
@@ -751,7 +751,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     }
     let different_digest = CompiledEnvironment::for_test(
         pin("1.17.0", 99),
-        environment.kernel().clone(),
+        environment.kernel().unwrap().clone(),
         "12.0.0",
         false,
     );
@@ -779,7 +779,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     assert_legacy(&bad_kernel);
     resolve(&bad_kernel).unwrap_err();
     assert!(bad_kernel.unavailable.iter().any(|artifact| {
-        matches!(artifact, UnavailableArtifact::Kernel { digest, .. } if *digest == environment.kernel().sha256)
+        matches!(artifact, UnavailableArtifact::Kernel { digest, .. } if *digest == environment.kernel().unwrap().sha256)
     }));
     assert!(!bad_kernel.unavailable.iter().any(|artifact| {
         matches!(artifact, UnavailableArtifact::Runtime { identity, .. } if identity == &environment.release().release)

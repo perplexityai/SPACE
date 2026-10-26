@@ -87,3 +87,39 @@ fn device_metadata_cannot_be_downgraded_or_lose_requirements() {
         serde_json::from_value::<SandboxArtifactMetadata>(invalid).unwrap_err();
     }
 }
+
+#[test]
+fn firmware_contract_survives_disk_metadata_and_refuses_version_downgrade() {
+    use pplx_space_execution_spec::guest_image::{
+        GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
+    };
+    let image = GuestImageContract::new(
+        GuestDiskLayout::OpaqueRawDisk,
+        GuestReadiness::TcpService {
+            port: std::num::NonZeroU16::new(3389).unwrap(),
+        },
+        GuestNetwork::SlotDhcpV1,
+    );
+    let metadata = SandboxArtifactMetadata::new(
+        SandboxId::new(),
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]),
+        TemplateName::parse("opaque-image").unwrap(),
+        None,
+    )
+    .with_guest_image(image);
+    let value = serde_json::to_value(&metadata).unwrap();
+    assert_eq!(
+        serde_json::from_value::<SandboxArtifactMetadata>(value.clone())
+            .unwrap()
+            .guest_image(),
+        image
+    );
+    for version in [1, 2, 3, 5] {
+        let mut invalid = value.clone();
+        invalid["schema_version"] = version.into();
+        serde_json::from_value::<SandboxArtifactMetadata>(invalid).unwrap_err();
+    }
+    let mut missing = value;
+    missing.as_object_mut().unwrap().remove("guest_image");
+    serde_json::from_value::<SandboxArtifactMetadata>(missing).unwrap_err();
+}

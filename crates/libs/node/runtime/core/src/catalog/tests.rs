@@ -266,11 +266,9 @@ fn every_qualified_environment_has_pinned_verity_sources() {
         for binary in &environment.release().binaries {
             assert!(compiled_verity_digest(binary.sha256).unwrap().is_some());
         }
-        assert!(
-            compiled_verity_digest(environment.kernel().sha256)
-                .unwrap()
-                .is_some()
-        );
+        if let Some(kernel) = environment.kernel() {
+            assert!(compiled_verity_digest(kernel.sha256).unwrap().is_some());
+        }
         for (_, identity, _) in environment
             .definition()
             .descriptor()

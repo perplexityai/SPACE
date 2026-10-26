@@ -317,6 +317,23 @@ impl SandboxManagerService {
         }
 
         let template_hash = template_create_hash(template_dir, content_hash_resolved)?;
+        let image_path = std::path::PathBuf::from(template_dir);
+        let guest_image =
+            tokio::task::spawn_blocking(move || super::guest_image::read_contract(&image_path))
+                .await
+                .map_err(|error| Status::internal(format!("read guest image task: {error}")))??;
+        self.admit_guest_image(guest_image, execution).await?;
+        super::guest_image::validate_policy(guest_image, auto_lifecycle)?;
+        if !guest_image.expects_agent()
+            && (req.snapshots_enabled
+                || req.pool_template.is_some()
+                || effective_mode != BootMode::Cold
+                || !req.env.is_empty())
+        {
+            return Err(Status::failed_precondition(
+                "firmware guests require cold boot without snapshots, pools or guest-agent configuration",
+            ));
+        }
 
         let pool_template = req.pool_template.as_deref().filter(|s| !s.is_empty());
         validate_pool_member_create_options(
@@ -379,6 +396,7 @@ impl SandboxManagerService {
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
+                    guest_image: (guest_image != Default::default()).then_some(&guest_image),
                     device_requirements,
                     id: &id,
                     uuid8: &uuid8,
@@ -1330,7 +1348,7 @@ impl SandboxManagerService {
                 slot: alloc.slot,
                 guest_cid,
                 pid,
-                spaced_host_pid: spaced_host_resp.pid,
+                spaced_host_pid: Some(spaced_host_resp.pid),
                 netgtw_pid: netgtw_resp.pid,
                 vsock_uds_path: &vsock_uds_path,
                 api_socket_path: &api_socket_path,
@@ -1345,7 +1363,7 @@ impl SandboxManagerService {
             sandbox_id: id,
             boot_type: "snapshot",
             pid,
-            spaced_host_pid: spaced_host_resp.pid,
+            spaced_host_pid: Some(spaced_host_resp.pid),
             net_gateway_pid: netgtw_resp.pid,
             sandbox_uid: sbx_uid,
             network_slot: alloc.slot,
@@ -1365,6 +1383,7 @@ impl SandboxManagerService {
         });
         self.watchdog
             .add_sandbox(crate::watchdog::SidecarInfo {
+                guest_image: Default::default(),
                 node_execution_id: Some(execution_fence.current()),
                 sandbox_id: id.clone(),
                 uid: Some(sbx_uid),
