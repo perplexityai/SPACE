@@ -31,6 +31,7 @@ class DirectNodeConfig:
     crash_owned_runtime: bool = False
     device_profile: str = ""
     device_parent: str = ""
+    firmware_lifecycle: bool = False
 
     @classmethod
     def from_environment(cls, values: Mapping[str, str]) -> DirectNodeConfig:
@@ -45,10 +46,10 @@ class DirectNodeConfig:
         supplied = [values.get(f"SPACE_SMOKE_NODE_{name}", "") for name in names]
         if (
             not all(supplied)
-            or values.get("SPACE_SMOKE_NODE_RECOVERY") != "restart-idle-node"
+            or values.get("SPACE_SMOKE_NODE_RECOVERY") not in ("restart-idle-node", "firmware-lifecycle")
         ):
             raise SmokeConfigurationError(
-                "direct-node recovery requires an explicit target and restart-idle-node opt-in"
+                "direct-node checks require an explicit target and recovery/lifecycle opt-in"
             )
         host, machine_id, client_env, template, content_hash, environment = supplied
         if host.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host):
@@ -80,6 +81,7 @@ class DirectNodeConfig:
             fault == "crash-owned-runtime",
             values.get("SPACE_SMOKE_NODE_DEVICE_PROFILE", ""),
             values.get("SPACE_SMOKE_NODE_DEVICE_PARENT", ""),
+            values.get("SPACE_SMOKE_NODE_RECOVERY") == "firmware-lifecycle",
         )
 
 
@@ -124,15 +126,18 @@ class DirectNodeRecoveryFixture:
             raise RuntimeError(f"node command {arguments[0]} failed: {result.detail()}")
         return result.stdout.strip()
 
-    def prepare(self, *, with_device: bool = False) -> None:
+    def prepare(self, *, with_device: bool = False, firmware: bool = False) -> None:
+        if firmware != self.config.firmware_lifecycle or (firmware and with_device):
+            raise SmokeConfigurationError("scenario does not match the explicit node operation opt-in")
         self.context.verify(
             self.command(["cat", "/etc/machine-id"]) == self.config.machine_id,
             "SSH target has a different machine identity",
         )
-        self.context.verify(
-            self.command(["space-sbxmgr", "list"]) == "No sandboxes found.",
-            "recovery requires a node with no existing sandboxes",
-        )
+        if not firmware:
+            self.context.verify(
+                self.command(["space-sbxmgr", "list"]) == "No sandboxes found.",
+                "recovery requires a node with no existing sandboxes",
+            )
         self.command(["systemctl", "is-active", *self.services])
         self.context.verify(
             self.command(
@@ -198,9 +203,11 @@ class DirectNodeRecoveryFixture:
 
     def start(self, *, memory_mib: int | None = None) -> ExecutionObservation:
         arguments = ["space-sbxmgr", "start", self.owned_selector(), "--blocking"]
+        if self.config.firmware_lifecycle:
+            arguments.extend(["--ready-timeout-secs", "120"])
         if memory_mib is not None:
             arguments.extend(["--memory", str(memory_mib)])
-        self.command(arguments, timeout=180)
+        self.command(arguments, timeout=240)
         return self.observe()
 
     def observe(self) -> ExecutionObservation:
@@ -241,6 +248,8 @@ class DirectNodeRecoveryFixture:
         return self.guest("cat /proc/sys/kernel/random/boot_id")
 
     def restart_managers(self) -> None:
+        if self.config.firmware_lifecycle:
+            raise SmokeConfigurationError("firmware lifecycle opt-in does not authorize manager restarts")
         # Explicit target opt-in and the idle-node precondition authorize only
         # these service restarts; there is no arbitrary host mutation surface.
         self.command(["sudo", "-n", "systemctl", "restart", *self.services], timeout=90)
@@ -256,12 +265,32 @@ class DirectNodeRecoveryFixture:
                 self.context.wait(1)
 
     def stop(self) -> None:
-        self.command(
-            ["space-sbxmgr", "stop", self.owned_selector(), "--blocking"], timeout=120
-        )
+        if self.config.firmware_lifecycle:
+            self.command(["space-sbxmgr", "stop", self.owned_selector()])
+            self.await_lifecycle_state("stopped")
+        else:
+            self.command(
+                ["space-sbxmgr", "stop", self.owned_selector(), "--blocking"], timeout=120
+            )
+
+    def await_lifecycle_state(self, expected: str | None) -> None:
+        """The durable cleanup outlives the blocking RPC's shorter wait budget."""
+        label = self.owned_selector().replace("-", "")[-8:]
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            output = self.command(["space-sbxmgr", "list"], timeout=15)
+            rows = [line for line in output.splitlines() if label in line]
+            if not rows and expected is None:
+                return
+            self.context.verify(len(rows) == 1, "owned sandbox disappeared or is ambiguous")
+            fields = [field.strip() for field in re.split(r"[│┆|]", rows[0]) if field.strip()]
+            if len(fields) >= 3 and fields[2] == expected:
+                return
+            self.context.wait(2)
+        self.context.verify(False, f"owned sandbox did not reach {expected or 'deleted'}")
 
     def crash_runtime(self, execution: ExecutionObservation) -> None:
-        if not self.config.crash_owned_runtime:
+        if not self.config.crash_owned_runtime or self.config.firmware_lifecycle:
             raise SmokeConfigurationError(
                 "VMM crash requires SPACE_SMOKE_NODE_FAULT=crash-owned-runtime"
             )
@@ -346,9 +375,13 @@ class DirectNodeRecoveryFixture:
                     "create outcome unknown; retained response directory for inspection"
                 )
             self.selector = match[1]
-        self.command(
-            ["space-sbxmgr", "delete", self.selector, "--blocking"], timeout=90
-        )
+        if self.config.firmware_lifecycle:
+            self.command(["space-sbxmgr", "delete", self.selector])
+            self.await_lifecycle_state(None)
+        else:
+            self.command(
+                ["space-sbxmgr", "delete", self.selector, "--blocking"], timeout=90
+            )
         remaining = self.command(["space-sbxmgr", "list"])
         self.context.verify(
             self.selector.replace("-", "")[-8:] not in remaining,
@@ -437,3 +470,36 @@ class DirectNodeRecoveryFixture:
             "CUDA computation mismatch",
         )
         self.context.record("cuda", result)
+
+    def verify_rdp_negotiation(self) -> None:
+        """Exercise the operator channel and NLA negotiation, not credential auth."""
+        script = textwrap.dedent("""\
+            import json, os, select, shlex, subprocess, sys, time
+            arguments = ['/space/bin/space-nodemgr', 'guest-channel', sys.argv[1], '--port', '3389']
+            command = ['sudo', '-n', 'bash', '-c', 'source '+shlex.quote(sys.argv[2])+'; exec '+shlex.join(arguments)]
+            with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as channel:
+                try:
+                    channel.stdin.write(bytes.fromhex('030000130ee000000000000100080003000000'))
+                    channel.stdin.flush()
+                    response = bytearray()
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        if not select.select([channel.stdout], [], [], max(0, deadline-time.monotonic()))[0]: break
+                        data = os.read(channel.stdout.fileno(), 4096)
+                        if not data: break
+                        response.extend(data)
+                        if len(response) >= 4 and len(response) >= int.from_bytes(response[2:4], 'big'): break
+                    # The server advertises capabilities in byte 12 (flags).
+                    # They need not be zero for a valid negotiation response.
+                    if len(response) != 19 or response[:2] != bytes([3,0]) or response[11] != 2 or response[13:15] != bytes([8,0]):
+                        raise RuntimeError('invalid RDP negotiation response')
+                    protocol = int.from_bytes(response[15:19], 'little')
+                    if protocol not in (2,8): raise RuntimeError('RDP did not select NLA')
+                    print(json.dumps({'rdp_nla_protocol':protocol}))
+                finally:
+                    channel.terminate()
+                    try: channel.wait(timeout=3)
+                    except subprocess.TimeoutExpired: channel.kill(); channel.wait()
+        """)
+        result = json.loads(self.command(["python3", "-c", script, self.owned_selector(), self.config.client_env]))
+        self.context.record("rdp_negotiation", result)
