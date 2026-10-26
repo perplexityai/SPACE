@@ -359,6 +359,9 @@ service NodeManager {
 message GetExecutionInventoryRequest {}
 
 message ResolveExecutionEnvironmentRequest {
+  // Highest definition schema understood, including its identity encoding.
+  // Zero requests the legacy representation. This changes encoding, never selection.
+  uint32 definition_schema_version = 5;
   // Omission requests the configured default. A supplied reference must match an
   // approved environment exactly; it never changes the node default.
   optional string reference = 1;
