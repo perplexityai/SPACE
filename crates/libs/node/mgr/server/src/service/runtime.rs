@@ -41,16 +41,8 @@ pub(super) fn firecracker_before_jail_rebuild(
         .map_err(|error| {
             Status::unavailable(format!("live VM ownership is unresolved: {error}"))
         })?;
-        let socket = Path::new(JAIL_DIR)
-            .join("firecracker")
-            .join(sandbox_id)
-            .join("root/firecracker.sock");
-        let metadata = std::fs::symlink_metadata(socket).map_err(|error| {
-            Status::unavailable(format!("live VM API endpoint unavailable: {error}"))
-        })?;
-        if !std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()) {
-            return Err(Status::unavailable("live VM API endpoint is not a socket"));
-        }
+        // Process ownership, not control-socket readiness, prevents rebuilding
+        // a live runtime's filesystem. The adapter checks readiness on adoption.
         return Ok(Some(pid));
     }
     let pid_path = Path::new(RUN_DIR).join(sandbox_id).join("fc.pid");
@@ -533,6 +525,19 @@ impl NodeManagerService {
                 sandbox_uid,
                 expected_spaced_host_peer,
             )
+        };
+        let expected_spaced_host_peer = match expected_spaced_host_peer {
+            Some(peer) => {
+                let runtime = self
+                    .recorded_execution(req.sandbox_id.clone())
+                    .await?
+                    .map_or(
+                        pplx_space_common_core::types::RuntimeKind::Firecracker,
+                        |e| e.runtime().kind,
+                    );
+                Some(peer.for_runtime(runtime))
+            }
+            None => None,
         };
         let mut launch_args = prepare_sidecar_launch_args(
             &req.program,

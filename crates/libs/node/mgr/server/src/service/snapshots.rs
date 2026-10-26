@@ -271,6 +271,14 @@ impl NodeManagerService {
         self.run_owned_sandbox_work(&owner, async move {
             let _gate = service.lock_sandbox_vm_cgroup_launch(&sandbox_id).await;
             service.check_execution(&sandbox_id, fence.as_ref(), false)?;
+            let execution = service.recorded_execution(sandbox_id.clone()).await?;
+            if execution.as_ref().is_some_and(|execution| {
+                execution.runtime().kind != pplx_space_common_core::types::RuntimeKind::Firecracker
+            }) {
+                return Err(Status::failed_precondition(
+                    "resident pause and resume are not qualified for this runtime",
+                ));
+            }
             let api_socket = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
             let client = crate::fc_api::FcApiClient::new(api_socket);
             if let Some(hint_timeout) = balloon_hint_timeout {

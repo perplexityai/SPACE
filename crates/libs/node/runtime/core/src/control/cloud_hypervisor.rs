@@ -1,5 +1,5 @@
 use super::{ControlError, ControlFuture, RuntimeControl, VmState};
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, StatusCode, body::Bytes};
 use hyper_util::rt::TokioIo;
 use pplx_space_common_core::types::RuntimeKind;
@@ -39,6 +39,18 @@ impl Client {
     /// One deadline covers connect, handshake, headers and a bounded body. A
     /// dropped caller aborts the connection task; control requests are not replayed.
     async fn info(&self) -> Result<Info, ApiError> {
+        let body = self
+            .request(Method::GET, "/api/v1/vm.info", Bytes::new())
+            .await?;
+        serde_json::from_slice(&body).map_err(ApiError::Decode)
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        uri: &'static str,
+        body: Bytes,
+    ) -> Result<Bytes, ApiError> {
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             let stream = tokio::net::UnixStream::connect(&self.socket).await?;
             let (mut sender, connection) =
@@ -49,10 +61,11 @@ impl Client {
                 }
             }));
             let request = Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/vm.info")
+                .method(method)
+                .uri(uri)
                 .header("Host", "localhost")
-                .body(Empty::<Bytes>::new())?;
+                .header("Content-Type", "application/json")
+                .body(Full::new(body))?;
             let response = sender.send_request(request).await?;
             if !response.status().is_success() {
                 return Err(ApiError::Status(response.status()));
@@ -62,9 +75,8 @@ impl Client {
                 .await
                 .map_err(ApiError::Body)?
                 .to_bytes();
-            let result = serde_json::from_slice(&body).map_err(ApiError::Decode);
             drop(task);
-            result
+            Ok(body)
         })
         .await
         .map_err(|_| ApiError::Timeout)?
@@ -102,6 +114,19 @@ impl RuntimeControl for Client {
                 State::Paused => VmState::Paused,
                 State::Shutdown => VmState::Shutdown,
             })
+        })
+    }
+    fn boot<'a>(&'a self, configuration: &'a str) -> ControlFuture<'a, ()> {
+        Box::pin(async move {
+            self.request(
+                Method::PUT,
+                "/api/v1/vm.create",
+                Bytes::copy_from_slice(configuration.as_bytes()),
+            )
+            .await?;
+            self.request(Method::PUT, "/api/v1/vm.boot", Bytes::new())
+                .await?;
+            Ok(())
         })
     }
     fn pause(&self) -> ControlFuture<'_, ()> {
