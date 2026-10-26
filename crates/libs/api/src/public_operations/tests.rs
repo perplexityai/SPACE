@@ -373,6 +373,169 @@ async fn active_sandbox_deletes_coalesce_per_tenant_and_target() -> TestResult {
 }
 
 #[tokio::test]
+async fn implicit_wake_sorts_after_a_suspend_committed_during_its_lock_wait() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+
+    let mut lock_tx = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    ))
+    .bind(format!(
+        "{org_id}:{target_id}:{}",
+        OperationKind::WakeSandbox.as_str()
+    ))
+    .execute(&mut *lock_tx)
+    .await?;
+
+    let wake = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            store
+                .create_or_join_active_sandbox_wake(
+                    org_id,
+                    &target_id,
+                    serde_json::json!({"action": "wake"}),
+                    None,
+                )
+                .await
+        }
+    });
+    // The wake's transaction has begun, and so fixed its start time, once it
+    // waits on the advisory lock held above.
+    wait_for_advisory_lock_waiter(&db.pool).await?;
+
+    let suspend_id =
+        create_test_operation_for_target(&store, org_id, OperationKind::SuspendSandbox, &target_id)
+            .await?
+            .expect_created();
+    lock_tx.commit().await?;
+    let wake_id = match wake.await?? {
+        CreatePublicOperationResult::Created(id) => id,
+        other => panic!("a wake queued before the suspend must not be joined: {other:?}"),
+    };
+
+    assert_eq!(
+        dispatch_order(&db.pool, org_id, &target_id).await?,
+        vec![suspend_id.as_uuid(), wake_id.as_uuid()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn operation_sorts_after_one_committed_during_its_idempotency_lock_wait() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let key = IdempotencyKey::parse("suspend-after-lock-wait")?;
+    let fingerprint = RequestFingerprint::parse("e".repeat(64))?;
+    let path_template = OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:suspend");
+
+    let mut lock_tx = db.pool.begin().await?;
+    lock_idempotency_key(
+        &mut lock_tx,
+        org_id,
+        ApiProduct::Native,
+        &CreatePublicOperationIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template,
+            key: &key,
+            request_fingerprint: &fingerprint,
+        },
+    )
+    .await?;
+
+    let suspend = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            store
+                .create_operation(CreatePublicOperation {
+                    org_id,
+                    actor_user_id: None,
+                    api_product: ApiProduct::Native,
+                    kind: OperationKind::SuspendSandbox,
+                    target_type: Some(OperationTargetType::Sandbox),
+                    target_id: Some(&target_id),
+                    payload_json: serde_json::json!({}),
+                    idempotency: Some(CreatePublicOperationIdempotency {
+                        method: HttpOperationMethod::Post,
+                        path_template,
+                        key: &key,
+                        request_fingerprint: &fingerprint,
+                    }),
+                    traceparent: None,
+                })
+                .await
+        }
+    });
+    wait_for_advisory_lock_waiter(&db.pool).await?;
+
+    let stop_id =
+        create_test_operation_for_target(&store, org_id, OperationKind::StopSandbox, &target_id)
+            .await?
+            .expect_created();
+    lock_tx.commit().await?;
+    let suspend_id = suspend.await??.expect_created();
+
+    assert_eq!(
+        dispatch_order(&db.pool, org_id, &target_id).await?,
+        vec![stop_id.as_uuid(), suspend_id.as_uuid()]
+    );
+    Ok(())
+}
+
+/// Returns once some transaction waits on an advisory lock in this database.
+async fn wait_for_advisory_lock_waiter(pool: &PgPool) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(sql!(
+                "SELECT COUNT(*)
+                   FROM pg_locks
+                  WHERE locktype = 'advisory'
+                    AND NOT granted
+                    AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            ))
+            .fetch_one(pool)
+            .await?;
+            if waiting > 0 {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+/// A target's operations in the dispatcher's `(requested_at, operation_id)`
+/// order.
+async fn dispatch_order(
+    pool: &PgPool,
+    org_id: OrgId,
+    target_id: &str,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT operation_id
+           FROM public_operations
+          WHERE org_id = $1 AND target_id = $2
+          ORDER BY requested_at, operation_id"
+    ))
+    .bind(org_id)
+    .bind(target_id)
+    .fetch_all(pool)
+    .await
+}
+
+#[tokio::test]
 async fn queued_delete_survives_observer_loss_and_reaches_authoritative_finality() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
@@ -1155,6 +1318,15 @@ async fn create_test_operation(
     org_id: OrgId,
     kind: OperationKind,
 ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+    create_test_operation_for_target(store, org_id, kind, "sbx_demo").await
+}
+
+async fn create_test_operation_for_target(
+    store: &PublicOperationStore,
+    org_id: OrgId,
+    kind: OperationKind,
+    target_id: &str,
+) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
     store
         .create_operation(CreatePublicOperation {
             org_id,
@@ -1162,7 +1334,7 @@ async fn create_test_operation(
             api_product: ApiProduct::Native,
             kind,
             target_type: Some(OperationTargetType::Sandbox),
-            target_id: Some("sbx_demo"),
+            target_id: Some(target_id),
             payload_json: serde_json::json!({}),
             idempotency: None,
             traceparent: None,

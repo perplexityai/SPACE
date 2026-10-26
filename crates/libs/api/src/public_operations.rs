@@ -688,7 +688,11 @@ impl PublicOperationStore {
             // Join only an operation nothing else for the sandbox is queued
             // behind, in the dispatcher's order: a wake ahead of a `:suspend`
             // leaves the sandbox at rest, so this caller's wake is queued
-            // after that instead.
+            // after that instead. Only committed operations are seen: other
+            // kinds never take this lock, so a `:suspend` still uncommitted
+            // here is missed, this caller joins the earlier wake, and the
+            // suspend then sorts after it, so the command finds the sandbox
+            // at rest.
             sqlx::query_scalar::<_, Uuid>(sql!(
                 "SELECT active.operation_id
                    FROM public_operations active
@@ -1538,6 +1542,9 @@ pub async fn create_operation_tx(
     }
 
     let operation_id = OperationId::new();
+    // Stamp `requested_at` at insert, not at the transaction's start: a lock
+    // wait above or in the caller can outlast an operation for the same
+    // target that commits first, and the dispatcher orders by this column.
     sqlx::query(sql!(
         "INSERT INTO public_operations (
              operation_id,
@@ -1549,12 +1556,14 @@ pub async fn create_operation_tx(
              target_id,
              payload_json,
              gc_after,
-             traceparent
+             traceparent,
+             requested_at
          )
          VALUES (
              $1, $2, $3, $4, $5, $6, $7, $8,
              NOW() + ($9::TEXT || ' days')::INTERVAL,
-             $10
+             $10,
+             clock_timestamp()
          )"
     ))
     .bind(operation_id.as_uuid())
