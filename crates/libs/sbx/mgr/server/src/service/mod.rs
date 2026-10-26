@@ -36,10 +36,10 @@ use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyApplyDecision};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_mgr_client::NodeManagerGrpcClient;
 use pplx_space_node_mgr_client::proto::{
-    AllocateRequest, CleanupSandboxRequest, CreateSnapshotRequest, LaunchRequest,
-    LaunchSandboxRequest, LoadSnapshotRequest, NetworkPoolStatusRequest, PauseSandboxRequest,
-    PrepareSandboxArtifactDirRequest, PrepareSandboxRequest, ReleaseRequest, ResumeSandboxRequest,
-    StopProcessRequest, SyncGuestRequest,
+    AllocateRequest, CaptureVmStateRequest, CleanupSandboxRequest, LaunchRequest,
+    LaunchSandboxRequest, NetworkPoolStatusRequest, PauseSandboxRequest,
+    PrepareSandboxArtifactDirRequest, PrepareSandboxRequest, ReleaseRequest, RestoreVmStateRequest,
+    ResumeSandboxRequest, StopProcessRequest, SyncGuestRequest,
 };
 use pplx_space_spaced_common::proto::host_control::host_control_server::HostControl;
 use pplx_space_spaced_common::proto::host_control::{
@@ -151,9 +151,9 @@ use crate::proto::{
     TouchAutoLifecycleRequest, TouchAutoLifecycleResponse, UpdateRequest, UpdateResponse,
     WaitRequest, WaitResponse, WakeRequest, WakeResponse, WakeTransition, spaced_write_request,
 };
-use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_firecracker_vm_state};
+use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_state};
 use crate::state::SandboxState;
-use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+use pplx_space_node_runtime_core::vm_state::VmState;
 
 type BoxedStatusStream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
 const CLEANUP_RETRY_INITIAL_DELAY_SECS: u64 = 1;
@@ -2093,3 +2093,5 @@ use cleanup_support::{
     CLEANUP_IO_CONCURRENCY_CAP, CleanupLockMap, CleanupMetrics, DEFAULT_CLEANUP_CONCURRENCY_CAP,
 };
 use spaced_bridge_policy::SpacedRpc;
+
+use pplx_space_node_mgr_client::runtime_control::RuntimeControl;

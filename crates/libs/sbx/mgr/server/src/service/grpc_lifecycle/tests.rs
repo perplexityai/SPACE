@@ -23,7 +23,7 @@ use pplx_space_common_core::types::{
     AutoLifecyclePolicy, HostCpu, LocalArtifactId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
 };
 use pplx_space_events::SandboxEventTrigger;
-use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+use pplx_space_node_runtime_core::vm_state::VmState;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 use std::collections::BTreeMap;
 use tokio::sync::oneshot;
@@ -1074,31 +1074,25 @@ fn reupload_restoring_message_carries_marker_running_states_do_not() {
 fn pause_reconciliation_maps_firecracker_observations() {
     assert_eq!(
         pause_reconciliation_outcome(
-            &crate::runtime_reconciliation::FirecrackerVmStateObservation::Observed(
-                FirecrackerVmState::Paused,
-            )
+            &crate::runtime_reconciliation::VmStateObservation::Observed(VmState::Paused,)
         ),
         super::PauseReconciliationOutcome::Paused
     );
     assert_eq!(
         pause_reconciliation_outcome(
-            &crate::runtime_reconciliation::FirecrackerVmStateObservation::Observed(
-                FirecrackerVmState::Running,
-            )
+            &crate::runtime_reconciliation::VmStateObservation::Observed(VmState::Running,)
         ),
         super::PauseReconciliationOutcome::Running
     );
     assert_eq!(
         pause_reconciliation_outcome(
-            &crate::runtime_reconciliation::FirecrackerVmStateObservation::Observed(
-                FirecrackerVmState::NotStarted,
-            )
+            &crate::runtime_reconciliation::VmStateObservation::Observed(VmState::NotStarted,)
         ),
         super::PauseReconciliationOutcome::Unknown("Firecracker reported NotStarted".to_string())
     );
     assert_eq!(
         pause_reconciliation_outcome(
-            &crate::runtime_reconciliation::FirecrackerVmStateObservation::Unobservable(
+            &crate::runtime_reconciliation::VmStateObservation::Unobservable(
                 "probe failed".to_string(),
             )
         ),
@@ -1109,12 +1103,8 @@ fn pause_reconciliation_maps_firecracker_observations() {
 #[test]
 fn pause_reconciliation_does_not_guess_unknown_state() {
     for observation in [
-        crate::runtime_reconciliation::FirecrackerVmStateObservation::Unobservable(
-            "probe failed".to_string(),
-        ),
-        crate::runtime_reconciliation::FirecrackerVmStateObservation::Observed(
-            FirecrackerVmState::NotStarted,
-        ),
+        crate::runtime_reconciliation::VmStateObservation::Unobservable("probe failed".to_string()),
+        crate::runtime_reconciliation::VmStateObservation::Observed(VmState::NotStarted),
     ] {
         assert!(
             matches!(

@@ -318,6 +318,40 @@ impl RuntimeSupervisorLazyClient {
         }
     }
 
+    pub async fn launch_runtime(
+        &self,
+        request: proto::LaunchRuntimeRequest,
+    ) -> Result<tonic::Response<proto::LaunchRuntimeResponse>, Status> {
+        let result = self
+            .call_unary(
+                "launch_runtime",
+                request.clone(),
+                |mut client, request| async move { client.launch_runtime(request).await },
+            )
+            .await;
+        match result {
+            Err(status)
+                if status.code() == tonic::Code::Unimplemented
+                    && request.runtime
+                        == pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32 =>
+            {
+                let legacy = request.try_into().map_err(
+                    |error: pplx_space_node_runtime_core::runtime_launch::LaunchContractError| {
+                        pplx_space_node_runtime_core::launch_admission::admission_refusal(
+                            Status::failed_precondition(error.to_string()),
+                        )
+                    },
+                )?;
+                let response = self.launch_firecracker(legacy).await?.into_inner();
+                Ok(tonic::Response::new(proto::LaunchRuntimeResponse {
+                    pid: response.pid,
+                    accepted_environment_reference: response.accepted_environment_reference,
+                }))
+            }
+            result => result,
+        }
+    }
+
     runtime_supervisor_lazy_unary_methods! {
         launch_firecracker, proto::LaunchFirecrackerRequest, proto::LaunchFirecrackerResponse;
         launch_sidecar, proto::LaunchSidecarRequest, proto::LaunchSidecarResponse;

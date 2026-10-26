@@ -100,3 +100,5 @@ pub fn reflink_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Re
 mod tests;
 
 pub mod runtime_launch;
+
+pub mod vm_state;

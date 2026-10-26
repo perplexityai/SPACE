@@ -12,6 +12,8 @@ pub enum CompiledEnvironmentDefinitionError {
     UnsupportedArchitecture(Arch),
     #[error("invalid compiled environment descriptor: {0}")]
     Descriptor(#[from] EnvironmentDescriptorError),
+    #[error("invalid compiled environment encoding: {0}")]
+    Encoding(#[from] pplx_space_execution_common::environment::EnvironmentDecodeError),
     #[error("invalid compiled runtime ordering version: {0}")]
     RuntimeVersion(#[from] semver::Error),
     #[error("invalid compiled state format: {0}")]
@@ -113,7 +115,7 @@ fn definition_from_pins(
         },
     }
     .try_into()?;
-    Ok(EnvironmentDefinition::new(descriptor))
+    Ok(EnvironmentDefinition::new(descriptor).into_runtime_neutral()?)
 }
 
 /// A complete approved binding, including the operations qualified for it.

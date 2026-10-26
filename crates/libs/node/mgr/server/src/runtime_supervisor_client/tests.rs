@@ -413,6 +413,7 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for RefusingRuntimeSupe
 
 #[derive(Clone)]
 struct StubRuntimeSupervisor {
+    implements_runtime_launch: bool,
     launch_firecracker_calls: Arc<AtomicUsize>,
     reject_launch_firecracker: bool,
     launch_gate: Option<Arc<tokio::sync::Notify>>,
@@ -425,6 +426,7 @@ struct StubRuntimeSupervisor {
 impl StubRuntimeSupervisor {
     fn counting(calls: Arc<AtomicUsize>) -> Self {
         Self {
+            implements_runtime_launch: true,
             launch_firecracker_calls: calls,
             reject_launch_firecracker: false,
             launch_gate: None,
@@ -436,6 +438,7 @@ impl StubRuntimeSupervisor {
 
     fn rejecting(calls: Arc<AtomicUsize>) -> Self {
         Self {
+            implements_runtime_launch: true,
             launch_firecracker_calls: calls,
             reject_launch_firecracker: true,
             launch_gate: None,
@@ -449,6 +452,7 @@ impl StubRuntimeSupervisor {
     /// so a graceful shutdown drains around it.
     fn gated(calls: Arc<AtomicUsize>, gate: Arc<tokio::sync::Notify>) -> Self {
         Self {
+            implements_runtime_launch: true,
             launch_firecracker_calls: calls,
             reject_launch_firecracker: false,
             launch_gate: Some(gate),
@@ -480,6 +484,9 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
         &self,
         request: Request<proto::LaunchRuntimeRequest>,
     ) -> Result<Response<proto::LaunchRuntimeResponse>, Status> {
+        if !self.implements_runtime_launch {
+            return Err(Status::unimplemented("unknown method"));
+        }
         let (metadata, extensions, request) = request.into_parts();
         let request = request.try_into().map_err(
             |error: pplx_space_node_runtime_core::runtime_launch::LaunchContractError| {
@@ -614,4 +621,47 @@ fn server_returned_codes_are_never_refused_before_transmission() {
         h2::Error::from(h2::Reason::REFUSED_STREAM),
     );
     assert!(!is_request_refused_before_transmission(&status));
+}
+
+#[tokio::test]
+async fn launch_admission_is_consistent_across_supervisor_versions() {
+    use pplx_space_node_runtime_core::launch_admission::supervisor_launch_status;
+    let sandbox_id = "018e390d-4dd8-7000-8000-000000000001";
+    for (identity, launcher, valid) in [
+        (sandbox_id, Some("/runtime/bin/jailer"), true),
+        ("another-sandbox", Some("/runtime/bin/jailer"), false),
+        (sandbox_id, None, false),
+        (sandbox_id, Some(""), false),
+    ] {
+        let mut refusals = Vec::new();
+        for implements_runtime_launch in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut stub = StubRuntimeSupervisor::counting(calls.clone());
+            stub.implements_runtime_launch = implements_runtime_launch;
+            let client = in_process_client(stub);
+            let result = client
+                .launch_runtime(proto::LaunchRuntimeRequest {
+                    sandbox_id: identity.into(),
+                    runtime: pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32,
+                    launcher_binary: launcher.map(str::to_owned),
+                    verified_runtime: Some(proto::VerifiedRuntimeLaunch {
+                        sandbox_id: sandbox_id.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .await;
+            if valid {
+                assert_eq!(result.unwrap().into_inner().pid, STUB_LAUNCH_PID);
+            } else {
+                let status = supervisor_launch_status(result.unwrap_err());
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                refusals.push(status.message().to_owned());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(valid));
+        }
+        if !valid {
+            assert_eq!(refusals[0], refusals[1]);
+        }
+    }
 }
