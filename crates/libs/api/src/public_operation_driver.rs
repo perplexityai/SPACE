@@ -561,6 +561,10 @@ where
                         // retrying, so the delete need not wait out its
                         // retries and the create never runs after it.
                         cancel_if_superseded: true,
+                        carried_error: Some(with_carried_error(
+                            serde_json::json!({ "last_progress_message": last_progress_message }),
+                            result.terminal_error_json,
+                        )),
                     })
                     .await?;
                 match released {
@@ -604,7 +608,7 @@ where
 /// any fields of the error the requeue `carried` that the evidence lacks. The
 /// carried code replaces the driver's own; see
 /// [`PublicOperationExecutionResult`].
-fn with_carried_error(
+pub(crate) fn with_carried_error(
     mut evidence: serde_json::Value,
     carried: Option<serde_json::Value>,
 ) -> serde_json::Value {

@@ -150,6 +150,7 @@ async fn delete_behind_a_create_in_backoff(
                 count_attempt: true,
                 undo_first_start: false,
                 cancel_if_superseded: false,
+                carried_error: None,
             })
             .await?,
         ReleasedClaim::Requeued
@@ -356,6 +357,7 @@ async fn claim_holds_back_operations_behind_their_sandboxs_live_or_earlier_work(
             count_attempt: true,
             undo_first_start: false,
             cancel_if_superseded: false,
+            carried_error: None,
         })
         .await?;
     assert!(claimed_ids(&claim_all(&store).await?).is_empty());
@@ -436,6 +438,7 @@ async fn delete_supersedes_backed_off_work_but_not_a_pending_create() -> TestRes
             count_attempt: true,
             undo_first_start: false,
             cancel_if_superseded: false,
+            carried_error: None,
         })
         .await?;
     assert_eq!(claimed_ids(&claim_all(&store).await?), vec![delete]);
@@ -490,6 +493,7 @@ async fn stale_claim_recovery_keeps_the_sandboxs_order() -> TestResult {
                 count_attempt: true,
                 undo_first_start: false,
                 cancel_if_superseded: false,
+                carried_error: None,
             })
             .await?,
         ReleasedClaim::Lost
@@ -949,7 +953,10 @@ impl PublicOperationExecutor for DeleteDuringCreate {
                 progress_message: "timed out waiting for sandbox pod to become ready".to_string(),
                 result_json: None,
                 terminal_error_code: None,
-                terminal_error_json: None,
+                terminal_error_json: Some(serde_json::json!({
+                    "reason": "sandbox_not_ready",
+                    "readiness_phase": "pod_never_ready",
+                })),
                 retry_after: Some(Duration::from_secs(1)),
                 requeue_reason: PublicOperationRequeueReason::TransientFailure,
             };
@@ -1004,6 +1011,17 @@ async fn a_create_mid_attempt_when_a_delete_arrives_ends_canceled_instead_of_ret
         .expect("lock")
         .expect("the delete was requested");
     assert_superseded(&store, org_id, create, delete).await?;
+    // The record keeps why the attempt failed, under its own reason.
+    let error = store
+        .fetch_operation(org_id, create)
+        .await?
+        .and_then(|operation| operation.terminal_error)
+        .expect("a canceled create carries its error envelope");
+    assert_eq!(
+        error["last_progress_message"],
+        "timed out waiting for sandbox pod to become ready"
+    );
+    assert_eq!(error["readiness_phase"], "pod_never_ready");
 
     while tick(&config, &store, &executor).await?.claimed > 0 {}
     assert_eq!(*executor.ran.lock().expect("lock"), vec![create, delete]);
@@ -1167,6 +1185,7 @@ async fn a_create_released_while_its_delete_commits_ends_canceled() -> TestResul
                     count_attempt: true,
                     undo_first_start: false,
                     cancel_if_superseded: true,
+                    carried_error: None,
                 })
                 .await
         }

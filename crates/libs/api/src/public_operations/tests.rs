@@ -811,6 +811,7 @@ async fn release_claimed_operation_requeues_with_backoff() -> TestResult {
                 count_attempt: true,
                 undo_first_start: false,
                 cancel_if_superseded: false,
+                carried_error: None,
             })
             .await?,
         ReleasedClaim::Requeued
@@ -876,6 +877,7 @@ async fn backpressure_release_rolls_back_claim_attempt() -> TestResult {
                 count_attempt: false,
                 undo_first_start: false,
                 cancel_if_superseded: false,
+                carried_error: None,
             })
             .await?,
         ReleasedClaim::Requeued
