@@ -24,8 +24,8 @@ use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::activation_support::internal_request;
 use crate::service::tests::service_tests::insert_test_sandbox_with_runtime;
 use pplx_space_node_mgr_client::proto::{
-    FirecrackerVmState as WireFirecrackerVmState, GetFirecrackerVmStateRequest,
-    GetFirecrackerVmStateResponse, PauseSandboxRequest, PauseSandboxResponse,
+    GetVmStateRequest, GetVmStateResponse, PauseSandboxRequest, PauseSandboxResponse,
+    VmState as WireVmState,
 };
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -98,14 +98,11 @@ impl Exit {
                     .unary("PauseSandbox", |_: PauseSandboxRequest| {
                         Err::<PauseSandboxResponse, _>(Status::unavailable("test pause failed"))
                     })
-                    .unary(
-                        "GetFirecrackerVmState",
-                        |_: GetFirecrackerVmStateRequest| {
-                            Ok(GetFirecrackerVmStateResponse {
-                                state: WireFirecrackerVmState::Running as i32,
-                            })
-                        },
-                    )
+                    .unary("GetVmState", |_: GetVmStateRequest| {
+                        Ok(GetVmStateResponse {
+                            state: WireVmState::Running as i32,
+                        })
+                    })
                     .serve(),
             ),
             Self::VmUnobservable => Some(
@@ -113,14 +110,11 @@ impl Exit {
                     .unary("PauseSandbox", |_: PauseSandboxRequest| {
                         Err::<PauseSandboxResponse, _>(Status::unavailable("test pause failed"))
                     })
-                    .unary(
-                        "GetFirecrackerVmState",
-                        |_: GetFirecrackerVmStateRequest| {
-                            Err::<GetFirecrackerVmStateResponse, _>(Status::unavailable(
-                                "test VM state unavailable",
-                            ))
-                        },
-                    )
+                    .unary("GetVmState", |_: GetVmStateRequest| {
+                        Err::<GetVmStateResponse, _>(Status::unavailable(
+                            "test VM state unavailable",
+                        ))
+                    })
                     .serve(),
             ),
         }

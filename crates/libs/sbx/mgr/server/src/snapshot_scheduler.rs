@@ -17,7 +17,7 @@ use crate::guest_filesystem_flush::{
     prepare_guest_for_vm_snapshot_via_spaced_host,
 };
 use crate::node_state_sync::mark_sandbox_dirty;
-use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_firecracker_vm_state};
+use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_state};
 use crate::state::SandboxState;
 use pplx_space_common_core::types::{
     ArtifactKind, LocalArtifactId, SandboxArtifactMetadata, SandboxId, SandboxQuarantineReasonCode,
@@ -27,9 +27,9 @@ use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_node_mgr_client::proto::{
-    CreateSnapshotRequest, PauseSandboxRequest, ResumeSandboxRequest, SyncGuestRequest,
+    CaptureVmStateRequest, PauseSandboxRequest, ResumeSandboxRequest, SyncGuestRequest,
 };
-use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+use pplx_space_node_runtime_core::vm_state::VmState;
 
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -666,11 +666,11 @@ fn finish_completed_checkpoint_after_resume_error(
     ctx: &CheckpointContext,
     sandbox_id: &str,
     reason: String,
-    vm_state: Option<FirecrackerVmState>,
+    vm_state: Option<VmState>,
 ) -> Result<(), String> {
     let (stable_state, lifecycle_result) = match vm_state {
-        Some(FirecrackerVmState::Running) => (SandboxState::Started, Ok(())),
-        Some(FirecrackerVmState::Paused) => (SandboxState::Paused, Err(reason.clone())),
+        Some(VmState::Running) => (SandboxState::Started, Ok(())),
+        Some(VmState::Paused) => (SandboxState::Paused, Err(reason.clone())),
         _ => {
             quarantine_checkpoint_resume_failure(ctx, sandbox_id, &reason);
             return Err(reason);
@@ -713,7 +713,7 @@ async fn rollback_checkpoint_failure(
         .map(|_| ())
         .map_err(|error| error.to_string());
     let observation = if resume_result.is_err() {
-        let observation = observe_firecracker_vm_state(
+        let observation = observe_vm_state(
             &sandbox_id_typed,
             "checkpoint rollback resume reconciliation",
             &ctx.node_manager,
@@ -745,7 +745,7 @@ fn finish_checkpoint_rollback(
     previous_state: SandboxState,
     checkpoint_error: String,
     resume_result: Result<(), String>,
-    observed_vm_state: Option<FirecrackerVmState>,
+    observed_vm_state: Option<VmState>,
 ) -> String {
     debug_assert_eq!(previous_state, SandboxState::Started);
     match resume_result {
@@ -758,10 +758,10 @@ fn finish_checkpoint_rollback(
                 "{checkpoint_error}; resume after checkpoint rollback failed: {resume_error}"
             );
             match observed_vm_state {
-                Some(FirecrackerVmState::Running) => {
+                Some(VmState::Running) => {
                     restore_checkpoint_state_best_effort(ctx, sandbox_id, SandboxState::Started)
                 }
-                Some(FirecrackerVmState::Paused) => {
+                Some(VmState::Paused) => {
                     restore_checkpoint_state_best_effort(ctx, sandbox_id, SandboxState::Paused)
                 }
                 _ => quarantine_checkpoint_resume_failure(ctx, sandbox_id, &reason),
@@ -973,18 +973,22 @@ pub async fn do_checkpoint(
         .await);
     }
     if let Err(e) = node_client
-        .create_snapshot(crate::service::snapshot_capture::bind(
-            CreateSnapshotRequest {
-                execution_fence: execution_fence.clone(),
-                sandbox_id: sandbox_id.to_string(),
-                snapshot_path: "/vmstate".to_string(),
-                mem_file_path: "/memory".to_string(),
-                dest_dir: Some(snapshot_dir.clone()),
-                snapshot_volume_mount_dir: None,
-                environment: None,
-            },
-            execution.as_ref(),
-        ))
+        .capture_runtime_state(
+            crate::service::snapshot_capture::runtime(execution.as_ref()),
+            crate::service::snapshot_capture::bind(
+                CaptureVmStateRequest {
+                    execution_fence: execution_fence.clone(),
+                    sandbox_id: sandbox_id.to_string(),
+                    artifacts: crate::service::snapshot_capture::artifacts(),
+                    storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
+                        directory: Some(snapshot_dir.clone()),
+                        encrypted_volume_mount: None,
+                    }),
+                    environment_reference: None,
+                },
+                execution.as_ref(),
+            ),
+        )
         .await
     {
         return Err(rollback_checkpoint_failure(
@@ -1008,7 +1012,7 @@ pub async fn do_checkpoint(
             .await
         {
             let reason = format!("resume after checkpoint failed: {e}");
-            let observation = observe_firecracker_vm_state(
+            let observation = observe_vm_state(
                 &sandbox_id_typed,
                 "completed checkpoint resume reconciliation",
                 &ctx.node_manager,
@@ -1073,3 +1077,5 @@ use retention::prune_scheduled_snapshots;
 
 #[cfg(test)]
 mod tests;
+
+use pplx_space_node_mgr_client::runtime_control::RuntimeControl;

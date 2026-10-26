@@ -25,7 +25,7 @@ use pplx_space_common_core::types::{LinuxPid, SandboxId, SemVer};
 use pplx_space_metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
 };
-use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+use pplx_space_node_runtime_core::vm_state::VmState;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::db::guest_health_scan::SandboxGuestHealthRow;
@@ -596,7 +596,7 @@ struct HealthObservation {
     latency_micros: u64,
     outcome: HealthProbeOutcome,
     detail: String,
-    firecracker_state: Option<FirecrackerVmState>,
+    firecracker_state: Option<VmState>,
     lifecycle_epoch: u64,
 }
 
@@ -1206,7 +1206,7 @@ impl SandboxHealth {
         self.health_components.get_mut(component).degraded = degraded;
     }
 
-    pub(crate) fn cached_firecracker_state(&self) -> Option<FirecrackerVmState> {
+    pub(crate) fn cached_firecracker_state(&self) -> Option<VmState> {
         if self
             .health_observed_at
             .and_then(|observed| observed.elapsed().ok())
@@ -2353,8 +2353,8 @@ async fn probe_firecracker_health(
             return health_observation(started, HealthProbeOutcome::Unavailable, error.to_string());
         }
     };
-    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(sandbox_id, node_manager).await {
-        Err(crate::firecracker_via_nodemgr::FirecrackerStateReadError::Timeout { .. }) => {
+    match crate::runtime_via_nodemgr::get_vm_state(sandbox_id, node_manager).await {
+        Err(crate::runtime_via_nodemgr::RuntimeStateReadError::Timeout { .. }) => {
             health_observation(
                 started,
                 HealthProbeOutcome::Timeout,
@@ -2368,8 +2368,8 @@ async fn probe_firecracker_health(
         ),
         Ok(vm_state) => {
             let expected = match lifecycle {
-                Some(crate::state::SandboxState::Started) => Some(FirecrackerVmState::Running),
-                Some(crate::state::SandboxState::Paused) => Some(FirecrackerVmState::Paused),
+                Some(crate::state::SandboxState::Started) => Some(VmState::Running),
+                Some(crate::state::SandboxState::Paused) => Some(VmState::Paused),
                 _ => None,
             };
             match expected {
@@ -2526,7 +2526,7 @@ fn firecracker_health_observation(
     started: Instant,
     outcome: HealthProbeOutcome,
     detail: impl Into<String>,
-    state: FirecrackerVmState,
+    state: VmState,
 ) -> HealthObservation {
     HealthObservation {
         firecracker_state: Some(state),
@@ -2789,9 +2789,9 @@ fn pause_failed_recovery_target(
         return None;
     }
     match firecracker_state {
-        FirecrackerVmState::Running => Some(crate::db::PauseFailedRecoveryTarget::Started),
-        FirecrackerVmState::Paused => Some(crate::db::PauseFailedRecoveryTarget::Paused),
-        FirecrackerVmState::NotStarted => None,
+        VmState::Running => Some(crate::db::PauseFailedRecoveryTarget::Started),
+        VmState::Paused => Some(crate::db::PauseFailedRecoveryTarget::Paused),
+        VmState::NotStarted => None,
     }
 }
 

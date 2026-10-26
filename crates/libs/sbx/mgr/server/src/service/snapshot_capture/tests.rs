@@ -2,6 +2,7 @@ use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use pplx_space_common_core::types::{Arch, SandboxId};
 use pplx_space_node_mgr_client::proto::CreateSnapshotResponse;
+use pplx_space_node_mgr_client::runtime_control::RuntimeControl;
 
 // The previous request schema does not know the environment input.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -31,9 +32,13 @@ async fn mixed_version_capture_cannot_reach_old_nodes_with_a_bound_identity() {
                 .serve();
             let id = SandboxId::new();
             let request = bind(
-                CreateSnapshotRequest {
+                CaptureVmStateRequest {
                     sandbox_id: id.to_string(),
-                    snapshot_volume_mount_dir: encrypted.then(|| "/synthetic/snapshot".into()),
+                    artifacts: artifacts(),
+                    storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
+                        encrypted_volume_mount: encrypted.then(|| "/synthetic/snapshot".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
                 execution.as_ref(),
@@ -41,10 +46,15 @@ async fn mixed_version_capture_cannot_reach_old_nodes_with_a_bound_identity() {
             let legacy = execution.as_ref().is_none_or(|execution| {
                 !super::super::validation::is_non_default_execution(execution)
             });
-            assert_eq!(request.sandbox_id.is_empty(), !legacy);
+            assert_eq!(request.environment_reference.is_some(), !legacy);
             let mut node = old_node.connector().connect().await.unwrap();
-            assert_eq!(node.create_snapshot(request).await.is_ok(), legacy);
-            assert_eq!(old_node.calls(), ["CreateSnapshot"]);
+            assert_eq!(
+                node.capture_runtime_state(runtime(execution.as_ref()), request)
+                    .await
+                    .is_ok(),
+                legacy
+            );
+            assert_eq!(old_node.calls(), ["CaptureVmState", "CreateSnapshot"]);
         }
     }
 }

@@ -1,5 +1,3 @@
-use pplx_space_execution_common::environment::canonical_descriptor;
-
 use super::*;
 
 #[test]
@@ -7,7 +5,7 @@ fn compiled_pins_produce_the_e0_golden_definition() {
     let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
     let definition = initial.definition().unwrap();
     assert_eq!(
-        canonical_descriptor(definition.descriptor()),
+        definition.canonical_identity(),
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../../../proto/execution/v1/fixtures/e0.canonical"

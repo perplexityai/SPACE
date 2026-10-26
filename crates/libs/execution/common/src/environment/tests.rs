@@ -63,7 +63,10 @@ fn golden_identity_survives_protobuf_round_trip() {
     assert_eq!(definition.reference().to_string(), E0_REFERENCE);
     let bytes = proto::EnvironmentDefinition::from(&definition).encode_to_vec();
     let wire = proto::EnvironmentDefinition::decode(bytes.as_slice()).unwrap();
-    assert_eq!(EnvironmentDefinition::try_from(&wire).unwrap(), definition);
+    assert_eq!(
+        EnvironmentDefinition::try_from(&wire).unwrap(),
+        definition.into_runtime_neutral().unwrap()
+    );
 }
 
 #[test]

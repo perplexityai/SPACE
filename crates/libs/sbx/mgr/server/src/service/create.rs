@@ -1161,22 +1161,24 @@ impl SandboxManagerService {
             let mut spaced_host_client = node_client.clone();
             let load_snapshot = async {
                 snapshot_client
-                    .load_snapshot(LoadSnapshotRequest {
-                        execution_fence: Some(execution_fence.into()),
-                        sandbox_id: id.clone(),
-                        snapshot_path: "/vmstate".to_string(),
-                        mem_file_path: "/memory".to_string(),
-                        source_dir: Some(snapshot_dir.clone()),
-                        // Restore configuration was checked before activation;
-                        // unsupported backends must never reach node-manager.
-                        snapshot_volume_mount_dir: snapshot_volume_mount_dir.clone(),
-                        rootfs_rate_limit: self
-                            .rootfs_rate_limiter(
-                                sandbox.user.kind() == SandboxOwnerKind::Builder,
-                                sandbox.disk_io_limits,
-                            )
-                            .map(super::start::drive_rate_limit_proto),
-                    })
+                    .restore_runtime_state(
+                        resolved_execution_metadata.runtime().kind.into(),
+                        RestoreVmStateRequest {
+                            execution_fence: Some(execution_fence.into()),
+                            sandbox_id: id.clone(),
+                            artifacts: super::snapshot_capture::artifacts(),
+                            storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
+                                directory: Some(snapshot_dir.clone()),
+                                encrypted_volume_mount: snapshot_volume_mount_dir.clone(),
+                            }),
+                            rootfs_rate_limit: self
+                                .rootfs_rate_limiter(
+                                    sandbox.user.kind() == SandboxOwnerKind::Builder,
+                                    sandbox.disk_io_limits,
+                                )
+                                .map(super::start::drive_rate_limit_proto),
+                        },
+                    )
                     .instrument(tracing::info_span!(
                         "sbxmgr.restore.node.load_snapshot",
                         sandbox_id = %id

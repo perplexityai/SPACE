@@ -72,23 +72,48 @@ Local source/path configuration cannot become a second selection authority.
 
 ## Runtime-neutral encoding and rollout
 
-Schema-1 Firecracker wire fields, JSON documents, canonical bytes and references
-remain unchanged. The legacy fields stay readable and writable for those
-identities; they are not templates for adding new runtimes.
+Firecracker catalog definitions and decoded legacy definitions normalize to the
+same generic boot and compatibility profiles used by other managed runtimes.
+The Firecracker builder consumes these profiles; it no longer depends on a
+Firecracker-specific protobuf profile. Runtime adapters still implement their
+own boot and machine contracts.
 
-Schema 2 uses the generic release, boot and compatibility profiles together.
-Boot artifacts are canonicalized by unique role. Every artifact's kind, version,
-digest and format, both contract identifiers, and the presence/value of memory
-state participate in the digest. A kernel-free boot profile is representable;
-its adapter still has to implement it. Synthetic round-trip and canonical
-fixtures exercise the wire shape without qualifying a runtime.
+Representation and identity versions are separate. `schema_version` describes
+the wire representation; `identity_schema_version` describes the canonical
+bytes hashed by the reference (zero retains the historical rule of using the
+wire version). Existing Firecracker definitions use generic schema-2 transport
+with identity version 1. The decoder accepts this combination only when every
+generic requirement maps exactly to the original Firecracker contract. It
+rejects extra artifacts, changed roles/formats/contracts, missing state format,
+and incompatible host/guest/runtime combinations. New definitions use identity
+version 2. Neither encoding conversion nor deployment changes persisted
+references, selection policy, template hashes, or snapshot provenance.
 
-Old schema-1 peers reject schema 2 before interpreting its fields. A new reader
-also rejects a schema-2 shape marked as schema 1 and vice versa. Upgrade readers
-before enabling a catalog entry that uses schema 2; ordinary schema-1 work is
-unchanged in either deployment order. Never retry an unsupported schema as an
-unbound or default environment. The existing exact-reference acknowledgement
-remains required.
+The immutable old representation is retained privately at the codec boundary
+for canonical hashing and stored schema-1 JSON. Consumers see generic profiles.
+Historical records that omitted component formats keep their original binding
+checks; native schema-2 identities require the declared formats.
+
+During rollout, ResolveExecutionEnvironment callers advertise the definition
+schema they understand. New nodes return generic profiles to new callers and
+an exact schema-1 representation to older callers. New callers also accept and
+normalize old-node responses. Native schema-2 definitions have no downgrade:
+an old peer receives an explicit refusal, never an unbound/default environment.
+Selection acknowledgements and persist-before-activation rules are unchanged.
+
+Remove legacy environment protobuf messages and the temporary response-format
+negotiation only after node-manager, builder, sandbox-manager and operator CLI
+readers have this migration deployed, including rollback images. Reserve removed
+field numbers and names. A later rollback to a pre-migration reader requires
+restoring the transitional server first. This removal does not remove the
+historical canonical/JSON reader: persisted references still need it. Existing
+Firecracker-specific lifecycle RPCs are separate adapter integration work.
+
+Schema-2 artifacts are canonicalized by unique role. Every artifact's kind,
+version, digest and format, both contract identifiers, and the presence/value of
+memory state participate in native schema-2 identity. A kernel-free boot profile
+is representable; its adapter still has to implement it. Synthetic round-trip
+and canonical fixtures exercise the wire shape without qualifying a runtime.
 
 ## Persisted-state provenance and restore compatibility
 
@@ -1027,3 +1052,17 @@ transport failures and runtime refusals never trigger a second mutation. Other
 runtimes must not use FC fallback. Deploy the new readers and FC callers across
 all participating services and rollback images before retiring the old routes.
 Persisted environment JSON/canonical compatibility is independent and remains.
+
+During the bridge canary, measure the end-to-end VM-state probe latency and
+its timeout rate against nodes that have not yet been upgraded. Those probes
+try the generic RPC and then the legacy RPC within the same 500 ms deadline.
+Do not cache peer support permanently: a reconnecting channel can reach an
+upgraded node where the legacy RPC has been removed. If measurements justify a
+cache, bound its lifetime and invalidate it when the legacy method is absent.
+
+When retiring the legacy RPCs, update lifecycle-admission metric queries for
+`method:LoadSnapshot` to `method:RestoreVmState`; during that rollout, include
+both labels. This is the limiter's metric label, not a change to its capacity
+settings. Keep the existing `LOAD_SNAPSHOT` configuration suffix so deployed
+limits continue to apply. Generic snapshot RPC timing already uses the generic
+method names during the bridge.

@@ -457,11 +457,11 @@ fn live_sandbox_namespace(
 fn sandbox_status_from_runtime_observation(
     state: SandboxState,
     pid_alive: bool,
-    vm_state: Option<FirecrackerVmState>,
+    vm_state: Option<VmState>,
 ) -> SandboxState {
     if pid_alive
         && matches!(state, SandboxState::Started | SandboxState::Paused)
-        && vm_state == Some(FirecrackerVmState::Paused)
+        && vm_state == Some(VmState::Paused)
     {
         SandboxState::Paused
     } else {
@@ -1875,18 +1875,22 @@ impl SandboxManagerService {
                 .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
             let phase = Instant::now();
             node_client
-                .create_snapshot(crate::service::snapshot_capture::bind(
-                    CreateSnapshotRequest {
-                        execution_fence: sandbox.node_execution_fence(),
-                        sandbox_id: sandbox.id.clone(),
-                        snapshot_path: "vmstate".to_string(),
-                        mem_file_path: "memory".to_string(),
-                        dest_dir: Some(staging_dir.clone()),
-                        snapshot_volume_mount_dir: None,
-                        environment: None,
-                    },
-                    sandbox.execution_metadata.as_ref(),
-                ))
+                .capture_runtime_state(
+                    crate::service::snapshot_capture::runtime(sandbox.execution_metadata.as_ref()),
+                    crate::service::snapshot_capture::bind(
+                        CaptureVmStateRequest {
+                            execution_fence: sandbox.node_execution_fence(),
+                            sandbox_id: sandbox.id.clone(),
+                            artifacts: crate::service::snapshot_capture::artifacts(),
+                            storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
+                                directory: Some(staging_dir.clone()),
+                                encrypted_volume_mount: None,
+                            }),
+                            environment_reference: None,
+                        },
+                        sandbox.execution_metadata.as_ref(),
+                    ),
+                )
                 .await
                 .map_err(|error| {
                     Status::internal(format!("create template base snapshot: {error}"))

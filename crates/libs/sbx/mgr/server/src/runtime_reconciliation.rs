@@ -1,19 +1,19 @@
 use pplx_space_common_core::types::{
     SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
-use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+use pplx_space_node_runtime_core::vm_state::VmState;
 
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::state::SandboxState;
 
 #[derive(Debug)]
-pub(crate) enum FirecrackerVmStateObservation {
-    Observed(FirecrackerVmState),
+pub(crate) enum VmStateObservation {
+    Observed(VmState),
     Unobservable(String),
 }
 
-impl FirecrackerVmStateObservation {
-    pub(crate) fn state(&self) -> Option<FirecrackerVmState> {
+impl VmStateObservation {
+    pub(crate) fn state(&self) -> Option<VmState> {
         match self {
             Self::Observed(state) => Some(*state),
             Self::Unobservable(_) => None,
@@ -44,25 +44,21 @@ pub(crate) enum ResidentObservationError {
 pub(crate) async fn observe_stable_resident_state<F, Fut>(
     sandbox_id: SandboxId,
     mut probe: F,
-) -> Result<FirecrackerVmState, ResidentObservationError>
+) -> Result<VmState, ResidentObservationError>
 where
     F: FnMut(SandboxId) -> Fut,
-    Fut: std::future::Future<Output = FirecrackerVmStateObservation>,
+    Fut: std::future::Future<Output = VmStateObservation>,
 {
     let mut previous = None;
     let mut error = ResidentObservationError::Unstable;
     for attempt in 0..3 {
         let current = match probe(sandbox_id).await {
-            FirecrackerVmStateObservation::Observed(FirecrackerVmState::Running) => {
-                Some(FirecrackerVmState::Running)
+            VmStateObservation::Observed(VmState::Running) => Some(VmState::Running),
+            VmStateObservation::Observed(VmState::Paused) => Some(VmState::Paused),
+            VmStateObservation::Observed(VmState::NotStarted) => {
+                return Ok(VmState::NotStarted);
             }
-            FirecrackerVmStateObservation::Observed(FirecrackerVmState::Paused) => {
-                Some(FirecrackerVmState::Paused)
-            }
-            FirecrackerVmStateObservation::Observed(FirecrackerVmState::NotStarted) => {
-                return Ok(FirecrackerVmState::NotStarted);
-            }
-            FirecrackerVmStateObservation::Unobservable(_) => {
+            VmStateObservation::Unobservable(_) => {
                 error = ResidentObservationError::Unobservable;
                 None
             }
@@ -81,14 +77,13 @@ where
     Err(error)
 }
 
-pub(crate) async fn observe_firecracker_vm_state(
+pub(crate) async fn observe_vm_state(
     sandbox_id: &SandboxId,
     probe_context: &'static str,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
-) -> FirecrackerVmStateObservation {
-    match crate::firecracker_via_nodemgr::get_firecracker_vm_state(*sandbox_id, node_manager).await
-    {
-        Ok(state) => FirecrackerVmStateObservation::Observed(state),
+) -> VmStateObservation {
+    match crate::runtime_via_nodemgr::get_vm_state(*sandbox_id, node_manager).await {
+        Ok(state) => VmStateObservation::Observed(state),
         Err(error) => {
             let reason = format!("Firecracker state probe failed: {error}");
             tracing::warn!(
@@ -97,7 +92,7 @@ pub(crate) async fn observe_firecracker_vm_state(
                 %error,
                 "failed to observe Firecracker VM state"
             );
-            FirecrackerVmStateObservation::Unobservable(reason)
+            VmStateObservation::Unobservable(reason)
         }
     }
 }
