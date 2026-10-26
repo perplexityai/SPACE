@@ -61,6 +61,50 @@ fn classify_auto_lifecycle_touch_response(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutExecutionAction {
+    StoredOnly,
+    StoredOnlyAfterLock,
+    ResetRuntime,
+}
+
+impl TimeoutExecutionAction {
+    fn from_execution(
+        execution: &sandbox_store::AutoLifecycleExecution,
+    ) -> Result<Self, ControllerError> {
+        let lifecycle = execution
+            .lifecycle
+            .parse::<SandboxLifecycle>()
+            .map_err(|error| {
+                ControllerError::internal(format!("invalid stored sandbox lifecycle: {error}"))
+            })?;
+        match lifecycle {
+            SandboxLifecycle::Created | SandboxLifecycle::Paused | SandboxLifecycle::Suspended => {
+                Ok(Self::StoredOnly)
+            }
+            SandboxLifecycle::Started => {
+                if execution.proves_no_execution() {
+                    Ok(Self::StoredOnlyAfterLock)
+                } else {
+                    Ok(Self::ResetRuntime)
+                }
+            }
+            SandboxLifecycle::Creating
+            | SandboxLifecycle::Starting
+            | SandboxLifecycle::Restoring
+            | SandboxLifecycle::Resuming
+            | SandboxLifecycle::Pausing
+            | SandboxLifecycle::Suspending
+            | SandboxLifecycle::Checkpointing => Ok(Self::ResetRuntime),
+            SandboxLifecycle::Stopping
+            | SandboxLifecycle::Stopped
+            | SandboxLifecycle::Deleting
+            | SandboxLifecycle::Quarantined
+            | SandboxLifecycle::Failed => Err(ControllerError::not_found("sandbox is terminal")),
+        }
+    }
+}
+
 pub(super) fn observed_access_idle_generation(
     sandbox_id: SandboxId,
     response: pplx_space_sbx_mgr_client::proto::StateResponse,
@@ -629,24 +673,13 @@ impl SandboxController {
                 == current_policy
                 && expected_policy
                     .is_none_or(|expected| expected.clone().normalized() == current_policy);
-            let claim_independent = match execution.lifecycle.parse::<SandboxLifecycle>() {
-                Ok(
-                    SandboxLifecycle::Created
-                    | SandboxLifecycle::Paused
-                    | SandboxLifecycle::Suspended
-                    | SandboxLifecycle::Creating
-                    | SandboxLifecycle::Starting
-                    | SandboxLifecycle::Restoring
-                    | SandboxLifecycle::Resuming
-                    | SandboxLifecycle::Pausing
-                    | SandboxLifecycle::Suspending
-                    | SandboxLifecycle::Checkpointing,
-                ) => true,
-                Ok(SandboxLifecycle::Started) => !execution.proves_no_execution(),
-                _ => false,
-            };
-            let (execution, tx) = if unchanged && claim_independent {
-                (execution, None)
+            let action = TimeoutExecutionAction::from_execution(&execution);
+            let (execution, action, tx) = if unchanged
+                && matches!(
+                    action,
+                    Ok(TimeoutExecutionAction::StoredOnly | TimeoutExecutionAction::ResetRuntime)
+                ) {
+                (execution, action?, None)
             } else {
                 let mut tx = pool
                     .begin()
@@ -668,33 +701,8 @@ impl SandboxController {
                     .await
                     .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
                     .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
-                (execution, Some(tx))
-            };
-            let lifecycle = execution
-                .lifecycle
-                .parse::<SandboxLifecycle>()
-                .map_err(|error| {
-                    ControllerError::internal(format!("invalid stored sandbox lifecycle: {error}"))
-                })?;
-            let needs_runtime = match lifecycle {
-                SandboxLifecycle::Created
-                | SandboxLifecycle::Paused
-                | SandboxLifecycle::Suspended => false,
-                SandboxLifecycle::Started => !execution.proves_no_execution(),
-                SandboxLifecycle::Creating
-                | SandboxLifecycle::Starting
-                | SandboxLifecycle::Restoring
-                | SandboxLifecycle::Resuming
-                | SandboxLifecycle::Pausing
-                | SandboxLifecycle::Suspending
-                | SandboxLifecycle::Checkpointing => true,
-                SandboxLifecycle::Stopping
-                | SandboxLifecycle::Stopped
-                | SandboxLifecycle::Deleting
-                | SandboxLifecycle::Quarantined
-                | SandboxLifecycle::Failed => {
-                    return Err(ControllerError::not_found("sandbox is terminal"));
-                }
+                let action = TimeoutExecutionAction::from_execution(&execution)?;
+                (execution, action, Some(tx))
             };
             let current_policy = execution.policy.0.normalized();
             if expected_policy
@@ -714,8 +722,12 @@ impl SandboxController {
                     .await
                     .map_err(|error| db_contention_error("commit timeout intent", &error))?;
             }
-            if !needs_runtime {
-                return Ok(AccessIdleTimeoutOutcome::StoredOnly);
+            match action {
+                TimeoutExecutionAction::StoredOnly
+                | TimeoutExecutionAction::StoredOnlyAfterLock => {
+                    return Ok(AccessIdleTimeoutOutcome::StoredOnly);
+                }
+                TimeoutExecutionAction::ResetRuntime => {}
             }
             // Only an identified execution is eligible for bounded readiness
             // observation. Missing identity alone cannot authorize a new wake.

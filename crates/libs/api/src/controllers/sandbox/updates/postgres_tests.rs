@@ -75,7 +75,7 @@ fn metadata_request(metadata: Option<SandboxMetadata>) -> UpdateSandboxRequest {
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
 
-// Direct is only a placeholder: the tests using this never reach the substrate.
+// Runtime tests seed their Direct route and simulated worker explicitly.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
@@ -116,7 +116,7 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
         let sandbox = seed_sandbox(&db.pool, &actor).await?;
         sqlx::query(sql!(
             "UPDATE sandboxes SET lifecycle = $2, auto_lifecycle_json = $3,
-                active_node_id = $4, placement = $5 WHERE id = $1"
+                active_node_id = $4, placement = $5, managed_by = $6 WHERE id = $1"
         ))
         .bind(sandbox.id)
         .bind(lifecycle)
@@ -127,6 +127,7 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
         } else {
             "unplaced"
         })
+        .bind(pplx_space_common_core::types::SubstrateKind::Space)
         .execute(&db.pool)
         .await?;
         if lifecycle == "started" {
@@ -208,6 +209,46 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
             );
         }
     }
+    // Absence must serialize with activation acquisition, even when the
+    // Kubernetes sandbox's policy is already unchanged.
+    let sandbox = seed_sandbox(&db.pool, &actor).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
+    ))
+    .bind(sandbox.id)
+    .bind(sqlx::types::Json(&policy))
+    .execute(&db.pool)
+    .await?;
+    let ownership = pplx_space_sandbox_store::auto_lifecycle_execution(&db.pool, sandbox.id)
+        .await?
+        .ok_or("seeded sandbox missing")?;
+    assert!(ownership.proves_no_execution());
+    let mut holder = db.pool.begin().await?;
+    sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+        .bind(sandbox.id)
+        .execute(&mut *holder)
+        .await?;
+    let result = controller
+        .set_access_idle_timeout(
+            &db.pool,
+            &sandbox,
+            90,
+            prost_types::Timestamp {
+                seconds: 1_800_000_000,
+                nanos: 0,
+            },
+            tokio::time::Instant::now() + Duration::from_millis(500),
+            Some(&policy),
+        )
+        .await;
+    holder.rollback().await?;
+    let error = result.expect_err("execution absence must still wait for the row lock");
+    assert_eq!(error.status().as_u16(), 503);
+    assert!(
+        error
+            .to_string()
+            .contains("sandbox deadline update expired")
+    );
     Ok(())
 }
 
