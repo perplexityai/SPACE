@@ -297,6 +297,23 @@ pub(super) fn validate_environment_create(
             "requested environment differs from the template binding",
         ));
     }
+    let capabilities = execution.runtime().kind.baseline_capabilities();
+    if !capabilities.snapshot
+        && (request.snapshots_enabled
+            || request.boot_mode != crate::proto::BootMode::Cold as i32
+            || request.pool_template.is_some())
+    {
+        return Err(Status::failed_precondition(
+            "runtime supports cold creation only",
+        ));
+    }
+    if execution.runtime().kind == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+        && execution.environment().is_none()
+    {
+        return Err(Status::failed_precondition(
+            "standalone runtime requires a bound template",
+        ));
+    }
     let non_default = is_non_default_execution(execution);
     if non_default || environment.is_some() {
         validate_environment_create_fields(request)?;
@@ -410,3 +427,27 @@ pub(super) fn requires_cold_creation(
 
 #[cfg(test)]
 mod tests;
+
+/// Reject timer-driven operations at policy admission, before a sandbox can
+/// become resident with a policy its adapter will never execute.
+pub(super) fn validate_runtime_lifecycle_policy(
+    runtime: pplx_space_common_core::types::RuntimeKind,
+    policy: &pplx_space_common_core::types::AutoLifecyclePolicy,
+) -> Result<(), Status> {
+    let capabilities = runtime.baseline_capabilities();
+    if !capabilities.pause_resume
+        && policy.contains_action(pplx_space_common_core::types::AutoLifecycleIdleAction::Pause)
+    {
+        return Err(Status::failed_precondition(
+            "runtime does not support automatic pause",
+        ));
+    }
+    if !capabilities.snapshot
+        && policy.contains_action(pplx_space_common_core::types::AutoLifecycleIdleAction::Suspend)
+    {
+        return Err(Status::failed_precondition(
+            "runtime does not support automatic suspend",
+        ));
+    }
+    Ok(())
+}
