@@ -16,7 +16,7 @@ use tokio::time::MissedTickBehavior;
 use crate::public_operations::{
     ApiProduct, ClaimedPublicOperation, CompleteClaimedPublicOperation, ExpirePublicOperation,
     FailClaimedPublicOperation, OverdueQueuedPublicOperations, PublicOperationRequeueReason,
-    PublicOperationStore, PublicOperationStoreError, ReleaseClaimedPublicOperation,
+    PublicOperationStore, PublicOperationStoreError, ReleaseClaimedPublicOperation, ReleasedClaim,
 };
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
 
@@ -348,28 +348,6 @@ where
         | OperationState::Canceled
         | OperationState::Expired
         | OperationState::Other(_) => {
-            // A create a later delete supersedes ends here rather than
-            // retrying, so the delete need not wait out its retries and the
-            // create never runs after it.
-            if kind == OperationKind::CreateSandbox
-                && let Some(delete_id) = store
-                    .cancel_claimed_create_superseded_by_delete(&claim_token, operation_id)
-                    .await?
-            {
-                report.canceled += 1;
-                pplx_space_metrics::operations::completed_by(
-                    api_product_label,
-                    kind.as_str(),
-                    OperationState::Canceled.as_str(),
-                    executor_label,
-                );
-                tracing::info!(
-                    operation_id = %operation_id,
-                    delete_operation_id = %delete_id,
-                    "public create canceled instead of retried: a later delete supersedes it"
-                );
-                return Ok(report);
-            }
             let supported_requeue = result.state == OperationState::Queued;
             let requeue_reason = if supported_requeue {
                 result.requeue_reason
@@ -569,7 +547,7 @@ where
                     }
                     None => retry_hint,
                 };
-                let updated = store
+                let released = store
                     .release_claimed_operation(ReleaseClaimedPublicOperation {
                         claim_token,
                         operation_id,
@@ -579,17 +557,38 @@ where
                         // waits do not consume the transient-failure budget.
                         count_attempt: !preserve_retry_budget,
                         undo_first_start: false,
+                        // A create a later delete supersedes ends rather than
+                        // retrying, so the delete need not wait out its
+                        // retries and the create never runs after it.
+                        cancel_if_superseded: true,
                     })
                     .await?;
-                if updated {
-                    report.retried += 1;
-                    pplx_space_metrics::operations::requeued(
-                        api_product_label,
-                        kind.as_str(),
-                        retry_reason,
-                    );
+                match released {
+                    ReleasedClaim::Requeued => {
+                        report.retried += 1;
+                        pplx_space_metrics::operations::requeued(
+                            api_product_label,
+                            kind.as_str(),
+                            retry_reason,
+                        );
+                    }
+                    ReleasedClaim::Superseded { delete_id } => {
+                        report.canceled += 1;
+                        pplx_space_metrics::operations::completed_by(
+                            api_product_label,
+                            kind.as_str(),
+                            OperationState::Canceled.as_str(),
+                            executor_label,
+                        );
+                        tracing::info!(
+                            operation_id = %operation_id,
+                            delete_operation_id = %delete_id,
+                            "public create canceled instead of retried: a later delete supersedes it"
+                        );
+                    }
+                    ReleasedClaim::Lost => {}
                 }
-                updated
+                released != ReleasedClaim::Lost
             }
         }
     };

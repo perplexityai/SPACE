@@ -220,7 +220,14 @@ async fn work_handed_back_unrun_at_its_first_claim_still_expires_past_its_deadli
         .expect("the pause is claimed");
     // Its sandbox was still executing here, so the dispatcher hands the pause
     // back without running it.
-    hand_back_busy_key(store.clone(), claim.claim_token, operation, Duration::ZERO).await;
+    hand_back_busy_key(
+        store.clone(),
+        claim.claim_token,
+        operation,
+        Duration::ZERO,
+        false,
+    )
+    .await;
     backdate_operations(&db.pool, &[pause]).await?;
     let executor = RecordingExecutor::default();
     let config = ReconcilerConfig {
