@@ -23,7 +23,7 @@ fn roots(base: &std::path::Path) -> ScanRoots {
         )],
         vendor_kernels: base.join("vendor/kernels"),
         managed_kernels: None,
-        managed_releases: None,
+        managed_releases: Vec::new(),
         cache_kernels: base.join("cache/firecracker/kernels"),
         cache_legacy_assets: base.join("cache/firecracker/assets"),
         runtime_aliases: Vec::new(),
@@ -552,26 +552,73 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
 }
 
 #[tokio::test]
-async fn catalog_listing_does_not_require_a_mutation_worker() {
-    use crate::installs::test_support::{FakeReleaseSource, FakeSource, TestPins, release_pin};
-    let dir = tempfile::tempdir().unwrap();
-    let source = Arc::new(FakeSource::default());
-    source.offer("1.16", "6.1.158", b"synthetic kernel");
-    let pins = TestPins::new(source.clone());
-    pins.pin_release(release_pin("1.16.2", 1));
-    let service = service(dir.path()).with_kernel_source(source).with_catalog(
-        pins,
-        Some(crate::installs::ReleaseContext {
-            root: dir.path().join("managed/releases"),
+async fn catalog_listing_routes_only_configured_sources_without_a_mutation_worker() {
+    use crate::installs::test_support::{
+        FakeExecutableSource, FakeReleaseSource, FakeSource, TestPins, release_pin,
+    };
+    use pplx_space_common_core::types::RuntimeKind;
+    for include_ch in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(FakeSource::default());
+        source.offer("1.16", "6.1.158", b"synthetic kernel");
+        let pins = TestPins::new(source.clone());
+        pins.pin_release(release_pin("1.16.2", 1));
+        let mut ch_pin = release_pin("1.16.2", 1);
+        ch_pin.release.kind = RuntimeKind::CloudHypervisor;
+        ch_pin.release.version = "54.0".parse().unwrap();
+        ch_pin.binaries.truncate(1);
+        ch_pin.binaries[0].path = "bin/cloud-hypervisor";
+        pins.pin_release(ch_pin);
+        let mut releases = vec![crate::installs::ReleaseContext {
+            root: dir.path().join("managed/firecracker"),
             source: Arc::new(FakeReleaseSource::default()),
-        }),
-    );
-    let response = service
-        .list_available_artifacts(peer_request(ListAvailableArtifactsRequest::default(), 0))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(response.artifacts.len(), 2);
-    assert!(!dir.path().join("vendor/runtime-manager/state").exists());
-    assert!(service.installer().is_err());
+        }];
+        if include_ch {
+            releases.push(crate::installs::ReleaseContext {
+                root: dir.path().join("managed/cloud-hypervisor"),
+                source: Arc::new(FakeExecutableSource {
+                    location: "https://releases.example.test/ch".parse().unwrap(),
+                    bytes: Vec::new(),
+                }),
+            });
+        }
+        let service = service(dir.path()).with_kernel_source(source).with_catalog(
+            pins,
+            crate::installs::ReleaseSources::new(releases).unwrap(),
+        );
+        let response = service
+            .list_available_artifacts(peer_request(ListAvailableArtifactsRequest::default(), 0))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.artifacts.len(), 2);
+        let response = service
+            .list_available_artifacts(peer_request(
+                ListAvailableArtifactsRequest {
+                    runtime_kind: pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor
+                        as i32,
+                    kinds: vec![ExecutionArtifactKind::Runtime as i32],
+                    ..Default::default()
+                },
+                0,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.artifacts.len(), usize::from(include_ch));
+        for artifact in response.artifacts {
+            assert_eq!(artifact.source, "https://releases.example.test/ch");
+            let Some(proto::artifact_identity::Artifact::Runtime(identity)) =
+                artifact.identity.and_then(|identity| identity.artifact)
+            else {
+                panic!("runtime-only filter returned a component");
+            };
+            assert_eq!(
+                identity.kind,
+                pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor as i32
+            );
+        }
+        assert!(!dir.path().join("vendor/runtime-manager/state").exists());
+        assert!(service.installer().is_err());
+    }
 }

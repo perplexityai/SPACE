@@ -19,10 +19,9 @@ pub(crate) fn mark_managed_store(
 ) {
     for artifact in &mut scan.artifacts {
         let in_store = match artifact.origin.kind {
-            ArtifactKind::Runtime(_) => roots
-                .managed_releases
-                .as_ref()
-                .is_some_and(|root| artifact.path.parent() == Some(root.path.as_path())),
+            ArtifactKind::Runtime(runtime) => roots.managed_releases.iter().any(|root| {
+                root.kind == runtime && artifact.path.parent() == Some(root.path.as_path())
+            }),
             ArtifactKind::Component(_) => roots.managed_kernels.as_ref().is_some_and(|root| {
                 artifact.path.parent().and_then(Path::parent) == Some(root.as_path())
             }),
