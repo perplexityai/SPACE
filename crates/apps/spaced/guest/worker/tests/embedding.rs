@@ -46,6 +46,8 @@ fn main() {
     if !pplx_space_test_env::root_or_skip("identity-worker embedding") {
         return;
     }
+    // Helper branches above must inspect inherited descriptors before host setup.
+    boundary::isolate_launcher_descriptors();
     let threaded = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .arg("--threaded-worker-probe")
         .env("SPACE_SPACED_FILESYSTEM_WORKER", "1")

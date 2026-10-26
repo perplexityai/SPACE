@@ -222,6 +222,11 @@ preinstalled SIGCHLD notification handler, a Tokio signal subscriber, and
 PID-specific caller reaping. A redirected descendant survives drain, then exits
 when the caller tears down its workload cgroup.
 
+Before any library work, the single-threaded test host marks launcher-inherited
+descriptors above stderr close-on-exec, keeping them usable in the host. Child
+probes still inspect every inherited descriptor without an allowlist, so newly
+leaked library descriptors remain visible.
+
 The concurrent descriptor check samples unrelated execs during 16 startup
 rounds. It detects leaks only when an exec overlaps the inheritable window; it
 does not guarantee a spawn in each round or detection of microsecond

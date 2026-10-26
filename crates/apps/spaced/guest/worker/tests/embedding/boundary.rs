@@ -1,5 +1,6 @@
 //! Caller-owned placement and cleanup, outside the daemon's guest bootstrap.
 use std::fs::{File, OpenOptions};
+use std::os::fd::{BorrowedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, StreamExt};
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use pplx_space_common_core::types::GuestUserName;
@@ -23,6 +25,30 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "boundary/descriptors.rs"]
 mod descriptors;
+
+// Run once in the single-threaded test host, before any library work. Launcher
+// descriptors remain usable by the host but must not pollute child inventories.
+pub(super) fn isolate_launcher_descriptors() {
+    for entry in std::fs::read_dir("/proc/self/fd").expect("launcher descriptors") {
+        let raw: RawFd = entry
+            .expect("launcher descriptor")
+            .file_name()
+            .to_str()
+            .expect("descriptor number")
+            .parse()
+            .expect("descriptor number");
+        if raw < 3 {
+            continue;
+        }
+        // SAFETY: startup is single-threaded and nothing closes descriptors
+        // during this enumeration. Borrowing does not take ownership of them.
+        let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+        let flags =
+            FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD).expect("descriptor flags"));
+        fcntl(fd, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))
+            .expect("launcher descriptor close-on-exec");
+    }
+}
 
 fn print_descriptors() {
     for fd in std::fs::read_dir("/proc/self/fd").expect("child descriptors") {
