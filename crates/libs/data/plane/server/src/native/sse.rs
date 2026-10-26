@@ -96,6 +96,16 @@ pub(crate) async fn session_events(
             return too_many_attached_streams_response(limit);
         }
     };
+    if recovery::is_recovery_session(&attached) {
+        return data_plane_http_error(
+            StatusCode::BAD_REQUEST,
+            DataPlaneHttpErrorCode::InvalidRequest,
+            "recovery commands require a WebSocket attach",
+            false,
+            ResponseOrigin::Client,
+            ResponseKind::Validation,
+        );
+    }
     let sandbox_id = attached.sandbox_id;
     let stream_state = match attached.kind {
         SessionKind::Process => {

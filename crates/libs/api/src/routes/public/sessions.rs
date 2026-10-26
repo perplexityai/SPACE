@@ -323,7 +323,81 @@ pub(crate) async fn create_command_session(
     idempotency_key: IdempotencyKey,
     admit: impl FnOnce() -> Result<(), PublicApiError> + Send,
 ) -> Result<PublicCommand, PublicApiError> {
-    let request = CreateProcessRequest::from(request);
+    create_process_command_session(
+        store,
+        org_id,
+        actor_user_id,
+        sandbox_id,
+        request.into(),
+        CreatePublicSessionIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new(COMMAND_PATH_TEMPLATE),
+            key: &idempotency_key,
+        },
+        admit,
+    )
+    .await
+}
+
+pub async fn create_recovery_command(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    headers: HeaderMap,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<pplx_space_public_api::recovery::CreateRecoveryCommandRequest>,
+) -> Result<(StatusCode, Json<PublicCommand>), PublicApiError> {
+    let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
+    let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
+    if accepts_event_stream(&headers) {
+        return Err(PublicApiError::bad_request(
+            "recovery commands require a WebSocket attach",
+        ));
+    }
+    let mut process = CreateProcessRequest::from(request.process);
+    process.recovery = Some(pplx_space_public_api::recovery::RecoveryStart {
+        contract_version: request.contract_version,
+        expected_instance_id: request.expected_instance_id,
+        expected_activation_id: request.expected_activation_id,
+        command: std::mem::take(&mut process.command),
+    });
+    let lifecycle = sandbox_lifecycle(&sandbox)?;
+    let admission = command_admission(lifecycle, &sandbox.auto_lifecycle.0);
+    let mut command = create_process_command_session(
+        &state.public_session_store(),
+        org.id,
+        actor.id,
+        sandbox_id,
+        process,
+        CreatePublicSessionIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new(
+                native_routes::CREATE_RECOVERY_COMMAND.path(),
+            ),
+            key: &idempotency_key(&headers)?,
+        },
+        || admit(admission, sandbox_id, lifecycle),
+    )
+    .await?;
+    if admission == CommandAdmission::AdmitAndWake {
+        enqueue_command_wake(&state, org.id, sandbox_id).await?;
+    }
+    if let Some(attach) = &mut command.attach {
+        attach.events_url = None;
+    }
+    Ok((StatusCode::CREATED, Json(command)))
+}
+
+async fn create_process_command_session(
+    store: &PublicSessionStore,
+    org_id: OrgId,
+    actor_user_id: UserId,
+    sandbox_id: PublicSandboxId,
+    request: CreateProcessRequest,
+    idempotency: CreatePublicSessionIdempotency<'_>,
+    admit: impl FnOnce() -> Result<(), PublicApiError> + Send,
+) -> Result<PublicCommand, PublicApiError> {
     validate_process_request(&request)?;
     let request_json = serde_json::to_value(&request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize command request");
@@ -349,11 +423,7 @@ pub(crate) async fn create_command_session(
                 target_path: None,
                 adapter_state: request_json,
                 fingerprint_payload: &fingerprint_payload,
-                idempotency: CreatePublicSessionIdempotency {
-                    method: HttpOperationMethod::Post,
-                    path_template: OperationPathTemplate::new(COMMAND_PATH_TEMPLATE),
-                    key: &idempotency_key,
-                },
+                idempotency,
             },
             admit,
         )
@@ -735,7 +805,24 @@ fn reject_streamed_pty(request: &CreateCommandRequest) -> Result<(), PublicApiEr
 }
 
 fn validate_process_request(request: &CreateProcessRequest) -> Result<(), PublicApiError> {
-    ProcessCommand::new(request.command.clone())
+    let command = if let Some(recovery) = &request.recovery {
+        if recovery.contract_version != 1 || !request.command.is_empty() {
+            return Err(PublicApiError::bad_request(
+                "recovery requires version 1 and an empty outer command",
+            ));
+        }
+        for token in [
+            &recovery.expected_instance_id,
+            &recovery.expected_activation_id,
+        ] {
+            pplx_space_common_core::types::ProcessRecoveryToken::parse(token)
+                .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
+        }
+        &recovery.command
+    } else {
+        &request.command
+    };
+    ProcessCommand::new(command.clone())
         .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     if let Some(cwd) = request.cwd.as_deref() {
         if cwd.is_empty() {

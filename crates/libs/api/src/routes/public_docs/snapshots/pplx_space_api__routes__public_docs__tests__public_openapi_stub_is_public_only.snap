@@ -85,6 +85,9 @@ expression: paths_by_method
   "/sandboxes/{sandbox_id}/ports/{port}/open": [
     "post"
   ],
+  "/sandboxes/{sandbox_id}/process-execution": [
+    "get"
+  ],
   "/sandboxes/{sandbox_id}/process-sessions": [
     "post"
   ],
@@ -101,6 +104,9 @@ expression: paths_by_method
     "post"
   ],
   "/sandboxes/{sandbox_id}/protocol-sessions": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/recovery-commands": [
     "post"
   ],
   "/sandboxes/{sandbox_id}/sessions": [

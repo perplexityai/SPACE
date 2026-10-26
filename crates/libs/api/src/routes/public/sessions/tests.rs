@@ -11,6 +11,7 @@ fn process_request_with_cwd(cwd: &str) -> CreateProcessRequest {
 
 fn process_request(cwd: Option<String>, user: Option<String>) -> CreateProcessRequest {
     CreateProcessRequest {
+        recovery: None,
         command: vec!["echo".to_string()],
         cwd,
         env: Default::default(),
@@ -198,8 +199,8 @@ mod not_running {
         Ok(sandbox_id)
     }
 
-    /// The two routes that start a process: commands and process sessions.
-    const PROCESS_ROUTES: [&str; 2] = ["commands", "process-sessions"];
+    /// Every route that creates a session for a process start.
+    const PROCESS_ROUTES: [&str; 3] = ["commands", "process-sessions", "recovery-commands"];
 
     async fn command(
         fixture: &Fixture,
@@ -224,6 +225,16 @@ mod not_running {
         key: &str,
         body: Value,
     ) -> TestDbResult<(StatusCode, Option<String>, Value)> {
+        let body = if route == "recovery-commands" {
+            json!({
+                "contract_version": 1,
+                "expected_instance_id": "01900000-0000-7000-8000-000000000001",
+                "expected_activation_id": "01900000-0000-7000-8000-000000000002",
+                "process": body,
+            })
+        } else {
+            body
+        };
         let request = Request::builder()
             .method(Method::POST)
             .uri(format!("/v1/sandboxes/{sandbox_id}/{route}"))
@@ -436,10 +447,10 @@ mod not_running {
             let (status, _, replayed) =
                 send(&fixture, sandbox_id, route, &key, body.clone()).await?;
             assert_eq!(status, StatusCode::CREATED, "{route} replay: {replayed}");
-            let id = if route == "commands" {
-                "session_id"
-            } else {
+            let id = if route == "process-sessions" {
                 "id"
+            } else {
+                "session_id"
             };
             assert!(created[id].is_string(), "{route}: {created}");
             assert_eq!(replayed[id], created[id], "{route}");
@@ -461,4 +472,38 @@ mod not_running {
         }
         Ok(())
     }
+}
+
+#[test]
+fn recovery_commands_are_fenced_and_cannot_be_lowered_to_legacy() {
+    let mut request = process_request(None, None);
+    request.recovery = Some(pplx_space_public_api::recovery::RecoveryStart {
+        contract_version: 1,
+        expected_instance_id: uuid::Uuid::now_v7().to_string(),
+        expected_activation_id: uuid::Uuid::now_v7().to_string(),
+        command: vec!["true".to_string()],
+    });
+    assert!(
+        validate_process_request(&request).is_err(),
+        "both argv locations are invalid"
+    );
+    request.command.clear();
+    validate_process_request(&request).expect("explicit recovery command");
+    let original = request.recovery.clone().unwrap();
+    for change in 0..4 {
+        let recovery = request.recovery.as_mut().unwrap();
+        *recovery = original.clone();
+        match change {
+            0 => recovery.contract_version = 2,
+            1 => recovery.expected_instance_id = uuid::Uuid::nil().to_string(),
+            2 => recovery.expected_activation_id.clear(),
+            _ => recovery.command.clear(),
+        }
+        assert!(validate_process_request(&request).is_err());
+    }
+    request.recovery = None;
+    assert!(
+        validate_process_request(&request).is_err(),
+        "an older reader sees empty argv"
+    );
 }

@@ -10,3 +10,6 @@ Use the SPACE HTTP API to create a sandbox, run commands, read their output, and
 - Consult the [API Reference](api/index.md) for supported endpoints, request fields, responses, and examples.
 
 If you do not have a local deployment yet, start with [Install and configure locally](installation.md).
+
+For explicitly fenced starts, replayable output and sequenced controls, see
+[Recovering process clients](process-recovery.md). Legacy command behavior is unchanged.

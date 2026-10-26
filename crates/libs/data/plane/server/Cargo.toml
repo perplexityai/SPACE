@@ -62,6 +62,7 @@ pplx-space-net-gateway-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-public-api = { workspace = true, features = ["serde"] }
 pplx-space-sbx-mgr-client = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
 
 [dev-dependencies]
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
