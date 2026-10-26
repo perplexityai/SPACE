@@ -535,10 +535,12 @@ fn a_stops_flush_resumes_a_paused_vm_first() {
         BeforeStopFlush::Flush
     );
     assert_eq!(BeforeStopFlush::for_vm_state(None), BeforeStopFlush::Flush);
-    assert_eq!(
-        BeforeStopFlush::for_vm_state(Some(VmState::NotStarted)),
-        BeforeStopFlush::NotRunning
-    );
+    for state in [VmState::NotStarted, VmState::Shutdown] {
+        assert_eq!(
+            BeforeStopFlush::for_vm_state(Some(state)),
+            BeforeStopFlush::NotRunning
+        );
+    }
 }
 
 // A stalled step ends the stop's flush attempt at its one budget, so the stop
