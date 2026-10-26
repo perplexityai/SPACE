@@ -947,8 +947,12 @@ fn completed_lifecycle_target_state(
 /// A native wake operation with no actor is the system's wake for a command
 /// or process session (`create_or_join_active_sandbox_wake`): no caller asked
 /// for it, so it runs only while the sandbox's wake policy, read now, still
-/// lets a command wake it. Nothing else creates one; a controller without
-/// this check runs it as the plain `:wake` the policy allowed at enqueue.
+/// lets a command wake it. Nothing else creates one, with one exception:
+/// `public_operations.actor_user_id` is `ON DELETE SET NULL`, so a caller's
+/// queued `:wake` whose user is deleted before it runs is recognized here too,
+/// and refused if the policy forbids a command wake; no caller remains to want
+/// it. A controller without this check runs it as the plain `:wake` the
+/// policy allowed at enqueue.
 fn is_implicit_command_wake(
     operation: &ClaimedPublicOperation,
     action: SandboxLifecycleAction,

@@ -278,6 +278,8 @@ mod not_running {
             ("stopped", &["command"], "stopped", Some("start")),
             ("deleting", &["command"], "deleting", None),
             ("failed", &["access"], "failed", None),
+            // Reports `creating`, but its creation has not started: at rest.
+            ("created", &[], "creating", Some("wake")),
         ] {
             let sandbox_id = sandbox(&fixture, lifecycle, wake_on).await?;
             for route in PROCESS_ROUTES {
@@ -299,6 +301,7 @@ mod not_running {
             ("suspended", &["access"][..]),
             ("paused", &["command"]),
             ("suspending", &["access"]),
+            ("created", &["command"]),
             // Heading to running: the attach waits, whatever the policy.
             ("creating", &[]),
             ("restoring", &[]),
