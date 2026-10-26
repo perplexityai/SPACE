@@ -94,20 +94,25 @@ for canonical hashing and stored schema-1 JSON. Consumers see generic profiles.
 Historical records that omitted component formats keep their original binding
 checks; native schema-2 identities require the declared formats.
 
-During rollout, ResolveExecutionEnvironment callers advertise the definition
-schema they understand. New nodes return generic profiles to new callers and
-an exact schema-1 representation to older callers. New callers also accept and
-normalize old-node responses. Native schema-2 definitions have no downgrade:
-an old peer receives an explicit refusal, never an unbound/default environment.
+The environment gRPC protocol accepts and emits only generic schema 2. Retired
+profile and selection fields are removed, including their reservation declarations;
+live field numbers and enum values are unchanged.
+ResolveExecutionEnvironment callers continue advertising schema 2: transitional
+nodes use that capability to return generic definitions during a rolling
+upgrade. Nodes reject clients advertising less than 2. No legacy environment
+response, reader, or Firecracker-specific environment protobuf message remains.
 Selection acknowledgements and persist-before-activation rules are unchanged.
 
-Remove legacy environment protobuf messages and the temporary response-format
-negotiation only after node-manager, builder, sandbox-manager and operator CLI
-readers have this migration deployed, including rollback images. Reserve removed
-field numbers and names. A later rollback to a pre-migration reader requires
-restoring the transitional server first. This removal does not remove the
-historical canonical/JSON reader: persisted references still need it. Existing
-Firecracker-specific lifecycle RPCs are separate adapter integration work.
+Deployment prerequisite: node-manager, builder, sandbox-manager and operator CLI
+readers must first run the transitional migration that understands generic
+transport with historical identities. Include rollback images in this gate.
+Both deployment orders between that transitional version and this removal are
+supported; jumping from a pre-migration version is not. A later rollback to a
+pre-migration reader requires restoring the transitional server first.
+
+The historical canonical/JSON reader remains because persisted references still
+need it; it is not a legacy gRPC API. Runtime control also uses only the generic
+launch, VM-state, capture and restore routes; the old routes and fallbacks are gone.
 
 Schema-2 artifacts are canonicalized by unique role. Every artifact's kind,
 version, digest and format, both contract identifiers, and the presence/value of
@@ -943,9 +948,11 @@ executable supports jailer-based and direct VMM adapters; source locators cannot
 supply trust or replace the requested execution identity. This does not claim a
 Windows or macOS host adapter exists.
 
-During migration the servers retain old routes. Updated FC clients use generic
-routes and may fall back only when the peer does not implement the new method;
-transport failures and runtime refusals never trigger a second mutation. Other
-runtimes must not use FC fallback. Deploy the new readers and FC callers across
-all participating services and rollback images before retiring the old routes.
+The preceding migration release serves both routes and moves FC clients onto the
+generic methods. This release removes the old routes and all method fallbacks.
+Deploy the migration across every participating service, finish in-flight work,
+and update supported rollback images before deploying this release. A rollback
+to an old caller requires restoring the migration server first; it is not a
+supported mixed-version configuration after retirement. Removing protobuf
+reservations does not renumber any live field or change stored identities.
 Persisted environment JSON/canonical compatibility is independent and remains.
