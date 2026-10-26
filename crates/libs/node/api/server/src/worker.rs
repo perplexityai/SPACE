@@ -602,6 +602,11 @@ impl WorkerApi for WorkerApiService {
         if let Some(sandbox_id) = r.get_ref().sandbox_id.as_deref() {
             record_sandbox_id(&tracing::Span::current(), sandbox_id);
         }
+        if r.get_ref().device_create.is_some() {
+            return Err(Status::failed_precondition(
+                "device creation is not enabled through worker routing",
+            ));
+        }
         crate::template_lookup::bind_create_caller_scope(&mut r)?;
         // Overrides and nonzero generations require policy authority. A generation
         // persists even without an override and can block later sandbox-specific

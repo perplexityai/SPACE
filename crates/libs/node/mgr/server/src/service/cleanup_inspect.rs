@@ -612,6 +612,12 @@ impl NodeManagerService {
             )));
         }
 
+        // Preserve both execution journals even when recovery finds no network
+        // lease. Device cleanup must resolve every holder before either retires.
+        let _device_exclusion = self
+            .cleanup_device_allocations(typed_sandbox_id, execution)
+            .await?;
+
         // 6. Release network slot
         if info.is_some() {
             self.pool.release(sandbox_id).map_err(|error| {

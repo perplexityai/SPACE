@@ -200,6 +200,11 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         operation: &'static str,
     ) -> Result<(), Status> {
+        if sandbox.device_requirements.is_some() {
+            return Err(Status::failed_precondition(format!(
+                "cannot {operation}: device-bearing executions do not support memory-state operations"
+            )));
+        }
         if sandbox
             .execution_metadata
             .as_ref()
@@ -288,6 +293,7 @@ impl SandboxManagerService {
         args: CreateWithIdArgs<'_>,
     ) -> Result<Response<CreateResponse>, Status> {
         let CreateWithIdArgs {
+            device_requirements,
             req,
             sandbox_owner,
             effective_mode,
@@ -373,6 +379,7 @@ impl SandboxManagerService {
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
+                    device_requirements,
                     id: &id,
                     uuid8: &uuid8,
                     state: SandboxState::Creating,
@@ -591,6 +598,7 @@ impl SandboxManagerService {
             };
             let r = start_resp.into_inner();
             return Ok(Response::new(CreateResponse {
+                accepted_device_requirements_digest: None,
                 environment: None,
                 sandbox_id: id,
                 pid: Some(r.pid),
@@ -847,6 +855,7 @@ impl SandboxManagerService {
         let has_netns_path = netns_path.is_some();
         let alloc = node_client
             .allocate(AllocateRequest {
+                device_allocation: None,
                 execution_fence: Some(execution_fence.into()),
                 sandbox_id: id.clone(),
                 netns_path,
@@ -930,6 +939,7 @@ impl SandboxManagerService {
         let prepare_rootfs_size_mb = prepare_template.as_ref().and(sandbox.rootfs_size_mb);
         let prepare_response = match node_client
             .prepare_sandbox(PrepareSandboxRequest {
+                device_execution: None,
                 execution_fence: Some(execution_fence.into()),
                 sandbox_id: id.clone(),
                 template: prepare_template,
@@ -1063,6 +1073,7 @@ impl SandboxManagerService {
             let launch_jailer = async {
                 let result = jailer_client
                     .launch_sandbox(LaunchSandboxRequest {
+                        device_execution: None,
                         execution_fence: Some(execution_fence.into()),
                         sandbox_id: id.clone(),
                         uid: sbx_uid,

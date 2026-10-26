@@ -730,6 +730,7 @@ impl SandboxManagerService {
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
+                    device_requirements: None,
                     id: &new_id,
                     uuid8: &uuid8,
                     state: SandboxState::Creating,
