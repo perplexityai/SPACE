@@ -93,6 +93,9 @@ pub enum ReleaseSourceConfig {
     /// [`crate::FIRECRACKER_RELEASE_SOURCE`] is.
     #[cfg(feature = "github")]
     GitHub(crate::ReleaseUrl),
+    /// Cloud Hypervisor's upstream static executable releases.
+    #[cfg(feature = "github")]
+    CloudHypervisorGitHub(crate::ReleaseUrl),
     /// A source the deployment supplies.
     Custom(Arc<dyn ReleaseSource>),
 }
@@ -102,6 +105,11 @@ impl std::fmt::Debug for ReleaseSourceConfig {
         match self {
             #[cfg(feature = "github")]
             Self::GitHub(base) => formatter.debug_tuple("GitHub").field(base).finish(),
+            #[cfg(feature = "github")]
+            Self::CloudHypervisorGitHub(base) => formatter
+                .debug_tuple("CloudHypervisorGitHub")
+                .field(base)
+                .finish(),
             Self::Custom(source) => formatter
                 .debug_tuple("Custom")
                 .field(source.root())
@@ -115,8 +123,19 @@ impl ReleaseSourceConfig {
         match self {
             #[cfg(feature = "github")]
             Self::GitHub(base) => Ok(Arc::new(
-                crate::installs::GitHubReleaseSource::new(base)
-                    .map_err(RunRuntimeManagerError::ReleaseSource)?,
+                crate::installs::GitHubReleaseSource::new(
+                    crate::installs::GitHubRuntime::Firecracker,
+                    base,
+                )
+                .map_err(RunRuntimeManagerError::ReleaseSource)?,
+            )),
+            #[cfg(feature = "github")]
+            Self::CloudHypervisorGitHub(base) => Ok(Arc::new(
+                crate::installs::GitHubReleaseSource::new(
+                    crate::installs::GitHubRuntime::CloudHypervisor,
+                    base,
+                )
+                .map_err(RunRuntimeManagerError::ReleaseSource)?,
             )),
             Self::Custom(source) => Ok(source),
         }

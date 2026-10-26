@@ -45,10 +45,16 @@ pub(crate) struct ArtifactStorePaths {
 impl Default for ArtifactStorePaths {
     fn default() -> Self {
         Self {
-            releases: [(
-                pplx_space_common_core::types::RuntimeKind::Firecracker,
-                paths::NODE_FIRECRACKER_DIR.into(),
-            )]
+            releases: [
+                (
+                    pplx_space_common_core::types::RuntimeKind::Firecracker,
+                    paths::NODE_FIRECRACKER_DIR.into(),
+                ),
+                (
+                    pplx_space_common_core::types::RuntimeKind::CloudHypervisor,
+                    paths::NODE_CLOUD_HYPERVISOR_DIR.into(),
+                ),
+            ]
             .into(),
             kernels: paths::NODE_KERNELS_DIR.into(),
             staging: paths::RUNTIME_MANAGER_STAGING_DIR.into(),
