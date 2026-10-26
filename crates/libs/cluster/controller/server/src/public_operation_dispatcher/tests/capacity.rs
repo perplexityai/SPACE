@@ -319,3 +319,84 @@ async fn other_work_starts_while_teardowns_hold_every_other_slot() -> TestResult
     tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
     Ok(())
 }
+
+/// Make `operations` due now, or with `due` unset, an hour from now.
+async fn set_due(pool: &PgPool, operations: &[OperationId], due: bool) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET next_attempt_at = CASE WHEN $2 THEN NOW() ELSE NOW() + INTERVAL '1 hour' END
+         WHERE operation_id = ANY($1)"
+    ))
+    .bind(
+        operations
+            .iter()
+            .map(|operation_id| operation_id.as_uuid())
+            .collect::<Vec<_>>(),
+    )
+    .bind(due)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn other_work_starts_while_other_work_already_runs_and_teardowns_are_due() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let first = queue_all(
+        &store,
+        org_id,
+        &[(OperationKind::CreateSandbox, "sbx_first_create")],
+    )
+    .await?[0];
+    let targets = (0..4)
+        .map(|index| format!("sbx_wave_delete_{index}"))
+        .collect::<Vec<_>>();
+    let mut queued = targets
+        .iter()
+        .map(|target_id| (OperationKind::DeleteSandbox, target_id.as_str()))
+        .collect::<Vec<_>>();
+    queued.push((OperationKind::CreateSandbox, "sbx_create_after_the_wave"));
+    let mut operations = queue_all(&store, org_id, &queued).await?;
+    let create = *operations.last().expect("the create was queued");
+    set_due(&db.pool, &operations, false).await?;
+    let executor = HeldWork {
+        hold_teardowns: true,
+        ..HeldWork::default()
+    };
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        ReconcilerConfig {
+            delete_reserved_slots: 0,
+            non_delete_reserved_slots: 1,
+            ..fast_loop_config(3)
+        },
+        store.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    // The first create already holds a slot when the deletes and the second
+    // create come due, all at once and the deletes first in order.
+    wait_for_running(&executor, 1).await?;
+    set_due(&db.pool, &operations, true).await?;
+
+    // One held delete and the create share the two free slots.
+    wait_for_running(&executor, 3).await?;
+    assert_eq!(
+        operation_state(&db.pool, create).await?,
+        OperationState::Running.as_str()
+    );
+
+    executor.release.cancel();
+    operations.push(first);
+    for operation in operations {
+        wait_for_state(&db.pool, operation, OperationState::Succeeded).await?;
+    }
+    assert_eq!(executor.max_running.load(Ordering::SeqCst), 3);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}

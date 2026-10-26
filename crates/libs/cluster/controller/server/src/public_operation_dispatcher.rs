@@ -56,8 +56,9 @@ const MAX_EXECUTION_CONCURRENCY: usize = 128;
 /// teardown can start while every other slot is held.
 const DEFAULT_DELETE_RESERVED_SLOTS: u32 = 2;
 const DELETE_RESERVED_SLOTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_DELETE_RESERVED_SLOTS";
-/// Execution slots teardowns may not take while other work is due, so other
-/// work can start while teardowns hold every other slot.
+/// Of the free execution slots other work may use, how many teardowns leave
+/// free while other work is due, so other work can start however many
+/// slots teardowns and other work already hold.
 const DEFAULT_NON_DELETE_RESERVED_SLOTS: u32 = 2;
 const NON_DELETE_RESERVED_SLOTS_ENV: &str =
     "SPACE_PUBLIC_OPERATION_DISPATCHER_NON_DELETE_RESERVED_SLOTS";
@@ -77,8 +78,9 @@ pub struct ReconcilerConfig {
     /// Of `execution_concurrency`, the slots kept for teardowns (sandbox
     /// deletes and kills); at least one slot is always left for other work.
     pub delete_reserved_slots: usize,
-    /// Of `execution_concurrency`, the slots teardowns may not take while
-    /// other work is due; with none due, teardowns may use them.
+    /// How many of the free slots other work may use teardowns leave free
+    /// while other work is due, however many other work already holds; with
+    /// none due, teardowns may use them.
     pub non_delete_reserved_slots: usize,
     pub claim_stale_after: Duration,
     pub retry_after: Duration,
@@ -393,8 +395,8 @@ pub async fn run<E>(
     // sandbox rule: a claim that would overlap a local execution of its key
     // is handed back, beside the loop, instead of running twice. Executions
     // other than teardowns may hold all but the slots reserved for teardowns;
-    // teardowns may hold all but the slots reserved for other work while
-    // other work is due.
+    // while other work is due, teardowns leave the last free slots other work
+    // may use to it.
     let other_concurrency = concurrency - delete_reserved_slots;
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
@@ -438,8 +440,10 @@ pub async fn run<E>(
                     continue;
                 }
                 let free_other = other_concurrency.saturating_sub(other_tasks.len());
-                let free_teardown_while_other_due = free
-                    .saturating_sub(non_delete_reserved_slots.saturating_sub(other_tasks.len()));
+                // While other work is due, teardowns leave free the last
+                // slots other work may use, however many it already holds.
+                let free_teardown_while_other_due =
+                    free - non_delete_reserved_slots.min(free_other.min(free));
                 #[cfg(test)]
                 tests::before_claim().await;
                 let started = Instant::now();
