@@ -149,3 +149,15 @@ impl RuntimeSupervisorService {
 fn store_status(error: std::io::Error) -> Status {
     Status::unavailable(format!("runtime execution store unavailable: {error}"))
 }
+
+/// Corrupt or conflicting evidence is a refusal; failed storage I/O must remain
+/// retryable without letting a caller substitute different launch intent.
+pub(super) fn device_store_status(error: std::io::Error) -> Status {
+    let message = format!("runtime device evidence: {error}");
+    match error.kind() {
+        std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::PermissionDenied => Status::failed_precondition(message),
+        _ => Status::unavailable(message),
+    }
+}

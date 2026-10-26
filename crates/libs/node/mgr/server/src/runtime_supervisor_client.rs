@@ -319,6 +319,7 @@ impl RuntimeSupervisorLazyClient {
     }
 
     runtime_supervisor_lazy_unary_methods! {
+        get_execution_capabilities, proto::GetExecutionCapabilitiesRequest, proto::GetExecutionCapabilitiesResponse;
         launch_runtime, proto::LaunchRuntimeRequest, proto::LaunchRuntimeResponse;
         launch_sidecar, proto::LaunchSidecarRequest, proto::LaunchSidecarResponse;
         stop_sandbox_runtime, proto::StopSandboxRuntimeRequest, proto::StopSandboxRuntimeResponse;

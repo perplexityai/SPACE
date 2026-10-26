@@ -38,6 +38,13 @@ fn launch_conversion_preserves_verified_identity_isolation_and_limits() {
         FirecrackerLaunch::try_from(generic.clone()).unwrap(),
         original
     );
+    let mut device = generic.clone();
+    device.device_execution =
+        Some(pplx_space_execution_common::proto::DeviceExecutionInput::default());
+    assert!(matches!(
+        FirecrackerLaunch::try_from(device),
+        Err(LaunchContractError::UnsupportedDevices)
+    ));
     for sandbox_id in ["", "another-sandbox"] {
         let mut conflict = generic.clone();
         conflict.sandbox_id = sandbox_id.into();

@@ -54,6 +54,7 @@ fn lease_generation(sandbox_id: SandboxId, generation: u64) -> ActiveLeaseMemory
         sandbox_id,
         generation,
         memory_reservation_mib: 8320,
+        mode: MemoryReservationMode::Elastic,
     }
 }
 
@@ -220,4 +221,35 @@ async fn unreadable_meminfo_fails_admission_closed() {
         error,
         MemoryAdmissionEvaluationError::NodeMemory(NodeMemoryCapacityError::Read { .. })
     ));
+}
+
+#[tokio::test]
+async fn device_memory_stays_reserved_before_pinning_and_across_admission_observation() {
+    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let sandbox = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
+    // Startup, fully charged, and a not-yet-raised cgroup limit. Device
+    // admission preserves the promised budget without charging current twice.
+    for (current, maximum, expected) in [(256, 8320, 8064), (8000, 8320, 320), (256, 1024, 8064)] {
+        let (_root, sources) = sources(20_000, 20_000 - current);
+        write_cgroup(&sources, sandbox, current, maximum);
+        let reserved = ActiveLeaseMemoryReservation {
+            mode: MemoryReservationMode::FullyReserved,
+            ..lease(sandbox)
+        };
+        let measurement = admission
+            .evaluate_new_allocation(8320, &[reserved], &sources)
+            .await
+            .unwrap();
+        assert_eq!(measurement.existing_growth_reserve_mib, expected);
+        assert_eq!(measurement.required_mib, current + expected + 8320 + 1024);
+
+        let observation = admission
+            .observe_active_leases(&[lease(sandbox)], &sources)
+            .await
+            .unwrap();
+        let committed = admission
+            .check_new_allocation_at_commit(8320, &observation, &[reserved])
+            .unwrap();
+        assert_eq!(committed, measurement);
+    }
 }

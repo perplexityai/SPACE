@@ -26,6 +26,7 @@ tonic = { workspace = true }
 # internal
 pplx-space-common-cli = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-net-gateway-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
