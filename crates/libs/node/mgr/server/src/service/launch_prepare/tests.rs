@@ -832,81 +832,84 @@ fn retained_instance_repair_grants_traversal_without_write_and_preserves_files()
 
 #[test]
 fn protected_launch_admission_preserves_binding_and_restore_rules() {
-    use super::ExecutionSourceIntegrity::{FsVerity, Legacy};
+    use super::ExecutionSourceIntegrity::{CatalogSha256, FsVerity, UnverifiedExternal};
     let reference =
         pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
             .unwrap()
             .definition()
             .unwrap()
             .reference();
-    // Outcome: None is deliberate legacy admission; Some is a protected request.
-    for (runtime, environment, requested, restore, components, expected) in [
-        (
-            FsVerity,
-            Some(reference),
-            Some(reference),
-            false,
-            vec![FsVerity],
-            Ok(Some(reference)),
-        ),
-        (
-            FsVerity,
-            Some(reference),
-            None,
-            false,
-            vec![FsVerity],
-            Ok(Some(reference)),
-        ),
-        (
-            FsVerity,
-            Some(reference),
-            Some(reference),
-            false,
-            vec![FsVerity, Legacy],
-            Err(tonic::Code::FailedPrecondition),
-        ),
-        (
-            FsVerity,
-            Some(reference),
-            Some(reference),
-            true,
-            vec![Legacy],
-            Ok(Some(reference)),
-        ),
-        (
-            FsVerity,
-            None,
-            Some(reference),
-            false,
-            vec![FsVerity],
-            Err(tonic::Code::FailedPrecondition),
-        ),
-        (FsVerity, None, None, false, vec![Legacy], Ok(None)),
-        (
-            Legacy,
-            Some(reference),
-            Some(reference),
-            false,
-            vec![Legacy],
-            Ok(None),
-        ),
+    for kind in [RuntimeKind::Firecracker, RuntimeKind::CloudHypervisor] {
+        for runtime in [UnverifiedExternal, CatalogSha256, FsVerity] {
+            for component in [UnverifiedExternal, CatalogSha256, FsVerity] {
+                for restore in [false, true] {
+                    let expected = match (kind, runtime, component, restore) {
+                        (_, UnverifiedExternal, _, _)
+                        | (RuntimeKind::Firecracker, CatalogSha256, _, _) => Ok(None),
+                        (_, _, _, true) => Ok(Some(reference)),
+                        (_, _, UnverifiedExternal, false)
+                        | (RuntimeKind::Firecracker, FsVerity, CatalogSha256, false) => {
+                            Err(tonic::Code::FailedPrecondition)
+                        }
+                        _ => Ok(Some(reference)),
+                    };
+                    assert_eq!(
+                        super::protected_launch_environment(
+                            kind,
+                            runtime,
+                            Some(reference),
+                            Some(reference),
+                            restore,
+                            [component]
+                        )
+                        .map_err(|e| e.code()),
+                        expected,
+                        "{kind:?} {runtime:?} {component:?} restore={restore}",
+                    );
+                }
+            }
+        }
+    }
+    for (kind, integrity) in [
+        (RuntimeKind::Firecracker, FsVerity),
+        (RuntimeKind::CloudHypervisor, FsVerity),
+        (RuntimeKind::CloudHypervisor, CatalogSha256),
     ] {
         assert_eq!(
             super::protected_launch_environment(
-                runtime,
-                environment,
-                requested,
-                restore,
-                components
+                kind,
+                integrity,
+                None,
+                Some(reference),
+                false,
+                [integrity]
             )
-            .map_err(|error| error.code()),
-            expected
+            .unwrap_err()
+            .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            super::protected_launch_environment(kind, integrity, None, None, false, [integrity])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            super::protected_launch_environment(
+                kind,
+                integrity,
+                Some(reference),
+                None,
+                false,
+                [integrity]
+            )
+            .unwrap(),
+            Some(reference)
         );
     }
 }
 
 #[tokio::test]
-async fn launch_identity_is_checked_before_rpc_and_acknowledgement_before_acceptance() {
+async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
     use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
     use pplx_space_node_runtime_core::proto;
     use std::sync::{
@@ -919,25 +922,21 @@ async fn launch_identity_is_checked_before_rpc_and_acknowledgement_before_accept
             .definition()
             .unwrap()
             .reference();
-    for (dual_identity, accepted) in [
-        (false, reference.to_string()),
-        (false, String::new()),
-        (false, format!("sha256:{}", "ff".repeat(32))),
-        (true, reference.to_string()),
+    for accepted in [
+        reference.to_string(),
+        String::new(),
+        format!("sha256:{}", "ff".repeat(32)),
     ] {
         let (mut service, lease) = allocated_service().await;
         let fence =
             super::super::tests::service_tests::bind_test_execution(&service, &lease.sandbox_id);
         let stops = Arc::new(AtomicUsize::new(0));
         let stop_calls = stops.clone();
-        let launches = Arc::new(AtomicUsize::new(0));
-        let launch_calls = launches.clone();
         let sandbox_id = lease.sandbox_id.clone();
         let expected_execution = fence.execution_id.clone();
         let matches = accepted == reference.to_string();
         service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
             launch: Some(Arc::new(move |request| {
-                launch_calls.fetch_add(1, Ordering::SeqCst);
                 assert!(request.sandbox_id.is_empty());
                 assert_eq!(
                     request.verified_runtime.unwrap().environment_reference,
@@ -961,11 +960,6 @@ async fn launch_identity_is_checked_before_rpc_and_acknowledgement_before_accept
             .launch_admitted_runtime(
                 &lease.sandbox_id,
                 pplx_space_node_runtime_core::runtime_launch::FirecrackerLaunch {
-                    sandbox_id: if dual_identity {
-                        lease.sandbox_id.clone()
-                    } else {
-                        String::new()
-                    },
                     execution_id: fence.execution_id,
                     jailer_bin: "/runtime/bin/jailer".into(),
                     verified_runtime: Some(proto::VerifiedRuntimeLaunch {
@@ -976,21 +970,17 @@ async fn launch_identity_is_checked_before_rpc_and_acknowledgement_before_accept
                                 .into(),
                     }),
                     ..Default::default()
-                },
+                }
+                .try_into()
+                .unwrap(),
             )
             .await;
-        if dual_identity {
-            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
-        } else if matches {
+        if matches {
             result.unwrap();
         } else {
             assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
         }
-        assert_eq!(launches.load(Ordering::SeqCst), usize::from(!dual_identity));
-        assert_eq!(
-            stops.load(Ordering::SeqCst),
-            usize::from(!dual_identity && !matches)
-        );
+        assert_eq!(stops.load(Ordering::SeqCst), usize::from(!matches));
         assert!(
             service
                 .pool
