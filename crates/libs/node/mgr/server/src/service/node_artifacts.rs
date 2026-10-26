@@ -49,8 +49,13 @@ impl NodeManagerService {
             ));
         }
         let paths = self.runtime_paths.clone();
+        let store = artifact_store(
+            &paths.store,
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+        )?;
         self.off_runtime("verify environment layout", move || {
-            separate_store(&paths).map_err(|error| Status::failed_precondition(describe(&error)))
+            separate_store(&paths, store.releases_root())
+                .map_err(|error| Status::failed_precondition(describe(&error)))
         })
         .await
     }
@@ -148,7 +153,11 @@ impl NodeManagerService {
                     identity != &initial.release().release
                         && (files.integrity() == ExecutionSourceIntegrity::FsVerity
                             || files.paths().any(|path| {
-                                path.starts_with(&self.runtime_paths.store.releases)
+                                self.runtime_paths
+                                    .store
+                                    .releases
+                                    .values()
+                                    .any(|root| path.starts_with(root))
                                     && !path.starts_with(&self.runtime_paths.vendor)
                             }))
                 };
@@ -306,7 +315,11 @@ pub(super) fn execution_inventory(
     paths: &crate::config::RuntimePaths,
     policy: &pplx_space_node_runtime_core::selection::ExecutionPolicy,
 ) -> Result<super::RuntimeInventory, Status> {
-    if execution_roots_overlap(paths)
+    let store = artifact_store(
+        &paths.store,
+        pplx_space_common_core::types::RuntimeKind::Firecracker,
+    )?;
+    if execution_roots_overlap(paths, store.releases_root())
         .map_err(|error| Status::failed_precondition(describe(&error)))?
     {
         tracing::warn!(
@@ -325,12 +338,6 @@ pub(super) fn execution_inventory(
         .map_err(super::RuntimeInventoryError::into_status);
     }
     let initial = initial_environment()?;
-    let store = ArtifactStore::new(
-        &paths.store.releases,
-        &paths.store.kernels,
-        &paths.store.staging,
-        MAX_ARTIFACT_FILE_BYTES,
-    );
     let mut inventory = super::RuntimeInventory::discover_with_store(
         &store,
         initial,
@@ -427,8 +434,11 @@ fn remove_status(error: RemoveError) -> Status {
 /// Earlier prototype images linked execution roots into the store. Refuse
 /// mutations there while retaining the existing external execution path. Root-owned deployment
 /// configuration is stable during a mutation; recheck it on each request.
-fn separate_store(paths: &crate::config::RuntimePaths) -> Result<(), std::io::Error> {
-    if execution_roots_overlap(paths)? {
+fn separate_store(
+    paths: &crate::config::RuntimePaths,
+    root: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    if execution_roots_overlap(paths, root)? {
         Err(std::io::Error::other(
             "execution and managed artifact roots overlap; repair provisioning before managing artifacts",
         ))
@@ -437,7 +447,10 @@ fn separate_store(paths: &crate::config::RuntimePaths) -> Result<(), std::io::Er
     }
 }
 
-fn execution_roots_overlap(paths: &crate::config::RuntimePaths) -> Result<bool, std::io::Error> {
+fn execution_roots_overlap(
+    paths: &crate::config::RuntimePaths,
+    root: &std::path::Path,
+) -> Result<bool, std::io::Error> {
     fn resolve(path: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
         match std::fs::canonicalize(path) {
             Ok(path) => Ok(path),
@@ -457,7 +470,7 @@ fn execution_roots_overlap(paths: &crate::config::RuntimePaths) -> Result<bool, 
     let vendor_kernels = std::path::Path::new(
         pplx_space_common_core::host::linux::paths::FIRECRACKER_KERNEL_VENDOR_DIR,
     );
-    for managed in [&paths.store.releases, &paths.store.kernels] {
+    for managed in [root, paths.store.kernels.as_path()] {
         let managed = resolve(managed)?;
         for execution in [
             paths.vendor.as_path(),
@@ -474,6 +487,28 @@ fn execution_roots_overlap(paths: &crate::config::RuntimePaths) -> Result<bool, 
     Ok(false)
 }
 
+fn artifact_runtime(artifact: &Artifact) -> pplx_space_common_core::types::RuntimeKind {
+    match artifact {
+        Artifact::Release(release, _) => release.kind,
+        Artifact::Kernel(..) => pplx_space_common_core::types::RuntimeKind::Firecracker,
+    }
+}
+
+fn artifact_store(
+    paths: &crate::config::ArtifactStorePaths,
+    runtime: pplx_space_common_core::types::RuntimeKind,
+) -> Result<ArtifactStore, Status> {
+    let root = paths.releases.get(&runtime).ok_or_else(|| {
+        Status::failed_precondition(format!("no managed release store configured for {runtime}"))
+    })?;
+    Ok(ArtifactStore::new(
+        root,
+        &paths.kernels,
+        &paths.staging,
+        MAX_ARTIFACT_FILE_BYTES,
+    ))
+}
+
 impl NodeManagerService {
     /// The slot an artifact-store change runs in, or `RESOURCE_EXHAUSTED`
     /// while another holds it, which the runtime manager retries.
@@ -484,60 +519,58 @@ impl NodeManagerService {
             .map_err(|_| Status::resource_exhausted("the artifact store is busy; retry"))
     }
 
-    fn artifact_store(&self) -> ArtifactStore {
-        let paths = &self.runtime_paths.store;
-        ArtifactStore::new(
-            &paths.releases,
-            &paths.kernels,
-            &paths.staging,
-            MAX_ARTIFACT_FILE_BYTES,
-        )
+    fn artifact_store(&self, artifact: &Artifact) -> Result<ArtifactStore, Status> {
+        let runtime = artifact_runtime(artifact);
+        artifact_store(&self.runtime_paths.store, runtime)
     }
 
     /// Best-effort preparation of the separate managed store. Existing launch
     /// roots and aliases are never moved or repaired here.
     pub(crate) async fn prepare_artifact_store(&self) {
-        let store = self.artifact_store();
-        let paths = self.runtime_paths.clone();
-        let prepared = tokio::task::spawn_blocking(move || {
-            separate_store(&paths)?;
-            store.prepare_roots()?;
-            if let Some(account) = nix::unistd::User::from_name(user_names::SPACE_RTMGR)
-                .map_err(std::io::Error::other)?
-            {
-                store.ensure_staging_root(account.uid.as_raw(), account.gid.as_raw())?;
+        for (&runtime, root) in &self.runtime_paths.store.releases {
+            let stores = &self.runtime_paths.store;
+            let store = ArtifactStore::new(
+                root,
+                &stores.kernels,
+                &stores.staging,
+                MAX_ARTIFACT_FILE_BYTES,
+            );
+            let paths = self.runtime_paths.clone();
+            let cleanup_store = store.clone();
+            let cleanup_paths = paths.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                separate_store(&paths, store.releases_root())?;
+                store.prepare_roots()?;
+                if let Some(account) = nix::unistd::User::from_name(user_names::SPACE_RTMGR)
+                    .map_err(std::io::Error::other)?
+                {
+                    store.ensure_staging_root(account.uid.as_raw(), account.gid.as_raw())?;
+                }
+                Ok::<_, std::io::Error>(())
+            })
+            .await;
+            match prepared {
+                Ok(Ok(())) => tracing::info!(%runtime, "managed artifact store prepared"),
+                Ok(Err(error)) => {
+                    tracing::warn!(%runtime, %error, "artifact store preparation incomplete; requests recheck the store")
+                }
+                Err(error) => {
+                    tracing::warn!(%runtime, %error, "artifact store preparation task failed")
+                }
             }
-            Ok::<_, std::io::Error>(())
-        })
-        .await;
-        match prepared {
-            Ok(Ok(())) => tracing::info!("managed artifact store prepared"),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "artifact store preparation incomplete; requests recheck the store; execution roots unchanged")
-            }
-            Err(error) => {
-                tracing::warn!(%error, "artifact store preparation failed; execution roots unchanged")
-            }
+            self.device_op_tasks.spawn_blocking(move || {
+                match separate_store(&cleanup_paths, cleanup_store.releases_root()).and_then(|()| cleanup_store.clear_leftovers()) {
+                    Ok(cleared) => tracing::info!(%runtime, cleared, "managed artifact leftovers cleared"),
+                    Err(error) => tracing::warn!(%runtime, %error, "managed artifact cleanup failed; retry on next startup"),
+                }
+            });
         }
-        // Warm in the tracked background lane. Inventory consumers still await
-        // the same serialized discovery; unrelated lifecycle RPCs can serve.
+        // Warm in the tracked background lane. Inventory consumers await the same
+        // serialized discovery; unrelated lifecycle RPCs can serve.
         let service = self.clone();
         self.device_op_tasks.spawn(async move {
             if let Err(error) = service.runtime_inventory().await {
                 tracing::warn!(%error, "execution cache preparation incomplete; inventory requests retry binding discovery");
-            }
-        });
-        // Reclaim independently of staging/account provisioning, and never hold
-        // node readiness behind recursive deletion. Tracked for shutdown.
-        let store = self.artifact_store();
-        let paths = self.runtime_paths.clone();
-        self.device_op_tasks.spawn_blocking(move || {
-            let result = separate_store(&paths).and_then(|()| store.clear_leftovers());
-            match result {
-                Ok(cleared) => tracing::info!(cleared, "managed artifact leftovers cleared"),
-                Err(error) => {
-                    tracing::warn!(%error, "managed artifact cleanup failed; retry on next startup")
-                }
             }
         });
     }
@@ -552,11 +585,11 @@ impl NodeManagerService {
         let staged = StagedName::parse(request.staging_name)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let architecture = host_arch()?;
-        let store = self.artifact_store();
+        let store = self.artifact_store(&artifact)?;
         let paths = self.runtime_paths.clone();
         let catalog_dir = self.runtime_paths.store.catalog.clone();
         let publication = self.publish_artifact_work(artifact.clone(), move || {
-                separate_store(&paths)
+                separate_store(&paths, store.releases_root())
                     .map_err(|error| Status::failed_precondition(describe(&error)))?;
                 let catalog = RuntimeCatalog::load(&catalog_dir)
                     .map_err(|error| Status::failed_precondition(describe(&error)))?;
@@ -652,7 +685,7 @@ impl NodeManagerService {
         self.authorize_peer(&request, "RemoveArtifact", ALLOW_ROOT_OR_RTMGR)?;
         let artifact = Artifact::parse(request.get_ref().artifact.as_ref())?;
         artifact.check_removal(initial_environment()?)?;
-        let store = self.artifact_store();
+        let store = self.artifact_store(&artifact)?;
         let paths = self.runtime_paths.clone();
         let slot = self.artifact_slot()?;
         // Only unselected candidates reach removal. Neither external files
@@ -660,7 +693,7 @@ impl NodeManagerService {
         let outcome = self
             .off_runtime("remove artifact", move || {
                 let _slot = slot;
-                separate_store(&paths)
+                separate_store(&paths, store.releases_root())
                     .map_err(|error| Status::failed_precondition(describe(&error)))?;
                 match &artifact {
                     Artifact::Release(release, digest) => store

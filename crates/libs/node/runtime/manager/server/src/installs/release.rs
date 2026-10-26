@@ -24,6 +24,96 @@ pub(crate) struct ReleaseContext {
     pub(crate) source: Arc<dyn ReleaseSource>,
 }
 
+/// Validated source/store routing, keyed by runtime identity.
+#[derive(Clone, Default)]
+pub(crate) struct ReleaseSources(Vec<ReleaseContext>);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReleaseConfigurationError {
+    #[error("release store {} must be an absolute path without parent traversal", path.display())]
+    InvalidStore { path: PathBuf },
+    #[error("resolve release store {}", path.display())]
+    ResolveStore {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("more than one release source configured for {runtime}")]
+    DuplicateRuntime { runtime: RuntimeKind },
+    #[error("release stores {} and {} overlap", first.display(), second.display())]
+    OverlappingStores { first: PathBuf, second: PathBuf },
+}
+
+impl ReleaseSources {
+    /// Blocking: resolves existing ancestors to reject aliases of another store.
+    pub(crate) fn new(sources: Vec<ReleaseContext>) -> Result<Self, ReleaseConfigurationError> {
+        let roots = sources
+            .iter()
+            .map(|entry| resolved_store_root(&entry.root))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, (source, root)) in sources.iter().zip(&roots).enumerate() {
+            for (previous, previous_root) in sources.iter().zip(&roots).take(index) {
+                if previous.source.runtime() == source.source.runtime() {
+                    return Err(ReleaseConfigurationError::DuplicateRuntime {
+                        runtime: source.source.runtime(),
+                    });
+                }
+                if root.starts_with(previous_root) || previous_root.starts_with(root) {
+                    return Err(ReleaseConfigurationError::OverlappingStores {
+                        first: previous.root.clone(),
+                        second: source.root.clone(),
+                    });
+                }
+            }
+        }
+        Ok(Self(sources))
+    }
+
+    pub(crate) fn get(&self, runtime: RuntimeKind) -> Option<&ReleaseContext> {
+        self.0
+            .iter()
+            .find(|entry| entry.source.runtime() == runtime)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &ReleaseContext> {
+        self.0.iter()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+fn resolved_store_root(path: &Path) -> Result<PathBuf, ReleaseConfigurationError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(ReleaseConfigurationError::InvalidStore { path: path.into() });
+    }
+    // A new store need not exist yet. Resolve its nearest existing ancestor,
+    // preserving the missing suffix rather than creating directories here.
+    for ancestor in path.ancestors() {
+        match std::fs::canonicalize(ancestor) {
+            Ok(resolved) => {
+                let suffix = path
+                    .strip_prefix(ancestor)
+                    .map_err(|_| ReleaseConfigurationError::InvalidStore { path: path.into() })?;
+                return Ok(resolved.join(suffix));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(ReleaseConfigurationError::ResolveStore {
+                    path: path.into(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(ReleaseConfigurationError::InvalidStore { path: path.into() })
+}
+
 /// Why a release's binaries could not be measured.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReleaseDigestError {
