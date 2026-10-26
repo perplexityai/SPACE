@@ -178,7 +178,7 @@ service SandboxManager {
   rpc TemplateNetworkPolicyUpdated(TemplateNetworkPolicyUpdatedRequest) returns (TemplateNetworkPolicyUpdatedResponse);
 
   // Deliberately cycle (kill + relaunch in place) one sandbox's net-gateway
-  // sidecar while the Firecracker VM keeps running. Gateways keep their
+  // sidecar while the VM keeps running. Gateways keep their
   // launch-time binary until cycled, so this is the operator path for
   // retiring gateways left running a pre-deploy binary. Synchronous and
   // single-sandbox; batching, rate-limiting, and dry-run live in the caller
@@ -441,11 +441,11 @@ message StartRequest {
   // Target lifecycle for checkpoint-based starts (a `checkpoint` value
   // is required for non-default behavior; ignored for fresh boots).
   // Unspecified → STARTED. PAUSED skips the post-load resume so the
-  // restored VM stays in the firecracker-paused state. Used by the
+  // restored VM stays in the resident paused state. Used by the
   // cluster-controller's lifecycle-preserving drain evacuation path.
   // STOPPED materializes an evacuated stopped sandbox's disk artifact and
   // stops there; it requires `checkpoint = "suspend"` plus an exact
-  // `suspend_restore_storage_uri`, and never launches Firecracker.
+  // `suspend_restore_storage_uri`, and never launches a VM.
   WakeTargetState target_state = 9;
   // Internal-only exact S3 fallback for `checkpoint = "suspend"`.
   optional string suspend_restore_storage_uri = 10;
@@ -614,7 +614,7 @@ message SandboxInfo {
   optional AutoLifecyclePolicy auto_lifecycle = 23;
   optional AutoLifecycleStatus auto_lifecycle_status = 24;
   optional string failure_reason = 25;
-  bool firecracker_alive = 26; // Is the sandbox runtime process alive?
+  bool runtime_alive = 26; // Is the sandbox runtime process alive?
   bool vsock_raw_ping_ok = 27; // can sbx-manager ping spaced-guest directly over v.sock?
   optional google.protobuf.Timestamp last_guest_ready_at = 28; // last time host observed guest ready
   optional google.protobuf.Timestamp last_guest_heartbeat_at = 29; // last guest-originated heartbeat
@@ -699,7 +699,7 @@ enum SandboxHealthStatus {
 
 enum SandboxHealthComponent {
   SANDBOX_HEALTH_COMPONENT_UNSPECIFIED = 0;
-  SANDBOX_HEALTH_COMPONENT_FIRECRACKER = 1;
+  SANDBOX_HEALTH_COMPONENT_RUNTIME = 1;
   SANDBOX_HEALTH_COMPONENT_SPACED_HOST = 2;
   SANDBOX_HEALTH_COMPONENT_SPACED_GUEST = 3;
   SANDBOX_HEALTH_COMPONENT_NET_GATEWAY = 4;
@@ -868,8 +868,8 @@ enum WakeTargetState {
   // Materialize an evacuated `stopped` sandbox on this node and leave it
   // stopped. The request must carry the exact storage URI of a `stop`-origin
   // DISK artifact belonging to this same sandbox id; the node stages the
-  // rootfs, pins the artifact on the local row, and returns. No Firecracker
-  // process is created: booting a microVM only to stop it again would run the
+  // rootfs, pins the artifact on the local row, and returns. No runtime process
+  // is created: booting a microVM only to stop it again would run the
   // guest's init and mutate the rootfs a stopped sandbox is meant to keep
   // inert.
   //

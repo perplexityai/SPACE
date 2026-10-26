@@ -138,8 +138,6 @@ enum IsolationClass {
 
 enum RuntimePayloadLayout {
   RUNTIME_PAYLOAD_LAYOUT_UNSPECIFIED = 0;
-  // Legacy schema-1 encoding only. Keep its number and meaning immutable.
-  RUNTIME_PAYLOAD_LAYOUT_FIRECRACKER_RELEASE_V1 = 1;
   // The trusted artifact catalog owns executable roles and file layout.
   // Archive formats, paths, and per-runtime binary counts are not wire contracts.
   RUNTIME_PAYLOAD_LAYOUT_CATALOG_RELEASE_V1 = 2;
@@ -159,11 +157,6 @@ message RuntimeBinding {
   }
 }
 
-message LinuxDirectBootV1 {
-  // All identity fields are required. Target is EnvironmentDescriptor.guest.
-  EnvironmentComponent kernel = 1;
-}
-
 message EnvironmentComponent {
   ArtifactComponentKind kind = 1;
   string version = 2;
@@ -172,8 +165,6 @@ message EnvironmentComponent {
 
 message BootProfile {
   oneof profile {
-    // Legacy schema-1 encoding.
-    LinuxDirectBootV1 linux_direct_v1 = 1;
     ArtifactBootProfileV1 artifacts_v1 = 2;
   }
 }
@@ -192,14 +183,8 @@ message BootArtifact {
   string format = 3;
 }
 
-// Legacy schema-1 encoding only, retained for existing identities and peers.
-message FirecrackerSnapshotCompatibilityV1 {
-  StateFormatIdentity state_format = 1;
-}
-
 message ExecutionCompatibilityProfile {
   oneof profile {
-    FirecrackerSnapshotCompatibilityV1 firecracker_snapshot_v1 = 1;
     RuntimeCompatibilityV1 runtime_v1 = 2;
   }
 }
@@ -224,6 +209,7 @@ message EnvironmentDescriptor {
 }
 
 message EnvironmentDefinition {
+  // Only generic transport schema 2 is supported.
   uint32 schema_version = 1;
   // SHA-256 over versioned canonical semantic fields, not protobuf wire bytes.
   string reference = 2;

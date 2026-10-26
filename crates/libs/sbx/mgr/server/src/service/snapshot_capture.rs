@@ -16,17 +16,6 @@ pub(crate) fn bind(
     request
 }
 
-/// Unbound historical snapshots predate runtime metadata and belong to FC.
-/// Bound snapshots must use their recorded runtime for the bridge fallback gate.
-pub(crate) fn runtime(
-    execution: Option<&ExecutionMetadata>,
-) -> pplx_space_execution_common::proto::RuntimeKind {
-    execution.map_or(
-        pplx_space_execution_common::proto::RuntimeKind::Firecracker,
-        |execution| execution.runtime().kind.into(),
-    )
-}
-
 #[cfg(test)]
 mod tests;
 

@@ -7,8 +7,8 @@ use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_node_runtime_core::{
     artifact_store::{VerifyError, managed_release_directory},
     catalog::{CompiledEnvironment, compiled_verity_digest},
-    proto::LaunchFirecrackerRequest,
     runtime_inventory::host_arch,
+    runtime_launch::FirecrackerLaunch,
     verity::{SealedFile, VerityDigest, VerityError},
 };
 use tonic::Status;
@@ -20,36 +20,10 @@ pub(crate) struct VerifiedLaunch {
     firecracker: VerityDigest,
 }
 
-/// Decode the request contract and identity without consulting the current
-/// catalog or executable paths. Resident adoption does not authenticate a new
-/// launch, but still requires an unambiguous, supported request envelope.
-pub(crate) fn decode_environment_reference(
-    request: &mut LaunchFirecrackerRequest,
-) -> Result<Option<EnvironmentReference>, Status> {
-    let Some(input) = request.verified_runtime.take() else {
-        return Ok(None);
-    };
-    if !request.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument(
-            "verified and legacy launch inputs are mutually exclusive",
-        ));
-    }
-    if input.integrity_requirement != pplx_space_node_runtime_core::proto::ArtifactIntegrityRequirement::AuthenticatedImmutableSources as i32 {
-        return Err(Status::failed_precondition("unsupported artifact integrity requirement"));
-    }
-    let reference = input.environment_reference.parse().map_err(
-        |error: pplx_space_common_core::types::DigestParseError| {
-            Status::invalid_argument(error.to_string())
-        },
-    )?;
-    request.sandbox_id = input.sandbox_id;
-    Ok(Some(reference))
-}
-
 impl VerifiedLaunch {
     pub(crate) fn resolve(
         reference: EnvironmentReference,
-        request: &LaunchFirecrackerRequest,
+        request: &FirecrackerLaunch,
     ) -> Result<Self, Status> {
         let architecture =
             host_arch().map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -61,8 +35,8 @@ impl VerifiedLaunch {
             .ok_or_else(|| Status::failed_precondition("unknown compiled environment reference"))?;
         Self::from_environment(
             environment,
-            Path::new(&request.firecracker_bin),
-            Path::new(&request.jailer_bin),
+            request.firecracker_bin.as_path(),
+            request.jailer_bin.as_path(),
         )
     }
 

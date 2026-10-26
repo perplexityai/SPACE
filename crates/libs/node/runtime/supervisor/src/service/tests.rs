@@ -760,7 +760,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
     let execution = pplx_space_common_core::types::SandboxActivationAttemptId::new();
     service.execution_store.write(sandbox, execution).unwrap();
     enum Invalid {
-        LegacyId,
+        IdentityMismatch,
         MissingReference,
         UnknownRequirement,
         MissingRequirement,
@@ -769,7 +769,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
         Layout,
     }
     for invalid in [
-        Invalid::LegacyId,
+        Invalid::IdentityMismatch,
         Invalid::MissingReference,
         Invalid::UnknownRequirement,
         Invalid::MissingRequirement,
@@ -777,7 +777,12 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
         #[cfg(target_arch = "x86_64")]
         Invalid::Layout,
     ] {
-        let mut request = LaunchFirecrackerRequest {
+        let mut request = pplx_space_node_runtime_core::proto::LaunchRuntimeRequest {
+            sandbox_id: sandbox.to_string(),
+            launcher_binary: Some("/synthetic/jailer".into()),
+            runtime_binary: "/synthetic/firecracker".into(),
+            workspace_root: "/synthetic/jails".into(),
+            network_namespace: "/synthetic/netns".into(),
             execution_id: execution.to_string(),
             verified_runtime: Some(VerifiedRuntimeLaunch {
                 sandbox_id: sandbox.to_string(),
@@ -787,11 +792,12 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
             }),
             ..Default::default()
         };
+        request.set_runtime(pplx_space_common_core::types::RuntimeKind::Firecracker.into());
         let input = request.verified_runtime.as_mut().unwrap();
         let expected = match invalid {
-            Invalid::LegacyId => {
-                request.sandbox_id = input.sandbox_id.clone();
-                tonic::Code::InvalidArgument
+            Invalid::IdentityMismatch => {
+                request.sandbox_id = SandboxId::new().to_string();
+                tonic::Code::FailedPrecondition
             }
             Invalid::MissingReference => {
                 input.environment_reference.clear();
@@ -816,14 +822,21 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
                         .definition()
                         .reference()
                         .to_string();
-                request.firecracker_bin = "/synthetic/invalid-layout".into();
+                request.runtime_binary = "/synthetic/invalid-layout".into();
                 tonic::Code::InvalidArgument
             }
         };
-        let error = service
-            .launch_firecracker_with(request, None, |_, _| async { Ok(None) })
-            .await
-            .unwrap_err();
+        let result = match FirecrackerLaunch::try_from(request) {
+            Ok(request) => {
+                service
+                    .launch_firecracker_with(request, None, |_, _| async { Ok(None) })
+                    .await
+            }
+            Err(error) => {
+                Err(pplx_space_node_runtime_core::launch_admission::launch_contract_status(error))
+            }
+        };
+        let error = result.unwrap_err();
         assert_eq!(supervisor_launch_status(error).code(), expected);
         assert_eq!(
             service
@@ -842,9 +855,6 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
 #[tokio::test]
 async fn resident_execution_adoption_does_not_require_current_catalog_or_sources() {
     use pplx_space_common_core::types::SandboxActivationAttemptId;
-    use pplx_space_node_runtime_core::proto::{
-        ArtifactIntegrityRequirement, VerifiedRuntimeLaunch,
-    };
     for resident in [false, true] {
         for current in [false, true] {
             let temp = tempfile::tempdir().unwrap();
@@ -861,22 +871,23 @@ async fn resident_execution_adoption_does_not_require_current_catalog_or_sources
             let inspected = AtomicBool::new(false);
             let result = service
                 .launch_firecracker_with(
-                    LaunchFirecrackerRequest {
-                        execution_id: if current {
-                            execution
-                        } else {
-                            SandboxActivationAttemptId::new()
-                        }
-                        .to_string(),
-                        verified_runtime: Some(VerifiedRuntimeLaunch {
+                    {
+                        let mut wire = pplx_space_node_runtime_core::proto::LaunchRuntimeRequest {
                             sandbox_id: sandbox.to_string(),
-                            environment_reference: reference.clone(),
-                            integrity_requirement:
-                                ArtifactIntegrityRequirement::AuthenticatedImmutableSources.into(),
-                        }),
-                        firecracker_bin: "/absent/old-cache/firecracker".into(),
-                        jailer_bin: "/absent/old-cache/jailer".into(),
-                        ..Default::default()
+                            execution_id: if current { execution } else { SandboxActivationAttemptId::new() }.to_string(),
+                            runtime_binary: "/absent/old-cache/firecracker".into(),
+                            launcher_binary: Some("/absent/old-cache/jailer".into()),
+                            workspace_root: "/synthetic/jails".into(),
+                            network_namespace: "/synthetic/netns".into(),
+                            verified_runtime: Some(pplx_space_node_runtime_core::proto::VerifiedRuntimeLaunch {
+                                sandbox_id: sandbox.to_string(),
+                                environment_reference: reference.clone(),
+                                integrity_requirement: pplx_space_node_runtime_core::proto::ArtifactIntegrityRequirement::AuthenticatedImmutableSources.into(),
+                            }),
+                            ..Default::default()
+                        };
+                        wire.set_runtime(pplx_space_common_core::types::RuntimeKind::Firecracker.into());
+                        wire.try_into().unwrap()
                     },
                     None,
                     |id, _| {

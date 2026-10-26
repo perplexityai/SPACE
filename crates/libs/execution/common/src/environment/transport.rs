@@ -22,9 +22,9 @@ impl EnvironmentDefinition {
         generic.boot = BootProfile::ArtifactsV1 {
             contract: FIRECRACKER_BOOT_CONTRACT.parse()?,
             artifacts: vec![BootArtifact::new(
-                "boot".parse()?,
+                BootProfile::LINUX_DIRECT_ROLE.parse()?,
                 kernel.clone(),
-                "vmlinux".parse()?,
+                BootProfile::LINUX_DIRECT_FORMAT.parse()?,
             )],
         };
         generic.compatibility = ExecutionCompatibilityProfile::RuntimeV1 {
@@ -44,27 +44,40 @@ impl EnvironmentDefinition {
         }
     }
 
-    /// Historical canonical bytes remain necessary while persisted references exist.
-    pub fn canonical_identity(&self) -> String {
-        canonical_descriptor(self.legacy_descriptor.as_ref().unwrap_or(&self.descriptor))
-    }
-
-    /// Serve old readers only when this identity has an exact old representation.
-    pub fn for_peer(
-        &self,
-        supported_schema: u32,
-    ) -> Result<proto::EnvironmentDefinition, EnvironmentDecodeError> {
-        if supported_schema >= RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION {
-            return Ok(self.into());
+    /// The Firecracker Linux boot and snapshot contract in either persisted or
+    /// runtime-neutral form. Qualification and host/guest requirements remain separate.
+    pub fn firecracker_linux_contract(&self) -> Option<(&ComponentIdentity, &StateFormatIdentity)> {
+        let spec = self.descriptor.spec();
+        if let (
+            BootProfile::LinuxDirectV1 { kernel },
+            ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format },
+        ) = (&spec.boot, &spec.compatibility)
+        {
+            return Some((kernel, state_format));
         }
-        if self.schema_version() == ENVIRONMENT_SCHEMA_VERSION {
-            return Ok(self.into());
-        }
-        let legacy = self
-            .legacy_descriptor
-            .as_ref()
-            .ok_or(EnvironmentDecodeError::UnsupportedPeer)?;
-        Ok((&Self::new(legacy.clone())).into())
+        let BootProfile::ArtifactsV1 {
+            contract,
+            artifacts,
+        } = &spec.boot
+        else {
+            return None;
+        };
+        let [artifact] = artifacts.as_slice() else {
+            return None;
+        };
+        let ExecutionCompatibilityProfile::RuntimeV1 {
+            contract: machine,
+            state_format: Some(state),
+        } = &spec.compatibility
+        else {
+            return None;
+        };
+        (contract.as_str() == FIRECRACKER_BOOT_CONTRACT
+            && machine.as_str() == FIRECRACKER_MACHINE_CONTRACT
+            && artifact.role().as_str() == BootProfile::LINUX_DIRECT_ROLE
+            && artifact.format().as_str() == BootProfile::LINUX_DIRECT_FORMAT
+            && artifact.component().kind == ArtifactComponentKind::Kernel)
+            .then_some((artifact.component(), state))
     }
 
     pub(super) fn from_representation(
@@ -82,35 +95,14 @@ impl EnvironmentDefinition {
             return Err(EnvironmentDecodeError::IdentityEncoding);
         }
         let spec = definition.descriptor.spec();
-        let BootProfile::ArtifactsV1 {
-            contract,
-            artifacts,
-        } = &spec.boot
-        else {
-            return Err(EnvironmentDecodeError::IdentityEncoding);
-        };
-        let [artifact] = artifacts.as_slice() else {
-            return Err(EnvironmentDecodeError::IdentityEncoding);
-        };
-        let ExecutionCompatibilityProfile::RuntimeV1 {
-            contract: machine,
-            state_format: Some(state),
-        } = &spec.compatibility
-        else {
-            return Err(EnvironmentDecodeError::IdentityEncoding);
-        };
-        if contract.as_str() != FIRECRACKER_BOOT_CONTRACT
-            || machine.as_str() != FIRECRACKER_MACHINE_CONTRACT
-            || artifact.role().as_str() != "boot"
-            || artifact.format().as_str() != "vmlinux"
-        {
-            return Err(EnvironmentDecodeError::IdentityEncoding);
-        }
+        let (kernel, state) = definition
+            .firecracker_linux_contract()
+            .ok_or(EnvironmentDecodeError::IdentityEncoding)?;
         let mut legacy = spec.clone();
         let RuntimeBinding::ManagedRelease(release) = &mut legacy.runtime;
         release.layout = RuntimePayloadLayout::FirecrackerReleaseV1;
         legacy.boot = BootProfile::LinuxDirectV1 {
-            kernel: artifact.component().clone(),
+            kernel: kernel.clone(),
         };
         legacy.compatibility = ExecutionCompatibilityProfile::FirecrackerSnapshotV1 {
             state_format: state.clone(),

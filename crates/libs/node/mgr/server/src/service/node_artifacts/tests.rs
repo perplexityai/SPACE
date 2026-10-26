@@ -290,25 +290,34 @@ async fn publication_preserves_available_inventory_until_replacement_is_ready() 
 }
 
 #[tokio::test]
-async fn environment_resolution_requires_authorization_and_verified_inventory() {
+async fn environment_resolution_requires_authorization_schema_and_verified_inventory() {
     use crate::service::tests::service_tests::{root_request, service_for_unit_tests};
     let service = service_for_unit_tests().await;
-    let request = || crate::proto::ResolveExecutionEnvironmentRequest {
-        definition_schema_version: 0,
-        reference: None,
-        compatible: None,
-    };
-    let error = service
-        .resolve_execution_environment(Request::new(request()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::Unauthenticated);
-    // No installed E0 is never reported as a usable binding, even for root.
-    let error = service
-        .resolve_execution_environment(root_request(request()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    for definition_schema_version in [0, 1, 2] {
+        let request = || crate::proto::ResolveExecutionEnvironmentRequest {
+            definition_schema_version,
+            reference: None,
+            compatible: None,
+        };
+        let error = service
+            .resolve_execution_environment(Request::new(request()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let error = service
+            .resolve_execution_environment(root_request(request()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let schema_refusal = "generic environment schema 2 is required";
+        if definition_schema_version < 2 {
+            assert_eq!(error.message(), schema_refusal);
+        } else {
+            // Schema 2 reaches host/inventory validation; missing E0 still
+            // cannot produce a usable binding, even for root.
+            assert_ne!(error.message(), schema_refusal);
+        }
+    }
 }
 
 fn initial_policy() -> pplx_space_node_runtime_core::selection::ExecutionPolicy {

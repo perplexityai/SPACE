@@ -1,5 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
+use pplx_space_common_core::types::NodeSpacePath;
 use tonic::Status;
 
 const VMSTATE_ARTIFACT: &str = "vmstate";
@@ -36,28 +37,20 @@ impl RuntimePaths {
         }
     }
 
-    pub fn create_snapshot_paths(
+    pub(crate) fn create_snapshot_paths(
         &self,
         sandbox_id: &str,
-        snapshot_path: &str,
-        mem_file_path: &str,
-        dest_dir: Option<&str>,
+        files: &SnapshotFiles,
+        dest_dir: Option<&NodeSpacePath>,
     ) -> Result<CreateSnapshotPaths, Status> {
         match self.kind {
             RuntimeKind::Firecracker => {
-                let vmstate_name = validate_firecracker_jail_artifact(
-                    "snapshot_path",
-                    snapshot_path,
-                    VMSTATE_ARTIFACT,
-                )?;
-                let memory_name = validate_firecracker_jail_artifact(
-                    "mem_file_path",
-                    mem_file_path,
-                    MEMORY_ARTIFACT,
-                )?;
+                let vmstate_name = files.state().to_owned();
+                let memory_name = files.memory().to_owned();
                 let dest_dir = dest_dir
-                    .filter(|path| !path.is_empty())
-                    .map(|path| validate_create_snapshot_dest(sandbox_id, path))
+                    .map(|path| {
+                        validate_create_snapshot_dest_path(sandbox_id, path.as_path().to_owned())
+                    })
                     .transpose()?;
                 Ok(CreateSnapshotPaths {
                     vmstate_name,
@@ -68,28 +61,20 @@ impl RuntimePaths {
         }
     }
 
-    pub fn load_snapshot_paths(
+    pub(crate) fn load_snapshot_paths(
         &self,
         sandbox_id: &str,
-        snapshot_path: &str,
-        mem_file_path: &str,
-        source_dir: Option<&str>,
+        files: &SnapshotFiles,
+        source_dir: Option<&NodeSpacePath>,
     ) -> Result<LoadSnapshotPaths, Status> {
         match self.kind {
             RuntimeKind::Firecracker => {
-                let vmstate_name = validate_firecracker_jail_artifact(
-                    "snapshot_path",
-                    snapshot_path,
-                    VMSTATE_ARTIFACT,
-                )?;
-                let memory_name = validate_firecracker_jail_artifact(
-                    "mem_file_path",
-                    mem_file_path,
-                    MEMORY_ARTIFACT,
-                )?;
+                let vmstate_name = files.state().to_owned();
+                let memory_name = files.memory().to_owned();
                 let source_dir = source_dir
-                    .filter(|path| !path.is_empty())
-                    .map(|path| validate_load_snapshot_source(sandbox_id, path))
+                    .map(|path| {
+                        validate_load_snapshot_source(sandbox_id, path.as_path().to_owned())
+                    })
                     .transpose()?;
                 Ok(LoadSnapshotPaths {
                     vmstate_name,
@@ -141,6 +126,10 @@ pub(super) fn validate_create_snapshot_dest(
     dest_dir: &str,
 ) -> Result<PathBuf, Status> {
     let path = normalize_absolute_path("dest_dir", dest_dir)?;
+    validate_create_snapshot_dest_path(sandbox_id, path)
+}
+
+fn validate_create_snapshot_dest_path(sandbox_id: &str, path: PathBuf) -> Result<PathBuf, Status> {
     let sandbox_root =
         Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR).join(sandbox_id);
     let allowed_roots = [
@@ -152,8 +141,7 @@ pub(super) fn validate_create_snapshot_dest(
     Ok(path)
 }
 
-fn validate_load_snapshot_source(sandbox_id: &str, source_dir: &str) -> Result<PathBuf, Status> {
-    let path = normalize_absolute_path("source_dir", source_dir)?;
+fn validate_load_snapshot_source(sandbox_id: &str, path: PathBuf) -> Result<PathBuf, Status> {
     let expected = Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR)
         .join(sandbox_id)
         .join("snapshot");
@@ -286,3 +274,25 @@ fn validate_regular_file_no_symlink(path: &Path) -> Result<(), Status> {
 
 #[cfg(test)]
 mod tests;
+
+/// Normalized fixed filenames for plaintext Firecracker snapshot artifacts.
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotFiles {
+    state: String,
+    memory: String,
+}
+
+impl SnapshotFiles {
+    pub(crate) fn parse(state: String, memory: String) -> Result<Self, Status> {
+        Ok(Self {
+            state: validate_firecracker_jail_artifact("snapshot_path", &state, VMSTATE_ARTIFACT)?,
+            memory: validate_firecracker_jail_artifact("mem_file_path", &memory, MEMORY_ARTIFACT)?,
+        })
+    }
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+    pub fn memory(&self) -> &str {
+        &self.memory
+    }
+}

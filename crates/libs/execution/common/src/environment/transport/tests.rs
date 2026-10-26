@@ -2,28 +2,45 @@ use super::*;
 use prost::Message;
 
 #[test]
-fn generic_firecracker_preserves_identity_and_negotiates_both_deployment_orders() {
+fn generic_firecracker_preserves_identity_and_refuses_retired_wire_fields() {
     let legacy = super::super::tests::e0();
-    let old_wire = proto::EnvironmentDefinition::from(&legacy);
     let modern = legacy.clone().into_runtime_neutral().unwrap();
+    assert_eq!(
+        legacy.firecracker_linux_contract(),
+        modern.firecracker_linux_contract()
+    );
     assert_eq!(modern.reference(), legacy.reference());
-    assert_eq!(modern.canonical_identity(), legacy.canonical_identity());
+    assert_eq!(
+        canonical_descriptor(modern.legacy_descriptor.as_ref().unwrap()),
+        canonical_descriptor(legacy.descriptor())
+    );
     assert!(matches!(
         modern.descriptor().spec().boot,
         BootProfile::ArtifactsV1 { .. }
     ));
-    for capability in [0, 1, 2] {
-        let response = modern.for_peer(capability).unwrap();
-        assert_eq!(response.schema_version, if capability < 2 { 1 } else { 2 });
-        if capability < 2 {
-            assert_eq!(response.encode_to_vec(), old_wire.encode_to_vec());
+    let response = proto::EnvironmentDefinition::from(&modern);
+    assert_eq!(response.schema_version, 2);
+    assert_eq!(response.identity_schema_version, 1);
+    assert_eq!(response, proto::EnvironmentDefinition::from(&legacy));
+    assert_eq!(EnvironmentDefinition::try_from(&response).unwrap(), modern);
+    let mut old = response.clone();
+    old.schema_version = 1;
+    assert!(matches!(
+        EnvironmentDefinition::try_from(&old),
+        Err(EnvironmentDecodeError::UnsupportedSchema(1))
+    ));
+    // Retired field 1 is unknown, never reinterpreted as the generic profile.
+    for boot in [true, false] {
+        let mut old = response.clone();
+        let descriptor = old.descriptor.as_mut().unwrap();
+        if boot {
+            descriptor.boot = Some(proto::BootProfile::decode(&b"\x0a\x00"[..]).unwrap());
         } else {
-            assert_eq!(response.identity_schema_version, 1);
+            descriptor.compatibility =
+                Some(proto::ExecutionCompatibilityProfile::decode(&b"\x0a\x00"[..]).unwrap());
         }
-        assert_eq!(EnvironmentDefinition::try_from(&response).unwrap(), modern);
+        EnvironmentDefinition::try_from(&old).unwrap_err();
     }
-    // A new caller must also accept the old node's response unchanged.
-    assert_eq!(EnvironmentDefinition::try_from(&old_wire).unwrap(), modern);
     // Encoding migration must not tighten admission for historical metadata.
     let mut components = legacy
         .execution_requirements()
@@ -63,10 +80,7 @@ fn historical_identity_never_drops_generic_requirements() {
                 .unwrap()
                 .profile
                 .as_mut()
-                .unwrap()
-            else {
-                panic!("generic fixture")
-            };
+                .unwrap();
             boot.contract = "different-boot-v1".into();
         },
         |wire| {
@@ -79,10 +93,7 @@ fn historical_identity_never_drops_generic_requirements() {
                 .unwrap()
                 .profile
                 .as_mut()
-                .unwrap()
-            else {
-                panic!("generic fixture")
-            };
+                .unwrap();
             profile.state_format = None;
         },
         |wire| {
@@ -95,25 +106,21 @@ fn historical_identity_never_drops_generic_requirements() {
                 .unwrap()
                 .profile
                 .as_mut()
-                .unwrap()
-            else {
-                panic!("generic fixture")
-            };
+                .unwrap();
             let mut extra = boot.artifacts[0].clone();
             extra.role = "extra".into();
             boot.artifacts.push(extra);
         },
     ];
     for mutate in cases {
-        let mut wire = modern.for_peer(2).unwrap();
+        let mut wire = proto::EnvironmentDefinition::from(&modern);
         mutate(&mut wire);
         EnvironmentDefinition::try_from(&wire).unwrap_err();
     }
     // Native generic definitions cannot silently downgrade to a legacy identity.
     let native = EnvironmentDefinition::new(modern.descriptor().clone());
     assert_ne!(native.reference(), modern.reference());
-    assert!(matches!(
-        native.for_peer(0),
-        Err(EnvironmentDecodeError::UnsupportedPeer)
-    ));
+    let wire = proto::EnvironmentDefinition::from(&native);
+    assert_eq!(wire.schema_version, 2);
+    assert_eq!(wire.identity_schema_version, 0);
 }

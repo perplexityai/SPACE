@@ -233,37 +233,10 @@ impl BuildExecutionBinding {
         command: &mut tokio::process::Command,
         pin: Option<&super::GuestKernelPin>,
     ) -> Result<(), BuildExecutionBindingError> {
-        use pplx_space_common_core::types::{BootProfile, ExecutionCompatibilityProfile};
-        use pplx_space_execution_common::environment::{
-            FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT,
-        };
-        let spec = self.definition.descriptor().spec();
-        let BootProfile::ArtifactsV1 {
-            contract,
-            artifacts,
-        } = &spec.boot
-        else {
-            return Err(BuildExecutionBindingError::ScratchProfile);
-        };
-        let [boot] = artifacts.as_slice() else {
-            return Err(BuildExecutionBindingError::ScratchProfile);
-        };
-        let ExecutionCompatibilityProfile::RuntimeV1 {
-            contract: machine,
-            state_format: Some(state_format),
-        } = &spec.compatibility
-        else {
-            return Err(BuildExecutionBindingError::ScratchProfile);
-        };
-        if contract.as_str() != FIRECRACKER_BOOT_CONTRACT
-            || machine.as_str() != FIRECRACKER_MACHINE_CONTRACT
-            || boot.role().as_str() != "boot"
-            || boot.format().as_str() != "vmlinux"
-            || boot.component().kind != pplx_space_common_core::types::ArtifactComponentKind::Kernel
-        {
-            return Err(BuildExecutionBindingError::ScratchProfile);
-        }
-        let kernel = boot.component();
+        let (kernel, state_format) = self
+            .definition
+            .firecracker_linux_contract()
+            .ok_or(BuildExecutionBindingError::ScratchProfile)?;
         if pin.is_some_and(|pin| pin.version != kernel.version || pin.digest != kernel.digest) {
             return Err(BuildExecutionBindingError::KernelPin);
         }

@@ -664,7 +664,7 @@ type SandboxHealthComponent int32
 
 const (
 	SandboxHealthComponent_SANDBOX_HEALTH_COMPONENT_UNSPECIFIED  SandboxHealthComponent = 0
-	SandboxHealthComponent_SANDBOX_HEALTH_COMPONENT_FIRECRACKER  SandboxHealthComponent = 1
+	SandboxHealthComponent_SANDBOX_HEALTH_COMPONENT_RUNTIME      SandboxHealthComponent = 1
 	SandboxHealthComponent_SANDBOX_HEALTH_COMPONENT_SPACED_HOST  SandboxHealthComponent = 2
 	SandboxHealthComponent_SANDBOX_HEALTH_COMPONENT_SPACED_GUEST SandboxHealthComponent = 3
 	SandboxHealthComponent_SANDBOX_HEALTH_COMPONENT_NET_GATEWAY  SandboxHealthComponent = 4
@@ -674,14 +674,14 @@ const (
 var (
 	SandboxHealthComponent_name = map[int32]string{
 		0: "SANDBOX_HEALTH_COMPONENT_UNSPECIFIED",
-		1: "SANDBOX_HEALTH_COMPONENT_FIRECRACKER",
+		1: "SANDBOX_HEALTH_COMPONENT_RUNTIME",
 		2: "SANDBOX_HEALTH_COMPONENT_SPACED_HOST",
 		3: "SANDBOX_HEALTH_COMPONENT_SPACED_GUEST",
 		4: "SANDBOX_HEALTH_COMPONENT_NET_GATEWAY",
 	}
 	SandboxHealthComponent_value = map[string]int32{
 		"SANDBOX_HEALTH_COMPONENT_UNSPECIFIED":  0,
-		"SANDBOX_HEALTH_COMPONENT_FIRECRACKER":  1,
+		"SANDBOX_HEALTH_COMPONENT_RUNTIME":      1,
 		"SANDBOX_HEALTH_COMPONENT_SPACED_HOST":  2,
 		"SANDBOX_HEALTH_COMPONENT_SPACED_GUEST": 3,
 		"SANDBOX_HEALTH_COMPONENT_NET_GATEWAY":  4,
@@ -833,8 +833,8 @@ const (
 	// Materialize an evacuated `stopped` sandbox on this node and leave it
 	// stopped. The request must carry the exact storage URI of a `stop`-origin
 	// DISK artifact belonging to this same sandbox id; the node stages the
-	// rootfs, pins the artifact on the local row, and returns. No Firecracker
-	// process is created: booting a microVM only to stop it again would run the
+	// rootfs, pins the artifact on the local row, and returns. No runtime process
+	// is created: booting a microVM only to stop it again would run the
 	// guest's init and mutate the rootfs a stopped sandbox is meant to keep
 	// inert.
 	//
@@ -2104,11 +2104,11 @@ type StartRequest struct {
 	// Target lifecycle for checkpoint-based starts (a `checkpoint` value
 	// is required for non-default behavior; ignored for fresh boots).
 	// Unspecified → STARTED. PAUSED skips the post-load resume so the
-	// restored VM stays in the firecracker-paused state. Used by the
+	// restored VM stays in the resident paused state. Used by the
 	// cluster-controller's lifecycle-preserving drain evacuation path.
 	// STOPPED materializes an evacuated stopped sandbox's disk artifact and
 	// stops there; it requires `checkpoint = "suspend"` plus an exact
-	// `suspend_restore_storage_uri`, and never launches Firecracker.
+	// `suspend_restore_storage_uri`, and never launches a VM.
 	TargetState WakeTargetState `protobuf:"varint,9,opt,name=target_state,json=targetState,proto3,enum=space.sandbox.manager.v1.WakeTargetState" json:"target_state,omitempty"`
 	// Internal-only exact S3 fallback for `checkpoint = "suspend"`.
 	SuspendRestoreStorageUri *string `protobuf:"bytes,10,opt,name=suspend_restore_storage_uri,json=suspendRestoreStorageUri,proto3,oneof" json:"suspend_restore_storage_uri,omitempty"`
@@ -3111,7 +3111,7 @@ type SandboxInfo struct {
 	AutoLifecycle                  *AutoLifecyclePolicy   `protobuf:"bytes,23,opt,name=auto_lifecycle,json=autoLifecycle,proto3,oneof" json:"auto_lifecycle,omitempty"`
 	AutoLifecycleStatus            *AutoLifecycleStatus   `protobuf:"bytes,24,opt,name=auto_lifecycle_status,json=autoLifecycleStatus,proto3,oneof" json:"auto_lifecycle_status,omitempty"`
 	FailureReason                  *string                `protobuf:"bytes,25,opt,name=failure_reason,json=failureReason,proto3,oneof" json:"failure_reason,omitempty"`
-	FirecrackerAlive               bool                   `protobuf:"varint,26,opt,name=firecracker_alive,json=firecrackerAlive,proto3" json:"firecracker_alive,omitempty"`                                               // Is the sandbox runtime process alive?
+	RuntimeAlive                   bool                   `protobuf:"varint,26,opt,name=runtime_alive,json=runtimeAlive,proto3" json:"runtime_alive,omitempty"`                                                           // Is the sandbox runtime process alive?
 	VsockRawPingOk                 bool                   `protobuf:"varint,27,opt,name=vsock_raw_ping_ok,json=vsockRawPingOk,proto3" json:"vsock_raw_ping_ok,omitempty"`                                                 // can sbx-manager ping spaced-guest directly over v.sock?
 	LastGuestReadyAt               *timestamppb.Timestamp `protobuf:"bytes,28,opt,name=last_guest_ready_at,json=lastGuestReadyAt,proto3,oneof" json:"last_guest_ready_at,omitempty"`                                      // last time host observed guest ready
 	LastGuestHeartbeatAt           *timestamppb.Timestamp `protobuf:"bytes,29,opt,name=last_guest_heartbeat_at,json=lastGuestHeartbeatAt,proto3,oneof" json:"last_guest_heartbeat_at,omitempty"`                          // last guest-originated heartbeat
@@ -3352,9 +3352,9 @@ func (x *SandboxInfo) GetFailureReason() string {
 	return ""
 }
 
-func (x *SandboxInfo) GetFirecrackerAlive() bool {
+func (x *SandboxInfo) GetRuntimeAlive() bool {
 	if x != nil {
-		return x.FirecrackerAlive
+		return x.RuntimeAlive
 	}
 	return false
 }
@@ -12897,7 +12897,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x0emetadata_valid\x18\x04 \x01(\bR\rmetadataValidB\v\n" +
 	"\t_template\"b\n" +
 	"\x12CleanupTargetBatch\x12L\n" +
-	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\x8d\x1f\n" +
+	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\x85\x1f\n" +
 	"\vSandboxInfo\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -12922,8 +12922,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\rpool_template\x18\x16 \x01(\tH\vR\fpoolTemplate\x88\x01\x01\x12Y\n" +
 	"\x0eauto_lifecycle\x18\x17 \x01(\v2-.space.sandbox.manager.v1.AutoLifecyclePolicyH\fR\rautoLifecycle\x88\x01\x01\x12f\n" +
 	"\x15auto_lifecycle_status\x18\x18 \x01(\v2-.space.sandbox.manager.v1.AutoLifecycleStatusH\rR\x13autoLifecycleStatus\x88\x01\x01\x12*\n" +
-	"\x0efailure_reason\x18\x19 \x01(\tH\x0eR\rfailureReason\x88\x01\x01\x12+\n" +
-	"\x11firecracker_alive\x18\x1a \x01(\bR\x10firecrackerAlive\x12)\n" +
+	"\x0efailure_reason\x18\x19 \x01(\tH\x0eR\rfailureReason\x88\x01\x01\x12#\n" +
+	"\rruntime_alive\x18\x1a \x01(\bR\fruntimeAlive\x12)\n" +
 	"\x11vsock_raw_ping_ok\x18\x1b \x01(\bR\x0evsockRawPingOk\x12N\n" +
 	"\x13last_guest_ready_at\x18\x1c \x01(\v2\x1a.google.protobuf.TimestampH\x0fR\x10lastGuestReadyAt\x88\x01\x01\x12V\n" +
 	"\x17last_guest_heartbeat_at\x18\x1d \x01(\v2\x1a.google.protobuf.TimestampH\x10R\x14lastGuestHeartbeatAt\x88\x01\x01\x12-\n" +
@@ -13902,10 +13902,10 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"!SANDBOX_HEALTH_STATUS_UNSPECIFIED\x10\x00\x12&\n" +
 	"\"SANDBOX_HEALTH_STATUS_INITIALIZING\x10\x01\x12!\n" +
 	"\x1dSANDBOX_HEALTH_STATUS_HEALTHY\x10\x02\x12\"\n" +
-	"\x1eSANDBOX_HEALTH_STATUS_DEGRADED\x10\x03*\xeb\x01\n" +
+	"\x1eSANDBOX_HEALTH_STATUS_DEGRADED\x10\x03*\xe7\x01\n" +
 	"\x16SandboxHealthComponent\x12(\n" +
-	"$SANDBOX_HEALTH_COMPONENT_UNSPECIFIED\x10\x00\x12(\n" +
-	"$SANDBOX_HEALTH_COMPONENT_FIRECRACKER\x10\x01\x12(\n" +
+	"$SANDBOX_HEALTH_COMPONENT_UNSPECIFIED\x10\x00\x12$\n" +
+	" SANDBOX_HEALTH_COMPONENT_RUNTIME\x10\x01\x12(\n" +
 	"$SANDBOX_HEALTH_COMPONENT_SPACED_HOST\x10\x02\x12)\n" +
 	"%SANDBOX_HEALTH_COMPONENT_SPACED_GUEST\x10\x03\x12(\n" +
 	"$SANDBOX_HEALTH_COMPONENT_NET_GATEWAY\x10\x04*\xaf\x02\n" +

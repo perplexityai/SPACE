@@ -94,20 +94,25 @@ for canonical hashing and stored schema-1 JSON. Consumers see generic profiles.
 Historical records that omitted component formats keep their original binding
 checks; native schema-2 identities require the declared formats.
 
-During rollout, ResolveExecutionEnvironment callers advertise the definition
-schema they understand. New nodes return generic profiles to new callers and
-an exact schema-1 representation to older callers. New callers also accept and
-normalize old-node responses. Native schema-2 definitions have no downgrade:
-an old peer receives an explicit refusal, never an unbound/default environment.
+The environment gRPC protocol accepts and emits only generic schema 2. Retired
+profile and selection fields are removed, including their reservation declarations;
+live field numbers and enum values are unchanged.
+ResolveExecutionEnvironment callers continue advertising schema 2: transitional
+nodes use that capability to return generic definitions during a rolling
+upgrade. Nodes reject clients advertising less than 2. No legacy environment
+response, reader, or Firecracker-specific environment protobuf message remains.
 Selection acknowledgements and persist-before-activation rules are unchanged.
 
-Remove legacy environment protobuf messages and the temporary response-format
-negotiation only after node-manager, builder, sandbox-manager and operator CLI
-readers have this migration deployed, including rollback images. Reserve removed
-field numbers and names. A later rollback to a pre-migration reader requires
-restoring the transitional server first. This removal does not remove the
-historical canonical/JSON reader: persisted references still need it. Existing
-Firecracker-specific lifecycle RPCs are separate adapter integration work.
+Deployment prerequisite: node-manager, builder, sandbox-manager and operator CLI
+readers must first run the transitional migration that understands generic
+transport with historical identities. Include rollback images in this gate.
+Both deployment orders between that transitional version and this removal are
+supported; jumping from a pre-migration version is not. A later rollback to a
+pre-migration reader requires restoring the transitional server first.
+
+The historical canonical/JSON reader remains because persisted references still
+need it; it is not a legacy gRPC API. Runtime control also uses only the generic
+launch, VM-state, capture and restore routes; the old routes and fallbacks are gone.
 
 Schema-2 artifacts are canonicalized by unique role. Every artifact's kind,
 version, digest and format, both contract identifiers, and the presence/value of
@@ -629,15 +634,15 @@ withdraw E0. Each compiled binding records its qualified lifecycle support; the
 same-environment memory snapshots. Cross-environment restore requires a
 qualified compatible loader; each snapshot retains its original producer binding.
 The 6.1.155 kernel keeps its existing artifact identity when paired with 1.17.0.
-Non-default snapshot capture carries an environment-bound sandbox identity on
-`CreateSnapshot`, with the legacy sandbox ID omitted. Old node-managers reject
-that request before capture or encrypted teardown. New nodes verify the running
-sandbox's metadata and resolve its exact binding for restore before capture.
-This enforces qualification on the serving node even if it restarts between a
-preflight and the mutation. During mixed rollouts non-default suspend can fail
-and leave a resident paused VM; upgrade the node and retry or resume it. E0 and
-legacy capture keep their existing wire shape. Retain qualified node versions
-while their snapshots exist: downgrading a loader is not a retirement operation.
+Non-default snapshot capture carries an environment reference alongside the
+sandbox identity on `CaptureVmState`. The serving node verifies the running
+sandbox's metadata and resolves its exact binding for restore before capture.
+This enforces qualification even if the node restarts between a preflight and
+the mutation. During the bridge rollout, fallback to an older route preserves
+the bound identity and refuses peers that cannot honor it. After removal of the
+legacy routes, all peers and rollback images must meet the rollout gate below.
+Retain qualified node versions while their snapshots exist: downgrading a loader
+is not a retirement operation.
 
 `StartBuild` and `Create` accept an additive environment input. It contains the
 reference and recipe or template; the environment determines the runtime. Legacy
@@ -1046,17 +1051,20 @@ executable supports jailer-based and direct VMM adapters; source locators cannot
 supply trust or replace the requested execution identity. This does not claim a
 Windows or macOS host adapter exists.
 
-During migration the servers retain old routes. Updated FC clients use generic
-routes and may fall back only when the peer does not implement the new method;
-transport failures and runtime refusals never trigger a second mutation. Other
-runtimes must not use FC fallback. Deploy the new readers and FC callers across
-all participating services and rollback images before retiring the old routes.
+The preceding migration release serves both routes and moves FC clients onto the
+generic methods. This release removes the old routes and all method fallbacks.
+Deploy the migration across every participating service, finish in-flight work,
+and update supported rollback images before deploying this release. A rollback
+to an old caller requires restoring the migration server first; it is not a
+supported mixed-version configuration after retirement. Removing protobuf
+reservations does not renumber any live field or change stored identities.
 Persisted environment JSON/canonical compatibility is independent and remains.
 
-During the bridge canary, measure the end-to-end VM-state probe latency and
-its timeout rate against nodes that have not yet been upgraded. Those probes
-try the generic RPC and then the legacy RPC within the same 500 ms deadline.
-Do not cache peer support permanently: a reconnecting channel can reach an
+For the preceding bridge release only, measure the end-to-end VM-state probe
+latency and timeout rate against nodes that have not yet been upgraded. That
+release tries the generic RPC and then the legacy RPC within the same 500 ms
+deadline; this cleanup release calls only the generic RPC. A bridge-release
+peer-support cache must not be permanent: a reconnecting channel can reach an
 upgraded node where the legacy RPC has been removed. If measurements justify a
 cache, bound its lifetime and invalidate it when the legacy method is absent.
 

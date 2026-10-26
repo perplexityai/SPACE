@@ -218,6 +218,15 @@ impl NodeManagerService {
             super::trusted_paths::canonical_sandbox_id(sandbox_id)?;
         }
         let requested = requested.map(ExecutionFence::try_from).transpose()?;
+        self.check_parsed_execution(sandbox_id, requested, allow_predecessor)
+    }
+
+    pub(super) fn check_parsed_execution(
+        &self,
+        sandbox_id: &str,
+        requested: Option<ExecutionFence>,
+        allow_predecessor: bool,
+    ) -> Result<Option<ExecutionFence>, Status> {
         let current = self
             .pool
             .execution_fence(sandbox_id)

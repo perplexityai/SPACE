@@ -22,7 +22,7 @@ SandboxInfo {
     auto_lifecycle: None,
     auto_lifecycle_status: None,
     failure_reason: None,
-    firecracker_alive: false,
+    runtime_alive: false,
     vsock_raw_ping_ok: false,
     last_guest_ready_at: None,
     last_guest_heartbeat_at: None,

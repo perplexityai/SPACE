@@ -41,6 +41,9 @@ pub fn guest_vlan_packets(packets: u64) {
     gauge("node_mgr.guest_vlan_packets", packets as f64, &[]);
 }
 
+/// Lifecycle admission uses the serving method name. Restore admission is tagged
+/// `RestoreVmState`; include the former `LoadSnapshot` label while upgrading nodes.
+/// The `LOAD_SNAPSHOT` configuration suffix remains stable independently of metrics.
 pub fn lifecycle_rejected(method: &'static str, reason: &'static str) {
     counter(
         "node_mgr.lifecycle.rejected",
@@ -77,8 +80,8 @@ pub fn lifecycle_released(method: &'static str, started: Instant) {
 
 /// Waiter outcomes are separate from mutation completion: abandoning a gRPC
 /// request does not cancel tracked host work.
-/// `method` names the serving RPC, including CaptureVmState/RestoreVmState on
-/// generic snapshot routes and CreateSnapshot/LoadSnapshot on legacy routes.
+/// `method` names the serving RPC, including CaptureVmState/RestoreVmState for
+/// snapshot capture and restore.
 pub fn rpc_wait_finished(method: &'static str, outcome: &'static str, started: Instant) {
     let tags = [tag("method", method), tag("outcome", outcome)];
     counter("node_mgr.rpc_wait.outcome", 1, &tags);

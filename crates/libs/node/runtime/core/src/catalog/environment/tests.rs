@@ -4,13 +4,7 @@ use super::*;
 fn compiled_pins_produce_the_e0_golden_definition() {
     let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
     let definition = initial.definition().unwrap();
-    assert_eq!(
-        definition.canonical_identity(),
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../../../proto/execution/v1/fixtures/e0.canonical"
-        ))
-    );
+    // execution-common checks canonical bytes; the catalog pins their reference.
     assert_eq!(
         definition.reference().to_string(),
         "sha256:3168c96b5719ce62543ae53e6641a4eb80416a9f01e5585f6f76c3c70111fa0b"
