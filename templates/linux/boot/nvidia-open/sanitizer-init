@@ -1,0 +1,30 @@
+#!/bin/busybox sh
+set -eu
+export PATH=/bin:/usr/bin
+/bin/busybox --install -s /bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+exec </dev/console >/dev/console 2>&1
+# A host-side execution deadline is still mandatory: a blocked device ioctl
+# cannot be bounded by a guest interpreter's cooperative deadline.
+trap 'result=$?; [ "$result" -eq 0 ] || echo "SPACE_GPU_SANITIZER_BOOT_FAILED exit=$result"; poweroff -f' EXIT
+attempt=
+for argument in $(cat /proc/cmdline); do
+    case "$argument" in space.sanitizer_attempt=*) attempt=${argument#space.sanitizer_attempt=} ;; esac
+done
+case "$attempt" in ''|*[!0-9a-f-]*) echo 'SPACE_GPU_SANITIZER_BOOT_FAILED invalid attempt'; exit 1 ;; esac
+[ "${#attempt}" -eq 36 ]
+insmod /modules/nvidia.ko
+insmod /modules/nvidia-uvm.ko uvm_disable_hmm=1
+gpu=$(awk '$2 == "nvidia" {print $1}' /proc/devices)
+control=$(awk '$2 == "nvidiactl" {print $1}' /proc/devices)
+uvm=$(awk '$2 == "nvidia-uvm" {print $1}' /proc/devices)
+for major in "$gpu" "$control" "$uvm"; do
+    case "$major" in ''|*[!0-9]*) echo 'SPACE_GPU_SANITIZER_BOOT_FAILED missing device major'; exit 1 ;; esac
+done
+mknod /dev/nvidiactl c "$control" 255
+mknod /dev/nvidia0 c "$gpu" 0
+mknod /dev/nvidia-uvm c "$uvm" 0
+mknod /dev/nvidia-uvm-tools c "$uvm" 1
+/usr/bin/python3 -I /sanitizer.py --attempt "$attempt" --minimum-mib 14336 --maximum-mib 16384
