@@ -124,3 +124,29 @@ fn verify_rejects_rootfs_that_matches_neither_shape() {
     let error = verify_rootfs_from_metadata(temp.path()).unwrap_err();
     assert!(matches!(error, ExpandedRootfsError::WrongSize { .. }));
 }
+
+#[test]
+fn unsupported_document_versions_refuse_before_disk_growth() {
+    for version in [4, 999] {
+        for (metadata, manifest) in [
+            (
+                format!(r#"{{"schema_version":{version},"disk_size_mb":2}}"#),
+                "{}".to_owned(),
+            ),
+            (
+                r#"{"disk_size_mb":2}"#.to_owned(),
+                format!(r#"{{"schema_version":{version}}}"#),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let disk = directory.path().join("rootfs.ext4");
+            let original = vec![0x5a; MIB as usize];
+            std::fs::write(&disk, &original).unwrap();
+            std::fs::write(directory.path().join("metadata.json"), metadata).unwrap();
+            std::fs::write(directory.path().join("manifest.json"), manifest).unwrap();
+            let error = expand_rootfs_from_metadata(directory.path()).unwrap_err();
+            assert_eq!(error.reason(), "invalid_metadata");
+            assert_eq!(std::fs::read(&disk).unwrap(), original);
+        }
+    }
+}
