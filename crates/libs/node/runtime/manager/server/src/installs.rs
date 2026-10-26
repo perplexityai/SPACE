@@ -45,8 +45,8 @@ pub use operations::{InstallLimits, OpenInstallerError};
 pub(crate) use publisher::{DirectoryCatalog, NodeManagerPublisher, PinSource};
 pub(crate) use release::ReleaseContext;
 pub use release_source::{
-    FIRECRACKER_RELEASE_SOURCE, ReleaseChunks, ReleaseSource, ReleaseSourceError, ReleaseUrl,
-    ReleaseUrlParseError, VerifiableRelease,
+    FIRECRACKER_RELEASE_SOURCE, ReleaseArchiveMember, ReleaseChunks, ReleasePayload, ReleaseSource,
+    ReleaseSourceError, ReleaseUrl, ReleaseUrlParseError, VerifiableRelease,
 };
 #[cfg(feature = "s3")]
 pub(crate) use s3::S3KernelSource;
