@@ -47,6 +47,7 @@ fn restore_meta_with_process_env(
     process_env: std::collections::BTreeMap<String, String>,
 ) -> crate::snapshot_upload::SnapshotMeta {
     snapshot_meta_with_sandbox(Some(crate::snapshot_upload::SnapshotSandbox {
+        device_requirements: None,
         owner: "user".to_string(),
         snapshots_enabled: true,
         process_env,
@@ -70,6 +71,7 @@ pub(in crate::service) fn insert_suspended_test_sandbox(conn: &crate::db::Connec
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            device_requirements: None,
             id,
             uuid8: &uuid8,
             state: SandboxState::Suspended,
@@ -109,6 +111,7 @@ fn recovered_sandbox_row_fields_defaults_missing_owner_block_to_legacy_guest_use
 fn recovered_sandbox_row_fields_rejects_invalid_owner() {
     let invalid = match recovered_sandbox_row_fields(&snapshot_meta_with_sandbox(Some(
         crate::snapshot_upload::SnapshotSandbox {
+            device_requirements: None,
             owner: String::new(),
             snapshots_enabled: true,
             process_env: std::collections::BTreeMap::new(),
@@ -129,6 +132,7 @@ fn recovered_sandbox_row_fields_rejects_invalid_owner() {
 fn recovered_sandbox_row_fields_preserves_template_manager_owner() {
     let fields = recovered_sandbox_row_fields(&snapshot_meta_with_sandbox(Some(
         crate::snapshot_upload::SnapshotSandbox {
+            device_requirements: None,
             owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             snapshots_enabled: true,
             process_env: std::collections::BTreeMap::new(),
@@ -3890,4 +3894,66 @@ async fn a_restart_allows_a_stopped_hold_one_more_rejection_and_a_plan_answer_re
         0,
         "a run below the bound is still being retried, not stopped"
     );
+}
+
+#[test]
+fn device_disk_recovery_preserves_requirements_and_refuses_lossy_metadata() {
+    use pplx_space_common_core::types::{ArtifactKind, SandboxArtifactMetadata};
+    use pplx_space_execution_spec::devices::{DeviceRequirement, DeviceRequirements};
+
+    let requirements = DeviceRequirements::new(vec![
+        DeviceRequirement::new("test-gpu".parse().unwrap(), 1).unwrap(),
+    ])
+    .unwrap();
+    let mut meta = restore_meta_with_process_env(Default::default());
+    meta.version = crate::snapshot_upload::DEVICE_DISK_METADATA_VERSION;
+    meta.artifact_kind = Some(ArtifactKind::Disk);
+    let sandbox = meta.sandbox.as_mut().unwrap();
+    sandbox.snapshots_enabled = false;
+    sandbox.device_requirements = Some(requirements.clone());
+    let meta: crate::snapshot_upload::SnapshotMeta =
+        serde_json::from_slice(&serde_json::to_vec(&meta).unwrap()).unwrap();
+    let fields = recovered_sandbox_row_fields(&meta).unwrap();
+    let conn = crate::db::test_conn();
+    let id: SandboxId = meta.sandbox_id.parse().unwrap();
+    fields
+        .with_insert_params(
+            &id.to_string(),
+            &SandboxRuntimeLabel::from_sandbox_id(id),
+            SandboxState::Stopped,
+            None,
+            |params| crate::db::insert_sandbox(&conn, params),
+        )
+        .unwrap();
+    let row = crate::db::get_sandbox(&conn, &id.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.device_requirements.as_ref(), Some(&requirements));
+    let sidecar: SandboxArtifactMetadata = serde_json::from_str(
+        &super::super::tail_support::activation_metadata_json(&row, None).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sidecar.device_requirements(), Some(&requirements));
+    assert_eq!(sidecar.schema_version(), 3);
+
+    // Neither legacy readers nor memory-state recovery may reinterpret this
+    // disk as a CPU-only or resumable sandbox.
+    for (version, kind, keep_requirements) in [
+        (1, Some(ArtifactKind::Disk), true),
+        (2, Some(ArtifactKind::Disk), true),
+        (3, Some(ArtifactKind::Disk), false),
+        (3, Some(ArtifactKind::Full), true),
+        (3, None, true),
+    ] {
+        let mut invalid = meta.clone();
+        invalid.version = version;
+        invalid.artifact_kind = kind;
+        if !keep_requirements {
+            invalid.sandbox.as_mut().unwrap().device_requirements = None;
+        }
+        assert!(matches!(
+            invalid.device_requirements(),
+            Err(crate::snapshot_upload::SnapshotRuntimeMetadataError::DeviceRequirements)
+        ));
+    }
 }

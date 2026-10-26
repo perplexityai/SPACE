@@ -36,6 +36,7 @@ fn insert_test_sandbox(conn: &crate::db::Connection, id: &str, state: crate::sta
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            device_requirements: None,
             id,
             uuid8: &uuid8,
             state,
