@@ -1,5 +1,10 @@
 # Runtime manager release and kernel catalog
 
+Diagnostic discovery recognizes Cloud Hypervisor release directories containing
+`bin/cloud-hypervisor`. A valid executable is reported without a memory-state
+format: recognizing the installation does not enable execution, snapshots or
+warm pools. Cloud Hypervisor releases are not yet offered by the install catalog.
+
 The compiled catalog pins installable Firecracker releases and guest kernels for
 both `x86_64` and `aarch64`. Installing an artifact does not select it as a node's
 default. Node-manager selects compiled E0 (Firecracker 1.15.1 / Linux 6.1.155)
