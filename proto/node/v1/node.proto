@@ -111,6 +111,11 @@ service NodeManager {
   rpc PauseSandbox(PauseSandboxRequest) returns (PauseSandboxResponse);
   // Resume the VM (thaw vCPUs).
   rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+  // Read VM state through the node's runtime adapter without granting the
+  // caller access to the runtime's control socket.
+  rpc GetVmState(GetVmStateRequest) returns (GetVmStateResponse);
+  rpc CaptureVmState(CaptureVmStateRequest) returns (CaptureVmStateResponse);
+  rpc RestoreVmState(RestoreVmStateRequest) returns (RestoreVmStateResponse);
   // Read the Firecracker VM state without granting the caller access to the
   // privileged Firecracker API socket.
   rpc GetFirecrackerVmState(GetFirecrackerVmStateRequest)
@@ -435,7 +440,7 @@ message AllocateRequest {
   // node-manager creates the sandbox namespace as a child and bridges
   // it to the pod namespace via a veth pair + MASQUERADE.
   optional string netns_path = 2;
-  // Effective Firecracker host cgroup memory.max needed for this new VM,
+  // Effective runtime host cgroup memory.max needed for this new VM,
   // clamped to the node-manager's configured sandbox cgroup memory limit.
   // Required (non-zero) when the request creates a new lease.
   uint64 sandbox_cgroup_memory_mib = 3;
@@ -631,7 +636,7 @@ message LaunchSandboxRequest {
   optional uint64 memory_mib = 5; // Host cgroup memory.max in MiB
   optional uint32 pids_max = 6;   // Max PIDs
   string runtime = 7;       // Required: "fc", "gvisor", or "ch"
-  bool snapshot_restore = 8; // If true, FC starts idle (no config boot) for snapshot load
+  bool snapshot_restore = 8; // Start idle for persisted-state loading; adapter must support restore.
   optional space.execution.v1.ExecutionMetadata requested_execution = 9;
   space.execution.v1.ExecutionSelectionMode execution_selection_mode = 10;
   // BYOK encrypted rootfs: when set, this host block device (a
@@ -646,7 +651,7 @@ message LaunchSandboxRequest {
 
 message LaunchSandboxResponse {
   uint32 pid = 1;              // Sandbox PID (observed from host)
-  string api_socket_path = 2; // Host path to Firecracker API socket: {JAIL_DIR}/firecracker/{id}/root/firecracker.sock
+  string api_socket_path = 2; // Adapter-owned control endpoint; callers must use node-manager for control.
   space.execution.v1.ExecutionMetadata resolved_execution = 3;
 }
 
@@ -672,7 +677,7 @@ message PrepareSandboxResponse {
   string run_dir = 2;            // /space/run/firecracker/sandboxes/{id}
   string rootfs_path = 3;        // full path to CoW rootfs
   string config_path = 4;        // full path to vm-config.json
-  string log_path = 5;           // full path to fc.log
+  string log_path = 5;           // full path to the adapter log
   space.execution.v1.ExecutionMetadata resolved_execution = 6;
 }
 
@@ -748,8 +753,8 @@ message InspectSandboxResponse {
   optional uint32 uid = 3;
 
   // Processes
-  optional uint32 fc_pid = 10;
-  bool fc_alive = 11;
+  optional uint32 runtime_pid = 10;
+  bool runtime_alive = 11;
   optional uint32 spaced_host_pid = 12;
   bool spaced_host_alive = 13;
   optional uint32 netgtw_pid = 14;
@@ -782,15 +787,15 @@ message InspectSandboxResponse {
   // Filesystem
   bool cache_dir_exists = 40;
   bool run_dir_exists = 41;
-  bool jailer_chroot_exists = 42;
+  bool isolation_root_exists = 42;
   bool vm_config_exists = 43;
-  bool fc_log_exists = 45;
+  bool runtime_log_exists = 45;
   bool vsock_sock_exists = 46;
   bool spaced_sock_exists = 47;
   bool rootfs_exists = 48;          // cache_dir/instance/rootfs.ext4
-  bool fc_pid_symlink_exists = 49;  // run_dir/fc.pid -> /proc/{pid}
+  bool runtime_pid_link_exists = 49;  // run_dir/fc.pid -> /proc/{pid}
   bool spaced_host_pid_symlink_exists = 55; // run_dir/space-spaced-host-svc.pid
-  bool firecracker_pidfile_exists = 56;     // jail_root/firecracker.pid
+  bool runtime_pidfile_exists = 56;     // jail_root/firecracker.pid
   bool netgtw_pid_symlink_exists = 57;      // run_dir/space-netgtw-svc.pid
   bool nft_ns_redirect_exists = 58;         // nftables REDIRECT on tap0 in namespace
   bool nft_ns_forward_drop_exists = 59;     // nftables forward DROP on tap0 in namespace
@@ -819,7 +824,7 @@ message VsockEndpointIdentity {
   uint32 owner_uid = 4;
   uint32 owner_gid = 5;
   uint32 guest_cid = 6;
-  // The descriptor by which the active Firecracker process owns this transport.
+  // The descriptor by which the active runtime process owns this transport.
   uint32 runtime_fd = 7;
   uint64 runtime_socket_inode = 8;
 }
@@ -945,7 +950,7 @@ message LoadSnapshotRequest {
 }
 message LoadSnapshotResponse {}
 
-// A Firecracker drive rate limiter, as sandbox-manager computes it.
+// Runtime-neutral disk I/O token buckets; adapters reject unsupported limits.
 message DriveRateLimit {
   TokenBucket bandwidth = 1;
   TokenBucket operations = 2;
@@ -1367,3 +1372,49 @@ message RemoveArtifactResponse {
   // False when the artifact was not in the store.
   bool removed = 1;
 }
+
+// State of a resident VM. Missing or unreadable control state is an RPC error,
+// never evidence that a VM has stopped.
+enum VmState {
+  VM_STATE_UNSPECIFIED = 0;
+  VM_STATE_NOT_STARTED = 1;
+  VM_STATE_RUNNING = 2;
+  VM_STATE_PAUSED = 3;
+  // The runtime reports that the VM has shut down. This does not certify a
+  // graceful guest shutdown, VMM process exit, or release of sandbox resources.
+  VM_STATE_SHUTDOWN = 4;
+}
+message GetVmStateRequest { string sandbox_id = 1; }
+message GetVmStateResponse { VmState state = 1; }
+
+// Names belong to the runtime's qualified state profile, not to this protocol.
+// A profile may require one file or several. Adapters reject missing, duplicate
+// or unknown names before any side effect. Paths retain the existing canonical
+// snapshot-root and relative-path validation; they never grant host access.
+message VmStateArtifact {
+  string name = 1;
+  string relative_path = 2;
+}
+
+// Existing node-owned storage locators shared by capture and restore. The node
+// validates these against the sandbox's canonical snapshot/volume roots.
+message VmStateStorage {
+  optional string directory = 1;
+  optional string encrypted_volume_mount = 2;
+}
+message CaptureVmStateRequest {
+  string sandbox_id = 1;
+  optional string environment_reference = 2;
+  repeated VmStateArtifact artifacts = 3;
+  VmStateStorage storage = 4;
+  ExecutionFence execution_fence = 5;
+}
+message CaptureVmStateResponse {}
+message RestoreVmStateRequest {
+  string sandbox_id = 1;
+  repeated VmStateArtifact artifacts = 2;
+  VmStateStorage storage = 3;
+  ExecutionFence execution_fence = 4;
+  DriveRateLimit rootfs_rate_limit = 5;
+}
+message RestoreVmStateResponse {}

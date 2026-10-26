@@ -464,10 +464,14 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!();
 
             println!("PROCESSES:");
-            if let Some(fc_pid) = resp.fc_pid {
-                println!("  Firecracker PID:  {}    {}", fc_pid, alive(resp.fc_alive));
+            if let Some(runtime_pid) = resp.runtime_pid {
+                println!(
+                    "  Runtime PID:      {}    {}",
+                    runtime_pid,
+                    alive(resp.runtime_alive)
+                );
             } else {
-                println!("  Firecracker PID:  -");
+                println!("  Runtime PID:      -");
             }
             if let Some(spaced_host_pid) = resp.spaced_host_pid {
                 println!(
@@ -513,21 +517,18 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("FILESYSTEM:");
             println!("  Cache dir:        {}", yn(resp.cache_dir_exists));
             println!("  Run dir:          {}", yn(resp.run_dir_exists));
-            println!("  Jailer chroot:    {}", yn(resp.jailer_chroot_exists));
+            println!("  Isolation root:   {}", yn(resp.isolation_root_exists));
             println!("  vm-config.json:   {}", yn(resp.vm_config_exists));
-            println!("  fc.log:           {}", yn(resp.fc_log_exists));
+            println!("  Runtime log:      {}", yn(resp.runtime_log_exists));
             println!("  vsock.sock:       {}", yn(resp.vsock_sock_exists));
             println!("  spaced-host.sock: {}", yn(resp.spaced_sock_exists));
             println!("  rootfs.ext4:      {}", yn(resp.rootfs_exists));
-            println!("  fc.pid symlink:   {}", yn(resp.fc_pid_symlink_exists));
+            println!("  Runtime PID link: {}", yn(resp.runtime_pid_link_exists));
             println!(
                 "  spaced-host.pid:  {}",
                 yn(resp.spaced_host_pid_symlink_exists)
             );
-            println!(
-                "  firecracker.pid:  {}",
-                yn(resp.firecracker_pidfile_exists)
-            );
+            println!("  Runtime PID file: {}", yn(resp.runtime_pidfile_exists));
             println!();
 
             println!("STATE:");

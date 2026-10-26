@@ -162,15 +162,14 @@ impl ExecutionPolicy {
             }
             let spec = entry.definition().descriptor().spec();
             let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
-            let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-                &spec.compatibility;
             if entry.is_initial()
                 && execution.environment().is_none()
                 && mode == ExecutionSelectionMode::PersistedStateRestore
                 && execution.components().is_empty()
                 && execution.runtime() == &release.runtime
                 && execution.guest() == spec.guest
-                && execution.state_format() == Some(state_format)
+                && spec.compatibility.state_format().is_some()
+                && execution.state_format() == spec.compatibility.state_format()
             {
                 return Ok(());
             }
