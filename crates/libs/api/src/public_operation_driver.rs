@@ -687,14 +687,9 @@ fn retry_budget_exhausted(attempts: i32, max_retry_attempts: i32) -> bool {
     attempts >= max_retry_attempts.max(1)
 }
 
+/// The Native kinds bound by the M1 deadline while they retry: the kinds
+/// that expire unrun, and a delete.
 fn is_native_m1_terminalized_kind(api_product: ApiProduct, kind: OperationKind) -> bool {
-    api_product == ApiProduct::Native
-        && matches!(
-            kind,
-            OperationKind::CreateSandbox
-                | OperationKind::DeleteSandbox
-                | OperationKind::PauseSandbox
-                | OperationKind::SuspendSandbox
-                | OperationKind::WakeSandbox
-        )
+    expires_unrun(api_product, kind)
+        || (api_product == ApiProduct::Native && kind == OperationKind::DeleteSandbox)
 }
