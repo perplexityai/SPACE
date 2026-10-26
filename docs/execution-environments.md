@@ -956,3 +956,28 @@ to an old caller requires restoring the migration server first; it is not a
 supported mixed-version configuration after retirement. Removing protobuf
 reservations does not renumber any live field or change stored identities.
 Persisted environment JSON/canonical compatibility is independent and remains.
+
+## Runtime adapter boundaries
+
+Shared lifecycle code owns sandbox identity, durable activation intent, resource
+ownership, selection and cleanup fences. It asks adapters to interpret a boot
+profile or resident state; it does not construct a particular VMM's JSON or infer
+snapshot support from the presence of an executable.
+
+The Linux direct-boot adapters currently render Firecracker and Cloud Hypervisor
+configuration. They share validated resource inputs, but own their device model,
+configuration keys and feature admission. Both adapters retain independent RX/TX
+network buckets. Cloud Hypervisor is configured with one queue pair so additional
+queues cannot multiply the assigned traffic budget.
+
+Control is separate from process containment. The `RuntimeControl` interface does
+not require a process, jailer or HTTP endpoint. A library-backed runtime can own a
+runner and implement that interface without teaching sandbox lifecycle about its
+implementation. Socket construction belongs to the standalone Linux adapters;
+node-manager owns those host-capable control endpoints. Guest communication is a
+separate channel.
+
+Installing a release does not qualify an execution environment. Cloud Hypervisor
+still needs a verified boot artifact, contained launch implementation and lifecycle
+qualification before it can be selected. New adapters must reject unsupported
+lifecycle and resource policies at admission, rather than silently ignoring them.
