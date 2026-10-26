@@ -14,6 +14,7 @@ use pplx_space_node_mgr_client::proto::{
 
 const FACET_SANDBOX_DESIRED_STATE: &str = "sandbox-desired-state";
 
+mod devices;
 #[cfg(test)]
 mod tests;
 
@@ -129,6 +130,11 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Inspect and administer node-local device ownership (operator only).
+    Devices {
+        #[command(subcommand)]
+        command: devices::Command,
+    },
     /// Resolve and verify an execution environment on this node; JSON output.
     Environment {
         #[arg(long)]
@@ -311,6 +317,9 @@ async fn run(cli: Cli) -> Result<(), String> {
         })?;
 
     match cli.command {
+        Commands::Devices { command } => devices::run(&mut client, command)
+            .await
+            .map_err(|error| error.to_string())?,
         Commands::Environment { reference } => {
             let response = client
                 .resolve_execution_environment(
@@ -958,16 +967,26 @@ async fn resolve_sandbox_selector(
         .into_inner()
         .leases;
 
-    let leases = leases
-        .into_iter()
-        .map(|lease| parse_lease_sandbox_id(&lease).map(|id| (lease, id)))
-        .collect::<Result<Vec<_>, _>>()?;
-    match selector.find(leases.iter(), |(_, id)| *id) {
-        Some(OneOrMany::One((lease, _))) => Ok(lease.sandbox_id.clone()),
+    resolve_selector_from_leases(&leases, selector)
+}
+
+fn resolve_selector_from_leases(
+    leases: &[NetworkLease],
+    selector: &SandboxSelector,
+) -> Result<String, String> {
+    // Retired slots can coexist with a new execution of the same sandbox.
+    // Selector ambiguity concerns sandbox identities, not lease generations.
+    let ids = leases
+        .iter()
+        .filter(|lease| !lease.sandbox_id.is_empty())
+        .map(parse_lease_sandbox_id)
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    match selector.find(ids.iter(), |id| **id) {
+        Some(OneOrMany::One(id)) => Ok(id.to_string()),
         Some(OneOrMany::Many(matches)) => {
             let mut message = format!("Ambiguous sandbox selector '{selector}', matches:");
-            for (lease, _) in &matches {
-                message.push_str(&format!("\n  {}", sandbox_label_or_id(&lease.sandbox_id)));
+            for id in &matches {
+                message.push_str(&format!("\n  {}", sandbox_label_or_id(&id.to_string())));
             }
             Err(message)
         }
