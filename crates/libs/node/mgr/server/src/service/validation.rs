@@ -5,11 +5,17 @@ use pplx_space_common_core::types::{LinuxPid, LinuxUid};
 pub(super) struct ExpectedSpacedHostPeer {
     runtime_pid: LinuxPid,
     sandbox_uid: LinuxUid,
+    execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
 }
 
 impl ExpectedSpacedHostPeer {
-    pub(super) const fn new(runtime_pid: LinuxPid, sandbox_uid: u32) -> Self {
+    pub(super) const fn new(
+        runtime_pid: LinuxPid,
+        sandbox_uid: u32,
+        execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    ) -> Self {
         Self {
+            execution,
             runtime_pid,
             sandbox_uid: LinuxUid::new(sandbox_uid),
         }
@@ -290,6 +296,7 @@ pub(super) fn prepare_sidecar_launch_args(
         )?;
         reject_caller_controlled_launch_arg(args, program, "--firecracker-pid")?;
         reject_caller_controlled_launch_arg(args, program, "--firecracker-uid")?;
+        reject_caller_controlled_launch_arg(args, program, "--process-recovery-activation")?;
         require_launch_arg_eq(
             args,
             program,
@@ -300,6 +307,12 @@ pub(super) fn prepare_sidecar_launch_args(
         // authorization input out of the caller's control and lets old and new
         // sandbox-manager revisions coexist during a DaemonSet rollout.
         let mut prepared = args.to_vec();
+        if let Some(execution) = expected_peer.execution {
+            prepared.extend([
+                "--process-recovery-activation".to_string(),
+                execution.to_string(),
+            ]);
+        }
         prepared.extend([
             "--firecracker-pid".to_string(),
             expected_peer.runtime_pid.get().get().to_string(),

@@ -16,7 +16,14 @@ fn supported_process_execution_info(
     info.map(|mut info| {
         // Advertise only guarantees preserved by this manager's request adapters.
         info.capabilities.retain(|capability| {
-            capability == pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume.as_str()
+            use pplx_space_common_grpc::GuestCapability;
+            matches!(
+                capability.parse::<GuestCapability>(),
+                Ok(GuestCapability::ProcessOutputGapResume
+                    | GuestCapability::ProcessRecoveryStart
+                    | GuestCapability::ProcessRecoveryHandles
+                    | GuestCapability::ProcessMutationReceipts)
+            )
         });
         info
     })
@@ -403,10 +410,14 @@ impl SandboxManagerService {
         };
         let timeout = proto_duration_to_std(req.timeout)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCKING_READY_TIMEOUT_SECS as u64));
-        let client = self
-            .connect_spaced_host_with_policy(&sandbox, endpoint_proof_policy)
+        let (_, response) = self
+            .recovery_ready(
+                &sandbox,
+                route_auth.as_ref(),
+                endpoint_proof_policy,
+                timeout,
+            )
             .await?;
-        let response = client.wait_ready(timeout).await?;
         Ok(Response::new(spaced_ready_response(response)))
     }
 

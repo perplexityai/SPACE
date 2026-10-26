@@ -48,18 +48,66 @@ impl RecoveryLifecycle {
     }
 }
 
-// Forwarding is not enabled until every process adapter and lifecycle owner can
-// honor the contract. Keep raw guest metadata internally for the handshake.
-pub(super) fn supported_execution_info(
-    mut info: proto::ProcessExecutionInfo,
-) -> proto::ProcessExecutionInfo {
-    info.capabilities.retain(|capability| {
-        capability == pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume.as_str()
-    });
-    info
-}
-
 impl SpacedHostService {
+    pub(super) fn require_recovery_fence(
+        &self,
+        fence: Option<pplx_space_spaced_common::recovery::RecoveryFence>,
+    ) -> Result<(), Status> {
+        let Some(fence) = fence else {
+            return Ok(());
+        };
+        let lifecycle = self.inner.process_recovery.as_ref().ok_or_else(|| {
+            pplx_space_common_grpc::guest_capability_unsupported_status(
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryStart,
+                "host has no recovery activation",
+            )
+        })?;
+        if lifecycle.activation != fence.activation {
+            return Err(
+                pplx_space_spaced_common::recovery::RecoveryReason::ActivationChanged.into_status(),
+            );
+        }
+        let gate = lifecycle
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match gate.phase {
+            Phase::Active => Ok(()),
+            Phase::Quiesced => Err(Status::unavailable("process recovery is quiesced")),
+        }
+    }
+
+    pub(super) fn supported_execution_info(
+        &self,
+        mut info: proto::ProcessExecutionInfo,
+    ) -> proto::ProcessExecutionInfo {
+        use pplx_space_common_grpc::GuestCapability;
+        let active = self
+            .inner
+            .process_recovery
+            .as_ref()
+            .is_some_and(|lifecycle| {
+                let gate = lifecycle
+                    .gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                matches!(gate.phase, Phase::Active)
+                    && info.activation_id.as_deref()
+                        == Some(lifecycle.activation.to_string().as_str())
+            });
+        info.capabilities
+            .retain(|capability| match capability.parse::<GuestCapability>() {
+                Ok(GuestCapability::ProcessOutputGapResume) => true,
+                Ok(
+                    GuestCapability::ProcessRecoveryStart
+                    | GuestCapability::ProcessRecoveryHandles
+                    | GuestCapability::ProcessMutationReceipts,
+                ) => active,
+                _ => false,
+            });
+        info
+    }
+
     pub(super) fn recovery_barrier(&self, guest: &GuestReadySnapshot) -> Option<String> {
         let lifecycle = self.inner.process_recovery.as_ref()?;
         guest.process_recovery_barrier_id.as_ref()?;

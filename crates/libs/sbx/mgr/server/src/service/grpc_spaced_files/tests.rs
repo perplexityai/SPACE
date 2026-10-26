@@ -42,7 +42,8 @@ fn readiness_discovery_preserves_instance_and_filters_unsupported_guarantees() {
         }),
     ] {
         let expected = info.clone().map(|mut info| {
-            info.capabilities = vec!["process_output_gap_resume".into()];
+            info.capabilities
+                .retain(|capability| capability != "future_capability");
             info
         });
         let ready = spaced_ready_response(WaitReadyResponse {

@@ -66,6 +66,8 @@ impl SpacedHostBootType {
 /// that sets nothing gets production behavior.
 #[derive(Clone, Debug, Default)]
 pub struct SpacedHostRunConfig {
+    /// External activation of the resident VM. None disables recovery forwarding.
+    pub process_recovery_activation: Option<pplx_space_common_core::types::ProcessRecoveryToken>,
     /// spaced-host's own gRPC Unix socket.
     pub socket: Option<PathBuf>,
     /// The sandbox host-control Unix socket spaced-host calls out on.
@@ -131,7 +133,10 @@ pub enum RunSpacedHostError {
 fn resolve_service_config(
     config: SpacedHostRunConfig,
 ) -> Result<SpacedHostServiceConfig, RunSpacedHostError> {
-    let mut service_config = SpacedHostServiceConfig::default();
+    let mut service_config = SpacedHostServiceConfig {
+        process_recovery_activation: config.process_recovery_activation,
+        ..Default::default()
+    };
     if let Some(socket) = config.socket {
         service_config.socket_path = socket;
     }

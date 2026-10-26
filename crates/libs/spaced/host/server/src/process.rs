@@ -57,23 +57,35 @@ impl Process for SpacedHostService {
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<Self::StartStream>, Status> {
-        let request = bridge_process_start_request(request.into_inner())
+        let (request, recovery) = bridge_process_start_request(request.into_inner())
             .map_err(pplx_space_common_grpc::mark_guest_process_error)?;
-        let guest_stream = self
-            .call_bridge_guest_process(
+        self.require_recovery_fence(recovery)?;
+        let call = move |mut client: BridgeGuestProcessClient<tonic::transport::Channel>| {
+            let request = request.clone();
+            async move {
+                client
+                    .start(request)
+                    .await
+                    .map_err(pplx_space_common_grpc::mark_guest_process_error)
+            }
+        };
+        // Recovery callers bound retries by the discovered key-retention window.
+        // Do not hide a dispatched Start retry inside an adapter's own budget.
+        let guest_stream = if recovery.is_some() {
+            self.call_bridge_guest_process_once(
                 "bridge_guest_process_start",
                 BridgeGuestOperationBudget::ProcessStreamOpen,
-                move |mut client| {
-                    let request = request.clone();
-                    async move {
-                        client
-                            .start(request)
-                            .await
-                            .map_err(pplx_space_common_grpc::mark_guest_process_error)
-                    }
-                },
+                call,
             )
-            .await?;
+            .await?
+        } else {
+            self.call_bridge_guest_process(
+                "bridge_guest_process_start",
+                BridgeGuestOperationBudget::ProcessStreamOpen,
+                call,
+            )
+            .await?
+        };
         Ok(Response::new(relay_stream(guest_stream, map_process_event)))
     }
 
@@ -81,8 +93,9 @@ impl Process for SpacedHostService {
         &self,
         request: Request<ConnectProcessRequest>,
     ) -> Result<Response<Self::ConnectProcessStream>, Status> {
-        let request = bridge_process_connect_request(request.into_inner())
+        let (request, recovery) = bridge_process_connect_request(request.into_inner())
             .map_err(pplx_space_common_grpc::mark_guest_process_error)?;
+        self.require_recovery_fence(recovery.map(|handle| handle.fence))?;
         let resume_after_output_gap = request.resume_after_output_gap == Some(true);
         let output_cursor = request.output_cursor;
         let guest_stream = self
@@ -157,7 +170,8 @@ impl Process for SpacedHostService {
         &self,
         request: Request<SendSignalRequest>,
     ) -> Result<Response<SendSignalResponse>, Status> {
-        let request = bridge_process_send_signal_request(request.into_inner())?;
+        let (request, recovery) = bridge_process_send_signal_request(request.into_inner())?;
+        self.require_recovery_fence(recovery.map(|handle| handle.fence))?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_send_signal",
             BridgeGuestOperationBudget::ProcessControl,
@@ -177,7 +191,8 @@ impl Process for SpacedHostService {
         // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: remove only this gate call.
         self.require_interactive_process_control_support("SendInput")
             .await?;
-        let request = bridge_process_send_input_request(request.into_inner())?;
+        let (request, recovery) = bridge_process_send_input_request(request.into_inner())?;
+        self.require_recovery_fence(recovery.map(|handle| handle.fence))?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_send_input",
             BridgeGuestOperationBudget::ProcessControl,
@@ -197,7 +212,8 @@ impl Process for SpacedHostService {
         // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: remove only this gate call.
         self.require_interactive_process_control_support("CloseStdin")
             .await?;
-        let request = bridge_process_close_stdin_request(request.into_inner())?;
+        let (request, recovery) = bridge_process_close_stdin_request(request.into_inner())?;
+        self.require_recovery_fence(recovery.map(|handle| handle.fence))?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_close_stdin",
             BridgeGuestOperationBudget::ProcessControl,
@@ -217,7 +233,8 @@ impl Process for SpacedHostService {
         // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: remove only this gate call.
         self.require_interactive_process_control_support("ResizePty")
             .await?;
-        let request = bridge_process_resize_pty_request(request.into_inner())?;
+        let (request, recovery) = bridge_process_resize_pty_request(request.into_inner())?;
+        self.require_recovery_fence(recovery.map(|handle| handle.fence))?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_resize_pty",
             BridgeGuestOperationBudget::ProcessControl,

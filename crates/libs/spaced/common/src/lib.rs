@@ -58,6 +58,7 @@ mod error;
 pub use pplx_space_spaced_guest_protocol::filesystem_limits;
 pub mod lazy_client;
 pub use pplx_space_spaced_guest_protocol::process_limits;
+pub use pplx_space_spaced_guest_protocol::recovery;
 pub mod retry_policy;
 pub mod server;
 pub mod uds;

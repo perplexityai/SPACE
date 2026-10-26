@@ -9,6 +9,9 @@ pub(super) async fn connect_process_stream(
     client: &pplx_space_spaced_host_client::SpacedHostClient,
     operation: &pplx_space_sbx_mgr_client::operations::ConnectProcessRequest,
 ) -> Result<tonic::Streaming<host_proto::ProcessEvent>, Status> {
+    if operation.recovery.is_some() {
+        return client.recovery_connect_process(operation.clone()).await;
+    }
     client
         .connect_process_stream_with_cursor(
             operation.process_id.clone(),
@@ -730,10 +733,7 @@ pub(super) fn process_event_to_spaced(
         .event
         .ok_or_else(|| Status::internal("spaced host returned process event without payload"))?;
     let event_payload = match host_event {
-        HostEvent::Started(started) => SpacedEvent::Started(SpacedProcessStarted {
-            start_time: started.start_time,
-            ..Default::default()
-        }),
+        HostEvent::Started(started) => SpacedEvent::Started(started),
         HostEvent::Connected(connected) => SpacedEvent::Connected(SpacedProcessConnected {
             output_cursor: connected.output_cursor,
             resume_after_output_gap: connected.resume_after_output_gap,

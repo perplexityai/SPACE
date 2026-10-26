@@ -18,3 +18,6 @@ mod filesystem;
 mod meta;
 #[path = "it/process.rs"]
 mod process;
+
+#[path = "it/recovery.rs"]
+mod recovery;

@@ -48,7 +48,7 @@ impl Meta for SpacedHostService {
             process_execution: status
                 .as_ref()
                 .and_then(|status| status.process_execution.clone())
-                .map(crate::recovery::supported_execution_info),
+                .map(|info| self.supported_execution_info(info)),
             guest_uptime: status.as_ref().and_then(|status| status.guest_uptime),
             host_version: Some(proto::VersionInfo {
                 version: pplx_space_spaced_common::spaced_version().to_string(),
@@ -72,7 +72,7 @@ impl Meta for SpacedHostService {
             process_recovery_barrier_id: self.recovery_barrier(&response),
             process_execution: response
                 .process_execution
-                .map(crate::recovery::supported_execution_info),
+                .map(|info| self.supported_execution_info(info)),
             guest_uptime: response.guest_uptime,
             mem_total_bytes: response.mem_total_bytes,
             vcpu_count: response.vcpu_count,

@@ -185,7 +185,7 @@ async fn activation_requires_current_host_barrier_and_launch_bound_epoch() {
                 .unwrap()
                 .capabilities
                 .is_empty(),
-            "do not advertise unfinished forwarding"
+            "do not advertise recovery before activation"
         );
         if !supports_recovery {
             assert!(observation.process_recovery_barrier_id.is_none());
@@ -294,4 +294,79 @@ async fn activation_requires_current_host_barrier_and_launch_bound_epoch() {
             .unwrap()
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn recovery_start_does_not_replay_a_dispatched_request() {
+    use proto::process_server::Process;
+    use std::sync::atomic::AtomicUsize;
+
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("guest.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = calls.clone();
+    let rpc = tower::service_fn(
+        move |request: tonic::codegen::http::Request<tonic::body::Body>| {
+            assert_eq!(
+                request.uri().path(),
+                "/space.spaced.bridge.guest.v1.Process/Start"
+            );
+            received.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok::<_, std::convert::Infallible>(
+                Status::unavailable("synthetic reply lost after dispatch")
+                    .into_http::<tonic::body::Body>(),
+            ))
+        },
+    );
+    let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .serve_with_incoming(
+                rpc,
+                tokio_stream::wrappers::UnixListenerStream::new(listener),
+            )
+            .await
+            .unwrap();
+    }));
+    let epoch = ProcessRecoveryToken::new();
+    let host = SpacedHostService::new_with_config(
+        CancellationToken::new(),
+        SpacedHostServiceConfig {
+            process_recovery_activation: Some(epoch),
+            socket_path: directory.path().join("host.sock"),
+            bridge_host_socket_path: directory.path().join("bridge.sock"),
+            host_control_socket_path: directory.path().join("control.sock"),
+            bridge_guest_connector: BridgeGuestConnector::Uds(socket),
+            ..Default::default()
+        },
+    );
+    // Activation itself is covered above; isolate the dispatch/retry contract.
+    host.inner
+        .process_recovery
+        .as_ref()
+        .unwrap()
+        .gate
+        .lock()
+        .unwrap()
+        .phase = Phase::Active;
+    let error = Process::start(
+        &host,
+        Request::new(proto::StartRequest {
+            idempotency_key: Some("once".into()),
+            recovery: Some(proto::RecoveryStart {
+                contract_version: 1,
+                expected_instance_id: ProcessRecoveryToken::new().to_string(),
+                expected_activation_id: epoch.to_string(),
+                command: vec!["/bin/true".into()],
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .err()
+    .expect("lost response");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
