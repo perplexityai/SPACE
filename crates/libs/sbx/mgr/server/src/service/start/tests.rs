@@ -24,16 +24,11 @@ async fn rootfs_rate_limiter_uses_the_assignment_and_configured_burst() {
         .rootfs_rate_limiter(false, limits)
         .expect("sandbox is limited");
 
-    let rendered = firecracker_rate_limiter_field("rate_limiter", Some(&limiter));
-    let field: serde_json::Value =
-        serde_json::from_str(&format!("{{{}}}", rendered.trim_start_matches(','))).unwrap();
-    assert_eq!(
-        field["rate_limiter"],
-        serde_json::json!({
-            "bandwidth": { "size": 629_145_600, "refill_time": 3000 },
-            "ops": { "size": 15_000, "refill_time": 3000 }
-        })
-    );
+    // Runtime-core boot adapters cover device serialization. This layer owns
+    // the assignment and the snapshot-load request.
+    assert_eq!(limiter.bandwidth.size, 629_145_600);
+    assert_eq!(limiter.bandwidth.refill_time_ms, 3000);
+    assert_eq!(limiter.operations.size, 15_000);
     let loaded = drive_rate_limit_proto(limiter);
     assert_eq!(
         loaded.operations,
@@ -51,7 +46,6 @@ async fn rootfs_rate_limiter_uses_the_assignment_and_configured_burst() {
     );
 
     assert_eq!(service.rootfs_rate_limiter(true, limits), None);
-    assert!(firecracker_rate_limiter_field("rate_limiter", None).is_empty());
 }
 use pplx_space_common_core::types::{
     NodeId, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId,
@@ -695,79 +689,42 @@ async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
     service.task_tracker.wait().await;
 }
 
-// A template's metadata.json balloon setting reaches the cold-boot VM config
-// as Firecracker's top-level `balloon` object; without one the config gains
-// nothing, and an invalid one fails the start instead of booting without it.
+// Template validation applies the effective memory budget before the runtime
+// adapter sees the balloon. Runtime-core owns provider configuration rendering.
 #[test]
-fn template_balloon_renders_into_the_cold_boot_vm_config() {
+fn template_balloon_is_validated_against_effective_memory() {
     use crate::service::validation::template_runtime_defaults;
-
-    let vsock = "{\n  \"vsock\": {\n    \"guest_cid\": 3,\n    \"uds_path\": \"/v.sock\"\n  }";
-    let render = |metadata: &str, memory_mib: u32| {
+    let parse = |metadata: &str, memory_mib: u32| {
         let template = tempfile::tempdir().unwrap();
         std::fs::write(template.path().join("metadata.json"), metadata).unwrap();
-        let defaults = template_runtime_defaults(template.path().to_str().unwrap());
-        defaults
+        template_runtime_defaults(template.path().to_str().unwrap())
             .balloon
             .for_memory_mib(memory_mib)
-            .map(|balloon| format!("{vsock}{}\n}}", firecracker_balloon_field(balloon)))
     };
-
     assert_eq!(
-        render(r#"{"vcpu":2,"memory_mib":8192}"#, 8192).unwrap(),
-        format!("{vsock}\n}}"),
-        "no balloon setting leaves the config byte-identical"
+        parse(r#"{"vcpu":2,"memory_mib":8192}"#, 8192).unwrap(),
+        None
     );
-    assert!(firecracker_balloon_field(None).is_empty());
-
-    let cases = [
-        (
-            r#"{"mode":"inflate","amount_mib":1024,"deflate_on_oom":true}"#,
-            serde_json::json!({
-                "amount_mib": 1024, "deflate_on_oom": true, "stats_polling_interval_s": 0,
-                "free_page_hinting": false, "free_page_reporting": false
-            }),
-        ),
-        (
-            r#"{"mode":"report","stats_polling_interval_s":1}"#,
-            serde_json::json!({
-                "amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": 1,
-                "free_page_hinting": false, "free_page_reporting": true
-            }),
-        ),
-        (
-            r#"{"mode":"hint"}"#,
-            serde_json::json!({
-                "amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": 0,
-                "free_page_hinting": true, "free_page_reporting": false
-            }),
-        ),
-    ];
-    for (balloon, expected) in cases {
-        let rendered = render(
-            &format!(r#"{{"memory_mib":8192,"balloon":{balloon}}}"#),
-            8192,
-        )
-        .unwrap();
-        let config: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(config["balloon"], expected, "{balloon}");
-        assert_eq!(config["vsock"]["guest_cid"], 3, "{balloon}");
-    }
-
     for (metadata, memory_mib) in [
         (r#"{"balloon":{"mode":"deflate"}}"#, 8192),
         (r#"{"balloon":{"mode":"hint","amount_mib":1}}"#, 8192),
         (r#"{"balloon":{"mode":"inflate","amount_mib":1024}}"#, 8192),
-        // The effective memory, not the template default, bounds inflation.
         (
             r#"{"balloon":{"mode":"inflate","amount_mib":1024,"deflate_on_oom":true}}"#,
             1024,
         ),
     ] {
-        let error = render(metadata, memory_mib).unwrap_err();
+        let error = parse(metadata, memory_mib).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{metadata}");
         assert!(error.message().contains("balloon"), "{metadata}: {error}");
     }
+    let balloon = parse(
+        r#"{"balloon":{"mode":"inflate","amount_mib":1024,"deflate_on_oom":true}}"#,
+        8192,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(balloon.amount_mib(), 1024);
 }
 
 // Each refusal happens before Start persists anything or contacts
