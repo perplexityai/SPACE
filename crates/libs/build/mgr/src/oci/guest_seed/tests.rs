@@ -97,7 +97,7 @@ fn os_release_precedence_and_missing_identity() {
 
 #[cfg(unix)]
 #[test]
-fn reads_relative_image_symlinks_but_rejects_host_paths_and_nonfiles() {
+fn resolves_image_symlinks_without_reading_host_paths() {
     use std::os::unix::fs::symlink;
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -108,13 +108,34 @@ fn reads_relative_image_symlinks_but_rejects_host_paths_and_nonfiles() {
     fs::write(outside.path().join("os-release"), contents).unwrap();
     let link = root.path().join("etc/os-release");
     let base = "seed".parse().unwrap();
-    symlink("../usr/lib/os-release", &link).unwrap();
+    for target in [
+        "../usr/lib/os-release",
+        "/usr/lib/os-release",
+        "../../usr/lib/os-release",
+    ] {
+        symlink(target, &link).unwrap();
+        assert_eq!(
+            configured().select(root.path(), &base).unwrap().to_string(),
+            "seed-noble:validated",
+            "{target}"
+        );
+        fs::remove_file(&link).unwrap();
+    }
+    // Directory symlinks also resolve relative to the image root.
+    fs::remove_dir(root.path().join("etc")).unwrap();
+    symlink("/usr/lib", root.path().join("etc")).unwrap();
     assert_eq!(
         configured().select(root.path(), &base).unwrap().to_string(),
         "seed-noble:validated"
     );
-    fs::remove_file(&link).unwrap();
+    fs::remove_file(root.path().join("etc")).unwrap();
+    fs::create_dir(root.path().join("etc")).unwrap();
+    fs::remove_file(root.path().join("usr/lib/os-release")).unwrap();
+    // A host file at the same absolute path cannot supply the image identity.
     symlink(outside.path().join("os-release"), &link).unwrap();
+    assert_eq!(configured().select(root.path(), &base).unwrap(), base);
+    fs::remove_file(&link).unwrap();
+    symlink("os-release", &link).unwrap();
     assert!(matches!(
         configured().select(root.path(), &base),
         Err(GuestSeedError::InvalidFile)

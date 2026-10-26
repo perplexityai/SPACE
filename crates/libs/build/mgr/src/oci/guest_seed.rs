@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use pplx_space_common_core::types::TemplateReference;
 
@@ -109,12 +109,14 @@ fn read_os_release(root: &Path) -> Result<Option<String>, GuestSeedError> {
     // The containerd view is read-only throughout inspection and assembly.
     let root = root.canonicalize()?;
     for relative in ["etc/os-release", "usr/lib/os-release"] {
-        let path = match root.join(relative).canonicalize() {
+        let path = match resolve_image_path(&root, Path::new(relative)) {
             Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+            Err(GuestSeedError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => return Err(error),
         };
-        if !path.starts_with(&root) || !path.metadata()?.is_file() {
+        if !path.metadata()?.is_file() {
             return Err(GuestSeedError::InvalidFile);
         }
         let mut contents = String::new();
@@ -127,6 +129,45 @@ fn read_os_release(root: &Path) -> Result<Option<String>, GuestSeedError> {
         return Ok(Some(contents));
     }
     Ok(None)
+}
+
+// Resolve every component in the immutable image view. Host canonicalization
+// treats absolute image symlinks as host paths, unlike the guest's filesystem.
+fn resolve_image_path(root: &Path, path: &Path) -> Result<PathBuf, GuestSeedError> {
+    let mut resolved = root.to_path_buf();
+    let mut pending = path.to_path_buf();
+    let mut links = 0;
+    loop {
+        let mut components = pending.components();
+        let Some(component) = components.next() else {
+            return Ok(resolved);
+        };
+        let remainder = components.as_path().to_path_buf();
+        match component {
+            Component::RootDir => resolved = root.to_path_buf(),
+            Component::ParentDir => {
+                if resolved != root {
+                    resolved.pop();
+                }
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                resolved.push(name);
+                if fs::symlink_metadata(&resolved)?.file_type().is_symlink() {
+                    links += 1;
+                    if links > 40 {
+                        return Err(GuestSeedError::InvalidFile);
+                    }
+                    let target = fs::read_link(&resolved)?;
+                    resolved.pop();
+                    pending = target.join(remainder);
+                    continue;
+                }
+            }
+            Component::Prefix(_) => return Err(GuestSeedError::InvalidFile),
+        }
+        pending = remainder;
+    }
 }
 
 #[cfg(test)]
