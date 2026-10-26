@@ -20,6 +20,7 @@ pub mod launch_admission;
 pub mod runtime_inventory;
 pub mod selection;
 pub mod verity;
+pub mod vfio;
 
 pub mod snapshot_files;
 

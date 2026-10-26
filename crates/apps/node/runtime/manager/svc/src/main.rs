@@ -5,14 +5,14 @@ use anyhow::Context as _;
 use clap::Parser;
 use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::{RuntimeKind, StorageUri};
-use pplx_space_common_svc::types::{UnixSocketPath, UnixSocketPathParseError};
+use pplx_space_common_svc::types::UnixSocketPath;
 use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{ScanLimits, ScanRoots};
 use pplx_space_node_runtime_manager::{
     DEFAULT_INSTALL_LIMITS, DEFAULT_LIST_ADMISSION_TIMEOUT, DEFAULT_SCAN_LIMITS,
     FIRECRACKER_CI_KERNEL_SOURCE, FIRECRACKER_RELEASE_SOURCE, InstallLimits, KernelSourceConfig,
-    ReleaseSourceConfig, ReleaseUrl, RuntimeManagerInstallConfig, RuntimeManagerReleaseConfig,
-    RuntimeManagerRunConfig, SERVICE_NAME,
+    LocalArtifactFeed, ReleaseSourceConfig, ReleaseUrl, RuntimeManagerInstallConfig,
+    RuntimeManagerReleaseConfig, RuntimeManagerRunConfig, SERVICE_NAME,
 };
 
 #[derive(Parser)]
@@ -97,6 +97,16 @@ struct Cli {
     #[arg(long, default_value = paths::RUNTIME_MANAGER_STAGING_DIR)]
     staging_dir: PathBuf,
 
+    /// Offline initramfs/firmware source. Each pinned identity is stored in
+    /// `<kind>-<version>--<digest-prefix>/image`. Never written by runtime-manager.
+    #[arg(long)]
+    boot_artifacts_source: Option<PathBuf>,
+
+    /// Replace a runtime's network release/kernel source with a read-only feed.
+    /// Format: <runtime>=<absolute-directory>. Repeat for distinct runtimes.
+    #[arg(long)]
+    artifact_source: Vec<LocalArtifactFeed>,
+
     /// Root-owned catalog files adding release and kernel pins to the
     /// compiled ones.
     #[arg(long, default_value = paths::RUNTIME_MANAGER_CATALOG_DIR)]
@@ -162,12 +172,23 @@ fn parse_release_root(value: &str) -> Result<ReleaseRoot, String> {
 }
 
 impl TryFrom<Cli> for RuntimeManagerRunConfig {
-    type Error = UnixSocketPathParseError;
+    type Error = anyhow::Error;
 
     fn try_from(cli: Cli) -> Result<Self, Self::Error> {
+        let mut feeds = std::collections::HashMap::new();
+        for feed in cli.artifact_source {
+            let runtime = feed.runtime();
+            anyhow::ensure!(
+                feeds.insert(runtime, feed).is_none(),
+                "duplicate artifact source for {runtime}"
+            );
+        }
+        let fc_feed = feeds.remove(&RuntimeKind::Firecracker);
+        let ch_feed = feeds.remove(&RuntimeKind::CloudHypervisor);
         let install = (!cli.list_only).then(|| RuntimeManagerInstallConfig {
             kernels_root: cli.node_kernels_dir.clone(),
             staging_dir: cli.staging_dir,
+            boot_artifacts_source: cli.boot_artifacts_source,
             limits: InstallLimits {
                 max_bytes: cli.max_install_bytes,
                 download_idle_timeout: Duration::from_secs(cli.download_idle_timeout_secs),
@@ -197,19 +218,29 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
             },
             list_admission_timeout: Duration::from_secs(cli.list_admission_timeout_secs),
             kernel_sources: vec![
-                KernelSourceConfig::S3(cli.kernel_source),
-                KernelSourceConfig::CloudHypervisor,
+                fc_feed
+                    .clone()
+                    .map(KernelSourceConfig::Directory)
+                    .unwrap_or(KernelSourceConfig::S3(cli.kernel_source)),
+                ch_feed
+                    .clone()
+                    .map(KernelSourceConfig::Directory)
+                    .unwrap_or(KernelSourceConfig::CloudHypervisor),
             ],
             catalog_dir: cli.catalog_dir,
             releases: vec![
                 RuntimeManagerReleaseConfig {
                     root: cli.node_releases_dir,
-                    source: ReleaseSourceConfig::GitHub(cli.release_source),
+                    source: fc_feed
+                        .map(ReleaseSourceConfig::Directory)
+                        .unwrap_or(ReleaseSourceConfig::GitHub(cli.release_source)),
                 },
                 RuntimeManagerReleaseConfig {
                     root: paths::NODE_CLOUD_HYPERVISOR_DIR.into(),
-                    source: ReleaseSourceConfig::CloudHypervisorGitHub(
-                        cli.cloud_hypervisor_release_source,
+                    source: ch_feed.map(ReleaseSourceConfig::Directory).unwrap_or(
+                        ReleaseSourceConfig::CloudHypervisorGitHub(
+                            cli.cloud_hypervisor_release_source,
+                        ),
                     ),
                 },
             ],
@@ -230,3 +261,6 @@ fn main() -> anyhow::Result<()> {
             Ok(result?)
         })
 }
+
+#[cfg(test)]
+mod tests;

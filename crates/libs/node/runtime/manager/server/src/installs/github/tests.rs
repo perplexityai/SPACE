@@ -24,10 +24,10 @@ fn archives_are_addressed_as_firecracker_publishes_them() {
     assert_eq!(source.runtime(), RuntimeKind::Firecracker);
     let archive = source.archive(&release("1.15.1"), Arch::X86_64);
     assert_eq!(
-        archive.as_str(),
+        archive.to_string(),
         "https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.1/firecracker-v1.15.1-x86_64.tgz"
     );
-    assert!(source.holds(&archive));
+    assert!(source.holds(&archive.to_string().parse().unwrap()));
     let ReleasePayload::TarGz { members } = source.payload(&release("1.15.1"), Arch::X86_64) else {
         panic!("Firecracker uses tar.gz")
     };
@@ -91,7 +91,7 @@ fn cloud_hypervisor_uses_the_upstream_static_asset_without_a_jailer_or_archive()
     ] {
         let location = source.archive(&release, architecture);
         assert_eq!(
-            location.as_str(),
+            location.to_string(),
             format!(
                 "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/{asset}"
             )
@@ -100,7 +100,7 @@ fn cloud_hypervisor_uses_the_upstream_static_asset_without_a_jailer_or_archive()
             source.payload(&release, architecture),
             ReleasePayload::Executable
         );
-        assert!(source.holds(&location));
+        assert!(source.holds(&location.to_string().parse().unwrap()));
     }
     let foreign = FIRECRACKER_RELEASE_SOURCE
         .parse::<ReleaseUrl>()
