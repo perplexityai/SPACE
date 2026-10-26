@@ -1077,7 +1077,7 @@ async fn claim_created_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: OperationId,
 ) -> Result<(String, ClaimedPublicOperation), PublicOperationStoreError> {
-    let claim_token = new_claim_token();
+    let claim_token = new_admission_claim_token();
     let row = sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
         "UPDATE public_operations
          SET state = $3,
@@ -1313,7 +1313,9 @@ pub struct ClaimLimits {
     pub teardown_while_other_due: u32,
     /// The most operations other than teardowns that one organization may
     /// have running under a live claim, counting those it already has,
-    /// across every claimer. `None` sets no such limit.
+    /// across every dispatcher. One claimed as it was created, which the
+    /// process that created it runs, is not counted. `None` sets no such
+    /// limit.
     pub per_org_non_teardown: Option<OrgSlotLimit>,
 }
 
@@ -1689,6 +1691,15 @@ fn new_claim_token() -> String {
     format!("public-operation-{}", Uuid::now_v7())
 }
 
+/// How the claim token of an operation claimed as it is created begins. The
+/// process that created it runs it, in no dispatcher slot, so the
+/// per-organization slot limit does not count it.
+const ADMISSION_CLAIM_TOKEN_PREFIX: &str = "public-operation-admission-";
+
+fn new_admission_claim_token() -> String {
+    format!("{ADMISSION_CLAIM_TOKEN_PREFIX}{}", Uuid::now_v7())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimMode {
     Keyed,
@@ -1772,6 +1783,8 @@ async fn claim_operations(
     // teardowns running under a live claim while another organization has
     // such work due, or more than `$16` while none has: `org_slots` counts
     // the ones it holds and, in claim order, the ones this claim would add.
+    // It holds no slot for one claimed as it was created (`$18`), which the
+    // process that created it runs.
     // While none has, an organization past `$15` also leaves `$17` of the
     // claim's `$12` untaken, so that many free slots stay free.
     // That rank needs a window, which cannot share a level with `FOR
@@ -1843,6 +1856,7 @@ async fn claim_operations(
              WHERE $15::BIGINT > 0
                AND state = $5
                AND claim_token <> ''
+               AND NOT starts_with(claim_token, $18)
                AND claimed_at > NOW() - make_interval(secs => $2::BIGINT)
                AND kind = ANY($6)
                AND kind <> ALL($14)
@@ -2009,6 +2023,7 @@ async fn claim_operations(
             .per_org_non_teardown
             .map_or(0, |limit| i64::from(limit.headroom)),
     )
+    .bind(ADMISSION_CLAIM_TOKEN_PREFIX)
     .fetch_all(&mut *tx)
     .await?;
 
