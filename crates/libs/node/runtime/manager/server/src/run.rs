@@ -61,6 +61,8 @@ pub enum KernelSourceConfig {
     S3(StorageUri),
     /// A source the deployment supplies.
     Custom(Arc<dyn KernelSource>),
+    /// Read-only operator feed; catalog pins still authenticate its bytes.
+    Directory(crate::LocalArtifactFeed),
     #[cfg(feature = "github")]
     CloudHypervisor,
 }
@@ -72,6 +74,7 @@ impl std::fmt::Debug for KernelSourceConfig {
             Self::S3(root) => formatter.debug_tuple("S3").field(root).finish(),
             #[cfg(feature = "github")]
             Self::CloudHypervisor => formatter.write_str("CloudHypervisor"),
+            Self::Directory(feed) => formatter.debug_tuple("Directory").field(feed).finish(),
             Self::Custom(source) => formatter
                 .debug_tuple("Custom")
                 .field(&source.root())
@@ -81,11 +84,17 @@ impl std::fmt::Debug for KernelSourceConfig {
 }
 
 impl KernelSourceConfig {
-    fn into_source(self) -> Result<Arc<dyn KernelSource>, RunRuntimeManagerError> {
+    fn into_source(
+        self,
+        pins: Arc<dyn crate::installs::PinSource>,
+    ) -> Result<Arc<dyn KernelSource>, RunRuntimeManagerError> {
         match self {
             #[cfg(feature = "s3")]
             Self::S3(root) => Ok(Arc::new(crate::installs::S3KernelSource::new(root))),
             Self::Custom(source) => Ok(source),
+            Self::Directory(feed) => Ok(Arc::new(
+                crate::installs::local_source::LocalArtifactSource::new(feed, pins),
+            )),
             #[cfg(feature = "github")]
             Self::CloudHypervisor => Ok(Arc::new(
                 crate::installs::https_kernel::CloudHypervisorKernels::new()
@@ -107,6 +116,8 @@ pub enum ReleaseSourceConfig {
     CloudHypervisorGitHub(crate::ReleaseUrl),
     /// A source the deployment supplies.
     Custom(Arc<dyn ReleaseSource>),
+    /// Read-only operator feed; catalog pins still authenticate its bytes.
+    Directory(crate::LocalArtifactFeed),
 }
 
 impl std::fmt::Debug for ReleaseSourceConfig {
@@ -119,6 +130,7 @@ impl std::fmt::Debug for ReleaseSourceConfig {
                 .debug_tuple("CloudHypervisorGitHub")
                 .field(base)
                 .finish(),
+            Self::Directory(feed) => formatter.debug_tuple("Directory").field(feed).finish(),
             Self::Custom(source) => formatter
                 .debug_tuple("Custom")
                 .field(&source.root())
@@ -128,7 +140,10 @@ impl std::fmt::Debug for ReleaseSourceConfig {
 }
 
 impl ReleaseSourceConfig {
-    fn into_source(self) -> Result<Arc<dyn ReleaseSource>, RunRuntimeManagerError> {
+    fn into_source(
+        self,
+        pins: Arc<dyn crate::installs::PinSource>,
+    ) -> Result<Arc<dyn ReleaseSource>, RunRuntimeManagerError> {
         match self {
             #[cfg(feature = "github")]
             Self::GitHub(base) => Ok(Arc::new(
@@ -147,6 +162,9 @@ impl ReleaseSourceConfig {
                 .map_err(RunRuntimeManagerError::ReleaseSource)?,
             )),
             Self::Custom(source) => Ok(source),
+            Self::Directory(feed) => Ok(Arc::new(
+                crate::installs::local_source::LocalArtifactSource::new(feed, pins),
+            )),
         }
     }
 }
@@ -173,6 +191,10 @@ pub struct RuntimeManagerInstallConfig {
     /// The runtime manager's private staging, which node-manager publishes
     /// from. Provisioning creates it.
     pub staging_dir: PathBuf,
+    /// Optional offline source of auxiliary boot files, laid out as
+    /// `<kind>-<version>--<digest-prefix>/image`. Bytes are independently pinned;
+    /// source contents never grant execution approval.
+    pub boot_artifacts_source: Option<PathBuf>,
     pub limits: InstallLimits,
 }
 
@@ -214,8 +236,8 @@ pub enum RunRuntimeManagerError {
     Serve(#[source] tonic::transport::Error),
     #[error("failed to enable kernel installs: {0}")]
     Installer(#[source] OpenInstallerError),
-    #[error("kernel installs need a kernel source")]
-    NoKernelSource,
+    #[error("artifact installs need a configured source")]
+    NoArtifactSource,
     #[error(
         "the runtime-manager state directory {} is not protected ({protection}); installs need it private",
         path.display()
@@ -243,18 +265,18 @@ pub async fn run(
         source,
     })?;
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    let pins = Arc::new(DirectoryCatalog(config.catalog_dir));
     let mut kernel_source = crate::installs::source::KernelSources::default();
     for source in config.kernel_sources {
-        kernel_source.insert(source.into_source()?)?;
+        kernel_source.insert(source.into_source(pins.clone())?)?;
     }
     let mut roots = config.roots;
-    let pins = Arc::new(DirectoryCatalog(config.catalog_dir));
     let release_contexts = config
         .releases
         .into_iter()
         .map(|release| {
             Ok(ReleaseContext {
-                source: release.source.into_source()?,
+                source: release.source.into_source(pins.clone())?,
                 root: release.root,
             })
         })
@@ -268,8 +290,11 @@ pub async fn run(
         .collect();
     let installer = match config.install {
         Some(install) => {
-            if kernel_source.is_empty() {
-                return Err(RunRuntimeManagerError::NoKernelSource);
+            if kernel_source.is_empty()
+                && releases.is_empty()
+                && install.boot_artifacts_source.is_none()
+            {
+                return Err(RunRuntimeManagerError::NoArtifactSource);
             }
             let source = kernel_source.clone();
             let audited = config.state_dir.clone();
@@ -336,6 +361,7 @@ pub async fn run(
                 let installer = Installer::open(
                     ExecutorParts {
                         kernels_root: install.kernels_root,
+                        boot_source: install.boot_artifacts_source,
                         staging: install.staging_dir,
                         limits: install.limits,
                         host_arch,
