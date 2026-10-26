@@ -11,8 +11,12 @@ import public "spaced/bridge/guest/v1/legacy.proto";
 service Meta {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
+  // Enable recovery only against the current snapshot-preparation barrier.
+  rpc ActivateProcessRecovery(ActivateProcessRecoveryRequest) returns (ActivateProcessRecoveryResponse);
   rpc ConfigureProcessEnv(ConfigureProcessEnvRequest) returns (ConfigureProcessEnvResponse);
   rpc NotifyResume(NotifyResumeRequest) returns (NotifyResumeResponse);
+  // Invalidates recovery activation barriers and waits for admitted recovery
+  // effects before flushing. Callers must not reactivate during snapshot capture.
   rpc FlushFilesystems(FlushFilesystemsRequest) returns (FlushFilesystemsResponse);
 }
 
@@ -93,6 +97,19 @@ message WaitReadyResponse {
   optional uint32 vcpu_count = 6;
   // Absent from older guests or while the guest is not ready.
   space.spaced.operations.v1.ProcessExecutionInfo process_execution = 7;
+  // Opaque compare-and-set token; absent from older or unready guests.
+  optional string process_recovery_barrier_id = 8;
+}
+
+// The host supplies an activation from outside VM memory. Every actual restore
+// needs a fresh activation; resident pause/resume keeps the existing activation.
+// A delayed request with a barrier invalidated by FlushFilesystems is refused.
+message ActivateProcessRecoveryRequest {
+  string expected_barrier_id = 1;
+  string activation_id = 2;
+}
+message ActivateProcessRecoveryResponse {
+  space.spaced.operations.v1.ProcessExecutionInfo process_execution = 1;
 }
 
 message ConfigureProcessEnvRequest {

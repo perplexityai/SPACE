@@ -47,7 +47,8 @@ impl Meta for SpacedHostService {
             ready: status.is_some(),
             process_execution: status
                 .as_ref()
-                .and_then(|status| status.process_execution.clone()),
+                .and_then(|status| status.process_execution.clone())
+                .map(crate::recovery::supported_execution_info),
             guest_uptime: status.as_ref().and_then(|status| status.guest_uptime),
             host_version: Some(proto::VersionInfo {
                 version: pplx_space_spaced_common::spaced_version().to_string(),
@@ -68,7 +69,10 @@ impl Meta for SpacedHostService {
         let timeout = validate_timeout(request.into_inner().timeout)?;
         let response = self.wait_guest_ready(timeout, context).await?;
         Ok(Response::new(WaitReadyResponse {
-            process_execution: response.process_execution,
+            process_recovery_barrier_id: self.recovery_barrier(&response),
+            process_execution: response
+                .process_execution
+                .map(crate::recovery::supported_execution_info),
             guest_uptime: response.guest_uptime,
             mem_total_bytes: response.mem_total_bytes,
             vcpu_count: response.vcpu_count,
@@ -77,6 +81,15 @@ impl Meta for SpacedHostService {
                 compatibility_family: response.compatibility_family,
             }),
         }))
+    }
+
+    async fn resume_process_recovery(
+        &self,
+        request: Request<proto::ResumeProcessRecoveryRequest>,
+    ) -> Result<Response<proto::ResumeProcessRecoveryResponse>, Status> {
+        let context = RetryContext::none().with_grpc_timeout_metadata(request.metadata());
+        self.resume_recovery(request.into_inner(), context).await?;
+        Ok(Response::new(proto::ResumeProcessRecoveryResponse {}))
     }
 
     async fn configure_process_env(
@@ -151,6 +164,7 @@ impl Meta for SpacedHostService {
         &self,
         request: Request<FlushGuestFilesystemsRequest>,
     ) -> Result<Response<FlushGuestFilesystemsResponse>, Status> {
+        let _recovery = self.quiesce_recovery()?;
         let timeout = RetryContext::with_timeout(Duration::from_secs(180))
             .with_grpc_timeout_metadata(request.metadata())
             .remaining()
@@ -176,6 +190,7 @@ impl Meta for SpacedHostService {
         &self,
         request: Request<PrepareSuspendRequest>,
     ) -> Result<Response<PrepareSuspendResponse>, Status> {
+        let _recovery = self.quiesce_recovery()?;
         let timeout = RetryContext::with_timeout(Duration::from_secs(180))
             .with_grpc_timeout_metadata(request.metadata())
             .remaining()

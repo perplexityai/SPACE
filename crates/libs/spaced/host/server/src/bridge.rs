@@ -529,16 +529,16 @@ impl SpacedHostService {
         )
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let guest_uptime = validate_optional_duration("guest_uptime", response.guest_uptime)?;
-        let process_execution = response.process_execution.map(|mut info| {
-            // A newer guest can advertise guarantees this host cannot forward.
-            info.capabilities.retain(|capability| {
-                capability
-                    == pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume.as_str()
-            });
-            info
-        });
         Ok(Some(GuestReadySnapshot {
-            process_execution,
+            process_execution: response.process_execution,
+            process_recovery_barrier_id: response
+                .process_recovery_barrier_id
+                .as_deref()
+                .map(pplx_space_common_core::types::ProcessRecoveryToken::parse)
+                .transpose()
+                .map_err(|error| {
+                    Status::failed_precondition(format!("invalid guest recovery barrier: {error}"))
+                })?,
             guest_uptime: guest_uptime.map(duration_to_proto).transpose()?,
             version: response.version,
             compatibility_family: response.compatibility_family,
@@ -769,6 +769,9 @@ impl SpacedHostService {
         };
         Self {
             inner: Arc::new(SpacedHostServiceInner {
+                process_recovery: config
+                    .process_recovery_activation
+                    .map(crate::recovery::RecoveryLifecycle::new),
                 shutdown,
                 socket_path: config.socket_path,
                 bridge_host_socket_path: config.bridge_host_socket_path,
