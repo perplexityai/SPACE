@@ -120,7 +120,17 @@ impl RuntimeKind {
     /// Deployment-specific configuration can still narrow or extend this set.
     pub const fn baseline_capabilities(self) -> RuntimeCapabilities {
         match self {
-            Self::Firecracker | Self::CloudHypervisor => RuntimeCapabilities::full_node(),
+            Self::Firecracker => RuntimeCapabilities::full_node(),
+            // Upstream VMM features are not SPACE lifecycle capabilities.
+            // Advertise each capability only when its adapter is qualified.
+            Self::CloudHypervisor => RuntimeCapabilities {
+                pause_resume: false,
+                snapshot: false,
+                fork: false,
+                prewarmed_pool: false,
+                network_gateway: false,
+                volume_manager: false,
+            },
             Self::Gvisor => RuntimeCapabilities {
                 pause_resume: false,
                 snapshot: false,
