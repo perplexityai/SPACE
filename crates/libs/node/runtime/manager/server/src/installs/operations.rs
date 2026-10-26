@@ -362,11 +362,8 @@ impl Installer {
         let context = self.executor.context();
         let releases = context
             .releases
-            .as_ref()
+            .get(release.kind)
             .ok_or(SubmitOperationError::Disabled)?;
-        if releases.source.runtime() != release.kind {
-            return Err(SubmitOperationError::Disabled);
-        }
         let archive = releases.source.archive(&release, context.host_arch);
         let checking = self.executor.clone();
         let release = tokio::task::spawn_blocking(move || {
@@ -393,13 +390,7 @@ impl Installer {
         release: RuntimeIdentity,
         digest: Digest,
     ) -> Result<Operation, SubmitOperationError> {
-        if self
-            .executor
-            .context()
-            .releases
-            .as_ref()
-            .is_none_or(|configured| configured.source.runtime() != release.kind)
-        {
+        if self.executor.context().releases.get(release.kind).is_none() {
             return Err(SubmitOperationError::Disabled);
         }
         self.enqueue(InstallOperation::UninstallRelease { release, digest })
@@ -424,12 +415,8 @@ impl Installer {
         self.executor.context().pins.catalog()
     }
 
-    pub(crate) fn releases_root(&self) -> Option<&Path> {
-        self.executor
-            .context()
-            .releases
-            .as_ref()
-            .map(|releases| releases.root.as_path())
+    pub(crate) fn releases_enabled(&self) -> bool {
+        !self.executor.context().releases.is_empty()
     }
     fn submit(&self, operation: &InstallOperation) -> Result<JobId, Box<tonic::Status>> {
         self.worker

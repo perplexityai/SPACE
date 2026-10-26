@@ -180,7 +180,7 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
                     .collect(),
                 vendor_kernels: cli.vendor_kernels_dir,
                 managed_kernels: Some(cli.node_kernels_dir),
-                managed_releases: None,
+                managed_releases: Vec::new(),
                 cache_kernels: cli.cache_kernels_dir,
                 cache_legacy_assets: cli.cache_legacy_assets_dir,
                 runtime_aliases: cli.runtime_aliases,
@@ -194,10 +194,10 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
             list_admission_timeout: Duration::from_secs(cli.list_admission_timeout_secs),
             kernel_source: Some(KernelSourceConfig::S3(cli.kernel_source)),
             catalog_dir: cli.catalog_dir,
-            releases: Some(RuntimeManagerReleaseConfig {
+            releases: vec![RuntimeManagerReleaseConfig {
                 root: cli.node_releases_dir,
                 source: ReleaseSourceConfig::GitHub(cli.release_source),
-            }),
+            }],
             install,
         })
     }
