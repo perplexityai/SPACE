@@ -169,9 +169,11 @@ impl InstallExecutor {
             });
         }
         let probed = image.clone();
-        let boots =
-            tokio::task::spawn_blocking(move || staging::is_boot_image(&probed, architecture))
-                .await??;
+        let runtime = pin.runtime;
+        let boots = tokio::task::spawn_blocking(move || {
+            staging::is_boot_image(&probed, architecture, runtime)
+        })
+        .await??;
         if boots {
             Ok(sha256)
         } else {
