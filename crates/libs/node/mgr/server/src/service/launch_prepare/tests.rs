@@ -958,6 +958,7 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
                 &lease.sandbox_id,
                 proto::LaunchFirecrackerRequest {
                     execution_id: fence.execution_id,
+                    jailer_bin: "/runtime/bin/jailer".into(),
                     verified_runtime: Some(proto::VerifiedRuntimeLaunch {
                         sandbox_id: lease.sandbox_id.clone(),
                         environment_reference: reference.to_string(),

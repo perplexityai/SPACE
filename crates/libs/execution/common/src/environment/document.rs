@@ -33,9 +33,14 @@ pub enum EnvironmentDocumentError {
 impl EnvironmentDefinition {
     pub fn to_document(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&Document {
-            schema_version: self.schema_version(),
+            schema_version: self.identity_schema_version(),
             reference: self.reference,
-            descriptor: self.descriptor.spec().clone(),
+            descriptor: self
+                .legacy_descriptor
+                .as_ref()
+                .unwrap_or(&self.descriptor)
+                .spec()
+                .clone(),
         })
     }
 
@@ -59,6 +64,7 @@ impl EnvironmentDefinition {
             .map_err(EnvironmentDecodeError::from)?;
         Ok(Self::new(descriptor)
             .check_schema(document.schema_version)?
-            .check_reference(document.reference)?)
+            .check_reference(document.reference)?
+            .into_runtime_neutral()?)
     }
 }

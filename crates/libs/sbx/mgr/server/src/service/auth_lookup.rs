@@ -845,7 +845,7 @@ impl SandboxManagerService {
             .await
         {
             let reason = format!("resume failed: {e}");
-            let observation = observe_firecracker_vm_state(
+            let observation = observe_vm_state(
                 &sandbox_id_typed,
                 "resident resume response reconciliation",
                 &self.node_manager,
@@ -902,9 +902,9 @@ impl SandboxManagerService {
                     })
                     .await
                 {
-                    Ok(_) => (Some(FirecrackerVmState::Paused), status),
+                    Ok(_) => (Some(VmState::Paused), status),
                     Err(pause_error) => {
-                        let observation = observe_firecracker_vm_state(
+                        let observation = observe_vm_state(
                             &sandbox_id_typed,
                             "resident resume guest setup rollback",
                             &self.node_manager,
@@ -1279,7 +1279,7 @@ pub(super) fn finish_resident_resume_after_guest_setup(
     db: &crate::db::SharedConnection,
     sandbox_id: &str,
     setup_result: Result<(), Status>,
-    rollback_vm_state: Option<FirecrackerVmState>,
+    rollback_vm_state: Option<VmState>,
 ) -> Result<(), Status> {
     if let Err(status) = setup_result {
         let failure_status = if status.code() == tonic::Code::FailedPrecondition {
@@ -1287,7 +1287,7 @@ pub(super) fn finish_resident_resume_after_guest_setup(
         } else {
             Status::unavailable(status.message().to_string())
         };
-        if rollback_vm_state == Some(FirecrackerVmState::Paused) {
+        if rollback_vm_state == Some(VmState::Paused) {
             let restored = match db.lock() {
                 Ok(db) => {
                     crate::db::restore_resident_resume_state(&db, sandbox_id, SandboxState::Paused)
@@ -1337,10 +1337,10 @@ pub(super) fn finish_resident_resume_after_rpc_error(
     db: &crate::db::SharedConnection,
     sandbox_id: &str,
     status: Status,
-    vm_state: Option<FirecrackerVmState>,
+    vm_state: Option<VmState>,
 ) -> Result<(), Status> {
     match vm_state {
-        Some(FirecrackerVmState::Running) => {
+        Some(VmState::Running) => {
             tracing::warn!(
                 sandbox_id,
                 error = %status,
@@ -1348,7 +1348,7 @@ pub(super) fn finish_resident_resume_after_rpc_error(
             );
             Ok(())
         }
-        Some(FirecrackerVmState::Paused) => {
+        Some(VmState::Paused) => {
             let restored = match db.lock() {
                 Ok(db) => {
                     crate::db::restore_resident_resume_state(&db, sandbox_id, SandboxState::Paused)

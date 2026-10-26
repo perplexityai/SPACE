@@ -685,14 +685,12 @@ impl SandboxManagerService {
             let fc_create_started_at = std::time::Instant::now();
             self.ensure_teardown_suspend_owner_for_durability(&sandbox.id, durability)?;
             if let Err(e) = node_client
-                .create_snapshot(crate::service::snapshot_capture::bind(CreateSnapshotRequest {
+                .capture_runtime_state(pplx_space_execution_common::proto::RuntimeKind::Firecracker, crate::service::snapshot_capture::bind(CaptureVmStateRequest {
                     execution_fence: sandbox.node_execution_fence(),
                     sandbox_id: sandbox.id.clone(),
-                    snapshot_path: "/vmstate".to_string(),
-                    mem_file_path: "/memory".to_string(),
-                    dest_dir: Some(staging_dir_string.clone()),
-                    snapshot_volume_mount_dir: enc_snapshot_mount_dir,
-                    environment: None,
+                    artifacts: crate::service::snapshot_capture::artifacts(),
+                    storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage { directory: Some(staging_dir_string.clone()), encrypted_volume_mount: enc_snapshot_mount_dir }),
+                    environment_reference: None,
                 }, sandbox.execution_metadata.as_ref()))
                 .await
             {

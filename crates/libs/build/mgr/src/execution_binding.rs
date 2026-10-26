@@ -1,5 +1,6 @@
 //! Builder-side use of node-manager's verified environment, separate from guest
 //! process environment variables and from downloadable artifact catalog entries.
+use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION as DEFINITION_SCHEMA;
 use std::path::Path;
 
 use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata, TemplateMetadata};
@@ -138,6 +139,7 @@ impl BuildExecutionBinding {
             let mut node = pplx_space_node_mgr_client::connect().await?;
             let response = node
                 .resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                    definition_schema_version: DEFINITION_SCHEMA,
                     reference: None,
                     compatible: Some(request.clone()),
                 })
@@ -153,6 +155,7 @@ impl BuildExecutionBinding {
                     // never an unacknowledged upgrade.
                     let response = node
                         .resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                            definition_schema_version: DEFINITION_SCHEMA,
                             reference: Some(fallback_reference.to_string()),
                             compatible: None,
                         })
@@ -174,6 +177,7 @@ impl BuildExecutionBinding {
             let mut node = pplx_space_node_mgr_client::connect().await?;
             Ok::<_, BuildExecutionBindingError>(
                 node.resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                    definition_schema_version: DEFINITION_SCHEMA,
                     compatible: None,
                     reference: reference.map(|value| value.to_string()),
                 })
@@ -230,18 +234,39 @@ impl BuildExecutionBinding {
         pin: Option<&super::GuestKernelPin>,
     ) -> Result<(), BuildExecutionBindingError> {
         use pplx_space_common_core::types::{BootProfile, ExecutionCompatibilityProfile};
-        let BootProfile::LinuxDirectV1 { kernel } = &self.definition.descriptor().spec().boot
+        use pplx_space_execution_common::environment::{
+            FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT,
+        };
+        let spec = self.definition.descriptor().spec();
+        let BootProfile::ArtifactsV1 {
+            contract,
+            artifacts,
+        } = &spec.boot
         else {
             return Err(BuildExecutionBindingError::ScratchProfile);
         };
+        let [boot] = artifacts.as_slice() else {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        };
+        let ExecutionCompatibilityProfile::RuntimeV1 {
+            contract: machine,
+            state_format: Some(state_format),
+        } = &spec.compatibility
+        else {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        };
+        if contract.as_str() != FIRECRACKER_BOOT_CONTRACT
+            || machine.as_str() != FIRECRACKER_MACHINE_CONTRACT
+            || boot.role().as_str() != "boot"
+            || boot.format().as_str() != "vmlinux"
+            || boot.component().kind != pplx_space_common_core::types::ArtifactComponentKind::Kernel
+        {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        }
+        let kernel = boot.component();
         if pin.is_some_and(|pin| pin.version != kernel.version || pin.digest != kernel.digest) {
             return Err(BuildExecutionBindingError::KernelPin);
         }
-        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-            &self.definition.descriptor().spec().compatibility
-        else {
-            return Err(BuildExecutionBindingError::ScratchProfile);
-        };
         // Values are resolved observations, never inherited selector ENV values.
         command.env("SPACE_SEED_RUNTIME", self.execution.runtime().kind.as_str());
         command.env(

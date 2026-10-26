@@ -133,7 +133,7 @@ impl EnvironmentDefinition {
         if execution.components().len() != spec.boot.components().count() {
             return Err(EnvironmentBindingError::BootComponents);
         }
-        let strict_format = matches!(spec.boot, BootProfile::ArtifactsV1 { .. });
+        let strict_format = self.identity_schema_version() != ENVIRONMENT_SCHEMA_VERSION;
         for (role, component, format) in required {
             if !execution.components().iter().any(|observed| {
                 observed.kind == component.kind
