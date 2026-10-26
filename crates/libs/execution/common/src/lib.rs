@@ -7,6 +7,7 @@ use pplx_space_common_core::types::{
     StateFormatVersion,
 };
 
+pub mod devices;
 pub mod environment;
 pub mod policy;
 
