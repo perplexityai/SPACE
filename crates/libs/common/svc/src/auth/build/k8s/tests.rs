@@ -343,7 +343,15 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
             (false, false),
         ),
     ] {
-        for method in ["RegisterTemplate", "RegisterTemplateRelease"] {
+        // `method` is the full gRPC path, under both ClusterApi packages.
+        for method in [
+            "space.node.api.v1.ClusterApi",
+            "space.cluster.api.v1.ClusterApi",
+        ]
+        .into_iter()
+        .flat_map(|service| {
+            ["RegisterTemplate", "RegisterTemplateRelease"].map(|name| format!("/{service}/{name}"))
+        }) {
             let (mut reviewer, calls) = reviewer(
                 bound_publisher_status(
                     "space-cluster-api",
@@ -363,10 +371,7 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
             let mut auth = authenticator(reviewer, false);
             auth.surface = BuildSurface::Publication;
             let result = auth
-                .authenticate(
-                    &format!("/space.node.api.v1.ClusterApi/{method}"),
-                    Some(&format!("Bearer {TOKEN}")),
-                )
+                .authenticate(&method, Some(&format!("Bearer {TOKEN}")))
                 .await
                 .and_then(|caller| {
                     let mut request = tonic::Request::new(());
@@ -388,15 +393,18 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
                 "{account}: {method}"
             );
             assert_eq!(calls.load(Ordering::SeqCst), 1);
-            assert!(
-                auth.authenticate(
-                    "/space.node.api.v1.ClusterApi/PublishNodeState",
-                    Some("Bearer shared-token")
-                )
-                .await
-                .unwrap()
-                .is_none()
-            );
+            for other in [
+                "/space.node.api.v1.ClusterApi/PublishNodeState",
+                "/space.cluster.api.v1.ClusterApi/PublishNodeState",
+            ] {
+                assert!(
+                    auth.authenticate(other, Some("Bearer shared-token"))
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{other}"
+                );
+            }
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
     }

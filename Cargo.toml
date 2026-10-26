@@ -72,6 +72,7 @@ members = [
     "crates/libs/grpc-rate-limiter",
     "crates/libs/systemd-watchdog",
     "crates/libs/node/api/client",
+    "crates/libs/node/api/types",
     "crates/libs/node/api/server",
     "crates/libs/node/ctl/server",
     "crates/libs/node/ctl/client",
@@ -154,6 +155,7 @@ members = [
     "crates/libs/db-identity",
     "crates/libs/http-server",
     "crates/libs/cluster/controller/server",
+    "crates/libs/cluster/api/client",
     "crates/libs/cluster/pool",
     "crates/libs/cluster/reconciler",
     "crates/libs/cluster/trigger-queue",
@@ -390,6 +392,7 @@ pplx-space-net-gateway-client = { path = "crates/libs/net/gateway/client" }
 pplx-space-net-gateway-protocol = { path = "crates/libs/net/gateway/protocol" }
 pplx-space-node-api-client = { path = "crates/libs/node/api/client" }
 pplx-space-node-ctl-client = { path = "crates/libs/node/ctl/client" }
+pplx-space-node-api-types = { path = "crates/libs/node/api/types" }
 pplx-space-node-api-server = { path = "crates/libs/node/api/server" }
 pplx-space-node-ctl-server = { path = "crates/libs/node/ctl/server" }
 pplx-space-k8s-node-id = { path = "crates/libs/node/k8s-node-id" }
@@ -431,6 +434,7 @@ pplx-space-btrfs = { path = "crates/libs/btrfs" }
 pplx-space-db-identity = { path = "crates/libs/db-identity" }
 pplx-space-http-server = { path = "crates/libs/http-server" }
 pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
+pplx-space-cluster-api-client = { path = "crates/libs/cluster/api/client" }
 pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }
 pplx-space-cluster-trigger-queue = { path = "crates/libs/cluster/trigger-queue" }
