@@ -4,6 +4,113 @@ use super::*;
 
 #[cfg(feature = "kubernetes")]
 #[tokio::test]
+async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_env::TestResult {
+    use pplx_space_common_core::{sql, types::SubstrateKind};
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    use pplx_space_public_api::{OperationKind, OperationTargetType};
+
+    use crate::public_operations::{
+        ApiProduct, ClaimPublicOperations, CreateClaimedPublicOperationResult,
+        CreatePublicOperation, PublicOperationStore, ReleaseClaimedPublicOperation,
+    };
+
+    let db = pg_test_db().await?;
+    let source = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, template_id, content_hash, lifecycle, placement,
+             network_policy_generation, managed_by
+         ) VALUES ($1, $2, $3, 'seed', $4, 'started', 'unplaced', 1, $5)"
+    ))
+    .bind(source)
+    .bind(SEED_USER_ID)
+    .bind(SEED_ORG_ID)
+    .bind("sha256:0000000000000000000000000000000000000000000000000000000000000001")
+    .bind(SubstrateKind::Kubernetes)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace, state, active
+         ) VALUES ($1, 7, $2, 'space', 'running', TRUE)"
+    ))
+    .bind(source)
+    .bind(format!("space-sbx-{}-g7", source.as_uuid().simple()))
+    .execute(&db.pool)
+    .await?;
+    let payload = ForkSandboxPayloadV1::new(
+        source,
+        crate::fork_operations::ForkRequest::from_wire(Some(60), Some(1))?,
+        "e2b.example.test".to_string(),
+    );
+    let source_id = source.to_string();
+    let store = PublicOperationStore::new(db.pool.clone());
+    let CreateClaimedPublicOperationResult::Claimed {
+        claim_token,
+        operation,
+    } = store
+        .create_claimed_operation(CreatePublicOperation {
+            org_id: OrgId::from_uuid(SEED_ORG_ID),
+            actor_user_id: Some(UserId::from_uuid(SEED_USER_ID)),
+            api_product: ApiProduct::Native,
+            kind: OperationKind::ForkSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&source_id),
+            payload_json: serde_json::to_value(ForkSandboxPayload::v1(payload))?,
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?
+    else {
+        panic!("new fork must own its claim");
+    };
+    let substrate = Substrate::from_kubernetes(
+        crate::controllers::substrate::kubernetes::tests::substrate_with_store(db.pool.clone()),
+    );
+    let executor = ForkSandboxOperationExecutor::new(
+        db.pool.clone(),
+        substrate.clone(),
+        SandboxController::new(substrate),
+    );
+
+    let result = executor.execute(&claim_token, &operation).await;
+
+    assert_eq!(result.state, OperationState::Queued);
+    // Reclaim through the dispatcher's store API to inspect what the next
+    // executor receives, without selecting a capture on the test's behalf.
+    assert!(
+        store
+            .release_claimed_operation(ReleaseClaimedPublicOperation {
+                claim_token,
+                operation_id: operation.id,
+                progress_message: result.progress_message,
+                retry_after: Duration::ZERO,
+                count_attempt: false,
+            })
+            .await?
+    );
+    let resumed = store
+        .claim_operations(ClaimPublicOperations {
+            limit: 1,
+            claim_stale_after: Duration::from_secs(30),
+            claimable_kinds: &[OperationKind::ForkSandbox],
+        })
+        .await?
+        .operations
+        .pop()
+        .expect("released fork must be claimable");
+    assert_eq!(resumed.id, operation.id);
+    let persisted = decode_fork_payload(resumed.payload)?;
+    assert_eq!(
+        persisted.capture_operation_id(),
+        Some(operation.id),
+        "one execution must pass source freeze and persist its capture leader before yielding"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "kubernetes")]
+#[tokio::test]
 async fn ready_capture_completes_in_one_claim_but_pending_upload_still_yields()
 -> pplx_space_test_env::TestResult {
     use pplx_space_common_core::{
