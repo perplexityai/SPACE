@@ -88,6 +88,7 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
                 count_attempt: false,
                 undo_first_start: false,
                 cancel_if_superseded: false,
+                carried_error: None,
             })
             .await?,
         ReleasedClaim::Requeued

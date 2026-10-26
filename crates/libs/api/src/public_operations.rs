@@ -19,6 +19,7 @@ use sqlx::{FromRow, PgPool, Postgres, Transaction, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::public_operation_driver::with_carried_error;
 use crate::public_store::{InvalidStoredEnum, parse_stored_enum};
 use pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle;
 
@@ -1541,6 +1542,9 @@ pub struct ReleaseClaimedPublicOperation {
     /// whose execution may still be running, since the delete would then
     /// no longer wait for it.
     pub cancel_if_superseded: bool,
+    /// The attempt's error, recorded under the cancel's own fields if the
+    /// release cancels a superseded create.
+    pub carried_error: Option<serde_json::Value>,
 }
 
 /// What a release did with its claimed operation.
@@ -1758,17 +1762,21 @@ pub async fn create_operation_tx(
 fn superseded_create(
     create_id: OperationId,
     delete_id: OperationId,
+    carried_error: Option<serde_json::Value>,
 ) -> (String, PublicErrorCode, serde_json::Value) {
     (
         "Superseded by a delete of the same sandbox requested before the create finished."
             .to_owned(),
         PublicErrorCode::OperationFailed,
-        serde_json::json!({
-            "operation_id": create_id.to_string(),
-            "kind": OperationKind::CreateSandbox.as_str(),
-            "reason": "superseded_by_delete",
-            "delete_operation_id": delete_id.to_string(),
-        }),
+        with_carried_error(
+            serde_json::json!({
+                "operation_id": create_id.to_string(),
+                "kind": OperationKind::CreateSandbox.as_str(),
+                "reason": "superseded_by_delete",
+                "delete_operation_id": delete_id.to_string(),
+            }),
+            carried_error,
+        ),
     )
 }
 
@@ -1778,8 +1786,9 @@ async fn cancel_superseded_create_tx(
     tx: &mut Transaction<'_, Postgres>,
     create_id: OperationId,
     delete_id: OperationId,
+    carried_error: Option<serde_json::Value>,
 ) -> Result<(), PublicOperationStoreError> {
-    let (progress_message, code, error) = superseded_create(create_id, delete_id);
+    let (progress_message, code, error) = superseded_create(create_id, delete_id, carried_error);
     sqlx::query(sql!(
         "UPDATE public_operations
          SET state = $2,
@@ -1858,7 +1867,7 @@ async fn cancel_creates_superseded_by_delete_tx(
         superseded
             .0
             .push(parse_stored_enum("api_product", &api_product)?);
-        cancel_superseded_create_tx(tx, OperationId::from_uuid(create), delete_id).await?;
+        cancel_superseded_create_tx(tx, OperationId::from_uuid(create), delete_id, None).await?;
     }
     Ok(superseded)
 }
@@ -2592,7 +2601,8 @@ async fn release_claimed_operation(
         && kind == OperationKind::CreateSandbox.as_str()
         && let Some(delete_id) = superseding_delete_tx(&mut tx, input.operation_id).await?
     {
-        cancel_superseded_create_tx(&mut tx, input.operation_id, delete_id).await?;
+        cancel_superseded_create_tx(&mut tx, input.operation_id, delete_id, input.carried_error)
+            .await?;
         tx.commit().await?;
         return Ok(ReleasedClaim::Superseded { delete_id });
     }

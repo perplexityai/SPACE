@@ -658,6 +658,7 @@ async fn hand_back_busy_key(
             count_attempt: false,
             undo_first_start: operation.is_first_start(),
             cancel_if_superseded: !executing_here,
+            carried_error: None,
         })
         .await
     {
