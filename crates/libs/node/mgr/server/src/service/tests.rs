@@ -266,6 +266,59 @@ pub(super) mod service_tests {
     }
 
     #[tokio::test]
+    async fn generic_vm_routes_authorize_before_validating_inputs() {
+        use crate::proto::node_manager_server::NodeManager as Rpc;
+
+        fn request<T: Default>(peer: &PeerIdentity) -> Request<T> {
+            let mut request = Request::new(T::default());
+            request.extensions_mut().insert(peer.clone());
+            request
+        }
+
+        let service = service_for_unit_tests().await;
+        for (peer, mutation_code) in [
+            (PeerIdentity::new(0, 0, None), tonic::Code::InvalidArgument),
+            (
+                PeerIdentity::new(
+                    users::SPACE_NODECTL.uid,
+                    users::SPACE_NODECTL.primary_group.gid,
+                    None,
+                ),
+                tonic::Code::PermissionDenied,
+            ),
+        ] {
+            for (method, error, expected) in [
+                (
+                    "GetVmState",
+                    Rpc::get_vm_state(&service, request(&peer))
+                        .await
+                        .unwrap_err(),
+                    tonic::Code::InvalidArgument,
+                ),
+                (
+                    "CaptureVmState",
+                    Rpc::capture_vm_state(&service, request(&peer))
+                        .await
+                        .unwrap_err(),
+                    mutation_code,
+                ),
+                (
+                    "RestoreVmState",
+                    Rpc::restore_vm_state(&service, request(&peer))
+                        .await
+                        .unwrap_err(),
+                    mutation_code,
+                ),
+            ] {
+                assert_eq!(error.code(), expected, "{method}");
+                if expected == tonic::Code::PermissionDenied {
+                    assert!(error.message().ends_with(method));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sandbox_manager_can_negotiate_and_inspect_send_sources_without_lease_access() {
         let service = service_for_unit_tests().await;
         for (user, allowed) in [

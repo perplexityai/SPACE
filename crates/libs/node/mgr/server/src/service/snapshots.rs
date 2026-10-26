@@ -193,6 +193,14 @@ impl NodeManagerService {
         request: Request<GetFirecrackerVmStateRequest>,
     ) -> Result<Response<GetFirecrackerVmStateResponse>, Status> {
         self.authorize_peer(&request, "GetFirecrackerVmState", ALLOW_NODE_STATUS)?;
+        self.get_firecracker_vm_state_after_authorization(request)
+            .await
+    }
+
+    pub(super) async fn get_firecracker_vm_state_after_authorization(
+        &self,
+        request: Request<GetFirecrackerVmStateRequest>,
+    ) -> Result<Response<GetFirecrackerVmStateResponse>, Status> {
         let sandbox_id = request
             .get_ref()
             .sandbox_id
@@ -280,6 +288,13 @@ impl NodeManagerService {
         request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         self.authorize_peer(&request, "CreateSnapshot", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+        self.create_snapshot_after_authorization(request).await
+    }
+
+    pub(super) async fn create_snapshot_after_authorization(
+        &self,
+        request: Request<CreateSnapshotRequest>,
+    ) -> Result<Response<CreateSnapshotResponse>, Status> {
         let mut request = request;
         let selected_environment = environment::normalize(request.get_mut())?;
         validate_sandbox_id(&request.get_ref().sandbox_id)?;
@@ -590,6 +605,13 @@ impl NodeManagerService {
         request: Request<LoadSnapshotRequest>,
     ) -> Result<Response<LoadSnapshotResponse>, Status> {
         self.authorize_peer(&request, "LoadSnapshot", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+        self.load_snapshot_after_authorization(request).await
+    }
+
+    pub(super) async fn load_snapshot_after_authorization(
+        &self,
+        request: Request<LoadSnapshotRequest>,
+    ) -> Result<Response<LoadSnapshotResponse>, Status> {
         validate_sandbox_id(&request.get_ref().sandbox_id)?;
         let sandbox_id = request.get_ref().sandbox_id.clone();
         let service = self.clone();
