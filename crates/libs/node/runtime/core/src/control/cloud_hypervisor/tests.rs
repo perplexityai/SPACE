@@ -73,3 +73,53 @@ async fn deadline_includes_a_stalled_response() {
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
 }
+
+#[tokio::test]
+async fn boot_orders_create_before_boot_and_never_replays_a_failure() {
+    for statuses in [[204, 204], [400, 204], [204, 500]] {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for (endpoint, status) in ["vm.create", "vm.boot"].into_iter().zip(statuses) {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let byte = stream.read_u8().await.unwrap();
+                    bytes.push(byte);
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert!(
+                    bytes.starts_with(format!("PUT /api/v1/{endpoint} HTTP/1.1\r\n").as_bytes())
+                );
+                if endpoint == "vm.create" {
+                    let mut body = [0; 2];
+                    stream.read_exact(&mut body).await.unwrap();
+                    assert_eq!(&body, b"{}");
+                }
+                stream
+                    .write_all(
+                        format!("HTTP/1.1 {status} Result\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                if status >= 400 {
+                    break;
+                }
+            }
+            // Closing the listener makes any replay fail; the original status
+            // must be preserved by the client rather than replaced by I/O.
+        });
+        let result = Client::new(socket).boot("{}").await;
+        let failure = statuses.into_iter().find(|status| *status >= 400);
+        match failure {
+            None => result.unwrap(),
+            Some(status) => assert!(
+                matches!(result, Err(ControlError::CloudHypervisor(ApiError::Status(actual))) if actual.as_u16() == status)
+            ),
+        }
+        server.await.unwrap();
+    }
+}
