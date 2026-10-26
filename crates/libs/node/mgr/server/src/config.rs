@@ -12,6 +12,7 @@ use pplx_space_common_core::host::{disk_admission::CacheDiskAdmissionConfig, lin
 
 #[derive(Debug)]
 pub(crate) struct ServiceSettings {
+    pub device_development: Option<crate::service::device_pool::DevelopmentAuthorization>,
     pub disk_admission: CacheDiskAdmissionConfig,
     pub lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter,
     pub runtime_paths: RuntimePaths,
@@ -66,6 +67,7 @@ impl Default for ArtifactStorePaths {
 impl ServiceSettings {
     pub fn from_env() -> Result<Self, SelectionConfigurationError> {
         let settings = Self {
+            device_development: crate::service::device_pool::DevelopmentAuthorization::from_env()?,
             execution_policy: execution_policy_from_env()?,
             disk_admission: CacheDiskAdmissionConfig::from_env(),
             lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter::from_env(),
@@ -123,6 +125,8 @@ mod tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SelectionConfigurationError {
+    #[error(transparent)]
+    DeviceDevelopment(#[from] crate::service::device_pool::ConfigurationError),
     #[error("invalid execution selection setting: {0}")]
     Environment(#[from] std::env::VarError),
     #[error("invalid execution selection: {0}")]

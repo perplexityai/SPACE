@@ -273,7 +273,8 @@ stage_env \
   SPACE_SEED_STATE_FORMAT_VERSION \
   SPACE_SEED_KERNEL_FORMAT \
   SPACE_SEED_KERNEL_VERSION \
-  SPACE_SEED_KERNEL_DIGEST
+  SPACE_SEED_KERNEL_DIGEST \
+  SPACE_SEED_BOOT_COMPONENTS
 
 # Prefer an explicit version from the outer launcher when available. Otherwise
 # rootfs-builder.sh will fall back to the workspace Cargo.toml copied below.

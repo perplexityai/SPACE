@@ -1,6 +1,6 @@
-use super::normalize_environment_input;
 use super::require_environment_acknowledgement;
-use pplx_space_common_core::types::{Arch, EnvironmentReference, ExecutionMetadata};
+use super::{normalize_device_input, normalize_environment_input};
+use pplx_space_common_core::types::{Arch, EnvironmentReference, ExecutionMetadata, SandboxId};
 
 #[test]
 fn bound_execution_requires_positive_peer_acknowledgement() {
@@ -196,5 +196,67 @@ fn automatic_lifecycle_admission_respects_runtime_capabilities() {
             }
             _ => result.unwrap(),
         }
+    }
+}
+
+#[test]
+fn device_create_keeps_retry_identity_and_rejects_mixed_or_memory_inputs() {
+    use crate::proto::{CreateRequest, DeviceCreateInput, EnvironmentCreateInput};
+    use pplx_space_execution_common::proto::{DeviceRequirement, DeviceRequirements};
+    let reference =
+        EnvironmentReference::new(pplx_space_common_core::types::Digest::sha256([8; 32]));
+    let original = CreateRequest {
+        sandbox_id: Some(SandboxId::new().to_string()),
+        boot_mode: crate::proto::BootMode::Cold as i32,
+        device_create: Some(DeviceCreateInput {
+            environment: Some(EnvironmentCreateInput {
+                reference: reference.to_string(),
+                template: "compute-seed".into(),
+            }),
+            requirements: Some(DeviceRequirements {
+                entries: vec![DeviceRequirement {
+                    profile: "compute".into(),
+                    count: 2,
+                    compatible_profiles: vec![],
+                }],
+            }),
+        }),
+        ..Default::default()
+    };
+    let mut request = original.clone();
+    let parsed = normalize_device_input(&mut request).unwrap().unwrap();
+    assert_eq!(parsed.entries()[0].count(), 2);
+    assert_eq!(
+        normalize_environment_input(&mut request).unwrap(),
+        Some(reference)
+    );
+    assert_eq!(request.template, "compute-seed");
+    assert_eq!(request.sandbox_id, original.sandbox_id);
+    assert!(request.runtime.is_empty());
+    for case in 0..9 {
+        let mut request = original.clone();
+        match case {
+            0 => request.runtime = "fc".into(),
+            1 => request.template = "other".into(),
+            2 => request.environment = request.device_create.as_ref().unwrap().environment.clone(),
+            3 => request.device_create.as_mut().unwrap().environment = None,
+            4 => request.device_create.as_mut().unwrap().requirements = None,
+            5 => {
+                request
+                    .device_create
+                    .as_mut()
+                    .unwrap()
+                    .requirements
+                    .as_mut()
+                    .unwrap()
+                    .entries[0]
+                    .count = 0
+            }
+            6 => request.snapshots_enabled = true,
+            7 => request.pool_template = Some("pool".into()),
+            8 => request.boot_mode = crate::proto::BootMode::BaseSnapshot as i32,
+            _ => unreachable!(),
+        }
+        normalize_device_input(&mut request).unwrap_err();
     }
 }

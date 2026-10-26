@@ -298,6 +298,7 @@ async fn do_create_from_base(
 
     let create_resp = sbx_client
         .create(pplx_space_sbx_mgr_client::proto::CreateRequest {
+            device_create: None,
             environment: None,
             template: template.to_string(),
             owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),

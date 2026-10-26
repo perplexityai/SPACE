@@ -234,6 +234,12 @@ pub(super) enum Commands {
         /// Exact environment; must match the template's immutable binding.
         #[arg(long)]
         environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        /// Qualified whole-device profile; requires an explicit environment.
+        #[arg(long, requires = "environment")]
+        device_profile: Option<pplx_space_execution_spec::devices::DeviceProfile>,
+        /// Number of same-profile allocations (default: one).
+        #[arg(long, requires = "device_profile", value_parser = clap::value_parser!(u32).range(1..=16))]
+        device_count: Option<u32>,
         /// Legacy runtime selector; an environment determines its own runtime.
         #[arg(
             long,
@@ -282,6 +288,9 @@ pub(super) enum Commands {
         /// Block until guest reports ready (or timeout)
         #[arg(long)]
         blocking: bool,
+        /// Guest memory in MiB for this activation (subject to node admission).
+        #[arg(long = "memory", value_parser = clap::value_parser!(u32).range(1..))]
+        memory_mib: Option<u32>,
         /// Ready timeout in seconds for --blocking
         #[arg(long)]
         ready_timeout_secs: Option<u32>,

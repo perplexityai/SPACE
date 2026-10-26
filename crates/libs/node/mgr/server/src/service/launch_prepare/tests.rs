@@ -5,6 +5,80 @@ use pplx_space_common_core::types::{Arch, ExecutionMetadata, RuntimeKind};
 use super::{parse_runtime_request, prepare_sandbox_cache_paths, prepare_sandbox_owned_paths};
 
 #[test]
+fn preparation_metadata_cannot_change_the_admitted_device_requirement() {
+    use pplx_space_common_core::types::{SandboxArtifactMetadata, TemplateName};
+    use pplx_space_execution_common::devices::{DeviceExecution, requirements_digest};
+    use pplx_space_execution_spec::devices::{
+        DeviceLeaseId, DeviceParentId, DeviceRequirement, DeviceRequirements,
+        ExclusiveDeviceAssignment,
+    };
+
+    let sandbox = SandboxId::new();
+    let execution = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+    let requirements = DeviceRequirements::new(vec![
+        DeviceRequirement::new("compute".parse().unwrap(), 1).unwrap(),
+    ])
+    .unwrap();
+    let metadata = SandboxArtifactMetadata::new(
+        sandbox,
+        execution.clone(),
+        TemplateName::parse("base").unwrap(),
+        None,
+    );
+    let device_metadata = metadata
+        .clone()
+        .with_device_requirements(requirements.clone());
+    let mismatched = metadata.clone().with_device_requirements(
+        DeviceRequirements::new(vec![
+            DeviceRequirement::new("compute".parse().unwrap(), 2).unwrap(),
+        ])
+        .unwrap(),
+    );
+    let devices = DeviceExecution::new(
+        requirements_digest(&requirements),
+        vec![
+            ExclusiveDeviceAssignment::new(
+                DeviceLeaseId::new(),
+                DeviceParentId::new(),
+                "compute".parse().unwrap(),
+                vec!["pci:0000:01:00.0".parse().unwrap()],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    for (metadata, admitted, accepted) in [
+        (None, None, true),
+        (Some(&metadata), None, true),
+        (Some(&device_metadata), Some(&devices), true),
+        (Some(&device_metadata), None, false),
+        (None, Some(&devices), false),
+        (Some(&metadata), Some(&devices), false),
+        (Some(&mismatched), Some(&devices), false),
+    ] {
+        let request = crate::proto::PrepareSandboxRequest {
+            sandbox_id: sandbox.to_string(),
+            metadata_json: metadata
+                .map(|m| serde_json::to_string(m).unwrap())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let result = super::sandbox_metadata_json(&request, execution.clone(), admitted);
+        if accepted {
+            let persisted: SandboxArtifactMetadata =
+                serde_json::from_slice(&result.unwrap()).unwrap();
+            assert_eq!(
+                persisted.device_requirements(),
+                metadata.and_then(|m| m.device_requirements())
+            );
+            assert_eq!(persisted.execution, execution);
+        } else {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+        }
+    }
+}
+
+#[test]
 fn oversized_rootfs_resize_is_rejected_before_touching_disk() {
     let directory = tempfile::tempdir().unwrap();
     let rootfs = directory.path().join("rootfs.ext4");
@@ -941,6 +1015,7 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
                 assert_eq!(request.sandbox_id, launch_sandbox);
                 assert_eq!(request.environment_reference, Some(reference));
                 Ok(proto::LaunchRuntimeResponse {
+                    devices: None,
                     pid: 0,
                     accepted_environment_reference: accepted.clone(),
                 })
