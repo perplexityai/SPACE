@@ -2093,8 +2093,16 @@ impl SandboxManagerService {
         let requested_memory_mib =
             optional_positive_or_default("memory_mib", req_memory_mib, memory_default)
                 .map_err(|error| activation_cleanup.failure(error))?;
-        let memory_policy =
+        let mut memory_policy =
             self.resolve_sandbox_memory_policy(requested_memory_mib, node_memory_policy);
+        if let Some(requirements) = &sandbox.device_requirements {
+            super::devices::reserve_device_memory(
+                &prepare_source.execution,
+                requirements,
+                &mut memory_policy,
+            )
+            .map_err(|error| activation_cleanup.failure(error))?;
+        }
         let mem_mib = memory_policy.effective_memory_mib;
         // Like boot args, the balloon device exists only from a cold boot:
         // snapshots carry the device state they were taken with.
@@ -2131,10 +2139,37 @@ impl SandboxManagerService {
                 "starting sandbox network allocation without pod netns"
             );
         }
+        let device_allocation = if let Some(requirements) = sandbox.device_requirements.as_ref() {
+            if self.node_managed_by.is_some() {
+                return Err(activation_cleanup.failure(Status::failed_precondition(
+                    "device activation is available only on standalone nodes",
+                )));
+            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                super::devices::require_node_support(&mut node_client),
+            )
+            .await
+            .map_err(|_| {
+                activation_cleanup.failure(Status::deadline_exceeded("device admission timed out"))
+            })?
+            .map_err(|error| activation_cleanup.failure(error))?;
+            Some(pplx_space_execution_common::proto::DeviceAllocationInput {
+                sandbox_id: id.clone(),
+                requirements: Some(requirements.into()),
+            })
+        } else {
+            None
+        };
         let alloc = node_client
             .allocate(AllocateRequest {
                 execution_fence: Some(execution_fence.into()),
-                sandbox_id: id.clone(),
+                sandbox_id: if device_allocation.is_some() {
+                    String::new()
+                } else {
+                    id.clone()
+                },
+                device_allocation,
                 netns_path,
                 sandbox_cgroup_memory_mib: memory_policy.cgroup_memory_mib,
             })
@@ -2151,6 +2186,14 @@ impl SandboxManagerService {
                 ))
             })?
             .into_inner();
+        let device_execution = super::devices::allocation_acknowledgement(
+            id.parse().map_err(|error| {
+                Status::invalid_argument(format!("invalid sandbox id: {error}"))
+            })?,
+            sandbox.device_requirements.as_ref(),
+            alloc.devices.as_ref(),
+        )
+        .map_err(|error| activation_cleanup.failure(error))?;
         let sbx_uid = alloc.sandbox_uid;
         if sbx_uid < 10000 {
             // No VM, sidecar, cgroup, or filesystem work has been launched yet.
@@ -2223,6 +2266,13 @@ impl SandboxManagerService {
             huge_pages: self.config.hugepages,
             console: guest_console_logs_enabled(),
             builder: is_builder,
+            initramfs: pplx_space_node_runtime_core::boot::initramfs_component(
+                &prepare_source.execution,
+            )
+            .map_err(|error| {
+                activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+            })?
+            .is_some(),
         };
         let vm_config = pplx_space_node_runtime_core::boot::configuration(
             prepare_source.execution.runtime().kind,
@@ -2254,7 +2304,12 @@ impl SandboxManagerService {
             prepare_client
                 .prepare_sandbox(PrepareSandboxRequest {
                     execution_fence: Some(execution_fence.into()),
-                    sandbox_id: id.clone(),
+                    sandbox_id: if device_execution.is_some() {
+                        String::new()
+                    } else {
+                        id.clone()
+                    },
+                    device_execution: device_execution.clone(),
                     template: prepare_template,
                     uid: sbx_uid,
                     vm_config_json: Some(vm_config),
@@ -2334,6 +2389,10 @@ impl SandboxManagerService {
             }
         };
         let resolved_execution_result = (|| {
+            super::devices::execution_acknowledgement(
+                device_execution.as_ref(),
+                prepare_response.devices.as_ref(),
+            )?;
             let resolved_execution = prepare_response.resolved_execution.ok_or_else(|| {
                 Status::internal(
                     "node-manager prepare response omitted resolved execution metadata",
@@ -2490,13 +2549,17 @@ impl SandboxManagerService {
         let jailer_result = node_client
             .launch_sandbox(LaunchSandboxRequest {
                 execution_fence: Some(execution_fence.into()),
-                sandbox_id: id.clone(),
+                sandbox_id: if device_execution.is_some() {
+                    String::new()
+                } else {
+                    id.clone()
+                },
+                device_execution: device_execution.clone(),
                 uid: sbx_uid,
                 gid: sbx_uid,
                 vcpu_count: Some(vcpu),
-                // Cgroup gets guest memory plus fixed MiB headroom for FC overhead
-                // (page tables, virtio buffers, FC process). This ensures the
-                // guest kernel OOM-kills processes before the host kills FC.
+                // Reuse the budget admitted before network/device allocation,
+                // including qualified pinned-memory overhead for device work.
                 memory_mib: Some(memory_policy.cgroup_memory_mib),
                 pids_max: None,
                 runtime: sandbox.runtime.clone(),
@@ -2528,6 +2591,13 @@ impl SandboxManagerService {
                 );
             }
         };
+        if let Err(error) = super::devices::execution_acknowledgement(
+            device_execution.as_ref(),
+            jailer_resp.devices.as_ref(),
+        ) {
+            settle_net_gateway_launch_task(netgtw_task, id, "device-acknowledgement-failed").await;
+            return Err(activation_cleanup.failure(error));
+        }
         let pid = jailer_resp.pid;
         let (spaced_host_result, netgtw_result) = {
             let mut spaced_host_client = node_client.clone();

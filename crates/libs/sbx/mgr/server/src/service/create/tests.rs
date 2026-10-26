@@ -63,6 +63,7 @@ async fn create_refusals_before_insert_persist_nothing() {
         let id = SandboxId::new().to_string();
         let error = service
             .create_with_id(CreateWithIdArgs {
+                device_requirements: None,
                 req: &case.req,
                 sandbox_owner: &owner,
                 effective_mode: BootMode::Cold,
@@ -141,6 +142,7 @@ async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoi
     crate::db::insert_sandbox(
         &conn,
         crate::db::InsertSandboxParams {
+            device_requirements: None,
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
             state: SandboxState::Suspended,

@@ -339,11 +339,43 @@ pub(super) fn validate_environment_create_fields(
 pub(super) fn allows_node_local_environment_selection(
     request: &crate::proto::CreateRequest,
 ) -> bool {
-    request.sandbox_id.is_none()
+    (request.sandbox_id.is_none() || request.device_create.is_some())
         && request.route_identity.is_none()
         && request.pool_template.is_none()
         && !request.snapshots_enabled
         && request.boot_mode == crate::proto::BootMode::Cold as i32
+}
+
+/// Retain the guarded input on the normalized request so retry validation can
+/// distinguish an explicit device create from legacy environment selection.
+pub(super) fn normalize_device_input(
+    request: &mut crate::proto::CreateRequest,
+) -> Result<Option<pplx_space_execution_spec::devices::DeviceRequirements>, Status> {
+    let Some(input) = request.device_create.as_ref() else {
+        return Ok(None);
+    };
+    if request.environment.is_some() || !request.template.is_empty() || !request.runtime.is_empty()
+    {
+        return Err(Status::invalid_argument("provide exactly one create input"));
+    }
+    let environment = input
+        .environment
+        .clone()
+        .ok_or_else(|| Status::invalid_argument("device create requires an environment"))?;
+    let requirements = input
+        .requirements
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("device create requires device requirements"))?;
+    let requirements =
+        pplx_space_execution_spec::devices::DeviceRequirements::try_from(requirements)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    if !allows_node_local_environment_selection(request) {
+        return Err(Status::failed_precondition(
+            "device create requires node-local cold creation without pools or snapshots",
+        ));
+    }
+    request.environment = Some(environment);
+    Ok(Some(requirements))
 }
 
 /// Decode the additive input before normal admission. Both legacy inputs must

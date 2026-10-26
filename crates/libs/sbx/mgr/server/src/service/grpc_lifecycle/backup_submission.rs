@@ -41,6 +41,11 @@ pub(super) fn captured_suspend_snapshot_metadata(
     sandbox: &crate::db::SandboxRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
 ) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
+    if sandbox.device_requirements.is_some() {
+        return Err(Status::failed_precondition(
+            "memory capture is unsupported for a sandbox with device requirements",
+        ));
+    }
     let mut metadata = suspend_snapshot_metadata(sandbox, format)?;
     metadata.execution = metadata.execution.map(|execution| {
         execution.with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned())
@@ -65,7 +70,11 @@ pub(super) fn suspend_snapshot_metadata(
         _ => None,
     };
     Ok(crate::snapshot_upload::SnapshotMeta {
-        version: crate::snapshot_upload::SNAPSHOT_METADATA_VERSION,
+        version: if sandbox.device_requirements.is_some() {
+            crate::snapshot_upload::DEVICE_DISK_METADATA_VERSION
+        } else {
+            crate::snapshot_upload::SNAPSHOT_METADATA_VERSION
+        },
         execution: Some(snapshot_execution),
         sandbox_id: sandbox.id.clone(),
         size_bytes: 0,
@@ -87,6 +96,7 @@ pub(super) fn suspend_snapshot_metadata(
             kernel_digest: None,
         },
         sandbox: Some(crate::snapshot_upload::SnapshotSandbox {
+            device_requirements: sandbox.device_requirements.clone(),
             owner: sandbox.user.to_string(),
             snapshots_enabled: sandbox.snapshots_enabled,
             process_env: sandbox.process_env.clone(),
@@ -311,6 +321,17 @@ impl SandboxManagerService {
             .map(pplx_space_common_core::types::SnapshotName::parse)
             .transpose()
             .map_err(|error| format!("invalid artifact snapshot name: {error}"))?;
+        if meta
+            .device_requirements()
+            .map_err(|error| error.to_string())?
+            != sandbox.device_requirements.as_ref()
+        {
+            return Err(
+                "artifact device requirements differ from the sandbox's persisted requirements"
+                    .to_string()
+                    .into(),
+            );
+        }
         // Normalize legacy metadata before persisting the durable intent. The
         // worker may execute after this process exits and must not need to
         // rediscover capture-time execution identity from the replacement

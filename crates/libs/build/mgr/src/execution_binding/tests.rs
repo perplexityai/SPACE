@@ -349,3 +349,95 @@ fn standalone_seed_records_its_kernel_without_inventing_snapshot_support() {
     assert_eq!(vars["SPACE_SEED_STATE_FORMAT"], "");
     assert_eq!(vars["SPACE_SEED_STATE_FORMAT_VERSION"], "");
 }
+
+#[test]
+fn scratch_seed_preserves_kernel_and_initramfs_binding() {
+    use pplx_space_execution_common::environment::{
+        CLOUD_HYPERVISOR_BOOT_CONTRACT, CLOUD_HYPERVISOR_MACHINE_CONTRACT,
+    };
+    let fc = BuildExecutionBinding::from_response(None, fixture()).unwrap();
+    let mut spec = fc.definition.descriptor().spec().clone();
+    let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
+    release.runtime.kind = RuntimeKind::CloudHypervisor;
+    release.runtime.version = "54.0".parse().unwrap();
+    spec.boot = BootProfile::ArtifactsV1 {
+        contract: CLOUD_HYPERVISOR_BOOT_CONTRACT.parse().unwrap(),
+        artifacts: vec![
+            BootArtifact::new(
+                "boot".parse().unwrap(),
+                ComponentIdentity {
+                    kind: ArtifactComponentKind::Kernel,
+                    version: "6.1.155-custom".parse().unwrap(),
+                    digest: Digest::sha256([3; 32]),
+                },
+                "linux-bzimage".parse().unwrap(),
+            ),
+            BootArtifact::new(
+                "initramfs".parse().unwrap(),
+                ComponentIdentity {
+                    kind: ArtifactComponentKind::Initrd,
+                    version: "1".parse().unwrap(),
+                    digest: Digest::sha256([4; 32]),
+                },
+                "linux-initramfs".parse().unwrap(),
+            ),
+        ],
+    };
+    spec.compatibility = ExecutionCompatibilityProfile::RuntimeV1 {
+        contract: CLOUD_HYPERVISOR_MACHINE_CONTRACT.parse().unwrap(),
+        state_format: None,
+    };
+    let definition = EnvironmentDefinition::new(spec.try_into().unwrap());
+    let execution = definition.execution_requirements().unwrap();
+    let binding = BuildExecutionBinding::from_response(
+        None,
+        ResolveExecutionEnvironmentResponse {
+            definition: Some((&definition).into()),
+            execution: Some((&execution).into()),
+            accepted_selection: 0,
+        },
+    )
+    .unwrap();
+    let mut command = tokio::process::Command::new("true");
+    binding.configure_scratch(&mut command, None).unwrap();
+    let env: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+    let components: Vec<ArtifactComponentMetadata> = serde_json::from_str(
+        env[std::ffi::OsStr::new("SPACE_SEED_BOOT_COMPONENTS")]
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(components.len(), 2);
+    assert!(
+        components
+            .iter()
+            .any(|c| c.kind == ArtifactComponentKind::Initrd
+                && c.digest == Some(Digest::sha256([4; 32])))
+    );
+    let mut metadata = TemplateMetadata::default();
+    metadata.set_execution_metadata(
+        ExecutionMetadata::new(
+            execution.runtime().clone(),
+            execution.guest(),
+            None,
+            components,
+        )
+        .unwrap(),
+    );
+    binding.bind_template(&mut metadata).unwrap();
+    assert_eq!(
+        metadata
+            .execution_metadata()
+            .unwrap()
+            .unwrap()
+            .environment(),
+        Some(definition.reference())
+    );
+    configure_legacy_scratch(&mut command, None);
+    let env: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+    assert_eq!(
+        env[std::ffi::OsStr::new("SPACE_SEED_BOOT_COMPONENTS")],
+        None
+    );
+}

@@ -19,6 +19,8 @@ pub enum LaunchContractError {
     UnsupportedRuntime(i32),
     #[error("Firecracker launch requires its containment executable")]
     MissingLauncher,
+    #[error("Firecracker does not support exclusive device assignments")]
+    UnsupportedDevices,
     #[error("verified launch identity differs from the request identity")]
     IdentityMismatch,
 }
@@ -27,6 +29,9 @@ impl TryFrom<LaunchRuntimeRequest> for FirecrackerLaunch {
     type Error = LaunchContractError;
 
     fn try_from(request: LaunchRuntimeRequest) -> Result<Self, Self::Error> {
+        if request.device_execution.is_some() {
+            return Err(LaunchContractError::UnsupportedDevices);
+        }
         if request.runtime != RuntimeKind::Firecracker as i32 {
             return Err(LaunchContractError::UnsupportedRuntime(request.runtime));
         }
