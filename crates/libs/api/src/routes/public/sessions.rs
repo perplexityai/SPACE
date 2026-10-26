@@ -7,23 +7,27 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_common_core::types::{
-    GuestUserName, IdempotencyKey, ProcessCommand, validate_linux_guest_path_input,
+    AutoLifecyclePolicy, GuestUserName, IdempotencyKey, ProcessCommand, SandboxLifecycle,
+    validate_linux_guest_path_input,
 };
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{
     CreateCommandRequest, CreateFileWatchSessionRequest, CreatePortSessionRequest,
     CreateProcessRequest, CreateProtocolSessionRequest, CreateTerminalSessionRequest,
     DataPlaneSessionId, PageCursor, PublicCommand, PublicPage, PublicSandboxId, PublicSession,
-    SessionKind, SessionTargetProtocol, TerminalSize, routes as native_routes,
+    SandboxLifecycleAction, SessionKind, SessionTargetProtocol, TerminalSize,
+    routes as native_routes,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
 
 use crate::{
-    controllers::ControllerError,
+    controllers::{ControllerError, substrate::ExecutionActivityKind},
     middleware::auth::{AuthOrg, AuthUser},
     models::Sandbox,
-    public_operations::{HttpOperationMethod, OperationPathTemplate},
+    public_operations::{HttpOperationMethod, OperationPathTemplate, PublicOperationStore},
+    public_sandbox_operations::SandboxLifecycleOperationPayload,
+    public_sandbox_projection::public_lifecycle_state,
     public_sessions::{
         CreatePublicSession, CreatePublicSessionIdempotency, ListPublicSessions,
         PublicSessionCursor, PublicSessionStore, RevokePublicSession, session_fingerprint_payload,
@@ -74,7 +78,7 @@ pub async fn create_terminal_session(
         &request_json,
     );
     let session = create_session(
-        state,
+        &state,
         RouteSessionCreate {
             org_id: org.id,
             actor_user_id: actor.id,
@@ -88,6 +92,7 @@ pub async fn create_terminal_session(
             idempotency_key: idempotency_key(&headers)?,
             path_template: OperationPathTemplate::new(TERMINAL_SESSION_PATH_TEMPLATE),
         },
+        || Ok(()),
     )
     .await?;
 
@@ -105,7 +110,9 @@ pub async fn create_process_session(
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
     validate_process_request(&request)?;
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
+    let lifecycle = sandbox_lifecycle(&sandbox)?;
+    let admission = command_admission(lifecycle, &sandbox.auto_lifecycle.0);
     let request_json = serde_json::to_value(&request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize process session request");
         PublicApiError::internal()
@@ -119,7 +126,7 @@ pub async fn create_process_session(
         &request_json,
     );
     let session = create_session(
-        state,
+        &state,
         RouteSessionCreate {
             org_id: org.id,
             actor_user_id: actor.id,
@@ -133,8 +140,12 @@ pub async fn create_process_session(
             idempotency_key: idempotency_key(&headers)?,
             path_template: OperationPathTemplate::new(PROCESS_SESSION_PATH_TEMPLATE),
         },
+        || admit(admission, sandbox_id, lifecycle),
     )
     .await?;
+    if admission == CommandAdmission::AdmitAndWake {
+        enqueue_command_wake(&state, org.id, sandbox_id).await?;
+    }
 
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -149,12 +160,14 @@ pub async fn create_command(
     Json(request): Json<CreateCommandRequest>,
 ) -> Result<Response, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let idempotency_key = idempotency_key(&headers)?;
     let event_stream = accepts_event_stream(&headers);
     if event_stream {
         reject_streamed_pty(&request)?;
     }
+    let lifecycle = sandbox_lifecycle(&sandbox)?;
+    let admission = command_admission(lifecycle, &sandbox.auto_lifecycle.0);
     let command = create_command_session(
         &state.public_session_store(),
         org.id,
@@ -162,8 +175,12 @@ pub async fn create_command(
         sandbox_id,
         request,
         idempotency_key,
+        || admit(admission, sandbox_id, lifecycle),
     )
     .await?;
+    if admission == CommandAdmission::AdmitAndWake {
+        enqueue_command_wake(&state, org.id, sandbox_id).await?;
+    }
 
     // Streaming is negotiated after the create, so validation, owner scope,
     // idempotency replay, and their errors are identical in both modes, apart
@@ -175,6 +192,114 @@ pub async fn create_command(
         return Ok(response);
     }
     Ok((StatusCode::CREATED, Json(command)).into_response())
+}
+
+/// What `createCommand` and `createProcessSession` do for the sandbox's
+/// current lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandAdmission {
+    /// Running, or heading to running, which the attach waits for.
+    Admit,
+    /// At rest or heading there, and its wake policy lets a command wake it.
+    AdmitAndWake,
+    /// The command could not run until the caller wakes or starts the
+    /// sandbox, so repeating the request cannot help.
+    Refuse,
+}
+
+/// A command wakes a sandbox at rest, or one heading there, only as its
+/// `auto_lifecycle.wake.on` allows (`command` or `access`), the rule the node
+/// applies when the attach starts the process. Answering here keeps a refused
+/// command from turning into an attach that reports a retryable error
+/// indefinitely. Nothing starts a stopped sandbox for a command: the wake
+/// action refuses `stopped`, and the node refuses guest access to it.
+fn command_admission(
+    lifecycle: SandboxLifecycle,
+    policy: &AutoLifecyclePolicy,
+) -> CommandAdmission {
+    let wakes = ExecutionActivityKind::Command.allows_implicit_wake(policy);
+    match lifecycle {
+        // A checkpoint returns the sandbox to the state it left, and the
+        // node's command wake waits it out; a paused result is refused there.
+        SandboxLifecycle::Started
+        | SandboxLifecycle::Creating
+        | SandboxLifecycle::Starting
+        | SandboxLifecycle::Resuming
+        | SandboxLifecycle::Restoring
+        | SandboxLifecycle::Checkpointing => CommandAdmission::Admit,
+        SandboxLifecycle::Created
+        | SandboxLifecycle::Paused
+        | SandboxLifecycle::Suspended
+        | SandboxLifecycle::Pausing
+        | SandboxLifecycle::Suspending => {
+            if wakes {
+                CommandAdmission::AdmitAndWake
+            } else {
+                CommandAdmission::Refuse
+            }
+        }
+        SandboxLifecycle::Stopped
+        | SandboxLifecycle::Stopping
+        | SandboxLifecycle::Deleting
+        | SandboxLifecycle::Failed
+        | SandboxLifecycle::Quarantined => CommandAdmission::Refuse,
+    }
+}
+
+/// The refusal for a new command or process session the sandbox cannot run.
+/// The session store calls it only for a request it has not seen, so a retry
+/// of one that was created replays it whatever state the sandbox is in now.
+fn admit(
+    admission: CommandAdmission,
+    sandbox_id: PublicSandboxId,
+    lifecycle: SandboxLifecycle,
+) -> Result<(), PublicApiError> {
+    match admission {
+        CommandAdmission::Admit | CommandAdmission::AdmitAndWake => Ok(()),
+        CommandAdmission::Refuse => Err(PublicApiError::sandbox_not_running(
+            sandbox_id,
+            &public_lifecycle_state(lifecycle),
+        )),
+    }
+}
+
+fn sandbox_lifecycle(sandbox: &Sandbox) -> Result<SandboxLifecycle, PublicApiError> {
+    sandbox.lifecycle.parse().map_err(|error| {
+        tracing::error!(sandbox_id = %sandbox.id, %error, "sandbox has an unknown lifecycle");
+        PublicApiError::internal()
+    })
+}
+
+/// Queue the wake a new command or process session waits for, or join the
+/// one already queued or running, so a sandbox at rest is placed again even
+/// when no attach can reach it. The operation runs through the dispatcher
+/// like a `:wake`, after any lifecycle operation queued before it, as the
+/// system (no actor) rather than the caller, and only if the sandbox's wake
+/// policy still allows a command wake when it runs. A sandbox still pausing or suspending
+/// refuses the activation for now; the operation retries until it settles.
+///
+/// Called for a replayed session too, so a retry heals a wake that failed to
+/// queue after its session was created.
+async fn enqueue_command_wake(
+    state: &AppState,
+    org_id: OrgId,
+    sandbox_id: PublicSandboxId,
+) -> Result<(), PublicApiError> {
+    let payload = SandboxLifecycleOperationPayload {
+        sandbox_id,
+        action: SandboxLifecycleAction::Wake,
+        rollback: None,
+    }
+    .into_json();
+    PublicOperationStore::new(state.pool.clone())
+        .create_or_join_active_sandbox_wake(
+            org_id,
+            &sandbox_id.to_string(),
+            payload,
+            crate::public_operations::request_traceparent(),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Create a command (one-shot process) data-plane session for `sandbox_id`,
@@ -195,6 +320,7 @@ pub(crate) async fn create_command_session(
     sandbox_id: PublicSandboxId,
     request: CreateCommandRequest,
     idempotency_key: IdempotencyKey,
+    admit: impl FnOnce() -> Result<(), PublicApiError> + Send,
 ) -> Result<PublicCommand, PublicApiError> {
     let request = CreateProcessRequest::from(request);
     validate_process_request(&request)?;
@@ -211,24 +337,27 @@ pub(crate) async fn create_command_session(
         &request_json,
     );
     let session = store
-        .create_session(CreatePublicSession {
-            org_id,
-            actor_user_id: Some(actor_user_id),
-            sandbox_id,
-            kind: SessionKind::Process,
-            target_port: None,
-            target_protocol: None,
-            target_path: None,
-            adapter_state: request_json,
-            fingerprint_payload: &fingerprint_payload,
-            idempotency: CreatePublicSessionIdempotency {
-                method: HttpOperationMethod::Post,
-                path_template: OperationPathTemplate::new(COMMAND_PATH_TEMPLATE),
-                key: &idempotency_key,
+        .create_session(
+            CreatePublicSession {
+                org_id,
+                actor_user_id: Some(actor_user_id),
+                sandbox_id,
+                kind: SessionKind::Process,
+                target_port: None,
+                target_protocol: None,
+                target_path: None,
+                adapter_state: request_json,
+                fingerprint_payload: &fingerprint_payload,
+                idempotency: CreatePublicSessionIdempotency {
+                    method: HttpOperationMethod::Post,
+                    path_template: OperationPathTemplate::new(COMMAND_PATH_TEMPLATE),
+                    key: &idempotency_key,
+                },
             },
-        })
+            admit,
+        )
         .await
-        .map_err(PublicApiError::from)?;
+        .map_err(PublicApiError::from)??;
 
     Ok(PublicCommand::from(session))
 }
@@ -260,7 +389,7 @@ pub async fn create_file_watch_session(
         &request_json,
     );
     let session = create_session(
-        state,
+        &state,
         RouteSessionCreate {
             org_id: org.id,
             actor_user_id: actor.id,
@@ -274,6 +403,7 @@ pub async fn create_file_watch_session(
             idempotency_key: idempotency_key(&headers)?,
             path_template: OperationPathTemplate::new(FILE_WATCH_SESSION_PATH_TEMPLATE),
         },
+        || Ok(()),
     )
     .await?;
 
@@ -323,7 +453,7 @@ pub async fn create_port_session(
         &request_json,
     );
     let session = create_session(
-        state,
+        &state,
         RouteSessionCreate {
             org_id: org.id,
             actor_user_id: actor.id,
@@ -337,6 +467,7 @@ pub async fn create_port_session(
             idempotency_key: idempotency_key(&headers)?,
             path_template: OperationPathTemplate::new(PORT_SESSION_PATH_TEMPLATE),
         },
+        || Ok(()),
     )
     .await?;
 
@@ -387,7 +518,7 @@ pub async fn create_protocol_session(
         &request_json,
     );
     let session = create_session(
-        state,
+        &state,
         RouteSessionCreate {
             org_id: org.id,
             actor_user_id: actor.id,
@@ -401,6 +532,7 @@ pub async fn create_protocol_session(
             idempotency_key: idempotency_key(&headers)?,
             path_template: OperationPathTemplate::new(PROTOCOL_SESSION_PATH_TEMPLATE),
         },
+        || Ok(()),
     )
     .await?;
 
@@ -523,29 +655,33 @@ impl ListSessionsQuery {
 }
 
 async fn create_session(
-    state: AppState,
+    state: &AppState,
     input: RouteSessionCreate<'_>,
+    admit: impl FnOnce() -> Result<(), PublicApiError> + Send,
 ) -> Result<PublicSession, PublicApiError> {
     let store = state.public_session_store();
     store
-        .create_session(CreatePublicSession {
-            org_id: input.org_id,
-            actor_user_id: Some(input.actor_user_id),
-            sandbox_id: input.sandbox_id,
-            kind: input.kind,
-            target_port: input.target_port,
-            target_protocol: input.target_protocol,
-            target_path: input.target_path,
-            adapter_state: input.request_json,
-            fingerprint_payload: &input.fingerprint_payload,
-            idempotency: CreatePublicSessionIdempotency {
-                method: HttpOperationMethod::Post,
-                path_template: input.path_template,
-                key: &input.idempotency_key,
+        .create_session(
+            CreatePublicSession {
+                org_id: input.org_id,
+                actor_user_id: Some(input.actor_user_id),
+                sandbox_id: input.sandbox_id,
+                kind: input.kind,
+                target_port: input.target_port,
+                target_protocol: input.target_protocol,
+                target_path: input.target_path,
+                adapter_state: input.request_json,
+                fingerprint_payload: &input.fingerprint_payload,
+                idempotency: CreatePublicSessionIdempotency {
+                    method: HttpOperationMethod::Post,
+                    path_template: input.path_template,
+                    key: &input.idempotency_key,
+                },
             },
-        })
+            admit,
+        )
         .await
-        .map_err(PublicApiError::from)
+        .map_err(PublicApiError::from)?
 }
 
 struct RouteSessionCreate<'a> {

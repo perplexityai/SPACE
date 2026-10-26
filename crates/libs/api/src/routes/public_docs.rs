@@ -146,10 +146,11 @@ fn public_openapi_value() -> Value {
             "/sandboxes/{sandbox_id}/process-sessions": {
                 "post": {
                     "summary": "Create a process session",
+                    "description": "A sandbox that is not running is handled as `createCommand` handles it: woken when its `auto_lifecycle.wake.on` includes `command` or `access`, otherwise refused with a `sandbox_not_running` conflict.",
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "201": { "description": "Process session with attach token" },
-                        "409": { "description": "Idempotency conflict, or a replayed create whose session was revoked" }
+                        "409": { "description": "Idempotency conflict, a replayed create whose session was revoked, or the sandbox is not running and this process cannot wake it" }
                     }
                 }
             },

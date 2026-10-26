@@ -24,6 +24,7 @@ use tracing::Instrument;
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
 use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
+use crate::controllers::substrate::ExecutionActivityKind;
 use crate::controllers::{ControllerError, SnapshotUploadCheck, SnapshotUploadInFlight};
 use crate::models::{
     CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
@@ -716,7 +717,14 @@ impl SandboxLifecycleOperationExecutor {
                 "sandbox rollback completed",
             ));
         }
-        let controller_action = sandbox_action(payload.action)?;
+        let controller_action = if is_implicit_command_wake(operation, payload.action) {
+            if !ExecutionActivityKind::Command.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
+                return Err(SandboxLifecycleExecutionError::ImplicitWakeNotAllowed);
+            }
+            SandboxAction::ImplicitWake(ExecutionActivityKind::Command)
+        } else {
+            sandbox_action(payload.action)?
+        };
         let body = self
             .controller
             .action(
@@ -936,6 +944,25 @@ fn completed_lifecycle_target_state(
     }
 }
 
+/// A native wake operation with no actor is the system's wake for a command
+/// or process session (`create_or_join_active_sandbox_wake`): no caller asked
+/// for it, so it runs only while the sandbox's wake policy, read now, still
+/// lets a command wake it. Nothing else creates one, with one exception:
+/// `public_operations.actor_user_id` is `ON DELETE SET NULL`, so a caller's
+/// queued `:wake` whose user is deleted before it runs is recognized here too,
+/// and refused if the policy forbids a command wake; no caller remains to want
+/// it. A controller without this check runs it as the plain `:wake` the
+/// policy allowed at enqueue.
+fn is_implicit_command_wake(
+    operation: &ClaimedPublicOperation,
+    action: SandboxLifecycleAction,
+) -> bool {
+    action == SandboxLifecycleAction::Wake
+        && operation.kind == OperationKind::WakeSandbox
+        && operation.api_product == ApiProduct::Native
+        && operation.actor_user_id.is_none()
+}
+
 fn sandbox_action(
     action: SandboxLifecycleAction,
 ) -> Result<SandboxAction, SandboxLifecycleExecutionError> {
@@ -1041,6 +1068,8 @@ enum SandboxLifecycleExecutionError {
     MissingRollbackSnapshotName,
     #[error("unsupported sandbox lifecycle action '{0}'")]
     UnsupportedAction(SandboxLifecycleAction),
+    #[error("the sandbox's wake policy no longer lets a command wake it")]
+    ImplicitWakeNotAllowed,
     #[error("unknown sandbox lifecycle: {0}")]
     UnknownLifecycle(#[from] SandboxLifecycleParseError),
     #[error("database error: {0}")]
@@ -1068,6 +1097,11 @@ impl SandboxLifecycleExecutionError {
             Self::SandboxNotFound => PublicOperationExecutionResult::failed(
                 "sandbox not found",
                 PublicErrorCode::NotFound,
+                terminal_error_json(operation, self.to_string()),
+            ),
+            Self::ImplicitWakeNotAllowed => PublicOperationExecutionResult::failed(
+                "sandbox wake policy no longer allows this wake",
+                PublicErrorCode::Conflict,
                 terminal_error_json(operation, self.to_string()),
             ),
             Self::Sql(error) => {

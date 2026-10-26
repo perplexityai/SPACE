@@ -2077,14 +2077,69 @@ pub struct PublicErrorEnvelope {
     /// the sandbox is yours and the path inside it does not exist; any other
     /// `not_found`, including a missing or unowned sandbox, carries none. A
     /// `conflict` from replaying a session create whose session has ended
-    /// carries `{"key": "reason", "value": "session_ended"}`. An
-    /// `invalid_request` for a command streamed with a `pty` carries
-    /// `{"key": "field", "value": "pty"}`.
+    /// carries `{"key": "reason", "value": "session_ended"}`. A `conflict`
+    /// refusing a command because the sandbox is not running carries `reason`
+    /// (`sandbox_not_running`), `state` (the sandbox's lifecycle state) and,
+    /// unless the sandbox is deleting or failed, `wake` (the request that
+    /// returns it to running). An `invalid_request` for a command streamed
+    /// with a `pty` carries `{"key": "field", "value": "pty"}`.
     pub details: Vec<PublicErrorDetail>,
 }
 
 /// [`PublicErrorDetail::key`] naming which resource a `not_found` is about.
 pub const NOT_FOUND_RESOURCE_DETAIL_KEY: &str = "resource";
+
+/// [`CONFLICT_REASON_DETAIL_KEY`] value when work needs a running sandbox and
+/// the sandbox's wake policy does not let this request wake it.
+pub const CONFLICT_REASON_SANDBOX_NOT_RUNNING: &str = "sandbox_not_running";
+
+/// [`PublicErrorDetail::key`] carrying the sandbox's [`SandboxLifecycleState`]
+/// alongside [`CONFLICT_REASON_SANDBOX_NOT_RUNNING`].
+pub const SANDBOX_STATE_DETAIL_KEY: &str = "state";
+
+/// [`PublicErrorDetail::key`] carrying the method and path that return the
+/// sandbox to running, alongside [`CONFLICT_REASON_SANDBOX_NOT_RUNNING`]:
+/// the wake action, or the start action for a stopped sandbox, which wake
+/// refuses. Omitted for a sandbox that no action returns to running.
+pub const SANDBOX_WAKE_DETAIL_KEY: &str = "wake";
+
+/// The ordered details of a [`CONFLICT_REASON_SANDBOX_NOT_RUNNING`] conflict,
+/// shared by the management API and the data plane so both answer the same.
+pub fn sandbox_not_running_details(
+    sandbox_id: PublicSandboxId,
+    state: &SandboxLifecycleState,
+) -> Vec<PublicErrorDetail> {
+    let wake = match state {
+        SandboxLifecycleState::Stopping | SandboxLifecycleState::Stopped => {
+            Some(routes::START_SANDBOX)
+        }
+        SandboxLifecycleState::Deleting
+        | SandboxLifecycleState::Deleted
+        | SandboxLifecycleState::Failed => None,
+        _ => Some(routes::WAKE_SANDBOX),
+    }
+    .map(|action| {
+        let path = action
+            .path()
+            .replace("{sandbox_id}", &sandbox_id.to_string());
+        format!("POST {path}")
+    });
+    [
+        Some((
+            CONFLICT_REASON_DETAIL_KEY,
+            CONFLICT_REASON_SANDBOX_NOT_RUNNING.to_string(),
+        )),
+        Some((SANDBOX_STATE_DETAIL_KEY, state.as_str().to_string())),
+        wake.map(|wake| (SANDBOX_WAKE_DETAIL_KEY, wake)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(key, value)| PublicErrorDetail {
+        key: key.to_string(),
+        value,
+    })
+    .collect()
+}
 
 /// [`NOT_FOUND_RESOURCE_DETAIL_KEY`] value of a `not_found` for a guest path in
 /// a sandbox the caller owns. Never set for the sandbox itself, so a missing

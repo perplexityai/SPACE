@@ -2,13 +2,15 @@
 
 use pplx_space_public_api::{
     DataPlaneHttpError, DataPlaneHttpErrorCode, DataPlaneHttpErrorEnvelope, PublicErrorCode,
-    PublicErrorEnvelope,
+    PublicErrorEnvelope, PublicSandboxId, SandboxLifecycleState,
     routes::{
         CREATE_COMMAND, CREATE_SANDBOX, DELETE_SANDBOX, NATIVE_V1_OPERATIONS, NativeOperation,
         PAUSE_SANDBOX, STREAM_SESSION_EVENTS, SUSPEND_SANDBOX, WAKE_SANDBOX,
     },
+    sandbox_not_running_details,
 };
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::routes::public::error::error_contract;
 
@@ -52,7 +54,10 @@ fn control_plane_examples(
             .map(|code| {
                 let (_, retryable) = error_contract(&code);
                 let name = code.as_str().to_owned();
+                // createCommand's conflict is the sandbox not running.
+                let not_running = operation == CREATE_COMMAND && code == Conflict;
                 let message = match code {
+                    Conflict if not_running => "sandbox is suspended, not running",
                     Conflict => "Request conflicts with the current state",
                     IdempotencyConflict => "Idempotency key was used with a different request",
                     CapacityUnavailable => "Sandbox capacity is temporarily unavailable",
@@ -65,7 +70,14 @@ fn control_plane_examples(
                     message: message.to_owned(),
                     request_id: None,
                     retryable,
-                    details: Vec::new(),
+                    details: if not_running {
+                        sandbox_not_running_details(
+                            PublicSandboxId::from_uuid(Uuid::nil()),
+                            &SandboxLifecycleState::Suspended,
+                        )
+                    } else {
+                        Vec::new()
+                    },
                 };
                 (name, json!({"description": EXAMPLE_NOTE, "value": value}))
             })

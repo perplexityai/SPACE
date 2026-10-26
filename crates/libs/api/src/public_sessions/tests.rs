@@ -6,6 +6,20 @@ use super::*;
 
 use pplx_space_test_env::TestResult;
 
+/// [`PublicSessionStore::create_session`] with nothing to refuse it.
+async fn create_unrefused(
+    store: &PublicSessionStore,
+    input: CreatePublicSession<'_>,
+) -> Result<PublicSession, PublicSessionStoreError> {
+    match store
+        .create_session(input, || Ok::<(), std::convert::Infallible>(()))
+        .await?
+    {
+        Ok(session) => Ok(session),
+        Err(never) => match never {},
+    }
+}
+
 #[test]
 fn events_url_is_only_exposed_for_event_stream_sessions() {
     let process_id = DataPlaneSessionId::Process(Default::default());
@@ -55,8 +69,9 @@ async fn create_terminal_session_persists_scoped_token_and_operation() -> TestRe
     let key = IdempotencyKey::parse("terminal-session-1")?;
     let store = PublicSessionStore::with_data_plane_base_url(db.pool.clone(), "https://dp.example");
 
-    let session = store
-        .create_session(CreatePublicSession {
+    let session = create_unrefused(
+        &store,
+        CreatePublicSession {
             org_id: OrgId::from_uuid(org_id),
             actor_user_id: Some(UserId::from_uuid(actor_id)),
             sandbox_id: public_sandbox_id,
@@ -73,8 +88,9 @@ async fn create_terminal_session_persists_scoped_token_and_operation() -> TestRe
                 ),
                 key: &key,
             },
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     assert_eq!(session.kind, SessionKind::Terminal);
     assert_eq!(session.sandbox_id, public_sandbox_id);
@@ -194,8 +210,8 @@ async fn idempotency_replay_reuses_session_and_mints_new_token() -> TestResult {
         },
     };
 
-    let first = store.create_session(input.clone()).await?;
-    let second = store.create_session(input).await?;
+    let first = create_unrefused(&store, input.clone()).await?;
+    let second = create_unrefused(&store, input).await?;
     assert_eq!(first.id, second.id);
     assert_ne!(
         first.attach.as_ref().expect("first token").token,
@@ -261,7 +277,7 @@ async fn create_session_reuses_key_after_idempotency_retention_expires() -> Test
         },
     };
 
-    let first = store.create_session(input.clone()).await?;
+    let first = create_unrefused(&store, input.clone()).await?;
     sqlx::query(sql!(
         "UPDATE public_idempotency_records
          SET expires_at = NOW() - INTERVAL '1 second'
@@ -272,7 +288,7 @@ async fn create_session_reuses_key_after_idempotency_retention_expires() -> Test
     .execute(&db.pool)
     .await?;
 
-    let second = store.create_session(input).await?;
+    let second = create_unrefused(&store, input).await?;
     assert_ne!(second.id, first.id);
     let session_count = sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*)
@@ -315,7 +331,7 @@ async fn create_statements(
     let session = {
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
         keep_query_events_enabled();
-        store.create_session(input).await?
+        create_unrefused(store, input).await?
     };
     let statements = events
         .events()
@@ -513,7 +529,8 @@ async fn concurrent_idempotent_create_replays_one_session() -> TestResult {
     };
 
     let results =
-        futures_util::future::join_all((0..16).map(|_| store.create_session(input.clone()))).await;
+        futures_util::future::join_all((0..16).map(|_| create_unrefused(&store, input.clone())))
+            .await;
     let mut sessions = Vec::new();
     for result in results {
         sessions.push(result?);
@@ -572,8 +589,9 @@ async fn create_port_session_advertises_proxy_endpoint_and_header_token() -> Tes
     let store =
         PublicSessionStore::with_data_plane_base_url(db.pool.clone(), "https://dp.example/");
 
-    let session = store
-        .create_session(CreatePublicSession {
+    let session = create_unrefused(
+        &store,
+        CreatePublicSession {
             org_id: OrgId::from_uuid(org_id),
             actor_user_id: Some(UserId::from_uuid(actor_id)),
             sandbox_id: public_sandbox_id,
@@ -590,8 +608,9 @@ async fn create_port_session_advertises_proxy_endpoint_and_header_token() -> Tes
                 ),
                 key: &key,
             },
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     assert_eq!(session.kind, SessionKind::Port);
     assert_eq!(session.target_port, Some(8080));
@@ -632,8 +651,9 @@ async fn idempotency_rejects_fingerprint_mismatch() -> TestResult {
     let key = IdempotencyKey::parse("port-session-1")?;
     let store = PublicSessionStore::with_data_plane_base_url(db.pool.clone(), "");
 
-    store
-        .create_session(CreatePublicSession {
+    create_unrefused(
+        &store,
+        CreatePublicSession {
             org_id: OrgId::from_uuid(org_id),
             actor_user_id: Some(UserId::from_uuid(actor_id)),
             sandbox_id: public_sandbox_id,
@@ -657,11 +677,13 @@ async fn idempotency_rejects_fingerprint_mismatch() -> TestResult {
                 ),
                 key: &key,
             },
-        })
-        .await?;
+        },
+    )
+    .await?;
 
-    let conflict = store
-        .create_session(CreatePublicSession {
+    let conflict = create_unrefused(
+        &store,
+        CreatePublicSession {
             org_id: OrgId::from_uuid(org_id),
             actor_user_id: Some(UserId::from_uuid(actor_id)),
             sandbox_id: public_sandbox_id,
@@ -685,9 +707,10 @@ async fn idempotency_rejects_fingerprint_mismatch() -> TestResult {
                 ),
                 key: &key,
             },
-        })
-        .await
-        .expect_err("mismatched idempotency fingerprint must fail");
+        },
+    )
+    .await
+    .expect_err("mismatched idempotency fingerprint must fail");
     assert!(matches!(
         conflict,
         PublicSessionStoreError::IdempotencyConflict
@@ -713,8 +736,9 @@ async fn list_sessions_filters_by_kind_and_returns_without_attach_token() -> Tes
     let terminal_key = IdempotencyKey::parse("list-terminal-session")?;
 
     let terminal_request = serde_json::json!({"command": [], "env": {}});
-    let terminal = store
-        .create_session(CreatePublicSession {
+    let terminal = create_unrefused(
+        &store,
+        CreatePublicSession {
             org_id: OrgId::from_uuid(org_id),
             actor_user_id: Some(UserId::from_uuid(actor_id)),
             sandbox_id: public_sandbox_id,
@@ -738,13 +762,15 @@ async fn list_sessions_filters_by_kind_and_returns_without_attach_token() -> Tes
                 ),
                 key: &terminal_key,
             },
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     let port_key = IdempotencyKey::parse("list-port-session")?;
     let port_request = serde_json::json!({"port": 8080, "protocol": "http"});
-    let port = store
-        .create_session(CreatePublicSession {
+    let port = create_unrefused(
+        &store,
+        CreatePublicSession {
             org_id: OrgId::from_uuid(org_id),
             actor_user_id: Some(UserId::from_uuid(actor_id)),
             sandbox_id: public_sandbox_id,
@@ -768,8 +794,9 @@ async fn list_sessions_filters_by_kind_and_returns_without_attach_token() -> Tes
                 ),
                 key: &port_key,
             },
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     let all = store
         .list_sessions(ListPublicSessions {
@@ -816,8 +843,9 @@ async fn revoke_session_marks_revoked_and_is_idempotent() -> TestResult {
     let request = serde_json::json!({"command": [], "env": {}});
     let store = PublicSessionStore::with_data_plane_base_url(db.pool.clone(), "");
     let key = IdempotencyKey::parse("revoke-terminal-session")?;
-    let session = store
-        .create_session(CreatePublicSession {
+    let session = create_unrefused(
+        &store,
+        CreatePublicSession {
             org_id: OrgId::from_uuid(org_id),
             actor_user_id: Some(UserId::from_uuid(actor_id)),
             sandbox_id: public_sandbox_id,
@@ -841,8 +869,9 @@ async fn revoke_session_marks_revoked_and_is_idempotent() -> TestResult {
                 ),
                 key: &key,
             },
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     let revoked = store
         .revoke_session(RevokePublicSession {
@@ -939,6 +968,7 @@ async fn command_session_persists_the_requested_guest_user() -> TestResult {
             public_sandbox_id,
             request(guest_user.clone()),
             IdempotencyKey::parse(key)?,
+            || Ok(()),
         )
         .await
         .expect("command session is created");
@@ -1015,6 +1045,7 @@ async fn command_session_runs_under_sandbox_org_for_cross_org_caller() -> TestRe
         public_sandbox_id,
         request,
         key,
+        || Ok(()),
     )
     .await
     .expect("admin command session is created for a cross-org sandbox");
@@ -1143,8 +1174,9 @@ impl ReplayableCreate {
     }
 
     async fn create(&self) -> Result<PublicSession, PublicSessionStoreError> {
-        self.store
-            .create_session(CreatePublicSession {
+        create_unrefused(
+            &self.store,
+            CreatePublicSession {
                 org_id: self.org_id,
                 actor_user_id: Some(self.actor_id),
                 sandbox_id: self.sandbox_id,
@@ -1161,8 +1193,9 @@ impl ReplayableCreate {
                     ),
                     key: &self.key,
                 },
-            })
-            .await
+            },
+        )
+        .await
     }
 }
 
