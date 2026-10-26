@@ -509,7 +509,18 @@ impl TemplateManagerService {
                 )));
             }
         };
-        validate_guest_documents(&metadata_bytes, &manifest_bytes)?;
+        let metadata = validate_guest_documents(&metadata_bytes, &manifest_bytes)?;
+        if metadata.guest_image.is_some() {
+            self.authorize_peer(
+                &request,
+                "RegisterFirmwareTemplate",
+                &[
+                    UdsPeerPrincipal::Root,
+                    UdsPeerPrincipal::Role(LocalRole::Operator),
+                ],
+            )?;
+            self.require_local_firmware_consumer().await?;
+        }
 
         // Network policy validation is independent of the content hash, so run
         // it before any disk work.

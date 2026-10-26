@@ -9,9 +9,9 @@ use std::num::{NonZeroU32, NonZeroU64};
 mod cloud_hypervisor;
 mod firecracker;
 
-/// Inputs for the Linux direct-boot adapters. Firmware and library-backed
-/// runtimes can introduce their own boot input without changing lifecycle intent.
-pub struct LinuxBoot<'a> {
+/// Resources for a catalog-qualified guest boot. The source selects direct
+/// kernel boot or firmware without making the lifecycle invent a kernel.
+pub struct GuestBoot<'a> {
     pub guest: GuestPlatform,
     pub cpus: VcpuCount,
     pub memory_mib: NonZeroU64,
@@ -24,14 +24,66 @@ pub struct LinuxBoot<'a> {
     pub huge_pages: bool,
     pub console: bool,
     pub builder: bool,
-    pub initramfs: bool,
+    pub source: BootSource,
+}
+
+/// The launch boundary derives this from verified execution metadata, not from
+/// caller-provided runtime JSON.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootSource {
+    LinuxDirect { initramfs: bool },
+    Uefi,
+}
+
+impl BootSource {
+    pub fn from_execution(execution: &ExecutionMetadata) -> Result<Self, BootConfigError> {
+        let has_firmware = execution
+            .components()
+            .iter()
+            .any(|component| component.kind == ArtifactComponentKind::Firmware);
+        let qualified_firmware = match execution.components() {
+            [component] => {
+                component.kind == ArtifactComponentKind::Firmware
+                    && component.role.as_ref().map(|role| role.as_str()) == Some("firmware")
+                    && component.digest.is_some()
+                    && component.format.as_ref().map(|format| format.as_str()) == Some("edk2-fd")
+            }
+            _ => false,
+        };
+        match execution.guest().os {
+            GuestOperatingSystem::Linux if !has_firmware => Ok(Self::LinuxDirect {
+                initramfs: initramfs_component(execution)?.is_some(),
+            }),
+            GuestOperatingSystem::Windows
+                if execution.runtime().kind == RuntimeKind::CloudHypervisor
+                    && execution.guest().architecture == Arch::X86_64
+                    && execution.environment().is_some()
+                    && qualified_firmware =>
+            {
+                Ok(Self::Uefi)
+            }
+            _ => Err(BootConfigError::Guest(execution.guest())),
+        }
+    }
+
+    pub fn disk_layout(self) -> pplx_space_execution_spec::guest_image::GuestDiskLayout {
+        use pplx_space_execution_spec::guest_image::GuestDiskLayout;
+        match self {
+            Self::LinuxDirect { .. } => GuestDiskLayout::Ext4Filesystem,
+            Self::Uefi => GuestDiskLayout::OpaqueRawDisk,
+        }
+    }
+
+    pub fn has_initramfs(self) -> bool {
+        matches!(self, Self::LinuxDirect { initramfs: true })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootConfigError {
-    #[error("runtime {0} has no Linux direct-boot adapter")]
+    #[error("runtime {0} has no boot adapter")]
     UnsupportedRuntime(RuntimeKind),
-    #[error("Linux direct boot cannot boot guest {0:?}")]
+    #[error("unqualified boot source for guest {0:?}")]
     Guest(GuestPlatform),
     #[error("{feature} is not qualified for runtime {runtime}")]
     UnsupportedFeature {
@@ -52,12 +104,15 @@ pub enum BootConfigError {
 
 pub fn configuration(
     runtime: RuntimeKind,
-    input: &LinuxBoot<'_>,
+    input: &GuestBoot<'_>,
 ) -> Result<String, BootConfigError> {
-    if input.guest.os != GuestOperatingSystem::Linux {
-        return Err(BootConfigError::Guest(input.guest));
+    match (input.source, input.guest.os, input.guest.architecture) {
+        (BootSource::LinuxDirect { .. }, GuestOperatingSystem::Linux, _) => {}
+        (BootSource::Uefi, GuestOperatingSystem::Windows, Arch::X86_64)
+            if runtime == RuntimeKind::CloudHypervisor && !input.builder => {}
+        _ => return Err(BootConfigError::Guest(input.guest)),
     }
-    if input.initramfs && runtime != RuntimeKind::CloudHypervisor {
+    if input.source.has_initramfs() && runtime != RuntimeKind::CloudHypervisor {
         return Err(BootConfigError::UnsupportedFeature {
             runtime,
             feature: "authenticated initramfs",
@@ -77,12 +132,12 @@ pub fn configuration(
 pub fn with_exclusive_devices(
     runtime: RuntimeKind,
     configuration: &str,
-    initramfs: bool,
+    source: BootSource,
     devices: &pplx_space_execution_common::devices::DeviceExecution,
     resources: crate::catalog::DeviceResourceLimits,
     reserved_memory_mib: u64,
 ) -> Result<String, BootConfigError> {
-    validate_standalone(runtime, configuration, initramfs)?;
+    validate_standalone(runtime, configuration, source)?;
     let mut value: serde_json::Value = serde_json::from_str(configuration)?;
     let guest_bytes = value
         .pointer("/memory/size")
@@ -130,7 +185,7 @@ pub fn initramfs_component(
     Ok(Some(component))
 }
 
-fn command_line(input: &LinuxBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
+fn command_line(input: &GuestBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
     use pplx_space_common_core::guest::linux::network::{
         GATEWAY_IPV4_ADDR, IPV4_ADDR, IPV4_NETMASK, PRIMARY_INTERFACE,
     };
@@ -154,7 +209,7 @@ fn command_line(input: &LinuxBoot<'_>, devices: &str, uart: &str, console: &str)
     };
     // Module-bearing boot bundles must not make template-controlled modules
     // loadable merely because the selected kernel permits optional enforcement.
-    let modules = if input.initramfs {
+    let modules = if input.source.has_initramfs() {
         " module.sig_enforce=1"
     } else {
         ""
@@ -188,10 +243,10 @@ fn object<const N: usize>(
 pub fn validate_standalone(
     runtime: RuntimeKind,
     configuration: &str,
-    initramfs: bool,
+    source: BootSource,
 ) -> Result<(), BootConfigError> {
     match runtime {
-        RuntimeKind::CloudHypervisor => cloud_hypervisor::validate(configuration, initramfs),
+        RuntimeKind::CloudHypervisor => cloud_hypervisor::validate(configuration, source),
         _ => Err(BootConfigError::UnsupportedRuntime(runtime)),
     }
 }
