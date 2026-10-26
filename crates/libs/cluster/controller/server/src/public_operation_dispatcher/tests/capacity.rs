@@ -400,3 +400,76 @@ async fn other_work_starts_while_other_work_already_runs_and_teardowns_are_due()
     tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_claim_only_teardowns_could_use_waits_before_the_next() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let targets = (0..3)
+        .map(|index| format!("sbx_outage_create_{index}"))
+        .collect::<Vec<_>>();
+    let creates = queue_all(
+        &store,
+        org_id,
+        &targets
+            .iter()
+            .map(|target_id| (OperationKind::CreateSandbox, target_id.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    let executor = HeldWork::default();
+    let claims = Arc::new(AtomicUsize::new(0));
+    let hook: BeforeClaimHook = {
+        let claims = claims.clone();
+        Arc::new(move || {
+            claims.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        })
+    };
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(super::BEFORE_CLAIM.scope(
+        hook,
+        run(
+            ReconcilerConfig {
+                delete_reserved_slots: 1,
+                non_delete_reserved_slots: 0,
+                ..fast_loop_config(3)
+            },
+            store.clone(),
+            executor.clone(),
+            shutdown.clone(),
+        ),
+    ));
+    // Other work holds every slot open to it, so only the slot kept for
+    // teardowns is free, and the third create is due but cannot start.
+    wait_for_running(&executor, 2).await?;
+    let before = claims.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // About four claims a second, not one every 20 ms tick.
+    let during = claims.load(Ordering::SeqCst) - before;
+    assert!((1..=8).contains(&during), "{during} claims in a second");
+
+    // A teardown requested meanwhile still starts in its slot.
+    let delete = queue_all(
+        &store,
+        org_id,
+        &[(
+            OperationKind::DeleteSandbox,
+            "sbx_deleted_during_the_outage",
+        )],
+    )
+    .await?[0];
+    wait_for_state(&db.pool, delete, OperationState::Succeeded).await?;
+    assert_eq!(executor.running.load(Ordering::SeqCst), 2);
+
+    executor.release.cancel();
+    for create in creates {
+        wait_for_state(&db.pool, create, OperationState::Succeeded).await?;
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}

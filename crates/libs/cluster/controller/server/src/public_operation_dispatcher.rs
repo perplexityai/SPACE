@@ -62,6 +62,11 @@ const DELETE_RESERVED_SLOTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_DELET
 const DEFAULT_NON_DELETE_RESERVED_SLOTS: u32 = 2;
 const NON_DELETE_RESERVED_SLOTS_ENV: &str =
     "SPACE_PUBLIC_OPERATION_DISPATCHER_NON_DELETE_RESERVED_SLOTS";
+/// After a claim that took nothing while only slots kept for teardowns were
+/// free, how long the loop waits before claiming again, unless an execution
+/// finishes first. Other work cannot start in those slots, so until a
+/// teardown is due such a claim reads the whole backlog for nothing.
+const HELD_BACK_CLAIM_BACKOFF: Duration = Duration::from_millis(250);
 const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
 /// How soon an operation handed back because its key is already executing
 /// in this process becomes claimable again.
@@ -398,6 +403,7 @@ pub async fn run<E>(
     // while other work is due, teardowns leave the last free slots other work
     // may use to it.
     let other_concurrency = concurrency - delete_reserved_slots;
+    let mut claim_backoff_until: Option<Instant> = None;
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
     let mut busy_keys: HashMap<String, OperationId> = HashMap::new();
@@ -418,6 +424,7 @@ pub async fn run<E>(
                 // Free finished executions' slots and keys before claiming.
                 while let Some(joined) = in_flight.try_join_next_with_id() {
                     finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
+                    claim_backoff_until = None;
                 }
                 pplx_space_metrics::operations::dispatcher_slots(in_flight.len(), concurrency);
                 if last_expiry_sweep.is_none_or(|at| at.elapsed() >= EXPIRY_SWEEP_INTERVAL) {
@@ -436,7 +443,9 @@ pub async fn run<E>(
                     }
                 }
                 let free = concurrency.saturating_sub(in_flight.len());
-                if free == 0 {
+                if free == 0
+                    || claim_backoff_until.is_some_and(|until| Instant::now() < until)
+                {
                     continue;
                 }
                 let free_other = other_concurrency.saturating_sub(other_tasks.len());
@@ -460,10 +469,15 @@ pub async fn run<E>(
                     Ok(claim) => {
                         // An execution that committed while the claim ran
                         // must not make its successor look busy.
+                        let mut finished_meanwhile = false;
                         while let Some(joined) = in_flight.try_join_next_with_id() {
                             finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
+                            finished_meanwhile = true;
                         }
                         let claimed = claim.operations.len();
+                        // Only a teardown could start, and none was due.
+                        claim_backoff_until = (claimed == 0 && free_other == 0 && !finished_meanwhile)
+                            .then(|| Instant::now() + HELD_BACK_CLAIM_BACKOFF);
                         for operation in claim.operations {
                             let key = config
                                 .keyed_claim_enabled
@@ -535,6 +549,7 @@ pub async fn run<E>(
             }
             Some(joined) = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
                 finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
+                claim_backoff_until = None;
             }
             Some(_) = hand_backs.join_next(), if !hand_backs.is_empty() => {}
             _ = shutdown_token.cancelled() => break,
