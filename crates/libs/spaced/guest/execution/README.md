@@ -358,6 +358,39 @@ Disabling recovery waits for admitted control calls, including a blocked stdin
 write; it does not wait for read streams or legacy calls. Bound pending calls
 with an application deadline before preparing a snapshot. Version 1 adds fencing
 only: a cancelled write may have delivered a prefix, and input or signals must
-not be automatically retried. Mutation receipts are a separate extension.
+not be automatically retried. Version-2 mutation receipts are described below.
 The daemon routing path still filters `process_recovery_handles` until its
 activation handshake and forwarding support are implemented.
+
+## Sequenced process mutations
+
+With `process_mutation_receipts`, native `SendInput`, `CloseStdin` and
+`SendSignal` accept a version-2 `RecoveryHandle` with a nonzero `sequence`.
+Use one ordered sequence per handle, starting at 1, shared across those three
+methods. Resolve each result before submitting the next sequence. Reconnect and
+PTY resize continue to use version 1 without a sequence. Older implementations
+reject version 2 before effects; never fall back to an unsequenced request after
+an uncertain result.
+
+A duplicate with the same operation and payload waits for its owner or replays
+its terminal success or error, including after process exit. A conflicting
+payload is `InvalidArgument`. An out-of-order sequence or an evicted receipt is
+`FailedPrecondition`, with a typed `RecoveryReason`. The last 64 terminal receipts
+stay with the process record; eviction never resets its high-water mark. Each
+receipt stores a fixed-size digest and bounded outcome, not stdin bytes.
+
+All sequenced calls, including duplicate waiters, hold payload admission. Once
+an effect begins, its tracked owner keeps capacity and the activation lease
+until the outcome is published, even if the caller drops its future. Quiescing
+recovery therefore waits for that owner; a caller deadline does not cancel it.
+If an owner cannot settle, abort snapshot preparation or cancel and drain the
+service. Cancellation permanently closes that service.
+
+Interrupted input reports `Aborted` with `InputOutcomeUncertain` and the known
+written prefix in `space-process-input-written`. This counts bytes accepted by
+the writer, not bytes consumed by the child. Do not resend the remainder.
+An owner lost after beginning records `MutationOutcomeUnknown`; retries preserve
+that uncertainty. Signals acknowledge OS delivery attempts, not handling by the
+child. Legacy and version-1 controls remain outside this ordering, so callers
+must coordinate any mixing. Daemon routing still filters this capability until
+its activation handshake and forwarding are implemented.

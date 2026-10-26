@@ -63,7 +63,7 @@ pub fn validate_start(request: &StartRequest) -> Result<Option<RecoveryFence>, S
     Ok(Some(fence))
 }
 
-/// Stable reason attached to a failed recovery fence. Tokens are not credentials.
+/// Stable reason attached to a failed recovery request. Tokens are not credentials.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryReason {
     UnsupportedContract,
@@ -73,6 +73,10 @@ pub enum RecoveryReason {
     TemporarilyUnavailable,
     StartModeMismatch,
     StartKeyExpired,
+    MutationReceiptExpired,
+    MutationOutOfOrder,
+    MutationOutcomeUnknown,
+    InputOutcomeUncertain,
 }
 
 impl RecoveryReason {
@@ -85,6 +89,10 @@ impl RecoveryReason {
             Self::TemporarilyUnavailable => "temporarily_unavailable",
             Self::StartModeMismatch => "start_mode_mismatch",
             Self::StartKeyExpired => "start_key_expired",
+            Self::MutationReceiptExpired => "mutation_receipt_expired",
+            Self::MutationOutOfOrder => "mutation_out_of_order",
+            Self::MutationOutcomeUnknown => "mutation_outcome_unknown",
+            Self::InputOutcomeUncertain => "input_outcome_uncertain",
         }
     }
     pub fn into_status(self) -> Status {
@@ -96,12 +104,21 @@ impl RecoveryReason {
             Self::TemporarilyUnavailable => "process recovery is temporarily unavailable",
             Self::StartModeMismatch => "idempotency_key belongs to a different start mode",
             Self::StartKeyExpired => "idempotency_key expired",
+            Self::MutationReceiptExpired => "mutation receipt expired; outcome cannot be replayed",
+            Self::MutationOutOfOrder => {
+                "resolve earlier mutations before sending the next sequence"
+            }
+            Self::MutationOutcomeUnknown => "process mutation outcome unknown",
+            Self::InputOutcomeUncertain => "stdin write interrupted; do not resend its remainder",
         };
-        let mut status = if self == Self::TemporarilyUnavailable {
-            Status::unavailable(message)
-        } else {
-            Status::failed_precondition(message)
-        };
+        let mut status = Status::new(
+            match self {
+                Self::TemporarilyUnavailable => tonic::Code::Unavailable,
+                Self::MutationOutcomeUnknown | Self::InputOutcomeUncertain => tonic::Code::Aborted,
+                _ => tonic::Code::FailedPrecondition,
+            },
+            message,
+        );
         status.metadata_mut().insert(
             RECOVERY_REASON_METADATA_KEY,
             tonic::metadata::MetadataValue::from_static(self.as_str()),
@@ -137,6 +154,10 @@ impl std::str::FromStr for RecoveryReason {
             "temporarily_unavailable" => Self::TemporarilyUnavailable,
             "start_mode_mismatch" => Self::StartModeMismatch,
             "start_key_expired" => Self::StartKeyExpired,
+            "mutation_receipt_expired" => Self::MutationReceiptExpired,
+            "mutation_out_of_order" => Self::MutationOutOfOrder,
+            "mutation_outcome_unknown" => Self::MutationOutcomeUnknown,
+            "input_outcome_uncertain" => Self::InputOutcomeUncertain,
             _ => return Err(ParseRecoveryReason),
         })
     }
@@ -144,13 +165,20 @@ impl std::str::FromStr for RecoveryReason {
 pub const RECOVERY_REASON_METADATA_KEY: &str = "space-process-recovery-reason";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlContract {
+    Fenced,
+    Sequenced(std::num::NonZeroU64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessHandle {
+    pub contract: ControlContract,
     pub fence: RecoveryFence,
     pub process_id: ProcessId,
     pub incarnation: ProcessRecoveryToken,
 }
 
-/// Version 1 fences calls but does not deduplicate input, close or signals.
+/// Version 1 fences calls. Version 2 requires ordered mutation receipts.
 /// Missing envelopes select legacy validation; a recovery request must leave
 /// the legacy ID empty so an older peer cannot silently execute it unfenced.
 pub fn validate_handle(
@@ -160,15 +188,26 @@ pub fn validate_handle(
     let Some(recovery) = recovery else {
         return Ok(None);
     };
-    if recovery.contract_version != CONTROL_CONTRACT_VERSION {
-        return Err(RecoveryReason::UnsupportedContract.into_status());
-    }
+    let contract = match (recovery.contract_version, recovery.sequence) {
+        (CONTROL_CONTRACT_VERSION, None) => ControlContract::Fenced,
+        (2, Some(sequence)) => ControlContract::Sequenced(
+            std::num::NonZeroU64::new(sequence)
+                .ok_or_else(|| Status::invalid_argument("mutation sequence must be nonzero"))?,
+        ),
+        (CONTROL_CONTRACT_VERSION | 2, _) => {
+            return Err(Status::invalid_argument(
+                "sequence does not match the recovery contract",
+            ));
+        }
+        _ => return Err(RecoveryReason::UnsupportedContract.into_status()),
+    };
     if !legacy_id.is_empty() {
         return Err(Status::invalid_argument(
             "legacy and recovery process handles are mutually exclusive",
         ));
     }
     Ok(Some(ProcessHandle {
+        contract,
         fence: RecoveryFence {
             instance: ProcessRecoveryToken::parse(&recovery.expected_instance_id)
                 .map_err(invalid_argument_status)?,
@@ -180,3 +219,6 @@ pub fn validate_handle(
             .map_err(invalid_argument_status)?,
     }))
 }
+
+#[cfg(test)]
+mod tests;

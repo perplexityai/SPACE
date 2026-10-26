@@ -2,7 +2,7 @@
 use super::*;
 use pplx_space_spaced_guest_protocol::{
     proto::operations::RecoveryHandle,
-    recovery::{ProcessHandle, RecoveryReason, validate_handle},
+    recovery::{ControlContract, ProcessHandle, RecoveryReason, validate_handle},
 };
 
 #[derive(Clone, Copy)]
@@ -11,11 +11,43 @@ pub(super) struct RecoveryIdentity {
     pub(super) incarnation: ProcessRecoveryToken,
 }
 
+pub(super) struct RecoveryRecord {
+    identity: RecoveryIdentity,
+    pub(super) mutations: Arc<super::mutations::Ledger>,
+}
+impl RecoveryRecord {
+    pub(super) fn new(identity: RecoveryIdentity) -> Self {
+        Self {
+            identity,
+            mutations: Arc::default(),
+        }
+    }
+}
+
 pub(super) enum ProcessAddress {
     Legacy(ProcessId),
     Recovery(ProcessHandle),
 }
 impl ProcessAddress {
+    pub(super) fn sequence(&self) -> Option<std::num::NonZeroU64> {
+        match self {
+            Self::Recovery(ProcessHandle {
+                contract: ControlContract::Sequenced(sequence),
+                ..
+            }) => Some(*sequence),
+            _ => None,
+        }
+    }
+
+    pub(super) fn require_unsequenced(&self) -> Result<(), Status> {
+        if self.sequence().is_some() {
+            return Err(Status::invalid_argument(
+                "this operation does not accept mutation sequences",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn parse(legacy: String, recovery: Option<RecoveryHandle>) -> Result<Self, Status> {
         match validate_handle(&legacy, recovery.as_ref())? {
             Some(handle) => Ok(Self::Recovery(handle)),
@@ -72,7 +104,9 @@ impl ExecutionService {
             .ok_or_else(|| Status::not_found("process not found"))?;
         if let Some(expected) = expected {
             let actual = record
-                .recovery_identity
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.identity)
                 .ok_or_else(|| RecoveryReason::ProcessReplaced.into_status())?;
             if actual.incarnation != expected.incarnation {
                 return Err(RecoveryReason::ProcessReplaced.into_status());

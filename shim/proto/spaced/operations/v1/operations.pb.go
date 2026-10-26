@@ -2733,8 +2733,10 @@ type RecoveryHandle struct {
 	ExpectedActivationId string                 `protobuf:"bytes,3,opt,name=expected_activation_id,json=expectedActivationId,proto3" json:"expected_activation_id,omitempty"`
 	ProcessId            string                 `protobuf:"bytes,4,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
 	ProcessIncarnation   string                 `protobuf:"bytes,5,opt,name=process_incarnation,json=processIncarnation,proto3" json:"process_incarnation,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Version 2 only: one ordered sequence shared by input, close and signal.
+	Sequence      *uint64 `protobuf:"varint,6,opt,name=sequence,proto3,oneof" json:"sequence,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RecoveryHandle) Reset() {
@@ -2800,6 +2802,13 @@ func (x *RecoveryHandle) GetProcessIncarnation() string {
 		return x.ProcessIncarnation
 	}
 	return ""
+}
+
+func (x *RecoveryHandle) GetSequence() uint64 {
+	if x != nil && x.Sequence != nil {
+		return *x.Sequence
+	}
+	return 0
 }
 
 type ConnectProcessRequest struct {
@@ -4636,14 +4645,16 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x04rows\x18\x01 \x01(\rR\x04rows\x12\x12\n" +
 	"\x04cols\x18\x02 \x01(\rR\x04cols\"D\n" +
 	"\tPtyConfig\x127\n" +
-	"\x04size\x18\x01 \x01(\v2#.space.spaced.operations.v1.PtySizeR\x04size\"\xf3\x01\n" +
+	"\x04size\x18\x01 \x01(\v2#.space.spaced.operations.v1.PtySizeR\x04size\"\xa1\x02\n" +
 	"\x0eRecoveryHandle\x12)\n" +
 	"\x10contract_version\x18\x01 \x01(\rR\x0fcontractVersion\x120\n" +
 	"\x14expected_instance_id\x18\x02 \x01(\tR\x12expectedInstanceId\x124\n" +
 	"\x16expected_activation_id\x18\x03 \x01(\tR\x14expectedActivationId\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x04 \x01(\tR\tprocessId\x12/\n" +
-	"\x13process_incarnation\x18\x05 \x01(\tR\x12processIncarnation\"\x97\x03\n" +
+	"\x13process_incarnation\x18\x05 \x01(\tR\x12processIncarnation\x12\x1f\n" +
+	"\bsequence\x18\x06 \x01(\x04H\x00R\bsequence\x88\x01\x01B\v\n" +
+	"\t_sequence\"\x97\x03\n" +
 	"\x15ConnectProcessRequest\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\x128\n" +
@@ -4972,6 +4983,7 @@ func file_spaced_operations_v1_operations_proto_init() {
 	file_spaced_operations_v1_operations_proto_msgTypes[34].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[35].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[37].OneofWrappers = []any{}
+	file_spaced_operations_v1_operations_proto_msgTypes[40].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[41].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[42].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[43].OneofWrappers = []any{}
