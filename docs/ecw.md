@@ -108,6 +108,33 @@ The selected template must already be published. `seed` is the compatibility
 default when a create request omits `templateID`; a production deployment will
 usually publish and select a purpose-built runtime template instead.
 
+### Set disk capacity at creation
+
+Pass `resources.disk_mib` in the SDK's string metadata to request the sandbox's
+total writable root disk capacity in MiB (not additional free space):
+
+```python
+sandbox = Sandbox.create(
+    template="seed",
+    metadata={"resources.disk_mib": "20480"},  # 20 GiB
+)
+```
+
+ECW consumes this key and forwards the size to SPACE's normal resource
+allocation; it is not retained as sandbox metadata. Other metadata is
+preserved. The value must be a positive integer no larger than 131072 MiB
+(128 GiB). Invalid values return an E2B-shaped HTTP 400. The requested disk
+must also accommodate the template's filesystem; this does not shrink it.
+
+An explicit size selects a cold boot, bypassing warm pools and base snapshots.
+Omitting the key preserves the normal template and pool defaults. This is a
+creation setting, not an in-place resize operation, and does not change the
+template or its build disk size.
+
+Deploy the updated ECW API before enabling callers: older APIs treat this key
+as ordinary metadata and do not apply the requested size. This SPACE extension
+works with the tested E2B Python SDK without a fork or native API credentials.
+
 ## Compatibility contract
 
 ECW supports the E2B-shaped sandbox create, list, inspect, delete, connect,

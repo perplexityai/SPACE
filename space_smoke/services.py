@@ -874,11 +874,18 @@ class _ScenarioSandboxes:
         reconcile_uncreated: Callable[[], bool] | None = None,
         observed_ids: list[str] | None = None,
     ) -> Compensation:
+        # ECW can consume caller metadata as create options; only run identity
+        # is guaranteed to remain available for cleanup after a lost response.
+        cleanup_metadata = {
+            **self._run_metadata,
+            "space_smoke_instance": create_metadata["space_smoke_instance"],
+        }
+
         def delete() -> None:
             if created:
                 created[0].kill()
             elif reconcile_uncreated is None or reconcile_uncreated():
-                self._ecw.kill_matching(create_metadata)
+                self._ecw.kill_matching(cleanup_metadata)
 
         def cleanup() -> None:
             retry_sandbox_delete(delete)

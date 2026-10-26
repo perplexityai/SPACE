@@ -25,10 +25,24 @@ pub(super) struct CreateSandboxTranslation {
 
 const NETWORK_POLICY_METADATA_KEY: &str = "network.policy";
 const TLS_INTERCEPTION_METADATA_KEY: &str = "network.tls_interception";
+const DISK_MIB_METADATA_KEY: &str = "resources.disk_mib";
 
 pub(super) fn translate_create_request(
     mut req: CreateSandboxRequestE2b,
 ) -> Result<CreateSandboxTranslation, E2bApiError> {
+    let disk_mib = req
+        .metadata
+        .remove(DISK_MIB_METADATA_KEY)
+        .map(|value| -> Result<u32, E2bApiError> {
+            let disk_mib = value.parse::<u32>().map_err(|_| {
+                E2bApiError::bad_request("resources.disk_mib must be a positive integer in MiB")
+            })?;
+            pplx_space_common_core::sandbox_storage::validate_rootfs_mib(disk_mib).map_err(
+                |error| E2bApiError::bad_request(format!("resources.disk_mib: {error}")),
+            )?;
+            Ok(disk_mib)
+        })
+        .transpose()?;
     let mut unsupported = Vec::new();
     let network_policy = if let Some(raw) = req.metadata.remove(NETWORK_POLICY_METADATA_KEY) {
         if req.network.is_some()
@@ -115,7 +129,7 @@ pub(super) fn translate_create_request(
             metadata,
             vcpu: None,
             memory_mib: None,
-            disk_mib: None,
+            disk_mib,
             file_changes: None,
             auto_lifecycle: Some(auto_lifecycle),
             // The E2B SDK assumes `Sandbox.create` returns a usable sandbox —

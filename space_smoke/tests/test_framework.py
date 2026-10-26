@@ -103,6 +103,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "ecw.binary_file_round_trip",
                 "ecw.cold_create_environment",
                 "ecw.command_round_trip",
+                "ecw.disk_sizing",
                 "ecw.domain_access_survives_default_deny",
                 "ecw.filesystem_mutations",
                 "ecw.filesystem_ownership",

@@ -1830,6 +1830,45 @@ fn create_translation_maps_supported_fields() {
 }
 
 #[test]
+fn create_translation_consumes_disk_sizing_metadata() {
+    for (value, expected) in [
+        (None, Ok(None)),
+        (Some("20480"), Ok(Some(20480))),
+        (Some("131072"), Ok(Some(131072))),
+        (Some(""), Err(())),
+        (Some("0"), Err(())),
+        (Some("-1"), Err(())),
+        (Some("1.5"), Err(())),
+        (Some("20GiB"), Err(())),
+        (Some("131073"), Err(())),
+        (Some("4294967296"), Err(())),
+    ] {
+        let metadata = match value {
+            Some(value) => serde_json::json!({"resources.disk_mib": value, "name": "disk-test"}),
+            None => serde_json::json!({"name": "disk-test"}),
+        };
+        let request = serde_json::from_value(serde_json::json!({"metadata": metadata})).unwrap();
+        match expected {
+            Ok(disk_mib) => {
+                let native = translate_create_request(request).unwrap().native;
+                assert_eq!(native.disk_mib, disk_mib, "{value:?}");
+                assert!(!native.metadata.contains_key("resources.disk_mib"));
+                assert_eq!(native.metadata.len(), 1);
+                assert_eq!(
+                    native.metadata.get("name"),
+                    Some(&SandboxMetadataValue::String("disk-test".into()))
+                );
+            }
+            Err(()) => assert_eq!(
+                translate_create_request(request).unwrap_err().status,
+                StatusCode::BAD_REQUEST,
+                "{value:?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn create_translation_parses_template_reference_digest() {
     let template_id =
         "seed@sha256:1111111111111111111111111111111111111111111111111111111111111111";

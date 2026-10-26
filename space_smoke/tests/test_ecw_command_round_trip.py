@@ -233,6 +233,7 @@ class _Ecw:
         self.fail_create = fail_create
         self.create_not_delivered = create_not_delivered
         self.last_metadata: Mapping[str, str] | None = None
+        self.cleanup_metadata: Mapping[str, str] | None = None
         self.metadata_history: list[Mapping[str, str]] = []
         self.create_attempt = create_attempt or EcwCreateAttempt(400, "rejected", None)
 
@@ -278,6 +279,7 @@ class _Ecw:
         interval_seconds: float = 1,
     ) -> None:
         del attempts, interval_seconds
+        self.cleanup_metadata = metadata
         self.trace.append(f"ecw.kill-matching:{metadata['space_smoke_run']}")
 
     def attempt_create(
@@ -840,12 +842,14 @@ class EcwCommandRoundTripTests(unittest.TestCase):
         self.assertEqual(secondary["space_smoke_instance"], "instance-secondary")
         self.assertEqual(trace.count("sandbox.kill"), 2)
 
-    def test_declared_collection_cleans_up_when_a_later_create_is_ambiguous(
+    def test_collection_cleans_up_when_a_later_create_is_ambiguous(
         self,
     ) -> None:
-        @smoke.scenario("ecw.partial_collection", sandboxes=2)
-        def partial_collection(_test: smoke.Ecw) -> None:
-            """Every declared sandbox has cleanup armed before creation."""
+        @smoke.scenario("ecw.partial_collection")
+        def partial_collection(test: smoke.Ecw) -> None:
+            """Cleanup uses retained identity, not metadata consumed by ECW."""
+
+            test.sandboxes.create(metadata={"resources.disk_mib": "20480"})
 
         class FailSecondCreate(_Ecw):
             def create(
@@ -874,12 +878,10 @@ class EcwCommandRoundTripTests(unittest.TestCase):
             types.SimpleNamespace(hex="instance-ambiguous"),
         ]
         trace: list[str] = []
+        ecw = FailSecondCreate(trace, EcwCommandResult(0, "", ""))
         services = SmokeServices(
             kind=None,
-            ecw=cast(
-                EcwSandboxes,
-                FailSecondCreate(trace, EcwCommandResult(0, "", "")),
-            ),
+            ecw=cast(EcwSandboxes, ecw),
             api_key="deployed-key",
             owns_api_key=False,
         )
@@ -893,6 +895,14 @@ class EcwCommandRoundTripTests(unittest.TestCase):
         self.assertEqual(result.verdict, Verdict.INFRA_ERROR)
         self.assertEqual(trace.count("ecw.create:seed:300:run-marker"), 2)
         self.assertEqual(trace[-2:], ["ecw.kill-matching:run-marker", "sandbox.kill"])
+        self.assertEqual(
+            ecw.cleanup_metadata,
+            {
+                "space_smoke_scenario": "ecw.partial_collection",
+                "space_smoke_run": "run-marker",
+                "space_smoke_instance": "instance-ambiguous",
+            },
+        )
 
     def test_scenario_metadata_cannot_override_framework_cleanup_identity(
         self,
