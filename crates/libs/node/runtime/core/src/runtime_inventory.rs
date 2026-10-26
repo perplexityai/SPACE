@@ -13,6 +13,7 @@ use pplx_space_common_core::types::{
 };
 use sha2::{Digest as _, Sha256};
 
+mod cloud_hypervisor;
 pub mod diagnostic;
 pub mod kernel_release;
 #[cfg(feature = "artifact-store")]
@@ -57,21 +58,21 @@ const FIRECRACKER_STATE_FORMAT_RELEASES: &[FirecrackerStateFormatRelease] = &[
 pub struct RuntimeInstallation {
     pub runtime: RuntimeIdentity,
     pub guest: GuestPlatform,
-    pub state_format: StateFormatIdentity,
+    pub state_format: Option<StateFormatIdentity>,
     pub files: RuntimeInstallationFiles,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum RuntimeFileRole {
-    FirecrackerBinary,
-    JailerBinary,
+    RuntimeExecutable,
+    LauncherExecutable,
 }
 
 impl RuntimeFileRole {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::FirecrackerBinary => "firecracker",
-            Self::JailerBinary => "jailer",
+            Self::RuntimeExecutable => "runtime executable",
+            Self::LauncherExecutable => "launcher executable",
         }
     }
 }
@@ -565,6 +566,12 @@ impl std::fmt::Display for ComponentDefaultSelection {
 
 trait RuntimeDriver: Send + Sync {
     fn kind(&self) -> RuntimeKind;
+    #[cfg(any(feature = "artifact-store", test))]
+    fn inspect_installation(
+        &self,
+        root: PathBuf,
+        version: RuntimeVersion,
+    ) -> Result<RuntimeInstallation, RuntimeInventoryError>;
     fn discover_installations(
         &self,
         root: &Path,
@@ -654,8 +661,8 @@ impl FirecrackerDriver {
         let firecracker_bin = root.join("bin/firecracker");
         let jailer_bin = root.join("bin/jailer");
         for (binary, role) in [
-            (&firecracker_bin, RuntimeFileRole::FirecrackerBinary),
-            (&jailer_bin, RuntimeFileRole::JailerBinary),
+            (&firecracker_bin, RuntimeFileRole::RuntimeExecutable),
+            (&jailer_bin, RuntimeFileRole::LauncherExecutable),
         ] {
             // `IncompleteInstallation` is a terminal verdict, so it may only be
             // reported when the binary is genuinely absent — a transient stat
@@ -678,7 +685,7 @@ impl FirecrackerDriver {
                 os: GuestOperatingSystem::Linux,
                 architecture: host_arch()?,
             },
-            state_format: StateFormatIdentity {
+            state_format: Some(StateFormatIdentity {
                 format: StateFormatName::parse(FIRECRACKER_STATE_FORMAT).map_err(|source| {
                     RuntimeInventoryError::InvalidStaticIdentifier {
                         field: "state_format_name",
@@ -687,16 +694,24 @@ impl FirecrackerDriver {
                     }
                 })?,
                 version: state_format_version,
-            },
+            }),
             files: RuntimeInstallationFiles::new([
-                (RuntimeFileRole::FirecrackerBinary, firecracker_bin),
-                (RuntimeFileRole::JailerBinary, jailer_bin),
+                (RuntimeFileRole::RuntimeExecutable, firecracker_bin),
+                (RuntimeFileRole::LauncherExecutable, jailer_bin),
             ]),
         })
     }
 }
 
 impl RuntimeDriver for FirecrackerDriver {
+    #[cfg(any(feature = "artifact-store", test))]
+    fn inspect_installation(
+        &self,
+        root: PathBuf,
+        version: RuntimeVersion,
+    ) -> Result<RuntimeInstallation, RuntimeInventoryError> {
+        FirecrackerDriver::inspect_installation(self, root, version)
+    }
     fn kind(&self) -> RuntimeKind {
         RuntimeKind::Firecracker
     }
@@ -809,12 +824,15 @@ impl RuntimeDriver for FirecrackerDriver {
         let requested_state = requested
             .state_format()
             .ok_or(RuntimeInventoryError::MissingStateFormat)?;
-        if installed.state_format.format != requested_state.format
-            || installed.state_format.format.as_str() != FIRECRACKER_STATE_FORMAT
+        let Some(installed_format) = &installed.state_format else {
+            return Ok(false);
+        };
+        if installed_format.format != requested_state.format
+            || installed_format.format.as_str() != FIRECRACKER_STATE_FORMAT
         {
             return Ok(false);
         }
-        let installed_state = self.parse_state_version(&installed.state_format.version)?;
+        let installed_state = self.parse_state_version(&installed_format.version)?;
         let requested_state = self.parse_state_version(&requested_state.version)?;
         Ok(installed_state.major == requested_state.major
             && requested_state.minor <= installed_state.minor)
@@ -823,21 +841,22 @@ impl RuntimeDriver for FirecrackerDriver {
 
 struct RuntimeDriverRegistry {
     firecracker: FirecrackerDriver,
+    cloud_hypervisor: cloud_hypervisor::CloudHypervisorDriver,
 }
 
 impl RuntimeDriverRegistry {
     const fn new() -> Self {
         Self {
             firecracker: FirecrackerDriver,
+            cloud_hypervisor: cloud_hypervisor::CloudHypervisorDriver,
         }
     }
 
     fn get(&self, kind: RuntimeKind) -> Result<&dyn RuntimeDriver, RuntimeInventoryError> {
         match kind {
             RuntimeKind::Firecracker => Ok(&self.firecracker),
-            RuntimeKind::CloudHypervisor | RuntimeKind::Gvisor => {
-                Err(RuntimeInventoryError::UnsupportedRuntime(kind))
-            }
+            RuntimeKind::CloudHypervisor => Ok(&self.cloud_hypervisor),
+            RuntimeKind::Gvisor => Err(RuntimeInventoryError::UnsupportedRuntime(kind)),
         }
     }
 }
@@ -1248,7 +1267,7 @@ impl RuntimeInventory {
         let execution = ExecutionMetadata::new(
             selected_runtime.runtime.clone(),
             selected_runtime.guest,
-            Some(selected_runtime.state_format.clone()),
+            selected_runtime.state_format.clone(),
             resolved_components,
         )?;
         let environment = if binding.is_some() {
@@ -1286,11 +1305,16 @@ impl RuntimeInventory {
             .map(|installation| proto::RuntimeInstallation {
                 runtime: Some((&installation.runtime).into()),
                 supported_guests: vec![installation.guest.into()],
-                state_formats: vec![proto::StateFormatCapability {
-                    identity: Some((&installation.state_format).into()),
-                    can_create: true,
-                    can_load: true,
-                }],
+                state_formats: installation
+                    .state_format
+                    .as_ref()
+                    .map(|format| proto::StateFormatCapability {
+                        identity: Some(format.into()),
+                        can_create: true,
+                        can_load: true,
+                    })
+                    .into_iter()
+                    .collect(),
             })
             .collect();
         let components = self
