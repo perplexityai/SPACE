@@ -61,9 +61,8 @@ enum Command {
         #[command(subcommand)]
         command: KernelsCommand,
     },
-    /// List, install, and uninstall runtime releases. An install never
-    /// changes the release new sandboxes boot on: that is the release root's
-    /// `default` alias.
+    /// List, install, and uninstall runtime releases. Installation does not
+    /// change the node's execution policy or qualify a runtime for execution.
     Runtimes {
         #[command(subcommand)]
         command: RuntimesCommand,
@@ -158,6 +157,9 @@ enum RuntimesCommand {
     /// List the releases this build can install, and whether each is on
     /// this node.
     Available {
+        /// Runtime family or release line, such as fc or cloud-hypervisor-54.0.
+        #[arg(long, value_parser = parse_runtime)]
+        runtime: Option<RuntimeArg>,
         /// Print the response as JSON.
         #[arg(long)]
         json: bool,
@@ -484,8 +486,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
         },
         Command::Runtimes { command } => match command {
-            RuntimesCommand::Available { json } => {
-                let response = available(&mut client, true, None, None).await?;
+            RuntimesCommand::Available { runtime, json } => {
+                let response = available(&mut client, true, None, runtime.as_ref()).await?;
                 show_available(&response, json)
             }
             RuntimesCommand::Install {
