@@ -4,6 +4,7 @@ use super::*;
 use pplx_space_common_core::types::{EnvironmentReference, RuntimeKind};
 use pplx_space_node_runtime_core::{
     artifact_store::managed_release_directory,
+    authenticated_source::SourcePins,
     catalog::{CompiledEnvironment, compiled_verity_digest},
     proto::{ArtifactIntegrityRequirement, LaunchRuntimeRequest},
     runtime_inventory::host_arch,
@@ -65,11 +66,11 @@ impl RuntimeSupervisorService {
             CgroupLimits::from_request(limits.vcpu_count, limits.memory_mib, limits.pids_max);
         let budget = limits.cpu_budget().map_err(cgroup_update_error_to_status)?;
         let path = config.executable.clone();
-        let digest = config.executable_digest;
+        let pins = config.executable_source;
         self.execution_io(move |store| {
             // Authenticate before publishing intent. The fresh launcher repeats
             // this check on the descriptor it executes, closing path replacement.
-            crate::verified_launch::open(&path, digest)
+            crate::verified_launch::open_catalog_executable(&path, pins)
                 .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
             if !cgroup::firecracker_is_quiescent(&sandbox_id.to_string())
                 .map_err(|e| Status::unavailable(format!("VM occupancy: {e}")))?
@@ -197,7 +198,10 @@ fn standalone_config(
         root,
         network_namespace: req.network_namespace.clone().into(),
         executable: binary.to_owned(),
-        executable_digest: digest,
+        executable_source: SourcePins {
+            sha256: file.sha256,
+            verity: digest,
+        },
         uid: req.uid,
         gid: req.gid,
         cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(
