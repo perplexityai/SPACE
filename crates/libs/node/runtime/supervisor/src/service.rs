@@ -1,3 +1,5 @@
+mod standalone;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -444,7 +446,18 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
     ) -> Result<Response<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse>, Status> {
         self.authorize_peer(&request, "LaunchRuntime")?;
         let caller = Some(execution::pin_caller(&request)?);
-        let request = FirecrackerLaunch::try_from(request.into_inner()).map_err(|error| {
+        let request = request.into_inner();
+        if request.runtime
+            == pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor as i32
+        {
+            let service = self.clone();
+            return self
+                .run_owned_operation(async move {
+                    service.launch_standalone_owned(request, caller).await
+                })
+                .await;
+        }
+        let request = FirecrackerLaunch::try_from(request).map_err(|error| {
             pplx_space_node_runtime_core::launch_admission::admission_refusal(
                 Status::failed_precondition(error.to_string()),
             )
