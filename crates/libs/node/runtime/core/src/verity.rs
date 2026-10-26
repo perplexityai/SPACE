@@ -73,45 +73,49 @@ impl SealedFile {
     }
 
     /// Link the authenticated inode, rather than reopening its former path.
-    /// Linux requires CAP_DAC_READ_SEARCH for linkat(AT_EMPTY_PATH); retain it
-    /// when restricting node-manager's capabilities. See linkat(2).
-    #[cfg(target_os = "linux")]
     pub fn link_to(&self, destination: &Path) -> std::io::Result<()> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::OpenOptionsExt;
-        let parent = destination
-            .parent()
-            .ok_or(std::io::ErrorKind::InvalidInput)?;
-        let name = destination
-            .file_name()
-            .ok_or(std::io::ErrorKind::InvalidInput)?;
-        let parent = File::options()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(parent)?;
-        let name = std::ffi::CString::new(name.as_bytes())?;
-        // SAFETY: both descriptors and the destination basename remain valid
-        // for linkat. AT_EMPTY_PATH selects the measured source inode itself.
-        let result = unsafe {
-            libc::linkat(
-                self.0.as_raw_fd(),
-                c"".as_ptr(),
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        link_file(&self.0, destination)
     }
+}
 
-    #[cfg(not(target_os = "linux"))]
-    pub fn link_to(&self, _destination: &Path) -> std::io::Result<()> {
-        Err(std::io::ErrorKind::Unsupported.into())
+/// Linux requires CAP_DAC_READ_SEARCH for linkat(AT_EMPTY_PATH); retain it
+/// when restricting node-manager's capabilities. See linkat(2).
+#[cfg(target_os = "linux")]
+pub(crate) fn link_file(file: &File, destination: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = destination
+        .parent()
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    let name = destination
+        .file_name()
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    let parent = File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    // SAFETY: both descriptors and the destination basename remain valid
+    // for linkat. AT_EMPTY_PATH selects the measured source inode itself.
+    let result = unsafe {
+        libc::linkat(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn link_file(_file: &File, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// Read-only availability query on an opened execution-filesystem directory.
