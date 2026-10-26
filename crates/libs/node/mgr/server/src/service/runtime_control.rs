@@ -54,7 +54,7 @@ impl NodeManagerService {
         &self,
         runtime: pplx_space_common_core::types::RuntimeKind,
         path: PathBuf,
-        initramfs: bool,
+        source: pplx_space_node_runtime_core::boot::BootSource,
         devices: Option<pplx_space_execution_common::devices::DeviceExecution>,
         device_budget: Option<(
             pplx_space_node_runtime_core::catalog::DeviceResourceLimits,
@@ -80,7 +80,7 @@ impl NodeManagerService {
                     pplx_space_node_runtime_core::boot::with_exclusive_devices(
                         runtime,
                         &text,
-                        initramfs,
+                        source,
                         &devices,
                         resources,
                         reserved_memory_mib,
@@ -88,10 +88,8 @@ impl NodeManagerService {
                     .map_err(|e| Status::invalid_argument(e.to_string()))
                 }
                 (None, None) => {
-                    pplx_space_node_runtime_core::boot::validate_standalone(
-                        runtime, &text, initramfs,
-                    )
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                    pplx_space_node_runtime_core::boot::validate_standalone(runtime, &text, source)
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
                     Ok(text)
                 }
                 _ => Err(Status::internal(
