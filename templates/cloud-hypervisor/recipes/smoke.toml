@@ -1,0 +1,10 @@
+[metadata]
+name = "ch-smoke"
+description = "Cloud Hypervisor template build and cold-boot check"
+base = "ch-seed"
+
+[[steps]]
+type = "run"
+name = "persist build result"
+command = "mkdir -p /opt/space && printf 'built inside Cloud Hypervisor\n' > /opt/space/ch-build-result"
+user = "root"
