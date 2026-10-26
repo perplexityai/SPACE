@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import textwrap
@@ -9,6 +10,8 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from space_smoke.runtime import (
     ScenarioContext,
@@ -26,6 +29,8 @@ class DirectNodeConfig:
     content_hash: str
     environment: str
     crash_owned_runtime: bool = False
+    device_profile: str = ""
+    device_parent: str = ""
 
     @classmethod
     def from_environment(cls, values: Mapping[str, str]) -> DirectNodeConfig:
@@ -73,6 +78,8 @@ class DirectNodeConfig:
             content_hash,
             environment,
             fault == "crash-owned-runtime",
+            values.get("SPACE_SMOKE_NODE_DEVICE_PROFILE", ""),
+            values.get("SPACE_SMOKE_NODE_DEVICE_PARENT", ""),
         )
 
 
@@ -117,7 +124,7 @@ class DirectNodeRecoveryFixture:
             raise RuntimeError(f"node command {arguments[0]} failed: {result.detail()}")
         return result.stdout.strip()
 
-    def prepare(self) -> None:
+    def prepare(self, *, with_device: bool = False) -> None:
         self.context.verify(
             self.command(["cat", "/etc/machine-id"]) == self.config.machine_id,
             "SSH target has a different machine identity",
@@ -159,6 +166,15 @@ class DirectNodeRecoveryFixture:
             "deploy@local",
             "--auto-lifecycle-off",
         ]
+        if with_device:
+            if not self.config.device_profile or not self.config.device_parent:
+                raise SmokeConfigurationError(
+                    "GPU run requires an exact enrolled parent and profile"
+                )
+            self.await_device_ready()
+            arguments.extend(
+                ["--device-profile", self.config.device_profile, "--device-count", "1"]
+            )
         # Retain the response on the node before transmitting it over SSH, so
         # cleanup can recover the run's selector if that connection is lost.
         response = self.create_directory + "/response"
@@ -258,7 +274,8 @@ class DirectNodeRecoveryFixture:
             import os
             import signal
             import sys
-                        pid, sandbox, execution = sys.argv[1:]
+            from pathlib import Path
+            pid, sandbox, execution = sys.argv[1:]
             fd = os.pidfd_open(int(pid))
             try:
                 owner = Path('/space/run/runtime-supervisor/executions') / sandbox
@@ -342,3 +359,81 @@ class DirectNodeRecoveryFixture:
             self.command(["rm", "--", self.create_directory + "/response"])
             self.command(["rmdir", "--", self.create_directory])
         self.context.record("cleanup", "owned sandbox deleted")
+
+    def device_parent(self) -> dict[str, Any]:
+        parents = [
+            json.loads(line)
+            for line in self.command(
+                [
+                    "sudo",
+                    "-n",
+                    "bash",
+                    "-c",
+                    f"source {shlex.quote(self.config.client_env)}; exec space-nodemgr devices list --json",
+                ]
+            ).splitlines()
+            if line.strip()
+        ]
+        parent = next(
+            (p for p in parents if p["parent_id"] == self.config.device_parent), None
+        )
+        self.context.verify(parent is not None, "configured device parent disappeared")
+        if parent is None:
+            raise RuntimeError("device parent missing")
+        self.context.verify(
+            parent["profile"] == self.config.device_profile, "device profile changed"
+        )
+        if parent.get("usage") is None:
+            raise RuntimeError("node-manager does not report device capacity")
+        return parent
+
+    def await_device_ready(self) -> None:
+        deadline = time.monotonic() + 60
+        while True:
+            parent = self.device_parent()
+            state = parent["state"]
+            if (
+                state == "DEVICE_PARENT_STATE_READY"
+                and parent["usage"]["allocatable"] is True
+            ):
+                self.context.record("device_pool_ready", parent)
+                return
+            if (
+                state
+                not in ("DEVICE_PARENT_STATE_READY", "DEVICE_PARENT_STATE_SANITIZING")
+                or time.monotonic() >= deadline
+            ):
+                raise RuntimeError(f"device pool did not become ready: {parent}")
+            self.context.wait(1)
+
+    def verify_device_owner(self, execution: ExecutionObservation) -> None:
+        parent = self.device_parent()
+        usage = parent["usage"]
+        self.context.verify(
+            usage["allocatable"] is False, "held device reported available"
+        )
+        self.context.verify(
+            any(
+                a["owner_kind"] == "sandbox"
+                and a["owner"] == execution.sandbox_id
+                and a["execution_id"] == execution.execution_id
+                and a["state"] == "attached"
+                for a in usage["allocations"]
+            ),
+            "device owner differs from the running sandbox",
+        )
+        self.context.record("device_owner", parent)
+
+    def compute_on_gpu(self) -> None:
+        source = (Path(__file__).parent / "assets" / "cuda_compute.py").read_text()
+        result = json.loads(self.guest("python3 -c " + shlex.quote(source)))
+        self.context.verify(
+            result
+            == {
+                "gpu_computation": "passed",
+                "checked_elements": 65536,
+                "operation": "out[i] = 3*i + 7",
+            },
+            "CUDA computation mismatch",
+        )
+        self.context.record("cuda", result)
