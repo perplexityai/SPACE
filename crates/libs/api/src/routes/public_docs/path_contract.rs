@@ -304,6 +304,40 @@ pub(super) fn insert_sandbox_operation_paths(
 pub(super) fn insert_process_paths(paths: &mut Map<String, Value>) {
     insert_public_route(
         paths,
+        pplx_space_public_api::routes::CREATE_RECOVERY_COMMAND,
+        json!({
+            "summary": "Create a recovery command session",
+            "description": "Creates an immutable command session without starting work. Attach over WebSocket and explicitly send recovery_start. Existing command, terminal and SSE behavior is unchanged.",
+            "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1}}],
+            "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateRecoveryCommandRequest"}}}},
+            "responses": {
+                "201": {"description": "Recovery command created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PublicCommand"}}}},
+                "400": {"description": "Invalid recovery request"},
+                "401": {"description": "Authentication required"},
+                "404": {"description": "Sandbox not found"},
+                "409": {"description": "Idempotency key conflicts"},
+                "500": {"description": "Command creation failed"}
+            }
+        }),
+    );
+    insert_public_route(
+        paths,
+        pplx_space_public_api::routes::GET_PROCESS_EXECUTION,
+        json!({
+            "summary": "Discover process recovery support",
+            "description": "Returns the current engine and activation fences and the start-key retry window. Discover before the first recovery start; never refresh fences to retry an uncertain start.",
+            "responses": {
+                "200": {"description": "Current execution contract", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProcessExecution"}}}},
+                "400": {"description": "Invalid sandbox id"},
+                "401": {"description": "Authentication required"},
+                "404": {"description": "Sandbox not found"},
+                "412": {"description": "Recovery discovery unsupported"},
+                "503": {"description": "Execution unavailable"}
+            }
+        }),
+    );
+    insert_public_route(
+        paths,
         LIST_PROCESSES,
         json!({
                 "summary": "List running processes",

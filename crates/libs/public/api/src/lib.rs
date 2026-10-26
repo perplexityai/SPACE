@@ -21,6 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 #[cfg(any(feature = "schema", feature = "serde"))]
 mod command;
+pub mod recovery;
 pub mod routes;
 mod sandbox;
 #[cfg(feature = "schema")]
@@ -1601,6 +1602,13 @@ pub struct CreateTerminalSessionRequest {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateProcessRequest {
+    /// Explicit recovery mode. Leave the outer command empty so older servers
+    /// reject the request before starting work. Uses WebSocket attaches only.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub recovery: Option<recovery::RecoveryStart>,
     pub command: Vec<String>,
     pub cwd: Option<String>,
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1683,6 +1691,7 @@ pub struct CreateCommandRequest {
 impl From<CreateCommandRequest> for CreateProcessRequest {
     fn from(request: CreateCommandRequest) -> Self {
         Self {
+            recovery: None,
             command: request.command,
             cwd: request.cwd,
             env: request.env,

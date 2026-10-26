@@ -42,7 +42,14 @@ pub(crate) fn process_start_request(
                 serde_json::from_str::<CreateProcessRequest>(&attached.adapter_state_json)
                     .map_err(StreamBridgeError::InvalidAdapterState)?;
             Ok(StartRequest {
-                recovery: None,
+                recovery: request.recovery.map(|r| {
+                    pplx_space_sbx_mgr_client::operations::RecoveryStart {
+                        contract_version: r.contract_version,
+                        expected_instance_id: r.expected_instance_id,
+                        expected_activation_id: r.expected_activation_id,
+                        command: r.command,
+                    }
+                }),
                 command: request.command,
                 cwd: request.cwd,
                 env: std::collections::BTreeMap::<String, String>::from(request.env)

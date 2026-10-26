@@ -155,6 +155,10 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
         ),
         mount(native::CREATE_COMMAND, sessions::create_command),
         mount(
+            native::CREATE_RECOVERY_COMMAND,
+            sessions::create_recovery_command,
+        ),
+        mount(
             native::CREATE_FILE_WATCH_SESSION,
             sessions::create_file_watch_session,
         ),
@@ -162,6 +166,10 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
         mount(
             native::CREATE_PROTOCOL_SESSION,
             sessions::create_protocol_session,
+        ),
+        mount(
+            native::GET_PROCESS_EXECUTION,
+            processes::get_process_execution,
         ),
         mount(native::LIST_PROCESSES, processes::list_processes),
         mount(native::GET_PROCESS, processes::get_process),
@@ -225,9 +233,11 @@ fn fails_over_from_silent_pods(operation: NativeOperation) -> bool {
         native::CREATE_TERMINAL_SESSION,
         native::CREATE_PROCESS_SESSION,
         native::CREATE_COMMAND,
+        native::CREATE_RECOVERY_COMMAND,
         native::CREATE_FILE_WATCH_SESSION,
         native::CREATE_PORT_SESSION,
         native::CREATE_PROTOCOL_SESSION,
+        native::GET_PROCESS_EXECUTION,
         native::LIST_PROCESSES,
         native::GET_PROCESS,
         native::SIGNAL_PROCESS,

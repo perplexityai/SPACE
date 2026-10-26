@@ -92,6 +92,16 @@ pub(crate) async fn session_events(
             return too_many_attached_streams_response(limit);
         }
     };
+    if recovery::is_recovery_session(&attached) {
+        return data_plane_http_error(
+            StatusCode::BAD_REQUEST,
+            DataPlaneHttpErrorCode::InvalidRequest,
+            "recovery commands require a WebSocket attach",
+            false,
+            ResponseOrigin::Client,
+            ResponseKind::Validation,
+        );
+    }
     let stream_state = match attached.kind {
         SessionKind::Process => {
             // Only a forged id leaves no later id to number the stream with.

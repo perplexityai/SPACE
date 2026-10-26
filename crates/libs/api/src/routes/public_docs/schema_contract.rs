@@ -153,6 +153,9 @@ pub(super) fn insert_generated_m1_schemas(spec: &mut Value) {
     request_generator.subschema_for::<pplx_space_public_api::CreateSandboxRequest>();
     request_generator.subschema_for::<pplx_space_public_api::SetSandboxTimeoutRequest>();
     request_generator.subschema_for::<pplx_space_public_api::CreateCommandRequest>();
+    request_generator.subschema_for::<pplx_space_public_api::recovery::RecoveryClientFrame>();
+    request_generator
+        .subschema_for::<pplx_space_public_api::recovery::CreateRecoveryCommandRequest>();
     request_generator.subschema_for::<pplx_space_public_api::ProcessSignalRequest>();
     request_generator.subschema_for::<pplx_space_public_api::RollbackSandboxRequest>();
 
@@ -169,7 +172,9 @@ pub(super) fn insert_generated_m1_schemas(spec: &mut Value) {
     response_generator
         .subschema_for::<pplx_space_public_api::PublicPage<pplx_space_public_api::PublicProcess>>();
     response_generator.subschema_for::<pplx_space_public_api::DataPlaneServerFrame>();
+    response_generator.subschema_for::<pplx_space_public_api::recovery::RecoveryServerFrame>();
     response_generator.subschema_for::<pplx_space_public_api::PublicProcess>();
+    response_generator.subschema_for::<pplx_space_public_api::recovery::ProcessExecution>();
     response_generator.subschema_for::<pplx_space_public_api::ProcessMutationResponse>();
     response_generator.subschema_for::<pplx_space_public_api::PublicErrorEnvelope>();
     response_generator.subschema_for::<pplx_space_public_api::DataPlaneHttpErrorEnvelope>();

@@ -3355,6 +3355,7 @@ fn process_session_maps_interactive_stdin_request() {
         backend_process_id: None,
         space_api_route_token: None,
         adapter_state_json: serde_json::to_string(&CreateProcessRequest {
+            recovery: None,
             command: vec!["cat".to_string()],
             cwd: None,
             env: Default::default(),
@@ -3391,6 +3392,7 @@ fn process_session_maps_timeout_duration() {
         backend_process_id: None,
         space_api_route_token: None,
         adapter_state_json: serde_json::to_string(&CreateProcessRequest {
+            recovery: None,
             command: vec!["sleep".to_string(), "10".to_string()],
             cwd: None,
             env: Default::default(),
@@ -3427,6 +3429,7 @@ fn process_session_maps_requested_pty() {
         backend_process_id: None,
         space_api_route_token: None,
         adapter_state_json: serde_json::to_string(&CreateProcessRequest {
+            recovery: None,
             command: vec!["/bin/sh".to_string()],
             cwd: None,
             env: Default::default(),
@@ -3466,6 +3469,7 @@ fn process_session_carries_the_requested_user_to_the_guest() {
         backend_process_id: None,
         space_api_route_token: None,
         adapter_state_json: serde_json::to_string(&CreateProcessRequest {
+            recovery: None,
             command: vec!["/bin/sh".to_string()],
             cwd: None,
             env: Default::default(),
@@ -3501,6 +3505,7 @@ fn process_session_without_a_user_defers_to_the_guest_default() {
         backend_process_id: None,
         space_api_route_token: None,
         adapter_state_json: serde_json::to_string(&CreateProcessRequest {
+            recovery: None,
             command: vec!["/bin/sh".to_string()],
             cwd: None,
             env: Default::default(),

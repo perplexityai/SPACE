@@ -273,9 +273,13 @@ fn public_openapi_value() -> Value {
             "/sessions/{session_id}/attach": {
                 "get": {
                     "summary": "Attach to a terminal, process, or file-watch session over WebSocket",
-                    "description": "Send the scoped data-plane token using `Sec-WebSocket-Protocol` or a first `attach` frame. Query-string tokens are rejected. Native terminal and process sessions permit one attached interactive writer per session; accepted stdin frames are acknowledged with `input_accepted`, while `signal`, `close_stdin`, and `heartbeat` frames are acknowledged with `control_accepted`. The `close` frame closes the stream only.",
+                    "description": "Send the scoped data-plane token using `Sec-WebSocket-Protocol` or a first `attach` frame. Query-string tokens are rejected. Legacy terminal and process sessions permit one attached interactive writer per session; accepted stdin frames are acknowledged with `input_accepted`, while `signal`, `close_stdin`, and `heartbeat` frames are acknowledged with `control_accepted`. The `close` frame closes the stream only.",
                     "responses": {
-                        "101": { "description": "WebSocket stream using DataPlaneClientFrame and DataPlaneServerFrame" },
+                        "101": {
+                            "description": "Legacy sessions use DataPlaneClientFrame and DataPlaneServerFrame. Recovery command sessions authenticate in the same way, then carry one explicit RecoveryClientFrame request per socket. Responses are RecoveryServerFrame values; EOF without recovery_complete or recovery_error is uncertain.",
+                            "x-space-recovery-request-schema": {"$ref": "#/components/schemas/RecoveryClientFrame"},
+                            "x-space-recovery-response-schema": {"$ref": "#/components/schemas/RecoveryServerFrame"}
+                        },
                         "401": { "description": "Invalid or expired data-plane token" },
                         "409": { "description": "Native interactive session is already attached" }
                     }
