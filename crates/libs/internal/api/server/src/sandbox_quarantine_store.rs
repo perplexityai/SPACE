@@ -1,5 +1,6 @@
 //! Transaction-scoped Postgres operations for node-authored quarantine recovery.
 
+use crate::published_state::PublishedSandboxInventoryRow;
 use pplx_space_common_core::types::NodeId;
 
 use std::sync::LazyLock;
@@ -42,17 +43,13 @@ const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     pod_uid TEXT
 ";
 
-/// Retain only rows that can satisfy a statement's inventory-side predicates.
-/// Leave malformed top-level values to Postgres, preserving its error behavior.
+/// Borrow only rows that can satisfy a statement's inventory-side predicates.
 pub(super) fn matching_inventory(
-    mut rows: Json<serde_json::Value>,
-    predicate: impl FnMut(&serde_json::Value) -> bool,
-) -> Option<Json<serde_json::Value>> {
-    let Some(inventory) = rows.0.as_array_mut() else {
-        return Some(rows);
-    };
-    inventory.retain(predicate);
-    (!inventory.is_empty()).then_some(rows)
+    rows: &[PublishedSandboxInventoryRow],
+    mut predicate: impl FnMut(&PublishedSandboxInventoryRow) -> bool,
+) -> Option<Json<Vec<&PublishedSandboxInventoryRow>>> {
+    let inventory: Vec<_> = rows.iter().filter(|row| predicate(row)).collect();
+    (!inventory.is_empty()).then_some(Json(inventory))
 }
 
 #[derive(Debug)]
@@ -361,20 +358,26 @@ pub(super) async fn get_quarantine_recovery_plan(
 pub(super) async fn consume_activation_completion_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    inventory: &[PublishedSandboxInventoryRow],
 ) -> Result<Vec<SandboxId>, Status> {
-    let Some(rows_json) = matching_inventory(rows_json, |row| {
-        let target = row["transition_receipt_target_state"].as_str();
-        row["transition_receipt_kind"].as_str()
-            == Some(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
-            && matches!(target, Some("created" | "started" | "paused"))
-            && row["status"]
-                .as_str()
-                .map(|status| status.trim_matches(' ').to_lowercase())
-                .as_deref()
-                == target
-            && !row["transition_receipt_execution_generation"].is_null()
-            && !row["transition_receipt_activation_attempt_id"].is_null()
+    let Some(rows_json) = matching_inventory(inventory, |row| {
+        row.transition_receipt().is_some_and(|receipt| {
+            receipt.kind() == SandboxTransitionReceiptKind::ActivationCompleted
+                && receipt.activation_attempt_id().is_some()
+                && matches!(
+                    (receipt.target_state(), row.lifecycle()),
+                    (
+                        SandboxTransitionTargetState::Created,
+                        Some(SandboxLifecycle::Created)
+                    ) | (
+                        SandboxTransitionTargetState::Started,
+                        Some(SandboxLifecycle::Started)
+                    ) | (
+                        SandboxTransitionTargetState::Paused,
+                        Some(SandboxLifecycle::Paused)
+                    )
+                )
+        })
     }) else {
         return Ok(Vec::new());
     };
@@ -444,14 +447,26 @@ pub(super) async fn consume_activation_completion_receipts(
 pub(super) async fn select_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    inventory: &[PublishedSandboxInventoryRow],
 ) -> Result<Vec<ActivationRollbackCandidate>, Status> {
-    let Some(rows_json) = matching_inventory(rows_json, |row| {
-        !row["transition_receipt_id"].is_null()
-            && row["transition_receipt_kind"].as_str()
-                == Some(SandboxTransitionReceiptKind::ActivationRollback.as_str())
-            && !row["transition_receipt_execution_generation"].is_null()
-            && !row["transition_receipt_activation_attempt_id"].is_null()
+    let Some(rows_json) = matching_inventory(inventory, |row| {
+        row.transition_receipt().is_some_and(|receipt| {
+            receipt.kind() == SandboxTransitionReceiptKind::ActivationRollback
+                && receipt.activation_attempt_id().is_some()
+                && matches!(
+                    (receipt.target_state(), row.lifecycle()),
+                    (
+                        SandboxTransitionTargetState::Created,
+                        Some(SandboxLifecycle::Created)
+                    ) | (
+                        SandboxTransitionTargetState::Stopped,
+                        Some(SandboxLifecycle::Stopped)
+                    ) | (
+                        SandboxTransitionTargetState::Suspended,
+                        Some(SandboxLifecycle::Suspended)
+                    )
+                )
+        })
     }) else {
         return Ok(Vec::new());
     };
@@ -626,15 +641,12 @@ pub(super) async fn apply_activation_rollback_candidates(
 pub(super) async fn recover_pause_failed_from_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    inventory: &[PublishedSandboxInventoryRow],
 ) -> Result<Vec<PauseFailedQuarantineRecovery>, Status> {
-    let Some(rows_json) = matching_inventory(rows_json, |row| {
+    let Some(rows_json) = matching_inventory(inventory, |row| {
         matches!(
-            row["status"]
-                .as_str()
-                .map(|status| status.trim_matches(' ').to_lowercase())
-                .as_deref(),
-            Some("started" | "paused")
+            row.lifecycle(),
+            Some(SandboxLifecycle::Started | SandboxLifecycle::Paused)
         )
     }) else {
         return Ok(Vec::new());
@@ -775,14 +787,10 @@ pub(super) async fn recover_pause_failed_from_inventory(
 pub(super) async fn select_suspended_projection_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    inventory: &[PublishedSandboxInventoryRow],
 ) -> Result<Vec<SuspendedProjectionCandidate>, Status> {
-    let Some(rows_json) = matching_inventory(rows_json, |row| {
-        row["status"]
-            .as_str()
-            .map(|status| status.trim_matches(' ').to_lowercase())
-            .as_deref()
-            == Some("suspended")
+    let Some(rows_json) = matching_inventory(inventory, |row| {
+        row.lifecycle() == Some(SandboxLifecycle::Suspended)
     }) else {
         return Ok(Vec::new());
     };

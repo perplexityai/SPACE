@@ -8,13 +8,16 @@
 use std::time::Duration;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{NodeId, SandboxId, SandboxLifecycle};
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db_with_max_connections};
 use pplx_space_test_env::TestResult;
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Transaction};
 
-use super::{project_node_published_failed_sandboxes, publish_sandbox_states};
+use super::{
+    PublishedSandboxInventoryRow, QuarantineRecoveryProjectionState,
+    project_node_published_failed_sandboxes, publish_sandbox_states,
+};
 use crate::proto::PublishedSandboxState;
 
 /// Bounds both the wait for the projection to block and its completion.
@@ -168,12 +171,18 @@ async fn failed_projection_decides_on_the_row_committed_while_it_waits() -> Test
         let waiter_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
             .fetch_one(&mut *projection_tx)
             .await?;
-        let rows_json = Json(serde_json::json!([
-            { "sandbox_id": sandbox_id.to_string(), "status": "failed" }
-        ]));
+        let inventory = [PublishedSandboxInventoryRow {
+            lifecycle: Some(Ok(SandboxLifecycle::Failed)),
+            transition_receipt: None,
+            quarantine_recovery: QuarantineRecoveryProjectionState::Absent,
+            payload: serde_json::json!({
+                "sandbox_id": sandbox_id.to_string(),
+                "status": "failed",
+            }),
+        }];
         let projection = tokio::spawn(async move {
             let moved =
-                project_node_published_failed_sandboxes(&mut projection_tx, node_id, rows_json)
+                project_node_published_failed_sandboxes(&mut projection_tx, node_id, &inventory)
                     .await?;
             projection_tx.commit().await?;
             TestResult::<Vec<_>>::Ok(moved)

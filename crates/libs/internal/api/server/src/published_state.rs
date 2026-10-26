@@ -14,10 +14,10 @@ use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::{
     Arch, ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration,
     ExecutionMetadata, LocalArtifactId, NodeRole, PodUid, PolicyAuthority, RuntimeKind,
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SemVer,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SemVer,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -365,6 +365,40 @@ pub(crate) struct ArtifactComponentProjection {
     pub(crate) format: Option<String>,
 }
 
+/// Keep validated evidence typed while serializing the existing bulk SQL
+/// payload unchanged. Unknown statuses still publish, but cannot match a
+/// query's known lifecycle predicates.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+pub(super) struct PublishedSandboxInventoryRow {
+    #[serde(skip)]
+    lifecycle: Option<Result<SandboxLifecycle, SandboxLifecycleParseError>>,
+    #[serde(skip)]
+    transition_receipt: Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
+    #[serde(skip)]
+    quarantine_recovery: QuarantineRecoveryProjectionState,
+    payload: serde_json::Value,
+}
+
+impl PublishedSandboxInventoryRow {
+    pub(super) fn lifecycle(&self) -> Option<SandboxLifecycle> {
+        self.lifecycle.as_ref()?.as_ref().ok().copied()
+    }
+
+    pub(super) fn transition_receipt(
+        &self,
+    ) -> Option<&SandboxTransitionReceipt<SandboxQuarantineReasonCode>> {
+        self.transition_receipt.as_ref()
+    }
+
+    fn has_recovery_observation(&self) -> bool {
+        matches!(
+            self.quarantine_recovery,
+            QuarantineRecoveryProjectionState::Observed(_)
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 struct QuarantineProjectionInput {
     sandbox_id: SandboxId,
@@ -511,6 +545,7 @@ struct QuarantineRecoveryProjection {
     next_attempt_at: Option<String>,
 }
 
+#[derive(Debug)]
 enum QuarantineRecoveryProjectionState {
     Absent,
     Degraded,
@@ -1694,35 +1729,38 @@ pub async fn publish_sandbox_states(
                 None
             }
         };
-        let (quarantine_recovery, quarantine_recovery_degraded) =
-            match quarantine_recovery_projection(state) {
-                Ok(QuarantineRecoveryProjectionState::Absent) => (None, false),
-                Ok(QuarantineRecoveryProjectionState::Degraded) => (None, true),
-                Ok(QuarantineRecoveryProjectionState::Observed(observation)) => {
-                    (Some(observation), false)
-                }
-                Err(error) => {
-                    let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitQuarantineRecoveryObservation;
-                    pplx_space_metrics::sandbox::publication::degraded(
+        let quarantine_recovery_projection = match quarantine_recovery_projection(state) {
+            Ok(projection) => projection,
+            Err(error) => {
+                let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitQuarantineRecoveryObservation;
+                pplx_space_metrics::sandbox::publication::degraded(
                     pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
                     pplx_space_metrics::sandbox::publication::StatePublicationField::QuarantineRecoveryObservation,
                     disposition,
                 );
-                    tracing::warn!(
-                        %node_id,
-                        %sandbox_id,
-                        %error,
-                        %disposition,
-                        "ignoring malformed quarantine recovery observation without rejecting sandbox state"
-                    );
-                    (None, true)
-                }
-            };
+                tracing::warn!(
+                    %node_id,
+                    %sandbox_id,
+                    %error,
+                    %disposition,
+                    "ignoring malformed quarantine recovery observation without rejecting sandbox state"
+                );
+                QuarantineRecoveryProjectionState::Degraded
+            }
+        };
         let row_count = rows.len();
         let snapshot_count = snapshot_rows.len();
         let quarantine_count = quarantine_inputs.len();
         let mut row_publishes_network_policy = false;
         let parse_result = (|| -> Result<(), Status> {
+            let (quarantine_recovery, quarantine_recovery_degraded) =
+                match &quarantine_recovery_projection {
+                    QuarantineRecoveryProjectionState::Absent => (None, false),
+                    QuarantineRecoveryProjectionState::Degraded => (None, true),
+                    QuarantineRecoveryProjectionState::Observed(observation) => {
+                        (Some(observation), false)
+                    }
+                };
             if optional_trimmed(state.status.as_deref())
                 .is_some_and(|status| status.eq_ignore_ascii_case("quarantined"))
             {
@@ -1837,9 +1875,11 @@ pub async fn publish_sandbox_states(
                 .map(PodUid::parse)
                 .transpose()
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let status = optional_trimmed(state.status.as_deref());
+            let lifecycle = status.as_deref().map(|value| value.to_lowercase().parse());
             let mut row = serde_json::json!({
                 "sandbox_id": sandbox_uuid,
-                "status": optional_trimmed(state.status.as_deref()),
+                "status": status,
                 "template": optional_trimmed(state.template.as_deref()),
                 "runtime": optional_trimmed(state.runtime.as_deref())
                     .or_else(|| execution.as_ref().map(|execution| execution.runtime.clone())),
@@ -1974,7 +2014,12 @@ pub async fn publish_sandbox_states(
                     .map(|pod_uid| serde_json::Value::String(pod_uid.to_string()))
                     .unwrap_or(serde_json::Value::Null),
             );
-            rows.push(row);
+            rows.push(PublishedSandboxInventoryRow {
+                lifecycle,
+                transition_receipt,
+                quarantine_recovery: quarantine_recovery_projection,
+                payload: row,
+            });
             for snapshot in &state.snapshots {
                 snapshot_rows.push(snapshot_json(sandbox_uuid, snapshot)?);
             }
@@ -2420,12 +2465,12 @@ pub async fn publish_sandbox_states(
         conflict_current = observed_state_stored_tuple("sandbox_observed_states"),
         conflict_excluded = observed_state_excluded_tuple(),
     );
-    let rows_json = Json(serde_json::Value::Array(rows));
+    let rows_json = Json(rows.as_slice());
     let accepted_rows = sqlx::query_as::<_, AcceptedSandboxPublishRow>(sqlx::AssertSqlSafe(sql!(
         observed_state_write_sql.as_str(),
     )))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .fetch_all(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("write published sandbox observed state: {err}")))?;
@@ -2502,7 +2547,7 @@ pub async fn publish_sandbox_states(
                IS DISTINCT FROM EXCLUDED.observed_payload -> $4::TEXT"
     ))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(SANDBOX_LOCAL_SUSPEND_KEY)
     .bind(SubstrateKind::Kubernetes)
@@ -2519,12 +2564,10 @@ pub async fn publish_sandbox_states(
             changed_at: row.state_changed_at?,
         })
     }));
-    if let Some(recovery_rows) =
-        crate::sandbox_quarantine_store::matching_inventory(rows_json.clone(), |row| {
-            !row["quarantine_recovery_payload"].is_null()
-                && row["quarantine_recovery_observation_degraded"].as_bool() != Some(true)
-        })
-    {
+    if let Some(recovery_rows) = crate::sandbox_quarantine_store::matching_inventory(
+        &rows,
+        PublishedSandboxInventoryRow::has_recovery_observation,
+    ) {
         sqlx::query(sql!(
             "WITH input AS (
              SELECT *
@@ -2604,7 +2647,7 @@ pub async fn publish_sandbox_states(
            AND observed.observed_payload ? 'quarantine_recovery'"
     ))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .execute(&mut *conn)
     .await
@@ -2700,7 +2743,7 @@ pub async fn publish_sandbox_states(
        )"
     ))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .execute(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("update sandbox last_used_at from publish: {err}")))?;
@@ -2745,7 +2788,7 @@ pub async fn publish_sandbox_states(
         restored_convergence_query.as_str()
     )))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)
@@ -2759,18 +2802,12 @@ pub async fn publish_sandbox_states(
         "started",
     );
 
-    crate::sandbox_quarantine_store::consume_activation_completion_receipts(
-        conn,
-        node_id,
-        rows_json.clone(),
-    )
-    .await?;
+    crate::sandbox_quarantine_store::consume_activation_completion_receipts(conn, node_id, &rows)
+        .await?;
 
     let rollback_candidates =
         crate::sandbox_quarantine_store::select_activation_rollback_candidates(
-            conn,
-            node_id,
-            rows_json.clone(),
+            conn, node_id, &rows,
         )
         .await?;
     let applied_rollbacks = crate::sandbox_quarantine_store::apply_activation_rollback_candidates(
@@ -2791,7 +2828,7 @@ pub async fn publish_sandbox_states(
     }));
 
     let suspended_projection =
-        project_node_published_suspended_sandboxes(conn, node_id, rows_json.clone()).await?;
+        project_node_published_suspended_sandboxes(conn, node_id, &rows).await?;
     let recovered_ids = suspended_projection
         .recoveries
         .iter()
@@ -2845,7 +2882,7 @@ pub async fn publish_sandbox_states(
          RETURNING s.id"
     ))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .fetch_all(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("promote stopped sandbox lifecycle: {err}")))?;
@@ -2857,8 +2894,7 @@ pub async fn publish_sandbox_states(
         "stopped",
     );
 
-    let failed_sandboxes =
-        project_node_published_failed_sandboxes(conn, node_id, rows_json.clone()).await?;
+    let failed_sandboxes = project_node_published_failed_sandboxes(conn, node_id, &rows).await?;
     emit_node_published_state_events(
         node_id,
         &failed_sandboxes,
@@ -3076,12 +3112,8 @@ pub async fn publish_sandbox_states(
     }
 
     let pause_failed_recoveries =
-        crate::sandbox_quarantine_store::recover_pause_failed_from_inventory(
-            conn,
-            node_id,
-            rows_json.clone(),
-        )
-        .await?;
+        crate::sandbox_quarantine_store::recover_pause_failed_from_inventory(conn, node_id, &rows)
+            .await?;
     post_commit_events.extend(pause_failed_recoveries.into_iter().map(|recovery| {
         PostCommitSandboxEvent {
             sandbox_id: recovery.sandbox_id,
@@ -3126,7 +3158,7 @@ pub async fn publish_sandbox_states(
                AND sos.network_policy_authority IS DISTINCT FROM publishable.observed_network_policy_authority"),
         )
         .bind(node_id)
-        .bind(rows_json.clone())
+        .bind(rows_json)
         .execute(&mut *conn)
         .await
         .map_err(|err| {
@@ -3187,7 +3219,7 @@ pub async fn publish_sandbox_states(
              )"
         ))
         .bind(node_id)
-        .bind(rows_json.clone())
+        .bind(rows_json)
         .bind(FACET_NETWORK_POLICY)
         .execute(&mut *conn)
         .await
@@ -3216,7 +3248,7 @@ pub async fn publish_sandbox_states(
                AND nfc.condition_type = 'ApplyFailed'"
         ))
         .bind(node_id)
-        .bind(rows_json.clone())
+        .bind(rows_json)
         .bind(FACET_NETWORK_POLICY)
         .execute(&mut *conn)
         .await
@@ -3247,7 +3279,7 @@ pub async fn publish_sandbox_states(
 async fn project_node_published_failed_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    inventory: &[PublishedSandboxInventoryRow],
 ) -> Result<Vec<(SandboxId, String)>, Status> {
     let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
         "WITH input AS (
@@ -3280,7 +3312,7 @@ async fn project_node_published_failed_sandboxes(
          RETURNING s.id, claimed.lifecycle"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(inventory))
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)
     .await
@@ -3302,10 +3334,10 @@ struct SuspendedProjectionOutcome {
 async fn project_node_published_suspended_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    inventory: &[PublishedSandboxInventoryRow],
 ) -> Result<SuspendedProjectionOutcome, Status> {
     let candidates = crate::sandbox_quarantine_store::select_suspended_projection_candidates(
-        conn, node_id, rows_json,
+        conn, node_id, inventory,
     )
     .await?;
     if candidates.is_empty() {
