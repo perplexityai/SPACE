@@ -91,7 +91,11 @@ pub struct RuntimeInstallationFiles {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionSourceIntegrity {
-    Legacy,
+    /// Discovered without authentication against the compiled catalog.
+    UnverifiedExternal,
+    /// Verified at discovery; protected consumers must hash their opened file again.
+    CatalogSha256,
+    /// Sealed against the catalog measurement; consumers measure the opened file.
     FsVerity,
 }
 
@@ -99,7 +103,7 @@ impl RuntimeInstallationFiles {
     fn new(files: impl IntoIterator<Item = (RuntimeFileRole, PathBuf)>) -> Self {
         Self {
             files: files.into_iter().collect(),
-            integrity: ExecutionSourceIntegrity::Legacy,
+            integrity: ExecutionSourceIntegrity::UnverifiedExternal,
         }
     }
 
@@ -1402,7 +1406,7 @@ fn kernel_installation(
         path,
         default_for_new,
         legacy_default,
-        integrity: ExecutionSourceIntegrity::Legacy,
+        integrity: ExecutionSourceIntegrity::UnverifiedExternal,
     }
 }
 

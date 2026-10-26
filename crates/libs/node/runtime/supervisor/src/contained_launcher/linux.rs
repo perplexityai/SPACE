@@ -8,7 +8,7 @@ use nix::{
     },
     unistd::{ForkResult, Gid, Uid},
 };
-use pplx_space_node_runtime_core::verity::SealedFile;
+use pplx_space_node_runtime_core::authenticated_source::AuthenticatedFile;
 use std::{
     ffi::CString,
     fs::File,
@@ -88,8 +88,11 @@ fn prepare_and_exec(config: &Config, stream: &mut UnixStream) -> Result<(), Erro
     if root.metadata().map_err(io("inspect isolation root"))?.uid() != config.uid {
         return Err(Error::Invalid("isolation root is not owned by the sandbox"));
     }
-    let executable = crate::verified_launch::open(&config.executable, config.executable_digest)
-        .map_err(Error::Authentication)?;
+    let executable = crate::verified_launch::open_catalog_executable(
+        &config.executable,
+        config.executable_source,
+    )
+    .map_err(Error::Authentication)?;
     let network = File::options()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -284,7 +287,7 @@ fn prepare_devices(uid: u32, gid: u32) -> Result<(), Error> {
     }
     Ok(())
 }
-fn exec(executable: SealedFile, arguments: &[String]) -> Result<(), Error> {
+fn exec(executable: AuthenticatedFile, arguments: &[String]) -> Result<(), Error> {
     let args = std::iter::once("runtime")
         .chain(arguments.iter().map(String::as_str))
         .map(CString::new)
@@ -296,7 +299,7 @@ fn exec(executable: SealedFile, arguments: &[String]) -> Result<(), Error> {
         .chain([std::ptr::null()])
         .collect();
     let env = [std::ptr::null::<libc::c_char>()];
-    // SAFETY: executable owns the measured inode, argv/env are NUL terminated
+    // SAFETY: executable owns the authenticated inode, argv/env are NUL terminated
     // pointer arrays backed by live CStrings. No pathname is reopened.
     unsafe {
         libc::syscall(
