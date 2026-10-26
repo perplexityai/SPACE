@@ -582,10 +582,12 @@ async fn catalog_listing_routes_only_configured_sources_without_a_mutation_worke
                 }),
             });
         }
-        let service = service(dir.path()).with_kernel_source(source).with_catalog(
-            pins,
-            crate::installs::ReleaseSources::new(releases).unwrap(),
-        );
+        let service = service(dir.path())
+            .with_kernel_source(crate::installs::test_support::kernel_sources(source))
+            .with_catalog(
+                pins,
+                crate::installs::ReleaseSources::new(releases).unwrap(),
+            );
         let response = service
             .list_available_artifacts(peer_request(ListAvailableArtifactsRequest::default(), 0))
             .await
