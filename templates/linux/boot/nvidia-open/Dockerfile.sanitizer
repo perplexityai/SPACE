@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.7
+FROM ubuntu:24.04@sha256:a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc AS build
+ARG TARGETARCH
+ARG BOOT_INITRAMFS_SHA256
+ENV DEBIAN_FRONTEND=noninteractive
+RUN test "$TARGETARCH" = amd64 \
+    && apt-get -o Acquire::Retries=5 update --error-on=any \
+    && apt-get install -y --no-install-recommends \
+        python3 cpio gzip \
+        libnvidia-compute-580=580.178.04-0ubuntu0.24.04.1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=boot-bundle /initrd.img /input/initrd.img
+COPY sanitizer.py /input/sanitizer.py
+COPY sanitizer-init /input/init
+COPY build-sanitizer-bundle.sh /input/build.sh
+RUN BOOT_INITRAMFS_SHA256="$BOOT_INITRAMFS_SHA256" bash /input/build.sh
+
+FROM scratch AS export
+COPY --from=build /output/ /
