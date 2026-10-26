@@ -601,6 +601,7 @@ impl fmt::Display for TerminalPodPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StalePodReason {
+    ObsoleteMaterialization,
     SandboxSuspended,
     SandboxStopped,
     LocalOnlyRestoreNowPortable,
@@ -611,6 +612,9 @@ pub(super) enum StalePodReason {
 impl fmt::Display for StalePodReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ObsoleteMaterialization => {
+                formatter.write_str("pod materialization no longer matches the execution")
+            }
             Self::SandboxSuspended => formatter.write_str("sandbox suspended"),
             Self::SandboxStopped => formatter.write_str("sandbox stopped"),
             Self::LocalOnlyRestoreNowPortable => {

@@ -206,6 +206,7 @@ impl ExpectedError {
 #[derive(Default)]
 struct ApiserverState {
     pod_name: Mutex<Option<String>>,
+    annotations: Mutex<Option<BTreeMap<String, String>>>,
     readiness_failed: AtomicBool,
     /// Held from the pod create to the cleanup delete in the contention case.
     table_lock: tokio::sync::Mutex<Option<Transaction<'static, Postgres>>>,
@@ -313,10 +314,20 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
         async move {
             let pod_name = state.pod_name.lock().unwrap().clone();
             let at_pod = pod_name.as_deref().map(pod_path);
+            let reply = |mut pod: Pod| {
+                // The apiserver retains the identity submitted by the creator.
+                pod.metadata.annotations = state.annotations.lock().unwrap().clone();
+                pod_reply(&pod)
+            };
             match request.method {
                 Method::POST if request.path == PODS_PATH => {
                     let pod_name = requested_pod_name(&request);
                     *state.pod_name.lock().unwrap() = Some(pod_name.clone());
+                    *state.annotations.lock().unwrap() = request
+                        .body
+                        .as_ref()
+                        .and_then(|pod| pod.pointer("/metadata/annotations"))
+                        .map(|annotations| serde_json::from_value(annotations.clone()).unwrap());
                     if let ReadinessFailure::LockContention = failure {
                         let mut lock = lock_pool.begin().await.expect("begin the table lock");
                         sqlx::query(sql!(
@@ -331,7 +342,7 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
                     // of `creating`, so readiness reads the pod rather than
                     // watching it. No node yet: placement is recorded only
                     // after readiness.
-                    pod_reply(&running_pod(&pod_name, sandbox_id, None))
+                    reply(running_pod(&pod_name, sandbox_id, None))
                 }
                 Method::GET if Some(&request.path) == at_pod.as_ref() => {
                     let pod_name = pod_name.expect("the pod was created");
@@ -356,12 +367,12 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
                                 Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
                                     jiff::Timestamp::now(),
                                 ));
-                            pod_reply(&pod)
+                            reply(pod)
                         }
                         (true, PodAfterFailure::ScheduledOnUncachedNode) => {
-                            pod_reply(&running_pod(&pod_name, sandbox_id, Some(UNCACHED_NODE)))
+                            reply(running_pod(&pod_name, sandbox_id, Some(UNCACHED_NODE)))
                         }
-                        _ => pod_reply(&running_pod(&pod_name, sandbox_id, Some(WORKER_NODE))),
+                        _ => reply(running_pod(&pod_name, sandbox_id, Some(WORKER_NODE))),
                     }
                 }
                 Method::GET if request.path == format!("/api/v1/nodes/{UNCACHED_NODE}") => {
@@ -537,16 +548,31 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
     let worker = start_scripted_worker(ScriptedWorkerConfig::new([])).await?;
     let pod_name: Arc<Mutex<Option<String>>> = Arc::default();
     let reply_pod_name = Arc::clone(&pod_name);
+    let owner_materialization: Arc<
+        Mutex<Option<pplx_space_common_core::types::PodMaterializationId>>,
+    > = Arc::default();
+    let reply_materialization = Arc::clone(&owner_materialization);
     let (client, log) = scripted_kube_client_async(move |request| {
         let pod_name = reply_pod_name.lock().unwrap().clone();
+        let materialization = *reply_materialization.lock().unwrap();
         async move {
+            let reply = |mut pod: Pod| {
+                if let Some(id) = materialization {
+                    pod.metadata.annotations.get_or_insert_default().insert(
+                        pplx_space_common_core::kubernetes::SANDBOX_MATERIALIZATION_ID_ANNOTATION
+                            .to_string(),
+                        id.to_string(),
+                    );
+                }
+                pod_reply(&pod)
+            };
             match (request.method, pod_name) {
                 (Method::GET, Some(pod_name)) if request.path == pod_path(&pod_name) => {
                     match owner_pod {
                         OwnerPod::Reachable => {
-                            pod_reply(&running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)))
+                            reply(running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)))
                         }
-                        OwnerPod::NeverAssigned => pod_reply(&sandbox_pod(
+                        OwnerPod::NeverAssigned => reply(sandbox_pod(
                             &pod_name,
                             &format!("{pod_name}-uid"),
                             sandbox_id,
@@ -578,6 +604,7 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
         )
         .await?;
     *pod_name.lock().unwrap() = Some(owner.pod_name.clone());
+    *owner_materialization.lock().unwrap() = owner.materialization_id;
     if let OwnerPod::Reachable = owner_pod {
         substrate
             .store

@@ -177,7 +177,7 @@ async fn an_unchanged_write_stamps_a_row_from_before_the_record() -> TestResult 
     assert!(
         fixture
             .store
-            .backfill_missing_pod_uid(backfilled, &identity, "observed-pod")
+            .backfill_missing_pod_uid(backfilled, &identity, "observed-pod", None)
             .await?
     );
     assert!(
@@ -196,7 +196,8 @@ async fn an_unchanged_write_stamps_a_row_from_before_the_record() -> TestResult 
 async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
     let fixture = postgres_store().await?;
 
-    // The metadata write replacing or clearing a pod UID.
+    // Observations cannot replace or clear an owned pod. Only the fenced
+    // materialization/reset writers below may release that identity.
     for (case, pod_uid) in [("replacing", Some("replacement-pod")), ("clearing", None)] {
         let rewritten = SandboxId::new();
         insert_sandbox(&fixture.pool, rewritten, "started").await?;
@@ -208,16 +209,18 @@ async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
             .generation;
         record_unstamped_pod_uid(&fixture.pool, rewritten, generation, "old-pod", "created")
             .await?;
-        fixture
-            .store
-            .persist_pod_metadata(rewritten, generation, pod_uid, None)
-            .await?;
-        assert!(
-            materialized_at(&fixture.pool, rewritten, generation)
-                .await?
-                .is_some(),
-            "{case} an unstamped pod UID stamps the pod it overwrites"
+        assert_eq!(
+            fixture
+                .store
+                .persist_pod_metadata(rewritten, generation, pod_uid, None)
+                .await?,
+            None,
+            "{case} a pod requires a new materialization claim"
         );
+        let unchanged: (Option<String>, Option<time::OffsetDateTime>) = sqlx::query_as(sql!(
+            "SELECT pod_uid, pod_materialized_at FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND generation=$2"
+        )).bind(rewritten).bind(generation).fetch_one(&fixture.pool).await?;
+        assert_eq!(unchanged, (Some("old-pod".into()), None));
     }
 
     // Pod re-materialization.

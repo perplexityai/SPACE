@@ -141,6 +141,7 @@ struct RedriveClaimGuard {
     sandbox_id: SandboxId,
     pod_name: String,
     generation: i64,
+    materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
     restore_lease_token: Option<Uuid>,
     activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
 }
@@ -165,6 +166,7 @@ impl RedriveClaimGuard {
             sandbox_id,
             pod_name: claim.row.pod_name.clone(),
             generation: claim.row.generation,
+            materialization_id: claim.row.materialization_id,
             restore_lease_token,
             activation_attempt_id,
         }
@@ -182,6 +184,7 @@ impl Drop for RedriveClaimGuard {
         };
         let sandbox_id = self.sandbox_id;
         let generation = self.generation;
+        let materialization_id = self.materialization_id;
         let restore_lease_token = self.restore_lease_token;
         let activation_attempt_id = self.activation_attempt_id;
         let pod_name = std::mem::take(&mut self.pod_name);
@@ -199,6 +202,7 @@ impl Drop for RedriveClaimGuard {
                         generation,
                         restore_lease_token,
                         activation_attempt_id,
+                        materialization_id,
                     )
                     .await
                 {
@@ -217,16 +221,16 @@ impl Drop for RedriveClaimGuard {
                     // The persist won: the row owns the pod. Nothing to clean.
                     return;
                 }
-                // The claim was still unmaterialized — any same-name pod is this
-                // generation's successor POSTed just before the drop; without an
-                // active execution it must not run.
-                if let Err(err) = delete_sandbox_pod_with_throttle_retry(
-                    &k8s,
-                    &pod_name,
-                    "redrive_cancel_cleanup",
-                )
+                let pod = match fetch_sandbox_pod_uncached(&k8s, &pod_name).await {
+                    Ok(Some(pod)) => pod,
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not observe cancelled materialization for cleanup");
+                        return;
+                    }
+                };
+                if let Err(err) = super::delete::delete_retired_materialization_pod(&k8s, &pod, sandbox_id, generation, &pod_name, materialization_id)
                 .await
-                    && !is_not_found_error(&err)
                 {
                     tracing::warn!(
                         sandbox_id = %sandbox_id,
@@ -364,6 +368,8 @@ impl KubernetesSubstrate {
         suspend_restore_storage_uri: Option<&str>,
         restore_lease_token: Option<Uuid>,
     ) -> Result<RedriveOutcome, SubstrateError> {
+        let mut successor_claim = claim.clone();
+        let claim = &mut successor_claim;
         let pod_name = &claim.row.pod_name;
         let activation_attempt_id = claim.row.activation_attempt_id;
         let live = fetch_sandbox_pod_uncached(&self.k8s, pod_name)
@@ -562,16 +568,21 @@ impl KubernetesSubstrate {
         //     this attempt lost the restore-lease fence — step aside.
         match self
             .store
-            .reset_active_execution_to_creating_if_generation(
+            .reset_pod_materialization(
                 sandbox.id,
                 claim.row.generation,
                 restore_lease_token,
                 activation_attempt_id,
+                claim.row.materialization_id,
             )
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(Some(id)) => {
+                claim.row.materialization_id = id.materialization_id;
+                claim.row.state = id.state;
+                claim.row.observed_pod_uid = None;
+            }
+            Ok(None) => {
                 tracing::info!(
                     sandbox_id = %sandbox.id,
                     pod_name = %pod_name,
@@ -689,6 +700,7 @@ impl KubernetesSubstrate {
                     claim_lifecycle,
                     cross_node_pod.uid(),
                     None,
+                    cross_node_pod.materialization_id()?,
                 )
                 .await
             {
@@ -697,11 +709,10 @@ impl KubernetesSubstrate {
                     // Materialization ownership was revoked between the two
                     // creates; drop the cross-node pod we just made and let the
                     // winner drive.
-                    self.delete_pod_and_forget_tracking(
-                        sandbox.id,
-                        pod_name,
-                        claim.row.generation,
-                        PodTrackingCleanupCause::ExplicitTeardown,
+                    super::delete::delete_created_materialization_pod(
+                        &self.k8s,
+                        &cross_node_pod,
+                        claim.row.materialization_id,
                     )
                     .await?;
                     Ok(RedriveOutcome::OwnershipLost)
@@ -709,13 +720,12 @@ impl KubernetesSubstrate {
                 Err(error) => {
                     // Mirror the fresh-create path: never leave an untracked
                     // pod behind a failed persist.
-                    if let Err(delete_error) = delete_sandbox_pod_with_throttle_retry(
+                    if let Err(delete_error) = super::delete::delete_created_materialization_pod(
                         &self.k8s,
-                        pod_name,
-                        "delete_pod_after_redrive_persistence_failure",
+                        &cross_node_pod,
+                        claim.row.materialization_id,
                     )
                     .await
-                        && !is_not_found_error(&delete_error)
                     {
                         tracing::warn!(
                             sandbox_id = %sandbox.id,

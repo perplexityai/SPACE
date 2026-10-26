@@ -11,7 +11,11 @@ pub(crate) use pplx_space_test_env::TestResult;
 pub(crate) const NAMESPACE: &str = "sandboxes";
 
 pub(crate) fn store_for(db: &TestDb) -> PostgresPlacementStore {
-    PostgresPlacementStore::new(db.pool.clone(), NAMESPACE.to_string())
+    PostgresPlacementStore::new(
+        db.pool.clone(),
+        NAMESPACE.to_string(),
+        pplx_space_common_core::types::PodMaterializationMode::Fenced,
+    )
 }
 
 pub(crate) async fn insert_sandbox(pool: &PgPool, lifecycle: &str) -> TestResult<SandboxId> {

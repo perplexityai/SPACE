@@ -7,7 +7,11 @@ fn waiters_with_capacity(capacity: usize) -> RestoreWaiters {
         .connect_lazy("postgres://unused@localhost/unused")
         .expect("lazy pool builds without connecting");
     RestoreWaiters::with_capacity(
-        K8sStore::new(pool, "space".to_string()),
+        K8sStore::new(
+            pool,
+            "space".to_string(),
+            crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+        ),
         CancellationToken::new(),
         TaskTracker::new(),
         capacity,
@@ -65,7 +69,11 @@ async fn poller_is_tracked_and_stops_on_shutdown() {
     let shutdown_token = CancellationToken::new();
     let task_tracker = TaskTracker::new();
     let waiters = RestoreWaiters::with_capacity(
-        K8sStore::new(pool, "space".to_string()),
+        K8sStore::new(
+            pool,
+            "space".to_string(),
+            crate::controllers::substrate::kubernetes::store::MaterializationMode::Fenced,
+        ),
         shutdown_token.clone(),
         task_tracker.clone(),
         1,
