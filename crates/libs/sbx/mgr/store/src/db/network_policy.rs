@@ -308,19 +308,21 @@ pub(super) fn decide_network_policy_override_update(
     }
 }
 
-/// Whether `sandbox_id` is a non-pool sandbox with a registered network
-/// gateway, so a policy change has a live gateway to reconcile.
-pub fn has_live_network_policy_gateway(conn: &Connection, sandbox_id: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS (
-             SELECT 1 FROM sandboxes
-             WHERE id = ?1
-               AND netgtw_pid IS NOT NULL
-               AND pool_template IS NULL
-         )",
-        params![sandbox_id],
-        |row| row.get(0),
-    )
+db_private_outside_tests! {
+    /// Whether `sandbox_id` is a non-pool sandbox with a registered network
+    /// gateway, so a policy change has a live gateway to reconcile.
+    fn has_live_network_policy_gateway(conn: &Connection, sandbox_id: &str) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sandboxes
+                 WHERE id = ?1
+                   AND netgtw_pid IS NOT NULL
+                   AND pool_template IS NULL
+             )",
+            params![sandbox_id],
+            |row| row.get(0),
+        )
+    }
 }
 
 fn enqueue_node_dirty_network_policy_sandbox_tx(

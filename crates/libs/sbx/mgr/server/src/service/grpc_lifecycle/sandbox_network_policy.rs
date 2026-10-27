@@ -327,7 +327,8 @@ impl SandboxManagerService {
             }
             let live = {
                 let db = self.db_conn()?;
-                crate::db::has_live_network_policy_gateway(&db, &sandbox.id)
+                crate::db::read::sandbox_view(&db, &sandbox.id)
+                    .live_network_policy_gateway()
                     .map_err(|e| Status::internal(format!("db live-gateway check failed: {e}")))?
             };
             if live {

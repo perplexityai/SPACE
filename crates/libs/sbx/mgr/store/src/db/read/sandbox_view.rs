@@ -157,6 +157,13 @@ impl SandboxView<'_> {
         crate::db::sandbox_exists(self.conn, self.id)
     }
 
+    /// Whether the row has a live network-policy gateway to reconcile: a row
+    /// with `netgtw_pid IS NOT NULL AND pool_template IS NULL`. `false`
+    /// without a row.
+    pub fn live_network_policy_gateway(&self) -> Result<bool> {
+        crate::db::has_live_network_policy_gateway(self.conn, self.id)
+    }
+
     /// Whether the row is `suspended` with `local_artifact_id` pinned.
     ///
     /// One `EXISTS` over two columns. It is only as current as the caller's

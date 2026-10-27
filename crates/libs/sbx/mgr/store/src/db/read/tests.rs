@@ -113,9 +113,10 @@ const FIXTURES: [Fixture; 4] = [
 /// Six sandboxes, one per shape an accessor needs to agree with.
 struct Seeded {
     conn: Connection,
-    /// A requested cold-start cleanup over a live runtime, with a running
-    /// teardown-suspend job, a retained execution delete receipt, a written
-    /// route claim and a pending auto-lifecycle delete receipt.
+    /// A requested cold-start cleanup over a live runtime with a registered
+    /// network gateway, with a running teardown-suspend job, a retained
+    /// execution delete receipt, a written route claim and a pending
+    /// auto-lifecycle delete receipt.
     main: SandboxId,
     main_ids: Vec<String>,
     cleanup_id: SandboxCleanupEpisodeId,
@@ -134,9 +135,9 @@ struct Seeded {
     claimed: ClaimedQuarantineRecoveryCandidate,
     /// An sbx-manager quarantine of an orphan whose row went missing.
     orphan: String,
-    /// Paused under the main generation, with no cleanup intent or episode,
-    /// a pending receipt for an older generation and an expired execution
-    /// receipt.
+    /// Paused under the main generation, with no gateway, cleanup intent or
+    /// episode, a pending receipt for an older generation and an expired
+    /// execution receipt.
     paused: String,
     paused_id: SandboxId,
     /// A second interrupted restore; only its scope is corrupted.
@@ -507,6 +508,27 @@ fn cases() -> Vec<Case> {
             view: |s| flag(s.main().exists()),
             old: |s| flag(crate::db::sandbox_exists(&s.conn, s.main_text())),
             expected: [T, T, F, T],
+        },
+        Case {
+            accessor: "live_network_policy_gateway",
+            view: |s| flag(s.main().live_network_policy_gateway()),
+            old: |s| {
+                flag(crate::db::has_live_network_policy_gateway(
+                    &s.conn,
+                    s.main_text(),
+                ))
+            },
+            expected: [T, T, F, T],
+        },
+        Case {
+            accessor: "live_network_policy_gateway without a gateway",
+            view: |s| flag(s.view(&s.paused).live_network_policy_gateway()),
+            old: |s| {
+                flag(crate::db::has_live_network_policy_gateway(
+                    &s.conn, &s.paused,
+                ))
+            },
+            expected: [F, F, F, F],
         },
         Case {
             accessor: "suspended_with_pinned_artifact",
