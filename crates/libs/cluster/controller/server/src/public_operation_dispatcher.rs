@@ -54,14 +54,14 @@ const DEFAULT_EXECUTION_CONCURRENCY: usize = 16;
 const MAX_EXECUTION_CONCURRENCY: usize = 128;
 /// Execution slots only teardowns (sandbox deletes and kills) may use, so a
 /// teardown can start while every other slot is held.
-const DEFAULT_DELETE_RESERVED_SLOTS: u32 = 2;
-const DELETE_RESERVED_SLOTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_DELETE_RESERVED_SLOTS";
+const DEFAULT_TEARDOWN_RESERVED_SLOTS: u32 = 2;
+const TEARDOWN_RESERVED_SLOTS_ENV: &str =
+    "SPACE_PUBLIC_OPERATION_DISPATCHER_TEARDOWN_RESERVED_SLOTS";
 /// Of the free execution slots other work may use, how many teardowns leave
 /// free while other work is due, so other work can start however many
 /// slots teardowns and other work already hold.
-const DEFAULT_NON_DELETE_RESERVED_SLOTS: u32 = 2;
-const NON_DELETE_RESERVED_SLOTS_ENV: &str =
-    "SPACE_PUBLIC_OPERATION_DISPATCHER_NON_DELETE_RESERVED_SLOTS";
+const DEFAULT_OTHER_RESERVED_SLOTS: u32 = 2;
+const OTHER_RESERVED_SLOTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_OTHER_RESERVED_SLOTS";
 /// After a claim that took nothing while only slots kept for teardowns were
 /// free, how long the loop waits before claiming again, unless an execution
 /// finishes first. Other work cannot start in those slots, so until a
@@ -82,11 +82,11 @@ pub struct ReconcilerConfig {
     pub execution_concurrency: usize,
     /// Of `execution_concurrency`, the slots kept for teardowns (sandbox
     /// deletes and kills); at least one slot is always left for other work.
-    pub delete_reserved_slots: usize,
+    pub teardown_reserved_slots: usize,
     /// How many of the free slots other work may use teardowns leave free
     /// while other work is due, however many other work already holds; with
     /// none due, teardowns may use them.
-    pub non_delete_reserved_slots: usize,
+    pub other_reserved_slots: usize,
     pub claim_stale_after: Duration,
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
@@ -105,8 +105,8 @@ impl Default for ReconcilerConfig {
             tick: DEFAULT_TICK,
             claim_limit: DEFAULT_CLAIM_LIMIT,
             execution_concurrency: DEFAULT_EXECUTION_CONCURRENCY,
-            delete_reserved_slots: DEFAULT_DELETE_RESERVED_SLOTS as usize,
-            non_delete_reserved_slots: DEFAULT_NON_DELETE_RESERVED_SLOTS as usize,
+            teardown_reserved_slots: DEFAULT_TEARDOWN_RESERVED_SLOTS as usize,
+            other_reserved_slots: DEFAULT_OTHER_RESERVED_SLOTS as usize,
             claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
@@ -145,14 +145,14 @@ impl ReconcilerConfig {
                 DEFAULT_EXECUTION_CONCURRENCY,
                 MAX_EXECUTION_CONCURRENCY,
             ),
-            delete_reserved_slots: config.bounded_u32_allow_zero(
-                DELETE_RESERVED_SLOTS_ENV,
-                DEFAULT_DELETE_RESERVED_SLOTS,
+            teardown_reserved_slots: config.bounded_u32_allow_zero(
+                TEARDOWN_RESERVED_SLOTS_ENV,
+                DEFAULT_TEARDOWN_RESERVED_SLOTS,
                 MAX_EXECUTION_CONCURRENCY as u32 - 1,
             ) as usize,
-            non_delete_reserved_slots: config.bounded_u32_allow_zero(
-                NON_DELETE_RESERVED_SLOTS_ENV,
-                DEFAULT_NON_DELETE_RESERVED_SLOTS,
+            other_reserved_slots: config.bounded_u32_allow_zero(
+                OTHER_RESERVED_SLOTS_ENV,
+                DEFAULT_OTHER_RESERVED_SLOTS,
                 MAX_EXECUTION_CONCURRENCY as u32,
             ) as usize,
             claim_stale_after: config.test_duration_secs(
@@ -377,15 +377,15 @@ pub async fn run<E>(
     // The effective width, after the ceiling clamp. Nothing else exposes it,
     // so without this line an over-ceiling setting looks like it took effect.
     let concurrency = config.execution_concurrency.max(1);
-    let delete_reserved_slots = config.delete_reserved_slots.min(concurrency - 1);
+    let teardown_reserved_slots = config.teardown_reserved_slots.min(concurrency - 1);
     // At least one slot always stays open to teardowns too.
-    let non_delete_reserved_slots = config
-        .non_delete_reserved_slots
-        .min(concurrency - delete_reserved_slots.max(1));
+    let other_reserved_slots = config
+        .other_reserved_slots
+        .min(concurrency - teardown_reserved_slots.max(1));
     tracing::info!(
         execution_concurrency = config.execution_concurrency,
-        delete_reserved_slots,
-        non_delete_reserved_slots,
+        teardown_reserved_slots,
+        other_reserved_slots,
         keyed_claim_enabled = config.keyed_claim_enabled,
         retry_deferral_enabled = config.retry_deferral_enabled,
         "starting public-operation-dispatcher"
@@ -403,7 +403,7 @@ pub async fn run<E>(
     // other than teardowns may hold all but the slots reserved for teardowns;
     // while other work is due, teardowns leave the last free slots other work
     // may use to it.
-    let other_concurrency = concurrency - delete_reserved_slots;
+    let other_concurrency = concurrency - teardown_reserved_slots;
     let mut claim_backoff_until: Option<Instant> = None;
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
@@ -460,12 +460,12 @@ pub async fn run<E>(
                 // but never the free slots owed to teardowns: what is left
                 // of their reservation or, with none, one while none runs.
                 let teardown_tasks = in_flight.len().saturating_sub(other_tasks.len());
-                let owed_to_teardowns = delete_reserved_slots
+                let owed_to_teardowns = teardown_reserved_slots
                     .max(1)
                     .saturating_sub(teardown_tasks)
                     .min(free);
                 let free_teardown_while_other_due =
-                    free - non_delete_reserved_slots.min(free - owed_to_teardowns);
+                    free - other_reserved_slots.min(free - owed_to_teardowns);
                 #[cfg(test)]
                 tests::before_claim().await;
                 let started = Instant::now();

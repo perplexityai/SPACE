@@ -99,23 +99,20 @@ async fn wait_for_running(executor: &HeldWork, count: usize) -> TestResult {
 fn reserved_slots_parse_from_the_environment() {
     let reserved = |env: &pplx_space_test_env::TestEnv| {
         let config = ReconcilerConfig::from_environment(env);
-        (
-            config.delete_reserved_slots,
-            config.non_delete_reserved_slots,
-        )
+        (config.teardown_reserved_slots, config.other_reserved_slots)
     };
     let mut env = pplx_space_test_env::TestEnv::default();
     assert_eq!(reserved(&env), (2, 2));
-    for (raw, delete, non_delete) in [
+    for (raw, teardown, other) in [
         ("0", 0, 0),
         ("5", 5, 5),
         ("500", 127, 128),
         ("two", 2, 2),
         ("", 2, 2),
     ] {
-        env.set(DELETE_RESERVED_SLOTS_ENV, raw);
-        env.set(NON_DELETE_RESERVED_SLOTS_ENV, raw);
-        assert_eq!(reserved(&env), (delete, non_delete), "{raw:?}");
+        env.set(TEARDOWN_RESERVED_SLOTS_ENV, raw);
+        env.set(OTHER_RESERVED_SLOTS_ENV, raw);
+        assert_eq!(reserved(&env), (teardown, other), "{raw:?}");
     }
 }
 
@@ -236,7 +233,7 @@ async fn a_teardown_starts_while_other_work_holds_every_unreserved_slot() -> Tes
     let shutdown = CancellationToken::new();
     let dispatcher = tokio::spawn(run(
         ReconcilerConfig {
-            delete_reserved_slots: 1,
+            teardown_reserved_slots: 1,
             ..fast_loop_config(3)
         },
         store.clone(),
@@ -294,8 +291,8 @@ async fn other_work_starts_while_teardowns_hold_every_other_slot() -> TestResult
     let shutdown = CancellationToken::new();
     let dispatcher = tokio::spawn(run(
         ReconcilerConfig {
-            delete_reserved_slots: 0,
-            non_delete_reserved_slots: 1,
+            teardown_reserved_slots: 0,
+            other_reserved_slots: 1,
             ..fast_loop_config(3)
         },
         store.clone(),
@@ -370,8 +367,8 @@ async fn other_work_starts_while_other_work_already_runs_and_teardowns_are_due()
     let shutdown = CancellationToken::new();
     let dispatcher = tokio::spawn(run(
         ReconcilerConfig {
-            delete_reserved_slots: 0,
-            non_delete_reserved_slots: 1,
+            teardown_reserved_slots: 0,
+            other_reserved_slots: 1,
             ..fast_loop_config(3)
         },
         store.clone(),
@@ -434,8 +431,8 @@ async fn a_claim_only_teardowns_could_use_waits_before_the_next() -> TestResult 
         hook,
         run(
             ReconcilerConfig {
-                delete_reserved_slots: 1,
-                non_delete_reserved_slots: 0,
+                teardown_reserved_slots: 1,
+                other_reserved_slots: 0,
                 ..fast_loop_config(3)
             },
             store.clone(),
@@ -508,8 +505,8 @@ async fn a_teardown_still_starts_with_no_reservation_and_a_floor_at_every_slot()
     let shutdown = CancellationToken::new();
     let dispatcher = tokio::spawn(run(
         ReconcilerConfig {
-            delete_reserved_slots: 0,
-            non_delete_reserved_slots: 3,
+            teardown_reserved_slots: 0,
+            other_reserved_slots: 3,
             ..fast_loop_config(3)
         },
         store.clone(),
