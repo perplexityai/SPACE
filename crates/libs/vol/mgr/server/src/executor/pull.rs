@@ -158,65 +158,86 @@ impl TransferExecutor {
         let artifact = transfer_artifact_tag(snapshot_artifact);
         let tmp_path = partial_path(local_path);
 
-        let source_meta = match existing_policy {
-            PullExistingPolicy::LegacySkipPresent => {
-                // Pre-check: if the local file already exists, looks the way
-                // our raw/non-raw contract says it should, and S3 still has
-                // the source object, we assume a previous download completed.
-                //
-                // Non-raw mode: the on-disk shape is the decompressed form, so
-                // a zstd-magic leftover means a previous attempt died between
-                // `get_file` and `decompress_in_place`. Fall through and
-                // re-download.
-                let half_decompressed = !p.raw && is_zstd(local_path).await;
-                if tokio::fs::metadata(local_path).await.is_ok()
-                    && !half_decompressed
-                    && let Ok(Some(_)) = self.store.head(creds, target).await
-                {
-                    tracing::info!(
-                        job_id = %job.job_id,
-                        subject_id = %p.subject_id,
-                        s3_uri = %p.s3_uri,
-                        local_path = %p.local_path,
-                        "pull skipped: local file already present"
-                    );
-                    // Sweep any leftover .partial from an earlier aborted run
-                    // so it doesn't accumulate.
-                    unlink_partial(&tmp_path, "skip_present").await;
-                    apply_file_mode(local_path, p.file_mode, FileModeApplyPolicy::ExistingFile)
-                        .await?;
-                    let size = tokio::fs::metadata(local_path)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    return bytes_len_to_job_i64(size, "existing pull output size");
-                }
-                None
+        // Expected identities supersede the object-store provenance cache.
+        let source_meta = if p.expected_integrity.is_some() {
+            if let Some(size) = self
+                .validate_existing_file_replica(
+                    p,
+                    creds,
+                    target,
+                    local_path,
+                    execution_materialization_mode,
+                    &cancellation,
+                )
+                .await?
+            {
+                apply_file_mode(local_path, p.file_mode, FileModeApplyPolicy::ExistingFile).await?;
+                unlink_partial(&tmp_path, "verified_present").await;
+                return bytes_len_to_job_i64(size, "verified pull output size");
             }
-            PullExistingPolicy::VerifiedReplica => {
-                if let Some(size) = self
-                    .validate_existing_file_replica(
-                        p,
-                        creds,
-                        target,
-                        local_path,
-                        execution_materialization_mode,
-                    )
-                    .await?
-                {
-                    tracing::info!(
-                        job_id = %job.job_id,
-                        subject_id = %p.subject_id,
-                        s3_uri = %p.s3_uri,
-                        local_path = %p.local_path,
-                        "file replica already present"
-                    );
-                    unlink_partial(&tmp_path, "verified_replica").await;
-                    apply_file_mode(local_path, p.file_mode, FileModeApplyPolicy::ExistingFile)
-                        .await?;
-                    return bytes_len_to_job_i64(size, "existing file replica size");
+            None
+        } else {
+            match existing_policy {
+                PullExistingPolicy::LegacySkipPresent => {
+                    // Pre-check: if the local file already exists, looks the way
+                    // our raw/non-raw contract says it should, and S3 still has
+                    // the source object, we assume a previous download completed.
+                    //
+                    // Non-raw mode: the on-disk shape is the decompressed form, so
+                    // a zstd-magic leftover means a previous attempt died between
+                    // `get_file` and `decompress_in_place`. Fall through and
+                    // re-download.
+                    let half_decompressed = !p.raw && is_zstd(local_path).await;
+                    if tokio::fs::metadata(local_path).await.is_ok()
+                        && !half_decompressed
+                        && let Ok(Some(_)) = self.store.head(creds, target).await
+                    {
+                        tracing::info!(
+                            job_id = %job.job_id,
+                            subject_id = %p.subject_id,
+                            s3_uri = %p.s3_uri,
+                            local_path = %p.local_path,
+                            "pull skipped: local file already present"
+                        );
+                        // Sweep any leftover .partial from an earlier aborted run
+                        // so it doesn't accumulate.
+                        unlink_partial(&tmp_path, "skip_present").await;
+                        apply_file_mode(local_path, p.file_mode, FileModeApplyPolicy::ExistingFile)
+                            .await?;
+                        let size = tokio::fs::metadata(local_path)
+                            .await
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        return bytes_len_to_job_i64(size, "existing pull output size");
+                    }
+                    None
                 }
-                Some(self.head_required(p, creds, target).await?)
+                PullExistingPolicy::VerifiedReplica => {
+                    if let Some(size) = self
+                        .validate_existing_file_replica(
+                            p,
+                            creds,
+                            target,
+                            local_path,
+                            execution_materialization_mode,
+                            &cancellation,
+                        )
+                        .await?
+                    {
+                        tracing::info!(
+                            job_id = %job.job_id,
+                            subject_id = %p.subject_id,
+                            s3_uri = %p.s3_uri,
+                            local_path = %p.local_path,
+                            "file replica already present"
+                        );
+                        unlink_partial(&tmp_path, "verified_replica").await;
+                        apply_file_mode(local_path, p.file_mode, FileModeApplyPolicy::ExistingFile)
+                            .await?;
+                        return bytes_len_to_job_i64(size, "existing file replica size");
+                    }
+                    Some(self.head_required(p, creds, target).await?)
+                }
             }
         };
 
@@ -486,6 +507,41 @@ impl TransferExecutor {
             }
         }
 
+        if let Some(expected) = p.expected_integrity {
+            let checked = async {
+                if !chained_decompressed
+                    && !streamed
+                    && p.should_transparent_decompress(is_zstd(&tmp_path).await)
+                {
+                    let (_, report) = self
+                        .run_admitted_decode(
+                            job,
+                            p,
+                            execution_materialization_mode,
+                            Some(TransferPhase::DecompressWait),
+                            &tmp_path,
+                            |gate| {
+                                decompress_in_place(
+                                    &tmp_path,
+                                    snapshot_artifact,
+                                    execution_materialization_mode,
+                                    gate,
+                                )
+                            },
+                        )
+                        .await?;
+                    decompression_report = report?;
+                    chained_decompressed = true;
+                }
+                integrity::verify_file(&tmp_path, expected, &cancellation).await
+            }
+            .await;
+            if let Err(error) = checked {
+                unlink_partial(&tmp_path, "integrity_failed").await;
+                return Err(error);
+            }
+        }
+
         let promote_started_at = Instant::now();
         if let Err(err) = self
             .invalidate_file_replica_provenance(local_path, "promote pull output")
@@ -731,6 +787,20 @@ impl TransferExecutor {
                 p,
                 local_path,
                 &object_meta,
+                output_size,
+                materialization.clone(),
+            )
+            .await?;
+        }
+        if p.expected_integrity.is_some() && source_meta.is_none() {
+            self.write_file_replica_provenance(
+                job,
+                p,
+                local_path,
+                &ObjectMeta {
+                    size: bytes,
+                    etag: None,
+                },
                 output_size,
                 materialization,
             )

@@ -265,6 +265,7 @@ fn write_test_replica_provenance(
     std::fs::write(
         verified_replica_provenance_path(path),
         serde_json::to_vec(&pplx_space_volmgr_client::VerifiedReplicaProvenance {
+            integrity: None,
             version: pplx_space_volmgr_client::VERIFIED_REPLICA_PROVENANCE_VERSION,
             subject_id: format!("sandbox:{sandbox_id}"),
             s3_uri: restore_artifact_uri(config, artifact.file_name()),

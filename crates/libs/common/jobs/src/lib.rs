@@ -381,6 +381,14 @@ pub trait JobExecutor: Clone + Send + Sync + 'static {
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<i64, JobError>;
 
+    /// Optional domain result encoded as a replacement payload after successful
+    /// execution. The worker commits it atomically with completion, retaining
+    /// the execution claim while retrying persistence. Never persist verification
+    /// evidence before that transition: a recovered older executor may ignore it.
+    fn completion_payload(&self, _job: &Job) -> Result<Option<String>, JobError> {
+        Ok(None)
+    }
+
     /// Remove executor-owned partial state after cancellation. This runs only
     /// after the execute future has stopped, so cleanup cannot race a writer.
     async fn cleanup_cancelled(&self, _job: &Job) -> Result<(), JobError> {

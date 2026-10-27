@@ -978,6 +978,8 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
     let (db, _worker) = test_worker();
     let scope = TransferScopeId::new();
     let payload = TransferPayload {
+        completion_integrity: None,
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: "/space/cache/snapshot.luks".to_string(),
         s3_uri: "s3://bucket/snapshot.luks?region=us-east-2".to_string(),
@@ -1040,6 +1042,7 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
 async fn submit_pull_does_not_reuse_job_with_different_materialization() {
     let (db, worker) = test_worker_with_active_limit(2);
     let req = PullFileRequest {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshots/a/snapshot.luks?region=us-east-2".to_string(),
         local_path: "/space/cache/sandboxes/sbx/snapshot/snapshot.luks".to_string(),
@@ -1052,6 +1055,8 @@ async fn submit_pull_does_not_reuse_job_with_different_materialization() {
     };
     let file_mode = Some(FileMode::new(0o600).unwrap());
     let payload = TransferPayload {
+        completion_integrity: None,
+        expected_integrity: None,
         subject_id: req.subject_id.clone(),
         local_path: req.local_path.clone(),
         s3_uri: req.s3_uri.clone(),
@@ -1441,6 +1446,7 @@ async fn pull_artifact_retry_allows_scoped_job_after_incompatible_legacy_complet
 async fn submit_pull_persists_explicit_snapshot_artifact_for_opaque_path() {
     let (_db, worker) = test_worker();
     let req = PullFileRequest {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
         local_path: "/space/cache/replacements/download-7b47".to_string(),
@@ -1459,6 +1465,7 @@ async fn submit_pull_persists_explicit_snapshot_artifact_for_opaque_path() {
 async fn submit_pull_persists_and_versions_rootfs_assignment() {
     let (_db, worker) = test_worker();
     let req = PullFileRequest {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshots/a/rootfs?region=us-east-2".to_string(),
         local_path: "/space/cache/sandboxes/sbx/snapshot/rootfs".to_string(),
@@ -1502,6 +1509,7 @@ async fn submit_pull_persists_and_versions_rootfs_assignment() {
 async fn submit_pull_preserves_unspecified_artifact_for_canonical_path() {
     let (_db, worker) = test_worker();
     let req = PullFileRequest {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshots/a/snapshot.luks?region=us-east-2".to_string(),
         local_path: "/space/cache/sandboxes/sbx/snapshot/snapshot.luks".to_string(),
@@ -1719,4 +1727,131 @@ fn classify_artifact_retry_rejects_divergent_wrap_on_pull() {
         .unwrap()
         .is_some()
     );
+}
+
+#[tokio::test]
+async fn integrity_receipt_survives_restart_and_is_fenced_to_the_running_attempt() {
+    use pplx_space_common_jobs::db as jobs;
+    let temp = tempfile::tempdir().unwrap();
+    let service = test_service(&temp).await;
+    let path = temp.path().join("metadata.json");
+    std::fs::write(&path, b"abc").unwrap();
+    let request = PushFileRequest {
+        local_path: path.to_string_lossy().into_owned(),
+        s3_uri: "s3://example-artifacts/metadata.json?region=us-east-1".into(),
+        subject_id: format!("sandbox:{}", uuid::Uuid::now_v7()),
+    };
+    let id = service
+        .submit_push_file(root_request(request))
+        .await
+        .unwrap()
+        .into_inner()
+        .job_id
+        .parse()
+        .unwrap();
+    let job = {
+        let db = service.lock_db().unwrap();
+        jobs::mark_job_running(&db, &id).unwrap();
+        jobs::get_job(&db, &id).unwrap().unwrap()
+    };
+    let identity = pplx_space_volmgr_client::Integrity::parse(
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        3,
+    )
+    .unwrap();
+    let store = crate::executor::integrity::CompletionStore::Database(service.db.clone());
+    store.record(&job, identity).unwrap();
+    let payload = TransferPayload::from_json(&job.payload).unwrap();
+    let staged = payload.staged_path.unwrap();
+    assert!(std::path::Path::new(&staged).exists());
+    // Recovery requeues the job after a crash between receipt persistence and
+    // completion. The durable receipt must also finish staged-source cleanup.
+    let recovered = {
+        let db = service.lock_db().unwrap();
+        jobs::reset_running_kind(&db, "push").unwrap();
+        jobs::mark_job_running(&db, &id).unwrap();
+        jobs::get_job(&db, &id).unwrap().unwrap()
+    };
+    assert!(
+        store.record(&job, identity).is_err(),
+        "old attempt cannot overwrite receipt"
+    );
+    assert_eq!(
+        crate::executor::integrity::receipt(&recovered).unwrap(),
+        Some(identity)
+    );
+    let executor = crate::executor::TransferExecutor::new(
+        TransferExecutorConfig::default(),
+        temp.path().join("staging"),
+        service.db.clone(),
+    );
+    assert_eq!(
+        executor
+            .execute(&recovered, tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap(),
+        3
+    );
+    assert!(!std::path::Path::new(&staged).exists());
+    {
+        let db = service.lock_db().unwrap();
+        jobs::complete_job(&db, &id, 3).unwrap();
+        let completed = jobs::get_job(&db, &id).unwrap().unwrap();
+        assert_eq!(
+            job_to_proto(completed).unwrap().integrity,
+            Some(identity.into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn pull_completion_evidence_does_not_survive_an_unverified_recovery() {
+    use pplx_space_common_jobs::db as jobs;
+    for complete_with_verification in [false, true] {
+        let (db, worker) = test_worker();
+        let expected = pplx_space_volmgr_client::Integrity::parse(
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            3,
+        )
+        .unwrap();
+        let request = PullFileRequest {
+            expected_integrity: Some(expected.into()),
+            subject_id: format!("sandbox:{}", uuid::Uuid::now_v7()),
+            local_path: "/space/cache/test-download".into(),
+            s3_uri: "s3://example-artifacts/metadata.json?region=us-east-1".into(),
+            ..Default::default()
+        };
+        let id = submit_pull(&worker, &request, MaterializationMode::Disabled).unwrap();
+        let job = {
+            let db = db.lock().unwrap();
+            jobs::mark_job_running(&db, &id).unwrap();
+            jobs::get_job(&db, &id).unwrap().unwrap()
+        };
+        let executor = TransferExecutor::new(
+            TransferExecutorConfig::default(),
+            PathBuf::new(),
+            db.clone(),
+        );
+        let completion = executor.completion_payload(&job).unwrap().unwrap();
+        let db = db.lock().unwrap();
+        assert!(
+            crate::executor::integrity::receipt(&jobs::get_job(&db, &id).unwrap().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        if complete_with_verification {
+            assert!(jobs::complete_job_with_payload(&db, &job, 3, &completion).unwrap());
+        } else {
+            // Lose the in-memory result, then finish with the old worker's
+            // completion operation. It must not certify the expectation.
+            jobs::reset_running_kind(&db, "pull").unwrap();
+            jobs::mark_job_running(&db, &id).unwrap();
+            jobs::complete_job(&db, &id, 3).unwrap();
+        }
+        let completed = jobs::get_job(&db, &id).unwrap().unwrap();
+        assert_eq!(
+            job_to_proto(completed).unwrap().integrity,
+            complete_with_verification.then(|| expected.into())
+        );
+    }
 }
