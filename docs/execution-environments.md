@@ -792,9 +792,10 @@ pairs. On aarch64, where the initial Firecracker contract has no compiled
 environment descriptor, absent settings mean `legacy` for both settings: builders
 and activations retain the existing unbound initial contract. That default report
 has no compiled references or default and has `legacy_unbound_allowed=true`.
-The compiled `ch-54.0-linux-7.2.8` name can be explicitly allowed on ARM64 as well
-as x86-64; its reference is architecture-specific. Installing artifacts alone does
-not add it to the effective policy.
+The compiled `ch-54.0-linux-7.2.8` name can be explicitly allowed on x86-64.
+ARM64 release and kernel pins remain installable for qualification tooling, but
+no ARM64 CH environment is admitted until its execution qualification passes.
+Installing artifacts alone does not add an environment to the effective policy.
 
 The configured default is used only for work without source or exact selection.
 A bound source prefers its exact environment, then compatible fallback if it is
@@ -1212,15 +1213,17 @@ node-manager owns those host-capable control endpoints. Guest communication is a
 separate channel.
 
 Installing a release does not approve it for execution. The compiled
-`ch-54.0-linux-7.2.8` environment has separate ARM64 and x86-64 identities. Each
-pairs the architecture's static Cloud Hypervisor 54.0 executable with its upstream
-7.2.8+ Linux image: ARM64 Image or x86-64 ELF with a PVH entry. SHA-256 and
-fs-verity measurements are pinned independently. Neither binding has a memory-state
+`ch-54.0-linux-7.2.8` environment pairs the x86-64 static Cloud Hypervisor 54.0
+executable with its upstream 7.2.8+ ELF kernel with a PVH entry. SHA-256 and
+fs-verity measurements are pinned independently. The binding has no memory-state
 format or cross-release replacement qualification. Existing ARM64 unbound Firecracker defaults stay
 unchanged; CH requires explicit policy permission and an exact environment.
 
-Node-manager owns the CH control API and validates the supported boot device
-model before sending configuration. Sandbox-manager receives only the separate
+Node-manager owns the CH control API and parses the supported boot device
+model into a strict typed configuration before sending it. The child launcher
+creates a root-owned, owner-only API listener and passes its descriptor to CH.
+Each control connection verifies its peer PID against the registered runtime
+and its pinned process lifetime; reconnects repeat that proof. Sandbox-manager receives only the separate
 guest communication endpoint. The supervisor opens and authenticates the runtime,
 then a fresh single-threaded launcher creates mount, network, IPC, UTS and PID
 isolation, enters the VM cgroup, drops privilege, and executes the same authenticated
@@ -1235,9 +1238,13 @@ Template finalization requires acknowledged Stop before copying the rootfs.
 Future runtime adapters own their boot and control implementation; the shared
 lifecycle retains selection, execution identity, resource fences and cleanup.
 
-### ARM64 local builder and worker exercise
+### Local x86-64 builder and worker exercise
 
-Use an isolated Linux ARM64 KVM builder/worker with the same SPACE revision across
+ARM64 CH admission remains disabled until build, guest traffic, manager restart,
+VMM crash and cleanup qualification passes on that host platform. Installing its
+artifacts for upstream qualification does not enable SPACE execution.
+
+Use an isolated Linux x86-64 KVM builder/worker with the same SPACE revision across
 runtime-manager, supervisor, node-manager, sandbox-manager, template-manager and
 build-manager. Deploy the protocol migration before removing old RPCs as described
 above. CH authenticates the executable and boot kernel against its compiled catalog.
@@ -1257,9 +1264,9 @@ supervisors refuse unsealed sources before spawning. Verify the host can boot th
 CH PCI device model before using it for workloads. Nested KVM availability alone does not prove working
 virtio block, network or vsock interrupts.
 
-Add `ch-54.0-linux-7.2.8` to the node-manager startup allowlist. On ARM64 the
-configuration `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS=legacy,ch-54.0-linux-7.2.8`
-keeps the existing unbound default. Leave `SPACE_DEFAULT_EXECUTION_ENVIRONMENT`
+Add `ch-54.0-linux-7.2.8` to the node-manager startup allowlist. The
+configuration `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS=e0,legacy,ch-54.0-linux-7.2.8`
+keeps the existing E0 default. Leave `SPACE_DEFAULT_EXECUTION_ENVIRONMENT`
 unset. Restart node-manager through the normal deployment mechanism. Installing
 artifacts does not change either setting.
 
@@ -1268,7 +1275,8 @@ On that node, install and resolve the exact sources:
 ```sh
 space-rtmgr runtimes install cloud-hypervisor-54.0
 space-rtmgr kernels install '7.2.8+' --runtime cloud-hypervisor-54.0
-CH_ENV=sha256:8da931abea319e09b50563ab03d22cbde774ed88296e8723772be8ba75e5d1d0
+# Set CH_ENV to the x86-64 reference from this build's compiled environment catalog.
+: "${CH_ENV:?set the installed environment reference}"
 space-nodemgr environment --reference "$CH_ENV"
 ```
 
@@ -1299,3 +1307,25 @@ sandbox readiness, including guest command transport and stop/start persistence.
 Do not enable CH for fleet placement based on these local results. Environment
 placement, multi-node qualification and additional lifecycle capabilities remain
 separate admission requirements.
+
+### Runtime exit and rollback
+
+Periodic lifecycle recovery examines bounded batches every 60 seconds. A Started
+sandbox whose recorded process has exited is admitted under its cleanup fence to
+Stopping, then the durable cleanup worker converges it to Stopped while retaining
+the disk. A missing identity, permission error or socket timeout is inconclusive,
+not permission to stop another execution. Cleanup retries survive manager restart;
+the scan advances past busy rows. The interval is not a per-sandbox deadline on a
+large node. Live crash/restart qualification remains required before general
+multi-tenant enablement.
+
+The contained launcher publishes the child's PID before releasing it to exec,
+so losing the supervisor reply cannot leave an executed VMM without registration.
+It pivots into its minimal root and detaches the inherited host mount tree;
+privileged device creation occurs only in a private root-controlled tmpfs.
+
+Before rolling node-manager or template-manager back to a build without CH,
+stop and drain all CH sandboxes and withdraw CH template use. Preserve the
+upgraded supervisor when compact execution-cache paths exist. The SHA-256
+fallback remains a distinct authenticated integrity mode on filesystems lacking
+fs-verity; a capable filesystem with an invalid or missing seal still fails closed.

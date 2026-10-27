@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Generic, TypeVar, cast, get_type_hints
 
 from space_smoke.config import SandboxConfig
+from space_smoke.direct_node import DirectNodeRecoveryFixture
 from space_smoke.fixtures import CommandSandboxFixture, Ecw, KindEcw
 from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.native_recovery import KindNativeHardeningFixture
@@ -19,6 +20,7 @@ from space_smoke.services import SmokeServices
 # The fixture type is the scenario's capability declaration; requesting a
 # privileged fixture narrows the backends the scenario may run on.
 FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
+    DirectNodeRecoveryFixture: frozenset({"deployed"}),
     NativeHardeningFixture: frozenset({"kind", "deployed"}),
     KindNativeHardeningFixture: frozenset({"kind"}),
     CommandSandboxFixture: frozenset({"kind", "deployed"}),
@@ -152,12 +154,14 @@ def scenario(
     if timeout_minutes is not None and timeout_minutes <= 0:
         raise ValueError("smoke timeout must be a positive number of minutes")
     if storage_credentials not in (None, "exchange", "static"):
-        raise ValueError("smoke storage credentials mode must be 'exchange' or 'static'")
+        raise ValueError(
+            "smoke storage credentials mode must be 'exchange' or 'static'"
+        )
     if test_hooks is not None and not test_hooks.strip():
         raise ValueError("smoke test hooks must name the hooks the scenario needs")
     supported_surfaces = frozenset(api_surfaces)
-    if not supported_surfaces or not supported_surfaces <= {"ecw", "native"}:
-        raise ValueError("smoke API surfaces must contain 'ecw' and/or 'native'")
+    if not supported_surfaces or not supported_surfaces <= {"ecw", "native", "node"}:
+        raise ValueError("smoke API surfaces must contain ecw, native or node")
 
     def define(verify: Callable[[Fixture], None]) -> Scenario[Fixture]:
         docstring = inspect.getdoc(verify)
@@ -174,17 +178,35 @@ def scenario(
                 f"smoke {id} fixture must be one of {supported}; got "
                 f"{getattr(fixture_type, '__name__', fixture_type)!r}"
             )
+        if (fixture_type is DirectNodeRecoveryFixture) != (
+            "node" in supported_surfaces
+        ):
+            raise TypeError("node API scenarios require DirectNodeRecoveryFixture")
+        if fixture_type is DirectNodeRecoveryFixture and supported_surfaces != {"node"}:
+            raise TypeError(
+                "DirectNodeRecoveryFixture requires only the node API surface"
+            )
         if "native" in supported_surfaces and fixture_type not in (
-            CommandSandboxFixture, NativeHardeningFixture, KindNativeHardeningFixture
+            CommandSandboxFixture,
+            NativeHardeningFixture,
+            KindNativeHardeningFixture,
         ):
             raise TypeError(
                 "Native API scenarios require CommandSandboxFixture or NativeHardeningFixture"
             )
-        if fixture_type in (NativeHardeningFixture, KindNativeHardeningFixture) and supported_surfaces != {"native"}:
-            raise TypeError("NativeHardeningFixture requires only the native API surface")
+        if fixture_type in (
+            NativeHardeningFixture,
+            KindNativeHardeningFixture,
+        ) and supported_surfaces != {"native"}:
+            raise TypeError(
+                "NativeHardeningFixture requires only the native API surface"
+            )
         if telemetry_mode is not None and fixture_type is not KindEcw:
             raise TypeError("a telemetry mode requires the KindEcw fixture")
-        if timeout_minutes is not None and timeout_minutes < fixture_type.timeout_minutes:
+        if (
+            timeout_minutes is not None
+            and timeout_minutes < fixture_type.timeout_minutes
+        ):
             raise ValueError(
                 f"smoke {id} may only raise its fixture's {fixture_type.timeout_minutes}-minute timeout"
             )
