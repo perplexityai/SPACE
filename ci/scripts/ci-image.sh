@@ -2,10 +2,10 @@
 # Provide the CI image to a job without rebuilding it on every run.
 #
 # The image is content-addressed. Its tag is the first 16 characters of the
-# SHA-256 over ci/Dockerfile.ci and rust-toolchain.toml, the only files it is
-# built from. Main pushes publish each tag to GHCR once. Every other job pulls
+# SHA-256 over the Dockerfile, toolchain and shared build scripts. Main pushes
+# publish each tag to GHCR once. Every other job pulls
 # its tag and retags it locally. A tag that does not exist yet (a change to
-# either file) or cannot be pulled is built locally, as every job did before,
+# an input file) or cannot be pulled is built locally, as every job did before,
 # so a registry problem slows a check down but never fails it.
 #
 # Usage: ci/scripts/ci-image.sh ref
@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPOSITORY="${SPACE_CI_IMAGE_REPOSITORY:-ghcr.io/perplexityai/space-ci}"
 SOURCE_URL="https://github.com/perplexityai/SPACE"
-INPUTS=(ci/Dockerfile.ci rust-toolchain.toml)
+INPUTS=(ci/Dockerfile.ci rust-toolchain.toml docker/build-btrfs-progs.sh)
 # Part of the tag, so that publishing the same inputs in a new form (layer
 # compression) produces a new tag instead of reusing the old one.
 PUBLISH_FORMAT="zstd"
