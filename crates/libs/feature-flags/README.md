@@ -154,15 +154,21 @@ to whatever their deployment configured locally rather than to a value chosen
 here, because an override that resolves nothing should leave local
 configuration standing — see `policy::override_allowed`.
 
-`space-api-timeout-lock-bypass` lets unchanged timeout updates skip the sandbox
-row lock when runtime presence is known. Policy changes and uncertain execution
-ownership still take the lock. Create this boolean flag in Eppo with a default
-of `false`, deploy the API with its existing `EPPO_SDK_KEY`, then enable it for
-selected sandbox UUIDs before increasing the percentage. The API evaluates it on
-each timeout call. Setting it to `false` restores locking after the provider
-refreshes; requests already admitted keep their decision. Missing assignments
-or an unready provider use `false`; a disconnected provider may retain its last
-configuration. No worker rollout or migration is needed.
+`space-api-timeout-lock-bypass` lets a timeout update that leaves the policy
+unchanged skip the sandbox row lock when one unlocked read settles runtime
+presence: the sandbox is created, paused or suspended, or started with a known
+execution generation. Policy changes, a mismatched expected policy, other
+started rows, transitions and terminal states still take the lock. The API
+reads the flag on every timeout call with the sandbox UUID as subject. Define
+it as a boolean that defaults to `false` in the deployment's provider (the
+flagd reference file already does), then enable it for selected sandbox UUIDs
+before raising the percentage. Setting it back to `false` restores locking once
+the provider serves the change; requests already past the check keep their
+decision. With no provider, an unready provider or no assignment it reads
+`false`; a disconnected provider may keep serving its last configuration. No
+worker rollout or migration is needed. The counter
+`sandbox.api.timeout_update.lock_decision` records, per call, whether the lock
+was skipped and why it was not.
 
 `space-native-hidden-operations` opens hidden native operations to an org, so
 its env master, `SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED` (on by default),

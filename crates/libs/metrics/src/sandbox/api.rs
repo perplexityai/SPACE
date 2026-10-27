@@ -482,6 +482,40 @@ pub fn wake_coalesce_outcome(identity: SandboxApiMetricIdentity, outcome: WakeCo
     counter("sandbox.api.wake_coalescer.outcome", 1, &tags);
 }
 
+metric_vocabulary!(
+    /// How one timeout update (ECW or native `/v1`) chose between the
+    /// lock-free read and the sandbox row lock. Exactly one value is
+    /// recorded per call, before any lock wait, so calls that later expire
+    /// waiting for the lock still count. The `skipped_*` share of the total
+    /// is how often `space-api-timeout-lock-bypass` avoids the lock; the
+    /// `locked_*` values say why the rest still take it.
+    TimeoutUpdateLockDecision {
+        /// Unchanged policy on a created, paused or suspended sandbox.
+        SkippedAbsent => "skipped_absent",
+        /// Unchanged policy on a started sandbox with a known execution
+        /// generation.
+        SkippedPresent => "skipped_present",
+        /// The flag is off for this sandbox; nothing was read unlocked.
+        LockedFlagOff => "locked_flag_off",
+        /// The call changes the stored policy.
+        LockedPolicyChanged => "locked_policy_changed",
+        /// The caller's expected policy differs from the stored one.
+        LockedExpectedMismatch => "locked_expected_mismatch",
+        /// Unchanged policy, but only a locked read can settle whether a
+        /// runtime must receive it.
+        LockedPresenceUnknown => "locked_presence_unknown",
+    }
+);
+
+/// Record how a timeout update chose its read. No per-sandbox tags.
+pub fn timeout_update_lock_decision(decision: TimeoutUpdateLockDecision) {
+    counter(
+        "sandbox.api.timeout_update.lock_decision",
+        1,
+        &[tag("decision", decision)],
+    );
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RouteIdentityDecisionReason {
     ResidentTargetIdentityReused,

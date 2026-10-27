@@ -61,39 +61,21 @@ fn classify_auto_lifecycle_touch_response(
     }
 }
 
-/// Whether a runtime exists that must receive a new timeout deadline.
+/// Whether a timeout update must reach a runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimePresence {
-    /// Created, Paused or Suspended: no runtime to tell; only the stored
-    /// policy matters.
+    /// Created, Paused or Suspended: the timeout is stored only. A paused VM
+    /// stays resident, but no runtime receives the deadline.
     Absent,
-    /// Started with execution evidence: the runtime receives the deadline.
+    /// Started with an execution, or mid-transition: the runtime receives
+    /// the deadline.
     Present,
-    /// A concurrent activation can change the answer: Started without
-    /// execution evidence, or mid-transition. Only a read taken under the
-    /// sandbox row lock can decide it.
-    Unknown,
 }
 
 impl RuntimePresence {
-    /// Presence from an unlocked read. `Unknown` sends the caller to the
-    /// locked path.
-    fn unlocked(
-        execution: &sandbox_store::AutoLifecycleExecution,
-    ) -> Result<Self, ControllerError> {
-        Self::classify(execution, false)
-    }
-
     /// Presence from a read taken under the sandbox row lock, where an
-    /// activation's claim is visible. Never returns `Unknown`.
+    /// activation's claim is visible.
     fn locked(execution: &sandbox_store::AutoLifecycleExecution) -> Result<Self, ControllerError> {
-        Self::classify(execution, true)
-    }
-
-    fn classify(
-        execution: &sandbox_store::AutoLifecycleExecution,
-        locked: bool,
-    ) -> Result<Self, ControllerError> {
         let lifecycle = execution
             .lifecycle
             .parse::<SandboxLifecycle>()
@@ -104,28 +86,63 @@ impl RuntimePresence {
             SandboxLifecycle::Created | SandboxLifecycle::Paused | SandboxLifecycle::Suspended => {
                 Ok(Self::Absent)
             }
-            // Only the row lock makes an absence proof hold against a
-            // concurrent activation claim.
-            SandboxLifecycle::Started if execution.proves_no_execution() => {
-                Ok(if locked { Self::Absent } else { Self::Unknown })
-            }
-            SandboxLifecycle::Started => Ok(Self::Present),
-            // Mid-transition, an unlocked read can see a stale execution
-            // generation; the locked read sees the activation's claim.
-            SandboxLifecycle::Creating
+            SandboxLifecycle::Started if execution.proves_no_execution() => Ok(Self::Absent),
+            SandboxLifecycle::Started
+            | SandboxLifecycle::Creating
             | SandboxLifecycle::Starting
             | SandboxLifecycle::Restoring
             | SandboxLifecycle::Resuming
             | SandboxLifecycle::Pausing
             | SandboxLifecycle::Suspending
-            | SandboxLifecycle::Checkpointing => {
-                Ok(if locked { Self::Present } else { Self::Unknown })
-            }
+            | SandboxLifecycle::Checkpointing => Ok(Self::Present),
             SandboxLifecycle::Stopping
             | SandboxLifecycle::Stopped
             | SandboxLifecycle::Deleting
             | SandboxLifecycle::Quarantined
             | SandboxLifecycle::Failed => Err(ControllerError::not_found("sandbox is terminal")),
+        }
+    }
+
+    /// Presence from an unlocked read, or `None` when only the locked read
+    /// can settle it. A call that writes nothing may act on committed state,
+    /// ordered before any writer still holding the row lock. A started row
+    /// qualifies only with a known execution generation, which the runtime
+    /// call fences on; every other row, including a started row with no
+    /// generation, takes the lock.
+    fn unlocked(execution: &sandbox_store::AutoLifecycleExecution) -> Option<Self> {
+        match execution.lifecycle.parse::<SandboxLifecycle>().ok()? {
+            SandboxLifecycle::Created | SandboxLifecycle::Paused | SandboxLifecycle::Suspended => {
+                Some(Self::Absent)
+            }
+            SandboxLifecycle::Started if execution.execution_generation.is_some() => {
+                Some(Self::Present)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The stored policy a timeout update reads and the one it would store.
+struct TimeoutIntent {
+    current: AutoLifecyclePolicy,
+    next: AutoLifecyclePolicy,
+    expected_matches: bool,
+}
+
+impl TimeoutIntent {
+    fn new(
+        execution: &sandbox_store::AutoLifecycleExecution,
+        timeout_secs: u32,
+        expected_policy: Option<&AutoLifecyclePolicy>,
+    ) -> Self {
+        let current = execution.policy.0.clone().normalized();
+        let next = crate::e2b::policy_for_timeout_update(&current, timeout_secs).normalized();
+        let expected_matches =
+            expected_policy.is_none_or(|expected| expected.clone().normalized() == current);
+        Self {
+            current,
+            next,
+            expected_matches,
         }
     }
 }
@@ -671,9 +688,16 @@ impl SandboxController {
         Ok(())
     }
 
-    /// Persist timeout intent while serializing its absence decision with
-    /// execution acquisition. The request budget includes the transaction and
-    /// any observation of an already-owned activation; this never starts one.
+    /// Persist timeout intent. With `space-api-timeout-lock-bypass` on, a call
+    /// that leaves the normalized policy unchanged and matches any
+    /// `expected_policy` is decided from one unlocked read when that read
+    /// settles runtime presence: created, paused or suspended (stored only),
+    /// or started with a known execution generation (runtime reset). Such a
+    /// call is ordered before any writer still holding the sandbox row lock.
+    /// Every other call reads under the row lock, so its absence decision
+    /// serializes with execution acquisition. The request budget includes
+    /// the transaction and any observation of an already-owned activation;
+    /// this never starts one.
     pub(crate) async fn set_access_idle_timeout(
         &self,
         pool: &PgPool,
@@ -683,8 +707,9 @@ impl SandboxController {
         deadline: tokio::time::Instant,
         expected_policy: Option<&AutoLifecyclePolicy>,
     ) -> Result<AccessIdleTimeoutOutcome, ControllerError> {
+        use pplx_space_metrics::sandbox::api::TimeoutUpdateLockDecision as Decision;
         tokio::time::timeout_at(deadline, async {
-            let unlocked = if self.feature_flags.bool_value(
+            let (decision, unlocked) = if self.feature_flags.bool_value(
                 pplx_space_feature_flags::SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG,
                 &sandbox.id.to_string(),
             ) {
@@ -692,28 +717,30 @@ impl SandboxController {
                     .await
                     .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
                     .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
-                let current_policy = execution.policy.0.clone().normalized();
-                // Only unchanged intent with known runtime presence can skip
-                // serialization with activation acquisition.
-                let unchanged =
-                    crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs)
-                        .normalized()
-                        == current_policy
-                        && expected_policy
-                            .is_none_or(|expected| expected.clone().normalized() == current_policy);
-                match RuntimePresence::unlocked(&execution) {
-                    Ok(presence @ (RuntimePresence::Absent | RuntimePresence::Present))
-                        if unchanged =>
-                    {
-                        Some((execution, presence))
+                let intent = TimeoutIntent::new(&execution, timeout_secs, expected_policy);
+                if !intent.expected_matches {
+                    (Decision::LockedExpectedMismatch, None)
+                } else if intent.next != intent.current {
+                    (Decision::LockedPolicyChanged, None)
+                } else {
+                    match RuntimePresence::unlocked(&execution) {
+                        Some(RuntimePresence::Absent) => (
+                            Decision::SkippedAbsent,
+                            Some((execution, intent, RuntimePresence::Absent)),
+                        ),
+                        Some(RuntimePresence::Present) => (
+                            Decision::SkippedPresent,
+                            Some((execution, intent, RuntimePresence::Present)),
+                        ),
+                        None => (Decision::LockedPresenceUnknown, None),
                     }
-                    _ => None,
                 }
             } else {
-                None
+                (Decision::LockedFlagOff, None)
             };
-            let (execution, presence, tx) = if let Some((execution, presence)) = unlocked {
-                (execution, presence, None)
+            pplx_space_metrics::sandbox::api::timeout_update_lock_decision(decision);
+            let (execution, intent, presence) = if let Some(unlocked) = unlocked {
+                unlocked
             } else {
                 let mut tx = pool
                     .begin()
@@ -736,35 +763,25 @@ impl SandboxController {
                     .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
                     .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
                 let presence = RuntimePresence::locked(&execution)?;
-                (execution, presence, Some(tx))
-            };
-            let current_policy = execution.policy.0.normalized();
-            if expected_policy
-                .is_some_and(|expected| expected.clone().normalized() != current_policy)
-            {
-                return Err(
-                    tonic::Status::failed_precondition("sandbox lifecycle policy changed").into(),
-                );
-            }
-            let policy =
-                crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs).normalized();
-            if let Some(mut tx) = tx {
-                if policy != current_policy {
-                    Self::persist_auto_lifecycle_policy(&mut tx, sandbox.id, &policy).await?;
+                let intent = TimeoutIntent::new(&execution, timeout_secs, expected_policy);
+                if !intent.expected_matches {
+                    return Err(tonic::Status::failed_precondition(
+                        "sandbox lifecycle policy changed",
+                    )
+                    .into());
+                }
+                if intent.next != intent.current {
+                    Self::persist_auto_lifecycle_policy(&mut tx, sandbox.id, &intent.next).await?;
                 }
                 tx.commit()
                     .await
                     .map_err(|error| db_contention_error("commit timeout intent", &error))?;
+                (execution, intent, presence)
+            };
+            if presence == RuntimePresence::Absent {
+                return Ok(AccessIdleTimeoutOutcome::StoredOnly);
             }
-            match presence {
-                RuntimePresence::Absent => return Ok(AccessIdleTimeoutOutcome::StoredOnly),
-                RuntimePresence::Present => {}
-                RuntimePresence::Unknown => {
-                    return Err(ControllerError::internal(
-                        "locked timeout read left runtime presence unknown",
-                    ));
-                }
-            }
+            let policy = intent.next;
             // Only an identified execution is eligible for bounded readiness
             // observation. Missing identity alone cannot authorize a new wake.
             let (client, generation) = match execution.execution_generation {
