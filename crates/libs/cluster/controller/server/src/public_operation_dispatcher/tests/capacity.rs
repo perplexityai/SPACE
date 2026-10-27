@@ -796,6 +796,46 @@ async fn organizations_at_their_limit_share_the_slots_no_one_waits_for() -> Test
 }
 
 #[tokio::test]
+async fn work_behind_another_organizations_backlog_is_still_claimed() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let busy_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    // The busy organization's backlog is longer than the claim reads of any
+    // one organization, and all of it comes first.
+    let targets = (0..6)
+        .map(|index| format!("sbx_backlog_{index}"))
+        .collect::<Vec<_>>();
+    let backlog = queue_all(
+        &store,
+        busy_org,
+        &targets
+            .iter()
+            .map(|target_id| (OperationKind::CreateSandbox, target_id.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    let other = queue_all(
+        &store,
+        other_org,
+        &[(OperationKind::CreateSandbox, "sbx_behind_the_backlog")],
+    )
+    .await?[0];
+    let limits = ClaimLimits {
+        per_org_non_teardown: Some(org_limit(1, 0)),
+        ..ClaimLimits::any(2)
+    };
+
+    // Both wait, so each gets one.
+    let mut expected = vec![backlog[0], other];
+    expected.sort();
+    assert_eq!(claim_with(&store, limits).await?, expected);
+    Ok(())
+}
+
+#[tokio::test]
 async fn work_run_as_it_was_created_holds_no_slot_under_the_limit() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());

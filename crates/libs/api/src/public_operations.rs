@@ -2010,6 +2010,11 @@ async fn claim_operations(
     // that `$16` of the free slots open to other work stay free for work
     // another organization submits later. Organizations all at their limit
     // share that one budget.
+    // No more than `2 * $12` of an organization's due operations can be
+    // admitted, so the rank reads only those: `due_other` reads every due
+    // one once, an organization with more gets a top-N pass of its own, and
+    // the others' go to the window whole, which keeps one organization's
+    // backlog out of the sort.
     // That rank needs a window, which cannot share a level with `FOR
     // UPDATE`, so `first_other` admits up to `2 * $12` and `picked_other`
     // locks the first `$12` of them it can by key, re-checking that each is
@@ -2093,21 +2098,15 @@ async fn claim_operations(
                AND kind <> ALL($14)
              GROUP BY org_id
          ),
-         other_candidates AS (
+         due_other AS MATERIALIZED (
              SELECT candidate.operation_id,
                     candidate.org_id,
                     candidate.next_attempt_at,
                     candidate.requested_at,
                     GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
                     candidate.claim_token <> '' AS reclaimed,
-                    candidate.started_at IS NULL AS first_start,
-                    COALESCE(org_live.live, 0) AS org_held,
-                    COALESCE(org_live.live, 0) + ROW_NUMBER() OVER (
-                        PARTITION BY candidate.org_id
-                        ORDER BY candidate.next_attempt_at, candidate.requested_at, candidate.operation_id
-                    ) AS org_slots
+                    candidate.started_at IS NULL AS first_start
              FROM public_operations candidate
-             LEFT JOIN org_live ON org_live.org_id = candidate.org_id
              WHERE candidate.state IN ($4, $5)
                AND candidate.kind = ANY($6)
                AND candidate.kind <> ALL($14)
@@ -2118,10 +2117,43 @@ async fn claim_operations(
                )
                AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
          ),
+         due_orgs AS (
+             SELECT org_id, COUNT(*) AS due
+             FROM due_other
+             GROUP BY org_id
+         ),
+         org_first AS (
+             SELECT due_other.*
+             FROM due_other
+             JOIN due_orgs ON due_orgs.org_id = due_other.org_id
+             WHERE due_orgs.due <= 2 * $12
+             UNION ALL
+             SELECT first.*
+             FROM due_orgs
+             CROSS JOIN LATERAL (
+                 SELECT *
+                 FROM due_other
+                 WHERE due_other.org_id = due_orgs.org_id
+                 ORDER BY next_attempt_at, requested_at, operation_id
+                 LIMIT 2 * $12
+             ) first
+             WHERE due_orgs.due > 2 * $12
+         ),
+         other_candidates AS (
+             SELECT org_first.*,
+                    COALESCE(org_live.live, 0) AS org_held,
+                    COALESCE(org_live.live, 0) + ROW_NUMBER() OVER (
+                        PARTITION BY org_first.org_id
+                        ORDER BY org_first.next_attempt_at, org_first.requested_at, org_first.operation_id
+                    ) AS org_slots
+             FROM org_first
+             LEFT JOIN org_live ON org_live.org_id = org_first.org_id
+         ),
          waiting AS (
-             SELECT COUNT(DISTINCT org_id) AS orgs
-             FROM other_candidates
-             WHERE org_held < $15
+             SELECT COUNT(*) AS orgs
+             FROM due_orgs
+             LEFT JOIN org_live ON org_live.org_id = due_orgs.org_id
+             WHERE COALESCE(org_live.live, 0) < $15
          ),
          admissible AS (
              SELECT other.*,
