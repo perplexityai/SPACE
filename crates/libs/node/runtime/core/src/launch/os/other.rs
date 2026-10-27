@@ -101,6 +101,12 @@ pub struct ProcessHandle {
     pid: u32,
 }
 
+pub(super) fn pin_current_process() -> Result<ProcessHandle, ProcessHandleError> {
+    Ok(ProcessHandle {
+        pid: std::process::id(),
+    })
+}
+
 impl ProcessHandle {
     pub fn open(pid: u32) -> Result<Self, ProcessHandleError> {
         validate_process_pid(pid).map_err(ProcessHandleError::InvalidPid)?;

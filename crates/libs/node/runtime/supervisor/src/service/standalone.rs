@@ -3,7 +3,8 @@
 use super::*;
 use pplx_space_common_core::types::{EnvironmentReference, RuntimeKind};
 use pplx_space_node_runtime_core::{
-    artifact_store::managed_release_directory,
+    artifact_store::release_directory_names,
+    authenticated_source::SourcePins,
     catalog::{CompiledEnvironment, compiled_verity_digest},
     proto::{ArtifactIntegrityRequirement, LaunchRuntimeRequest},
     runtime_inventory::host_arch,
@@ -65,11 +66,11 @@ impl RuntimeSupervisorService {
             CgroupLimits::from_request(limits.vcpu_count, limits.memory_mib, limits.pids_max);
         let budget = limits.cpu_budget().map_err(cgroup_update_error_to_status)?;
         let path = config.executable.clone();
-        let digest = config.executable_digest;
+        let pins = config.executable_source;
         self.execution_io(move |store| {
             // Authenticate before publishing intent. The fresh launcher repeats
             // this check on the descriptor it executes, closing path replacement.
-            crate::verified_launch::open(&path, digest)
+            crate::verified_launch::open_catalog_executable(&path, pins)
                 .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
             if !cgroup::firecracker_is_quiescent(&sandbox_id.to_string())
                 .map_err(|e| Status::unavailable(format!("VM occupancy: {e}")))?
@@ -159,9 +160,11 @@ fn standalone_config(
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| Status::invalid_argument("runtime source has no release directory"))?;
-    let directory = managed_release_directory(&release.release, release.digest());
+    let directories = release_directory_names(&release.release, release.digest());
     if !canonical_absolute(root)
-        || root.file_name() != Some(std::ffi::OsStr::new(&directory))
+        || !directories
+            .iter()
+            .any(|directory| root.file_name() == Some(std::ffi::OsStr::new(directory)))
         || binary != root.join("bin/cloud-hypervisor")
     {
         return Err(Status::invalid_argument(
@@ -176,6 +179,11 @@ fn standalone_config(
     let digest = compiled_verity_digest(file.sha256)
         .map_err(|e| Status::failed_precondition(e.to_string()))?
         .ok_or_else(|| Status::failed_precondition("runtime executable has no verity pin"))?;
+    // The generic wire carries a path, but containment only accepts a validated
+    // namespace locator, just like the Firecracker adapter.
+    let network_namespace =
+        pplx_space_common_core::types::NodeSpacePath::parse(&req.network_namespace)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let workspace = Path::new(&req.workspace_root);
     if !canonical_absolute(workspace) {
         return Err(Status::invalid_argument(
@@ -195,16 +203,23 @@ fn standalone_config(
     }
     Ok(crate::contained_launcher::Config {
         root,
-        network_namespace: req.network_namespace.clone().into(),
+        registration_directory: pplx_space_common_core::host::linux::paths::sandbox_run_dir(
+            &sandbox.to_string(),
+        )
+        .into(),
+        network_namespace: network_namespace.as_path().to_owned(),
         executable: binary.to_owned(),
-        executable_digest: digest,
+        executable_source: SourcePins {
+            sha256: file.sha256,
+            verity: digest,
+        },
         uid: req.uid,
         gid: req.gid,
         cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(
             &sandbox.to_string(),
         ),
         output: req.console_path.clone().into(),
-        arguments: vec!["--api-socket".into(), "/control.sock".into()],
+        arguments: vec!["--seccomp".into(), "true".into()],
     })
 }
 

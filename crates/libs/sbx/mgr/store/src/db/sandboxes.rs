@@ -1318,7 +1318,7 @@ db_private_outside_tests! {
                 }
             };
             let eligible = match state.parse::<SandboxState>() {
-                Ok(SandboxState::Paused | SandboxState::Resuming | SandboxState::Checkpointing) => true,
+                Ok(SandboxState::Started | SandboxState::Paused | SandboxState::Resuming | SandboxState::Checkpointing) => true,
                 Ok(SandboxState::Suspending) => {
                     matches!(row.get_ref(3)?, rusqlite::types::ValueRef::Null)
                 }

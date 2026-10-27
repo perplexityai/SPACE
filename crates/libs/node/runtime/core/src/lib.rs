@@ -11,6 +11,8 @@ pub mod launch;
 
 #[cfg(feature = "artifact-store")]
 pub mod artifact_store;
+#[cfg(all(feature = "artifact-store", feature = "host-runtime"))]
+pub mod authenticated_source;
 pub mod catalog;
 pub mod file_delta;
 
