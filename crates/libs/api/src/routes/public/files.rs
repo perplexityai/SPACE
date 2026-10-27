@@ -247,7 +247,9 @@ pub async fn write_file(
         .flag(parents)
         .user(user.as_ref())
         .chunks(&chunks);
-    let binding = bind_request_key(&state, &sandbox, WRITE_FILE, &idempotency_key, fingerprint);
+    let fingerprint = fingerprint.finish()?;
+    let guest_key = guest_key(WRITE_FILE, &idempotency_key, &fingerprint)?;
+    let binding = bind_request_key(&state, &sandbox, WRITE_FILE, &idempotency_key, &fingerprint);
     let metric = SandboxApiMetricIdentity::native("files_write");
     if !parents {
         // Bind the key while the write connects, which hides the binding's
@@ -257,12 +259,7 @@ pub async fn write_file(
         // still have woken a dormant sandbox, as the request would have.
         let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
         let mut requests = Some(spaced_write_requests(
-            sandbox.id,
-            path,
-            append,
-            idempotency_key.clone(),
-            chunks,
-            user,
+            sandbox.id, path, append, guest_key, chunks, user,
         ));
         let requests = stream::once(bound_rx).flat_map(move |bound| {
             stream::iter(
@@ -309,7 +306,7 @@ pub async fn write_file(
         )
     };
     let response = write_creating_parents(
-        &idempotency_key,
+        &guest_key,
         [path.as_str()],
         user.as_ref(),
         |key| attempt(key.clone()),
@@ -378,12 +375,14 @@ pub async fn write_file_batch(
             .flag(entry.append)
             .field(&entry.data);
     }
+    let fingerprint = fingerprint.finish()?;
+    let guest_key = guest_key(WRITE_FILE_BATCH, &idempotency_key, &fingerprint)?;
     bind_request_key(
         &state,
         &sandbox,
         WRITE_FILE_BATCH,
         &idempotency_key,
-        fingerprint,
+        &fingerprint,
     )
     .await?;
     let attempt = |entries: Vec<SpacedWriteBatchEntry>, key: &IdempotencyKey| {
@@ -404,7 +403,7 @@ pub async fn write_file_batch(
     let response = if parents {
         let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
         write_creating_parents(
-            &idempotency_key,
+            &guest_key,
             paths.iter().map(String::as_str),
             user.as_ref(),
             |key| attempt(entries.clone(), key),
@@ -413,7 +412,7 @@ pub async fn write_file_batch(
         )
         .await?
     } else {
-        attempt(entries, &idempotency_key)
+        attempt(entries, &guest_key)
             .await
             .map_err(controller_error)?
     };
@@ -444,7 +443,7 @@ pub async fn mkdir_file(
         &sandbox,
         CREATE_DIRECTORY,
         &idempotency_key,
-        fingerprint,
+        &fingerprint.finish()?,
     )
     .await?;
     state
@@ -477,7 +476,14 @@ pub async fn remove_file(
         .field(path.as_bytes())
         .flag(request.recursive)
         .user(user.as_ref());
-    bind_request_key(&state, &sandbox, REMOVE_FILE, &idempotency_key, fingerprint).await?;
+    bind_request_key(
+        &state,
+        &sandbox,
+        REMOVE_FILE,
+        &idempotency_key,
+        &fingerprint.finish()?,
+    )
+    .await?;
     state
         .sandbox_controller
         .spaced_remove(
@@ -517,7 +523,16 @@ pub async fn rename_file(
         .field(old_path.as_bytes())
         .field(new_path.as_bytes())
         .user(user.as_ref());
-    bind_request_key(&state, &sandbox, RENAME_FILE, &idempotency_key, fingerprint).await?;
+    let fingerprint = fingerprint.finish()?;
+    let guest_key = guest_key(RENAME_FILE, &idempotency_key, &fingerprint)?;
+    bind_request_key(
+        &state,
+        &sandbox,
+        RENAME_FILE,
+        &idempotency_key,
+        &fingerprint,
+    )
+    .await?;
     state
         .sandbox_controller
         .spaced_rename(
@@ -529,7 +544,7 @@ pub async fn rename_file(
                 operation: Some(spaced_ops::RenameRequest {
                     old_path,
                     new_path,
-                    idempotency_key: Some(idempotency_key.as_str().to_string()),
+                    idempotency_key: Some(guest_key.as_str().to_string()),
                     user: user.map(|user| user.as_str().to_string()),
                 }),
             },
@@ -1097,7 +1112,7 @@ fn path_basename(path: &str) -> &str {
 }
 
 mod key_binding;
-use key_binding::{RequestDigest, bind_request_key};
+use key_binding::{RequestDigest, bind_request_key, guest_key};
 
 #[cfg(test)]
 mod tests;

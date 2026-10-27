@@ -12,13 +12,10 @@ use crate::{
     routes::AppState,
 };
 
-/// Bind the client's key to this request before the sandbox sees it. The
-/// sandbox replays a keyed write or rename by key alone, so without the
-/// binding a key reused for another path or other data got the first
-/// request's answer while nothing was written. A reused key whose request
-/// differs gets `idempotency_conflict` instead, and the guest is never
-/// asked. mkdir and remove, which the sandbox runs again on a retry, are
-/// bound the same way, so no key is accepted and then ignored.
+/// Bind the client's key to this request before the sandbox sees it. A key
+/// reused for a request that differs gets `idempotency_conflict`, and the
+/// guest is never asked. mkdir and remove, which the sandbox runs again on a
+/// retry, are bound the same way, so no key is accepted and then ignored.
 ///
 /// The key is scoped to the sandbox as the sandbox's own replay is: a key
 /// reused in another sandbox keeps working as it did.
@@ -27,7 +24,7 @@ pub(super) async fn bind_request_key(
     sandbox: &Sandbox,
     route: NativeOperation,
     key: &IdempotencyKey,
-    fingerprint: RequestDigest,
+    fingerprint: &RequestFingerprint,
 ) -> Result<(), PublicApiError> {
     let mut scoped = Sha256::new();
     scoped.update(sandbox.id.to_string());
@@ -35,12 +32,11 @@ pub(super) async fn bind_request_key(
     scoped.update(key.as_str());
     let scoped = IdempotencyKey::parse(hex::encode(scoped.finalize()))
         .map_err(|_| PublicApiError::internal())?;
-    let fingerprint = fingerprint.finish()?;
     let idempotency = CreatePublicOperationIdempotency {
         method: HttpOperationMethod::Post,
         path_template: OperationPathTemplate::new(route.path()),
         key: &scoped,
-        request_fingerprint: &fingerprint,
+        request_fingerprint: fingerprint,
     };
     if bind_idempotency_key(&state.pool, sandbox.org_id, &idempotency).await? {
         Ok(())
@@ -49,6 +45,26 @@ pub(super) async fn bind_request_key(
             "idempotency key was already used with a different request",
         ))
     }
+}
+
+/// The key the sandbox sees for a request bound to `key`. The sandbox
+/// replays a keyed write or rename by key alone, and nothing bounds how long
+/// it holds a record whose operation is still running, so its memory of a key
+/// can outlast the binding. Deriving its key from the request as well means a
+/// different request never reaches another one's record, however long that
+/// lives, while a retry of the same request still replays its own.
+pub(super) fn guest_key(
+    route: NativeOperation,
+    key: &IdempotencyKey,
+    fingerprint: &RequestFingerprint,
+) -> Result<IdempotencyKey, PublicApiError> {
+    let mut digest = RequestDigest::default();
+    digest
+        .field(route.path().as_bytes())
+        .field(key.as_str().as_bytes())
+        .field(fingerprint.as_str().as_bytes());
+    IdempotencyKey::parse(format!("native-file-{}", digest.finish()?.as_str()))
+        .map_err(|_| PublicApiError::internal())
 }
 
 /// What a file mutation asks the sandbox to do, as the fingerprint its key is

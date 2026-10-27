@@ -128,6 +128,39 @@ fn spaced_write_requests_include_idempotency_on_open() {
     assert_eq!(open.idempotency_key.as_deref(), Some("native-file-write"));
 }
 
+/// The sandbox replays a keyed operation by key alone, and can remember a key
+/// after its binding has expired. The key it sees therefore changes with the
+/// request, so a reused key's different request never reaches the first
+/// request's record, while a retry of the same request keeps its key.
+#[test]
+fn the_sandbox_key_changes_with_the_request() {
+    let fingerprint = |data: &[u8]| {
+        let mut digest = RequestDigest::default();
+        digest.field(b"/workspace/a").field(data);
+        digest.finish().unwrap()
+    };
+    let key = IdempotencyKey::parse("client-key").unwrap();
+    let first = guest_key(WRITE_FILE, &key, &fingerprint(b"first")).unwrap();
+    assert_eq!(
+        guest_key(WRITE_FILE, &key, &fingerprint(b"first")).unwrap(),
+        first
+    );
+    assert_ne!(first, key);
+    for other in [
+        guest_key(WRITE_FILE, &key, &fingerprint(b"other")).unwrap(),
+        guest_key(WRITE_FILE_BATCH, &key, &fingerprint(b"first")).unwrap(),
+        guest_key(RENAME_FILE, &key, &fingerprint(b"first")).unwrap(),
+        guest_key(
+            WRITE_FILE,
+            &IdempotencyKey::parse("other-key").unwrap(),
+            &fingerprint(b"first"),
+        )
+        .unwrap(),
+    ] {
+        assert_ne!(other, first);
+    }
+}
+
 #[test]
 fn modified_filters_are_mutually_exclusive() {
     validate_modified_filters(&FileModifiedRequest {
