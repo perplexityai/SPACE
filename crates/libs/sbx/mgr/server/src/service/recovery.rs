@@ -468,7 +468,7 @@ impl SandboxManagerService {
         let target = match observe_stable_resident_state(sandbox_id, probe).await {
             Ok(VmState::Running) => crate::db::PauseFailedRecoveryTarget::Started,
             Ok(VmState::Paused) => crate::db::PauseFailedRecoveryTarget::Paused,
-            Ok(VmState::NotStarted) => {
+            Ok(VmState::NotStarted | VmState::Shutdown) => {
                 return self
                     .quarantine_interrupted_pause(row, "Firecracker reported NotStarted")
                     .await;
