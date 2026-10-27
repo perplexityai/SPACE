@@ -88,6 +88,8 @@ pub(super) fn observed_access_idle_generation(
 pub(crate) enum AccessIdleTimeoutOutcome {
     StoredOnly,
     Applied,
+    /// The stored policy isn't ECW-managed, so the timeout left it and the runtime untouched.
+    Unmanaged,
 }
 
 enum DeadlineExecutionReadiness {
@@ -572,6 +574,45 @@ impl SandboxController {
         Ok(())
     }
 
+    /// Replace a sandbox's auto-lifecycle policy with one derived from its current
+    /// value under the row lock, so the decision can't act on a stale read.
+    /// `update` returns the replacement, or `None` to leave the policy as it is.
+    /// Returns whether it wrote.
+    pub(crate) async fn update_auto_lifecycle_policy_with(
+        &self,
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        update: impl FnOnce(&AutoLifecyclePolicy) -> Option<AutoLifecyclePolicy>,
+    ) -> Result<bool, ControllerError> {
+        let mut tx = pool.begin().await.map_err(|error| {
+            db_contention_error("failed to begin sandbox auto lifecycle update", &error)
+        })?;
+        let locked = sqlx::query_scalar::<_, SandboxId>(sql!(
+            "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| db_contention_error("lock sandbox auto lifecycle", &error))?;
+        if locked.is_none() {
+            return Err(ControllerError::not_found("sandbox no longer exists"));
+        }
+        let current = sandbox_store::auto_lifecycle_policy(&mut *tx, sandbox_id)
+            .await
+            .map_err(|error| db_contention_error("read sandbox auto lifecycle", &error.into()))?
+            .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
+        let Some(mut policy) = update(&current) else {
+            return Ok(false);
+        };
+        policy.normalize_in_place();
+        validate_v1_policy(&policy).map_err(ControllerError::bad_request)?;
+        Self::persist_auto_lifecycle_policy(&mut tx, sandbox_id, &policy).await?;
+        tx.commit().await.map_err(|error| {
+            db_contention_error("failed to commit sandbox auto lifecycle", &error)
+        })?;
+        Ok(true)
+    }
+
     async fn persist_auto_lifecycle_policy(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         sandbox_id: SandboxId,
@@ -668,6 +709,9 @@ impl SandboxController {
                 return Err(
                     tonic::Status::failed_precondition("sandbox lifecycle policy changed").into(),
                 );
+            }
+            if !crate::e2b::is_ecw_managed(&current_policy) {
+                return Ok(AccessIdleTimeoutOutcome::Unmanaged);
             }
             let policy =
                 crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs).normalized();

@@ -676,6 +676,19 @@ pub fn sandbox_created(tls_interception_on: bool) {
     );
 }
 
+/// One ECW lifecycle request that met a policy ECW doesn't manage, such as a
+/// CommandIdle template default, and so left it unchanged. ECW fills in default
+/// lifecycle options, so this counts requests, not options the caller set. `op`
+/// is `create`, `timeout`, `resume`, `connect`, or `fork` (one per fork target
+/// creation attempt).
+pub fn ecw_unmanaged_policy_request(op: &'static str) {
+    counter(
+        "sandbox.api.ecw.unmanaged_policy_request",
+        1,
+        &[tag("op", op)],
+    );
+}
+
 /// One completed create, tagged with where its vCPU and memory came from.
 /// `shape_source:default` means the platform default shape applied.
 pub fn create_shape_source(shape_source: &str, runtime: &str, template: &str) {
