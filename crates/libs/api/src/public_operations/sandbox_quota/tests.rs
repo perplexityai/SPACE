@@ -234,7 +234,7 @@ async fn a_create_is_matched_to_its_row_only_by_its_public_sandbox_id() -> TestR
             assert_eq!(
                 (held.org, held.subject),
                 expected,
-                "a create targeting {case} ({target}), {plan_cache_mode}"
+                "a create targeting {case}, {plan_cache_mode}"
             );
         }
     }
