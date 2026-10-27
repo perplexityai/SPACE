@@ -165,3 +165,36 @@ fn memory_state_support_follows_complete_environment_identity() {
         assert_eq!(super::requires_cold_creation(&execution), cold_only);
     }
 }
+
+#[test]
+fn automatic_lifecycle_admission_respects_runtime_capabilities() {
+    use pplx_space_common_core::types::{
+        AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, RuntimeKind,
+    };
+    for action in [
+        AutoLifecycleIdleAction::None,
+        AutoLifecycleIdleAction::Pause,
+        AutoLifecycleIdleAction::Suspend,
+        AutoLifecycleIdleAction::Stop,
+        AutoLifecycleIdleAction::Delete,
+    ] {
+        let policy = AutoLifecyclePolicy {
+            stages: vec![AutoLifecycleStage {
+                condition_set:
+                    pplx_space_common_core::types::AutoLifecycleConditionSetId::AccessIdle,
+                at: 60,
+                action,
+            }],
+            ..AutoLifecyclePolicy::disabled()
+        };
+        super::validate_runtime_lifecycle_policy(RuntimeKind::Firecracker, &policy).unwrap();
+        let result =
+            super::validate_runtime_lifecycle_policy(RuntimeKind::CloudHypervisor, &policy);
+        match action {
+            AutoLifecycleIdleAction::Pause | AutoLifecycleIdleAction::Suspend => {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            }
+            _ => result.unwrap(),
+        }
+    }
+}
