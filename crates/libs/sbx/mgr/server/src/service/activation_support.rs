@@ -722,6 +722,15 @@ impl WakeNetworkContext {
             }
         }
     }
+
+    /// Whether `status` is the refusal [`Self::netns_path_for_launch`] returns
+    /// for a launch without the pod network namespace. The Wake is handed back
+    /// rather than failed: the API keeps polling while a restore pod's shim
+    /// takes the launch, and otherwise re-places the sandbox through a restore.
+    pub(super) fn is_missing_runtime_path_refusal(status: &Status) -> bool {
+        status.code() == tonic::Code::FailedPrecondition
+            && status.message() == MISSING_RUNTIME_CONTEXT_MARKER
+    }
 }
 
 /// Map the wire-level `WakeTargetState` proto enum into the

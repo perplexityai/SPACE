@@ -567,22 +567,13 @@ impl SandboxManagerService {
             // `wake_with_start_config` observes the row.
             // A stopped target only places disk bytes and never launches, so it
             // has no use for a runtime namespace; requiring one would refuse a
-            // Kubernetes-identity materialization that carries none.
+            // Kubernetes-identity materialization that carries none. The
+            // refusal hands the wake back to its caller, which records the
+            // outcome, as the wake below does.
             let netns_path = match start.network_context.netns_path_for_launch() {
                 Ok(netns_path) => netns_path,
                 Err(_) if target_state == SandboxState::Stopped => None,
-                Err(error) => {
-                    emit_sandbox_event(
-                        &sandbox_id,
-                        SandboxEventType::WakeFailed,
-                        SandboxEventSource::SbxManager,
-                        SandboxEventDetails::default()
-                            .target_state(target_state.to_string())
-                            .reason("stage_from_checkpoint")
-                            .error(error.to_string()),
-                    );
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
             if let Err(error) = self
                 .start_sandbox_with_authority(
@@ -675,14 +666,19 @@ impl SandboxManagerService {
         {
             Ok(response) => response,
             Err(error) => {
-                emit_sandbox_event(
-                    &sandbox_id,
-                    SandboxEventType::WakeFailed,
-                    SandboxEventSource::SbxManager,
-                    SandboxEventDetails::default()
-                        .target_state(target_state.to_string())
-                        .error(error.to_string()),
-                );
+                // The caller owns the outcome of a handed-back wake and records
+                // it; recording the hand-back too would report every restore
+                // fallback as a failed wake.
+                if !WakeNetworkContext::is_missing_runtime_path_refusal(&error) {
+                    emit_sandbox_event(
+                        &sandbox_id,
+                        SandboxEventType::WakeFailed,
+                        SandboxEventSource::SbxManager,
+                        SandboxEventDetails::default()
+                            .target_state(target_state.to_string())
+                            .error(error.to_string()),
+                    );
+                }
                 return Err(error);
             }
         };
