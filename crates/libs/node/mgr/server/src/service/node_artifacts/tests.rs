@@ -232,12 +232,14 @@ async fn publication_preserves_available_inventory_until_replacement_is_ready() 
         let (_fixture, paths) = installed_runtime();
         let mut service = service_for_unit_tests().await;
         service.runtime_paths = paths;
-        service.execution_policy = pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
-            Some(allowed),
-            None,
-            &catalog,
-        )
-        .unwrap();
+        service.set_startup_execution_policy_for_test(
+            pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+                Some(allowed),
+                None,
+                &catalog,
+            )
+            .unwrap(),
+        );
         let inventory = Arc::new(
             RuntimeInventory::discover(
                 [RuntimeInstallationRoot::new(
@@ -499,15 +501,17 @@ async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
                 }
             }
         }
-        service.execution_policy = pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
-            Some("e0"),
-            None,
-            &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                pplx_space_common_core::types::Arch::X86_64,
+        service.set_startup_execution_policy_for_test(
+            pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+                Some("e0"),
+                None,
+                &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                    pplx_space_common_core::types::Arch::X86_64,
+                )
+                .unwrap(),
             )
             .unwrap(),
-        )
-        .unwrap();
+        );
         for mode in [
             ExecutionSelectionMode::NewColdBoot,
             ExecutionSelectionMode::ExistingColdBoot,
@@ -550,13 +554,17 @@ async fn legacy_runtime_placement_is_not_hidden_by_a_compiled_environment() {
     )
     .unwrap();
     let mut service = service_for_unit_tests().await;
-    service.execution_policy = pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
-        Some("e0,fc-1.17.0-linux-6.1.155"),
-        None,
-        &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+    service.set_startup_execution_policy_for_test(
+        pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+            Some("e0,fc-1.17.0-linux-6.1.155"),
+            None,
+            &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                Arch::X86_64,
+            )
             .unwrap(),
-    )
-    .unwrap();
+        )
+        .unwrap(),
+    );
     service.runtime_paths = paths;
     service.runtime_inventory.store(Some(Arc::new(inventory)));
     let report = service

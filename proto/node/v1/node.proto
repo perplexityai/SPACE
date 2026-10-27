@@ -15,6 +15,13 @@ service NodeManager {
   rpc ResolveExecutionEnvironment(ResolveExecutionEnvironmentRequest)
       returns (ResolveExecutionEnvironmentResponse);
 
+  // Enforce the cluster's execution policy over the startup settings, which it
+  // may narrow but never widen, and persist it across restarts. Callers send
+  // every cluster response in full; an absent policy restores the startup
+  // settings. A refused default isn't an error: the response reports it.
+  rpc ApplyExecutionPolicy(ApplyExecutionPolicyRequest)
+      returns (ApplyExecutionPolicyResponse);
+
   // Lease a preprovisioned network slot, or provision a pod-network allocation.
   rpc Allocate(AllocateRequest) returns (AllocateResponse);
 
@@ -349,6 +356,38 @@ service NodeManager {
 }
 
 message GetExecutionInventoryRequest {}
+
+// A cluster-api RuntimeEnvironmentDesiredPolicy, forwarded by node-ctl.
+message ClusterExecutionPolicy {
+  uint64 generation = 1;
+  optional string default_environment_reference = 2;
+  // Allowed and deprecated environments, the default included. Narrows only
+  // while default_environment_reference is set.
+  repeated string executing_environment_references = 3;
+  optional bool legacy_unbound_allowed = 4;
+}
+
+message ApplyExecutionPolicyRequest {
+  // Absent: the cluster serves no policy, so the startup settings apply.
+  optional ClusterExecutionPolicy policy = 1;
+}
+
+enum ClusterDefaultOutcome {
+  CLUSTER_DEFAULT_OUTCOME_UNSPECIFIED = 0;
+  // No cluster policy, or one without a default: the configured default applies.
+  CLUSTER_DEFAULT_OUTCOME_UNSET = 1;
+  CLUSTER_DEFAULT_OUTCOME_ADOPTED = 2;
+  // This node doesn't compile or allow the cluster default.
+  CLUSTER_DEFAULT_OUTCOME_NOT_ALLOWED = 3;
+  // The cluster default isn't installed and verified on this node.
+  CLUSTER_DEFAULT_OUTCOME_UNUSABLE = 4;
+}
+
+message ApplyExecutionPolicyResponse {
+  // The policy now enforced, as GetExecutionInventory publishes it.
+  space.execution.v1.ExecutionPolicyObservation enforced = 1;
+  ClusterDefaultOutcome default_outcome = 2;
+}
 
 message ResolveExecutionEnvironmentRequest {
   // Highest definition schema understood, including its identity encoding.

@@ -1,4 +1,5 @@
-//! Startup execution eligibility, independent of discovery and artifact retention.
+//! Execution eligibility, independent of discovery and artifact retention: the
+//! startup settings, optionally narrowed by the cluster's desired policy.
 use crate::catalog::CompiledEnvironment;
 use crate::runtime_inventory::ExecutionSelectionMode;
 use pplx_space_common_core::types::*;
@@ -13,6 +14,84 @@ pub struct ExecutionPolicy {
     allowed: BTreeSet<EnvironmentReference>,
     default: Option<EnvironmentReference>,
     legacy_unbound_allowed: bool,
+    applied_generation: Option<u64>,
+    /// Narrowing left no default although the startup settings had one.
+    default_withdrawn: bool,
+    /// The persisted cluster policy couldn't be read; nothing new executes.
+    cluster_policy_unreadable: bool,
+}
+
+/// The cluster's desired execution policy as served to this node. Unset fields
+/// leave the node's configured values in place.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterExecutionPolicy {
+    pub generation: u64,
+    pub default: Option<ClusterDefault>,
+    /// Allowed and deprecated environments, the default included. It narrows
+    /// only while `default` is set.
+    pub executing: BTreeSet<EnvironmentReference>,
+    pub legacy_unbound_allowed: Option<bool>,
+}
+
+/// The default the cluster names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ClusterDefault {
+    Environment(EnvironmentReference),
+    /// A default this build can't parse. It still narrows, as any default
+    /// does, and is refused as not allowed.
+    Unrecognized,
+}
+
+impl ClusterExecutionPolicy {
+    /// The cluster default, when this build can name it.
+    pub fn default_reference(&self) -> Option<EnvironmentReference> {
+        match self.default {
+            Some(ClusterDefault::Environment(reference)) => Some(reference),
+            Some(ClusterDefault::Unrecognized) | None => None,
+        }
+    }
+}
+
+/// Why the narrowed policy has the default it has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultOutcome {
+    /// The cluster sets no default, so the configured one applies.
+    Unset,
+    Adopted,
+    /// The node doesn't compile or allow the cluster default.
+    NotAllowed,
+    /// The cluster default is allowed but isn't installed and verified here.
+    Unusable,
+}
+
+impl DefaultOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Adopted => "adopted",
+            Self::NotAllowed => "not_allowed",
+            Self::Unusable => "unusable",
+        }
+    }
+
+    /// The node enforces a default other than the one the cluster asked for.
+    pub fn diverges(self) -> bool {
+        matches!(self, Self::NotAllowed | Self::Unusable)
+    }
+}
+
+impl std::fmt::Display for DefaultOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NarrowedPolicy {
+    pub policy: ExecutionPolicy,
+    pub default: DefaultOutcome,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,7 +182,89 @@ impl ExecutionPolicy {
             allowed,
             default,
             legacy_unbound_allowed,
+            applied_generation: None,
+            default_withdrawn: false,
+            cluster_policy_unreadable: false,
         })
+    }
+
+    /// What a node enforces when it can't read the cluster policy it
+    /// persisted: nothing new executes, so a damaged record can never lift a
+    /// cluster block. Running VMs are untouched; the next application of the
+    /// cluster policy replaces this.
+    pub fn refuse_all(&self) -> Self {
+        Self {
+            catalog: self.catalog.clone(),
+            allowed: BTreeSet::new(),
+            default: None,
+            legacy_unbound_allowed: false,
+            applied_generation: None,
+            default_withdrawn: false,
+            cluster_policy_unreadable: true,
+        }
+    }
+
+    /// Narrow these startup settings by the cluster policy, never widening
+    /// them: the cluster can remove environments and revoke `legacy`, and pick
+    /// the default among the environments left. `default_usable` says whether
+    /// the cluster default is installed and verified; one that isn't is
+    /// refused. A refused default falls back to the configured one while that
+    /// still executes, and otherwise leaves no compiled default, so unbound new
+    /// work is refused rather than run on an environment the cluster removed.
+    pub fn narrow(&self, cluster: &ClusterExecutionPolicy, default_usable: bool) -> NarrowedPolicy {
+        debug_assert!(
+            self.applied_generation.is_none() && !self.cluster_policy_unreadable,
+            "narrow the startup settings, not an already narrowed policy"
+        );
+        let allowed: BTreeSet<_> = match cluster.default {
+            Some(_) => self
+                .allowed
+                .intersection(&cluster.executing)
+                .copied()
+                .collect(),
+            None => self.allowed.clone(),
+        };
+        let configured = self.default.filter(|reference| allowed.contains(reference));
+        let (default, outcome) = match cluster.default {
+            None => (configured, DefaultOutcome::Unset),
+            Some(ClusterDefault::Unrecognized) => (configured, DefaultOutcome::NotAllowed),
+            Some(ClusterDefault::Environment(reference)) if !allowed.contains(&reference) => {
+                (configured, DefaultOutcome::NotAllowed)
+            }
+            Some(_) if !default_usable => (configured, DefaultOutcome::Unusable),
+            Some(ClusterDefault::Environment(reference)) => {
+                (Some(reference), DefaultOutcome::Adopted)
+            }
+        };
+        NarrowedPolicy {
+            policy: Self {
+                catalog: self.catalog.clone(),
+                allowed,
+                default,
+                legacy_unbound_allowed: self.legacy_unbound_allowed
+                    && cluster.legacy_unbound_allowed.unwrap_or(true),
+                applied_generation: Some(cluster.generation),
+                default_withdrawn: self.default.is_some() && default.is_none(),
+                cluster_policy_unreadable: false,
+            },
+            default: outcome,
+        }
+    }
+
+    /// The cluster policy generation narrowing these settings, if any.
+    pub fn applied_generation(&self) -> Option<u64> {
+        self.applied_generation
+    }
+
+    /// The cluster policy removed the configured default and its own default
+    /// can't run here, so unbound new work has no environment.
+    pub fn default_withdrawn(&self) -> bool {
+        self.default_withdrawn
+    }
+
+    /// Built by [`Self::refuse_all`].
+    pub fn cluster_policy_unreadable(&self) -> bool {
+        self.cluster_policy_unreadable
     }
 
     pub fn catalog(&self) -> &[CompiledEnvironment] {

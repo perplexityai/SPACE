@@ -9,12 +9,16 @@ fn policy_observation_validates_shape_and_old_inventory_readers_omit_it() {
         legacy_unbound_allowed: true,
         allowed_environment_references: vec![reference.clone()],
         default_environment_reference: Some(reference.clone()),
+        applied_generation: None,
+        cluster_policy_unreadable: false,
     };
     let legacy_only = crate::proto::ExecutionPolicyObservation {
         schema_version: 1,
         legacy_unbound_allowed: true,
         allowed_environment_references: vec![],
         default_environment_reference: None,
+        applied_generation: None,
+        cluster_policy_unreadable: false,
     };
     let legacy_policy = ExecutionPolicyObservation::try_from(&legacy_only).unwrap();
     assert!(legacy_policy.legacy_unbound_allowed());
@@ -24,9 +28,39 @@ fn policy_observation_validates_shape_and_old_inventory_readers_omit_it() {
     );
     let value = ExecutionPolicyObservation::try_from(&wire).unwrap();
     assert_eq!(crate::proto::ExecutionPolicyObservation::from(&value), wire);
+    let applied = crate::proto::ExecutionPolicyObservation {
+        schema_version: 2,
+        default_environment_reference: None,
+        applied_generation: Some(9),
+        ..wire.clone()
+    };
+    let unreadable = crate::proto::ExecutionPolicyObservation {
+        schema_version: 2,
+        legacy_unbound_allowed: false,
+        allowed_environment_references: vec![],
+        default_environment_reference: None,
+        applied_generation: None,
+        cluster_policy_unreadable: true,
+    };
+    let unreadable_value = ExecutionPolicyObservation::try_from(&unreadable).unwrap();
+    assert!(unreadable_value.cluster_policy_unreadable());
+    assert_eq!(
+        crate::proto::ExecutionPolicyObservation::from(&unreadable_value),
+        unreadable
+    );
+    let applied_value = ExecutionPolicyObservation::try_from(&applied).unwrap();
+    assert_eq!(applied_value.applied_generation(), Some(9));
+    assert_eq!(
+        crate::proto::ExecutionPolicyObservation::from(&applied_value),
+        applied
+    );
     for bad in [
         crate::proto::ExecutionPolicyObservation {
             schema_version: 2,
+            ..wire.clone()
+        },
+        crate::proto::ExecutionPolicyObservation {
+            applied_generation: Some(9),
             ..wire.clone()
         },
         crate::proto::ExecutionPolicyObservation {

@@ -274,6 +274,19 @@ pub fn btrfs_send_stream_rejected(reason: BtrfsSendStreamRejection) {
     );
 }
 
+/// 1 while node-manager enforces the admit-nothing policy it falls back to
+/// when it can't read the cluster execution policy it persisted, else 0. It
+/// drops to 0 on the first inventory read after an application replaces that
+/// policy, even if the application's own record write failed. Emitted on every execution inventory
+/// read, which node-ctl makes each node-status tick.
+pub fn execution_policy_record_unreadable(unreadable: bool) {
+    gauge(
+        "node_mgr.execution.policy_record_unreadable",
+        f64::from(u8::from(unreadable)),
+        &[],
+    );
+}
+
 /// Successful resolver decisions selecting a consumer other than the recorded
 /// source. Counts attempts (including retries), not completed launches; no
 /// sandbox or environment identifiers are metric tags.

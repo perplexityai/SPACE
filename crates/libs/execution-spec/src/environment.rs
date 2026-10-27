@@ -339,5 +339,6 @@ impl From<EnvironmentReference> for String {
 
 mod policy;
 pub use policy::{
-    EXECUTION_POLICY_SCHEMA_VERSION, ExecutionPolicyObservation, ExecutionPolicyObservationError,
+    EXECUTION_POLICY_APPLIED_SCHEMA_VERSION, EXECUTION_POLICY_SCHEMA_VERSION,
+    ExecutionPolicyObservation, ExecutionPolicyObservationError,
 };

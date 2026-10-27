@@ -5,6 +5,8 @@ use pplx_space_common_core::types::{EnvironmentReference, SandboxArtifactMetadat
 use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
 use std::io::Read;
 
+use super::super::node_artifacts::PolicyScope;
+
 fn validate_binding(
     requested: Option<EnvironmentReference>,
     actual: EnvironmentReference,
@@ -27,8 +29,12 @@ impl NodeManagerService {
         sandbox_id: String,
         reference: Option<EnvironmentReference>,
     ) -> Result<(), Status> {
+        // A capture executes nothing, and restore admission is narrowed, so
+        // captures obey the startup settings, not the cluster policy: a blocked
+        // environment's VMs can still be suspended and resumed elsewhere.
         if let Some(reference) = reference {
-            self.allowed_definition(
+            self.allowed_definition_in(
+                PolicyScope::Startup,
                 Some(reference),
                 ExecutionSelectionMode::PersistedStateRestore,
             )?;
@@ -93,7 +99,8 @@ impl NodeManagerService {
                 Ok(())
             };
         }
-        self.resolve_bound_execution(
+        self.resolve_bound_execution_in(
+            PolicyScope::Startup,
             Some(&execution),
             execution.runtime().kind,
             ExecutionSelectionMode::PersistedStateRestore,

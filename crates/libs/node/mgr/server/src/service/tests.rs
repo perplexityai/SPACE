@@ -738,15 +738,20 @@ pub(super) mod service_tests {
                 },
             },
             guest_console_logs: false,
-            execution_policy: pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
-                None,
-                None,
-                &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                    pplx_space_common_core::types::Arch::X86_64,
-                )
-                .unwrap(),
-            )
-            .unwrap(),
+            execution_policy: std::sync::Arc::new(
+                super::execution_policy::ExecutionPolicyState::load(
+                    pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+                        None,
+                        None,
+                        &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                            pplx_space_common_core::types::Arch::X86_64,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                    vacant.join("execution-policy.json"),
+                ),
+            ),
             lifecycle_limiter: std::sync::Arc::new(
                 crate::lifecycle_limiter::tests::default_limiter(),
             ),

@@ -34,15 +34,35 @@ use pplx_space_node_runtime_core::runtime_inventory::{
 };
 
 impl NodeManagerService {
+    #[cfg(test)]
     pub(super) fn allowed_definition(
         &self,
         reference: Option<pplx_space_common_core::types::EnvironmentReference>,
         mode: ExecutionSelectionMode,
     ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
-        select_definition(&self.execution_policy, reference, mode)
+        self.allowed_definition_in(PolicyScope::Effective, reference, mode)
     }
 
-    async fn require_verified_environment_layout(&self) -> Result<(), Status> {
+    pub(super) fn allowed_definition_in(
+        &self,
+        scope: PolicyScope,
+        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+        mode: ExecutionSelectionMode,
+    ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
+        select_definition(&self.execution_policy_in(scope), reference, mode)
+    }
+
+    fn execution_policy_in(
+        &self,
+        scope: PolicyScope,
+    ) -> std::sync::Arc<pplx_space_node_runtime_core::selection::ExecutionPolicy> {
+        match scope {
+            PolicyScope::Effective => self.execution_policy(),
+            PolicyScope::Startup => std::sync::Arc::new(self.execution_policy.startup().clone()),
+        }
+    }
+
+    pub(super) async fn require_verified_environment_layout(&self) -> Result<(), Status> {
         if !cfg!(target_os = "linux") {
             return Err(Status::failed_precondition(
                 "verified managed execution requires a Linux host",
@@ -91,7 +111,38 @@ impl NodeManagerService {
             .map_err(|error: pplx_space_common_core::types::DigestParseError| {
                 Status::invalid_argument(error.to_string())
             })?;
-        let definition = self.allowed_definition(reference, ExecutionSelectionMode::NewColdBoot)?;
+        let (definition, execution) = self
+            .resolve_new_cold_boot(&self.execution_policy(), reference)
+            .await?;
+        // Re-read after discovery, so a policy applied meanwhile still gates
+        // the binding callers persist.
+        self.execution_policy()
+            .check_execution(&execution, ExecutionSelectionMode::NewColdBoot)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(
+            crate::proto::ResolveExecutionEnvironmentResponse {
+                accepted_selection: 0,
+                definition: Some((&definition).into()),
+                execution: Some((&execution).into()),
+            },
+        ))
+    }
+
+    /// Resolve `reference`, or the policy default, for a new cold boot against
+    /// verified inventory, as admission would. Pass one policy for the whole
+    /// decision, even if node-ctl applies another meanwhile.
+    pub(super) async fn resolve_new_cold_boot(
+        &self,
+        policy: &pplx_space_node_runtime_core::selection::ExecutionPolicy,
+        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+    ) -> Result<
+        (
+            pplx_space_execution_common::environment::EnvironmentDefinition,
+            pplx_space_common_core::types::ExecutionMetadata,
+        ),
+        Status,
+    > {
+        let definition = select_definition(policy, reference, ExecutionSelectionMode::NewColdBoot)?;
         let requested = definition
             .execution_requirements()
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -106,16 +157,10 @@ impl NodeManagerService {
         let execution = definition
             .bind_execution(resolved.execution)
             .map_err(|error| Status::failed_precondition(describe(&error)))?;
-        self.execution_policy
+        policy
             .check_execution(&execution, ExecutionSelectionMode::NewColdBoot)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        Ok(Response::new(
-            crate::proto::ResolveExecutionEnvironmentResponse {
-                accepted_selection: 0,
-                definition: Some((&definition).into()),
-                execution: Some((&execution).into()),
-            },
-        ))
+        Ok((definition, execution))
     }
 
     pub(super) async fn resolve_bound_execution(
@@ -124,10 +169,22 @@ impl NodeManagerService {
         runtime: pplx_space_common_core::types::RuntimeKind,
         mode: ExecutionSelectionMode,
     ) -> Result<ResolvedExecutionEnvironment, Status> {
+        self.resolve_bound_execution_in(PolicyScope::Effective, requested, runtime, mode)
+            .await
+    }
+
+    pub(super) async fn resolve_bound_execution_in(
+        &self,
+        scope: PolicyScope,
+        requested: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+        mode: ExecutionSelectionMode,
+    ) -> Result<ResolvedExecutionEnvironment, Status> {
+        let policy = self.execution_policy_in(scope);
         let definition =
             if let Some(reference) = requested.and_then(|metadata| metadata.environment()) {
                 self.require_verified_environment_layout().await?;
-                let definition = self.allowed_definition(Some(reference), mode)?;
+                let definition = select_definition(&policy, Some(reference), mode)?;
                 if let Some(requested) = requested {
                     definition
                         .check_execution(requested)
@@ -173,11 +230,23 @@ impl NodeManagerService {
                 .bind_execution(resolved.execution)
                 .map_err(|error| Status::failed_precondition(describe(&error)))?;
         }
-        self.execution_policy
+        // Re-read after the awaits above, so a policy applied meanwhile
+        // still gates this admission.
+        self.execution_policy_in(scope)
             .check_execution(&resolved.execution, mode)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         Ok(resolved)
     }
+}
+
+const UNREADABLE_POLICY: &str = "node can't read its persisted cluster execution policy and admits no new work until the policy is reapplied";
+
+/// Which policy a decision obeys. Admission obeys the effective policy;
+/// captures, which execute nothing, obey the startup settings.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PolicyScope {
+    Effective,
+    Startup,
 }
 
 fn select_definition(
@@ -185,8 +254,15 @@ fn select_definition(
     reference: Option<pplx_space_common_core::types::EnvironmentReference>,
     mode: ExecutionSelectionMode,
 ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
+    if policy.cluster_policy_unreadable() {
+        return Err(Status::failed_precondition(UNREADABLE_POLICY));
+    }
     let reference = reference.or(policy.default_reference()).ok_or_else(|| {
-        Status::failed_precondition("host has no qualified initial execution environment")
+        Status::failed_precondition(if policy.default_withdrawn() {
+            "node has no usable default execution environment under the cluster policy"
+        } else {
+            "host has no qualified initial execution environment"
+        })
     })?;
     if !policy.allows(reference) {
         return Err(Status::failed_precondition(
@@ -602,7 +678,8 @@ impl NodeManagerService {
         publish: impl FnOnce() -> Result<Publication, Status> + Send + 'static,
     ) -> Result<Publication, Status> {
         let initial = initial_environment()?;
-        let policy = self.execution_policy.clone();
+        // Inventory is discovered against the startup ceiling.
+        let policy = self.execution_policy.startup().clone();
         let affects_execution = artifact.belongs_to_initial(initial)
             || policy.catalog().iter().any(|environment| {
                 policy.allows(environment.definition().reference())

@@ -16,7 +16,9 @@ pub(crate) struct ServiceSettings {
     pub lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter,
     pub runtime_paths: RuntimePaths,
     pub guest_console_logs: bool,
+    /// Startup settings, the upper bound any cluster policy narrows.
     pub execution_policy: pplx_space_node_runtime_core::selection::ExecutionPolicy,
+    pub execution_policy_record: PathBuf,
     pub memory_admission_sources: crate::memory_admission::MemoryAdmissionSources,
     pub runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
     pub node_status_dirty: std::sync::Arc<dyn crate::node_state_sync::NodeStatusDirtySink>,
@@ -57,6 +59,7 @@ impl ServiceSettings {
     pub fn from_env() -> Result<Self, SelectionConfigurationError> {
         let settings = Self {
             execution_policy: execution_policy_from_env()?,
+            execution_policy_record: paths::NODE_MANAGER_EXECUTION_POLICY_FILE.into(),
             disk_admission: CacheDiskAdmissionConfig::from_env(),
             lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter::from_env(),
             runtime_paths: RuntimePaths {

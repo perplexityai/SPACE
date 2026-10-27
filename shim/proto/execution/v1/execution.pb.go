@@ -978,8 +978,9 @@ type NodeExecutionInventory struct {
 	state      protoimpl.MessageState           `protogen:"open.v1"`
 	Runtimes   []*RuntimeInstallation           `protobuf:"bytes,1,rep,name=runtimes,proto3" json:"runtimes,omitempty"`
 	Components []*ArtifactComponentInstallation `protobuf:"bytes,2,rep,name=components,proto3" json:"components,omitempty"`
-	// Effective startup policy, independent of installed/usable artifacts. Absence
-	// means unknown support, never implicit E0 approval.
+	// Effective policy: the startup settings, narrowed by any applied cluster
+	// policy. Independent of installed/usable artifacts. Absence means unknown
+	// support, never implicit E0 approval.
 	Policy        *ExecutionPolicyObservation `protobuf:"bytes,3,opt,name=policy,proto3" json:"policy,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1044,8 +1045,17 @@ type ExecutionPolicyObservation struct {
 	DefaultEnvironmentReference *string `protobuf:"bytes,3,opt,name=default_environment_reference,json=defaultEnvironmentReference,proto3,oneof" json:"default_environment_reference,omitempty"`
 	// Permission for unbound historical contracts, not an environment identity.
 	LegacyUnboundAllowed bool `protobuf:"varint,4,opt,name=legacy_unbound_allowed,json=legacyUnboundAllowed,proto3" json:"legacy_unbound_allowed,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// The cluster policy generation this policy enforces, with schema_version 2.
+	// Absent with schema_version 1: the node runs its startup policy only. A
+	// schema 2 policy may have allowed environments and no default.
+	AppliedGeneration *uint64 `protobuf:"varint,5,opt,name=applied_generation,json=appliedGeneration,proto3,oneof" json:"applied_generation,omitempty"`
+	// With schema_version 2 and no applied_generation: the node can't read the
+	// cluster policy it persisted, so it admits no new work (empty allowlist,
+	// no default, no legacy) until the policy is reapplied. Running VMs are
+	// untouched. Treat the node as having no usable policy evidence.
+	ClusterPolicyUnreadable bool `protobuf:"varint,6,opt,name=cluster_policy_unreadable,json=clusterPolicyUnreadable,proto3" json:"cluster_policy_unreadable,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ExecutionPolicyObservation) Reset() {
@@ -1102,6 +1112,20 @@ func (x *ExecutionPolicyObservation) GetDefaultEnvironmentReference() string {
 func (x *ExecutionPolicyObservation) GetLegacyUnboundAllowed() bool {
 	if x != nil {
 		return x.LegacyUnboundAllowed
+	}
+	return false
+}
+
+func (x *ExecutionPolicyObservation) GetAppliedGeneration() uint64 {
+	if x != nil && x.AppliedGeneration != nil {
+		return *x.AppliedGeneration
+	}
+	return 0
+}
+
+func (x *ExecutionPolicyObservation) GetClusterPolicyUnreadable() bool {
+	if x != nil {
+		return x.ClusterPolicyUnreadable
 	}
 	return false
 }
@@ -1874,13 +1898,16 @@ const file_execution_v1_execution_proto_rawDesc = "" +
 	"\n" +
 	"components\x18\x02 \x03(\v21.space.execution.v1.ArtifactComponentInstallationR\n" +
 	"components\x12F\n" +
-	"\x06policy\x18\x03 \x01(\v2..space.execution.v1.ExecutionPolicyObservationR\x06policy\"\xaa\x02\n" +
+	"\x06policy\x18\x03 \x01(\v2..space.execution.v1.ExecutionPolicyObservationR\x06policy\"\xb1\x03\n" +
 	"\x1aExecutionPolicyObservation\x12%\n" +
 	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12D\n" +
 	"\x1eallowed_environment_references\x18\x02 \x03(\tR\x1callowedEnvironmentReferences\x12G\n" +
 	"\x1ddefault_environment_reference\x18\x03 \x01(\tH\x00R\x1bdefaultEnvironmentReference\x88\x01\x01\x124\n" +
-	"\x16legacy_unbound_allowed\x18\x04 \x01(\bR\x14legacyUnboundAllowedB \n" +
-	"\x1e_default_environment_reference\"\x90\x01\n" +
+	"\x16legacy_unbound_allowed\x18\x04 \x01(\bR\x14legacyUnboundAllowed\x122\n" +
+	"\x12applied_generation\x18\x05 \x01(\x04H\x01R\x11appliedGeneration\x88\x01\x01\x12:\n" +
+	"\x19cluster_policy_unreadable\x18\x06 \x01(\bR\x17clusterPolicyUnreadableB \n" +
+	"\x1e_default_environment_referenceB\x15\n" +
+	"\x13_applied_generation\"\x90\x01\n" +
 	"\fHostPlatform\x127\n" +
 	"\x02os\x18\x01 \x01(\x0e2'.space.execution.v1.HostOperatingSystemR\x02os\x12G\n" +
 	"\farchitecture\x18\x02 \x01(\x0e2#.space.execution.v1.CpuArchitectureR\farchitecture\"\xea\x01\n" +

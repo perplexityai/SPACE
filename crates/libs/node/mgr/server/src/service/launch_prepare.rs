@@ -326,6 +326,11 @@ impl NodeManagerService {
             .await?;
         let _cgroup_guard = self.lock_sandbox_vm_cgroup_launch(sandbox_id).await;
         self.check_execution(sandbox_id, req.execution_fence.as_ref(), false)?;
+        // Re-check after waiting for the permit and lock, so a policy applied
+        // meanwhile still gates this launch.
+        self.execution_policy()
+            .check_execution(&resolved_execution.execution, selection_mode)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let lease = self
             .pool
             .get(sandbox_id)
@@ -738,6 +743,11 @@ impl NodeManagerService {
             .acquire_preparation_ownership(sandbox_id, req.uid, lifecycle_permit)
             .await?;
         self.check_execution(sandbox_id, req.execution_fence.as_ref(), false)?;
+        // Re-check after waiting for the permit and ownership, so a policy
+        // applied meanwhile still gates this preparation.
+        self.execution_policy()
+            .check_execution(&runtime_installation.execution, selection_mode)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let uid = ownership.lease.sandbox_uid;
         let cache_paths = prepare_sandbox_cache_paths(sandbox_id);
         let cache_dir = cache_paths.instance_dir;

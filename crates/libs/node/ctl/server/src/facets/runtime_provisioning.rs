@@ -1,5 +1,6 @@
-//! Whole-node installation reconciliation. Recipes never select an environment
-//! or remove bytes; execution eligibility and usable inventory remain separate.
+//! Whole-node installation reconciliation, and the hand-off of the cluster
+//! execution policy to node-manager. Recipes never select an environment or
+//! remove bytes; execution eligibility and usable inventory remain separate.
 
 use std::{collections::BTreeSet, future::Future, time::Duration};
 
@@ -9,13 +10,16 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_node_api_client::proto::{
     GetNodeRuntimeDesiredStateRequest, GetNodeRuntimeDesiredStateResponse, NodeRole,
-    RuntimeProvisioningRecipe,
+    RuntimeEnvironmentDesiredPolicy, RuntimeProvisioningRecipe,
 };
+use pplx_space_node_mgr_client::proto as node_manager;
 use pplx_space_node_runtime_core::catalog::{CatalogError, CompiledEnvironment};
 use pplx_space_node_runtime_manager_client::{RuntimeManagerGrpcClient, proto as runtime};
 use tonic::{Code, Status};
 
 const RECONCILE_BUDGET: Duration = Duration::from_secs(30);
+/// Separate from the install budget, so a slow install pass can't hold up a block.
+const POLICY_BUDGET: Duration = Duration::from_secs(10);
 const MAX_ENVIRONMENTS: usize = 32;
 const SUBMISSION_CONCURRENCY: usize = 4;
 
@@ -66,6 +70,10 @@ pub(super) enum ProvisioningError {
     Timeout { stage: Stage },
     #[error("fetch runtime recipe: {0}")]
     Fetch(#[source] Status),
+    #[error("apply execution policy: {0}")]
+    ApplyPolicy(#[source] Status),
+    #[error("applying the execution policy exceeded its {POLICY_BUDGET:?} budget")]
+    PolicyTimeout,
     #[error("connect cluster API: {0}")]
     ClusterConnect(#[source] crate::ClusterApiConnectError),
     #[error("connect runtime-manager: {0}")]
@@ -98,6 +106,7 @@ pub(super) enum ProvisioningError {
 /// continue in rtmgr's durable worker after this tick or its caller is cancelled.
 /// The next periodic tick reads fresh intent and inventory, including after a
 /// restart or a lost reply. No recipe is cached or replayed on fetch failure.
+/// Node-manager persists the applied policy, so a fetch failure keeps it.
 pub(super) async fn refresh(
     node_id: &str,
     node_role: Option<NodeRole>,
@@ -107,7 +116,7 @@ pub(super) async fn refresh(
         return Ok(());
     }
     let deadline = tokio::time::Instant::now() + RECONCILE_BUDGET;
-    let recipe = within(deadline, Stage::Fetch, async {
+    let (recipe, policy) = within(deadline, Stage::Fetch, async {
         let mut cluster = crate::connect_cluster_api()
             .await
             .map_err(ProvisioningError::ClusterConnect)?;
@@ -118,9 +127,27 @@ pub(super) async fn refresh(
             })
             .await
             .map(tonic::Response::into_inner);
-        recipe_from_response(response)
+        desired_from_response(response)
     })
     .await?;
+    // Enforce first: a block mustn't wait for this pass's installs. A default
+    // those installs provide is adopted on a later pass, once verified.
+    let applying = tokio::time::Instant::now();
+    let applied = apply_policy(&NodeManager, policy).await;
+    // Applying has its own budget and doesn't shorten the installs'.
+    let installed = install(recipe, state, deadline + applying.elapsed()).await;
+    if let (Err(_), Err(error)) = (&installed, &applied) {
+        // The facet status carries the install error; keep this one visible.
+        tracing::warn!(%error, "execution policy application failed");
+    }
+    installed.and(applied)
+}
+
+async fn install(
+    recipe: Option<RuntimeProvisioningRecipe>,
+    state: &Provisioning,
+    deadline: tokio::time::Instant,
+) -> Result<(), ProvisioningError> {
     let Some(recipe) = recipe else {
         state.retain(&[]);
         return Ok(());
@@ -155,16 +182,97 @@ pub(super) async fn refresh(
     Ok(())
 }
 
-fn recipe_from_response(
+type DesiredState = (
+    Option<RuntimeProvisioningRecipe>,
+    Option<RuntimeEnvironmentDesiredPolicy>,
+);
+
+fn desired_from_response(
     response: Result<GetNodeRuntimeDesiredStateResponse, Status>,
-) -> Result<Option<RuntimeProvisioningRecipe>, ProvisioningError> {
+) -> Result<DesiredState, ProvisioningError> {
     match response {
-        Ok(response) => Ok(response.recipe),
-        // An older cluster has no recipe authority. Do not infer E0 or an
-        // empty applied recipe from this compatibility path.
-        Err(error) if error.code() == Code::Unimplemented => Ok(None),
+        Ok(response) => Ok((response.recipe, response.execution_policy)),
+        // An older cluster has no recipe or policy authority. Do not infer E0
+        // or an empty applied recipe from this compatibility path; the node
+        // keeps its startup execution settings, as with an absent policy.
+        Err(error) if error.code() == Code::Unimplemented => Ok((None, None)),
         Err(error) => Err(ProvisioningError::Fetch(error)),
     }
+}
+
+trait PolicyApplier: Sync {
+    fn apply(
+        &self,
+        request: node_manager::ApplyExecutionPolicyRequest,
+    ) -> impl Future<Output = Result<node_manager::ApplyExecutionPolicyResponse, Status>> + Send;
+}
+
+struct NodeManager;
+
+impl PolicyApplier for NodeManager {
+    async fn apply(
+        &self,
+        request: node_manager::ApplyExecutionPolicyRequest,
+    ) -> Result<node_manager::ApplyExecutionPolicyResponse, Status> {
+        let mut request = crate::local_manager_request(request, false);
+        // Bounds the call on node-manager's side too; the caller's timeout
+        // also bounds connecting.
+        request.set_timeout(POLICY_BUDGET);
+        pplx_space_node_mgr_client::lazy()
+            .apply_execution_policy(request)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+}
+
+/// Forward every response in full, whatever its generation: an absent policy
+/// tells node-manager to return to its startup settings. Node-manager
+/// validates the policy and decides what this node enforces.
+async fn apply_policy(
+    manager: &impl PolicyApplier,
+    policy: Option<RuntimeEnvironmentDesiredPolicy>,
+) -> Result<(), ProvisioningError> {
+    let request = node_manager::ApplyExecutionPolicyRequest {
+        policy: policy.map(|policy| node_manager::ClusterExecutionPolicy {
+            generation: policy.generation,
+            default_environment_reference: policy.default_environment_ref,
+            executing_environment_references: policy.executing_environment_refs,
+            legacy_unbound_allowed: policy.legacy_unbound_allowed,
+        }),
+    };
+    let generation = request.policy.as_ref().map(|policy| policy.generation);
+    let response = match tokio::time::timeout(POLICY_BUDGET, manager.apply(request)).await {
+        Err(_elapsed) => return Err(ProvisioningError::PolicyTimeout),
+        // An older node-manager enforces its startup settings only, and its
+        // policy observation carries no applied generation.
+        Ok(Err(error)) if error.code() == Code::Unimplemented => {
+            tracing::debug!(
+                ?generation,
+                "node-manager can't apply the cluster execution policy yet"
+            );
+            return Ok(());
+        }
+        Ok(Err(error)) => return Err(ProvisioningError::ApplyPolicy(error)),
+        Ok(Ok(response)) => response,
+    };
+    let outcome = response.default_outcome();
+    match outcome {
+        // Node-manager warns when its enforced policy changes; this repeats
+        // every pass while a refusal persists.
+        node_manager::ClusterDefaultOutcome::NotAllowed
+        | node_manager::ClusterDefaultOutcome::Unusable => tracing::debug!(
+            ?generation,
+            outcome = outcome.as_str_name(),
+            enforced = ?response.enforced,
+            "node-manager refused the cluster default execution environment"
+        ),
+        _ => tracing::debug!(
+            ?generation,
+            outcome = outcome.as_str_name(),
+            "applied execution policy"
+        ),
+    }
+    Ok(())
 }
 
 struct InstallationPlan {

@@ -95,8 +95,9 @@ message ArtifactComponentInstallation {
 message NodeExecutionInventory {
   repeated RuntimeInstallation runtimes = 1;
   repeated ArtifactComponentInstallation components = 2;
-  // Effective startup policy, independent of installed/usable artifacts. Absence
-  // means unknown support, never implicit E0 approval.
+  // Effective policy: the startup settings, narrowed by any applied cluster
+  // policy. Independent of installed/usable artifacts. Absence means unknown
+  // support, never implicit E0 approval.
   ExecutionPolicyObservation policy = 3;
 }
 
@@ -107,6 +108,15 @@ message ExecutionPolicyObservation {
   optional string default_environment_reference = 3;
   // Permission for unbound historical contracts, not an environment identity.
   bool legacy_unbound_allowed = 4;
+  // The cluster policy generation this policy enforces, with schema_version 2.
+  // Absent with schema_version 1: the node runs its startup policy only. A
+  // schema 2 policy may have allowed environments and no default.
+  optional uint64 applied_generation = 5;
+  // With schema_version 2 and no applied_generation: the node can't read the
+  // cluster policy it persisted, so it admits no new work (empty allowlist,
+  // no default, no legacy) until the policy is reapplied. Running VMs are
+  // untouched. Treat the node as having no usable policy evidence.
+  bool cluster_policy_unreadable = 6;
 }
 
 // Environment definitions are additive data contracts. Sending one to a peer

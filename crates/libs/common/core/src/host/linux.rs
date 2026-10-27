@@ -58,6 +58,9 @@ pub mod paths {
     pub const NODE_MANAGER_STATE_DIR: &str = "/space/run/node-manager";
     pub const NODE_MANAGER_STATE_FILE: &str = "/space/run/node-manager/state.json";
     pub const NODE_MANAGER_DB: &str = "/space/run/node-manager/node-manager.db";
+    /// The cluster execution policy node-manager last applied, kept across restarts.
+    pub const NODE_MANAGER_EXECUTION_POLICY_FILE: &str =
+        "/space/run/node-manager/execution-policy.json";
     pub const RUNTIME_SUPERVISOR_SOCKET: &str =
         "/space/run/runtime-supervisor/runtime-supervisor.sock";
     pub const RUNTIME_SUPERVISOR_STATE_DIR: &str = "/space/run/runtime-supervisor";

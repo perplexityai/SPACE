@@ -73,6 +73,13 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::resolve_execution_environment(self, request).await
     }
 
+    async fn apply_execution_policy(
+        &self,
+        request: Request<crate::proto::ApplyExecutionPolicyRequest>,
+    ) -> Result<Response<crate::proto::ApplyExecutionPolicyResponse>, Status> {
+        NodeManagerService::apply_execution_policy(self, request).await
+    }
+
     async fn get_execution_inventory(
         &self,
         request: Request<GetExecutionInventoryRequest>,

@@ -811,9 +811,8 @@ attempts, including retries, rather than completed launches. Transient exact-sou
 errors follow the existing inventory refresh backoff and the caller's activation
 retry/deadline; selection itself does not wait or write a consumer.
 
-Cluster desired policy (below) will add restrictions within these node settings
-once nodes apply it; the node settings stay the upper bound on what a node may
-execute.
+Cluster desired policy (below) adds restrictions within these node settings;
+the node settings stay the upper bound on what a node may execute.
 Until placement consumes environment eligibility and fresh usability evidence,
 keep allowed/default policy uniform within each role/host-platform cohort and
 verify that builder outputs work on every worker cohort that may receive them.
@@ -858,13 +857,15 @@ fails the whole call rather than coming back absent, since absence would send a
 node back to its startup settings. The setting is read per cluster API replica at
 startup, so while it changes, or during a rolling deploy that changes it, some
 replicas serve the field and others don't. Rolling the cluster API back to a
-binary without the field has the same effect. Since a missing field sends a node
-back to its startup settings, which would lift any cluster block, change the
-setting or roll the binary back only while no node applies the field. No node
-reads the field yet. A node that does
-combines the policy with its own settings by these rules, so policy narrows what
-a node allows, and may pick its default among the environments left, but never
-widens it:
+binary without the field has the same effect. Nodes apply the field, so a
+missing field sends a node back to its startup settings and lifts any cluster
+block: while replicas disagree, a node alternates between the two on each pass.
+Turning the setting off, or rolling the cluster API back, lifts every block
+for as long as it lasts. Lift blocks deliberately, or keep the cluster API
+serving the field, rather than relying on either.
+Node-manager combines the policy with its own settings by these rules, so policy
+narrows what a node allows, and may pick its default among the environments
+left, but never widens it:
 
 - **Allowed set.** With no cluster default, state rows narrow nothing: the node
   keeps its configured allowlist. Since the store refuses a block without a
@@ -876,16 +877,117 @@ widens it:
   setting the first default narrows every node to the environments that have
   a state. Mark the environments nodes must keep `allowed` before setting it.
 - **Default.** The node adopts the cluster default when it's in that
-  intersection. Otherwise, as on an older build during a rollout, it keeps its
-  configured default if that's still in the intersection, and has no compiled
-  default if it isn't. Either way, it should report the divergence once node
-  policy publication carries the cluster policy, which it doesn't yet.
+  intersection and its artifacts are installed and verified, by the same
+  inventory resolution a new cold boot uses. Otherwise it keeps its configured
+  default if that's still in the intersection, and has no compiled default if
+  it isn't: a request for the default is then refused rather than run on an
+  environment the cluster removed or one this node can't verify. Unbound work
+  that matches an environment still in the intersection keeps running. The refusal is logged,
+  returned to node-ctl as the `ApplyExecutionPolicy` outcome
+  (`not_allowed` or `unusable`), and visible as a published default that
+  differs from the cluster's at the same applied generation. Install the
+  environment, through the recipe, before making it the default.
 - **Legacy permission.** The node allows unbound historical contracts only when
   both its own setting and the cluster's allow them. The cluster can revoke
   `legacy`, never grant it.
 - **aarch64.** No compiled environment qualifies, so the intersection is empty
   and the node has no compiled default whatever the cluster says. Only the
   legacy permission applies, and the cluster can revoke it.
+
+**How nodes apply it.** Node-ctl's runtime-provisioning facet forwards the
+`execution_policy` of every `GetNodeRuntimeDesiredState` response to
+node-manager's `ApplyExecutionPolicy`, on each periodic tick and each trigger,
+before that pass's installations so a block doesn't wait for them. An absent
+field, or an older cluster API answering `Unimplemented`, is forwarded as no
+policy, and node-manager returns to its startup settings. A failed fetch
+forwards nothing and keeps the applied policy. Older node-managers answer
+`Unimplemented`, which node-ctl logs and tolerates; they keep enforcing their
+startup settings. Node-manager authorizes only root and node-ctl. It refuses no
+policy for what it names, since a refusal would leave a block unenforced. It
+ignores executing references it can't parse, repeats and ones it doesn't
+compile, treats the default as executing whether listed or not, refuses an
+unparsable default as not allowed while still narrowing, and, like the
+cluster's store, caps no count of references. Applying has its own 10-second
+budget. Within it, node-manager waits at most 1 second for the previous
+application's record write and bounds its check of the default at 3 seconds. A
+slow first inventory discovery refuses a default not yet verified for that
+pass, while a slow or retryable check keeps one already verified, so a rescan
+can't flap it. A verdict restored from the record counts until a check this
+process completes says otherwise. A block is enforced within those 4 seconds of
+the call arriving. A hung write leaves the new policy enforced but not
+persisted, with an `Unavailable` error, rather than cancelling the whole
+application. Applications take effect in arrival order: one that finishes after
+a later arrival has enforced its policy is dropped with `Aborted`, so a slow
+call can't swap an older policy back in.
+
+Node-manager enforces the narrowed policy for every admission decision: exact
+and compatible resolution, launches, preparations and restores. Each re-reads
+the policy for its last check, after any inventory discovery or metadata read,
+and launches and preparations after their lifecycle permit and sandbox lock, so
+a policy applied while it waited still gates it. Later steps, such as the jail
+setup after a launch's check, aren't re-checked. A request that passed that
+check before an application returned can still complete; a block doesn't recall
+it. A restore's state load follows its launch's admission: the launch
+re-checks, and the load into the VM it created doesn't. Captures are the
+exception: they execute nothing, and the restore a capture feeds is narrowed at
+admission, so a capture obeys the node's startup settings, not the cluster
+policy, even while the record is unreadable. A blocked environment's VMs can
+still be suspended and drained, and restore selection resumes them on an
+allowed compatible environment. It's enforced on the resolved environment, so
+unbound work matching a removed compiled environment is refused too. Inventory
+discovery and artifact publication keep using the startup settings, the
+ceiling, so narrowing never needs a rescan. Node-manager persists the received
+cluster policy, with whether its default was verified, in
+`/space/run/node-manager/execution-policy.json`, through pinned descriptors
+that never follow a link, and on restart narrows it against that process's
+startup settings before serving. A restart reuses the recorded verdict on the
+default; the next application checks it again.
+
+It swaps a new policy in before persisting it, so a failed write doesn't delay
+a block in the running process; the failure is returned and the write retried
+on the next application. A restart before that retry succeeds restores the
+previous record, which may not carry the block, until node-ctl next applies
+the policy.
+
+An unreadable record (corrupt, a link, an unknown record schema, or larger than
+8 MiB, twice node-manager's 4 MiB gRPC request bound, so any accepted policy
+fits) fails closed: node-manager admits no new work, with no allowed
+environment, no default and no `legacy`, until node-ctl next applies the
+policy, so a damaged file can never lift a cluster block. An application
+carrying no policy, such as from a cluster that stopped serving the field,
+reopens the node on its startup settings. Running VMs are untouched, and can
+still be captured. The next application replaces the file, or removes it if the
+cluster serves no policy. While the cluster API is unreachable no application
+arrives, so the node stays closed. Node-manager logs the error and reports
+`node_mgr.execution.policy_record_unreadable` as 1 on every inventory read, and
+the published observation carries `cluster_policy_unreadable` (below) whenever
+inventory discovery succeeds; a node whose discovery fails publishes no policy
+at all.
+
+The record outlives the process that wrote it, so whatever stops node-ctl
+applying leaves node-manager on its last record across restarts: node-ctl
+rolled back to a build that doesn't call `ApplyExecutionPolicy`, the facet's
+sync disabled, or a node whose role skips the facet. A node-manager rolled
+back to a build without this RPC ignores the record and enforces its startup
+settings; rolled forward again, it restores that record until the next
+application. A build rolled back under a record with fields it doesn't know
+treats the record as unreadable and fails closed until the next application.
+A node-ctl rolled back to a build without the observation's new fields drops
+them when it forwards the inventory, so the cluster withholds that node's
+schema 2 policy evidence as malformed.
+
+A changed enforced policy marks node status dirty, so node-ctl republishes it.
+The published `ExecutionPolicyObservation` then has `schema_version` 2 and
+either `applied_generation`, possibly with allowed environments and no
+default, or `cluster_policy_unreadable` with nothing allowed. A node
+reporting an unreadable cluster policy has no usable policy evidence, and
+placement should avoid it once placement reads node policy. Nothing reads the
+flag yet: reporting doesn't gate placement, so such a node keeps receiving work
+it refuses with `FailedPrecondition` until node-ctl reapplies the policy. A startup-only node keeps publishing schema 1 with
+neither, which the control plane treats as running its startup policy. Deploy
+cluster readers that accept schema 2, the cluster API and the admin API, before
+node-managers that apply a policy: an older reader withholds schema 2 policy
+evidence as a future schema.
 
 Apply each response in full, and never skip one because of its generation.
 Rolling the schema back and reapplying it restarts the generation at 0. A node
@@ -948,8 +1050,8 @@ no installed artifacts or templates. The response optionally carries a
 `RuntimeProvisioningRecipe` of immutable compiled environment references. The
 recipe contains neither execution permissions/defaults nor arbitrary download URLs,
 paths or artifact hashes; the response's separate `execution_policy` field
-(see "Cluster desired policy") carries execution policy, and installation never
-reads it. The cluster authenticates the registered node by the
+(see "Cluster desired policy") carries execution policy, which the facet hands
+to node-manager, and installation never reads it. The cluster authenticates the registered node by the
 existing origin check before answering.
 
 The current cluster handler returns no recipe. A recipe store and producer must
