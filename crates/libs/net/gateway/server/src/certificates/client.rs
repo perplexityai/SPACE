@@ -16,9 +16,9 @@ use super::material::{CertificateLease, Fence, VerifiedMaterial};
 use super::{CERTIFICATE_REQUEST_TIMEOUT, CertificateRequester};
 use crate::state::GatewayNetworkState;
 
-const MAX_REQUESTS_PER_SECOND: usize = 32;
+const MAX_REQUESTS_PER_SECOND: usize = 256;
 const MAX_CONCURRENT_REQUESTS: usize = 4;
-const MAX_CACHED_CERTIFICATES: usize = 256;
+const MAX_CACHED_CERTIFICATES: usize = 4096;
 
 #[derive(Clone)]
 pub struct CertificateContext {
