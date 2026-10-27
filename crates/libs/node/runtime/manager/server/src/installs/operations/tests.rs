@@ -124,7 +124,7 @@ impl Fixture {
             staging: base.join("staging"),
             limits: LIMITS,
             host_arch: crate::installs::host_arch().unwrap(),
-            source,
+            source: crate::installs::test_support::kernel_sources(source),
             releases: super::super::release::ReleaseSources::new(vec![ReleaseContext {
                 root: base.join("node/firecracker"),
                 source: releases,
@@ -199,7 +199,7 @@ impl Fixture {
 
 #[tokio::test]
 async fn both_kinds_install_retry_and_delete_without_touching_execution() {
-    for runtime in [false, true] {
+    for (runtime, historical) in [(false, false), (true, false), (false, true), (true, true)] {
         let fixture = Fixture::new().await;
         // An existing image's paths remain independent, including flat kernels.
         let execution = fixture.dir.path().join("vendor/firecracker/v1.15.1");
@@ -220,6 +220,23 @@ async fn both_kinds_install_retry_and_delete_without_touching_execution() {
                 ..
             })
         ));
+        if historical {
+            use pplx_space_node_runtime_core::artifact_store::{
+                kernel_directory_names, release_directory_names,
+            };
+            let compact = executor.target(&request.artifact()).unwrap();
+            let names = match request.artifact() {
+                NodeArtifactRef::Kernel(version, digest) => {
+                    kernel_directory_names(version.artifact_version(), digest)
+                }
+                NodeArtifactRef::Release(release, digest) => {
+                    release_directory_names(&release, digest)
+                }
+            };
+            let old = compact.parent().unwrap().join(&names[1]);
+            std::fs::rename(&compact, &old).unwrap();
+            assert_eq!(executor.target(&request.artifact()).unwrap(), old);
+        }
         let repeated = fixture.job(&request);
         executor
             .execute(&repeated, CancellationToken::new())
@@ -241,6 +258,10 @@ async fn both_kinds_install_retry_and_delete_without_touching_execution() {
         let absent = fixture.job(&Fixture::remove(&request));
         executor
             .execute(&absent, CancellationToken::new())
+            .await
+            .unwrap();
+        executor
+            .execute(&removal, CancellationToken::new())
             .await
             .unwrap();
         assert!(!executor.target(&request.artifact()).unwrap().exists());

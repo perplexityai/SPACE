@@ -20,6 +20,14 @@ fn compiled_pins() -> Result<&'static BTreeMap<Digest, VerityDigest>, &'static s
             "sha256:cd4561645a5536a9ec4e45039c25f46b364a3715590d64ebeabf0f0f03c35fe0",
         ),
         (
+            "sha256:edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a853",
+            "sha256:3396d3f75a7bb5cd27df06ffd8e09397376d22023151a6251be32f0718e24d79",
+        ),
+        (
+            "sha256:8f8f3d5a983809f87a4e1e9a13053a3361fda47ef04e09c771a41c5e037cb6c2",
+            "sha256:26a86972db2461c90fea9945b577e24734f4ec7fcb9e4060c2dba401e5832176",
+        ),
+        (
             "sha256:e8a6d9786ea678e739f1a386682846e93742dcb9c7b6e3e0c62e3bda6cff0ef3",
             "sha256:083395c407a8e266798efa98f33f4ec259d2df93b2b3197456d1792f9f38e2cd",
         ),

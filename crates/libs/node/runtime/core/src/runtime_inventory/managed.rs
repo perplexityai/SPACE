@@ -1,7 +1,7 @@
 use super::*;
 use crate::artifact_store::{
-    ArtifactStore, KERNEL_IMAGE, KernelSource, managed_kernel_directory, managed_release_directory,
-    release_directory,
+    ArtifactStore, KERNEL_IMAGE, KernelSource, existing_artifact_path, kernel_directory_names,
+    release_directory, release_directory_names,
 };
 use crate::catalog::InitialEnvironment;
 
@@ -71,15 +71,15 @@ impl RuntimeInventory {
         }
         inventory.components = components;
 
-        let managed_release = store.releases_root().join(managed_release_directory(
-            &initial.release().release,
-            initial.release().digest(),
-        ));
+        let managed_release = managed_path(
+            store.releases_root(),
+            release_directory_names(&initial.release().release, initial.release().digest()),
+        )?;
         let baked_release = vendor.join(release_directory(&initial.release().release));
-        let managed_kernel = store.kernels_root().join(managed_kernel_directory(
-            &initial.kernel().version,
-            initial.kernel().sha256,
-        ));
+        let managed_kernel = managed_path(
+            store.kernels_root(),
+            kernel_directory_names(&initial.kernel().version, initial.kernel().sha256),
+        )?;
         let cache_parent = kernels
             .parent()
             .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
@@ -236,10 +236,10 @@ impl RuntimeInventory {
     ) -> Result<(), RuntimeInventoryError> {
         let release = environment.release();
         let kernel = environment.kernel();
-        let release_root = store.releases_root().join(managed_release_directory(
-            &release.release,
-            release.digest(),
-        ));
+        let release_root = managed_path(
+            store.releases_root(),
+            release_directory_names(&release.release, release.digest()),
+        )?;
         let cache_parent = kernels
             .parent()
             .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
@@ -270,9 +270,10 @@ impl RuntimeInventory {
             .iter()
             .find(|entry| entry.default_for_new && entry.metadata.digest == Some(kernel.sha256))
             .cloned();
-        let kernel_root = store
-            .kernels_root()
-            .join(managed_kernel_directory(&kernel.version, kernel.sha256));
+        let kernel_root = managed_path(
+            store.kernels_root(),
+            kernel_directory_names(&kernel.version, kernel.sha256),
+        )?;
         let mut watched = vec![
             kernel_root.join(KERNEL_IMAGE),
             ArtifactStore::execution_kernel_path(cache_parent, kernel),
@@ -319,6 +320,24 @@ impl RuntimeInventory {
                         false,
                         false,
                     );
+                    if let Some((_, _, format)) = environment
+                        .definition()
+                        .descriptor()
+                        .spec()
+                        .boot
+                        .components()
+                        .find(|(_, component, _)| component.digest == kernel.sha256)
+                    {
+                        installation.metadata.format = Some(format.parse().map_err(
+                            |source: pplx_space_common_core::types::ArtifactFormatParseError| {
+                                RuntimeInventoryError::InvalidStaticIdentifier {
+                                    field: "boot format",
+                                    value: format.to_owned(),
+                                    reason: source.to_string(),
+                                }
+                            },
+                        )?);
+                    }
                     installation.integrity = image.integrity;
                     Ok::<_, RuntimeInventoryError>(installation)
                 })();
@@ -454,7 +473,7 @@ fn runtime_from_source(
         }
     }
     match source {
-        RuntimeSource::Store(_) => store.verify_release(pin)?,
+        RuntimeSource::Store(path) => store.verify_managed_release_at(pin, path)?,
         RuntimeSource::Baked(path) => store.verify_release_at(pin, path)?,
     };
     DRIVERS
@@ -508,3 +527,12 @@ fn kernel_from_source(
 
 #[cfg(test)]
 mod tests;
+
+fn managed_path(root: &Path, names: [String; 2]) -> Result<PathBuf, RuntimeInventoryError> {
+    existing_artifact_path(root, &names).map_err(|source| {
+        RuntimeInventoryError::ProbeInventoryPath {
+            path: root.to_owned(),
+            source,
+        }
+    })
+}

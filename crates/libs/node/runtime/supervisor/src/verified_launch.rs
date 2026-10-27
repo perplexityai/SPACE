@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_node_runtime_core::{
-    artifact_store::{VerifyError, managed_release_directory},
+    artifact_store::VerifyError,
     catalog::{CompiledEnvironment, compiled_verity_digest},
     runtime_inventory::host_arch,
     runtime_launch::FirecrackerLaunch,
@@ -50,7 +50,10 @@ impl VerifiedLaunch {
             .parent()
             .and_then(Path::parent)
             .ok_or_else(|| Status::invalid_argument("missing execution source paths"))?;
-        let directory = managed_release_directory(&release.release, release.digest());
+        let directories = pplx_space_node_runtime_core::artifact_store::release_directory_names(
+            &release.release,
+            release.digest(),
+        );
         if !root.is_absolute()
             || !root.components().all(|part| {
                 matches!(
@@ -58,7 +61,9 @@ impl VerifiedLaunch {
                     std::path::Component::RootDir | std::path::Component::Normal(_)
                 )
             })
-            || root.file_name() != Some(std::ffi::OsStr::new(&directory))
+            || !directories
+                .iter()
+                .any(|directory| root.file_name() == Some(std::ffi::OsStr::new(directory)))
             || firecracker != root.join("bin/firecracker")
             || jailer != root.join("bin/jailer")
         {
