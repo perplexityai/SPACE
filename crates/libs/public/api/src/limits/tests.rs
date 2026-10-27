@@ -350,3 +350,26 @@ fn field_names_match_the_request_body() {
         ]
     );
 }
+
+#[test]
+#[allow(deprecated)]
+fn validate_idempotency_key_applies_the_header_rule() {
+    let at_max = "k".repeat(MAX_IDEMPOTENCY_KEY_BYTES);
+    assert_eq!(
+        validate_idempotency_key(at_max.as_bytes()),
+        Ok(at_max.as_str())
+    );
+    assert_eq!(validate_idempotency_key(b"two words"), Ok("two words"));
+    assert_eq!(
+        validate_idempotency_key("k".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1).as_bytes()),
+        Err(IdempotencyKeyError::TooLong)
+    );
+    assert_eq!(
+        validate_idempotency_key(b""),
+        Err(IdempotencyKeyError::Empty)
+    );
+    assert_eq!(
+        validate_idempotency_key("ключ".as_bytes()),
+        Err(IdempotencyKeyError::InvalidEncoding)
+    );
+}

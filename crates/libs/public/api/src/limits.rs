@@ -54,6 +54,18 @@ pub const MAX_SANDBOX_DISK_MIB: u32 = (MAX_SANDBOX_ROOTFS_BYTES / (1024 * 1024))
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize =
     pplx_space_common_core::types::MAX_IDEMPOTENCY_KEY_HEADER_BYTES;
 
+/// Why an `Idempotency-Key` header value was rejected.
+pub use pplx_space_common_core::types::IdempotencyKeyHeaderError as IdempotencyKeyError;
+
+/// Checks a native `Idempotency-Key` header value with
+/// `IdempotencyKey::parse_header`: 1 to [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes of
+/// printable ASCII, space or tab.
+#[deprecated(note = "use `pplx_space_common_core::types::IdempotencyKey::parse_header`")]
+pub fn validate_idempotency_key(value: &[u8]) -> Result<&str, IdempotencyKeyError> {
+    pplx_space_common_core::types::IdempotencyKey::parse_header(value)?;
+    std::str::from_utf8(value).map_err(|_| IdempotencyKeyError::InvalidEncoding)
+}
+
 /// A request field these limits cover, named as in the request body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestField {
