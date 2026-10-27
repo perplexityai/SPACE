@@ -1,5 +1,7 @@
 //! Firecracker's release archives, read from its GitHub releases.
 
+use super::release_source::ReleasePayload;
+
 use std::time::Duration;
 
 use pplx_space_common_core::types::{Arch, RuntimeIdentity, RuntimeKind};
@@ -109,14 +111,8 @@ impl ReleaseSource for GitHubReleaseSource {
         ))
     }
 
-    fn archive_member(
-        &self,
-        release: &RuntimeIdentity,
-        architecture: Arch,
-        binary: &str,
-    ) -> String {
-        let (version, architecture) = (release.version.as_str(), architecture.as_str());
-        format!("release-v{version}-{architecture}/{binary}-v{version}-{architecture}")
+    fn payload(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleasePayload {
+        super::release_source::firecracker_payload(release, architecture)
     }
 
     async fn open(&self, archive: &ReleaseUrl) -> Result<ReleaseChunks, ReleaseSourceError> {

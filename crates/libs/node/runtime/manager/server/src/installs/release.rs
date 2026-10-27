@@ -1,8 +1,8 @@
-//! Firecracker release download, verification and bounded unpacking.
+//! Runtime release download, verification and bounded materialization.
 
 use super::describe;
 use super::executor::InstallExecutor;
-use super::release_source::{ReleaseSource, ReleaseSourceError, VerifiableRelease};
+use super::release_source::{ReleasePayload, ReleaseSource, ReleaseSourceError, VerifiableRelease};
 use super::staging::{self, StagingError};
 use pplx_space_common_core::types::{Arch, Digest, RuntimeIdentity, RuntimeKind};
 use pplx_space_common_jobs::JobError;
@@ -10,12 +10,12 @@ use pplx_space_node_runtime_core::catalog::{CatalogError, PinnedRelease};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{self, ElfProbe, ReleaseLayout};
 use sha2::{Digest as _, Sha256};
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-const ARCHIVE_FILE: &str = "release.tgz";
+const PAYLOAD_FILE: &str = "release.download";
 const MAX_ARCHIVE_ENTRIES: usize = 256;
 
 #[derive(Clone)]
@@ -89,16 +89,16 @@ pub(crate) fn release_digest(
     ))
 }
 
-/// Why an archive could not be unpacked into a release.
+/// Why a downloaded payload could not be materialized into a release.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UnpackError {
-    #[error("read the release archive")]
+    #[error("read the release payload")]
     Read(#[source] std::io::Error),
     #[error("the archive has no {member}")]
     Missing { member: String },
     #[error("the archive holds {member} more than once")]
     Duplicate { member: String },
-    #[error("{member} in the archive is not a regular file")]
+    #[error("{member} is not a regular file")]
     NotRegularFile { member: String },
     #[error("{member} is {size} bytes, over the {limit}-byte limit")]
     TooLarge {
@@ -162,14 +162,12 @@ impl<R: std::io::Read> std::io::Read for BoundedRead<'_, R> {
 }
 
 /// The unpack error a read failure is, telling the bounds apart.
-fn read_error(error: std::io::Error, limits: UnpackLimits) -> UnpackError {
+fn read_error(error: std::io::Error, limit: u64) -> UnpackError {
     match error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<Stopped>())
     {
-        Some(Stopped::Limit) => UnpackError::TooMuchData {
-            limit: limits.max_total_bytes,
-        },
+        Some(Stopped::Limit) => UnpackError::TooMuchData { limit },
         Some(Stopped::Cancelled) => UnpackError::Cancelled,
         None => UnpackError::Read(error),
     }
@@ -199,7 +197,10 @@ pub(crate) fn unpack(
         .map(|(binary, member)| (*binary, member.as_str(), false))
         .collect();
     let mut seen = 0usize;
-    for entry in tar.entries().map_err(|error| read_error(error, limits))? {
+    for entry in tar
+        .entries()
+        .map_err(|error| read_error(error, limits.max_total_bytes))?
+    {
         if pending.iter().all(|(.., written)| *written) {
             break;
         }
@@ -209,7 +210,7 @@ pub(crate) fn unpack(
                 limit: limits.max_entries,
             });
         }
-        let mut entry = entry.map_err(|error| read_error(error, limits))?;
+        let mut entry = entry.map_err(|error| read_error(error, limits.max_total_bytes))?;
         let name = entry
             .path()
             .map_err(UnpackError::Read)?
@@ -253,7 +254,7 @@ pub(crate) fn unpack(
             .open(&destination)
             .map_err(|error| StagingError::new("create", &destination, error))?;
         let copied = std::io::copy(&mut (&mut entry).take(limits.max_member_bytes), &mut out)
-            .map_err(|error| match read_error(error, limits) {
+            .map_err(|error| match read_error(error, limits.max_total_bytes) {
                 UnpackError::Read(error) => StagingError::new("write", &destination, error).into(),
                 bounded => bounded,
             })?;
@@ -277,6 +278,41 @@ pub(crate) fn unpack(
     Ok(())
 }
 
+/// Move the verified download within its private staging tree. Publication
+/// independently verifies the executable; no second payload copy is needed.
+fn materialize_executable(
+    source: &Path,
+    destination: &Path,
+    cancellation: &CancellationToken,
+) -> Result<(), UnpackError> {
+    if cancellation.is_cancelled() {
+        return Err(UnpackError::Cancelled);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(source)
+        .map_err(UnpackError::Read)?;
+    if !file.metadata().map_err(UnpackError::Read)?.is_file() {
+        return Err(UnpackError::NotRegularFile {
+            member: "download payload".into(),
+        });
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| StagingError::new("prepare executable", source, error))?;
+    if let Some(parent) = destination.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)
+            .map_err(|error| StagingError::new("create", parent, error))?;
+    }
+    std::fs::rename(source, destination)
+        .map_err(|error| StagingError::new("move executable", destination, error))?;
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum DownloadError {
     #[error("cancelled")]
@@ -285,7 +321,7 @@ pub(super) enum DownloadError {
     Source(#[from] ReleaseSourceError),
     #[error(transparent)]
     Transfer(#[from] super::transfer::TransferError<ReleaseSourceError>),
-    #[error("the archive's SHA-256 {found} is not the pinned {pinned}")]
+    #[error("the payload's SHA-256 {found} is not the pinned {pinned}")]
     ChecksumMismatch { found: Digest, pinned: Digest },
     #[error("the catalog cannot be loaded")]
     Catalog(#[from] CatalogError),
@@ -294,11 +330,13 @@ pub(super) enum DownloadError {
         release: RuntimeIdentity,
         architecture: Arch,
     },
-    #[error("the unpacked binaries are not the pinned ones")]
+    #[error("the materialized binaries are not the pinned ones")]
     BinariesDiffer,
     #[error("the requested release pins differ from the current catalog; submit a new install")]
     PinChanged,
-    #[error("the archive cannot be unpacked")]
+    #[error("release payload does not describe exactly the runtime layout binaries")]
+    PayloadLayout,
+    #[error("the release payload cannot be materialized")]
     Unpack(#[from] UnpackError),
     #[error("{} is not an {architecture} executable", path.display())]
     NotExecutable { path: PathBuf, architecture: Arch },
@@ -347,12 +385,53 @@ impl DownloadError {
             | Self::NotPinned { .. }
             | Self::PinChanged
             | Self::BinariesDiffer
+            | Self::PayloadLayout
             | Self::Unpack(_)
             | Self::NotExecutable { .. } => JobError::permanent(describe(&self)),
             Self::Transfer(error) => error.into_job_error(),
             Self::Source(_) | Self::Measure(_) | Self::Staging(_) | Self::Task(_) => {
                 JobError::retriable(describe(&self))
             }
+        }
+    }
+}
+
+/// A payload mapped to trusted layout paths before any download is started.
+enum Materialization {
+    TarGz(Vec<(&'static str, String)>),
+    Executable(&'static str),
+}
+
+impl Materialization {
+    fn for_layout(payload: ReleasePayload, layout: &ReleaseLayout) -> Result<Self, DownloadError> {
+        match payload {
+            ReleasePayload::Executable => match layout.binaries {
+                [binary] => Ok(Self::Executable(binary)),
+                _ => Err(DownloadError::PayloadLayout),
+            },
+            ReleasePayload::TarGz { members } if members.len() == layout.binaries.len() => {
+                let mut seen_members = std::collections::HashSet::new();
+                if members
+                    .iter()
+                    .any(|entry| !seen_members.insert(&entry.member))
+                {
+                    return Err(DownloadError::PayloadLayout);
+                }
+                let mapped = layout
+                    .binaries
+                    .iter()
+                    .map(|binary| {
+                        let mut matching = members.iter().filter(|member| member.binary == *binary);
+                        let member = matching.next().ok_or(DownloadError::PayloadLayout)?;
+                        if matching.next().is_some() {
+                            return Err(DownloadError::PayloadLayout);
+                        }
+                        Ok((*binary, member.member.clone()))
+                    })
+                    .collect::<Result<Vec<_>, DownloadError>>()?;
+                Ok(Self::TarGz(mapped))
+            }
+            ReleasePayload::TarGz { .. } => Err(DownloadError::PayloadLayout),
         }
     }
 }
@@ -381,12 +460,20 @@ impl InstallExecutor {
         if pin.digest() != digest || pin.archive_sha256 != release.sha256 {
             return Err(DownloadError::PinChanged);
         }
+        let layout =
+            ReleaseLayout::of(release.release.kind).ok_or(ReleaseDigestError::NoLayout {
+                runtime: release.release.kind,
+            })?;
+        let payload = context
+            .source
+            .payload(&release.release, release.architecture);
+        let materialization = Materialization::for_layout(payload, layout)?;
         let staged = staged_root.join(
             pplx_space_node_runtime_core::artifact_store::release_directory(&release.release),
         );
         let created = staged_root.to_path_buf();
         tokio::task::spawn_blocking(move || staging::create_private_dir(&created)).await??;
-        let archive_path = staged_root.join(ARCHIVE_FILE);
+        let archive_path = staged_root.join(PAYLOAD_FILE);
         let opened = archive_path.clone();
         let file = tokio::task::spawn_blocking(move || {
             std::fs::OpenOptions::new()
@@ -404,7 +491,7 @@ impl InstallExecutor {
             opened = context.source.open(&release.archive) => opened?,
         };
         let limits = self.context().limits;
-        let writer = ArchiveWriter {
+        let writer = PayloadWriter {
             file,
             hasher: Sha256::new(),
             written: 0,
@@ -434,26 +521,6 @@ impl InstallExecutor {
                 pinned: release.sha256,
             });
         }
-        let layout =
-            ReleaseLayout::of(release.release.kind).ok_or(ReleaseDigestError::NoLayout {
-                runtime: release.release.kind,
-            })?;
-        let members: Vec<(&'static str, String)> = layout
-            .binaries
-            .iter()
-            .map(|binary| {
-                let name = Path::new(binary)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(binary);
-                (
-                    *binary,
-                    context
-                        .source
-                        .archive_member(&release.release, release.architecture, name),
-                )
-            })
-            .collect();
         let (unpacked_archive, unpacked) = (archive_path.clone(), staged.to_path_buf());
         let unpack_limits = UnpackLimits {
             max_member_bytes: limits.max_bytes,
@@ -466,13 +533,20 @@ impl InstallExecutor {
                 .mode(0o755)
                 .create(&unpacked)
                 .map_err(|error| StagingError::new("create", &unpacked, error))?;
-            unpack(
-                &unpacked_archive,
-                &unpacked,
-                &members,
-                unpack_limits,
-                &unpack_cancellation,
-            )
+            match materialization {
+                Materialization::TarGz(members) => unpack(
+                    &unpacked_archive,
+                    &unpacked,
+                    &members,
+                    unpack_limits,
+                    &unpack_cancellation,
+                ),
+                Materialization::Executable(binary) => materialize_executable(
+                    &unpacked_archive,
+                    &unpacked.join(binary),
+                    &unpack_cancellation,
+                ),
+            }
         })
         .await??;
 
@@ -527,12 +601,12 @@ impl InstallExecutor {
     }
 }
 
-struct ArchiveWriter {
+struct PayloadWriter {
     file: std::fs::File,
     hasher: Sha256,
     written: u64,
 }
-impl super::transfer::DownloadWriter for ArchiveWriter {
+impl super::transfer::DownloadWriter for PayloadWriter {
     fn written(&self) -> u64 {
         self.written
     }

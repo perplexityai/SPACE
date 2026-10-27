@@ -1332,7 +1332,7 @@ impl ReleaseLayout {
 
 /// `bin/firecracker` and `bin/jailer`, writing the snapshot version the
 /// known-release map gives.
-const FIRECRACKER_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
+pub const FIRECRACKER_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
     binaries: &["bin/firecracker", "bin/jailer"],
     state_format: Some(firecracker_state_format),
     known_releases: firecracker_known_releases,
