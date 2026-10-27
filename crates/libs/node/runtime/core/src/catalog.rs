@@ -27,7 +27,16 @@ use sha2::{Digest as _, Sha256};
 
 use crate::runtime_inventory::diagnostic::ReleaseLayout;
 
+mod device_profile;
+#[cfg(feature = "gpu-development")]
+pub use device_profile::development_t4_profile;
+pub use device_profile::{
+    DedicatedPciHardware, DeviceProfileError, DeviceResourceLimits, ExclusiveDeviceProfile,
+};
+mod boot_artifact;
+pub use boot_artifact::{BOOT_ARTIFACT_IMAGE, BootArtifactPinError, PinnedBootArtifact};
 mod environment;
+pub(crate) mod gpu_boot;
 mod verity;
 pub use environment::{
     CompiledEnvironment, CompiledEnvironmentDefinitionError, ResolveEnvironmentError,
@@ -53,6 +62,13 @@ struct CompiledRelease {
 /// their `.sha256.txt`; Cloud Hypervisor's static ARM64 and x86_64 payloads were
 /// downloaded, hashed and compared with the upstream release asset digests.
 const COMPILED_RELEASES: &[CompiledRelease] = &[
+    CompiledRelease {
+        runtime: RuntimeKind::CloudHypervisor,
+        version: gpu_boot::RUNTIME_VERSION,
+        architecture: "x86_64",
+        archive_sha256: gpu_boot::RUNTIME_SHA256,
+        binaries: &[("bin/cloud-hypervisor", gpu_boot::RUNTIME_SHA256)],
+    },
     CompiledRelease {
         runtime: RuntimeKind::Firecracker,
         version: "1.15.1",
@@ -246,6 +262,13 @@ struct CompiledKernel {
 /// Reviewed upstream direct-boot images; download transport is independent
 /// of the node-manager content pins.
 const CLOUD_HYPERVISOR_KERNELS: &[CompiledKernel] = &[
+    CompiledKernel {
+        version: gpu_boot::KERNEL_VERSION,
+        runtime_line: "54.0",
+        architecture: "x86_64",
+        size: 27_374_592,
+        sha256: gpu_boot::KERNEL_SHA256,
+    },
     CompiledKernel {
         version: "7.2.8+",
         runtime_line: "54.0",
@@ -588,13 +611,18 @@ pub enum CatalogError {
 pub struct RuntimeCatalog {
     releases: Vec<PinnedRelease>,
     kernels: Vec<PinnedKernel>,
+    boot_artifacts: Vec<PinnedBootArtifact>,
 }
 
 impl RuntimeCatalog {
     /// A catalog of exactly these pins, as a test or a tool assembles one.
     /// What node-manager trusts is the catalog it loads itself.
     pub fn from_pins(releases: Vec<PinnedRelease>, kernels: Vec<PinnedKernel>) -> Self {
-        Self { releases, kernels }
+        Self {
+            releases,
+            kernels,
+            boot_artifacts: Vec::new(),
+        }
     }
 
     /// The compiled table alone.
@@ -670,6 +698,7 @@ impl RuntimeCatalog {
                     .ok_or_else(|| field("sha256", compiled.sha256))?,
             });
         }
+        catalog.boot_artifacts.push(gpu_boot::initramfs()?);
         Ok(catalog)
     }
 
@@ -833,7 +862,45 @@ impl RuntimeCatalog {
                 None => self.kernels.push(pinned),
             }
         }
+        for pin in file.boot_artifacts {
+            let existing = self.boot_artifacts.iter().find(|existing| {
+                existing.architecture() == pin.architecture()
+                    && existing.identity().kind == pin.identity().kind
+                    && existing.identity().version == pin.identity().version
+            });
+            match existing {
+                Some(existing) if existing == &pin => {}
+                Some(_) => {
+                    return Err(CatalogError::Conflict {
+                        path: path.to_path_buf(),
+                        entry: format!(
+                            "{} {} {}",
+                            pin.identity().kind,
+                            pin.identity().version,
+                            pin.architecture()
+                        ),
+                    });
+                }
+                None => self.boot_artifacts.push(pin),
+            }
+        }
         Ok(())
+    }
+
+    pub fn boot_artifact(
+        &self,
+        identity: &pplx_space_common_core::types::ComponentIdentity,
+        architecture: Arch,
+    ) -> Option<&PinnedBootArtifact> {
+        self.boot_artifacts
+            .iter()
+            .find(|pin| pin.identity() == identity && pin.architecture() == architecture)
+    }
+
+    pub fn boot_artifacts(&self, architecture: Arch) -> impl Iterator<Item = &PinnedBootArtifact> {
+        self.boot_artifacts
+            .iter()
+            .filter(move |pin| pin.architecture() == architecture)
     }
 
     /// The pins of `release` for `architecture`.
@@ -893,6 +960,8 @@ struct CatalogFile {
     releases: Vec<CatalogFileRelease>,
     #[serde(default)]
     kernels: Vec<CatalogFileKernel>,
+    #[serde(default)]
+    boot_artifacts: Vec<PinnedBootArtifact>,
 }
 
 #[derive(serde::Deserialize)]

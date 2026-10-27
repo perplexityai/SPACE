@@ -24,7 +24,9 @@ use pplx_space_node_runtime_core::catalog::{
 };
 
 use super::publisher::{ArtifactPublisher, NodeArtifactRef, PinSource, Published, PublisherError};
-use super::release_source::{ReleaseChunks, ReleaseSource, ReleaseSourceError, ReleaseUrl};
+use super::release_source::{
+    ReleaseChunks, ReleaseLocation, ReleaseSource, ReleaseSourceError, ReleaseUrl,
+};
 
 use super::source::{
     ByteChunks, ContentMd5, KernelLocation, KernelSource, KernelSources, RuntimeLine, SourceError,
@@ -277,7 +279,7 @@ pub(crate) fn fc_line(release: &str) -> RuntimeLine {
 /// Firecracker's GitHub releases are, each with a published checksum.
 pub(crate) struct FakeReleaseSource {
     root: ReleaseUrl,
-    archives: Mutex<Vec<(ReleaseUrl, Vec<u8>)>>,
+    archives: Mutex<Vec<(ReleaseLocation, Vec<u8>)>>,
     opens: AtomicUsize,
 }
 
@@ -314,22 +316,23 @@ impl ReleaseSource for FakeReleaseSource {
         RuntimeKind::Firecracker
     }
 
-    fn root(&self) -> &ReleaseUrl {
-        &self.root
+    fn root(&self) -> ReleaseLocation {
+        self.root.clone().into()
     }
 
-    fn archive(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleaseUrl {
+    fn archive(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleaseLocation {
         let version = release.version.as_str();
         self.root
             .join(&format!("v{version}"))
             .join(&format!("firecracker-v{version}-{architecture}.tgz"))
+            .into()
     }
 
     fn payload(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleasePayload {
         super::release_source::firecracker_payload(release, architecture)
     }
 
-    async fn open(&self, archive: &ReleaseUrl) -> Result<ReleaseChunks, ReleaseSourceError> {
+    async fn open(&self, archive: &ReleaseLocation) -> Result<ReleaseChunks, ReleaseSourceError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
         let bytes = self
             .archives
@@ -524,6 +527,16 @@ impl ArtifactPublisher for LocalPublisher {
             .map_err(|error| refused(&error, false))?;
         let architecture = host();
         let publication = match artifact {
+            NodeArtifactRef::Boot(identity) => {
+                let pin = catalog
+                    .boot_artifact(identity, architecture)
+                    .ok_or_else(|| {
+                        PublisherError::Refused(Box::new(tonic::Status::failed_precondition(
+                            "no boot pins",
+                        )))
+                    })?;
+                self.store.publish_boot_artifact(pin, staged)
+            }
             NodeArtifactRef::Release(release, digest) => {
                 let pin = catalog
                     .release(release, architecture)
@@ -557,6 +570,7 @@ impl ArtifactPublisher for LocalPublisher {
 
     async fn remove(&self, artifact: &NodeArtifactRef) -> Result<bool, PublisherError> {
         let removed = match artifact {
+            NodeArtifactRef::Boot(identity) => self.store.remove_boot_artifact(identity),
             NodeArtifactRef::Release(release, digest) => {
                 self.store.remove_release(release, *digest)
             }
@@ -608,7 +622,7 @@ pub(crate) fn staging_holds_no_job(staging: &Path) -> bool {
 }
 
 pub(crate) struct FakeExecutableSource {
-    pub(crate) location: super::release_source::ReleaseUrl,
+    pub(crate) location: super::release_source::ReleaseLocation,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -618,11 +632,11 @@ impl ReleaseSource for FakeExecutableSource {
         RuntimeKind::CloudHypervisor
     }
 
-    fn root(&self) -> &super::release_source::ReleaseUrl {
-        &self.location
+    fn root(&self) -> super::release_source::ReleaseLocation {
+        self.location.clone()
     }
 
-    fn archive(&self, _: &RuntimeIdentity, _: Arch) -> super::release_source::ReleaseUrl {
+    fn archive(&self, _: &RuntimeIdentity, _: Arch) -> super::release_source::ReleaseLocation {
         self.location.clone()
     }
 
@@ -632,7 +646,7 @@ impl ReleaseSource for FakeExecutableSource {
 
     async fn open(
         &self,
-        _: &super::release_source::ReleaseUrl,
+        _: &super::release_source::ReleaseLocation,
     ) -> Result<super::release_source::ReleaseChunks, ReleaseSourceError> {
         Ok(Box::pin(futures_util::stream::iter([Ok(
             bytes::Bytes::copy_from_slice(&self.bytes),

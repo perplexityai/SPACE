@@ -173,6 +173,8 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
     #[derive(Clone, Copy, Debug)]
     enum Case {
         Valid,
+        LocalValid,
+        LocalCorrupt,
         CorruptTransfer,
         WrongBinaryPin,
         WrongArchitecture,
@@ -188,6 +190,8 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
     let checksum = |bytes: &[u8]| Digest::sha256(Sha256::digest(bytes).into());
     for case in [
         Case::Valid,
+        Case::LocalValid,
+        Case::LocalCorrupt,
         Case::CorruptTransfer,
         Case::WrongBinaryPin,
         Case::WrongArchitecture,
@@ -214,7 +218,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
                 version: "54.0".parse().unwrap(),
             },
             architecture,
-            archive_sha256: if matches!(case, Case::CorruptTransfer) {
+            archive_sha256: if matches!(case, Case::CorruptTransfer | Case::LocalCorrupt) {
                 checksum(b"different download")
             } else {
                 checksum(&bytes)
@@ -228,21 +232,37 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
                 },
             }],
         };
-        let source = Arc::new(FakeExecutableSource {
-            location: "https://releases.example.test/runtime-static"
-                .parse()
-                .unwrap(),
-            bytes: bytes.clone(),
-        });
-        let release = VerifiableRelease {
-            release: pin.release.clone(),
-            architecture,
-            archive: source.location.clone(),
-            sha256: pin.archive_sha256,
-        };
         let kernels = Arc::new(FakeSource::default());
         let pins = TestPins::new(kernels.clone());
         pins.pin_release(pin.clone());
+        let source: Arc<dyn crate::installs::release_source::ReleaseSource> =
+            if matches!(case, Case::LocalValid | Case::LocalCorrupt) {
+                let feed = root.path().join("feed");
+                let payload = feed.join(format!(
+                    "releases/cloud-hypervisor/54.0/{architecture}/payload"
+                ));
+                std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+                std::fs::write(payload, &bytes).unwrap();
+                Arc::new(crate::installs::local_source::LocalArtifactSource::new(
+                    format!("cloud-hypervisor={}", feed.display())
+                        .parse()
+                        .unwrap(),
+                    pins.clone(),
+                ))
+            } else {
+                Arc::new(FakeExecutableSource {
+                    location: "https://releases.example.test/runtime-static"
+                        .parse()
+                        .unwrap(),
+                    bytes: bytes.clone(),
+                })
+            };
+        let release = VerifiableRelease {
+            release: pin.release.clone(),
+            architecture,
+            archive: source.archive(&pin.release, architecture),
+            sha256: pin.archive_sha256,
+        };
         let context = ReleaseContext {
             root: root.path().join("releases"),
             source,
@@ -251,6 +271,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
         let publisher = LocalPublisher::new(&context.root, root.path(), &staging, pins.clone());
         let executor = InstallExecutor::new(
             ExecutorParts {
+                boot_source: None,
                 kernels_root: root.path().to_path_buf(),
                 staging: staging.clone(),
                 limits: super::super::operations::InstallLimits {
@@ -277,7 +298,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
             .prepare_release(&context, &release, pin.digest(), &staging, &cancellation)
             .await;
         match case {
-            Case::Valid => {
+            Case::Valid | Case::LocalValid => {
                 assert_eq!(result.unwrap(), (pin.digest(), bytes.len() as u64));
                 let path = staging
                     .join(
@@ -294,7 +315,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
                     0
                 );
             }
-            Case::CorruptTransfer => assert!(matches!(
+            Case::CorruptTransfer | Case::LocalCorrupt => assert!(matches!(
                 result,
                 Err(DownloadError::ChecksumMismatch { .. })
             )),

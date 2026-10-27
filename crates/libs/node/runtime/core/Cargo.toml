@@ -11,6 +11,8 @@ publish.workspace = true
 workspace = true
 
 [features]
+# Isolated hardware qualification only; excluded from production builds.
+gpu-development = []
 default = []
 host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-net-common"]
 # The node's root-owned store of runtime releases and guest kernels, which
@@ -18,6 +20,7 @@ host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zer
 artifact-store = ["dep:rustix", "rustix/fs"]
 
 [dependencies]
+pplx-space-execution-spec = { workspace = true }
 aws-lc-rs = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
