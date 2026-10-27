@@ -41,6 +41,22 @@ def _command(test, sandbox, discovery, argv, **extra):
                         idempotency_key=test.key("recovery-command")).require(201)
 
 
+def _discovery(test, path):
+    # The public lifecycle can report running before guest startup finishes.
+    deadline = time.monotonic() + test.config.ready_timeout_seconds
+    while (remaining := deadline - time.monotonic()) > 0:
+        response = test.request(
+            "GET", path + "/process-execution",
+            timeout=min(test.config.request_timeout_seconds, remaining),
+        )
+        if not (response.status == 412 and response.body.get("message") ==
+                "sandbox is starting, not started"):
+            return response.require(200)
+        time.sleep(min(max(test.config.poll_interval_seconds, 0.05),
+                       max(0, deadline - time.monotonic())))
+    raise TimeoutError("guest did not become ready for process recovery discovery")
+
+
 @scenario("native.process_recovery", api_surfaces=("native",), required_tools=("node",))
 def process_recovery(test: NativeHardeningFixture) -> None:
     """Start replay, cursor reads and sequenced input survive transport reconnects;
@@ -48,7 +64,7 @@ def process_recovery(test: NativeHardeningFixture) -> None:
     """
     sandbox = test.create_ready()
     path = f"/v1/sandboxes/{sandbox}"
-    discovery = test.request("GET", path + "/process-execution").require(200)
+    discovery = _discovery(test, path)
     test.context.verify({"process_recovery_start", "process_recovery_handles", "process_mutation_receipts"}
                         <= set(discovery["capabilities"]), "recovery not advertised")
     test.context.verify(bool(discovery["activation_id"]) and discovery["idempotency_retention_ms"] > 0,
@@ -141,7 +157,7 @@ def process_recovery(test: NativeHardeningFixture) -> None:
                                  idempotency_key=test.key(action)).require(202)
         test.wait_operation(operation["operation_id"])
     test.wait_sandbox(sandbox)
-    restored = test.request("GET", path + "/process-execution").require(200)
+    restored = _discovery(test, path)
     test.context.verify(restored["activation_id"] != discovery["activation_id"],
                         "memory restore reused the recovery activation")
     for request in [
