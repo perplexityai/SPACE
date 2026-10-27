@@ -1,7 +1,7 @@
 use super::*;
 use crate::artifact_store::{
-    ArtifactStore, KERNEL_IMAGE, KernelSource, managed_kernel_directory, managed_release_directory,
-    release_directory,
+    ArtifactStore, KERNEL_IMAGE, KernelSource, existing_artifact_path, kernel_directory_names,
+    release_directory, release_directory_names,
 };
 use crate::catalog::InitialEnvironment;
 
@@ -71,32 +71,16 @@ impl RuntimeInventory {
         }
         inventory.components = components;
 
-        let managed_release = store.releases_root().join(managed_release_directory(
-            &initial.release().release,
-            initial.release().digest(),
-        ));
         let baked_release = vendor.join(release_directory(&initial.release().release));
-        let managed_kernel = store.kernels_root().join(managed_kernel_directory(
-            &initial.kernel().version,
-            initial.kernel().sha256,
-        ));
         let cache_parent = kernels
             .parent()
             .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
-        let cached_kernel = ArtifactStore::execution_kernel_path(cache_parent, initial.kernel());
-        let cached_release = ArtifactStore::execution_release_path(cache_parent, initial.release());
         let mut watched = vec![
             store.releases_root().to_path_buf(),
             store.kernels_root().to_path_buf(),
             cache_parent.to_path_buf(),
-            managed_release.join("bin/firecracker"),
-            managed_release.join("bin/jailer"),
             baked_release.join("bin/firecracker"),
             baked_release.join("bin/jailer"),
-            cached_release.join("bin/firecracker"),
-            cached_release.join("bin/jailer"),
-            managed_kernel.join(KERNEL_IMAGE),
-            cached_kernel.clone(),
             kernels
                 .join(initial.kernel().version.as_str())
                 .join(KERNEL_IMAGE),
@@ -105,6 +89,12 @@ impl RuntimeInventory {
             assets.join("default/kernel/vmlinux.bin"),
             vendor.join("default"),
         ];
+        watched.extend(binding_paths(
+            store,
+            cache_parent,
+            initial.release(),
+            initial.kernel(),
+        ));
         // Protected consumers check the full ancestry; repairing any rejected
         // ancestor must invalidate the cached observation too.
         watched.extend(cache_parent.ancestors().map(Path::to_path_buf));
@@ -114,6 +104,12 @@ impl RuntimeInventory {
             .runtimes
             .retain(|entry| entry.runtime != initial.release().release);
         let release = (|| {
+            let managed_release = managed_path(
+                store.releases_root(),
+                release_directory_names(&initial.release().release, initial.release().digest()),
+            )?;
+            let cached_release =
+                ArtifactStore::execution_release_path(cache_parent, initial.release())?;
             let source = if probe_inventory_path(&managed_release)?.is_some() {
                 RuntimeSource::Store(&managed_release)
             } else {
@@ -150,6 +146,12 @@ impl RuntimeInventory {
             .components
             .retain(|entry| entry.metadata.digest != Some(initial.kernel().sha256));
         let kernel = (|| {
+            let managed_kernel = managed_path(
+                store.kernels_root(),
+                kernel_directory_names(&initial.kernel().version, initial.kernel().sha256),
+            )?;
+            let cached_kernel =
+                ArtifactStore::execution_kernel_path(cache_parent, initial.kernel())?;
             let managed_present = probe_inventory_path(&managed_kernel)?.is_some();
             if managed_present
                 || (initial_kernels.is_empty() && probe_inventory_path(&cached_kernel)?.is_some())
@@ -236,75 +238,69 @@ impl RuntimeInventory {
     ) -> Result<(), RuntimeInventoryError> {
         let release = environment.release();
         let kernel = environment.kernel();
-        let release_root = store.releases_root().join(managed_release_directory(
-            &release.release,
-            release.digest(),
-        ));
         let cache_parent = kernels
             .parent()
             .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
-        let sealed_release_root = ArtifactStore::execution_release_path(cache_parent, release);
-        let shared_runtime = self
-            .runtimes
-            .iter()
-            .find(|entry| {
-                entry.runtime == release.release && self.defaults.contains(&entry.runtime)
-            })
-            .or_else(|| {
-                // Reuse only a verified managed copy of this exact release.
-                // External installations share version keys but lack digest evidence.
-                self.environments
-                    .values()
-                    .filter_map(|entry| entry.runtime.as_ref().ok())
-                    .find(|entry| {
-                        entry.runtime == release.release
-                            && entry.files.paths().all(|path| {
-                                path.starts_with(&release_root)
-                                    || path.starts_with(&sealed_release_root)
-                            })
-                    })
-            })
-            .cloned();
+        let runtime = (|| {
+            let release_root = managed_path(
+                store.releases_root(),
+                release_directory_names(&release.release, release.digest()),
+            )?;
+            let sealed_release_root = ArtifactStore::execution_release_path(cache_parent, release)?;
+            let shared_runtime = self
+                .runtimes
+                .iter()
+                .find(|entry| {
+                    entry.runtime == release.release && self.defaults.contains(&entry.runtime)
+                })
+                .or_else(|| {
+                    // Reuse only a verified managed copy of this exact release.
+                    // External installations share version keys but lack digest evidence.
+                    self.environments
+                        .values()
+                        .filter_map(|entry| entry.runtime.as_ref().ok())
+                        .find(|entry| {
+                            entry.runtime == release.release
+                                && entry.files.paths().all(|path| {
+                                    path.starts_with(&release_root)
+                                        || path.starts_with(&sealed_release_root)
+                                })
+                        })
+                })
+                .cloned();
+            match shared_runtime {
+                Some(runtime) => Ok(runtime),
+                None => runtime_from_source(
+                    store,
+                    release,
+                    RuntimeSource::Store(&release_root),
+                    cache_parent,
+                ),
+            }
+        })();
+        let runtime = runtime.map_err(|error| {
+            tracing::warn!(%error, "environment runtime unavailable");
+            let error = self.binding_error(error);
+            self.unavailable.push(UnavailableArtifact::Runtime {
+                identity: release.release.clone(),
+                error: error.clone(),
+            });
+            error
+        });
         let shared_kernel = self
             .components
             .iter()
             .find(|entry| entry.default_for_new && entry.metadata.digest == Some(kernel.sha256))
             .cloned();
-        let kernel_root = store
-            .kernels_root()
-            .join(managed_kernel_directory(&kernel.version, kernel.sha256));
-        let mut watched = vec![
-            kernel_root.join(KERNEL_IMAGE),
-            ArtifactStore::execution_kernel_path(cache_parent, kernel),
-        ];
-        for binary in &release.binaries {
-            watched.push(release_root.join(binary.path));
-            watched.push(sealed_release_root.join(binary.path));
-        }
-        let runtime = match shared_runtime {
-            Some(runtime) => Ok(runtime),
-            None => {
-                let runtime = runtime_from_source(
-                    store,
-                    release,
-                    RuntimeSource::Store(&release_root),
-                    cache_parent,
-                );
-                runtime.map_err(|error| {
-                    tracing::warn!(%error, "environment runtime unavailable");
-                    let error = self.binding_error(error);
-                    self.unavailable.push(UnavailableArtifact::Runtime {
-                        identity: release.release.clone(),
-                        error: error.clone(),
-                    });
-                    error
-                })
-            }
-        };
+        let mut watched = binding_paths(store, cache_parent, release, kernel);
         let component = match shared_kernel {
             Some(kernel) => Ok(kernel),
             None => {
                 let component = (|| {
+                    let kernel_root = managed_path(
+                        store.kernels_root(),
+                        kernel_directory_names(&kernel.version, kernel.sha256),
+                    )?;
                     let source = kernel_root.join(KERNEL_IMAGE);
                     let image = kernel_from_source(
                         store,
@@ -319,6 +315,24 @@ impl RuntimeInventory {
                         false,
                         false,
                     );
+                    if let Some((_, _, format)) = environment
+                        .definition()
+                        .descriptor()
+                        .spec()
+                        .boot
+                        .components()
+                        .find(|(_, component, _)| component.digest == kernel.sha256)
+                    {
+                        installation.metadata.format = Some(format.parse().map_err(
+                            |source: pplx_space_common_core::types::ArtifactFormatParseError| {
+                                RuntimeInventoryError::InvalidStaticIdentifier {
+                                    field: "boot format",
+                                    value: format.to_owned(),
+                                    reason: source.to_string(),
+                                }
+                            },
+                        )?);
+                    }
                     installation.integrity = image.integrity;
                     Ok::<_, RuntimeInventoryError>(installation)
                 })();
@@ -454,7 +468,7 @@ fn runtime_from_source(
         }
     }
     match source {
-        RuntimeSource::Store(_) => store.verify_release(pin)?,
+        RuntimeSource::Store(path) => store.verify_managed_release_at(pin, path)?,
         RuntimeSource::Baked(path) => store.verify_release_at(pin, path)?,
     };
     DRIVERS
@@ -508,3 +522,42 @@ fn kernel_from_source(
 
 #[cfg(test)]
 mod tests;
+
+fn managed_path(root: &Path, names: [String; 2]) -> Result<PathBuf, RuntimeInventoryError> {
+    existing_artifact_path(root, &names).map_err(|source| {
+        RuntimeInventoryError::ProbeInventoryPath {
+            path: root.to_owned(),
+            source,
+        }
+    })
+}
+
+// Watch both published layouts even when a locator is unreadable. Repair of one
+// component must refresh its binding without withdrawing unrelated components.
+fn binding_paths(
+    store: &ArtifactStore,
+    cache_parent: &Path,
+    release: &crate::catalog::PinnedRelease,
+    kernel: &crate::catalog::PinnedKernel,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for root in [
+        store.releases_root().to_owned(),
+        cache_parent.join("managed/releases"),
+    ] {
+        for name in release_directory_names(&release.release, release.digest()) {
+            for binary in &release.binaries {
+                paths.push(root.join(&name).join(binary.path));
+            }
+        }
+    }
+    for root in [
+        store.kernels_root().to_owned(),
+        cache_parent.join("managed/kernels"),
+    ] {
+        for name in kernel_directory_names(&kernel.version, kernel.sha256) {
+            paths.push(root.join(name).join(KERNEL_IMAGE));
+        }
+    }
+    paths
+}

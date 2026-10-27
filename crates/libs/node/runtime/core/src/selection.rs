@@ -86,7 +86,9 @@ pub fn select<'a>(
         let spec = entry.definition().descriptor().spec();
         // Runtime adapters own ordering. Do not assign semantic-version ordering
         // to future host-provided facilities or other runtime families.
-        if entry.release().release.kind != RuntimeKind::Firecracker {
+        if entry.release().release.kind != RuntimeKind::Firecracker
+            && entry.definition().reference() != source_reference
+        {
             continue;
         }
         let RuntimeBinding::ManagedRelease(source_runtime) = &source.runtime;

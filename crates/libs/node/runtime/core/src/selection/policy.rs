@@ -166,7 +166,7 @@ impl ExecutionPolicy {
             AllowedEntry::Environment(reference) => Some(reference),
             // Architectures without qualified descriptors retain their existing
             // unbound contract, without fabricating a descriptor.
-            AllowedEntry::LegacyUnbound if catalog.is_empty() => None,
+            AllowedEntry::LegacyUnbound if initial.is_none() => None,
             AllowedEntry::LegacyUnbound => return Err(PolicyError::DefaultNotAllowed),
         };
         let legacy_unbound_allowed = entries.contains(&AllowedEntry::LegacyUnbound);

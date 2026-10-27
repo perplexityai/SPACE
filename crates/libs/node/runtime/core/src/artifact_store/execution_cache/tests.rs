@@ -3,6 +3,29 @@ use crate::artifact_store::test_support::*;
 use std::fs::File;
 
 #[test]
+fn release_cache_locators_reuse_history_without_hiding_inspection_errors() {
+    let fixture = Fixture::new();
+    let parent = fixture._dir.path().join("cache");
+    let release = pin("1.15.1", 1);
+    let root = parent.join("managed/releases");
+    let [compact, historical] = release_directory_names(&release.release, release.digest());
+    let old = root.join(historical);
+    std::fs::create_dir_all(&old).unwrap();
+    assert_eq!(
+        ArtifactStore::execution_release_path(&parent, &release).unwrap(),
+        old
+    );
+    std::fs::create_dir(root.join(&compact)).unwrap();
+    assert_eq!(
+        ArtifactStore::execution_release_path(&parent, &release).unwrap(),
+        root.join(compact)
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::write(&root, b"not a directory").unwrap();
+    ArtifactStore::execution_release_path(&parent, &release).unwrap_err();
+}
+
+#[test]
 fn sealed_cache_reuses_authenticated_inodes_without_its_source() {
     let Some(directory) = crate::tests::verity_test_directory() else {
         return;
@@ -534,7 +557,7 @@ fn cached_kernel_validation_precedes_unused_source_validation() {
         .unwrap();
         let pin = initial.kernel();
         let parent = fixture._dir.path().join("cache/firecracker");
-        let cached = ArtifactStore::execution_kernel_path(&parent, pin);
+        let cached = ArtifactStore::execution_kernel_path(&parent, pin).unwrap();
         let target = cached.parent().unwrap();
         std::fs::create_dir_all(target).unwrap();
         if !empty {

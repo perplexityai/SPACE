@@ -1,4 +1,5 @@
 use super::*;
+use crate::artifact_store::managed_kernel_directory;
 use crate::artifact_store::test_support::*;
 use crate::catalog::PinnedKernel;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -710,6 +711,18 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     let ready = discover();
     assert_default(&ready);
     assert_legacy(&ready);
+    let unreadable = fixture._dir.path().join("blocked-release-root");
+    std::fs::write(&unreadable, b"not a directory").unwrap();
+    let blocked_store =
+        ArtifactStore::new(&unreadable, &fixture.kernels, &fixture.staging, 1 << 20)
+            .owned_by(std::fs::metadata(&fixture.kernels).unwrap().uid());
+    let mut isolated = ready.clone();
+    isolated
+        .include_environment(&blocked_store, &environment, &cache.join("kernels"))
+        .unwrap();
+    assert_default(&isolated);
+    assert_legacy(&isolated);
+    resolve(&isolated).expect_err("an unreadable candidate must fail only its own binding");
     let resolved = resolve(&ready).unwrap();
     assert_eq!(resolved.environment, Some(definition.reference()));
     assert_eq!(
@@ -772,6 +785,20 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     assert!(!ready.check_files_unchanged());
     let recovered = discover();
     assert_eq!(resolve(&recovered).unwrap().execution, resolved.execution);
+    // Retain the old execution inode across a compact-layout upgrade rather
+    // than publishing a second copy and leaving the historical one unused.
+    let compact = resolve(&recovered).unwrap().components[0].path.clone();
+    let old_directory = compact.parent().unwrap().parent().unwrap().join(
+        kernel_directory_names(&environment.kernel().version, environment.kernel().sha256)[1]
+            .clone(),
+    );
+    let inode = std::fs::metadata(&compact).unwrap().ino();
+    std::fs::rename(compact.parent().unwrap(), &old_directory).unwrap();
+    let recovered = discover();
+    let historical = resolve(&recovered).unwrap().components[0].path.clone();
+    assert_eq!(historical, old_directory.join(KERNEL_IMAGE));
+    assert_eq!(std::fs::metadata(&historical).unwrap().ino(), inode);
+    assert!(!compact.exists());
     let image = resolve(&recovered).unwrap().components[0].path.clone();
     std::fs::write(&image, binary(99)).unwrap();
     let bad_kernel = discover();
@@ -835,7 +862,7 @@ fn cache_repairs_invalidate_a_failed_binding_observation() {
             .publish_kernel(initial.kernel(), &staged("kernel"))
             .unwrap();
         let cache = fixture._dir.path().join("cache/firecracker");
-        let image = ArtifactStore::execution_kernel_path(&cache, initial.kernel());
+        let image = ArtifactStore::execution_kernel_path(&cache, initial.kernel()).unwrap();
         std::fs::create_dir_all(image.parent().unwrap()).unwrap();
         std::fs::write(&image, binary(99)).unwrap();
         if matches!(repair, Repair::Ancestor) {
@@ -945,7 +972,7 @@ fn legacy_cached_kernel_is_verified_without_a_store_source() {
     let initial = synthetic_initial_environment();
     std::fs::remove_dir_all(&fixture.kernels).unwrap();
     let cache = fixture._dir.path().join("cache/firecracker");
-    let image = ArtifactStore::execution_kernel_path(&cache, initial.kernel());
+    let image = ArtifactStore::execution_kernel_path(&cache, initial.kernel()).unwrap();
     std::fs::create_dir_all(image.parent().unwrap()).unwrap();
     let discover = || {
         RuntimeInventory::discover_with_store(

@@ -1,5 +1,6 @@
 use super::*;
 use pplx_space_common_core::types::Arch;
+use pplx_space_node_runtime_core::artifact_store::managed_release_directory;
 
 #[test]
 fn adapter_locations_are_not_environment_authority() {
@@ -17,6 +18,17 @@ fn adapter_locations_are_not_environment_authority() {
     // Missing files still fail authentication before execution.
     let launch = VerifiedLaunch::from_environment(environment, &firecracker, &jailer).unwrap();
     assert!(launch.open().is_err());
+    let historical = temporary.path().join(format!(
+        "v{}--{}",
+        release.release.version,
+        release.digest().hex_string()
+    ));
+    VerifiedLaunch::from_environment(
+        environment,
+        &historical.join("bin/firecracker"),
+        &historical.join("bin/jailer"),
+    )
+    .unwrap();
     for (runtime, launcher) in [
         (PathBuf::from("relative/bin/firecracker"), jailer.clone()),
         (root.join("../bin/firecracker"), jailer.clone()),
