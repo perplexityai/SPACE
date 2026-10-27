@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_common_core::{sql, types::SandboxActivationAttemptId};
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
 
 impl NetworkPool {
@@ -41,13 +41,23 @@ impl NetworkPool {
         sandbox_id: &str,
         fence: ExecutionFence,
     ) -> Result<(), SlotStoreError> {
-        let db = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        db.execute(
-            "INSERT INTO sandbox_executions (sandbox_id, execution_id, previous_id) VALUES (?1, ?2, ?3)
+        let mut db = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let replay: bool = tx.query_row(
+            sql!("SELECT EXISTS(SELECT 1 FROM sandbox_executions WHERE sandbox_id=?1 AND execution_id=?2)"),
+            params![sandbox_id, fence.current().to_string()],
+            |row| row.get(0),
+        )?;
+        if !replay {
+            devices::admission::ensure_no_holders(&tx, sandbox_id)?;
+        }
+        tx.execute(
+            sql!("INSERT INTO sandbox_executions (sandbox_id, execution_id, previous_id) VALUES (?1, ?2, ?3)
              ON CONFLICT (sandbox_id) DO UPDATE SET execution_id = excluded.execution_id,
-                                                   previous_id = excluded.previous_id",
+                                                   previous_id = excluded.previous_id"),
             params![sandbox_id, fence.current().to_string(), fence.previous().map(|id| id.to_string())],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -56,11 +66,21 @@ impl NetworkPool {
         sandbox_id: &str,
         expected: SandboxActivationAttemptId,
     ) -> Result<(), SlotStoreError> {
-        let db = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        db.execute(
-            "DELETE FROM sandbox_executions WHERE sandbox_id = ?1 AND execution_id = ?2",
+        let mut db = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: bool = tx.query_row(
+            sql!("SELECT EXISTS(SELECT 1 FROM sandbox_executions WHERE sandbox_id=?1 AND execution_id=?2)"),
+            params![sandbox_id, expected.to_string()],
+            |row| row.get(0),
+        )?;
+        if current {
+            devices::admission::ensure_no_holders(&tx, sandbox_id)?;
+        }
+        tx.execute(
+            sql!("DELETE FROM sandbox_executions WHERE sandbox_id = ?1 AND execution_id = ?2"),
             params![sandbox_id, expected.to_string()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 }
