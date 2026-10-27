@@ -95,6 +95,7 @@ fn insert_paused_pool_member(conn: &crate::db::Connection, sandbox_id: SandboxId
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            device_requirements: None,
             id: &id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
             state: SandboxState::Paused,

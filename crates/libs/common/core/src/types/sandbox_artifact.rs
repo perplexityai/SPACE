@@ -1,10 +1,12 @@
 //! Durable metadata stored beside a sandbox's node-local files.
 
 use super::{ContentHash, ExecutionMetadata, SandboxId, TemplateName, VcpuCount};
+use pplx_space_execution_spec::devices::DeviceRequirements;
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Current sandbox `metadata.json` schema version.
 pub const SANDBOX_ARTIFACT_METADATA_VERSION: u32 = 2;
+const DEVICE_ARTIFACT_METADATA_VERSION: u32 = 3;
 
 /// Metadata stored at the sandbox cache root beside `instance/` and `snapshots/`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -19,6 +21,8 @@ pub struct SandboxArtifactMetadata {
     /// Absence on older artifacts does not establish a default allocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_budget: Option<VcpuCount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_requirements: Option<DeviceRequirements>,
 }
 
 impl SandboxArtifactMetadata {
@@ -35,6 +39,7 @@ impl SandboxArtifactMetadata {
             template,
             content_hash,
             cpu_budget: None,
+            device_requirements: None,
         }
     }
 
@@ -45,6 +50,18 @@ impl SandboxArtifactMetadata {
 
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    /// A version change makes readers predating device ownership refuse this
+    /// artifact instead of restoring its disk as a CPU-only sandbox.
+    pub fn with_device_requirements(mut self, requirements: DeviceRequirements) -> Self {
+        self.schema_version = DEVICE_ARTIFACT_METADATA_VERSION;
+        self.device_requirements = Some(requirements);
+        self
+    }
+
+    pub fn device_requirements(&self) -> Option<&DeviceRequirements> {
+        self.device_requirements.as_ref()
     }
 }
 
@@ -58,6 +75,8 @@ struct SandboxArtifactMetadataWire {
     content_hash: Option<ContentHash>,
     #[serde(default)]
     cpu_budget: Option<VcpuCount>,
+    #[serde(default)]
+    device_requirements: Option<DeviceRequirements>,
 }
 
 impl<'de> Deserialize<'de> for SandboxArtifactMetadata {
@@ -66,7 +85,12 @@ impl<'de> Deserialize<'de> for SandboxArtifactMetadata {
         D: Deserializer<'de>,
     {
         let wire = SandboxArtifactMetadataWire::deserialize(deserializer)?;
-        if wire.schema_version != SANDBOX_ARTIFACT_METADATA_VERSION {
+        let expected_version = if wire.device_requirements.is_some() {
+            DEVICE_ARTIFACT_METADATA_VERSION
+        } else {
+            SANDBOX_ARTIFACT_METADATA_VERSION
+        };
+        if wire.schema_version != expected_version {
             return Err(de::Error::custom(format!(
                 "unsupported sandbox metadata schema version {}",
                 wire.schema_version
@@ -79,6 +103,7 @@ impl<'de> Deserialize<'de> for SandboxArtifactMetadata {
             template: wire.template,
             content_hash: wire.content_hash,
             cpu_budget: wire.cpu_budget,
+            device_requirements: wire.device_requirements,
         })
     }
 }
