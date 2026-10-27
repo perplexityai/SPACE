@@ -761,11 +761,29 @@ impl UdpProxy {
                 let reply =
                     self.reserved_dns
                         .udp_capacity_response(self.sandbox_id, resolver, wire);
-                if !reply.is_empty()
-                    && let Ok(response_socket) = response_socket_factory(flow.orig_dst)
-                    && let Ok(sent) = response_socket.try_send_to(&reply, flow.guest_src)
-                {
-                    self.stats.add_network_rx_bytes(sent as u64);
+                if !reply.is_empty() {
+                    // The reply socket was registered with the reactor a moment
+                    // ago, so tokio's `try_send_to` would report WouldBlock until
+                    // the reactor observes write readiness, silently dropping the
+                    // SERVFAIL and leaving the guest to its own timeout. Send on
+                    // the std socket instead: a fresh UDP socket's send buffer is
+                    // empty, so the non-blocking send completes immediately.
+                    let sent = response_socket_factory(flow.orig_dst)
+                        .and_then(UdpSocket::into_std)
+                        .and_then(|socket| socket.send_to(&reply, flow.guest_src));
+                    match sent {
+                        Ok(sent) => self.stats.add_network_rx_bytes(sent as u64),
+                        Err(error) => {
+                            pplx_space_metrics::gateway::udp_socket_error(
+                                "reserved_dns_capacity_response",
+                            );
+                            debug!(
+                                sandbox_id = self.sandbox_id,
+                                %error,
+                                "failed to send reserved-DNS capacity response"
+                            );
+                        }
+                    }
                 }
                 return;
             }

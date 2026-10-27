@@ -447,6 +447,67 @@ async fn pending_replay_rechecks_ca_readiness_before_each_datagram() {
     }
 }
 
+#[tokio::test]
+async fn reserved_udp_capacity_rejection_reaches_the_guest_as_servfail() {
+    let resolver =
+        crate::reserved_dns::test_support::RecordedResolver::new("192.0.2.10".parse().unwrap());
+    let network_state = ready_network_state(v1_policy(&["allowed.example"], &[])).await;
+    let policy = network_state.snapshot().await.policy.unwrap();
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let guest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let response_addr = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let reserved_dns_cancellation = network_state.reserved_dns_cancellation().clone();
+    let mut proxy = UdpProxy::new(
+        UdpProxyConfig {
+            sandbox_id: "test",
+            listener,
+            stats: Arc::new(ProxyStats::new()),
+            network_state,
+            known_egress_state: crate::known_egress::KnownEgressState::default(),
+            reserved_dns: resolver.core(),
+            shutdown_token: CancellationToken::new(),
+        },
+        TaskTracker::new(),
+    )
+    .unwrap();
+    let _saturated = Arc::clone(&proxy.reserved_dns_task_slots)
+        .try_acquire_many_owned(MAX_ACTIVE_RESERVED_DNS_DATAGRAMS as u32)
+        .unwrap();
+    let flow = FlowKey {
+        guest_src: guest.local_addr().unwrap(),
+        orig_dst: response_addr,
+    };
+
+    proxy
+        .forward_reserved_dns_datagram(
+            flow,
+            ReservedResolver::Cloudflare,
+            &dns_query("allowed.example"),
+            policy,
+            reserved_dns_cancellation.operation_token(),
+            // Like production, the reply socket is created and registered with
+            // the reactor here, with no reactor turn before the send.
+            |addr| {
+                let socket = std::net::UdpSocket::bind(addr)?;
+                socket.set_nonblocking(true)?;
+                UdpSocket::from_std(socket)
+            },
+        )
+        .await;
+
+    let (reply, source, _) = recv_dns(&guest).await;
+    assert_eq!(source, flow.orig_dst);
+    assert_eq!(
+        reply.metadata.response_code,
+        hickory_resolver::proto::op::ResponseCode::ServFail
+    );
+    assert!(resolver.requests().is_empty());
+}
+
 fn dns_query(name: &str) -> Vec<u8> {
     use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
     use hickory_resolver::proto::rr::{Name, RecordType};
