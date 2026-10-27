@@ -227,20 +227,25 @@ fn sidecar_restart_queue_backs_off_failures_until_the_attempt_changes() {
 
 // A Launch NOT_FOUND is node-manager reporting that the fenced execution holds
 // no network lease, so retrying the same attempt cannot succeed. The restart
-// stops until the sandbox's execution or sidecar authority changes; other
-// refusals stay retryable after a backoff.
+// stops until the sandbox's execution or sidecar authority changes, and a
+// committed live lifecycle is quarantined; other refusals stay retryable after
+// a backoff and leave the lifecycle alone.
 #[tokio::test]
 async fn sidecar_restart_stops_when_node_manager_holds_no_allocation() {
+    use crate::state::SandboxState::{Paused, Quarantined, Started, Suspending};
     let a_day_later = Instant::now() + Duration::from_secs(86_400);
+    let cases = [
+        (tonic::Code::NotFound, Started, Quarantined, true),
+        (tonic::Code::NotFound, Paused, Quarantined, true),
+        (tonic::Code::NotFound, Suspending, Suspending, true),
+        (tonic::Code::Unavailable, Started, Started, false),
+    ];
     for kind in [SidecarKind::SpacedHost, SidecarKind::NetGateway] {
-        for (code, stopped) in [
-            (tonic::Code::NotFound, true),
-            (tonic::Code::Unavailable, false),
-        ] {
-            let case = format!("{kind:?} restart answered {code:?}");
+        for (code, state, expected_state, stopped) in cases {
+            let case = format!("{kind:?} restart answered {code:?} from {state}");
             let sandbox_id = SandboxId::new().to_string();
             let conn = crate::db::test_conn();
-            insert_test_sandbox(&conn, &sandbox_id, crate::state::SandboxState::Started);
+            insert_test_sandbox(&conn, &sandbox_id, state);
             set_runtime_fields(&conn, &sandbox_id, test_route_identity());
             let db = crate::db::SharedConnection::new(conn);
             let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
@@ -275,9 +280,13 @@ async fn sidecar_restart_stops_when_node_manager_holds_no_allocation() {
                 &node_manager.connector(),
             )
             .await;
-            finish_sidecar_restart(&mut queue, outcome);
+            finish_sidecar_restart(&mut queue, outcome, &sidecars, &db).await;
 
             assert_eq!(node_manager.calls(), ["Launch"], "{case}");
+            let row = crate::db::read::sandbox(&db.lock().unwrap(), &sandbox_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, expected_state, "{case}");
             assert_eq!(
                 queue.schedule(request(&info), a_day_later),
                 !stopped,

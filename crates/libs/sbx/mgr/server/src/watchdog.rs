@@ -1439,7 +1439,7 @@ async fn sidecar_loop(
             tick_at = interval.tick() => Some(tick_at.into_std()),
             outcome = restart_futures.next(), if !restart_futures.is_empty() => {
                 if let Some(outcome) = outcome {
-                    finish_sidecar_restart(&mut restart_queue, outcome);
+                    finish_sidecar_restart(&mut restart_queue, outcome, &sidecars, &db).await;
                 }
                 fill_sidecar_restart_slots(
                     &mut restart_queue,
@@ -1708,7 +1708,12 @@ fn start_sidecar_restart(
     .boxed()
 }
 
-fn finish_sidecar_restart(queue: &mut SidecarRestartQueue, outcome: SidecarRestartOutcome) {
+async fn finish_sidecar_restart(
+    queue: &mut SidecarRestartQueue,
+    outcome: SidecarRestartOutcome,
+    sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    db: &crate::db::SharedConnection,
+) {
     let SidecarRestartOutcome { request, result } = outcome;
     let sandbox_id = request.sandbox_id().to_owned();
     let operation = request.operation();
@@ -1725,15 +1730,66 @@ fn finish_sidecar_restart(queue: &mut SidecarRestartQueue, outcome: SidecarResta
             );
         }
         Err(SidecarRestartFailure::NotAllocated(error)) => {
+            // Hand the contradiction to the lifecycle record only while the
+            // attempted execution is still the one being monitored.
+            let still_current = sidecars
+                .lock()
+                .await
+                .get(&sandbox_id)
+                .is_some_and(|current| request.same_attempt(current));
+            let quarantined =
+                still_current && quarantine_unallocated_sandbox(db, &sandbox_id, operation);
             queue.stop(request);
             tracing::error!(
                 sandbox_id,
                 %error,
                 operation,
+                quarantined,
                 "sidecar restart stopped: node-manager holds no allocation for the sandbox"
             );
         }
     }
+}
+
+/// Quarantine a sandbox whose committed lifecycle still expects live sidecars
+/// after node-manager reported it holds no allocation for the execution.
+/// Transitional states belong to the lifecycle operation in flight, which
+/// either re-arms monitoring or retires it.
+fn quarantine_unallocated_sandbox(
+    db: &crate::db::SharedConnection,
+    sandbox_id: &str,
+    operation: &'static str,
+) -> bool {
+    let state = {
+        let Ok(conn) = db.lock() else {
+            tracing::warn!(
+                sandbox_id,
+                "sandbox database mutex poisoned before quarantine"
+            );
+            return false;
+        };
+        match crate::db::read::sandbox(&conn, sandbox_id) {
+            Ok(Some(row)) => row.state,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(sandbox_id, %error, "failed to load sandbox before quarantine");
+                return false;
+            }
+        }
+    };
+    if !matches!(
+        state,
+        crate::state::SandboxState::Started | crate::state::SandboxState::Paused
+    ) {
+        return false;
+    }
+    crate::runtime_reconciliation::mark_quarantined_best_effort(
+        db,
+        sandbox_id,
+        state,
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
+        &format!("{operation} found no node-manager allocation for the sandbox"),
+    )
 }
 
 fn emit_auto_lifecycle_delete_gauges(db: &crate::db::SharedConnection) {
