@@ -941,6 +941,26 @@ mod not_running {
         );
         assert!(wake_markers(&fixture, sandbox_id).await?.is_empty());
 
+        // A start that completed since the resolver looked, so nothing is
+        // queued any more: keep waiting, with no wake.
+        let sandbox_id = sandbox(&fixture, "stopped", &["command"]).await?;
+        let stored =
+            crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                .await?
+                .expect("seeded sandbox");
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1"
+        ))
+        .bind(stored.id)
+        .execute(&fixture.db.pool)
+        .await?;
+        assert!(
+            queue_implicit_wake(&fixture.db.pool, &stored, Command)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+        );
+        assert!(wake_markers(&fixture, sandbox_id).await?.is_empty());
+
         // A new command's wake is a command's.
         let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
         let (status, _, body) = command(&fixture, sandbox_id, "commands").await?;

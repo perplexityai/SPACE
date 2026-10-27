@@ -358,7 +358,21 @@ pub(crate) async fn queue_implicit_wake(
                 tracing::warn!(sandbox_id = %sandbox.id, %error, "could not read pending activations");
                 PublicApiError::internal()
             })?;
-            Ok(observed.is_some_and(|observed| observed.activation_pending))
+            // A start, resume, restore or wake queued since the sandbox was
+            // read is about to place it. One that completed, or got under
+            // way, since then already has: the lifecycle read with the
+            // operations is one the attach is admitted in, running or
+            // heading there.
+            Ok(observed.is_some_and(|observed| {
+                observed.activation_pending
+                    || observed
+                        .lifecycle
+                        .parse::<SandboxLifecycle>()
+                        .is_ok_and(|lifecycle| {
+                            activity_admission(activity, lifecycle, &sandbox.auto_lifecycle.0)
+                                == CommandAdmission::Admit
+                        })
+            }))
         }
         CommandAdmission::AdmitAndWake => {
             let sandbox_id = PublicSandboxId::from(sandbox.id);
