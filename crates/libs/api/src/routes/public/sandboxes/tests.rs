@@ -2087,5 +2087,13 @@ async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
         vec![1, 7, 8]
     );
     assert_eq!(pages.concat(), expected);
+
+    // Within the budget, the walk stops at the limit's lookahead row.
+    let after_oversized = Some((newest, expected[0]));
+    let rows = fetch_sandboxes_page(&db.pool, org_id, None, after_oversized, 2).await?;
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        expected[1..4]
+    );
     Ok(())
 }

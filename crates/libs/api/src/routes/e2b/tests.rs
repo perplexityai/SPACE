@@ -2597,6 +2597,138 @@ fn create_translation_rejects_unsupported_fields() {
     translate_create_request(compatible).expect("memory snapshots are the supported default");
 }
 
+/// An ECW list page stops at the list byte budget, returning at least one
+/// sandbox, and still sets `x-next-token`, which following visits every
+/// sandbox once. The rows are inserted directly, as ECW create stores
+/// metadata without size limits.
+#[tokio::test]
+async fn sandbox_list_pages_stop_at_the_byte_budget() -> TestResult {
+    const MIB: usize = 1024 * 1024;
+    let db = pg_test_db().await?;
+    let org = sqlx::query_as::<_, Organization>(sql!(
+        "SELECT id, name, slug, parent_id, theme_primary, theme_secondary, logo_url,
+                byok_enabled, snapshot_base_object_storage_uri, created_at, updated_at
+         FROM organizations
+         WHERE id = $1"
+    ))
+    .bind(SEED_ORG_ID)
+    .fetch_one(&db.pool)
+    .await?;
+    // Newest first: one row over the whole budget, four 3 MiB rows, then two
+    // small ones. They are suspended, which ECW lists as paused.
+    let newest = OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+    let sizes = std::iter::once(9 * MIB)
+        .chain(std::iter::repeat_n(3 * MIB, 4))
+        .chain(std::iter::repeat_n(16, 2));
+    let mut expected = Vec::new();
+    for (offset, size) in sizes.enumerate() {
+        let sandbox_id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, lifecycle, created_at, metadata,
+                 network_policy_override_json, network_policy_generation
+             ) VALUES ($1, $2, $3, 'suspended', $4, $5, $6, 1)"
+        ))
+        .bind(sandbox_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(newest - time::Duration::seconds(offset as i64))
+        .bind(sqlx::types::Json(json!({ "legacy": "m".repeat(size) })))
+        .bind(sqlx::types::Json(
+            &pplx_space_net_common::NetworkPolicyV1::default(),
+        ))
+        .execute(&db.pool)
+        .await?;
+        expected.push(sandbox_id.to_string());
+    }
+    let app = e2b_api_routes()
+        .layer(Extension(AuthOrg(org)))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(AppState::from_pool(db.pool.clone()).await?);
+
+    let mut pages = Vec::new();
+    let mut next_token: Option<String> = None;
+    loop {
+        let uri = match &next_token {
+            Some(token) => format!("/sandboxes?limit=1000&nextToken={token}"),
+            None => "/sandboxes?limit=1000".to_string(),
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::HOST, TEST_ECW_API_HOST)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        next_token = response
+            .headers()
+            .get(super::lifecycle::NEXT_TOKEN_HEADER)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        let ids = body
+            .as_array()
+            .ok_or("list body is an array")?
+            .iter()
+            .map(|item| item["sandboxID"].as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("listed sandboxes carry an ID")?;
+        pages.push(ids);
+        assert!(pages.len() <= 8, "the cursor stopped advancing");
+        if next_token.is_none() {
+            break;
+        }
+    }
+
+    // The oversized row comes back alone; 3 MiB rows fit two to a page, and
+    // the small rows fit beside the last two.
+    assert_eq!(
+        pages.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![1, 2, 4]
+    );
+    assert_eq!(pages.concat(), expected);
+    Ok(())
+}
+
+#[test]
+fn create_translation_rejects_nul_in_metadata_and_env() {
+    let entry = |key: &str, value: &str| StringMap::from([(key.to_string(), value.to_string())]);
+    for (metadata, env_vars, message) in [
+        (
+            entry("a\0b", "v"),
+            StringMap::new(),
+            "metadata must not contain NUL",
+        ),
+        (
+            entry("k", "a\0b"),
+            StringMap::new(),
+            "metadata must not contain NUL",
+        ),
+        (
+            StringMap::new(),
+            entry("A\0B", "v"),
+            "envVars must not contain NUL",
+        ),
+        (
+            StringMap::new(),
+            entry("K", "a\0b"),
+            "envVars must not contain NUL",
+        ),
+    ] {
+        let mut request = base_create_request();
+        request.metadata = metadata;
+        request.env_vars = env_vars;
+        let error = translate_create_request(request).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, message);
+    }
+}
+
 #[test]
 fn lifecycle_requests_reject_only_unsupported_parameter_values() {
     let pause_error = validate_pause_request(Some(SandboxPauseRequestE2b {

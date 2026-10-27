@@ -407,19 +407,18 @@ pub(super) async fn list_sandboxes(
         .unwrap_or(ECW_LIST_DEFAULT_LIMIT)
         .min(ECW_LIST_MAX_LIMIT);
 
-    // The controller pushes the metadata filter into the list query and fetches
-    // `limit + 1` rows. If a sentinel row is present, another page exists and
-    // the cursor is the LAST kept row's keyset. Encoding the sentinel itself
-    // would skip it on the next request because pagination is strict `<`.
+    // The controller pushes the metadata filter into the list query and stops
+    // the page at `limit` rows or the list byte budget. When more rows follow,
+    // the cursor is the LAST kept row's keyset: pagination is strict `<`, so
+    // the next request starts at the first row this page left out.
     let scope = ecw_access_scope(&org, &federated);
-    let mut rows =
-        fetch_scoped_sandbox_page(&state, &scope, cursor, limit, &metadata_filter).await?;
-    let next_cursor_row = if rows.len() > limit as usize {
-        rows.pop(); // discard sentinel (the (limit+1)th row)
-        rows.last().cloned()
+    let page = fetch_scoped_sandbox_page(&state, &scope, cursor, limit, &metadata_filter).await?;
+    let next_cursor_row = if page.has_more {
+        page.rows.last().cloned()
     } else {
         None
     };
+    let rows = page.rows;
 
     let mut items = Vec::with_capacity(rows.len());
     for sandbox in rows {

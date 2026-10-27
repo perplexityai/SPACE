@@ -137,6 +137,12 @@ The following compatibility limits are important:
   are rejected with an E2B-shaped `400` response. `autoPauseMemory=true` is
   accepted; `false` is rejected because SPACE cannot cold-resume from a
   filesystem-only E2B pause.
+- Sandbox create rejects a NUL character in a `metadata` or `envVars` key or
+  value with an E2B-shaped `400` response.
+- A sandbox list page holds at most `limit` sandboxes and ends early once it
+  reaches 8 MiB of estimated JSON, always returning at least one sandbox. A
+  page that ends early still sets `x-next-token`, which the SDK paginator
+  follows; a client must not treat a short page as the last one.
 - The legacy create `secure` field is ignored, matching E2B's newer
   always-secure behavior. `network.allowPublicTraffic=true` is rejected because
   ECW data-plane access is token-authenticated.

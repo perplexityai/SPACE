@@ -223,8 +223,12 @@ async fn scoped_sandbox_page_filters_by_owner() -> TestResult {
         )
         .await?;
 
-    let local_ids: Vec<SandboxId> = local_page.iter().map(|sandbox| sandbox.id).collect();
-    let federated_ids: Vec<SandboxId> = federated_page.iter().map(|sandbox| sandbox.id).collect();
+    let local_ids: Vec<SandboxId> = local_page.rows.iter().map(|sandbox| sandbox.id).collect();
+    let federated_ids: Vec<SandboxId> = federated_page
+        .rows
+        .iter()
+        .map(|sandbox| sandbox.id)
+        .collect();
     assert!(local_ids.contains(&local_id));
     assert!(!local_ids.contains(&federated_id));
     // Own federated rows plus the key org's legacy rows, merged newest-first.
@@ -233,6 +237,7 @@ async fn scoped_sandbox_page_filters_by_owner() -> TestResult {
     assert!(!federated_ids.contains(&other_federated_id));
     assert!(!federated_ids.contains(&other_org_local_id));
     let keys: Vec<_> = federated_page
+        .rows
         .iter()
         .map(|sandbox| (sandbox.created_at, sandbox.id))
         .collect();
@@ -250,10 +255,11 @@ async fn scoped_sandbox_page_filters_by_owner() -> TestResult {
             None,
         )
         .await?;
-    assert_eq!(first[0].id, federated_id);
+    assert_eq!(first.rows[0].id, federated_id);
+    assert!(first.has_more);
     let cursor = SandboxPageCursor {
-        created_at: first[0].created_at,
-        id: first[0].id,
+        created_at: first.rows[0].created_at,
+        id: first.rows[0].id,
     };
     let rest: Vec<SandboxId> = fixture
         .controller
@@ -265,10 +271,136 @@ async fn scoped_sandbox_page_filters_by_owner() -> TestResult {
             None,
         )
         .await?
+        .rows
         .iter()
         .map(|sandbox| sandbox.id)
         .collect();
     assert!(rest.contains(&local_id));
     assert!(!rest.contains(&federated_id));
+    Ok(())
+}
+
+/// Moves a seeded row to `created_at` and gives it `bytes` of metadata or,
+/// with `in_env`, of env, as rows ECW created without size limits can hold.
+async fn set_listed_row(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    created_at: time::OffsetDateTime,
+    bytes: usize,
+    in_env: bool,
+) -> TestResult {
+    let (metadata, env) = if in_env {
+        (
+            serde_json::json!({}),
+            serde_json::json!({ "LEGACY": "e".repeat(bytes) }),
+        )
+    } else {
+        (
+            serde_json::json!({ "legacy": "m".repeat(bytes) }),
+            serde_json::json!({}),
+        )
+    };
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET created_at = $2, metadata = $3, env = $4 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(created_at)
+    .bind(sqlx::types::Json(metadata))
+    .bind(sqlx::types::Json(env))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Follows an ECW list from the first page to the last, as the route does:
+/// the cursor is the last row of a page that has more. Returns each page's
+/// sandbox IDs, and checks that a page of more than one row stays within the
+/// byte budget.
+async fn walk_scoped_pages(
+    fixture: &ScopeFixture,
+    scope: &SandboxAccessScope,
+) -> TestResult<Vec<Vec<SandboxId>>> {
+    let mut pages = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = fixture
+            .controller
+            .scoped_sandbox_page(&fixture.db.pool, scope, cursor, 1000, None)
+            .await?;
+        let row_bytes = page
+            .rows
+            .iter()
+            .map(|sandbox| {
+                serde_json::to_vec(&sandbox.metadata).unwrap().len()
+                    + serde_json::to_vec(&sandbox.env).unwrap().len()
+            })
+            .sum::<usize>();
+        if page.rows.len() > 1 {
+            assert!(
+                row_bytes <= MAX_SANDBOX_LIST_PAGE_BYTES as usize,
+                "{row_bytes}"
+            );
+        }
+        pages.push(page.rows.iter().map(|sandbox| sandbox.id).collect());
+        assert!(pages.len() <= 16, "the cursor stopped advancing");
+        if !page.has_more {
+            return Ok(pages);
+        }
+        let last = page.rows.last().expect("a page with more is not empty");
+        cursor = Some(SandboxPageCursor {
+            created_at: last.created_at,
+            id: last.id,
+        });
+    }
+}
+
+#[tokio::test]
+async fn scoped_sandbox_page_bounds_the_bytes_it_returns() -> TestResult {
+    const MIB: usize = 1024 * 1024;
+    let fixture = scope_fixture().await?;
+    let newest = time::OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+    // Newest first: one row over the whole budget, twelve 1 MiB rows, then
+    // three small ones, alternating between a legacy local row and the
+    // federated subject's own row so the federated walk crosses both arms.
+    // The federated rows carry their bytes in env, which the page holds too.
+    let sizes = std::iter::once(9 * MIB)
+        .chain(std::iter::repeat_n(MIB, 12))
+        .chain(std::iter::repeat_n(16, 3));
+    let mut all = Vec::new();
+    let mut local = Vec::new();
+    for (offset, size) in sizes.enumerate() {
+        let sandbox_id = if offset % 2 == 0 {
+            let sandbox_id = insert_local_sandbox(&fixture.db.pool).await?;
+            local.push(sandbox_id);
+            sandbox_id
+        } else {
+            insert_federated_sandbox(&fixture.db.pool, UPSTREAM_SUBJECT_ID).await?
+        };
+        let created_at = newest - time::Duration::seconds(offset as i64);
+        set_listed_row(
+            &fixture.db.pool,
+            sandbox_id,
+            created_at,
+            size,
+            offset % 2 == 1,
+        )
+        .await?;
+        all.push(sandbox_id);
+    }
+
+    // The oversized row comes back alone; 1 MiB rows fit seven to a page.
+    let federated = walk_scoped_pages(&fixture, &federated_scope(UPSTREAM_SUBJECT_ID)).await?;
+    assert_eq!(
+        federated.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![1, 7, 8]
+    );
+    assert_eq!(federated.concat(), all);
+    // The local rows are the oversized one, six 1 MiB rows and one small.
+    let local_pages = walk_scoped_pages(&fixture, &local_scope()).await?;
+    assert_eq!(
+        local_pages.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![1, 7]
+    );
+    assert_eq!(local_pages.concat(), local);
     Ok(())
 }

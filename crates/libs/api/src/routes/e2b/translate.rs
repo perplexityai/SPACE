@@ -11,6 +11,7 @@ use pplx_space_net_common::{
 use std::net::IpAddr;
 
 use crate::controllers::ControllerError;
+use crate::controllers::sandbox::list_page::ListPage;
 
 pub(super) use crate::e2b::{
     auto_lifecycle_policy as e2b_auto_lifecycle_policy,
@@ -79,6 +80,9 @@ pub(super) fn translate_create_request(
         )));
     }
 
+    reject_nul("metadata", &req.metadata)?;
+    reject_nul("envVars", &req.env_vars)?;
+
     let ignored_metadata = req
         .metadata
         .keys()
@@ -130,6 +134,20 @@ pub(super) fn translate_create_request(
         },
         template_id,
     })
+}
+
+/// Postgres cannot store NUL in text or jsonb, so a create carrying one in
+/// `field` is an invalid request rather than an insert failure.
+fn reject_nul(field: &str, entries: &StringMap) -> Result<(), E2bApiError> {
+    if entries
+        .iter()
+        .any(|(key, value)| key.contains('\0') || value.contains('\0'))
+    {
+        return Err(E2bApiError::bad_request(format!(
+            "{field} must not contain NUL"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_e2b_tls_interception(metadata: &StringMap) -> Result<TlsInterception, E2bApiError> {
@@ -618,7 +636,7 @@ pub(super) async fn fetch_scoped_sandbox_page(
     cursor: Option<ListCursor>,
     limit: u32,
     metadata_filter: &[(String, String)],
-) -> Result<Vec<Sandbox>, E2bApiError> {
+) -> Result<ListPage<Sandbox>, E2bApiError> {
     let metadata_jsonb = build_metadata_filter_jsonb(metadata_filter);
     state
         .sandbox_controller

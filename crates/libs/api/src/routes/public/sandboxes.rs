@@ -39,7 +39,13 @@ use time::OffsetDateTime;
 use crate::{
     controllers::{
         ControllerError,
-        sandbox::{AdmissionPoolPlan, SandboxController, fetch_sandbox},
+        sandbox::{
+            AdmissionPoolPlan, SandboxController, fetch_sandbox,
+            list_page::{
+                ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams,
+                SANDBOX_LIST_ROW_OVERHEAD_BYTES, page_rows_cte,
+            },
+        },
         substrate::AdmissionPoolClaim,
     },
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
@@ -68,14 +74,6 @@ const CREATE_SANDBOX_PATH_TEMPLATE: &str = native_routes::CREATE_SANDBOX.path();
 const UPDATE_SANDBOX_PATH_TEMPLATE: &str = native_routes::UPDATE_SANDBOX.path();
 const DEFAULT_SANDBOX_LIST_LIMIT: u16 = 100;
 const MAX_SANDBOX_LIST_LIMIT: u16 = 1000;
-/// Estimated JSON bytes after which a sandbox list page stops, applied in
-/// the page query. Capped metadata keeps a typical full row near 18 KB, but
-/// JSON escapes a control character to six bytes, and rows stored before the
-/// input limits can hold megabytes of metadata.
-const MAX_SANDBOX_LIST_PAGE_BYTES: i64 = 8 * 1024 * 1024;
-/// A listed sandbox's JSON apart from its name and metadata: about 700 bytes,
-/// up to about 1.1 KB with the longest template reference.
-const SANDBOX_LIST_ROW_OVERHEAD_BYTES: i64 = 2 * 1024;
 const SANDBOX_METRICS_STREAM_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_NATIVE_IDLE_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 /// Env master for claiming a warm-pool slot at native-create admission.
@@ -700,14 +698,13 @@ fn sandbox_metrics_stream(
 }
 
 /// Builds a page from the rows `fetch_sandboxes_page` returned: at most
-/// `limit` sandboxes, with a cursor when the limit's lookahead row came back
-/// or the query stopped at its byte budget before the end of the list.
+/// `limit` sandboxes, with a cursor when more follow them.
 fn sandboxes_page(
-    mut rows: Vec<PublicSandboxRow>,
+    rows: Vec<PublicSandboxRow>,
     limit: u16,
 ) -> Result<PublicPage<PublicSandbox>, PublicApiError> {
-    let has_more = rows.len() > usize::from(limit) || rows.last().is_some_and(|row| row.has_next);
-    rows.truncate(usize::from(limit));
+    let ListPage { rows, has_more } =
+        ListPage::from_rows(rows, usize::from(limit), |row| row.has_next);
     let next_cursor = if has_more {
         rows.last()
             .map(|sandbox| sandbox_cursor(sandbox.created_at, sandbox.id))
@@ -1131,20 +1128,29 @@ const PUBLIC_SANDBOX_FROM: &str = "FROM sandboxes s
       AND failure_observation.facet = $1
       AND failure_observation.element = s.id::TEXT";
 
-/// The rows a sandbox list may show: the org's live sandboxes, owned by
-/// subject $12 or, without one, by a local user.
-const PAGE_FILTER: &str = "s.org_id = $8
-    AND s.lifecycle <> 'deleted'
-    AND (($12::UUID IS NOT NULL AND s.user_id = $12)
-      OR ($12::UUID IS NULL AND EXISTS (
-          SELECT 1 FROM users owner WHERE owner.id = s.user_id
-            AND owner.owner_source = 'local'
-      )))";
+/// The first sandbox the list shows after the page walk's current row: the
+/// org's live sandboxes, owned by subject $12 or, without one, by a local
+/// user.
+const PAGE_NEXT_ROW: &str = "SELECT s.id, s.created_at
+    FROM sandboxes s
+    WHERE s.org_id = $8
+      AND s.lifecycle <> 'deleted'
+      AND (($12::UUID IS NOT NULL AND s.user_id = $12)
+        OR ($12::UUID IS NULL AND EXISTS (
+            SELECT 1 FROM users owner WHERE owner.id = s.user_id
+              AND owner.owner_source = 'local'
+        )))
+      AND (s.created_at, s.id) < (walk.created_at, walk.id)
+    ORDER BY s.created_at DESC, s.id DESC
+    LIMIT 1";
 
-/// A listed row's estimated JSON size; see `PublicSandboxQuery::Page`.
-const PAGE_ROW_BYTES: &str = "(octet_length(s.metadata::TEXT)
-    + COALESCE(octet_length(to_jsonb(s.name)::TEXT), 0)
-    + $14::BIGINT)";
+const PAGE_WALK_PARAMS: PageWalkParams = PageWalkParams {
+    cursor_created_at: "$9",
+    cursor_id: "$10",
+    max_rows: "$11",
+    max_bytes: "$13",
+    row_overhead_bytes: "$14",
+};
 
 #[derive(Clone, Copy)]
 enum PublicSandboxQuery {
@@ -1161,53 +1167,13 @@ fn public_sandbox_query(query: PublicSandboxQuery) -> sqlx::AssertSqlSafe<String
              {PUBLIC_SANDBOX_FROM}
              WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
         ),
-        // `page_walk` follows the list order one row at a time, adding each
-        // row's estimated JSON size to a running total. It stops one row
-        // after the total passes $13 bytes or at $11 rows, so the page keeps
-        // rows within the budget, always the first so the cursor advances,
-        // and the row after the last kept one tells the handler whether the
-        // list continues. It is recursive so that Postgres sizes only those
-        // rows: a running-sum window cannot stop early and would size all $11
-        // candidates, megabytes each for rows stored before the input limits.
-        //
-        // The estimate is the metadata's and the escaped name's JSON text plus
-        // $14 bytes for everything else; jsonb's text form is never shorter
-        // than the compact JSON the page is served as. `pg_column_size` would
-        // be cheaper, but it is the compressed size, which repetitive metadata
-        // makes many times smaller than the decoded row.
         PublicSandboxQuery::Page => format!(
-            "WITH RECURSIVE page_walk AS (
-                 (SELECT s.id, s.created_at, {PAGE_ROW_BYTES} AS through_bytes,
-                         1::BIGINT AS position
-                  FROM sandboxes s
-                  WHERE {PAGE_FILTER}
-                    AND (
-                        $9::TIMESTAMPTZ IS NULL
-                        OR (s.created_at, s.id) < ($9::TIMESTAMPTZ, $10::UUID)
-                    )
-                  ORDER BY s.created_at DESC, s.id DESC
-                  LIMIT 1)
-                 UNION ALL
-                 (SELECT next.id, next.created_at, walk.through_bytes + next.row_bytes,
-                         walk.position + 1
-                  FROM page_walk walk
-                  CROSS JOIN LATERAL (
-                      SELECT s.id, s.created_at, {PAGE_ROW_BYTES} AS row_bytes
-                      FROM sandboxes s
-                      WHERE {PAGE_FILTER}
-                        AND (s.created_at, s.id) < (walk.created_at, walk.id)
-                      ORDER BY s.created_at DESC, s.id DESC
-                      LIMIT 1
-                  ) next
-                  WHERE (walk.through_bytes <= $13::BIGINT OR walk.position = 1)
-                    AND walk.position < $11::BIGINT)
-             )
-             {PUBLIC_SANDBOX_SELECT}, walk.position < walk_end.last_position AS has_next
+            "{page_rows}
+             {PUBLIC_SANDBOX_SELECT}, page.has_next
              {PUBLIC_SANDBOX_FROM}
-             JOIN page_walk walk ON walk.id = s.id
-             CROSS JOIN (SELECT max(position) AS last_position FROM page_walk) walk_end
-             WHERE walk.through_bytes <= $13::BIGINT OR walk.position = 1
-             ORDER BY s.created_at DESC, s.id DESC"
+             JOIN page_rows page ON page.id = s.id
+             ORDER BY s.created_at DESC, s.id DESC",
+            page_rows = page_rows_cte(PAGE_NEXT_ROW, &PAGE_WALK_PARAMS),
         ),
     };
     sqlx::AssertSqlSafe(sql!(sql))
