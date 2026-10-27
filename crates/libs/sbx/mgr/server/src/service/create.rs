@@ -902,8 +902,20 @@ impl SandboxManagerService {
         .map_err(|error| activation_cleanup.failure(error))?;
 
         let guest_cid = alloc.slot + 3;
-        let vsock_uds_path = format!("{JAIL_DIR}/firecracker/{id}/root/v.sock");
-        let api_socket_path = format!("{JAIL_DIR}/firecracker/{id}/root/firecracker.sock");
+        let runtime = requested_execution.runtime().kind;
+        let vsock_uds_path = pplx_space_node_runtime_core::control::guest_socket_path(runtime, id)
+            .map_err(|e| activation_cleanup.failure(Status::failed_precondition(e.to_string())))?
+            .display()
+            .to_string();
+        let api_socket_path = pplx_space_node_runtime_core::control::socket_path(
+            runtime,
+            id.parse().map_err(|e| {
+                activation_cleanup.failure(Status::invalid_argument(format!("sandbox id: {e}")))
+            })?,
+        )
+        .map_err(|e| activation_cleanup.failure(Status::failed_precondition(e.to_string())))?
+        .display()
+        .to_string();
 
         // Build minimal VM config for snapshot restore (need network + vsock)
         // Keep Firecracker's block-device defaults. The cache/io-engine variants
@@ -923,6 +935,44 @@ impl SandboxManagerService {
 }}"#,
             alloc.guest_mac, alloc.tap_device, guest_cid
         );
+
+        let vm_config = if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+            let memory_mib = snapshot_memory_mib
+                .and_then(|mib| std::num::NonZeroU64::new(u64::from(mib)))
+                .ok_or_else(|| {
+                    activation_cleanup.failure(Status::failed_precondition(
+                        "CH restore requires a nonempty memory artifact",
+                    ))
+                })?;
+            let cpus = cpu_budget.ok_or_else(|| {
+                activation_cleanup.failure(Status::failed_precondition(
+                    "CH restore requires persisted CPU shape",
+                ))
+            })?;
+            let builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
+            pplx_space_node_runtime_core::boot::configuration(
+                runtime,
+                &pplx_space_node_runtime_core::boot::LinuxBoot {
+                    guest: requested_execution.guest(),
+                    cpus,
+                    memory_mib,
+                    guest_cid: std::num::NonZeroU32::new(guest_cid).ok_or_else(|| {
+                        activation_cleanup.failure(Status::internal("invalid guest CID"))
+                    })?,
+                    tap: &alloc.tap_device,
+                    mac: &alloc.guest_mac,
+                    disk_rate: self.rootfs_rate_limiter(builder, sandbox.disk_io_limits),
+                    network_rate: (!builder).then_some(super::start::NET_RATE_LIMITER),
+                    balloon: None,
+                    huge_pages: self.config.hugepages,
+                    console: false,
+                    builder,
+                },
+            )
+            .map_err(|e| activation_cleanup.failure(Status::failed_precondition(e.to_string())))?
+        } else {
+            vm_config
+        };
 
         // Prepare sandbox after slot allocation so node-manager can derive and
         // enforce the slot UID. If this sandbox was only logically created,

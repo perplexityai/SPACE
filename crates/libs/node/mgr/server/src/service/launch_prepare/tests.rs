@@ -832,75 +832,78 @@ fn retained_instance_repair_grants_traversal_without_write_and_preserves_files()
 
 #[test]
 fn protected_launch_admission_preserves_binding_and_restore_rules() {
-    use super::ExecutionSourceIntegrity::{FsVerity, Legacy};
+    use super::ExecutionSourceIntegrity::{CatalogSha256, FsVerity, UnverifiedExternal};
     let reference =
         pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
             .unwrap()
             .definition()
             .unwrap()
             .reference();
-    // Outcome: None is deliberate legacy admission; Some is a protected request.
-    for (runtime, environment, requested, restore, components, expected) in [
-        (
-            FsVerity,
-            Some(reference),
-            Some(reference),
-            false,
-            vec![FsVerity],
-            Ok(Some(reference)),
-        ),
-        (
-            FsVerity,
-            Some(reference),
-            None,
-            false,
-            vec![FsVerity],
-            Ok(Some(reference)),
-        ),
-        (
-            FsVerity,
-            Some(reference),
-            Some(reference),
-            false,
-            vec![FsVerity, Legacy],
-            Err(tonic::Code::FailedPrecondition),
-        ),
-        (
-            FsVerity,
-            Some(reference),
-            Some(reference),
-            true,
-            vec![Legacy],
-            Ok(Some(reference)),
-        ),
-        (
-            FsVerity,
-            None,
-            Some(reference),
-            false,
-            vec![FsVerity],
-            Err(tonic::Code::FailedPrecondition),
-        ),
-        (FsVerity, None, None, false, vec![Legacy], Ok(None)),
-        (
-            Legacy,
-            Some(reference),
-            Some(reference),
-            false,
-            vec![Legacy],
-            Ok(None),
-        ),
+    for kind in [RuntimeKind::Firecracker, RuntimeKind::CloudHypervisor] {
+        for runtime in [UnverifiedExternal, CatalogSha256, FsVerity] {
+            for component in [UnverifiedExternal, CatalogSha256, FsVerity] {
+                for restore in [false, true] {
+                    let expected = match (kind, runtime, component, restore) {
+                        (_, UnverifiedExternal, _, _)
+                        | (RuntimeKind::Firecracker, CatalogSha256, _, _) => Ok(None),
+                        (RuntimeKind::Firecracker, _, _, true) => Ok(Some(reference)),
+                        (_, _, UnverifiedExternal, _)
+                        | (RuntimeKind::Firecracker, FsVerity, CatalogSha256, false) => {
+                            Err(tonic::Code::FailedPrecondition)
+                        }
+                        _ => Ok(Some(reference)),
+                    };
+                    assert_eq!(
+                        super::protected_launch_environment(
+                            kind,
+                            runtime,
+                            Some(reference),
+                            Some(reference),
+                            restore,
+                            [component]
+                        )
+                        .map_err(|e| e.code()),
+                        expected,
+                        "{kind:?} {runtime:?} {component:?} restore={restore}",
+                    );
+                }
+            }
+        }
+    }
+    for (kind, integrity) in [
+        (RuntimeKind::Firecracker, FsVerity),
+        (RuntimeKind::CloudHypervisor, FsVerity),
+        (RuntimeKind::CloudHypervisor, CatalogSha256),
     ] {
         assert_eq!(
             super::protected_launch_environment(
-                runtime,
-                environment,
-                requested,
-                restore,
-                components
+                kind,
+                integrity,
+                None,
+                Some(reference),
+                false,
+                [integrity]
             )
-            .map_err(|error| error.code()),
-            expected
+            .unwrap_err()
+            .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            super::protected_launch_environment(kind, integrity, None, None, false, [integrity])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            super::protected_launch_environment(
+                kind,
+                integrity,
+                Some(reference),
+                None,
+                false,
+                [integrity]
+            )
+            .unwrap(),
+            Some(reference)
         );
     }
 }

@@ -165,3 +165,48 @@ fn memory_state_support_follows_complete_environment_identity() {
         assert_eq!(super::requires_cold_creation(&execution), cold_only);
     }
 }
+
+#[test]
+fn automatic_lifecycle_admission_respects_runtime_capabilities() {
+    use pplx_space_common_core::types::{
+        AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, RuntimeKind,
+    };
+    for action in [
+        AutoLifecycleIdleAction::None,
+        AutoLifecycleIdleAction::Pause,
+        AutoLifecycleIdleAction::Suspend,
+        AutoLifecycleIdleAction::Stop,
+        AutoLifecycleIdleAction::Delete,
+    ] {
+        let policy = AutoLifecyclePolicy {
+            stages: vec![AutoLifecycleStage {
+                condition_set:
+                    pplx_space_common_core::types::AutoLifecycleConditionSetId::AccessIdle,
+                at: 60,
+                action,
+            }],
+            ..AutoLifecyclePolicy::disabled()
+        };
+        super::validate_runtime_lifecycle_policy(RuntimeKind::Firecracker, &policy).unwrap();
+        super::validate_runtime_lifecycle_policy(RuntimeKind::CloudHypervisor, &policy).unwrap();
+        for entry in pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+            pplx_space_common_core::types::Arch::X86_64,
+        )
+        .unwrap()
+        {
+            let execution = entry.definition().execution_requirements().unwrap();
+            let result = super::validate_execution_lifecycle_policy(Some(&execution), &policy);
+            assert_eq!(
+                result.is_ok(),
+                action != AutoLifecycleIdleAction::Suspend || entry.supports_memory_state()
+            );
+        }
+        let result = super::validate_runtime_lifecycle_policy(RuntimeKind::Gvisor, &policy);
+        match action {
+            AutoLifecycleIdleAction::Pause | AutoLifecycleIdleAction::Suspend => {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            }
+            _ => result.unwrap(),
+        }
+    }
+}

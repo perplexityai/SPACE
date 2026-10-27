@@ -167,6 +167,7 @@ fn quarantine_recovery_no_progress_reason(
         crate::snapshot_restore::RestoreError::CanonicalRootConflict { .. }
         | crate::snapshot_restore::RestoreError::ParentTemplateLookup { .. }
         | crate::snapshot_restore::RestoreError::BtrfsReceive { .. }
+        | crate::snapshot_restore::RestoreError::ReplaceInstance { .. }
         | crate::snapshot_restore::RestoreError::Other(..) => {
             crate::db::QuarantineRecoveryNoProgressReason::OrphanRestoreDeferred
         }
@@ -470,7 +471,7 @@ impl SandboxManagerService {
             Ok(VmState::Paused) => crate::db::PauseFailedRecoveryTarget::Paused,
             Ok(VmState::NotStarted | VmState::Shutdown) => {
                 return self
-                    .quarantine_interrupted_pause(row, "Firecracker reported NotStarted")
+                    .quarantine_interrupted_pause(row, "runtime reported not started or shut down")
                     .await;
             }
             Err(error) => {

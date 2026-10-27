@@ -591,6 +591,7 @@ impl NodeManagerService {
                 format!("{RUN_DIR}/{sandbox_id}"),
                 format!("{CACHE_DIR}/{sandbox_id}"),
                 format!("{JAIL_DIR}/firecracker/{sandbox_id}"),
+                format!("{JAIL_DIR}/cloud-hypervisor/{sandbox_id}"),
                 format!("/sys/fs/cgroup/space/sbx-{sandbox_id}"),
                 format!("/sys/fs/cgroup/space/{sandbox_id}"),
             ] {
@@ -784,7 +785,14 @@ impl NodeManagerService {
         };
 
         let run_dir = format!("{RUN_DIR}/{sandbox_id}");
-        let jail_root = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root");
+        let runtime = super::runtime_control::recorded_execution_blocking(sandbox_id)?.map_or(
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            |execution| execution.runtime().kind,
+        );
+        let jail_root = pplx_space_node_runtime_core::control::isolation_root(runtime, sandbox_id)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .display()
+            .to_string();
 
         let slot_allocated = {
             self.pool
@@ -866,7 +874,8 @@ impl NodeManagerService {
             run_dir_exists: std::path::Path::new(&run_dir).exists(),
             isolation_root_exists: std::path::Path::new(&jail_root).exists(),
             vm_config_exists: std::path::Path::new(&format!("{run_dir}/vm-config.json")).exists(),
-            runtime_log_exists: std::path::Path::new(&format!("{jail_root}/fc.log")).exists()
+            runtime_log_exists: std::path::Path::new(&format!("{jail_root}/console.log")).exists()
+                || std::path::Path::new(&format!("{jail_root}/fc.log")).exists()
                 || std::path::Path::new(&format!("{run_dir}/fc.log")).exists(),
             vsock_sock_exists: std::path::Path::new(&format!("{jail_root}/v.sock")).exists(),
             spaced_sock_exists: std::path::Path::new(&format!("{run_dir}/spaced-host.sock"))

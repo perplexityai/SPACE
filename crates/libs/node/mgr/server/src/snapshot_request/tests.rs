@@ -32,7 +32,7 @@ fn capture_and_restore_preserve_storage_and_execution_ownership() {
         } else {
             artifacts("/vmstate".into(), "/memory".into())
         };
-        let capture = FirecrackerCapture::try_from(CaptureVmStateRequest {
+        let capture = StateCapture::try_from(CaptureVmStateRequest {
             sandbox_id: id.into(),
             environment_reference: Some(reference.into()),
             artifacts: files.clone(),
@@ -40,7 +40,7 @@ fn capture_and_restore_preserve_storage_and_execution_ownership() {
             execution_fence: Some(fence.clone()),
         })
         .unwrap();
-        let restore = FirecrackerRestore::try_from(RestoreVmStateRequest {
+        let restore = StateRestore::try_from(RestoreVmStateRequest {
             sandbox_id: id.into(),
             artifacts: files,
             storage: Some(storage),
@@ -94,13 +94,13 @@ fn state_profile_rejects_partial_duplicate_and_foreign_artifact_sets() {
             })
             .collect();
         assert!(matches!(
-            firecracker_files(artifacts),
+            memory_state_files(artifacts),
             Err(StateContractError::Missing(_)
                 | StateContractError::Duplicate(_)
                 | StateContractError::Unknown(_))
         ));
     }
-    let files = firecracker_files(vec![
+    let files = memory_state_files(vec![
         VmStateArtifact {
             name: "memory".into(),
             relative_path: "guest-memory".into(),
@@ -126,7 +126,7 @@ fn capture_validates_optional_environment_without_relocating_identity() {
         ("deadbeef", Some(reference), false),
         ("deadbeef", None, false),
     ] {
-        let result = FirecrackerCapture::try_from(CaptureVmStateRequest {
+        let result = StateCapture::try_from(CaptureVmStateRequest {
             sandbox_id: sandbox_id.into(),
             environment_reference: reference.map(str::to_owned),
             execution_fence: Some(ExecutionFence {
@@ -174,12 +174,12 @@ pub(crate) fn artifacts(state: String, memory: String) -> Vec<VmStateArtifact> {
 #[test]
 fn missing_execution_fences_are_refused_at_the_snapshot_boundary() {
     let id = "018e390d-4dd8-7000-8000-000000000001";
-    let capture = FirecrackerCapture::try_from(CaptureVmStateRequest {
+    let capture = StateCapture::try_from(CaptureVmStateRequest {
         sandbox_id: id.into(),
         artifacts: artifacts("vmstate".into(), "memory".into()),
         ..Default::default()
     });
-    let restore = FirecrackerRestore::try_from(RestoreVmStateRequest {
+    let restore = StateRestore::try_from(RestoreVmStateRequest {
         sandbox_id: id.into(),
         artifacts: artifacts("vmstate".into(), "memory".into()),
         ..Default::default()

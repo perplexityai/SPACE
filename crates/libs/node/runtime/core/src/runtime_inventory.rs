@@ -91,7 +91,11 @@ pub struct RuntimeInstallationFiles {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionSourceIntegrity {
-    Legacy,
+    /// Discovered without authentication against the compiled catalog.
+    UnverifiedExternal,
+    /// Verified at discovery; protected consumers must hash their opened file again.
+    CatalogSha256,
+    /// Sealed against the catalog measurement; consumers measure the opened file.
     FsVerity,
 }
 
@@ -99,7 +103,7 @@ impl RuntimeInstallationFiles {
     fn new(files: impl IntoIterator<Item = (RuntimeFileRole, PathBuf)>) -> Self {
         Self {
             files: files.into_iter().collect(),
-            integrity: ExecutionSourceIntegrity::Legacy,
+            integrity: ExecutionSourceIntegrity::UnverifiedExternal,
         }
     }
 
@@ -565,6 +569,7 @@ impl std::fmt::Display for ComponentDefaultSelection {
 }
 
 trait RuntimeDriver: Send + Sync {
+    fn restore_requires_boot_components(&self) -> bool;
     fn kind(&self) -> RuntimeKind;
     #[cfg(any(feature = "artifact-store", test))]
     fn inspect_installation(
@@ -704,6 +709,9 @@ impl FirecrackerDriver {
 }
 
 impl RuntimeDriver for FirecrackerDriver {
+    fn restore_requires_boot_components(&self) -> bool {
+        false
+    }
     #[cfg(any(feature = "artifact-store", test))]
     fn inspect_installation(
         &self,
@@ -1134,11 +1142,14 @@ impl RuntimeInventory {
             ),
             None => &self.runtimes,
         };
-        // A snapshot already contains the running guest kernel. Its recorded
-        // identity remains provenance, not a dependency on a boot image file.
-        let restoring = mode == ExecutionSelectionMode::PersistedStateRestore;
+        let driver = DRIVERS.get(runtime)?;
+        // Firecracker restores from RAM without reopening its kernel. CH also
+        // validates the saved boot configuration and installs Landlock rules
+        // for its payload, so its restore needs the authenticated boot files.
+        let omit_boot_components = mode == ExecutionSelectionMode::PersistedStateRestore
+            && !driver.restore_requires_boot_components();
         let components = match binding {
-            Some(environment) if !restoring => environment
+            Some(environment) if !omit_boot_components => environment
                 .components
                 .as_ref()
                 .map_err(|error| RuntimeInventoryError::UnavailableBinding(error.clone()))?
@@ -1155,7 +1166,6 @@ impl RuntimeInventory {
                 .iter()
                 .find(|installation| &installation.runtime == identity)
         };
-        let driver = DRIVERS.get(runtime)?;
         if requested.is_none() && mode != ExecutionSelectionMode::NewColdBoot {
             return Err(RuntimeInventoryError::MissingRequestedExecution(mode));
         }
@@ -1212,7 +1222,7 @@ impl RuntimeInventory {
         let mut selected_components = Vec::new();
         if let Some(requested) = requested {
             for component in requested.components() {
-                if restoring && component.kind == ArtifactComponentKind::Kernel {
+                if omit_boot_components && component.kind == ArtifactComponentKind::Kernel {
                     resolved_components.push(component.clone());
                     continue;
                 }
@@ -1225,7 +1235,7 @@ impl RuntimeInventory {
                 resolved_components.push(installed.metadata.clone());
             }
         }
-        if !restoring {
+        if !omit_boot_components {
             let boot_role = boot_component_role();
             let requested_kernel = requested.and_then(|metadata| {
                 metadata.component(ArtifactComponentKind::Kernel, Some(&boot_role))
@@ -1282,7 +1292,7 @@ impl RuntimeInventory {
                     // Restore does not consume boot inputs. Authenticate the
                     // initial runtime independently without inventing kernel
                     // provenance in the returned ExecutionMetadata.
-                    restoring && definition.check_runtime(&execution).is_ok()
+                    omit_boot_components && definition.check_runtime(&execution).is_ok()
                 })
                 .map(|definition| definition.reference())
         };
@@ -1402,7 +1412,7 @@ fn kernel_installation(
         path,
         default_for_new,
         legacy_default,
-        integrity: ExecutionSourceIntegrity::Legacy,
+        integrity: ExecutionSourceIntegrity::UnverifiedExternal,
     }
 }
 

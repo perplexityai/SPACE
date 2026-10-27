@@ -301,6 +301,7 @@ impl SandboxManagerService {
                 .filter(|value| !value.is_empty());
             let auto_lifecycle =
                 self.resolve_create_auto_lifecycle_policy(req, &resolved_template, pool_template)?;
+            super::validation::validate_runtime_lifecycle_policy(resolved_template.execution.runtime().kind, &auto_lifecycle)?;
             let auto_lifecycle_authority = if req.auto_lifecycle.is_some() {
                 crate::db::PolicyAuthority::try_from(req.auto_lifecycle_authority)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?
@@ -310,6 +311,7 @@ impl SandboxManagerService {
 
             // Pool path: adopt a paused pool sandbox
             if matches!(intent, SandboxCreateIntent::AdoptPool) {
+                super::validation::validate_execution_lifecycle_policy(Some(&resolved_template.execution), &auto_lifecycle)?;
                 let adopt_req = internal_request(pool_adoption_request(
                     req,
                     template.clone(),
@@ -443,6 +445,7 @@ impl SandboxManagerService {
                                     existing.id, existing.state
                                 )));
                             }
+                            super::validation::validate_execution_lifecycle_policy(existing.execution_metadata.as_ref(), &auto_lifecycle)?;
                             if existing.auto_lifecycle != auto_lifecycle {
                                 update_existing_sandbox_create_auto_lifecycle(
                                     &db,
@@ -501,6 +504,8 @@ impl SandboxManagerService {
                     pplx_space_node_mgr_client::proto::ExecutionEnvironmentSelection::ColdBoot,
                 ).await?;
             }
+
+            super::validation::validate_execution_lifecycle_policy(Some(&resolved_template.execution), &auto_lifecycle)?;
 
             self.create_with_id(CreateWithIdArgs {
                 req,

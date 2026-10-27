@@ -48,7 +48,7 @@ use super::validation::{
     reject_incompatible_template_spaced_compatibility,
 };
 use super::{
-    CACHE_DIR, DEFAULT_BLOCKING_READY_TIMEOUT_SECS, JAIL_DIR, RUN_DIR, RouteStreamEpochIdentity,
+    CACHE_DIR, DEFAULT_BLOCKING_READY_TIMEOUT_SECS, RUN_DIR, RouteStreamEpochIdentity,
     SandboxManagerService,
 };
 use crate::{
@@ -1794,6 +1794,17 @@ impl SandboxManagerService {
                 .await?;
         }
         let sandbox = start_lookup.sandbox;
+        if let Some(policy) = &start_ctx.activation_auto_lifecycle {
+            let runtime = sandbox
+                .runtime
+                .parse()
+                .map_err(|e| Status::failed_precondition(format!("runtime: {e}")))?;
+            super::validation::validate_runtime_lifecycle_policy(runtime, policy)?;
+            super::validation::validate_execution_lifecycle_policy(
+                sandbox.execution_metadata.as_ref(),
+                policy,
+            )?;
+        }
         let restore_cleanup_id = if checkpoint == SUSPEND_CHECKPOINT {
             self.checkpoint_restore_cleanup_episode_id(&sandbox)?
         } else {
@@ -2242,7 +2253,15 @@ impl SandboxManagerService {
         // Host-visible paths
         let run_dir = format!("{RUN_DIR}/{id}");
         let log_path = format!("{run_dir}/fc.log");
-        let vsock_uds_path = format!("{JAIL_DIR}/firecracker/{id}/root/v.sock");
+        let vsock_uds_path = pplx_space_node_runtime_core::control::guest_socket_path(
+            prepare_source.execution.runtime().kind,
+            id,
+        )
+        .map_err(|error| {
+            activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+        })?
+        .display()
+        .to_string();
 
         // Node-manager prepares filesystem after slot allocation so UID/GID
         // ownership is derived from the allocated slot. If Create only recorded
@@ -2792,7 +2811,7 @@ pub(super) fn drive_rate_limit_proto(
 
 /// Each direction of a sandbox's network interface: 50 MiB/s and 10000
 /// packets/s, refilled every second.
-const NET_RATE_LIMITER: RateLimiter = RateLimiter {
+pub(super) const NET_RATE_LIMITER: RateLimiter = RateLimiter {
     bandwidth: TokenBucket {
         size: 52_428_800,
         refill_time_ms: 1000,
