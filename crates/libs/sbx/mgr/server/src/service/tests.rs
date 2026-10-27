@@ -20275,6 +20275,7 @@ pub(crate) mod service_tests {
             pool_template: None,
             volume_encryption: false,
             auto_lifecycle: &requested_policy,
+            environment: None,
         };
 
         assert!(
@@ -20327,6 +20328,7 @@ pub(crate) mod service_tests {
             pool_template: None,
             volume_encryption: false,
             auto_lifecycle: &policy,
+            environment: None,
         };
 
         assert!(
@@ -20362,6 +20364,7 @@ pub(crate) mod service_tests {
             pool_template: Some("other-pool"),
             volume_encryption: true,
             auto_lifecycle: &policy,
+            environment: None,
         };
 
         assert_eq!(
@@ -20399,6 +20402,7 @@ pub(crate) mod service_tests {
             pool_template: None,
             volume_encryption: false,
             auto_lifecycle: &requested_policy,
+            environment: None,
         };
 
         assert!(requested_sandbox_create_mismatches(&existing, &requested).is_empty());

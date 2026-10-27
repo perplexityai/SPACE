@@ -12,19 +12,19 @@ use pplx_space_node_mgr_client::proto::{NetworkPoolStatusRequest, NetworkPoolSta
 use pplx_space_template_mgr_client::proto::{GetTemplateRequest, GetTemplateResponse, TemplateRef};
 use std::collections::HashMap;
 
-const TEMPLATE: &str = "seed";
-const BUILD: &str = "sha256:create-after-lookup";
-const OWNER: &str = "root@local";
+pub(super) const TEMPLATE: &str = "seed";
+pub(super) const BUILD: &str = "sha256:create-after-lookup";
+pub(super) const OWNER: &str = "root@local";
 /// Prefix of the insert fence's refusal; the rest is the refused row as JSON.
 const FENCE: &str = "create fence refused row: ";
 /// Bounds every create on real time, including the node-manager calls it
 /// makes, so a regression that waits on node-manager fails instead of hanging.
-const CREATE_WAIT: Duration = Duration::from_secs(30);
+pub(super) const CREATE_WAIT: Duration = Duration::from_secs(30);
 
 /// Run the test in a child process without the feature-flag provider
 /// settings, so service construction cannot start a provider. Call before
 /// constructing any service; return when false.
-fn enter_isolated_test_process() -> bool {
+pub(super) fn enter_isolated_test_process() -> bool {
     crate::service::tests::enter_route_test_process(&[
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
@@ -83,12 +83,12 @@ fn fenced_row(error: &Status) -> FencedRow {
 
 /// A template build in a test-owned directory, built for this node with a
 /// supported spaced guest.
-struct TemplateBuild {
-    dir: tempfile::TempDir,
+pub(super) struct TemplateBuild {
+    pub(super) dir: tempfile::TempDir,
 }
 
 impl TemplateBuild {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("metadata.json"),
@@ -103,7 +103,7 @@ impl TemplateBuild {
         Self { dir }
     }
 
-    fn response(&self, build: &str) -> GetTemplateResponse {
+    pub(super) fn response(&self, build: &str) -> GetTemplateResponse {
         GetTemplateResponse {
             template: Some(TemplateRef {
                 name: TEMPLATE.into(),
@@ -120,7 +120,7 @@ impl TemplateBuild {
     }
 
     /// A resolver answering every lookup with this template at build `build`.
-    fn resolver(&self, build: &str) -> Arc<FakeTemplateResolver> {
+    pub(super) fn resolver(&self, build: &str) -> Arc<FakeTemplateResolver> {
         let response = self.response(build);
         Arc::new(FakeTemplateResolver::new(move || {
             let mut response = tonic::Response::new(response.clone());
@@ -152,16 +152,16 @@ fn access_idle_suspend_policy() -> AutoLifecyclePolicy {
     .normalized()
 }
 
-struct Fixture {
-    service: SandboxManagerService,
-    templates: Arc<FakeTemplateResolver>,
-    node_manager: ServedNodeManager,
+pub(super) struct Fixture {
+    pub(super) service: SandboxManagerService,
+    pub(super) templates: Arc<FakeTemplateResolver>,
+    pub(super) node_manager: ServedNodeManager,
 }
 
 impl Fixture {
     /// A service over `conn`, with the insert fence installed, whose template
     /// lookups go to `templates` and whose node-manager is `node_manager`.
-    fn new(
+    pub(super) fn new(
         conn: crate::db::Connection,
         templates: Arc<FakeTemplateResolver>,
         node_manager: FakeNodeManager,
@@ -183,7 +183,7 @@ impl Fixture {
         }
     }
 
-    async fn create(&self, request: CreateRequest) -> Result<CreateResponse, Status> {
+    pub(super) async fn create(&self, request: CreateRequest) -> Result<CreateResponse, Status> {
         let mut request = Request::new(request);
         request
             .extensions_mut()
@@ -194,11 +194,11 @@ impl Fixture {
             .map(Response::into_inner)
     }
 
-    fn row(&self, id: &str) -> Option<crate::db::SandboxRow> {
+    pub(super) fn row(&self, id: &str) -> Option<crate::db::SandboxRow> {
         crate::db::get_sandbox(&self.service.db_conn().unwrap(), id).unwrap()
     }
 
-    fn row_count(&self) -> i64 {
+    pub(super) fn row_count(&self) -> i64 {
         self.service
             .db_conn()
             .unwrap()
@@ -225,7 +225,7 @@ impl Fixture {
     }
 }
 
-fn create_request() -> CreateRequest {
+pub(super) fn create_request() -> CreateRequest {
     CreateRequest {
         template: TEMPLATE.into(),
         owner: OWNER.into(),
@@ -237,7 +237,7 @@ fn create_request() -> CreateRequest {
 
 /// Insert a row the way create writes one, with [`row_env`], before the fence
 /// is installed.
-fn insert_created_row(
+pub(super) fn insert_created_row(
     conn: &crate::db::Connection,
     id: &str,
     state: SandboxState,
@@ -443,7 +443,7 @@ async fn autostart_create_checks_ready_network_slots_before_the_row_insert() {
 }
 
 /// A paused pool donor at `build`, as the pool leaves it for adoption.
-fn insert_pool_donor(conn: &crate::db::Connection, build: &str) -> String {
+pub(super) fn insert_pool_donor(conn: &crate::db::Connection, build: &str) -> String {
     let donor = SandboxId::new();
     let id = donor.to_string();
     insert_created_row(
@@ -523,18 +523,18 @@ async fn pool_create_never_adopts_a_donor_of_another_build() {
     let fixture = Fixture::new(conn, build.resolver(BUILD), FakeNodeManager::default());
     let before = fixture.row(&donor).unwrap();
 
-    // Adoption selects donors by the resolved build. What create does next
-    // when the pool holds only stale donors is not pinned here: it refuses
-    // with ResourceExhausted, while the documented contract falls through to
-    // a base-snapshot or cold create, which the insert fence would refuse.
-    let result = fixture
+    // Adoption selects donors by the resolved build. A pool holding only stale
+    // donors is skipped like any other ineligible one: create falls through to
+    // a cold create, which the insert fence refuses with the row it attempted.
+    let error = fixture
         .create(CreateRequest {
             boot_mode: BootMode::Pool as i32,
             ..create_request()
         })
-        .await;
+        .await
+        .unwrap_err();
 
-    assert!(result.is_err(), "{result:?}");
+    assert_eq!(fenced_row(&error).template_hash.as_deref(), Some(BUILD));
     let after = fixture.row(&donor).unwrap();
     assert_eq!(after.state, before.state);
     assert_eq!(after.user, before.user);
@@ -689,11 +689,21 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
         |r| r.snapshots_enabled = true,
         |r| r.boot_mode = BootMode::BaseSnapshot as i32,
     ] {
+        // First, on every path, a node that doesn't execute the selected
+        // environment refuses it before the template lookup or any row. The
+        // legacy base evidence check follows below, with a node that admits.
         let build = TemplateBuild::new();
         let fixture = Fixture::new(
             crate::db::test_conn(),
             build.resolver(BUILD),
-            FakeNodeManager::default(),
+            FakeNodeManager::default().unary(
+                "ResolveExecutionEnvironment",
+                |_: ResolveExecutionEnvironmentRequest| -> Result<ResolveExecutionEnvironmentResponse, Status> {
+                    Err(Status::failed_precondition(
+                        "execution environment is not allowed on this node",
+                    ))
+                },
+            ),
         );
         let mut request = create_request();
         request.boot_mode = BootMode::Cold as i32;
@@ -704,13 +714,17 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
             ),
         );
         mutate(&mut request);
+        // A selected pool member is refused from the request alone.
+        let pool_member = request.pool_template.is_some();
         let error = fixture.create(request).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            !fixture
-                .node_manager
-                .calls()
-                .contains(&"ResolveExecutionEnvironment".into())
+        assert_eq!(
+            fixture.node_manager.calls(),
+            if pool_member {
+                Vec::<String>::new()
+            } else {
+                vec!["ResolveExecutionEnvironment".to_owned()]
+            }
         );
         assert!(fixture.templates.requests().is_empty());
         assert_eq!(fixture.row_count(), 0);

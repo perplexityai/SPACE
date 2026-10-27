@@ -1638,7 +1638,7 @@ impl SandboxManagerService {
             "start_execution_path",
             SandboxStartExecutionPath::WarmSnapshot.as_str(),
         );
-        let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
+        let sandbox_dir = self.cache_root().join(&sandbox.id);
         let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
         let vmstate_path = snapshot_dir.join("vmstate");
 
@@ -1676,6 +1676,27 @@ impl SandboxManagerService {
             {
                 return Err(Status::failed_precondition(format!(
                     "no base snapshot for template '{}' (need vmstate.base + snapshot.base)",
+                    sandbox.template
+                )));
+            }
+            // Restore selects its consumer from the snapshot's producer, so a
+            // snapshot captured under another binding would move the sandbox.
+            // Rows that predate saved bindings ran the initial environment.
+            let legacy;
+            let execution = match sandbox.execution_metadata.as_ref() {
+                Some(execution) => execution,
+                None => {
+                    legacy = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+                        super::tail_support::host_architecture()
+                            .map_err(|error| Status::failed_precondition(error.to_string()))?,
+                        vec![],
+                    );
+                    &legacy
+                }
+            };
+            if !super::validation::base_snapshot_matches_execution(&snap_dir, execution) {
+                return Err(Status::failed_precondition(format!(
+                    "base snapshot for template '{}' was captured under another execution environment; start cold instead",
                     sandbox.template
                 )));
             }

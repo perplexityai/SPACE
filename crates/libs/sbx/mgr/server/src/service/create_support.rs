@@ -47,6 +47,9 @@ pub(super) struct RequestedSandboxCreateSpec<'a> {
     pub(super) pool_template: Option<&'a str>,
     pub(super) volume_encryption: bool,
     pub(super) auto_lifecycle: &'a AutoLifecyclePolicy,
+    /// An explicit selection must match the row's saved binding. An
+    /// unselected retry keeps the row's own binding.
+    pub(super) environment: Option<pplx_space_common_core::types::EnvironmentReference>,
 }
 
 pub(super) struct CreateWithIdArgs<'a> {
@@ -125,7 +128,7 @@ impl SandboxManagerService {
         req: &CreateRequest,
         requested_mode: BootMode,
         requested_id: Option<Uuid>,
-        snapshot_dir: Option<&str>,
+        target: CreateTarget<'_>,
     ) -> Result<(BootMode, SandboxCreateIntent), Status> {
         if req.rootfs_size_mb.is_some() && requested_mode == BootMode::BaseSnapshot {
             return Err(Status::invalid_argument(
@@ -135,8 +138,12 @@ impl SandboxManagerService {
         // Pool is an optimization: donor identity and immutable resources cannot
         // change at adoption. Skip ineligible donors before testing occupancy so
         // valid caller intent follows the same fallback whether the pool is full
-        // or empty. A rootfs resize additionally requires a cold create.
-        let eligible_mode = if req.rootfs_size_mb.is_some() {
+        // or empty. A rootfs resize additionally requires a cold create. An
+        // explicit environment selection never falls back, while a warm start
+        // restores through whichever loader the node selects for the snapshot,
+        // and donors are matched by build rather than binding; so a selected
+        // create always boots cold.
+        let eligible_mode = if req.rootfs_size_mb.is_some() || target.selected {
             BootMode::Cold
         } else if requested_mode == BootMode::Pool
             && (requested_id.is_some()
@@ -153,7 +160,12 @@ impl SandboxManagerService {
         } else {
             requested_mode
         };
-        let effective_mode = self.resolve_boot_mode(eligible_mode, &req.template, snapshot_dir)?;
+        let effective_mode = self.resolve_boot_mode(
+            eligible_mode,
+            &req.template,
+            target.snapshot_dir,
+            target.execution,
+        )?;
         let intent = if effective_mode == BootMode::Pool {
             SandboxCreateIntent::AdoptPool
         } else {
@@ -161,6 +173,15 @@ impl SandboxManagerService {
         };
         Ok((effective_mode, intent))
     }
+}
+
+/// What a create will run, as far as choosing its boot path depends on it.
+#[derive(Clone, Copy)]
+pub(super) struct CreateTarget<'a> {
+    pub(super) snapshot_dir: Option<&'a str>,
+    pub(super) execution: &'a pplx_space_common_core::types::ExecutionMetadata,
+    /// The request selected its environment explicitly.
+    pub(super) selected: bool,
 }
 
 pub(super) struct RuntimeActivatedEvent<'a> {
@@ -485,6 +506,18 @@ pub(super) fn requested_sandbox_create_mismatches(
     if existing.volume_encryption != requested.volume_encryption {
         mismatches.push("volume_encryption");
     }
+    // Saved bindings can move to a newly selected loader after a failed
+    // restore, so this is the one non-fixed field compared: an explicit
+    // selection never falls back, and reuse must not acknowledge another one.
+    if let Some(environment) = requested.environment
+        && existing
+            .execution_metadata
+            .as_ref()
+            .and_then(|execution| execution.environment())
+            != Some(environment)
+    {
+        mismatches.push("environment");
+    }
     mismatches
 }
 
@@ -740,14 +773,11 @@ pub(super) async fn resolve_template_paths(
     })
 }
 
-/// Stage the exact base snapshot's runtime and allocation evidence together.
-/// Older metadata lacks CPU allocation; the selected snapshot dimensions are
-/// authoritative for that artifact, unlike mutable template boot defaults.
-pub(super) fn stage_base_snapshot_runtime_metadata(
+/// The producer a template base snapshot records. Snapshots predating the
+/// record were captured under the initial environment.
+pub(super) fn read_base_snapshot_execution_metadata(
     source_dir: &std::path::Path,
-    destination_dir: &std::path::Path,
-    snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
-) -> Result<(), Status> {
+) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, Status> {
     use pplx_space_common_core::types::{ExecutionMetadata, SnapshotExecutionMetadata};
 
     let metadata = match std::fs::read(source_dir.join("metadata.json")) {
@@ -776,6 +806,18 @@ pub(super) fn stage_base_snapshot_runtime_metadata(
             )));
         }
     };
+    Ok(metadata)
+}
+
+/// Stage the exact base snapshot's runtime and allocation evidence together.
+/// Older metadata lacks CPU allocation; the selected snapshot dimensions are
+/// authoritative for that artifact, unlike mutable template boot defaults.
+pub(super) fn stage_base_snapshot_runtime_metadata(
+    source_dir: &std::path::Path,
+    destination_dir: &std::path::Path,
+    snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
+) -> Result<(), Status> {
+    let metadata = read_base_snapshot_execution_metadata(source_dir)?;
     // Captured allocation wins; selected dimensions fill only legacy absence.
     let cpu_budget = metadata.cpu_budget().or(snapshot_vcpu);
     let bytes =

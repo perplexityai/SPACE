@@ -109,6 +109,32 @@ impl PoolAdoptionFailure {
     }
 }
 
+/// How many of a build's oldest donors adoption considers. Pools are small,
+/// and a node refuses at most a few distinct bindings among them. Past the
+/// bound a create boots without the pool, which is slower but correct.
+const POOL_DONOR_SCAN_LIMIT: u32 = 32;
+
+/// What the node said about each donor execution this adoption asked about.
+#[derive(Default)]
+struct DonorAdmissions {
+    admitted: Vec<pplx_space_common_core::types::ExecutionMetadata>,
+    refused: Vec<(pplx_space_common_core::types::ExecutionMetadata, Status)>,
+}
+
+/// The donor adoption may claim, or the node's refusal of every one.
+enum DonorChoice {
+    Admitted(Box<crate::db::SandboxRow>),
+    Refused(Status),
+}
+
+/// What adoption did with the donor it claimed.
+pub(super) enum PoolAdoption {
+    Adopted(Box<Response<AdoptPoolSandboxResponse>>),
+    /// No donor could be claimed: the node refused every donor's binding, or
+    /// concurrent adoptions took the rest. None was claimed by this call.
+    NoUsableDonor(Status),
+}
+
 impl From<Status> for PoolAdoptionFailure {
     fn from(status: Status) -> Self {
         Self::rollback(status)
@@ -166,6 +192,69 @@ impl SandboxManagerService {
         &self,
         request: Request<AdoptPoolSandboxRequest>,
     ) -> Result<Response<AdoptPoolSandboxResponse>, Status> {
+        match self.adopt_pool_sandbox_outcome(request).await? {
+            PoolAdoption::Adopted(response) => Ok(*response),
+            // Callers treat an exhausted pool as "boot without it".
+            PoolAdoption::NoUsableDonor(status) => Err(Status::resource_exhausted(format!(
+                "no usable pool sandbox: {}",
+                status.message()
+            ))),
+        }
+    }
+
+    /// The oldest donor whose saved binding the node executes. Each distinct
+    /// binding is asked about once; a warm pool fill restores through
+    /// whichever loader the node selects, so donors of one build can differ.
+    /// Admission comes before the claim, so a refused donor is never touched
+    /// and stays for a node whose policy admits it again. A node refusal
+    /// (`FailedPrecondition`) skips the donor; any other failure to ask, such
+    /// as an unreachable node-manager, is returned as is.
+    async fn first_admitted_donor(
+        &self,
+        candidates: Vec<crate::db::SandboxRow>,
+        admissions: &mut DonorAdmissions,
+    ) -> Result<DonorChoice, Status> {
+        for candidate in candidates {
+            let Some(execution) = candidate.execution_metadata.as_ref() else {
+                return Ok(DonorChoice::Admitted(Box::new(candidate)));
+            };
+            if admissions.admitted.contains(execution) {
+                return Ok(DonorChoice::Admitted(Box::new(candidate)));
+            }
+            if admissions.refused.iter().any(|(seen, _)| seen == execution) {
+                continue;
+            }
+            match self.admit_exact_execution(execution).await {
+                Ok(()) => {
+                    admissions.admitted.push(execution.clone());
+                    return Ok(DonorChoice::Admitted(Box::new(candidate)));
+                }
+                Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                    tracing::info!(
+                        sandbox_id = %candidate.id,
+                        environment = ?execution.environment(),
+                        %status,
+                        "skipping a pool donor the node does not admit"
+                    );
+                    admissions.refused.push((execution.clone(), status));
+                }
+                Err(status) => return Err(status),
+            }
+        }
+        Ok(DonorChoice::Refused(
+            admissions
+                .refused
+                .last()
+                .map(|(_, status)| status.clone())
+                .unwrap_or_else(|| Status::internal("pool donor scan returned no candidates")),
+        ))
+    }
+
+    /// Adoption, telling an unusable pool apart so Create can boot without it.
+    pub(super) async fn adopt_pool_sandbox_outcome(
+        &self,
+        request: Request<AdoptPoolSandboxRequest>,
+    ) -> Result<PoolAdoption, Status> {
         let peer = self.authorize_peer(&request, "AdoptPoolSandbox", ALLOW_SANDBOX_POOL_ADOPT)?;
         let req = request.get_ref();
         let template = &req.template;
@@ -215,27 +304,64 @@ impl SandboxManagerService {
         } else {
             None
         };
-        let candidate = {
-            let db = self.db_conn()?;
-            crate::db::scan::pool_donor(&db, template, req.content_hash.as_deref(), required_user)
+        // Selection is only a hint: the claim rechecks the chosen row under
+        // SQLite. A concurrent adoption can win that row while admission is
+        // awaited, so a lost claim moves on to the next donor; admissions are
+        // remembered, so a retry asks the node nothing new.
+        let mut admissions = DonorAdmissions::default();
+        let mut lost: Vec<String> = Vec::new();
+        let (sandbox, _wake) = loop {
+            let candidates: Vec<_> = {
+                let db = self.db_conn()?;
+                crate::db::scan::pool_donors(
+                    &db,
+                    template,
+                    req.content_hash.as_deref(),
+                    required_user,
+                    POOL_DONOR_SCAN_LIMIT,
+                )
                 .map_err(|e| Status::internal(format!("db error: {e}")))?
+            }
+            .into_iter()
+            .filter(|candidate| !lost.contains(&candidate.id))
+            .collect();
+            if candidates.is_empty() {
+                // None of this build, or every one taken while this call ran:
+                // Create boots without the pool, as for any ineligible donor.
+                return Ok(PoolAdoption::NoUsableDonor(if lost.is_empty() {
+                    Status::resource_exhausted(format!(
+                        "no available pool sandboxes for template '{template}'"
+                    ))
+                } else {
+                    Status::unavailable(
+                        "every pool donor was taken by a concurrent adoption or lifecycle operation",
+                    )
+                }));
+            }
+            let candidate = match self
+                .first_admitted_donor(candidates, &mut admissions)
+                .await?
+            {
+                DonorChoice::Admitted(candidate) => *candidate,
+                DonorChoice::Refused(refused) => return Ok(PoolAdoption::NoUsableDonor(refused)),
+            };
+            // Hold the same canonical fence as cloning through hydration and rollback.
+            match self.claim_pool_donor(
+                &candidate.id,
+                template,
+                req.content_hash.as_deref(),
+                required_user,
+                &sandbox_owner,
+                &process_env,
+            ) {
+                Ok(claimed) => break claimed,
+                Err(status) if status.code() == tonic::Code::Unavailable => {
+                    tracing::info!(sandbox_id = %candidate.id, %status, "pool donor taken concurrently; trying the next");
+                    lost.push(candidate.id);
+                }
+                Err(status) => return Err(status),
+            }
         };
-
-        let candidate = candidate.ok_or_else(|| {
-            Status::resource_exhausted(format!(
-                "no available pool sandboxes for template '{template}'"
-            ))
-        })?;
-        // Hold the same canonical fence as cloning through hydration and rollback.
-        // Selection is only a hint: the claim rechecks this exact row under SQLite.
-        let (sandbox, _wake) = self.claim_pool_donor(
-            &candidate.id,
-            template,
-            req.content_hash.as_deref(),
-            required_user,
-            &sandbox_owner,
-            &process_env,
-        )?;
         let id = sandbox.id.clone();
         let adoption_result: Result<Response<AdoptPoolSandboxResponse>, PoolAdoptionFailure> =
             async {
@@ -391,7 +517,7 @@ impl SandboxManagerService {
             .await;
 
         match adoption_result {
-            Ok(response) => Ok(response),
+            Ok(response) => Ok(PoolAdoption::Adopted(Box::new(response))),
             Err(failure) if failure.retires_donor() => {
                 let error = failure.status;
                 if let Err(retire_error) = self.retire_failed_pool_donor(&id).await {
@@ -723,6 +849,22 @@ impl SandboxManagerService {
             resolved_template.content_hash.as_deref(),
         )?;
 
+        // A clone runs its donor's exact binding, which the serving node must
+        // still execute. The saved binding carries the clone's identity for
+        // activation, retries and upgrades; its first warm start still selects
+        // a consumer from the producer record the clone copies.
+        // Admission reuses the clone's channel, with its own 5 second budget
+        // like connect and capability lookup, since the donor stays fenced.
+        let execution = donor.execution_metadata.as_ref();
+        if let Some(execution) = execution {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                super::environment_selection::admit_exact_with_client(&mut node_client, execution),
+            )
+            .await
+            .map_err(|_| Status::unavailable("pool donor environment admission timed out"))??;
+        }
+
         let cleanup_id = SandboxCleanupEpisodeId::new();
         // Arm disposal before any node resources can be created.
         {
@@ -762,7 +904,7 @@ impl SandboxManagerService {
                 },
                 None,
                 None,
-                None,
+                execution,
             )
             .map_err(|e| Status::internal(format!("db insert: {e}")))?;
         }

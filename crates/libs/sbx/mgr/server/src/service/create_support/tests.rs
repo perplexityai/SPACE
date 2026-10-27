@@ -352,6 +352,11 @@ async fn create_intent_preserves_immutables_independently_of_pool_occupancy() {
             .unwrap();
         }
         let service = SandboxManagerService::for_test(conn);
+        let legacy_execution =
+            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+                pplx_space_common_core::types::Arch::X86_64,
+                vec![],
+            );
         for has_snapshot in [false, true] {
             let snapshot_dir = has_snapshot.then(|| snapshot.path().to_str().unwrap());
             for (field, request, incompatible_with_pool) in &cases {
@@ -370,7 +375,11 @@ async fn create_intent_preserves_immutables_independently_of_pool_occupancy() {
                         &request,
                         requested_mode,
                         requested_id,
-                        snapshot_dir,
+                        CreateTarget {
+                            snapshot_dir,
+                            execution: &legacy_execution,
+                            selected: false,
+                        },
                     );
                     let context = format!(
                         "{field}: {requested_mode:?}, pool={populated_pool}, snapshot={has_snapshot}"

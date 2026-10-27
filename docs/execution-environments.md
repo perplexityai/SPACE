@@ -683,7 +683,20 @@ therefore does not upgrade a usable source or contaminate an exact benchmark arm
 Explicit requests never fall back. Existing sandbox stop/start retains its saved
 consumer. After a failed restore that saved consumer may be the newly selected
 loader; its kernel identity is unchanged and cold admission rechecks policy.
-Cluster-directed work and pools still require their placement-bound identities.
+Unselected cluster-directed work, new pool members and warm creates persist the
+template's exact binding instead. A warm start restores through a consumer that the node
+selects from the base snapshot's producer, so it can differ from that binding,
+and Start refuses a base snapshot recorded under another environment, or one
+without provenance for a non-default binding. Pool
+adoption and clones keep the donor's own binding. Adoption passes over a donor
+whose binding the node refuses, leaving it in the pool, and takes the next one
+it admits, looking at a build's oldest 32 donors; with none, or when concurrent
+adoptions take the rest, Create boots without the pool. A clone also carries its
+donor's snapshot producer record (`snapshot/runtime.json`), so its first warm
+start restores through a consumer selected from the donor's producer, not the
+initial environment. Before Create persists such a
+sandbox or adopts a pool donor, and before a clone, the serving node must
+resolve that non-default binding exactly.
 
 Retained instance directories grant sandbox-manager traversal without group write.
 Normal Start repairs old traversal permissions through node-manager before choosing
@@ -724,9 +737,22 @@ filesystem repair without discarding the retained disk or rewriting its binding.
 Unbound derived builds and custom kernel recipes retain their legacy contracts
 while the default-enabled `legacy` permission remains present.
 Every resolved build, including E0, sends its exact selected environment to Create
-so inventory changes cannot cause reselection. Local selected creation remains
-cold-only, without pool adoption, snapshots or cluster-owned identities; later
-snapshot and suspend operations independently check memory-state qualification.
+so inventory changes cannot cause reselection. Selected and non-default bindings
+may use cluster-owned identities and snapshots at create; non-default bindings
+may also fill and adopt pools and boot from base snapshots. Paths that capture or load
+memory require a binding qualified for memory state. A non-default base snapshot
+boots warm only under the environment that captured it; otherwise Create boots
+cold. Pool donors are matched by build rather than by binding, so every member
+of a build is created with the build's own binding: selected Create can't create pool
+members, and a pool clone saves its donor's binding. Selected Create always
+boots cold: it never adopts a donor, and it never boots from a base snapshot,
+whose warm start restores through whichever loader the node selects. A
+requested-ID retry with a selection reuses the existing sandbox only if its saved
+binding is the selected one. Because the response acknowledges that environment,
+such a retry also needs the node to still admit it; an unselected retry reuses the
+row without asking.
+Later snapshot and suspend operations still check memory-state qualification
+independently.
 
 During mixed versions, an old resolver's missing selection acknowledgement keeps
 the pre-existing exact source contract. Scratch builds use ordinary default

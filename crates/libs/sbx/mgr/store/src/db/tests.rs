@@ -9926,6 +9926,7 @@ mod cleanup_quarantine_refusal;
 mod local_network_policy_clear;
 mod network_policy_live_gateway;
 mod pinned_artifact_capture;
+mod pool_donors;
 mod state_write_table;
 mod stopped_artifact_pin;
 mod thin_writer_coverage;

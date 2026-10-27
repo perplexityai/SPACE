@@ -218,8 +218,9 @@ begin_iter() {
 
 create_sandbox() {
   local flags="${1:-}"
-  # Explicit selection admits cold creation; memory-state operations are
-  # requested separately against the resulting bound sandbox.
+  # Selected runs keep periodic snapshots off so every arm measures the same
+  # work; memory-state operations are requested separately against the
+  # resulting bound sandbox.
   if [[ -n "$ENVIRONMENT_REFERENCE" && "$flags" == "--snapshots" ]]; then
     flags=""
   fi
@@ -503,8 +504,8 @@ bench_start_base_snap() {
     begin_iter "$i"
     local id
     if [[ -n "$ENVIRONMENT_REFERENCE" ]]; then
-      # Selected Create allocates a cold record; Start owns the qualified
-      # template-snapshot restore and its exact execution binding.
+      # Selected Create allocates a cold record; Start then restores the
+      # template snapshot only when it was captured under that binding.
       id=$(create_sandbox)
     else
       id=$(create_sandbox "--boot-mode base-snapshot")

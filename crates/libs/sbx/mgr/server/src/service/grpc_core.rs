@@ -193,6 +193,7 @@ impl SandboxManagerService {
             let req = request.get_ref();
             let sandbox_owner = Self::authorize_create_sandbox_owner(&peer, req)?;
             let (requested_boot_mode, requested_id) = if environment.is_some() {
+                super::validation::validate_selected_create_fields(req)?;
                 validate_create_request_fields(req)?
             } else {
                 validate_create_request(req)?
@@ -209,9 +210,6 @@ impl SandboxManagerService {
                     crate::db::PolicyAuthority::try_from(req.auto_lifecycle_authority)
                         .map_err(|error| Status::invalid_argument(error.to_string()))?;
                 require_local_authority_peer(peer.principal(), authority)?;
-            }
-            if environment.is_some() {
-                super::validation::validate_environment_create_fields(req)?;
             }
             let verified = if let Some(reference) = environment {
                 let selected = self.resolve_create_environment(reference).await?;
@@ -286,12 +284,13 @@ impl SandboxManagerService {
                 resolved_template.spaced_compatibility_family.as_deref(),
             )?;
 
-            let (effective_mode, intent) = self.resolve_create_intent(
-                req,
-                requested_boot_mode,
-                requested_id,
-                resolved_template.snapshot_dir.as_deref(),
-            )?;
+            let target = super::create_support::CreateTarget {
+                snapshot_dir: resolved_template.snapshot_dir.as_deref(),
+                execution: &resolved_template.execution,
+                selected: environment.is_some(),
+            };
+            let (mut effective_mode, mut intent) =
+                self.resolve_create_intent(req, requested_boot_mode, requested_id, target)?;
             if effective_mode == BootMode::BaseSnapshot {
                 self.ensure_snapshot_restore_supported("create_base_snapshot")?;
             }
@@ -309,6 +308,7 @@ impl SandboxManagerService {
             };
 
             // Pool path: adopt a paused pool sandbox
+            let mut resp_from_pool = None;
             if matches!(intent, SandboxCreateIntent::AdoptPool) {
                 let adopt_req = internal_request(pool_adoption_request(
                     req,
@@ -318,7 +318,26 @@ impl SandboxManagerService {
                     auto_lifecycle_authority.as_proto_i32(),
                     resolved_template.content_hash.clone(),
                 ));
-                let resp = self.adopt_pool_sandbox(adopt_req).await?;
+                resp_from_pool = match self.adopt_pool_sandbox_outcome(adopt_req).await? {
+                    super::grpc_pool_wait_clone::PoolAdoption::Adopted(resp) => Some(resp),
+                    // Pool is an optimization: a donor the node won't run is
+                    // skipped like any other ineligible donor.
+                    super::grpc_pool_wait_clone::PoolAdoption::NoUsableDonor(status) => {
+                        tracing::info!(template = %template, %status, "pool donor refused; creating without the pool");
+                        (effective_mode, intent) = self.resolve_create_intent(
+                            req,
+                            BootMode::BaseSnapshot,
+                            requested_id,
+                            target,
+                        )?;
+                        if effective_mode == BootMode::BaseSnapshot {
+                            self.ensure_snapshot_restore_supported("create_base_snapshot")?;
+                        }
+                        None
+                    }
+                };
+            }
+            if let Some(resp) = resp_from_pool {
                 let sbx_id = resp.into_inner().sandbox_id;
 
                 if req.autostart {
@@ -378,6 +397,7 @@ impl SandboxManagerService {
                         pool_template,
                         volume_encryption: req.volume_encryption,
                         auto_lifecycle: &auto_lifecycle,
+                        environment,
                     };
                     let auto_lifecycle_changed =
                         requested_sandbox_create_auto_lifecycle_changed(&existing, &requested);
@@ -491,15 +511,17 @@ impl SandboxManagerService {
             }
 
             // Reused IDs return above before selection. Cluster placement and
-            // pool identity still require their existing exact environment.
-            if environment.is_none()
-                && resolved_template.execution.environment().is_some()
-                && super::validation::allows_node_local_environment_selection(req)
-            {
-                resolved_template.execution = self.select_compatible_execution(
-                    &resolved_template.execution,
-                    pplx_space_node_mgr_client::proto::ExecutionEnvironmentSelection::ColdBoot,
-                ).await?;
+            // pool identity keep their exact environment, which the node must
+            // still admit before the row is persisted.
+            if environment.is_none() && resolved_template.execution.environment().is_some() {
+                if super::validation::allows_node_local_environment_selection(req) {
+                    resolved_template.execution = self.select_compatible_execution(
+                        &resolved_template.execution,
+                        pplx_space_node_mgr_client::proto::ExecutionEnvironmentSelection::ColdBoot,
+                    ).await?;
+                } else {
+                    self.admit_exact_execution(&resolved_template.execution).await?;
+                }
             }
 
             self.create_with_id(CreateWithIdArgs {
@@ -1256,6 +1278,8 @@ fn project_template_catalog(
 
 #[cfg(test)]
 mod create_after_lookup_tests;
+#[cfg(test)]
+mod create_environment_tests;
 #[cfg(test)]
 mod create_template_lookup_tests;
 #[cfg(test)]

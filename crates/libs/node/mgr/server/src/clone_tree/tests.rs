@@ -335,3 +335,44 @@ fn private_clone_blocks_foreign_uid_grafts_and_shared_clone_is_held() {
         b"untouched"
     );
 }
+
+/// A clone keeps the producer record restore selects its consumer from;
+/// without it, the clone's memory would read as the initial environment's.
+#[test]
+fn clone_copies_the_donors_snapshot_producer_when_it_has_one() {
+    for recorded in [true, false] {
+        let fixture = Fixture::new();
+        if recorded {
+            std::fs::write(
+                fixture.cache.join("donor/snapshot/runtime.json"),
+                b"{\"producer\":\"donor\"}",
+            )
+            .unwrap();
+        }
+        copy(fixture.open().unwrap()).unwrap();
+        let copied = fixture.cache.join("target/snapshot/runtime.json");
+        assert_eq!(copied.exists(), recorded);
+        if recorded {
+            assert_eq!(std::fs::read(&copied).unwrap(), b"{\"producer\":\"donor\"}");
+        }
+        assert_eq!(
+            std::fs::read(fixture.cache.join("target/snapshot/vmstate")).unwrap(),
+            b"vmstate"
+        );
+        fixture.outside_untouched();
+    }
+}
+
+/// The producer record is held to the same containment as the snapshot it
+/// describes: a link in its place fails the clone.
+#[test]
+fn clone_refuses_a_linked_producer_record() {
+    let fixture = Fixture::new();
+    symlink(
+        fixture.outside.join("sentinel"),
+        fixture.cache.join("donor/snapshot/runtime.json"),
+    )
+    .unwrap();
+    assert!(fixture.open().is_err());
+    fixture.outside_untouched();
+}

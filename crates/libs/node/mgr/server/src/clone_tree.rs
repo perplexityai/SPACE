@@ -26,6 +26,10 @@ pub(crate) struct CloneTree {
     instance: File,
     vmstate: File,
     memory: File,
+    /// The producer of `vmstate` and `memory`, which restore selects its
+    /// consumer from. Older donors have none, which reads as the initial
+    /// environment.
+    runtime: Option<File>,
     run: File,
 }
 
@@ -58,6 +62,11 @@ impl CloneTree {
         let snapshot = directory(&donor, "snapshot")?;
         let vmstate = regular_file(&snapshot, "vmstate")?;
         let memory = regular_file(&snapshot, "memory")?;
+        let runtime = match regular_file(&snapshot, "runtime.json") {
+            Ok(runtime) => Some(runtime),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         let run = File::from(open(run, DIRECTORY, Mode::empty())?);
         Ok(Self {
             cache,
@@ -66,6 +75,7 @@ impl CloneTree {
             instance,
             vmstate,
             memory,
+            runtime,
             run,
         })
     }
@@ -90,6 +100,9 @@ impl CloneTree {
         let snapshot = create_directory(&self.target, "snapshot")?;
         copy_file(&self.vmstate, &snapshot, "vmstate", cache_gid)?;
         copy_file(&self.memory, &snapshot, "memory", cache_gid)?;
+        if let Some(runtime) = &self.runtime {
+            copy_file(runtime, &snapshot, "runtime.json", cache_gid)?;
+        }
         permissions(&snapshot, cache_gid, 0o2775)?;
         let snapshots = create_directory(&self.target, "snapshots")?;
         permissions(&snapshots, cache_gid, 0o2775)?;

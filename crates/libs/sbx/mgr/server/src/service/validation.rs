@@ -285,8 +285,11 @@ pub(super) fn require_environment_acknowledgement(
     Ok(())
 }
 
-/// Explicit selection cannot relabel a template. Non-default bindings remain local and
-/// cold-only until cluster placement and memory-state compatibility are qualified.
+/// Explicit selection cannot relabel a template. Selected and non-default
+/// bindings may use snapshots at create and cluster-owned identity once the
+/// serving node admits them, and non-default bindings may also fill and adopt
+/// pools and boot warm; paths that capture or load memory also require the
+/// environment's qualified memory-state support.
 pub(super) fn validate_environment_create(
     request: &crate::proto::CreateRequest,
     environment: Option<pplx_space_common_core::types::EnvironmentReference>,
@@ -298,35 +301,109 @@ pub(super) fn validate_environment_create(
         ));
     }
     let non_default = is_non_default_execution(execution);
-    if non_default || environment.is_some() {
-        validate_environment_create_fields(request)?;
+    // A selected create always boots cold, so only its snapshots load memory.
+    let memory_state = if environment.is_some() {
+        request.snapshots_enabled
+    } else {
+        requests_memory_state(request)
+    };
+    if (non_default || environment.is_some()) && memory_state && requires_cold_creation(execution) {
+        return Err(tonic::Status::failed_precondition(
+            "execution environment does not support the memory-state operations that pools, snapshots and base-snapshot boot require",
+        ));
     }
     Ok(non_default)
 }
 
-/// Selected creation is a node-local cold protocol, including qualified E0.
-/// Later memory operations independently check the environment's qualification.
-pub(super) fn validate_environment_create_fields(
+/// Pool donors are matched by build, so every member of a build must carry the
+/// build's own binding. Checked from the request alone, before any node or
+/// template call.
+pub(super) fn validate_selected_create_fields(
     request: &crate::proto::CreateRequest,
-) -> Result<(), Status> {
-    if !allows_node_local_environment_selection(request) {
-        return Err(Status::failed_precondition(
-            "selected environments require node-local cold creation without pools, snapshots, or cluster-owned identity",
+) -> Result<(), tonic::Status> {
+    if is_pool_member(request) {
+        return Err(tonic::Status::failed_precondition(
+            "pool members take their template's binding; select the environment when building the template",
         ));
     }
     Ok(())
 }
 
-/// Node-local cold creation can select before its first persisted execution.
-/// Cluster-directed work and pools retain their placement-bound identities.
+/// An empty pool template names no pool, as everywhere else in Create.
+fn is_pool_member(request: &crate::proto::CreateRequest) -> bool {
+    request
+        .pool_template
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// Pool members are paused for adoption and cloning, base-snapshot boot loads
+/// memory, and enabled snapshots capture it.
+fn requests_memory_state(request: &crate::proto::CreateRequest) -> bool {
+    is_pool_member(request)
+        || request.snapshots_enabled
+        || request.boot_mode != crate::proto::BootMode::Cold as i32
+}
+
+/// Node-local cold creation may select a compatible consumer before its first
+/// persisted execution. Cluster-directed work and pools keep the exact binding
+/// their placement and donors were chosen for.
 pub(super) fn allows_node_local_environment_selection(
     request: &crate::proto::CreateRequest,
 ) -> bool {
-    request.sandbox_id.is_none()
+    request.sandbox_id.as_deref().is_none_or(str::is_empty)
         && request.route_identity.is_none()
-        && request.pool_template.is_none()
-        && !request.snapshots_enabled
-        && request.boot_mode == crate::proto::BootMode::Cold as i32
+        && !requests_memory_state(request)
+}
+
+/// A non-default base snapshot boots only under the environment that captured
+/// it. Restore selects its consumer from this producer, so a snapshot captured
+/// under another binding would silently move the sandbox off its template's
+/// environment. E0 and legacy executions keep their existing contract, in
+/// which missing provenance means E0, and refuse only a snapshot recorded
+/// under a non-default environment.
+pub(super) fn base_snapshot_matches_execution(
+    snapshot_dir: &str,
+    execution: &pplx_space_common_core::types::ExecutionMetadata,
+) -> bool {
+    let producer = super::create_support::read_base_snapshot_execution_metadata(
+        std::path::Path::new(snapshot_dir),
+    );
+    if !is_non_default_execution(execution) {
+        // Unreadable provenance keeps failing where it always has, at staging.
+        let Ok(producer) = producer else {
+            return true;
+        };
+        if !is_non_default_execution(producer.execution()) {
+            return true;
+        }
+        tracing::info!(
+            snapshot_dir,
+            producer = ?producer.execution().environment(),
+            "base snapshot was captured under a non-default environment; booting cold"
+        );
+        return false;
+    }
+    match producer {
+        Ok(producer) if producer.execution().environment() == execution.environment() => true,
+        Ok(producer) => {
+            tracing::info!(
+                snapshot_dir,
+                producer = ?producer.execution().environment(),
+                consumer = ?execution.environment(),
+                "base snapshot was captured under another environment; booting cold"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                snapshot_dir,
+                %error,
+                "base snapshot provenance is unreadable; booting cold"
+            );
+            false
+        }
+    }
 }
 
 /// Decode the additive input before normal admission. Both legacy inputs must

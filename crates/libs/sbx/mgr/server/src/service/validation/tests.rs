@@ -25,9 +25,116 @@ fn bound_execution_requires_positive_peer_acknowledgement() {
     }
 }
 
-#[test]
-fn environment_selection_inherits_template_but_refuses_mismatch_and_nonlocal_memory_paths() {
+/// Every create path a cluster, pool or warm boot uses, beside node-local cold.
+fn create_paths() -> Vec<(&'static str, crate::proto::CreateRequest, bool)> {
     use crate::proto::{BootMode, CreateRequest};
+    let cold = CreateRequest {
+        boot_mode: BootMode::Cold as i32,
+        ..Default::default()
+    };
+    // (name, request, whether the path captures or loads memory)
+    vec![
+        ("node-local cold", cold.clone(), false),
+        (
+            "cluster-owned sandbox id",
+            CreateRequest {
+                sandbox_id: Some("cluster-owned".into()),
+                ..cold.clone()
+            },
+            false,
+        ),
+        (
+            "cluster-owned route identity",
+            CreateRequest {
+                route_identity: Some(Default::default()),
+                ..cold.clone()
+            },
+            false,
+        ),
+        (
+            "pool member",
+            CreateRequest {
+                pool_template: Some("candidate".into()),
+                ..cold.clone()
+            },
+            true,
+        ),
+        (
+            "pool adoption",
+            CreateRequest {
+                boot_mode: BootMode::Pool as i32,
+                ..cold.clone()
+            },
+            true,
+        ),
+        (
+            "base-snapshot boot",
+            CreateRequest {
+                boot_mode: BootMode::BaseSnapshot as i32,
+                ..cold.clone()
+            },
+            true,
+        ),
+        (
+            "snapshots at create",
+            CreateRequest {
+                snapshots_enabled: true,
+                ..cold
+            },
+            true,
+        ),
+    ]
+}
+
+#[test]
+fn compiled_environments_admit_the_create_paths_they_qualify_for_and_never_relabel_a_template() {
+    use pplx_space_common_core::types::Digest;
+    use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
+    for environment in CompiledEnvironment::for_architecture(Arch::X86_64).unwrap() {
+        let reference = environment.definition().reference();
+        let execution = environment.definition().execution_requirements().unwrap();
+        let non_default = !environment.is_initial();
+        for (name, request, memory_state) in create_paths() {
+            for selector in [None, Some(reference)] {
+                let result = super::validate_environment_create(&request, selector, &execution);
+                // A selected create boots cold, so only its snapshots load memory.
+                let needs_memory_state = if selector.is_some() {
+                    request.snapshots_enabled
+                } else {
+                    memory_state
+                };
+                let context = format!(
+                    "{} {name} selected={}",
+                    environment.name(),
+                    selector.is_some()
+                );
+                if needs_memory_state && !environment.supports_memory_state() {
+                    assert_eq!(
+                        result.unwrap_err().code(),
+                        tonic::Code::FailedPrecondition,
+                        "{context}"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    result.unwrap_or_else(|error| panic!("{context}: {error}")),
+                    non_default,
+                    "{context}"
+                );
+            }
+            let error = super::validate_environment_create(
+                &request,
+                Some(EnvironmentReference::new(Digest::sha256([9; 32]))),
+                &execution,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{name}");
+        }
+    }
+}
+
+#[test]
+fn an_environment_without_memory_state_support_is_refused_on_memory_paths() {
     use pplx_space_common_core::types::{Digest, RuntimeIdentity, RuntimeKind};
     let reference = EnvironmentReference::new(Digest::sha256([8; 32]));
     let execution = ExecutionMetadata::new(
@@ -41,42 +148,196 @@ fn environment_selection_inherits_template_but_refuses_mismatch_and_nonlocal_mem
     )
     .unwrap()
     .with_environment(reference);
-    let base = CreateRequest {
-        boot_mode: BootMode::Cold as i32,
+    assert!(super::requires_cold_creation(&execution));
+    // A bound template's own paths; selected creates are covered separately.
+    for (name, request, memory_state) in create_paths() {
+        let result = super::validate_environment_create(&request, None, &execution);
+        if memory_state {
+            assert_eq!(
+                result.unwrap_err().code(),
+                tonic::Code::FailedPrecondition,
+                "{name}"
+            );
+        } else {
+            assert!(result.unwrap(), "{name}");
+        }
+    }
+    // Legacy unbound work keeps its existing contract on every path.
+    let legacy = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+    for (name, request, _) in create_paths() {
+        assert!(
+            !super::validate_environment_create(&request, None, &legacy).unwrap(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_selected_create_cannot_be_a_pool_member_but_an_empty_pool_names_none() {
+    for (name, request, _) in create_paths() {
+        let result = super::validate_selected_create_fields(&request);
+        assert_eq!(result.is_err(), name == "pool member", "{name}");
+    }
+    let empty_pool = crate::proto::CreateRequest {
+        boot_mode: crate::proto::BootMode::Cold as i32,
+        pool_template: Some(String::new()),
         ..Default::default()
     };
-    for selector in [None, Some(reference)] {
-        assert!(super::validate_environment_create(&base, selector, &execution).unwrap());
-    }
-    super::validate_environment_create(
-        &base,
-        Some(EnvironmentReference::new(Digest::sha256([9; 32]))),
-        &execution,
+    super::validate_selected_create_fields(&empty_pool).unwrap();
+    assert!(super::allows_node_local_environment_selection(&empty_pool));
+    let empty_id = crate::proto::CreateRequest {
+        sandbox_id: Some(String::new()),
+        ..empty_pool
+    };
+    assert!(super::allows_node_local_environment_selection(&empty_id));
+}
+
+#[test]
+fn a_selected_create_boots_cold_so_only_its_snapshots_need_memory_state() {
+    use pplx_space_common_core::types::{Digest, RuntimeIdentity, RuntimeKind};
+    let reference = EnvironmentReference::new(Digest::sha256([8; 32]));
+    let cold_only = ExecutionMetadata::new(
+        RuntimeIdentity {
+            kind: RuntimeKind::Firecracker,
+            version: "1.17.0".parse().unwrap(),
+        },
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).guest(),
+        None,
+        vec![],
     )
-    .unwrap_err();
-    for request in [
-        CreateRequest {
-            boot_mode: BootMode::Pool as i32,
-            ..base.clone()
-        },
-        CreateRequest {
-            boot_mode: BootMode::BaseSnapshot as i32,
-            ..base.clone()
-        },
-        CreateRequest {
-            pool_template: Some("candidate".into()),
-            ..base.clone()
-        },
-        CreateRequest {
-            snapshots_enabled: true,
-            ..base.clone()
-        },
-        CreateRequest {
-            sandbox_id: Some("cluster-owned".into()),
-            ..base.clone()
-        },
+    .unwrap()
+    .with_environment(reference);
+    for (name, request, _) in create_paths() {
+        if name == "pool member" {
+            continue; // refused from the request before this check
+        }
+        let result = super::validate_environment_create(&request, Some(reference), &cold_only);
+        assert_eq!(result.is_err(), name == "snapshots at create", "{name}");
+    }
+}
+
+#[test]
+fn only_node_local_cold_creation_selects_a_compatible_consumer() {
+    for (name, request, _) in create_paths() {
+        assert_eq!(
+            super::allows_node_local_environment_selection(&request),
+            name == "node-local cold",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_non_default_base_snapshot_boots_only_under_its_producer_environment() {
+    use pplx_space_common_core::types::SnapshotExecutionMetadata;
+    use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
+    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let execution = |name| {
+        catalog
+            .iter()
+            .find(|entry| entry.name() == name)
+            .unwrap()
+            .definition()
+            .execution_requirements()
+            .unwrap()
+    };
+    // The upgrade changes only the runtime; the 6.18 guest kernel is a separate environment.
+    let (e0, upgrade, other) = (
+        execution("e0"),
+        execution("fc-1.17.0-linux-6.1.155"),
+        execution("fc-1.17.0-linux-6.18.44"),
+    );
+    let legacy = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+    enum Producer<'a> {
+        Missing,
+        Corrupt,
+        Captured(&'a ExecutionMetadata),
+    }
+    for (name, consumer, producer, usable) in [
+        (
+            "legacy snapshot, legacy consumer",
+            &legacy,
+            Producer::Missing,
+            true,
+        ),
+        ("legacy snapshot, E0 consumer", &e0, Producer::Missing, true),
+        (
+            "E0 snapshot, E0 consumer",
+            &e0,
+            Producer::Captured(&e0),
+            true,
+        ),
+        (
+            "corrupt provenance, E0 consumer",
+            &e0,
+            Producer::Corrupt,
+            true,
+        ),
+        (
+            "UPGRADE snapshot, E0 consumer",
+            &e0,
+            Producer::Captured(&upgrade),
+            false,
+        ),
+        (
+            "UPGRADE snapshot, legacy consumer",
+            &legacy,
+            Producer::Captured(&upgrade),
+            false,
+        ),
+        (
+            "UPGRADE snapshot, UPGRADE consumer",
+            &upgrade,
+            Producer::Captured(&upgrade),
+            true,
+        ),
+        (
+            "E0 snapshot, UPGRADE consumer",
+            &upgrade,
+            Producer::Captured(&e0),
+            false,
+        ),
+        (
+            "legacy snapshot, UPGRADE consumer",
+            &upgrade,
+            Producer::Captured(&legacy),
+            false,
+        ),
+        (
+            "other snapshot, UPGRADE consumer",
+            &upgrade,
+            Producer::Captured(&other),
+            false,
+        ),
+        (
+            "missing provenance, UPGRADE consumer",
+            &upgrade,
+            Producer::Missing,
+            false,
+        ),
+        (
+            "corrupt provenance, UPGRADE consumer",
+            &upgrade,
+            Producer::Corrupt,
+            false,
+        ),
     ] {
-        super::validate_environment_create(&request, None, &execution).unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        match producer {
+            Producer::Missing => {}
+            Producer::Corrupt => std::fs::write(dir.path().join("metadata.json"), b"{").unwrap(),
+            Producer::Captured(producer) => std::fs::write(
+                dir.path().join("metadata.json"),
+                serde_json::to_vec(&SnapshotExecutionMetadata::new(producer.clone()).unwrap())
+                    .unwrap(),
+            )
+            .unwrap(),
+        }
+        assert_eq!(
+            super::base_snapshot_matches_execution(dir.path().to_str().unwrap(), consumer),
+            usable,
+            "{name}"
+        );
     }
 }
 

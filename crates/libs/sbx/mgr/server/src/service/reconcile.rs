@@ -1048,11 +1048,14 @@ impl SandboxManagerService {
 
     /// Resolve the requested boot mode with fallthrough: pool → base_snapshot → cold.
     /// `snapshot_dir` is the resolved snapshot dir from template-manager (empty = no snapshot).
+    /// A base snapshot is usable when both files exist and it was captured
+    /// under the execution the sandbox will run.
     pub(super) fn resolve_boot_mode(
         &self,
         requested: BootMode,
         template: &str,
         snapshot_dir: Option<&str>,
+        execution: &pplx_space_common_core::types::ExecutionMetadata,
     ) -> Result<BootMode, Status> {
         if requested == BootMode::Pool {
             let has_pool = {
@@ -1070,6 +1073,7 @@ impl SandboxManagerService {
             let has_snapshot = snapshot_dir.is_some_and(|snapshot_dir| {
                 std::path::Path::new(&format!("{snapshot_dir}/vmstate.base")).exists()
                     && std::path::Path::new(&format!("{snapshot_dir}/snapshot.base")).exists()
+                    && super::validation::base_snapshot_matches_execution(snapshot_dir, execution)
             });
             if has_snapshot {
                 return Ok(BootMode::BaseSnapshot);

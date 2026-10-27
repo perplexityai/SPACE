@@ -101,35 +101,60 @@ async fn create_refusals_before_insert_persist_nothing() {
 
 /// Stop at allocation's validated rollback boundary, before any VM or host
 /// filesystem mutation. Both attempts must select from the same checkpoint.
+/// E0 restores through a qualified compatible loader; a checkpoint of the
+/// 1.17 runtime upgrade restores under its own producer, which that binding
+/// qualifies for memory state.
 #[tokio::test]
 async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoint() {
-    use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{
-        Arch, ContentHash, EnvironmentDescriptor, RuntimeBinding, RuntimeKind,
-        SandboxArtifactMetadata, SandboxRuntimeLabel, SnapshotExecutionMetadata,
-    };
+    use pplx_space_common_core::types::{Arch, EnvironmentDescriptor, RuntimeBinding};
     use pplx_space_execution_common::environment::EnvironmentDefinition;
-    use pplx_space_node_mgr_client::proto::{
-        AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
-        ReleaseResponse, ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
-        resolve_execution_environment_request::Compatible,
-    };
     if !crate::service::tests::enter_route_test_process(&[
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
     ]) {
         return;
     }
-    let initial =
+    let mut catalog =
         pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
-            .unwrap()
-            .remove(0);
-    let producer = initial.definition().execution_requirements().unwrap();
+            .unwrap();
+    let upgrade = catalog
+        .iter()
+        .find(|entry| entry.name() == "fc-1.17.0-linux-6.1.155")
+        .unwrap();
+    assert!(upgrade.supports_memory_state());
+    let upgrade = upgrade.definition().clone();
+    let initial = catalog.remove(0);
+    assert!(initial.is_initial());
     let mut spec = initial.definition().descriptor().spec().clone();
     let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
     release.runtime.version = "1.15.2".parse().unwrap();
-    let consumer_definition =
-        EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap());
+    let patched_e0 = EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap());
+    restore_selects_its_consumer_from_the_checkpoint(
+        initial.definition().execution_requirements().unwrap(),
+        patched_e0,
+    )
+    .await;
+    restore_selects_its_consumer_from_the_checkpoint(
+        upgrade.execution_requirements().unwrap(),
+        upgrade,
+    )
+    .await;
+}
+
+async fn restore_selects_its_consumer_from_the_checkpoint(
+    producer: pplx_space_common_core::types::ExecutionMetadata,
+    consumer_definition: pplx_space_execution_common::environment::EnvironmentDefinition,
+) {
+    use crate::node_manager_transport::fake::FakeNodeManager;
+    use pplx_space_common_core::types::{
+        ContentHash, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
+        SnapshotExecutionMetadata,
+    };
+    use pplx_space_node_mgr_client::proto::{
+        AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
+        ReleaseResponse, ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
+        resolve_execution_environment_request::Compatible,
+    };
     let consumer = consumer_definition.execution_requirements().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().join("cache");

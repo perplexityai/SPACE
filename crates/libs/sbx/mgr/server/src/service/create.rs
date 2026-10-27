@@ -501,7 +501,11 @@ impl SandboxManagerService {
                 return Err(status);
             }
 
-            let sandbox_snapshot_dir = format!("{CACHE_DIR}/{id}/snapshot");
+            let sandbox_snapshot_dir = cache_dir
+                .join(&id)
+                .join("snapshot")
+                .to_string_lossy()
+                .into_owned();
             if let Err(e) = std::fs::create_dir_all(&sandbox_snapshot_dir) {
                 let status = Status::internal(format!("create snapshot dir: {e}"));
                 create_cleanup.cleanup_after_failure(

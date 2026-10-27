@@ -225,10 +225,14 @@ bash scripts/benchmarks/bench-sbx-lifecycle.sh worker.example.com \
 ```
 
 Use explicit selection for the baseline too, so each arm pays for the same
-admission protocol. Memory-state operations require a qualified binding;
-selected warm creation and pools have separate admission restrictions. Selected
-creation leaves periodic snapshots disabled; the harness requests suspend and
-checkpoint separately. Legacy `--snapshots` setup enables the scheduler, so do
+admission protocol. Memory-state operations, including warm creation and
+periodic snapshots, require a qualified binding. For selected runs the harness
+skips the pool phases, because selected Create doesn't adopt pool donors. It
+also skips the base-snapshot create phases and measures warm start through
+Start instead. Start refuses a template base snapshot captured under another
+environment, which fails that phase and the run, so build each arm's template,
+and its base snapshot, under that arm's environment. It leaves periodic snapshots disabled for selected creation and
+requests suspend and checkpoint separately. Legacy `--snapshots` setup enables the scheduler, so do
 not mix legacy and selected invocations in one runtime comparison.
 
 1. Roll out the environment-aware services and clients to the designated builder

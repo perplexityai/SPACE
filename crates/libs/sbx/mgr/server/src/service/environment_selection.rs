@@ -31,6 +31,38 @@ impl SandboxManagerService {
         .await
         .map_err(|_| Status::deadline_exceeded("compatible environment selection timed out"))?
     }
+
+    /// Exact non-default bindings skip compatible selection. Refuse one the
+    /// serving node doesn't execute at create rather than at first start. E0
+    /// and legacy executions keep their existing admission at launch.
+    pub(super) async fn admit_exact_execution(
+        &self,
+        source: &ExecutionMetadata,
+    ) -> Result<(), Status> {
+        if !super::validation::is_non_default_execution(source) {
+            return Ok(());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut node = connect_node(&self.node_manager)
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+            admit_exact_with_client(&mut node, source).await
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("environment admission timed out"))?
+    }
+}
+
+/// [`SandboxManagerService::admit_exact_execution`] on a channel the caller
+/// already holds. The caller owns the deadline.
+pub(super) async fn admit_exact_with_client(
+    node: &mut NodeManagerGrpcClient,
+    source: &ExecutionMetadata,
+) -> Result<(), Status> {
+    if !super::validation::is_non_default_execution(source) {
+        return Ok(());
+    }
+    resolve_exact_source(node, source).await.map(|_| ())
 }
 
 /// The caller owns the deadline, including any exact fallback on this connection.
@@ -39,9 +71,9 @@ pub(super) async fn select_with_client(
     source: &ExecutionMetadata,
     intent: ExecutionEnvironmentSelection,
 ) -> Result<ExecutionMetadata, Status> {
-    let Some(reference) = source.environment() else {
+    if source.environment().is_none() {
         return Ok(source.clone());
-    };
+    }
     let request = match intent {
         ExecutionEnvironmentSelection::ColdBoot => Compatible::ColdBootSource(source.into()),
         ExecutionEnvironmentSelection::Restore => Compatible::RestoreSource(source.into()),
@@ -64,18 +96,30 @@ pub(super) async fn select_with_client(
         Err(SelectionResponseError::Unsupported)
             if intent == ExecutionEnvironmentSelection::ColdBoot =>
         {
-            let selected = resolve_exact(node, reference).await?;
-            selected
-                .definition
-                .check_execution(source)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
-            Ok(selected.execution)
+            Ok(resolve_exact_source(node, source).await?.execution)
         }
         // Restore admission remains operation-specific in Prepare/Launch. The
         // exact resolver is a cold-boot RPC and would require unused boot files.
         Err(SelectionResponseError::Unsupported) => Ok(source.clone()),
         Err(error) => Err(Status::failed_precondition(error.to_string())),
     }
+}
+
+/// Resolve a bound source's exact environment and require the source's
+/// evidence to match the definition the node acknowledged.
+async fn resolve_exact_source(
+    node: &mut NodeManagerGrpcClient,
+    source: &ExecutionMetadata,
+) -> Result<SelectedEnvironment, Status> {
+    let reference = source
+        .environment()
+        .ok_or_else(|| Status::failed_precondition("execution has no environment binding"))?;
+    let selected = resolve_exact(node, reference).await?;
+    selected
+        .definition
+        .check_execution(source)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    Ok(selected)
 }
 
 pub(super) async fn resolve_exact(
