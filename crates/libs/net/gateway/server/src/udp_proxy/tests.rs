@@ -480,7 +480,7 @@ async fn reserved_udp_capacity_rejection_reaches_the_guest_as_servfail() {
             .get(ReservedResolver::Cloudflare),
     )
     .try_acquire_many_owned(MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER as u32)
-        .unwrap();
+    .unwrap();
     let flow = FlowKey {
         guest_src: guest.local_addr().unwrap(),
         orig_dst: response_addr,
