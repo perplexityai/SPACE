@@ -110,7 +110,7 @@ pub(crate) struct OpenedRuntime {
     pub(crate) firecracker_path: String,
 }
 
-fn open(path: &Path, expected: VerityDigest) -> Result<SealedFile, Status> {
+pub(crate) fn open(path: &Path, expected: VerityDigest) -> Result<SealedFile, Status> {
     use std::os::unix::fs::MetadataExt;
     let parent = path
         .parent()
