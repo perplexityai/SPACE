@@ -126,3 +126,15 @@ the Kind backend requires it. Deployed clusters run templates that may predate
 that guest; there the scenario accepts an absent exit and still requires the
 `SIGKILL` exit when one is reported. Set `SPACE_SMOKE_REQUIRE_EXIT_RETENTION=1`
 or `0` to override the backend default.
+
+## Standalone Windows lifecycle
+
+`node.windows_sandbox_lifecycle` requires the same explicit node identity and
+pinned template/environment inputs as the recovery scenario, with
+`SPACE_SMOKE_NODE_RECOVERY=firmware-lifecycle`. It creates a task-owned Windows
+sandbox, checks RDP NLA negotiation through the fenced operator channel, then
+stops/starts and deletes that sandbox. Agent refusal before wake is covered by
+the sandbox-manager guest-image tests. The scenario neither
+restarts managers nor allocates devices, so other authorized sandboxes may stay
+running. RDP negotiation does not establish authenticated interactive access;
+that remains a separate image acceptance check.
