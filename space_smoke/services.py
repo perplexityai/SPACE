@@ -34,18 +34,19 @@ from space_smoke.capabilities import (
     EcwSandboxDeleteRetryable,
     EcwSandboxes,
     EcwSandboxPages,
-    ForkableSandbox,
     EncryptedResuspendControl,
+    ForkableSandbox,
     KindEnvironment,
     NetworkConfig,
     ProcessSandbox,
     ResidentLifecycleSandbox,
-    StoppableLifecycleSandbox,
     SandboxInfo,
     SandboxPages,
+    StoppableLifecycleSandbox,
     WarmPoolCandidate,
 )
 from space_smoke.config import SandboxConfig
+from space_smoke.direct_node import DirectNodeConfig, DirectNodeRecoveryFixture
 from space_smoke.encrypted_resuspend import ByokIdentity, prepare_byok_identity
 from space_smoke.fixtures import (
     SANDBOX_CLEANUP_ATTEMPTS,
@@ -112,6 +113,7 @@ class SmokeServices:
     template_override: str | None = None
     native: CommandSandboxFactory | None = None
     api_surface: str = ECW_API_SURFACE
+    direct_node: DirectNodeConfig | None = None
 
     def bootstrap(self) -> bool:
         """Prepare the selected environment once before suite dispatch.
@@ -158,7 +160,17 @@ class SmokeServices:
         sandbox: SandboxConfig,
         sandbox_count: int = 1,
     ) -> Fixture:
-        if fixture_type not in (CommandSandboxFixture, Ecw, KindEcw, NativeHardeningFixture, KindNativeHardeningFixture):
+        if fixture_type is DirectNodeRecoveryFixture:
+            if self.direct_node is None:
+                raise SmokeConfigurationError("node recovery configuration is missing")
+            return cast(Fixture, DirectNodeRecoveryFixture(context, self.direct_node))
+        if fixture_type not in (
+            CommandSandboxFixture,
+            Ecw,
+            KindEcw,
+            NativeHardeningFixture,
+            KindNativeHardeningFixture,
+        ):
             raise SmokeConfigurationError(
                 f"unsupported smoke fixture: {fixture_type.__name__}"
             )
@@ -166,10 +178,10 @@ class SmokeServices:
             if self.api_surface != NATIVE_API_SURFACE or not isinstance(
                 self.native, NativeSandboxFactory
             ):
-                raise SmokeConfigurationError("Native hardening requires a native client")
-            return cast(
-                Fixture, fixture_type(context, self.native.config, scenario_id)
-            )
+                raise SmokeConfigurationError(
+                    "Native hardening requires a native client"
+                )
+            return cast(Fixture, fixture_type(context, self.native.config, scenario_id))
         if fixture_type is CommandSandboxFixture:
             if self.api_surface == NATIVE_API_SURFACE:
                 return cast(
@@ -377,7 +389,9 @@ class SmokeServices:
             fixture._warm_pool_observer = cast(Any, kind)
             fixture._warm_pool_candidate = warm_pool_candidate
             if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
-                from space_smoke.private_template_build import PrivateTemplateBuildAssertions
+                from space_smoke.private_template_build import (
+                    PrivateTemplateBuildAssertions,
+                )
 
                 fixture._private_template_build_setup = partial(
                     PrivateTemplateBuildAssertions, context, kind, self.ecw.config
@@ -459,7 +473,32 @@ class SmokeServices:
         *,
         required_tools: Iterable[str] | None = None,
     ) -> SmokeServices:
-        if scenario.fixture_type not in (CommandSandboxFixture, Ecw, KindEcw, NativeHardeningFixture, KindNativeHardeningFixture):
+        if scenario.fixture_type is DirectNodeRecoveryFixture:
+            values = dict(os.environ if environment is None else environment)
+            if (
+                values.get("SPACE_SMOKE_BACKEND") != DEPLOYED_BACKEND
+                or values.get("SPACE_SMOKE_API_SURFACE") != "node"
+            ):
+                raise SmokeConfigurationError(
+                    "node recovery requires deployed backend and node API surface"
+                )
+            if shutil.which("ssh") is None:
+                raise MissingToolError("node recovery requires ssh")
+            return cls(
+                kind=None,
+                ecw=None,
+                api_key="",
+                owns_api_key=False,
+                direct_node=DirectNodeConfig.from_environment(values),
+                api_surface="node",
+            )
+        if scenario.fixture_type not in (
+            CommandSandboxFixture,
+            Ecw,
+            KindEcw,
+            NativeHardeningFixture,
+            KindNativeHardeningFixture,
+        ):
             raise SmokeConfigurationError(
                 f"unsupported smoke fixture: {scenario.fixture_type.__name__}"
             )
@@ -469,7 +508,10 @@ class SmokeServices:
             raise SmokeConfigurationError(
                 "SPACE_SMOKE_BACKEND must be 'kind' or 'deployed'"
             )
-        if scenario.fixture_type is KindNativeHardeningFixture and backend != KIND_BACKEND:
+        if (
+            scenario.fixture_type is KindNativeHardeningFixture
+            and backend != KIND_BACKEND
+        ):
             raise SmokeConfigurationError(
                 "native recovery requires the kind backend; deployed clusters are unsupported"
             )
@@ -500,10 +542,15 @@ class SmokeServices:
             data_plane_url = values.get("SPACE_DATA_PLANE_URL", api_url)
             template = values.get("SPACE_TEMPLATE") or scenario.sandbox.template
             kind = None
-            if backend == KIND_BACKEND and scenario.fixture_type is CommandSandboxFixture:
+            if (
+                backend == KIND_BACKEND
+                and scenario.fixture_type is CommandSandboxFixture
+            ):
                 validate_loopback_environment(api_url, False, scenario_id=scenario.id)
                 validate_loopback_environment(
-                    data_plane_url, False, scenario_id=scenario.id,
+                    data_plane_url,
+                    False,
+                    scenario_id=scenario.id,
                     endpoint_name="SPACE_DATA_PLANE_URL",
                 )
                 kind = KindHarness(
@@ -831,15 +878,19 @@ class _ScenarioSandboxes:
             if not child_ids:
                 # Replay the original operation, never create a replacement.
                 # Child expiry inherits the source's lifecycle and may pause.
-                record_child(forkable.fork_response(timeout=lifetime, idempotency_key=key))
+                record_child(
+                    forkable.fork_response(timeout=lifetime, idempotency_key=key)
+                )
             for child_id in child_ids:
-                retry_sandbox_delete(lambda: forkable.delete_forked(child_id))
+                retry_sandbox_delete(partial(forkable.delete_forked, child_id))
                 if self._after_teardown_delete is not None:
                     self._after_teardown_delete(child_id)
 
         # A lost response still leaves an operation recoverable by this key.
         # Record its child before SDK construction, which can also fail.
-        compensation = self._context.scope.defer("delete fork child", cleanup, critical=True)
+        compensation = self._context.scope.defer(
+            "delete fork child", cleanup, critical=True
+        )
         response = forkable.fork_response(timeout=lifetime, idempotency_key=key)
         record_child(response)
         child = self._ecw.attach_fork(response)
