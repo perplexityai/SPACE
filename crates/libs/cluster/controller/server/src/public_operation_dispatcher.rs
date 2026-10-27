@@ -429,19 +429,6 @@ pub async fn run<E>(
     // sandbox rule: a claim that would overlap a local execution of its key
     // is handed back, beside the loop, instead of running twice. `slots`
     // splits the free slots between teardowns and other work at each claim.
-    let org_slot_limit = config.org_slot_limit.map(|contended| {
-        let uncontended = u32::try_from(
-            slots
-                .other_concurrency()
-                .saturating_sub(config.org_slot_headroom),
-        )
-        .unwrap_or(u32::MAX);
-        OrgSlotLimit {
-            contended,
-            uncontended: NonZeroU32::new(uncontended).map_or(contended, |u| u.max(contended)),
-            headroom: u32::try_from(config.org_slot_headroom).unwrap_or(u32::MAX),
-        }
-    });
     let mut claim_backoff_until: Option<Instant> = None;
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
@@ -495,15 +482,7 @@ pub async fn run<E>(
                 #[cfg(test)]
                 tests::before_claim().await;
                 let started = Instant::now();
-                match claim_up_to(
-                    &config,
-                    &store,
-                    &executor,
-                    ClaimSlots {
-                        org_slot_limit,
-                        ..claim_slots
-                    },
-                ).await {
+                match claim_up_to(&config, &store, &executor, claim_slots).await {
                     Ok(claim) => {
                         // An execution that committed while the claim ran
                         // must not make its successor look busy.
@@ -711,7 +690,7 @@ fn log_execution_outcome(
 }
 
 /// How the dispatcher's execution slots are shared between teardowns
-/// (sandbox deletes and kills) and other work.
+/// (sandbox deletes and kills) and other work, and between organizations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlotPolicy {
     /// Execution slots; at least one.
@@ -724,6 +703,8 @@ struct SlotPolicy {
     /// holds. At most `concurrency` minus `teardown_reserved`, or minus one
     /// without a reservation, so at least one slot stays open to teardowns.
     other_reserved: usize,
+    /// How many slots open to other work one organization may hold.
+    org_slot_limit: Option<OrgSlotLimit>,
 }
 
 impl SlotPolicy {
@@ -737,6 +718,10 @@ impl SlotPolicy {
             other_reserved: config
                 .other_reserved_slots
                 .min(concurrency - teardown_reserved.max(1)),
+            org_slot_limit: config.org_slot_limit.map(|contended| OrgSlotLimit {
+                contended,
+                headroom: u32::try_from(config.org_slot_headroom).unwrap_or(u32::MAX),
+            }),
         }
     }
 
@@ -765,7 +750,7 @@ impl SlotPolicy {
                 .saturating_sub(other_in_flight)
                 .min(free),
             free_teardown_while_other_due: free - self.other_reserved.min(free - owed_to_teardowns),
-            org_slot_limit: None,
+            org_slot_limit: self.org_slot_limit,
         }
     }
 }

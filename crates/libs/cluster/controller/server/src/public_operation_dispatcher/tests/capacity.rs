@@ -686,11 +686,10 @@ fn org_slot_settings_parse_from_the_environment() {
     }
 }
 
-fn org_limit(contended: u32, uncontended: u32) -> OrgSlotLimit {
+fn org_limit(contended: u32, headroom: u32) -> OrgSlotLimit {
     OrgSlotLimit {
         contended: NonZeroU32::new(contended).expect("a positive limit"),
-        uncontended: NonZeroU32::new(uncontended).expect("a positive limit"),
-        headroom: 0,
+        headroom,
     }
 }
 
@@ -732,7 +731,7 @@ async fn an_organizations_limit_holds_only_while_another_organization_waits() ->
     )
     .await?;
     let limits = ClaimLimits {
-        per_org_non_teardown: Some(org_limit(2, 64)),
+        per_org_non_teardown: Some(org_limit(2, 0)),
         ..ClaimLimits::any(64)
     };
 
@@ -743,6 +742,56 @@ async fn an_organizations_limit_holds_only_while_another_organization_waits() ->
     assert_eq!(claim_with(&store, limits).await?, expected);
     // Nothing else waits now, so the busy organization may go past it.
     assert_eq!(claim_with(&store, limits).await?, [busy[1], busy[2]]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn organizations_at_their_limit_share_the_slots_no_one_waits_for() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let first_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let second_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    // Each organization already runs its limit of two.
+    for (org_id, prefix) in [(first_org, "sbx_first"), (second_org, "sbx_second")] {
+        let running = [format!("{prefix}_running_0"), format!("{prefix}_running_1")];
+        queue_all(
+            &store,
+            org_id,
+            &running
+                .iter()
+                .map(|target_id| (OperationKind::CreateSandbox, target_id.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    }
+    claim_with(&store, ClaimLimits::any(4)).await?;
+    // Then both queue more, in turn.
+    let mut queued = Vec::new();
+    for index in 0..3 {
+        for (org_id, prefix) in [(first_org, "sbx_first"), (second_org, "sbx_second")] {
+            let target_id = format!("{prefix}_more_{index}");
+            queued.extend(
+                queue_all(
+                    &store,
+                    org_id,
+                    &[(OperationKind::CreateSandbox, target_id.as_str())],
+                )
+                .await?,
+            );
+        }
+    }
+    let limits = ClaimLimits {
+        per_org_non_teardown: Some(org_limit(2, 1)),
+        ..ClaimLimits::any(6)
+    };
+
+    // Neither waits, both being at their limit, so both go past it, and
+    // together they leave one of the six free slots untaken.
+    let mut expected = queued[..5].to_vec();
+    expected.sort();
+    assert_eq!(claim_with(&store, limits).await?, expected);
     Ok(())
 }
 
@@ -787,7 +836,7 @@ async fn work_run_as_it_was_created_holds_no_slot_under_the_limit() -> TestResul
     )
     .await?[0];
     let limits = ClaimLimits {
-        per_org_non_teardown: Some(org_limit(2, 64)),
+        per_org_non_teardown: Some(org_limit(2, 0)),
         ..ClaimLimits::any(64)
     };
 

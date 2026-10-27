@@ -1336,14 +1336,13 @@ pub struct ClaimLimits {
 /// running at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrgSlotLimit {
-    /// While another organization also has such work due.
+    /// While another organization is waiting: has such work due and holds
+    /// fewer than this many.
     pub contended: NonZeroU32,
-    /// While no other organization does; at least `contended`.
-    pub uncontended: NonZeroU32,
-    /// While no other organization does, how many of the claim's
-    /// `non_teardown` limit, the free slots open to other work, an
-    /// organization past `contended` leaves untaken, so work another
-    /// organization submits later can start.
+    /// While no other organization is waiting, organizations may go past
+    /// `contended`, but the claim leaves this many of its `non_teardown`
+    /// limit, the free slots open to other work, untaken by operations past
+    /// it, so work another organization submits later can start.
     pub headroom: u32,
 }
 
@@ -1997,15 +1996,18 @@ async fn claim_operations(
     // their rows before that last `LIMIT`, so up to `$12 + $13 - $1` rows stay
     // locked but unclaimed until this transaction commits. A concurrent
     // unkeyed claim skips them meanwhile, and a keyed one does not run while
-    // this claim holds the claim lock. With `$15` above
-    // zero, no organization gets more than `$15` operations other than
-    // teardowns running under a live claim while another organization has
-    // such work due, or more than `$16` while none has: `org_slots` counts
-    // the ones it holds and, in claim order, the ones this claim would add.
-    // It holds no slot for one claimed as it was created (`$18`), which the
-    // process that created it runs.
-    // While none has, an organization past `$15` also leaves `$17` of the
-    // claim's `$12` untaken, so that many free slots stay free.
+    // this claim holds the claim lock. With `$15` above zero, it limits each
+    // organization's operations other than teardowns: `org_slots` counts the
+    // ones it runs under a live claim, except one claimed as it was created
+    // (`$17`), which the process that created it runs, and, in claim order,
+    // the ones this claim would add. An organization is waiting while it has
+    // such work due and holds fewer than `$15`. While another one is
+    // waiting, an organization gets no more than `$15`. While none is, it may
+    // go past `$15`, but operations past their organization's limit are taken
+    // only among the first `$12 - $16` admissible ones in claim order, so
+    // that `$16` of the free slots open to other work stay free for work
+    // another organization submits later. Organizations all at their limit
+    // share that one budget.
     // That rank needs a window, which cannot share a level with `FOR
     // UPDATE`, so `picked_other` locks the chosen rows by key and re-checks
     // that each is still claimable.
@@ -2075,7 +2077,7 @@ async fn claim_operations(
              WHERE $15::BIGINT > 0
                AND state = $5
                AND claim_token <> ''
-               AND NOT starts_with(claim_token, $18)
+               AND NOT starts_with(claim_token, $17)
                AND claimed_at > NOW() - make_interval(secs => $2::BIGINT)
                AND kind = ANY($6)
                AND kind <> ALL($14)
@@ -2106,21 +2108,28 @@ async fn claim_operations(
                )
                AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
          ),
-         first_other AS (
-             SELECT operation_id, next_attempt_at, requested_at, claimable_at, reclaimed, first_start
+         waiting AS (
+             SELECT COUNT(DISTINCT org_id) AS orgs
+             FROM other_candidates
+             WHERE org_held < $15
+         ),
+         admissible AS (
+             SELECT other.*,
+                    ROW_NUMBER() OVER (
+                        ORDER BY other.next_attempt_at, other.requested_at, other.operation_id
+                    ) AS admissible_rank
              FROM other_candidates other
              WHERE $15::BIGINT = 0
-                OR other.org_slots <= CASE
-                    -- Every candidate's organization is among them, so
-                    -- another organization waits exactly when two do.
-                    WHEN EXISTS (
-                        SELECT 1
-                        FROM other_candidates any_other
-                        WHERE any_other.org_id <> (SELECT org_id FROM other_candidates LIMIT 1)
-                    )
-                    THEN $15
-                    ELSE GREATEST($15, LEAST($16, other.org_held + $12 - $17))
-                END
+                OR other.org_slots <= $15
+                -- Past its limit only while no other organization waits.
+                OR (SELECT orgs FROM waiting) = CASE WHEN other.org_held < $15 THEN 1 ELSE 0 END
+         ),
+         first_other AS (
+             SELECT operation_id, next_attempt_at, requested_at, claimable_at, reclaimed, first_start
+             FROM admissible
+             WHERE $15::BIGINT = 0
+                OR org_slots <= $15
+                OR admissible_rank <= $12 - $16
              ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
              LIMIT $12
          ),
@@ -2229,12 +2238,6 @@ async fn claim_operations(
             .limits
             .per_org_non_teardown
             .map_or(0, |limit| i64::from(limit.contended.get())),
-    )
-    .bind(
-        input
-            .limits
-            .per_org_non_teardown
-            .map_or(0, |limit| i64::from(limit.uncontended.get())),
     )
     .bind(
         input
