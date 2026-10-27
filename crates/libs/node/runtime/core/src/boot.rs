@@ -38,6 +38,8 @@ pub enum BootConfigError {
     },
     #[error("guest memory size overflows the runtime's byte count")]
     MemoryOverflow,
+    #[error("invalid runtime boot configuration: {0}")]
+    Invalid(&'static str),
     #[error("serialize runtime boot configuration: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -85,7 +87,7 @@ fn command_line(input: &LinuxBoot<'_>, devices: &str, uart: &str, console: &str)
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // The two REST protocols use the same token-bucket schema and millisecond units.
 // Queue topology remains an adapter policy, not part of this encoding.
@@ -102,4 +104,25 @@ fn object<const N: usize>(
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
         .collect()
+}
+
+/// Parsed, admitted input. Control adapters cannot accept unvalidated JSON.
+#[derive(Debug)]
+pub struct StandaloneBoot(cloud_hypervisor::Configuration);
+impl StandaloneBoot {
+    /// Encode the admitted device model for its runtime control protocol.
+    pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&self.0)
+    }
+}
+
+/// Parse the standalone adapter's privileged boot input before process launch.
+pub fn validate_standalone(
+    runtime: RuntimeKind,
+    configuration: &str,
+) -> Result<StandaloneBoot, BootConfigError> {
+    match runtime {
+        RuntimeKind::CloudHypervisor => cloud_hypervisor::parse(configuration).map(StandaloneBoot),
+        _ => Err(BootConfigError::UnsupportedRuntime(runtime)),
+    }
 }

@@ -73,7 +73,7 @@ pplx-space-net-gateway-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-metrics = { workspace = true }
-pplx-space-node-runtime-core = { workspace = true }
+pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime"] }
 pplx-space-spaced-common = { workspace = true }
 pplx-space-spaced-host-client = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
