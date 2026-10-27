@@ -346,14 +346,21 @@ counts only on an unsampled context: a sampled one is saved whatever its
 
 A `grpc.client` span that ends in a non-OK status is marked ERROR, except for
 an answer the call expects: a readiness poll's FAILED_PRECONDITION, a guest
-file or process operation's application status, and a code the caller marks
-on that one call with `ExpectedGrpcStatus`. A marked call records the code in
-`space.grpc.expected_status` whatever the answer. net-gateway marks its policy
-pulls PERMISSION_DENIED until sandbox-manager has registered it: a pull sent
-before the owner's first control call, within ten seconds of launch, and short
-of the last pending attempt. A marked pull's refusal is always retried; the
-refusal that ends the wait is still an ERROR span. Platform codes such as
-UNAVAILABLE and INTERNAL stay errors even when marked.
+file or process operation's application status, a lookup's NOT_FOUND, and a
+code the caller marks on that one call with `ExpectedGrpcStatus`. The NOT_FOUND
+lookups are `ClusterApi/FindTemplateRelease` (no release has that tag),
+`ClusterApi/GetArtifactBackupLocation` (no ready backup yet) and
+`WorkerApi/SpacedStat`, whose spans carry `space.grpc.expected_not_found=true`,
+and sandbox-manager's `SpacedStat`, `SpacedRead` and `SpacedList` when the
+status carries the guest-path-not-found reason; there a NOT_FOUND without it,
+such as a sandbox the node does not know, stays an error. A marked call
+records the code in `space.grpc.expected_status` whatever the answer.
+net-gateway marks its policy pulls PERMISSION_DENIED until sandbox-manager has
+registered it: a pull sent before the owner's first control call, within ten
+seconds of launch, and short of the last pending attempt. A marked pull's
+refusal is always retried; the refusal that ends the wait is still an ERROR
+span. Platform codes such as UNAVAILABLE and INTERNAL stay errors even when
+marked.
 
 ## S3 client spans
 

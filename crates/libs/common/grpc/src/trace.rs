@@ -88,7 +88,6 @@ fn expected_status_for<B>(request: &Request<B>) -> Option<tonic::Code> {
         .and_then(|expected| expected.honored())
 }
 
-const WORKER_API_SPACED_STAT_PATH: &str = "/space.node.api.v1.WorkerApi/SpacedStat";
 const WORKER_API_SPACED_PREFIX: &str = "/space.node.api.v1.WorkerApi/Spaced";
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,6 +121,7 @@ impl MakeClassifier for GrpcClientMakeClassifier {
                     | "/space.sandbox.manager.v1.SandboxManager/ServicePortIngress"
                     | "/space.net.gateway.v1.NetGatewayControl/ServicePortIngress"
             ),
+            guest_path_lookup: grpc_client_is_guest_path_lookup(path),
         }
     }
 }
@@ -132,12 +132,14 @@ impl MakeClassifier for GrpcClientMakeClassifier {
 pub struct GrpcClientClassifier {
     inner: GrpcErrorsAsFailures,
     service_port_ingress: bool,
+    guest_path_lookup: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct GrpcClientEosClassifier {
     inner: GrpcEosErrorsAsFailures,
     service_port_ingress: bool,
+    guest_path_lookup: bool,
 }
 
 /// Carry the request-specific error decision to OnFailure, which cannot recover
@@ -174,6 +176,11 @@ fn is_guest_refusal(headers: &HeaderMap) -> bool {
         .is_some_and(|status| crate::GuestServiceUnavailable::from_status(&status).is_some())
 }
 
+fn is_guest_path_not_found(headers: &HeaderMap) -> bool {
+    tonic::Status::from_header_map(headers)
+        .is_some_and(|status| crate::is_guest_path_not_found(&status))
+}
+
 impl ClassifyResponse for GrpcClientClassifier {
     type FailureClass = GrpcClientFailureClass;
     type ClassifyEos = GrpcClientEosClassifier;
@@ -182,7 +189,9 @@ impl ClassifyResponse for GrpcClientClassifier {
         self,
         response: &Response<B>,
     ) -> ClassifiedResponse<Self::FailureClass, Self::ClassifyEos> {
-        if self.service_port_ingress && is_guest_refusal(response.headers()) {
+        if (self.service_port_ingress && is_guest_refusal(response.headers()))
+            || (self.guest_path_lookup && is_guest_path_not_found(response.headers()))
+        {
             return ClassifiedResponse::Ready(Ok(()));
         }
         match self.inner.classify_response(response) {
@@ -195,6 +204,7 @@ impl ClassifyResponse for GrpcClientClassifier {
                 ClassifiedResponse::RequiresEos(GrpcClientEosClassifier {
                     inner,
                     service_port_ingress: self.service_port_ingress,
+                    guest_path_lookup: self.guest_path_lookup,
                 })
             }
         }
@@ -209,7 +219,9 @@ impl ClassifyEos for GrpcClientEosClassifier {
     type FailureClass = GrpcClientFailureClass;
 
     fn classify_eos(self, trailers: Option<&HeaderMap>) -> Result<(), Self::FailureClass> {
-        if self.service_port_ingress && trailers.is_some_and(is_guest_refusal) {
+        if (self.service_port_ingress && trailers.is_some_and(is_guest_refusal))
+            || (self.guest_path_lookup && trailers.is_some_and(is_guest_path_not_found))
+        {
             return Ok(());
         }
         self.inner
@@ -233,8 +245,33 @@ fn grpc_client_is_readiness_poll(path: &str) -> bool {
     )
 }
 
+/// RPCs whose NOT_FOUND is the answer to the question the caller asked, so it
+/// is classified as success. Each has no other NOT_FOUND, and every caller
+/// maps it to an absent value. Everywhere else NOT_FOUND stays an error.
 fn grpc_client_not_found_is_expected(path: &str) -> bool {
-    path == WORKER_API_SPACED_STAT_PATH
+    matches!(
+        path,
+        // The guest path does not exist. The WorkerApi's other Spaced methods
+        // expect every application status; see below.
+        "/space.node.api.v1.WorkerApi/SpacedStat"
+            // No release carries the requested tag, as for a prefetch tag that
+            // a template does not define. A by-hash miss stays an error.
+            | "/space.node.api.v1.ClusterApi/FindTemplateRelease"
+            // No ready backup of this artifact is placed on the caller's node.
+            | "/space.node.api.v1.ClusterApi/GetArtifactBackupLocation"
+    )
+}
+
+/// A file stat, read or list on sandbox-manager. Its NOT_FOUND is either the
+/// guest path missing, an answer, or the sandbox unknown to that node, an
+/// error. Only the answer carries the guest-path-not-found marker.
+fn grpc_client_is_guest_path_lookup(path: &str) -> bool {
+    matches!(
+        path,
+        "/space.sandbox.manager.v1.SandboxManager/SpacedStat"
+            | "/space.sandbox.manager.v1.SandboxManager/SpacedRead"
+            | "/space.sandbox.manager.v1.SandboxManager/SpacedList"
+    )
 }
 
 fn grpc_client_application_statuses_are_expected(path: &str) -> bool {
