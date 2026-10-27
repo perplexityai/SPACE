@@ -82,12 +82,26 @@ pub(super) fn e2b_native_resume_action() -> SandboxAction {
     SandboxAction::Restore
 }
 
+/// Whether a connect `timeout` should ask the worker to extend `policy`'s
+/// deadline. Like the other ECW lifecycle options, it applies only to a policy
+/// ECW manages; any other (such as a CommandIdle template default) keeps its own
+/// idle clock and the connect proceeds without the extension. A disabled policy
+/// is ECW-managed, so the extension is still sent and the worker's runtime
+/// policy decides the outcome; a rejection fails the connect.
+pub(super) fn connect_can_extend_access_deadline(policy: &AutoLifecyclePolicy) -> bool {
+    crate::e2b::is_ecw_managed(policy)
+}
+
 pub(super) fn e2b_policy_for_resume_update(
     current_policy: &AutoLifecyclePolicy,
     timeout_secs: Option<u32>,
     auto_pause: Option<bool>,
 ) -> Option<AutoLifecyclePolicy> {
     if timeout_secs.is_none() && auto_pause.is_none() {
+        return None;
+    }
+    // Like create and timeout, leave a policy ECW doesn't own untouched.
+    if !crate::e2b::is_ecw_managed(current_policy) {
         return None;
     }
     let current_config = e2b_lifecycle_config_from_policy(current_policy);
@@ -102,7 +116,8 @@ pub(super) fn e2b_policy_for_resume_update(
             .map(|config| config.auto_resume)
             .unwrap_or(false),
     );
-    (updated_policy != *current_policy).then_some(updated_policy)
+    (updated_policy.clone().normalized() != current_policy.clone().normalized())
+        .then_some(updated_policy)
 }
 
 pub(super) fn e2b_policy_for_refresh(
@@ -354,6 +369,7 @@ pub(super) async fn create_sandbox(
             &state.pool,
             &actor,
             &translated.native,
+            crate::controllers::sandbox::RequestAutoLifecycleOrigin::SynthesizedDefault,
             SandboxApiMetricIdentity::ecw("create"),
             federated_create,
         )
@@ -939,7 +955,17 @@ pub(super) async fn connect_sandbox_inner(
         .auto_lifecycle
         .as_ref()
         .unwrap_or(&sandbox.auto_lifecycle.0);
-    let requested_timeout_secs = body.and_then(|crate::e2b::E2bJson(request)| request.timeout);
+    // A connect `timeout` applies only to a policy ECW manages. Drop it before
+    // the touch decision too, so it neither forces a keepalive touch nor extends
+    // the deadline of any other policy (such as a CommandIdle template default).
+    let requested_timeout_secs = match body.and_then(|crate::e2b::E2bJson(request)| request.timeout)
+    {
+        Some(_) if !connect_can_extend_access_deadline(current_policy) => {
+            pplx_space_metrics::sandbox::api::ecw_unmanaged_policy_request("connect");
+            None
+        }
+        requested => requested,
+    };
     let connect_should_touch =
         should_touch_on_connect(current_policy, requested_timeout_secs, &native);
     let mut refreshed_response = None;
@@ -1260,16 +1286,22 @@ async fn update_resuming_sandbox_policy(
     if sandbox.lifecycle.eq_ignore_ascii_case("failed") {
         return Err(E2bApiError::failed_to_place_sandbox());
     }
-    if let Some(policy) = e2b_policy_for_resume_update(
-        &sandbox.auto_lifecycle.0,
-        request.timeout,
-        request.auto_pause,
-    ) {
-        state
-            .sandbox_controller
-            .set_auto_lifecycle_policy(&state.pool, &sandbox, policy)
-            .await
-            .map_err(controller_error)?;
+    if request.timeout.is_none() && request.auto_pause.is_none() {
+        return Ok(());
+    }
+    // Decide under the row lock: a stale read could replace a policy ECW doesn't
+    // own that a concurrent update just installed.
+    let mut unmanaged = false;
+    state
+        .sandbox_controller
+        .update_auto_lifecycle_policy_with(&state.pool, sandbox.id, |current| {
+            unmanaged = !crate::e2b::is_ecw_managed(current);
+            e2b_policy_for_resume_update(current, request.timeout, request.auto_pause)
+        })
+        .await
+        .map_err(controller_error)?;
+    if unmanaged {
+        pplx_space_metrics::sandbox::api::ecw_unmanaged_policy_request("resume");
     }
     Ok(())
 }
@@ -1359,7 +1391,7 @@ pub(super) async fn timeout_sandbox(
     }
     let observed_at = touch_observed_at_now()?;
     let deadline = tokio::time::Instant::now() + crate::controllers::substrate::NODE_RPC_TIMEOUT;
-    state
+    let outcome = state
         .sandbox_controller
         .set_access_idle_timeout(
             &state.pool,
@@ -1371,6 +1403,15 @@ pub(super) async fn timeout_sandbox(
         )
         .await
         .map_err(controller_error)?;
+    // A policy ECW doesn't own (such as a CommandIdle template default) is left
+    // untouched; the controller decides under the row lock.
+    if let crate::controllers::sandbox::AccessIdleTimeoutOutcome::Unmanaged = outcome {
+        pplx_space_metrics::sandbox::api::ecw_unmanaged_policy_request("timeout");
+        tracing::debug!(
+            sandbox_id = %sandbox.id,
+            "skipping E2B timeout for non-E2B auto lifecycle policy",
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

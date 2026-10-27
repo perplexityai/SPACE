@@ -1072,6 +1072,23 @@ bias cohort shares and percentiles. Use independently counted caller requests
 for population latency, error and cancellation rates; restore counters and
 reconnect-attempt counters do not necessarily count one event per connect.
 
+## ECW lifecycle options on other policies
+
+ECW lifecycle options reshape only a policy ECW manages: a disabled policy, or
+the single access-idle rule ECW synthesizes. When a sandbox's policy is anything
+else, such as a CommandIdle template default, that policy wins: ECW create keeps
+it, `/timeout` and a resume `timeout` or `autoPause` leave it unchanged, a
+connect `timeout` is ignored, and a fork target inherits it instead of taking
+the requested lifetime.
+
+`space.sandbox.api.ecw.unmanaged_policy_request`, tagged `op` (`create`,
+`timeout`, `resume`, `connect`, or `fork`), counts ECW requests that met such a
+policy. ECW fills in default lifecycle options, so it counts requests, not
+options the caller set explicitly. `op:create` counts create attempts, including
+ones that later fail, and `op:fork` counts each fork target creation attempt,
+retries included. A sustained `op:timeout` rate means a client is still sending
+`/timeout` heartbeats that no longer change anything.
+
 ## Sandbox create shape
 
 `create_completed` events carry the resolved `vcpu` and `memory_mib` and a

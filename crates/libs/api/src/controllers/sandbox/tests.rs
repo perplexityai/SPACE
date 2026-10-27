@@ -205,10 +205,116 @@ mod policy_tests {
 
     use pplx_space_common_core::types::{
         AutoLifecycleConditionKind, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-        AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
+        AutoLifecycleIdleAction, AutoLifecycleStage, AutoLifecycleWakePolicy,
+        AutoLifecycleWakeSource,
     };
 
     use super::*;
+    use crate::test_support::command_idle_suspend_policy;
+
+    /// The policy ECW create synthesizes from a request timeout.
+    fn synthesized_access_idle_policy(timeout_secs: u32) -> AutoLifecyclePolicy {
+        crate::e2b::auto_lifecycle_policy(timeout_secs, false, false).normalized()
+    }
+
+    fn guest_activity_suspend_policy(timeout_secs: u64) -> AutoLifecyclePolicy {
+        AutoLifecyclePolicy {
+            wake: AutoLifecycleWakePolicy::default(),
+            condition_sets: BTreeMap::from([(
+                AutoLifecycleConditionSetId::GuestActivity,
+                AutoLifecycleConditionSet::guest_activity(Some("30s".parse().unwrap())),
+            )]),
+            stages: vec![AutoLifecycleStage {
+                condition_set: AutoLifecycleConditionSetId::GuestActivity,
+                at: timeout_secs,
+                action: AutoLifecycleIdleAction::Suspend,
+            }],
+        }
+        .normalized()
+    }
+
+    #[test]
+    fn command_idle_template_default_wins_over_synthesized_access_idle() {
+        // ECW create always fabricates (synthesizes) an AccessIdle policy from the request
+        // timeout. For a template whose default is CommandIdle, that default must win so
+        // the sandbox keeps its command-driven idle lifecycle instead of being
+        // downgraded.
+        let request = synthesized_access_idle_policy(300);
+        let template_default = command_idle_suspend_policy(600);
+
+        let resolved = resolve_create_auto_lifecycle(
+            Some(&request),
+            RequestAutoLifecycleOrigin::SynthesizedDefault,
+            &template_default,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, template_default);
+    }
+
+    #[test]
+    fn synthesized_request_wins_when_template_default_is_ecw_managed() {
+        // A template default ECW manages (here none) yields to the synthesized policy.
+        let request = synthesized_access_idle_policy(300);
+        let template_default = AutoLifecyclePolicy::disabled();
+
+        let resolved = resolve_create_auto_lifecycle(
+            Some(&request),
+            RequestAutoLifecycleOrigin::SynthesizedDefault,
+            &template_default,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, request);
+    }
+
+    #[test]
+    fn explicit_access_idle_request_wins_over_command_idle_template_default() {
+        // A native caller's explicit policy is authoritative and must not be silently dropped
+        // (or skip validation) just because the template default is non-access.
+        let request = synthesized_access_idle_policy(120);
+        let template_default = command_idle_suspend_policy(600);
+
+        let resolved = resolve_create_auto_lifecycle(
+            Some(&request),
+            RequestAutoLifecycleOrigin::Explicit,
+            &template_default,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, request);
+    }
+
+    #[test]
+    fn template_default_used_when_request_is_absent() {
+        let template_default = command_idle_suspend_policy(600);
+
+        let resolved = resolve_create_auto_lifecycle(
+            None,
+            RequestAutoLifecycleOrigin::SynthesizedDefault,
+            &template_default,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, template_default);
+    }
+
+    #[test]
+    fn guest_activity_template_default_wins_over_synthesized_access_idle() {
+        // The rule generalizes beyond CommandIdle: any template default ECW doesn't manage
+        // (here GuestActivity) is preserved against a synthesized AccessIdle request.
+        let template_default = guest_activity_suspend_policy(600);
+        let request = synthesized_access_idle_policy(300);
+
+        let resolved = resolve_create_auto_lifecycle(
+            Some(&request),
+            RequestAutoLifecycleOrigin::SynthesizedDefault,
+            &template_default,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, template_default);
+    }
 
     #[test]
     fn create_auto_lifecycle_policy_rejects_invalid_policy() {

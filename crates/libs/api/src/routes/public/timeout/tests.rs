@@ -248,6 +248,73 @@ async fn timeout_validation_scope_and_policy_matrix() -> TestDbResult<()> {
 }
 
 #[tokio::test]
+async fn ecw_lifecycle_options_leave_an_unmanaged_policy_unchanged() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let policy = crate::test_support::command_idle_suspend_policy(600);
+    let id = seed(&db.pool, "suspended", &policy, None).await?;
+    let sandbox = fetch_sandbox(&db.pool, id).await?.unwrap();
+    let state = AppState::from_pool(db.pool.clone()).await?;
+
+    // ECW `/timeout` passes no expected policy and decides under the row lock.
+    let outcome = state
+        .sandbox_controller
+        .set_access_idle_timeout(
+            &db.pool,
+            &sandbox,
+            90,
+            prost_types::Timestamp {
+                seconds: OffsetDateTime::now_utc().unix_timestamp(),
+                nanos: 0,
+            },
+            tokio::time::Instant::now() + NODE_RPC_TIMEOUT,
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    assert!(matches!(outcome, AccessIdleTimeoutOutcome::Unmanaged));
+
+    // ECW resume options decide under the same lock.
+    let wrote = state
+        .sandbox_controller
+        .update_auto_lifecycle_policy_with(&db.pool, id, |current| {
+            crate::e2b::is_ecw_managed(current)
+                .then(|| crate::e2b::auto_lifecycle_policy(90, true, false))
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    assert!(!wrote);
+
+    let SqlJson(stored): SqlJson<AutoLifecyclePolicy> = sqlx::query_scalar(sql!(
+        "SELECT auto_lifecycle_json FROM sandboxes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(stored, policy);
+
+    // A policy ECW manages is replaced.
+    let managed = crate::e2b::auto_lifecycle_policy(300, false, false).normalized();
+    let id = seed(&db.pool, "suspended", &managed, None).await?;
+    let replacement = crate::e2b::auto_lifecycle_policy(90, true, false).normalized();
+    let wrote = state
+        .sandbox_controller
+        .update_auto_lifecycle_policy_with(&db.pool, id, |current| {
+            crate::e2b::is_ecw_managed(current).then(|| replacement.clone())
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    assert!(wrote);
+    let SqlJson(stored): SqlJson<AutoLifecyclePolicy> = sqlx::query_scalar(sql!(
+        "SELECT auto_lifecycle_json FROM sandboxes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(stored, replacement);
+    Ok(())
+}
+
+#[tokio::test]
 async fn dormant_timeout_persists_without_waking_and_caches_retries() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let app = app(&db.pool).await?;

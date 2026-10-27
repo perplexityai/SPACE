@@ -150,6 +150,25 @@ pub(crate) fn policy_for_timeout_update(
     )
 }
 
+/// Whether `policy` is one the ECW surface owns: disabled, or exactly the single
+/// access-idle rule ECW synthesizes. ECW create and timeout yield to any other policy,
+/// such as a CommandIdle or GuestActivity template default, instead of replacing it
+/// with an access-idle one.
+pub(crate) fn is_ecw_managed(policy: &AutoLifecyclePolicy) -> bool {
+    let policy = policy.clone().normalized();
+    if policy.is_disabled() {
+        return true;
+    }
+    let (Some(config), [stage]) = (
+        lifecycle_config_from_policy(&policy),
+        policy.stages.as_slice(),
+    ) else {
+        return false;
+    };
+    // Compare against the stage's own duration: the ECW config clamps it to `u32`.
+    access_idle_policy(stage.at, config.auto_pause, config.auto_resume).normalized() == policy
+}
+
 pub(crate) fn build_sandbox_response(
     keyring: &EcwCredentialKeyring,
     native: &SandboxResponse,
