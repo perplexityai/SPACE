@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # space-images.sh — the SPACE images the Kind harness builds locally and loads
-# into every node under Tilt's `<name>:tilt-<hash>` rewrite of their
-# `<name>:local` refs (the Tiltfile's custom_builds).
+# into the nodes that run them under the `<name>:tilt-<hash>` references Tilt
+# deploys in place of their `<name>:local` refs (the Tiltfile's custom_builds).
 #
 # Source it for the array, or run it to print one name per line (the
 # superseded-image prune reads that). These are the only repositories
