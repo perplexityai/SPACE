@@ -376,16 +376,11 @@ pub async fn run<E>(
     }
     // The effective width, after the ceiling clamp. Nothing else exposes it,
     // so without this line an over-ceiling setting looks like it took effect.
-    let concurrency = config.execution_concurrency.max(1);
-    let teardown_reserved_slots = config.teardown_reserved_slots.min(concurrency - 1);
-    // At least one slot always stays open to teardowns too.
-    let other_reserved_slots = config
-        .other_reserved_slots
-        .min(concurrency - teardown_reserved_slots.max(1));
+    let slots = SlotPolicy::new(&config);
     tracing::info!(
         execution_concurrency = config.execution_concurrency,
-        teardown_reserved_slots,
-        other_reserved_slots,
+        teardown_reserved_slots = slots.teardown_reserved,
+        other_reserved_slots = slots.other_reserved,
         keyed_claim_enabled = config.keyed_claim_enabled,
         retry_deferral_enabled = config.retry_deferral_enabled,
         "starting public-operation-dispatcher"
@@ -399,11 +394,8 @@ pub async fn run<E>(
     // one of `execution_concurrency` slots but does not delay pickup into the
     // others. `busy_keys` is this process's view of the claim's one-per-
     // sandbox rule: a claim that would overlap a local execution of its key
-    // is handed back, beside the loop, instead of running twice. Executions
-    // other than teardowns may hold all but the slots reserved for teardowns;
-    // while other work is due, teardowns leave the last free slots other work
-    // may use to it.
-    let other_concurrency = concurrency - teardown_reserved_slots;
+    // is handed back, beside the loop, instead of running twice. `slots`
+    // splits the free slots between teardowns and other work at each claim.
     let mut claim_backoff_until: Option<Instant> = None;
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
@@ -429,9 +421,9 @@ pub async fn run<E>(
                 }
                 pplx_space_metrics::operations::dispatcher_slots(
                     in_flight.len(),
-                    concurrency,
+                    slots.concurrency,
                     other_tasks.len(),
-                    other_concurrency,
+                    slots.other_concurrency(),
                 );
                 if last_expiry_sweep.is_none_or(|at| at.elapsed() >= EXPIRY_SWEEP_INTERVAL) {
                     last_expiry_sweep = Some(Instant::now());
@@ -448,37 +440,16 @@ pub async fn run<E>(
                         );
                     }
                 }
-                let free = concurrency.saturating_sub(in_flight.len());
-                if free == 0
+                let claim_slots = slots.claim_slots(in_flight.len(), other_tasks.len());
+                if claim_slots.free == 0
                     || claim_backoff_until.is_some_and(|until| Instant::now() < until)
                 {
                     continue;
                 }
-                let free_other = other_concurrency.saturating_sub(other_tasks.len());
-                // While other work is due, teardowns leave free the last
-                // slots other work may use, however many it already holds,
-                // but never the free slots owed to teardowns: what is left
-                // of their reservation or, with none, one while none runs.
-                let teardown_tasks = in_flight.len().saturating_sub(other_tasks.len());
-                let owed_to_teardowns = teardown_reserved_slots
-                    .max(1)
-                    .saturating_sub(teardown_tasks)
-                    .min(free);
-                let free_teardown_while_other_due =
-                    free - other_reserved_slots.min(free - owed_to_teardowns);
                 #[cfg(test)]
                 tests::before_claim().await;
                 let started = Instant::now();
-                match claim_up_to(
-                    &config,
-                    &store,
-                    &executor,
-                    ClaimSlots {
-                        free,
-                        free_other,
-                        free_teardown_while_other_due,
-                    },
-                ).await {
+                match claim_up_to(&config, &store, &executor, claim_slots).await {
                     Ok(claim) => {
                         // An execution that committed while the claim ran
                         // must not make its successor look busy.
@@ -489,7 +460,7 @@ pub async fn run<E>(
                         }
                         let claimed = claim.operations.len();
                         // Only a teardown could start, and none was due.
-                        claim_backoff_until = (claimed == 0 && free_other == 0 && !finished_meanwhile)
+                        claim_backoff_until = (claimed == 0 && claim_slots.free_other == 0 && !finished_meanwhile)
                             .then(|| Instant::now() + HELD_BACK_CLAIM_BACKOFF);
                         for operation in claim.operations {
                             let key = config
@@ -661,8 +632,68 @@ fn log_execution_outcome(
     }
 }
 
-/// Free execution slots, by what may use them.
-#[derive(Debug, Clone, Copy)]
+/// How the dispatcher's execution slots are shared between teardowns
+/// (sandbox deletes and kills) and other work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlotPolicy {
+    /// Execution slots; at least one.
+    concurrency: usize,
+    /// Slots only teardowns may use. At most `concurrency - 1`, so at least
+    /// one slot stays open to other work.
+    teardown_reserved: usize,
+    /// How many of the free slots other work may use teardowns leave free
+    /// while other work is due, however many slots either class already
+    /// holds. At most `concurrency` minus `teardown_reserved`, or minus one
+    /// without a reservation, so at least one slot stays open to teardowns.
+    other_reserved: usize,
+}
+
+impl SlotPolicy {
+    /// The configured settings, clamped so each class keeps a slot.
+    fn new(config: &ReconcilerConfig) -> Self {
+        let concurrency = config.execution_concurrency.max(1);
+        let teardown_reserved = config.teardown_reserved_slots.min(concurrency - 1);
+        Self {
+            concurrency,
+            teardown_reserved,
+            other_reserved: config
+                .other_reserved_slots
+                .min(concurrency - teardown_reserved.max(1)),
+        }
+    }
+
+    /// The slots executions other than teardowns may hold.
+    fn other_concurrency(self) -> usize {
+        self.concurrency - self.teardown_reserved
+    }
+
+    /// The free slots, by what may use them, while `in_flight` executions
+    /// run, `other_in_flight` of them other than teardowns.
+    fn claim_slots(self, in_flight: usize, other_in_flight: usize) -> ClaimSlots {
+        let free = self.concurrency.saturating_sub(in_flight);
+        // While other work is due, teardowns leave free the last slots other
+        // work may use, but never the free slots owed to teardowns: what is
+        // left of their reservation or, with none, one while none runs.
+        let teardown_in_flight = in_flight.saturating_sub(other_in_flight);
+        let owed_to_teardowns = self
+            .teardown_reserved
+            .max(1)
+            .saturating_sub(teardown_in_flight)
+            .min(free);
+        ClaimSlots {
+            free,
+            free_other: self
+                .other_concurrency()
+                .saturating_sub(other_in_flight)
+                .min(free),
+            free_teardown_while_other_due: free - self.other_reserved.min(free - owed_to_teardowns),
+        }
+    }
+}
+
+/// Free execution slots, by what may use them; neither class gets more than
+/// `free`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ClaimSlots {
     free: usize,
     /// Free slots other work may use.

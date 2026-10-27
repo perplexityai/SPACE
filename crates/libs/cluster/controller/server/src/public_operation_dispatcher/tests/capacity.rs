@@ -116,6 +116,120 @@ fn reserved_slots_parse_from_the_environment() {
     }
 }
 
+#[test]
+fn slot_policy_keeps_each_class_its_slots() {
+    // (execution_concurrency, teardown_reserved, other_reserved) as
+    // configured, the policy they clamp to, then (in_flight,
+    // other_in_flight) and the claim's (free, free_other,
+    // free_teardown_while_other_due).
+    type Case = (
+        (usize, usize, usize),
+        (usize, usize, usize),
+        (usize, usize),
+        (usize, usize, usize),
+    );
+    let cases: &[Case] = &[
+        // The defaults on an idle dispatcher: other work may use 14, and
+        // teardowns leave it 2 while it is due.
+        ((16, 2, 2), (16, 2, 2), (0, 0), (16, 14, 14)),
+        // Other work holds every slot open to it: only the reservation is
+        // free, and teardowns may take both slots of it.
+        ((16, 2, 2), (16, 2, 2), (14, 14), (2, 0, 2)),
+        // The floor keeps free slots, however many other work holds.
+        ((16, 2, 2), (16, 2, 2), (10, 10), (6, 4, 4)),
+        // Teardowns hold more than their reservation: other work may still
+        // use what is free, and nothing more is owed to teardowns.
+        ((4, 1, 1), (4, 1, 1), (3, 0), (1, 1, 0)),
+        ((16, 2, 2), (16, 2, 2), (12, 4), (4, 4, 2)),
+        // No reservation: other work may use every free slot, but the
+        // floor still leaves a teardown one while none runs...
+        ((4, 0, 3), (4, 0, 3), (0, 0), (4, 4, 1)),
+        // ...even with other work running, which takes from what other
+        // work may use but not from what teardowns are owed: the floor is
+        // bounded by `free - owed`, not by `min(free, free_other)`.
+        ((4, 0, 3), (4, 0, 3), (1, 1), (3, 3, 1)),
+        // With a teardown running, the floor may keep every free slot.
+        ((4, 0, 3), (4, 0, 3), (1, 0), (3, 3, 0)),
+        // Both off: one shared pool.
+        ((8, 0, 0), (8, 0, 0), (3, 1), (5, 5, 5)),
+        // One slot: no reservation either way, and both classes share it.
+        ((1, 1, 1), (1, 0, 0), (0, 0), (1, 1, 1)),
+        ((1, 5, 5), (1, 0, 0), (1, 1), (0, 0, 0)),
+        // Zero slots configured means one.
+        ((0, 0, 0), (1, 0, 0), (0, 0), (1, 1, 1)),
+        // Settings above the slot count leave each class a slot.
+        ((3, 9, 9), (3, 2, 1), (0, 0), (3, 1, 2)),
+        ((3, 0, 9), (3, 0, 2), (0, 0), (3, 3, 1)),
+        // More running than slots, as after a lower setting: no underflow.
+        ((4, 1, 1), (4, 1, 1), (6, 5), (0, 0, 0)),
+    ];
+    let policy_for = |execution_concurrency, teardown_reserved_slots, other_reserved_slots| {
+        SlotPolicy::new(&ReconcilerConfig {
+            execution_concurrency,
+            teardown_reserved_slots,
+            other_reserved_slots,
+            ..ReconcilerConfig::default()
+        })
+    };
+    for &(configured, policy, (in_flight, other_in_flight), claim) in cases {
+        let slots = policy_for(configured.0, configured.1, configured.2);
+        assert_eq!(
+            (
+                slots.concurrency,
+                slots.teardown_reserved,
+                slots.other_reserved
+            ),
+            policy,
+            "{configured:?}"
+        );
+        let got = slots.claim_slots(in_flight, other_in_flight);
+        assert_eq!(
+            (got.free, got.free_other, got.free_teardown_while_other_due),
+            claim,
+            "{configured:?} with {in_flight} running, {other_in_flight} other"
+        );
+    }
+
+    // And for every small setting and load: neither class gets more than is
+    // free, other work never takes the teardown reservation, the floor keeps
+    // no more than its setting and never the slots owed to teardowns, and
+    // an idle dispatcher has a slot open to each class.
+    for concurrency in 0..=6 {
+        for teardown_reserved in 0..=7 {
+            for other_reserved in 0..=7 {
+                let slots = policy_for(concurrency, teardown_reserved, other_reserved);
+                for in_flight in 0..=slots.concurrency + 1 {
+                    for other_in_flight in 0..=in_flight {
+                        let case =
+                            format!("{slots:?} with {in_flight} running, {other_in_flight} other");
+                        let got = slots.claim_slots(in_flight, other_in_flight);
+                        assert!(got.free_other <= got.free, "{case}");
+                        assert!(got.free_teardown_while_other_due <= got.free, "{case}");
+                        assert!(
+                            other_in_flight + got.free_other
+                                <= slots.other_concurrency().max(other_in_flight),
+                            "{case}"
+                        );
+                        assert!(
+                            got.free - got.free_teardown_while_other_due <= slots.other_reserved,
+                            "{case}"
+                        );
+                        let owed = slots
+                            .teardown_reserved
+                            .max(1)
+                            .saturating_sub(in_flight - other_in_flight)
+                            .min(got.free);
+                        assert!(got.free_teardown_while_other_due >= owed, "{case}");
+                    }
+                }
+                let idle = slots.claim_slots(0, 0);
+                assert!(idle.free_other >= 1, "{slots:?}");
+                assert!(idle.free_teardown_while_other_due >= 1, "{slots:?}");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_claim_takes_no_more_than_its_non_teardown_limit_of_other_work() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
