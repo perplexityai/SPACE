@@ -774,6 +774,11 @@ const PROCESS_START_IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 /// value read at this boundary.
 const MAX_PROCESS_START_IDEMPOTENCY_KEY_BYTES: usize = 256;
 
+/// This route does not use `IdempotencyKey::parse_header`, the rule for routes
+/// that require the header. Here the key is optional, is trimmed, and is
+/// digested into a fixed-size key before it reaches the sandbox, so the caller's
+/// value is never stored. The 256-byte bound and the error answer are what
+/// envd-compatible clients already see.
 fn process_start_client_idempotency_key(
     headers: &HeaderMap,
 ) -> Result<Option<&str>, EcwProxyError> {
