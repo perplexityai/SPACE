@@ -469,8 +469,13 @@ fn full_rollback_restage_writes_only_over_a_stopped_row() {
 /// ordering. An in-use row, including one a failed row commit left `deleting`,
 /// refuses the name. An unreadable row answers `Internal`, and a row naming
 /// another path `FailedPrecondition`. Delete-all omits each of them from
-/// `deleted` and goes on. None reaches node-manager. A failed byte delete
-/// answers `Internal` by name and passes node-manager's status through for all.
+/// `deleted` and goes on. None reaches node-manager. A catalogued snapshot is
+/// renamed to GC staging, and node-manager deletes that path once the
+/// artifact lock is released; once the rename and the row delete are done the
+/// snapshot is deleted, even if node-manager then fails. A snapshot without a
+/// row is deleted in place under the lock, as before, and a failed
+/// byte delete answers `Internal` by name and passes node-manager's status
+/// through for all.
 #[tokio::test]
 async fn delete_snapshots_answers_each_named_delete_outcome() {
     use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
@@ -478,45 +483,60 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
         BtrfsSnapshotInfo, DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
         ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
     };
+    use std::path::Path;
     use tonic::Code;
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Setup {
         Deletable,
+        StagingDeleteFails,
         Pinned,
         AlreadyDeleting,
         UnreadableRow,
         PathDiffers,
         UncataloguedDeleteFails,
     }
+    /// The path node-manager is asked to delete.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Deletes {
+        Nothing,
+        LocalPath,
+        Staging,
+    }
     const NAME: &str = "d-user-keep";
     // (setup, byte delete requested, single-name answer, delete-all answer:
     // whether the snapshot is listed as deleted; an error is its code and the
     // start of its message)
     type Answer<T> = Result<T, (Code, &'static str)>;
-    let cases: [(Setup, bool, Answer<()>, Answer<bool>); 6] = [
-        (Setup::Deletable, true, Ok(()), Ok(true)),
+    let cases: [(Setup, Deletes, Answer<()>, Answer<bool>); 7] = [
+        (Setup::Deletable, Deletes::Staging, Ok(()), Ok(true)),
+        (
+            Setup::StagingDeleteFails,
+            Deletes::Staging,
+            Ok(()),
+            Ok(true),
+        ),
         (
             Setup::Pinned,
-            false,
+            Deletes::Nothing,
             Err((Code::FailedPrecondition, "snapshot is in use")),
             Ok(false),
         ),
         (
             Setup::AlreadyDeleting,
-            false,
+            Deletes::Nothing,
             Err((Code::FailedPrecondition, "snapshot is in use")),
             Ok(false),
         ),
         (
             Setup::UnreadableRow,
-            false,
+            Deletes::Nothing,
             Err((Code::Internal, "inspect snapshot publication")),
             Ok(false),
         ),
         (
             Setup::PathDiffers,
-            false,
+            Deletes::Nothing,
             Err((
                 Code::FailedPrecondition,
                 "delete snapshot publication path differs",
@@ -525,7 +545,7 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
         ),
         (
             Setup::UncataloguedDeleteFails,
-            true,
+            Deletes::LocalPath,
             Err((Code::Internal, "delete snapshot failed")),
             Err((Code::Unavailable, "injected byte delete failure")),
         ),
@@ -533,7 +553,13 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
     for all in [false, true] {
         for (setup, byte_delete, single, delete_all) in cases {
             let case = format!("{setup:?}, all={all}");
+            let sandbox = SandboxId::new().to_string();
+            // Each requested path, with whether the sandbox's artifact lock
+            // was held while node-manager deleted it.
             let deletions = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let coordinator = Arc::new(std::sync::OnceLock::<
+                crate::auto_lifecycle::AutoLifecycleCoordinator,
+            >::new());
             let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
                 .unary("ListBtrfsSnapshots", |_: ListBtrfsSnapshotsRequest| {
                     Ok(ListBtrfsSnapshotsResponse {
@@ -545,10 +571,26 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
                     })
                 })
                 .unary("DeleteCacheArtifact", {
-                    let deletions = Arc::clone(&deletions);
+                    let (deletions, coordinator, sandbox) = (
+                        Arc::clone(&deletions),
+                        Arc::clone(&coordinator),
+                        sandbox.clone(),
+                    );
                     move |request: DeleteCacheArtifactRequest| {
-                        deletions.lock().unwrap().push(request.local_path);
-                        if setup == Setup::UncataloguedDeleteFails {
+                        let lock_held = coordinator
+                            .get()
+                            .expect("the service is built before any delete")
+                            .artifact_lock(&sandbox)
+                            .try_lock_owned()
+                            .is_err();
+                        deletions
+                            .lock()
+                            .unwrap()
+                            .push((request.local_path, lock_held));
+                        if matches!(
+                            setup,
+                            Setup::StagingDeleteFails | Setup::UncataloguedDeleteFails
+                        ) {
                             return Err(Status::unavailable("injected byte delete failure"));
                         }
                         Ok(DeleteCacheArtifactResponse { was_present: true })
@@ -557,7 +599,6 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
                 .serve();
             let scratch = tempfile::tempdir().unwrap();
             let conn = crate::db::test_conn();
-            let sandbox = SandboxId::new().to_string();
             crate::db::fixture::insert_test_sandbox(&conn, &sandbox, SandboxState::Stopped);
             let service = SandboxManagerService::new_with_options(
                 conn,
@@ -566,12 +607,27 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
                     ..SandboxManagerServiceOptions::for_test_in(scratch.path())
                 },
             );
-            let local_path =
-                pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(&sandbox, NAME);
+            coordinator
+                .set(service.auto_lifecycle.clone())
+                .unwrap_or_else(|_| unreachable!());
+            // `for_test_in` roots the sandbox cache here.
+            let local_path = format!(
+                "{}/cache/{sandbox}/snapshots/{NAME}",
+                scratch.path().display()
+            );
+            std::fs::create_dir_all(&local_path).unwrap();
             let artifact = LocalArtifactId::new();
+            let staging = format!(
+                "{}/cache/{sandbox}/snapshots/.gc-pending-{artifact}",
+                scratch.path().display()
+            );
             if matches!(
                 setup,
-                Setup::Deletable | Setup::Pinned | Setup::AlreadyDeleting | Setup::PathDiffers
+                Setup::Deletable
+                    | Setup::StagingDeleteFails
+                    | Setup::Pinned
+                    | Setup::AlreadyDeleting
+                    | Setup::PathDiffers
             ) {
                 let published = if setup == Setup::PathDiffers {
                     format!("{local_path}-elsewhere")
@@ -614,7 +670,10 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
                     )
                     .unwrap();
                 }
-                Setup::Deletable | Setup::PathDiffers | Setup::UncataloguedDeleteFails => {}
+                Setup::Deletable
+                | Setup::StagingDeleteFails
+                | Setup::PathDiffers
+                | Setup::UncataloguedDeleteFails => {}
             }
             drop(db);
 
@@ -645,12 +704,180 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
                 }
                 (result, expected) => panic!("{case}: {result:?}, expected {expected:?}"),
             }
-            let requested = if byte_delete {
-                vec![local_path]
-            } else {
-                Vec::new()
+            // A snapshot without a row is deleted in place under the lock, as
+            // before; staging is deleted once the lock is released.
+            let requested = match byte_delete {
+                Deletes::Nothing => Vec::new(),
+                Deletes::LocalPath => vec![(local_path.clone(), true)],
+                Deletes::Staging => vec![(staging.clone(), false)],
             };
             assert_eq!(*deletions.lock().unwrap(), requested, "{case}");
+            // The fake deletes nothing, so the bytes are wherever sbx-mgr left them.
+            let staged = byte_delete == Deletes::Staging;
+            assert_eq!(Path::new(&local_path).exists(), !staged, "{case}");
+            assert_eq!(Path::new(&staging).exists(), staged, "{case}");
         }
     }
+}
+
+/// GC staging, in the fixed-length `.gc-pending-<id>` shape and in the earlier
+/// `<name>.gc-pending-<id>` one that keeps the snapshot's own name.
+fn gc_staging_names() -> [String; 2] {
+    let id = pplx_space_common_core::types::LocalArtifactId::new();
+    [
+        format!(".gc-pending-{id}"),
+        format!("d-user-keep.gc-pending-{id}"),
+    ]
+}
+
+/// Node-manager lists GC staging among a sandbox's snapshots, and ListSnapshots
+/// leaves it out, from that listing and from its own scan for full snapshots.
+#[test]
+fn snapshot_inventory_omits_gc_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let id = pplx_space_common_core::types::LocalArtifactId::new();
+    // Only on disk: the scan for full snapshots finds it.
+    std::fs::create_dir(
+        root.path()
+            .join(format!("f-manual-20260101T000000Z.gc-pending-{id}")),
+    )
+    .unwrap();
+    let btrfs = std::iter::once("d-user-keep".to_string())
+        .chain(gc_staging_names())
+        .map(|name| {
+            std::fs::create_dir(root.path().join(&name)).unwrap();
+            pplx_space_node_mgr_client::proto::BtrfsSnapshotInfo {
+                name,
+                ..Default::default()
+            }
+        })
+        .collect();
+    let snapshots =
+        project_snapshot_inventory("sbx", "template", None, root.path(), btrfs, Vec::new())
+            .unwrap();
+    let listed: Vec<_> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.as_str())
+        .collect();
+    assert_eq!(listed, ["d-user-keep"]);
+}
+
+/// GC staging is logically deleted bytes that only the orphan sweep removes, so
+/// no snapshot RPC treats it as a snapshot. Deleting it by name, rolling back to
+/// it and exporting it are refused, and delete-all passes over it. None reaches
+/// node-manager's delete, and the staging stays for the sweep.
+#[tokio::test]
+async fn snapshot_rpcs_refuse_gc_staging() {
+    use pplx_space_node_mgr_client::proto::{
+        BtrfsSnapshotInfo, DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+        ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
+    };
+
+    let staging = gc_staging_names();
+    let deletions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listed = staging.clone();
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("ListBtrfsSnapshots", move |_: ListBtrfsSnapshotsRequest| {
+            Ok(ListBtrfsSnapshotsResponse {
+                snapshots: listed
+                    .iter()
+                    .map(|name| BtrfsSnapshotInfo {
+                        name: name.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                next_page_token: String::new(),
+            })
+        })
+        .unary("DeleteCacheArtifact", {
+            let deletions = Arc::clone(&deletions);
+            move |request: DeleteCacheArtifactRequest| {
+                deletions.lock().unwrap().push(request.local_path);
+                Ok(DeleteCacheArtifactResponse { was_present: true })
+            }
+        })
+        .serve();
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let sandbox = SandboxId::new().to_string();
+    crate::db::fixture::insert_test_sandbox(&conn, &sandbox, SandboxState::Stopped);
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: node_manager.connector(),
+            ..SandboxManagerServiceOptions::for_test_in(scratch.path())
+        },
+    );
+    let refused = |result: Result<(), Status>, rpc: &str, name: &str, message: &str| {
+        let status = result.expect_err(rpc);
+        assert_eq!(
+            status.code(),
+            tonic::Code::FailedPrecondition,
+            "{rpc} {name}: {status}"
+        );
+        assert_eq!(status.message(), message, "{rpc} {name}");
+    };
+    for name in &staging {
+        let deleted = service
+            .delete_snapshots(crate::service::activation_support::internal_request(
+                DeleteSnapshotsRequest {
+                    sandbox_id: sandbox.clone(),
+                    all: false,
+                    snapshot_name: Some(name.clone()),
+                },
+            ))
+            .await
+            .map(drop);
+        refused(
+            deleted,
+            "DeleteSnapshots",
+            name,
+            "cannot delete an internal snapshot artifact",
+        );
+        let rolled_back = service
+            .rollback(crate::service::activation_support::internal_request(
+                RollbackRequest {
+                    sandbox_id: sandbox.clone(),
+                    snapshot_name: name.clone(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .map(drop);
+        refused(
+            rolled_back,
+            "Rollback",
+            name,
+            "cannot rollback to an internal snapshot artifact",
+        );
+        let exported = service
+            .export_snapshot(crate::service::activation_support::internal_request(
+                crate::proto::ExportSnapshotRequest {
+                    sandbox_id: sandbox.clone(),
+                    snapshot_name: name.clone(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .map(drop);
+        refused(
+            exported,
+            "ExportSnapshot",
+            name,
+            "cannot export an internal snapshot artifact",
+        );
+    }
+    let all = service
+        .delete_snapshots(crate::service::activation_support::internal_request(
+            DeleteSnapshotsRequest {
+                sandbox_id: sandbox.clone(),
+                all: true,
+                snapshot_name: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(all.deleted.is_empty(), "{:?}", all.deleted);
+    assert!(deletions.lock().unwrap().is_empty());
 }

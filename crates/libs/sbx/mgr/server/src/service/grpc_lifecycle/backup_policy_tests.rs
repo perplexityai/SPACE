@@ -1252,3 +1252,52 @@ async fn kill_refuses_signals_it_cannot_deliver_before_cleanup_admission() {
         cleanup_untouched(&service, &id, state, case);
     }
 }
+
+/// GC staging is logically deleted bytes. Backing one up by name would adopt
+/// it as a new `ready` row that the orphan sweep then deletes from under it, so
+/// both staging shapes are refused as internal before any row is adopted.
+#[tokio::test]
+async fn artifact_backup_refuses_gc_staging() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        LOOPBACK_ENDPOINT,
+        STATIC_TOKEN,
+        &token_path,
+    )) {
+        return;
+    }
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let service = SandboxManagerService::for_test(conn);
+    let artifact = LocalArtifactId::new();
+    for name in [
+        format!(".gc-pending-{artifact}"),
+        format!("d-manual-20260101T000000Z.gc-pending-{artifact}"),
+    ] {
+        let refused = service
+            .enqueue_artifact_backup(artifact_backup_request(
+                &id,
+                crate::proto::ArtifactKind::Disk,
+                Some(Source::SnapshotName(name.clone())),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.code(),
+            tonic::Code::FailedPrecondition,
+            "{name}: {refused}"
+        );
+        assert!(refused.message().contains("internal"), "{name}: {refused}");
+        let name = SnapshotName::parse(name).unwrap();
+        assert!(
+            service
+                .local_artifacts
+                .get_named(&id, &name)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(snapshot_upload_jobs(&service, &id), 0);
+}

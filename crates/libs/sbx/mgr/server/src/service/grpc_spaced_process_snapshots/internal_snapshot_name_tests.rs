@@ -8,6 +8,14 @@ fn operation_snapshots_are_internal() {
         "operation snapshots must not be exposed to list, delete, or rollback"
     );
     assert!(!is_internal_snapshot_name("d-manual-20260804T180000Z"));
+    // GC staging in either shape, the fixed-length one included: a leading
+    // `.gc-pending-` still contains the marker.
+    for staging in [
+        ".gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33",
+        "d-manual-20260804T180000Z.gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33",
+    ] {
+        assert!(is_internal_snapshot_name(staging), "{staging}");
+    }
 }
 
 #[test]

@@ -69,6 +69,10 @@ fn host_linux_paths_canonicalize_sandbox_uuids() {
         format!("{expected_cache}/snapshots/sn"),
     );
     assert_eq!(
+        host::linux::paths::sandbox_snapshot_dir_in("/root", compact, "sn"),
+        format!("/root/{hyphenated}/snapshots/sn"),
+    );
+    assert_eq!(
         host::linux::paths::spaced_host_socket(compact),
         format!("{expected_run}/spaced-host.sock"),
     );
