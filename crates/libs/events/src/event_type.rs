@@ -112,9 +112,11 @@ pub enum SandboxEventType {
     /// for it to become remotely durable before the execution is released.
     /// The sandbox-level suspend is reported by `SuspendRequested`.
     ExecutionSuspendRequested,
-    /// The suspend bound to this execution generation is remotely durable, so
-    /// the execution may be released. The sandbox-level completion is
-    /// reported by `SuspendCompleted`.
+    /// This execution generation's teardown suspend is remotely durable, so
+    /// the execution may be released. Emitted for every teardown generation
+    /// suspend, whether teardown bound to an existing suspend or drove the
+    /// suspend itself. Only the bound case emits `ExecutionSuspendRequested`;
+    /// a driven suspend's request is the sandbox-level `SuspendRequested`.
     ExecutionSuspendCompleted,
     /// An exact-execution suspend request was conclusively skipped because a
     /// newer execution generation already owns the sandbox. No local runtime
