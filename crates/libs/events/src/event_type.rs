@@ -34,10 +34,6 @@ pub enum SandboxEventType {
     SuspendRequested,
     SuspendCompleted,
     SuspendFailed,
-    /// An exact-execution suspend request was conclusively skipped because a
-    /// newer execution generation already owns the sandbox. No local runtime
-    /// transition is performed for the stale execution.
-    SuspendSuperseded,
     StopRequested,
     StopCompleted,
     StopFailed,
@@ -111,6 +107,19 @@ pub enum SandboxEventType {
     /// Emitted by the cluster-controller suspended-execution reaper when it
     /// retires the row and clears the stale placement bookkeeping.
     ExecutionRetired,
+    /// Teardown of one execution generation bound itself to the sandbox's
+    /// existing suspend (the sandbox is already `suspended`) and is waiting
+    /// for it to become remotely durable before the execution is released.
+    /// The sandbox-level suspend is reported by `SuspendRequested`.
+    ExecutionSuspendRequested,
+    /// The suspend bound to this execution generation is remotely durable, so
+    /// the execution may be released. The sandbox-level completion is
+    /// reported by `SuspendCompleted`.
+    ExecutionSuspendCompleted,
+    /// An exact-execution suspend request was conclusively skipped because a
+    /// newer execution generation already owns the sandbox. No local runtime
+    /// transition is performed for the stale execution.
+    ExecutionSuspendSuperseded,
     PoolSlotClaimed,
     PoolSlotMissed,
     CleanupRequested,
@@ -253,7 +262,6 @@ pub const SANDBOX_EVENT_TYPES: &[SandboxEventType] = &[
     SandboxEventType::SuspendRequested,
     SandboxEventType::SuspendCompleted,
     SandboxEventType::SuspendFailed,
-    SandboxEventType::SuspendSuperseded,
     SandboxEventType::StopRequested,
     SandboxEventType::StopCompleted,
     SandboxEventType::StopFailed,
@@ -287,6 +295,9 @@ pub const SANDBOX_EVENT_TYPES: &[SandboxEventType] = &[
     SandboxEventType::ExecutionEnsured,
     SandboxEventType::ExecutionReplaced,
     SandboxEventType::ExecutionRetired,
+    SandboxEventType::ExecutionSuspendRequested,
+    SandboxEventType::ExecutionSuspendCompleted,
+    SandboxEventType::ExecutionSuspendSuperseded,
     SandboxEventType::PoolSlotClaimed,
     SandboxEventType::PoolSlotMissed,
     SandboxEventType::CleanupRequested,
@@ -383,7 +394,6 @@ impl SandboxEventType {
             Self::SuspendRequested => "suspend_requested",
             Self::SuspendCompleted => "suspend_completed",
             Self::SuspendFailed => "suspend_failed",
-            Self::SuspendSuperseded => "suspend_superseded",
             Self::StopRequested => "stop_requested",
             Self::StopCompleted => "stop_completed",
             Self::StopFailed => "stop_failed",
@@ -417,6 +427,9 @@ impl SandboxEventType {
             Self::ExecutionEnsured => "execution_ensured",
             Self::ExecutionReplaced => "execution_replaced",
             Self::ExecutionRetired => "execution_retired",
+            Self::ExecutionSuspendRequested => "execution_suspend_requested",
+            Self::ExecutionSuspendCompleted => "execution_suspend_completed",
+            Self::ExecutionSuspendSuperseded => "execution_suspend_superseded",
             Self::PoolSlotClaimed => "pool_slot_claimed",
             Self::PoolSlotMissed => "pool_slot_missed",
             Self::CleanupRequested => "cleanup_requested",
@@ -496,6 +509,7 @@ impl SandboxEventType {
             | Self::RestoreRequested
             | Self::ForkRequested
             | Self::SuspendRequested
+            | Self::ExecutionSuspendRequested
             | Self::StopRequested
             | Self::KillRequested
             | Self::DeleteRequested
@@ -529,7 +543,6 @@ impl SandboxEventType {
             | Self::ResumeCompleted
             | Self::RestoreCompleted
             | Self::SuspendCompleted
-            | Self::SuspendSuperseded
             | Self::StopCompleted
             | Self::KillCompleted
             | Self::DeleteCompleted
@@ -540,6 +553,8 @@ impl SandboxEventType {
             | Self::ExecutionEnsured
             | Self::ExecutionReplaced
             | Self::ExecutionRetired
+            | Self::ExecutionSuspendCompleted
+            | Self::ExecutionSuspendSuperseded
             | Self::PoolSlotClaimed
             | Self::PoolSlotMissed
             | Self::CleanupCompleted

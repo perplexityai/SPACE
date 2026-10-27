@@ -91,15 +91,27 @@ fn sandbox_failed_and_quarantined_have_domain_names_and_failed_phase() {
 }
 
 #[test]
-fn suspend_superseded_has_domain_name_and_completed_phase() {
-    assert_eq!(
-        SandboxEventType::SuspendSuperseded.as_str(),
-        "suspend_superseded"
-    );
-    assert_eq!(
-        SandboxEventType::SuspendSuperseded.phase(),
-        SandboxEventPhase::Completed
-    );
+fn execution_suspend_events_have_domain_names_and_phases() {
+    for (event_type, name, phase) in [
+        (
+            SandboxEventType::ExecutionSuspendRequested,
+            "execution_suspend_requested",
+            SandboxEventPhase::Requested,
+        ),
+        (
+            SandboxEventType::ExecutionSuspendCompleted,
+            "execution_suspend_completed",
+            SandboxEventPhase::Completed,
+        ),
+        (
+            SandboxEventType::ExecutionSuspendSuperseded,
+            "execution_suspend_superseded",
+            SandboxEventPhase::Completed,
+        ),
+    ] {
+        assert_eq!(event_type.as_str(), name);
+        assert_eq!(event_type.phase(), phase);
+    }
 }
 
 #[test]

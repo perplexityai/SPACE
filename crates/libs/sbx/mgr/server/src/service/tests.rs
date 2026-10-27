@@ -12167,7 +12167,7 @@ pub(crate) mod service_tests {
         drop(db);
 
         let events = capture.events.lock().unwrap();
-        for event_type in ["suspend_requested", "suspend_completed"] {
+        for event_type in ["execution_suspend_requested", "execution_suspend_completed"] {
             let event = events
                 .iter()
                 .find(|event| {
@@ -12531,7 +12531,7 @@ pub(crate) mod service_tests {
             .filter(|event| {
                 event
                     .get("event_type")
-                    .is_some_and(|value| value == "suspend_superseded")
+                    .is_some_and(|value| value == "execution_suspend_superseded")
             })
             .collect::<Vec<_>>();
         assert_eq!(

@@ -213,7 +213,7 @@ pub(super) fn emit_teardown_suspend_lease_claim(
     };
     emit_sandbox_event(
         sandbox_id,
-        SandboxEventType::SuspendSuperseded,
+        SandboxEventType::ExecutionSuspendSuperseded,
         SandboxEventSource::SbxManager,
         SandboxEventDetails::default()
             .operation(PLANNED_TEARDOWN_SUSPEND_OPERATION)

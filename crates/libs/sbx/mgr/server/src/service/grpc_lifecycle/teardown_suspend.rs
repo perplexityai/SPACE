@@ -398,7 +398,7 @@ impl SandboxManagerService {
         if bound_existing_suspend {
             emit_sandbox_event(
                 &sandbox_id.to_string(),
-                SandboxEventType::SuspendRequested,
+                SandboxEventType::ExecutionSuspendRequested,
                 SandboxEventSource::SbxManager,
                 teardown_suspend_event_details(execution_generation, event_trigger)
                     .with_from_state(SandboxState::Suspended.to_string()),
@@ -1125,7 +1125,7 @@ impl SandboxManagerService {
         if completed {
             emit_sandbox_event(
                 sandbox_id,
-                SandboxEventType::SuspendCompleted,
+                SandboxEventType::ExecutionSuspendCompleted,
                 SandboxEventSource::SbxManager,
                 teardown_suspend_event_details(execution_generation, event_trigger)
                     .result("durable")
