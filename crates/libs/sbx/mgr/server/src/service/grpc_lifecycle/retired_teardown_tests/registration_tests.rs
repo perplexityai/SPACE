@@ -171,33 +171,14 @@ async fn backup_rerequested_by_artifact_keeps_its_execution_generation() {
                 let service = &refused.service;
                 let sandbox_id = refused.sandbox_id.to_string();
                 let snapshot_root = tempfile::tempdir().unwrap();
-                let snapshot_dir = snapshot_root.path().join("suspend");
-                crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
-                    &snapshot_dir,
-                    &sandbox_id,
-                    refused.staged,
-                    b"refused-capture",
+                stage_refused_capture(
+                    &refused,
+                    &snapshot_root.path().join("suspend"),
+                    recorded,
+                    upload_retained,
                 );
-                if recorded {
-                    record_capture_generation(&snapshot_dir, refused.staged);
-                }
                 {
                     let db = service.db.lock().unwrap();
-                    db.execute(
-                        "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
-                        crate::db::fixture::params![
-                            snapshot_dir.to_str().unwrap(),
-                            refused.staged.to_string()
-                        ],
-                    )
-                    .unwrap();
-                    if !upload_retained {
-                        db.execute(
-                            "DELETE FROM jobs WHERE dedup_key = ?1",
-                            [refused.staged.to_string()],
-                        )
-                        .unwrap();
-                    }
                     // The teardown failed and waits for its next drive, so the
                     // running-teardown fallback can't supply the generation.
                     let teardown_job: JobId = db
@@ -258,6 +239,84 @@ async fn backup_rerequested_by_artifact_keeps_its_execution_generation() {
                     "the re-request must start a fresh attempt: {error}"
                 );
                 assert_eq!(payload.execution_generation, Some(generation(GENERATION)));
+                drain(service).await;
+            }
+        },
+    )
+    .await;
+}
+
+/// Eviction's re-upload of a suspended row's unproven artifact registers a
+/// refused teardown capture under the generation that captured it. A restart
+/// can mark the row `suspended` with that capture still pinned, and a
+/// re-upload naming no generation would register it unfenced. The generation
+/// comes from the capture's record or, before the record existed, from the
+/// refused upload; an unrecorded artifact with no earlier upload belongs to a
+/// node-local suspend and still re-uploads unfenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eviction_reupload_of_a_refused_capture_keeps_its_execution_generation() {
+    with_cluster_api(
+        RetiringClusterApi {
+            placed: true,
+            ..RETIRING
+        },
+        async || {
+            for (recorded, upload_retained, carried) in [
+                (true, false, Some(generation(GENERATION))),
+                (false, true, Some(generation(GENERATION))),
+                (false, false, None),
+            ] {
+                let refused = refused_teardown_with(|staged| {
+                    serde_json::to_string(&bound_upload_payload(staged)).unwrap()
+                })
+                .await;
+                let service = &refused.service;
+                let sandbox_id = refused.sandbox_id.to_string();
+                stage_refused_capture(
+                    &refused,
+                    &crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+                        &service.cache_root().join(&sandbox_id),
+                    ),
+                    recorded,
+                    upload_retained,
+                );
+                // Startup recovery marked the row suspended with the capture
+                // still pinned.
+                service
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE sandboxes SET state = 'suspended' WHERE id = ?1",
+                        [&sandbox_id],
+                    )
+                    .unwrap();
+
+                let job_id = service
+                    .reupload_legacy_sandbox_for_eviction(&sandbox_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "recorded {recorded}, upload retained {upload_retained}: the \
+                             re-upload must be queued: {error}"
+                        )
+                    });
+                let payload = service
+                    .snapshot_upload_worker
+                    .get_job(&job_id)
+                    .unwrap()
+                    .unwrap()
+                    .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                    .unwrap();
+                assert_eq!(
+                    payload.meta.local_artifact_id,
+                    Some(refused.staged),
+                    "the re-upload must back up the pinned capture"
+                );
+                assert_eq!(
+                    payload.execution_generation, carried,
+                    "recorded {recorded}, upload retained {upload_retained}"
+                );
                 drain(service).await;
             }
         },
@@ -429,6 +488,39 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
         },
     )
     .await;
+}
+
+/// Write `refused`'s capture into `snapshot_dir` and point its local artifact
+/// row there. The capture records [`GENERATION`] when `recorded`, and its
+/// refused upload is pruned unless `upload_retained`.
+fn stage_refused_capture(
+    refused: &RefusedTeardown,
+    snapshot_dir: &std::path::Path,
+    recorded: bool,
+    upload_retained: bool,
+) {
+    crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+        snapshot_dir,
+        &refused.sandbox_id.to_string(),
+        refused.staged,
+        b"refused-capture",
+    );
+    if recorded {
+        record_capture_generation(snapshot_dir, refused.staged);
+    }
+    let db = refused.service.db.lock().unwrap();
+    db.execute(
+        "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
+        crate::db::fixture::params![snapshot_dir.to_str().unwrap(), refused.staged.to_string()],
+    )
+    .unwrap();
+    if !upload_retained {
+        db.execute(
+            "DELETE FROM jobs WHERE dedup_key = ?1",
+            [refused.staged.to_string()],
+        )
+        .unwrap();
+    }
 }
 
 /// Record [`GENERATION`] as the capture's execution generation in the

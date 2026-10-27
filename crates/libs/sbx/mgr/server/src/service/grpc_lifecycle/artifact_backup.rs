@@ -1119,7 +1119,7 @@ impl SandboxManagerService {
             return Err(Status::failed_precondition(msg));
         }
 
-        let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
+        let sandbox_dir = self.cache_root().join(&sandbox.id);
         let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir)
             .to_string_lossy()
             .into_owned();
@@ -1173,6 +1173,25 @@ impl SandboxManagerService {
                 }
             }
         };
+        // A restart can leave a teardown's refused capture as a suspended
+        // row's artifact. Register it under the generation that captured it,
+        // as a re-request by artifact id does, so the cluster's fence decides
+        // it again; without one it would register unfenced.
+        let artifact = self
+            .local_artifacts
+            .get(local_artifact_id)
+            .map_err(|err| Status::internal(format!("db artifact lookup failed: {err}")))?
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "suspended artifact {local_artifact_id} has no local artifact row"
+                ))
+            })?;
+        let previous_job = self.snapshot_upload_worker.find_job_by_dedup_key(
+            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(local_artifact_id),
+        )?;
+        let execution_generation =
+            self.capture_execution_generation(&sandbox, &artifact, previous_job.as_ref())?;
         let backup_attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
         let outcome = self
             .submit_artifact_backup(
@@ -1187,7 +1206,7 @@ impl SandboxManagerService {
                     request_override: parsed_upload_config.as_ref(),
                     format: reupload_format,
                     handoff: ArtifactBackupHandoff::DurableWorker,
-                    execution_generation: None,
+                    execution_generation,
                 },
             )
             .await
@@ -1218,7 +1237,8 @@ impl SandboxManagerService {
     /// The execution generation a fresh backup attempt of `artifact`
     /// registers under: the one whose teardown suspend captured it, so a
     /// capture the control plane refused as superseded stays refused when the
-    /// backup is requested again by artifact id. The control plane fences only
+    /// backup is requested again by artifact id or a suspended row's artifact
+    /// is re-uploaded for eviction. The control plane fences only
     /// an artifact's first registration, so a capture it admitted once
     /// registers again.
     ///
