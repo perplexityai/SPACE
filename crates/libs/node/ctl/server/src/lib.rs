@@ -437,14 +437,19 @@ impl NodeObjectReconciles for kubernetes_controller::Controller {
         if let Err(error) = self.reconcile_template_inventory().await {
             tracing::warn!(%error, "local Kubernetes template-inventory facet failed");
         }
+        // Before the network-slot capacity: a sandbox pod requests a network
+        // slot, so a new node takes none until that capacity is published,
+        // and labeling it first keeps a waiting restore's host-CPU `NotIn`
+        // term able to exclude it. A failed label write still publishes
+        // capacity; the node then reads as unlabeled.
+        if let Err(error) = self.reconcile_host_cpu().await {
+            tracing::warn!(%error, "local Kubernetes host-cpu reconcile failed");
+        }
         if let Err(error) = self.reconcile_network_slot_capacity().await {
             tracing::warn!(%error, "local Kubernetes network-slot capacity reconcile failed");
         }
         if let Err(error) = self.reconcile_ssd_headroom_tier().await {
             tracing::warn!(%error, "local Kubernetes ssd-headroom-tier reconcile failed");
-        }
-        if let Err(error) = self.reconcile_host_cpu().await {
-            tracing::warn!(%error, "local Kubernetes host-cpu reconcile failed");
         }
     }
 }
@@ -1329,10 +1334,10 @@ impl NodeCtlWorker {
             return;
         }
         // The node-local Kubernetes object reconciles (template-presence node
-        // metadata, network-slot status capacity, the SSD placement labels, and
-        // the host-CPU label) share this cadence: the template-inventory facet
-        // is pushed on every periodic outbound tick, so gating on it runs each
-        // of these reconciles every tick and self-heals drift.
+        // metadata, the host-CPU label, network-slot status capacity, and the
+        // SSD placement labels) share this cadence: the template-inventory
+        // facet is pushed on every periodic outbound tick, so gating on it
+        // runs each of these reconciles every tick and self-heals drift.
         if batch.facets().any(|(facet_name, _)| {
             facets::FacetKind::parse(facet_name) == Some(facets::FacetKind::TemplateInventory)
         }) && let Some(node_objects) = &mut self.node_objects

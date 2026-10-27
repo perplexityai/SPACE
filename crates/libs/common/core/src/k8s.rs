@@ -105,10 +105,15 @@ pub const SANDBOX_NETWORK_SLOTS_RESOURCE: &str = "space.pplx.net/network-slots";
 /// Node label carrying the node's [`HostCpu`](crate::types::HostCpu) identity,
 /// published by the node-local controller from `/proc/cpuinfo`.
 ///
-/// It's the same derivation the sandbox manager records as a suspend
-/// snapshot's capture CPU, so a snapshot's recorded value can be compared with
-/// the label of any node that might load it. A node whose CPU can't be
-/// identified carries no label.
+/// A suspend snapshot records the same identity at capture, and a restore pod
+/// for it renders a required `NotIn` term listing every identity the fleet
+/// publishes that can't load it, so kube-scheduler keeps it off hosts known to
+/// have such a CPU. `NotIn` is satisfied by an unlabeled node, like the
+/// exclusions below, so a node node-ctl hasn't labeled yet stays eligible as it
+/// was before the label existed. The API only renders the term while
+/// [`SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV`] is on, and once some node
+/// the pod could land on publishes a CPU that can load the snapshot. A node
+/// whose CPU can't be identified carries no label.
 pub const HOST_CPU_LABEL: &str = "space.pplx.net/host-cpu";
 
 /// Node label carrying the bucketed SSD-headroom signal for sandbox placement.
@@ -227,6 +232,23 @@ pub const SANDBOX_RESTORE_SOURCE_NODE_HARD_PIN_ENV: &str =
 pub const SANDBOX_NODE_SERVICES_READY_AFFINITY_ENV: &str =
     "SPACE_SANDBOX_NODE_SERVICES_READY_AFFINITY";
 pub const DEFAULT_SANDBOX_RESTORE_SOURCE_NODE_HARD_PIN: bool = false;
+/// Host-CPU-aware restore placement: when enabled, a restore from a remote
+/// full snapshot whose capture CPU is known renders a required `NotIn` term on
+/// [`HOST_CPU_LABEL`] listing the published CPUs that can't load it, the
+/// source-aware shortlist drops fallbacks labeled with one of them, and a
+/// local-only restore stranded on such a host switches to the snapshot's
+/// storage URI. Off by default, which places restores exactly as before the
+/// label existed; `SPACE_SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED` enables it.
+pub const SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV: &str =
+    "SPACE_SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED";
+pub const DEFAULT_SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED: bool = false;
+/// One-way compatibilities between unequal host CPU identities that restore
+/// placement may use, as comma-separated `capture=>loader` pairs; see
+/// [`HostCpuCompatibility`](crate::types::HostCpuCompatibility). Empty by
+/// default: when the CPU term is rendered, only hosts of the capture CPU
+/// itself, and unlabeled ones, take a snapshot's restore.
+pub const SANDBOX_RESTORE_HOST_CPU_COMPATIBILITY_ENV: &str =
+    "SPACE_SANDBOX_RESTORE_HOST_CPU_COMPATIBILITY";
 /// Node-local-service readiness placement bias (a weighted preferred
 /// node-affinity term for nodes not labelled [`NODE_SERVICES_NOT_READY_VALUE`]).
 /// Off by default; `SPACE_SANDBOX_NODE_SERVICES_READY_AFFINITY` enables it.
@@ -340,6 +362,24 @@ pub struct SandboxPodConfigValues {
     pub ssd_headroom_tier_affinity: bool,
     pub restore_source_node_hard_pin: bool,
     pub node_services_ready_affinity: bool,
+    /// Gate on host-CPU-aware restore placement. Like `node_group_placement`
+    /// it doesn't reach [`SandboxPodConfig`]: it gates the API's resolution of
+    /// the excluded CPUs, and an empty exclusion is what "gate off" renders
+    /// as. See [`SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV`].
+    pub restore_host_cpu_placement_enabled: bool,
+    /// Which unequal host CPUs can load each other's snapshots; consulted
+    /// before rendering, like `node_group_placement`. See
+    /// [`SANDBOX_RESTORE_HOST_CPU_COMPATIBILITY_ENV`].
+    pub host_cpu_compatibility: crate::types::HostCpuCompatibility,
+}
+
+/// Failure loading [`SandboxPodConfigValues`] from the environment.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SandboxPodConfigError {
+    #[error(transparent)]
+    NodeSelectorLabels(#[from] NodeSelectorLabelsParseError),
+    #[error("{SANDBOX_RESTORE_HOST_CPU_COMPATIBILITY_ENV}: {0}")]
+    HostCpuCompatibility(#[from] crate::types::HostCpuCompatibilityParseError),
 }
 
 /// Failure parsing [`SANDBOX_NODE_SELECTOR_LABELS_ENV`] into a label map.
@@ -384,7 +424,7 @@ pub fn parse_node_selector_labels(
 }
 
 impl SandboxPodConfigValues {
-    pub fn from_env() -> Result<Self, NodeSelectorLabelsParseError> {
+    pub fn from_env() -> Result<Self, SandboxPodConfigError> {
         Ok(Self {
             node_group_placement: crate::env::env_flag_var(
                 SANDBOX_NODE_GROUP_PLACEMENT_ENV,
@@ -419,6 +459,14 @@ impl SandboxPodConfigValues {
                 SANDBOX_NODE_SERVICES_READY_AFFINITY_ENV,
                 DEFAULT_SANDBOX_NODE_SERVICES_READY_AFFINITY,
             ),
+            restore_host_cpu_placement_enabled: crate::env::env_flag_var(
+                SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV,
+                DEFAULT_SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED,
+            ),
+            host_cpu_compatibility: crate::types::HostCpuCompatibility::parse(&env_or(
+                SANDBOX_RESTORE_HOST_CPU_COMPATIBILITY_ENV,
+                "",
+            ))?,
         })
     }
 
@@ -455,6 +503,8 @@ impl Default for SandboxPodConfigValues {
             ssd_headroom_tier_affinity: DEFAULT_SANDBOX_SSD_HEADROOM_TIER_AFFINITY,
             restore_source_node_hard_pin: DEFAULT_SANDBOX_RESTORE_SOURCE_NODE_HARD_PIN,
             node_services_ready_affinity: DEFAULT_SANDBOX_NODE_SERVICES_READY_AFFINITY,
+            restore_host_cpu_placement_enabled: DEFAULT_SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED,
+            host_cpu_compatibility: crate::types::HostCpuCompatibility::default(),
         }
     }
 }
@@ -588,6 +638,17 @@ pub enum SandboxPodRequest<'a> {
         /// evacuation path passes `Some` with the active target cohort's
         /// key+value so evacuated sandboxes land only on the target MNG.
         extra_required_affinity: Option<(&'a str, &'a str)>,
+        /// CPU identities that can't load the restored VM state's capture CPU.
+        /// When non-empty, a required `NotIn` match on [`HOST_CPU_LABEL`]
+        /// listing them is ANDed into every required term, so kube-scheduler
+        /// keeps the pod off hosts known to have one of them. The API passes
+        /// it empty while [`SANDBOX_RESTORE_HOST_CPU_PLACEMENT_ENABLED_ENV`]
+        /// is off, for a disk-only restore or a fork's disk restore (no vCPU
+        /// state), for a local-only restore (no remote snapshot to read the
+        /// capture CPU from), when the capture CPU is unknown, and whenever no
+        /// node the pod could land on publishes a CPU that can load it; see
+        /// [`HOST_CPU_LABEL`].
+        excluded_host_cpus: &'a [crate::types::HostCpu],
     },
     Pooled {
         common: SandboxPodCommon<'a>,
@@ -723,6 +784,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
         restore_node_shortlist,
         extra_tolerations,
         extra_required_affinity,
+        excluded_host_cpus,
         pool,
         node_pool,
         prefer_template_cache,
@@ -746,6 +808,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             Vec::new(),
             empty_tolerations,
             None,
+            &[][..],
             None,
             node_pool,
             true,
@@ -765,6 +828,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             restore_node_shortlist,
             extra_tolerations,
             extra_required_affinity,
+            excluded_host_cpus,
         } => {
             let checkpoint = fork_disk_restore.is_none().then_some(match artifact_kind {
                 crate::types::ArtifactKind::Full => "suspend",
@@ -782,6 +846,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                 restore_node_shortlist,
                 extra_tolerations,
                 extra_required_affinity,
+                excluded_host_cpus,
                 None,
                 None,
                 true,
@@ -805,6 +870,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             Vec::new(),
             empty_tolerations,
             None,
+            &[][..],
             Some(pool),
             None,
             true,
@@ -1265,6 +1331,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                 preferred_template_label: preferred_template_label.as_deref(),
                 preferred_template_weight: template_cache_preference_weight,
                 extra_required_label: extra_required_affinity,
+                excluded_host_cpus,
                 // Rendered unconditionally, including for a pre-bound
                 // (`spec.nodeName`) pod. kube-scheduler is skipped there, but
                 // kubelet's own admission re-evaluates `spec.nodeSelector` and
@@ -1421,6 +1488,7 @@ struct SandboxNodeAffinityInput<'a> {
     preferred_template_label: Option<&'a str>,
     preferred_template_weight: i32,
     extra_required_label: Option<(&'a str, &'a str)>,
+    excluded_host_cpus: &'a [crate::types::HostCpu],
     required_node_group_expressions: Vec<NodeSelectorRequirement>,
     preferred_dedicated_term: Option<PreferredSchedulingTerm>,
     ssd_placement_block: bool,
@@ -1435,6 +1503,7 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
         preferred_template_label,
         preferred_template_weight,
         extra_required_label,
+        excluded_host_cpus,
         required_node_group_expressions,
         preferred_dedicated_term,
         ssd_placement_block,
@@ -1453,6 +1522,7 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
         && preferred_source_node_name.is_none()
         && preferred_template_label.is_none()
         && extra_required_label.is_none()
+        && excluded_host_cpus.is_empty()
         && required_node_group_expressions.is_empty()
         && preferred_dedicated_term.is_none()
         && !ssd_placement_block
@@ -1463,8 +1533,9 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
     }
 
     // Required node selectors are ANDed within a single term and ORed across
-    // terms. The hard placement-block exclusion, the node-group boundary, and
-    // any caller-supplied required label sit together so a pod must satisfy
+    // terms. The hard placement-block exclusion, the node-group boundary, the
+    // restore's capture host CPU, and any caller-supplied required label sit
+    // together so a pod must satisfy
     // all of them; every ORed shortlist term repeats the shared expressions,
     // so a drain-cohort pin or a source pin can never let a pod escape the
     // node-group boundary (or vice versa). `NotIn` is also satisfied by nodes
@@ -1479,6 +1550,18 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
             key: label_key.to_string(),
             operator: "In".to_string(),
             values: Some(vec![label_value.to_string()]),
+        });
+    }
+    if !excluded_host_cpus.is_empty() {
+        match_expressions.push(NodeSelectorRequirement {
+            key: HOST_CPU_LABEL.to_string(),
+            operator: "NotIn".to_string(),
+            values: Some(
+                excluded_host_cpus
+                    .iter()
+                    .map(|host_cpu| host_cpu.as_str().to_string())
+                    .collect(),
+            ),
         });
     }
     match_expressions.extend(required_node_group_expressions);

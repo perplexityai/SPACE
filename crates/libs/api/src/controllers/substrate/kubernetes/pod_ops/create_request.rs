@@ -132,6 +132,7 @@ impl KubernetesSubstrate {
             auto_lifecycle_json,
             network_policy_json,
             node_group_placement,
+            excluded_host_cpus,
         } = inputs;
         let disk_io_limits = u64::try_from(sandbox.disk_io_max_operations_per_sec)
             .ok()
@@ -212,7 +213,12 @@ impl KubernetesSubstrate {
                         if self.k8s.sandbox_pod_config.restore_source_node_hard_pin
                             && suspend_restore_storage_uri.is_some() =>
                     {
-                        self.restore_node_shortlist(sandbox.id, source, node_group_placement)
+                        self.restore_node_shortlist(
+                            sandbox.id,
+                            source,
+                            node_group_placement,
+                            excluded_host_cpus,
+                        )
                     }
                     _ => Vec::new(),
                 };
@@ -242,6 +248,7 @@ impl KubernetesSubstrate {
                     restore_node_shortlist,
                     extra_tolerations: &[],
                     extra_required_affinity: None,
+                    excluded_host_cpus,
                 }
             }
             PodCreateContext::Restore(RestoreContext::Evacuation {
@@ -267,6 +274,7 @@ impl KubernetesSubstrate {
                 restore_node_shortlist: Vec::new(),
                 extra_tolerations,
                 extra_required_affinity,
+                excluded_host_cpus,
             },
         }
     }
