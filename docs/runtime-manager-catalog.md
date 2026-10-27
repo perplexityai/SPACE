@@ -3,7 +3,7 @@
 Diagnostic discovery recognizes Cloud Hypervisor release directories containing
 `bin/cloud-hypervisor`. A valid executable is reported without a memory-state
 format: recognizing the installation does not enable execution, snapshots or
-warm pools. The install catalog offers a pinned ARM64 release as described below.
+warm pools. The install catalog offers pinned ARM64 and x86-64 releases as described below.
 
 The compiled catalog pins installable Firecracker releases and guest kernels for
 both `x86_64` and `aarch64`. Installing an artifact does not select it as a node's
@@ -67,8 +67,8 @@ additional transfer checksum.
 ## Managed E0 execution and rollout
 
 The managed store at `/space/vendor/artifacts/{firecracker,kernels}` is separate
-from external vendor layouts. Releases occupy `v<version>--<release-digest-hex>`
-and kernels `<version>--<kernel-digest-hex>`. Release identity hashes the pinned
+from external vendor layouts. Releases occupy `v<version>--<first-12-release-digest-hex>`
+and kernels `<version>--<first-12-kernel-digest-hex>`. Release identity hashes the pinned
 binary names and hashes in layout order; it is not the download-archive hash.
 Different builds sharing a label occupy different directories. The approved
 catalog still admits one executable runtime identity per version/platform.
@@ -259,5 +259,16 @@ space-rtmgr kernels install '7.2.8+' --runtime cloud-hypervisor-54.0
 
 Artifacts referenced by compiled environments are retained by the removal guard,
 including CH. Installation remains separate from execution permission. See
-[the local builder and worker exercise](execution-environments.md#arm64-local-builder-and-worker-exercise)
+[the local builder and worker exercise](execution-environments.md#local-x86-64-builder-and-worker-exercise)
 for explicit policy configuration, template builds and sandbox creation.
+
+### Compact locator rollout
+
+Upgrade runtime-supervisor before node-manager or runtime-manager creates compact
+execution paths. The updated supervisor accepts both the historical 64-hex and
+compact 12-hex locator for the exact compiled digest. The old supervisor does not
+accept compact paths. Keep the updated supervisor in rollback images once compact
+paths have been published. Inventory and removal recognize both store layouts;
+when both exist, the compact copy is preferred and both are authenticated before
+removal. A short-name collision fails full-content verification rather than
+replacing another artifact. Historical paths remain read-compatible.
