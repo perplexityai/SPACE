@@ -18,7 +18,7 @@ guest daemon or an embedding application.
 | Bind a start key to the request it identifies | [Bound recovery starts](https://github.com/perplexityai/SPACE/pull/966). |
 | Reject stale engine and process handles | [Fenced handles](https://github.com/perplexityai/SPACE/pull/967), using discovery before the first start. |
 | Deduplicate process input, stdin closure and signals | [Ordered mutation receipts](https://github.com/perplexityai/SPACE/pull/968). |
-| Capability discovery and end-to-end forwarding | [Routed enforcement](https://github.com/perplexityai/SPACE/pull/970) and the [public command transport](../../process-recovery.md). |
+| Capability discovery and end-to-end forwarding | [Routed enforcement](https://github.com/perplexityai/SPACE/pull/969) and the [public command transport](../../process-recovery.md). |
 
 Retention and gaps are independently useful. The opt-in operations additionally
 require the discovery, enforcement, routing and lifecycle changes below.
