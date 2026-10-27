@@ -8,7 +8,7 @@ use super::describe;
 use super::operations::{InstallLimits, InstallOperation};
 use super::publisher::{ArtifactPublisher, NodeArtifactRef, PinSource};
 use super::release::ReleaseSources;
-use super::source::KernelSource;
+use super::source::KernelSources;
 use super::staging;
 use super::store::{self, JobOutcome, JobPhase, JobResult};
 use pplx_space_common_core::types::{Arch, Digest, JobId};
@@ -32,7 +32,7 @@ pub(crate) struct ExecutorParts {
     pub(crate) staging: PathBuf,
     pub(crate) limits: InstallLimits,
     pub(crate) host_arch: Arch,
-    pub(crate) source: Arc<dyn KernelSource>,
+    pub(crate) source: KernelSources,
     pub(crate) releases: ReleaseSources,
     pub(crate) publisher: Arc<dyn ArtifactPublisher>,
     pub(crate) pins: Arc<dyn PinSource>,
@@ -43,7 +43,7 @@ pub(super) struct ExecutorContext {
     pub(super) staging: PathBuf,
     pub(super) limits: InstallLimits,
     pub(super) host_arch: Arch,
-    pub(super) source: Arc<dyn KernelSource>,
+    pub(super) source: KernelSources,
     pub(super) releases: ReleaseSources,
     pub(super) publisher: Arc<dyn ArtifactPublisher>,
     pub(super) pins: Arc<dyn PinSource>,
