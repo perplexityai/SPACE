@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Parser)]
 #[command(
     name = "space-buildmgr",
-    about = "Build Firecracker sandbox templates",
+    about = "Build sandbox templates",
     version,
     disable_version_flag = true
 )]

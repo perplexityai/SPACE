@@ -3,13 +3,14 @@
 Diagnostic discovery recognizes Cloud Hypervisor release directories containing
 `bin/cloud-hypervisor`. A valid executable is reported without a memory-state
 format: recognizing the installation does not enable execution, snapshots or
-warm pools. Cloud Hypervisor releases are not yet offered by the install catalog.
+warm pools. The install catalog offers a pinned ARM64 release as described below.
 
 The compiled catalog pins installable Firecracker releases and guest kernels for
 both `x86_64` and `aarch64`. Installing an artifact does not select it as a node's
 default. Node-manager selects compiled E0 (Firecracker 1.15.1 / Linux 6.1.155)
-for new work and stock legacy fallback. Verified managed copies can supply this
-binding; other installed candidates remain outside execution discovery.
+by default for new work and stock legacy fallback. Verified managed copies can
+supply this binding; other compiled environments require explicit execution
+policy permission.
 
 | Firecracker | Snapshot format | Kernel options | Upstream kernel directory |
 | --- | --- | --- | --- |
@@ -219,7 +220,6 @@ operators can use:
 space-rtmgr runtimes available --runtime cloud-hypervisor
 space-rtmgr runtimes install cloud-hypervisor-54.0
 space-rtmgr list --kind runtime --wide
-space-rtmgr runtimes uninstall cloud-hypervisor-54.0
 ```
 
 The managed release is published under `/space/vendor/artifacts/cloud-hypervisor`,
@@ -240,3 +240,24 @@ execution require the CH adapter and a qualified environment separately.
 Finish upgrading both artifact services before submitting CH installs. An older
 node-manager lacks the pin and refuses publication. Such a failed operation
 must be resubmitted after the upgrade; existing Firecracker work is unaffected.
+
+The ARM64 boot environment also pins upstream `Image-arm64` from
+[the Cloud Hypervisor Linux release](https://github.com/cloud-hypervisor/linux/releases/tag/ch-release-v7.2.8-20261009).
+The embedded kernel banner is `7.2.8+`; its file length is 24,177,152 bytes.
+The content SHA-256 is
+`8f8f3d5a983809f87a4e1e9a13053a3361fda47ef04e09c771a41c5e037cb6c2`;
+the SHA-256/4096-byte/no-salt fs-verity measurement is
+`26a86972db2461c90fea9945b577e24734f4ec7fcb9e4060c2dba401e5832176`.
+The latter was checked with the Linux enable/measure ioctls on a disposable
+btrfs copy. The HTTPS source uses the same bounded transport as release downloads;
+node-manager independently authenticates the staged bytes against its catalog.
+
+```sh
+space-rtmgr kernels available --runtime cloud-hypervisor-54.0
+space-rtmgr kernels install '7.2.8+' --runtime cloud-hypervisor-54.0
+```
+
+Artifacts referenced by compiled environments are retained by the removal guard,
+including CH. Installation remains separate from execution permission. See
+[the local builder and worker exercise](execution-environments.md#arm64-local-builder-and-worker-exercise)
+for explicit policy configuration, template builds and sandbox creation.
