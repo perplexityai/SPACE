@@ -48,10 +48,6 @@ enum Commands {
         #[arg(long)]
         environment: Option<pplx_space_common_core::types::EnvironmentReference>,
 
-        /// Overwrite existing template
-        #[arg(long)]
-        force: bool,
-
         /// Extra release tag to register in addition to the immutable digest tag.
         #[arg(long = "publish-tag")]
         publish_tags: Vec<String>,
@@ -81,7 +77,6 @@ async fn main() -> anyhow::Result<()> {
             recipe,
             id,
             base,
-            force,
             environment,
             publish_tags,
             async_mode,
@@ -117,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 recipe: Some(parsed_recipe),
                 template_id: id,
                 options: Some(BuildOptions {
-                    force,
+                    force: false,
                     publish_tags,
                 }),
                 client: Some(ClientContext {

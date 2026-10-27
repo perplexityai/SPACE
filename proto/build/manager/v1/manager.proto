@@ -37,7 +37,8 @@ message StartBuildRequest {
 }
 
 message BuildOptions {
-  // Skip the local-build-already-exists cache check.
+  // Accepted for compatibility with older clients and ignored: every build
+  // runs in job-scoped staging, so there is no existing-build check to skip.
   bool force = 1;
   // Tags applied when registering the cluster release.
   repeated string publish_tags = 3;

@@ -560,7 +560,7 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
                         "additionalProperties": false,
                         "properties": {
                             "base": { "type": ["string", "null"], "description": "Seed reference for code-runtime only; defaults to seed:latest" },
-                            "force": { "type": "boolean", "default": false },
+                            "force": { "type": "boolean", "default": false, "description": "Accepted for compatibility and ignored" },
                             "publish_tags": { "type": "array", "items": { "type": "string" }, "default": [] }
                         }
                     }, "example": { "publish_tags": ["latest"] } } }

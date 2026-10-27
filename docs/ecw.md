@@ -164,8 +164,8 @@ The following compatibility limits are important:
   Clients may receive connection refused immediately after create and must wait
   for their application separately.
   See [native template startup](native-template-runtime.md) for limits and rollout.
-  Per-step `force=true` is promoted to SPACE's build-wide cache switch, which
-  may rebuild more layers but will not reuse the requested layer. Positive
+  Per-step `force=true` is accepted and ignored: SPACE builds keep no step
+  cache, so every step reruns on every build. Positive
   `minFreeDiskMb` and `teamID` are rejected explicitly.
 - Template aliases are flat. E2B `team/template` names and tagged alias lookup
   are not supported.

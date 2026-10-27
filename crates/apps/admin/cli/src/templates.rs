@@ -34,7 +34,6 @@ impl AdminClient {
             TemplateCommands::Build {
                 template,
                 base,
-                force,
                 publish_tags,
                 async_mode,
             } => {
@@ -51,7 +50,6 @@ impl AdminClient {
                 );
                 let request = self.http.post(url).json(&serde_json::json!({
                     "base": base,
-                    "force": force,
                     "publish_tags": publish_tags,
                 }));
                 let body = self.template_request(request).await?;

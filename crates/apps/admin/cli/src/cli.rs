@@ -154,8 +154,6 @@ pub(crate) enum TemplateCommands {
         /// Seed reference for code-runtime (default: seed:latest).
         #[arg(long)]
         base: Option<pplx_space_common_core::types::TemplateReference>,
-        #[arg(long)]
-        force: bool,
         /// Assign a release tag, such as latest, after a successful build.
         #[arg(long = "publish-tag")]
         publish_tags: Vec<pplx_space_common_core::types::TemplateTag>,

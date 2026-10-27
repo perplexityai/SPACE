@@ -62,10 +62,7 @@ async fn system_build_submits_options_and_reports_publication_outcome() {
 
         assert_eq!(result.is_ok(), succeeds, "{state}: {result:?}");
         let request = requests.try_recv().unwrap();
-        assert_eq!(
-            request,
-            json!({"base": seed, "force": false, "publish_tags": ["latest"]})
-        );
+        assert_eq!(request, json!({"base": seed, "publish_tags": ["latest"]}));
         if succeeds {
             let status: Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
             assert_eq!(status["content_hash"], HASH);
@@ -83,10 +80,7 @@ async fn async_seed_build_returns_job_without_polling_or_promoting_latest() {
     let app = Router::new().route(
         "/admin/api/v1/system-templates/seed/builds",
         post(|Json(body): Json<Value>| async move {
-            assert_eq!(
-                body,
-                json!({"base": null, "force": false, "publish_tags": []})
-            );
+            assert_eq!(body, json!({"base": null, "publish_tags": []}));
             Json(json!({"job_id": JOB, "template_name": "seed"}))
         }),
     );

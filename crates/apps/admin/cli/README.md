@@ -9,7 +9,8 @@ space-admin-cli login [--print-token] [--api-url URL] [--auth-url URL] [--email 
 space-admin-cli template build seed [--publish-tag latest] [--async]
 space-admin-cli template build code-runtime [--base seed@sha256:...] [--publish-tag latest]
 space-admin-cli template status <seed|code-runtime> <job-id>
-space-admin-cli drain-node     <node>          POST /admin/api/v1/nodes/{node}:drain
+space-admin-cli drain-node     <node> [--forced] [--no-replace-after-terminate]
+                                               POST /admin/api/v1/nodes/{node}:drain
 space-admin-cli terminate-node <node>          POST /admin/api/v1/nodes/{node}:terminate
 space-admin-cli undrain-node   <node>          POST /admin/api/v1/nodes/{node}:undrain
 space-admin-cli list-nodes [--drain-phase X] [--role X] [--include-deleted] [--json]
@@ -148,6 +149,86 @@ There is no local-recipe or internal-gRPC fallback.
 
 Follow the [system-template release procedure](../../../../templates/firecracker/seed/README.md#build-and-publish-system-templates)
 for the full seed → code-runtime sequence, prerequisites, and verification.
+
+## Node drain
+
+`space-admin-cli drain-node <node>` cordons the node and starts a drain. The
+default drain is gentle: resident sandboxes keep serving traffic until they
+suspend on inactivity, are suspended by their user, or are deleted. The node
+advances to `drained` once its residents have left and suspended sandboxes'
+snapshots have been uploaded. Unless the controller runs with
+`SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE=true`, sandboxes in lifecycles
+such as `stopped` don't hold the drain, so a drained node can still host
+sandboxes that block its termination. Check
+`node_drain.sandboxes_remaining{node}` and `node_drain.drain_blockers{node}`
+first when a drain stalls; they don't cover every gate term. The
+[`node_drain` module docs](../../../libs/cluster/controller/server/src/node_drain/mod.rs)
+list the full gate.
+
+A drained node waits for `terminate-node` unless the cluster controller runs
+with `SPACE_DRAINED_NODE_TERMINATOR_ENABLED=true`. That reconciler moves a
+drained node to `terminating` automatically once its own guards pass (no
+sandbox still assigned to the node, no snapshot still on its local disk), and
+never for a node whose Kubernetes Node carries the `space.pplx.net/drain-keep`
+annotation.
+`undrain-node` returns a draining or drained node to service. All three
+commands mutate cluster state; see [Safety](#safety).
+
+The cluster controller acts on drains only when it runs with
+`SPACE_NODE_DRAIN_ENABLED=true`, which is off by default. Without it,
+`drain-node` still cordons the node, and a forced drain still returns 409 to
+user calls, but nothing evacuates residents and the node never reaches
+`drained`. The controller also disables the drained-node terminator. Use
+`undrain-node` to back out.
+
+### `--forced`
+
+`--forced` sets `mode=forced` in the request body. Instead of waiting, the drain
+suspends and migrates every resident `started` or `paused` sandbox right away
+and returns 409 to user calls against them for the whole drain window. It's
+faster, but per-node disruption is proportional to how many live sandboxes the
+node hosts.
+
+Re-running `drain-node --forced` against a node that's already draining gently
+escalates that drain in place: the node stays cordoned throughout, and the
+drain keeps its original start time. Prefer this to `undrain-node` followed by
+`drain-node --forced`, which uncordons the node between the two calls and lets
+fresh sandboxes land on it. The server refuses the opposite downgrade
+(`drain-node` without `--forced` against a forced drain); abort with
+`undrain-node` instead.
+
+Escalating also re-enables the stale-transient sweep, which only runs for
+forced drains. Any resident wedged in a non-evacuable transient lifecycle
+(creating, starting, resuming, and similar) past the cluster's abandon age is
+flipped to `failed`, unrecoverably. There's no grace period. The age is
+measured from the sandbox's own last lifecycle change, not from the
+escalation, so a resident that has been wedged longer than the abandon age
+while the node drained gently is already past it and is flipped on the first
+tick after the write.
+
+Before escalating a drain that has been sitting, read both
+`node_drain.sandboxes_remaining{node}` and `node_drain.drain_blockers{node}`.
+Neither is a superset of what the sweep destroys: they differ in both the
+lifecycles and the node-pinning column they count. Two zeros is the only
+reassuring answer, and a non-zero in either is a prompt to look at the rows
+rather than proof that something will be lost.
+
+### `--no-replace-after-terminate`
+
+With the default `aws` terminator backend, the auto-scaling group replaces the
+instance after `terminate-node`.
+`--no-replace-after-terminate` sets `replace_after_terminate=false` in the
+request body, which persists `terminate_decrement_capacity=true` on the node
+row so termination shrinks the group instead. Use it for
+[blue-green rollouts](../../../../infra/space/aws/eks/modules/rollout-mng/README.md)
+across two managed node groups, where the incumbent group must shrink
+monotonically.
+
+The flag is honored only on the call that starts a drain. A drain's
+replacement intent is fixed for its lifetime, so passing the flag against a
+node that's already draining returns 409 if it disagrees with how that drain
+was started. Omit it to escalate on the existing terms, or run `undrain-node`
+and start a fresh drain to change them.
 
 ## Warm pools
 

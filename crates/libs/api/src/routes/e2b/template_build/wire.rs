@@ -118,9 +118,8 @@ pub struct TemplateBuildStartV2 {
 /// SDK source: `TemplateStep`. `type` is the only required field; the
 /// remaining fields are optional per the SDK's openapi spec.
 ///
-/// SPACE promotes per-step `force=true` to its build-wide cache switch. This
-/// may rebuild more layers than E2B, but never reuses a layer the caller asked
-/// to invalidate.
+/// SPACE accepts per-step `force=true` for compatibility and ignores it:
+/// builds keep no step cache, so every step reruns on every build.
 /// SDK-only upload hints such as `forceUpload`, `gzip`, and `resolveSymlinks`
 /// remain in the open-object remainder; uploads already bypass an ECW cache.
 #[derive(Debug, Default, Deserialize)]
