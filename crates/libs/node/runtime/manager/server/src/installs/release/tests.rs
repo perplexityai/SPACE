@@ -1,4 +1,4 @@
-use super::super::test_support::{Member, executable, tgz};
+use super::super::test_support::{FakeExecutableSource, Member, executable, tgz};
 use super::*;
 fn place(root: &Path, version: &str, fill: u8) {
     let bin = root.join(format!("v{version}/bin"));
@@ -161,39 +161,6 @@ fn unpack_retries_local_io_but_rejects_malformed_content() {
     assert!(matches!(error, JobError::Retriable(_)));
 }
 
-struct ExecutableSource {
-    location: super::super::release_source::ReleaseUrl,
-    bytes: Vec<u8>,
-}
-
-#[async_trait::async_trait]
-impl ReleaseSource for ExecutableSource {
-    fn runtime(&self) -> RuntimeKind {
-        RuntimeKind::CloudHypervisor
-    }
-
-    fn root(&self) -> &super::super::release_source::ReleaseUrl {
-        &self.location
-    }
-
-    fn archive(&self, _: &RuntimeIdentity, _: Arch) -> super::super::release_source::ReleaseUrl {
-        self.location.clone()
-    }
-
-    fn payload(&self, _: &RuntimeIdentity, _: Arch) -> ReleasePayload {
-        ReleasePayload::Executable
-    }
-
-    async fn open(
-        &self,
-        _: &super::super::release_source::ReleaseUrl,
-    ) -> Result<super::super::release_source::ReleaseChunks, ReleaseSourceError> {
-        Ok(Box::pin(futures_util::stream::iter([Ok(
-            bytes::Bytes::copy_from_slice(&self.bytes),
-        )])))
-    }
-}
-
 /// A standalone executable must pass both download and installed-file pins,
 /// as well as the architecture check, before it can reach publication.
 #[tokio::test]
@@ -261,7 +228,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
                 },
             }],
         };
-        let source = Arc::new(ExecutableSource {
+        let source = Arc::new(FakeExecutableSource {
             location: "https://releases.example.test/runtime-static"
                 .parse()
                 .unwrap(),
@@ -296,7 +263,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
                 },
                 host_arch: architecture,
                 source: kernels,
-                releases: Some(context.clone()),
+                releases: ReleaseSources::new(vec![context.clone()]).unwrap(),
                 publisher,
                 pins,
             },
@@ -371,6 +338,66 @@ fn source_packaging_cannot_choose_install_paths_or_omit_binaries() {
         assert!(matches!(
             Materialization::for_layout(payload, layout),
             Err(DownloadError::PayloadLayout)
+        ));
+    }
+}
+
+#[test]
+fn release_sources_are_unambiguous_and_do_not_fall_back_across_runtimes() {
+    use super::super::test_support::FakeReleaseSource;
+    let directory = tempfile::tempdir().unwrap();
+    let fc = ReleaseContext {
+        root: directory.path().join("fc"),
+        source: Arc::new(FakeReleaseSource::default()),
+    };
+    let ch = ReleaseContext {
+        root: directory.path().join("ch"),
+        source: Arc::new(FakeExecutableSource {
+            location: "https://releases.example.test/ch".parse().unwrap(),
+            bytes: Vec::new(),
+        }),
+    };
+    let sources = ReleaseSources::new(vec![fc.clone(), ch.clone()]).unwrap();
+    assert_eq!(sources.get(RuntimeKind::Firecracker).unwrap().root, fc.root);
+    assert_eq!(
+        sources.get(RuntimeKind::CloudHypervisor).unwrap().root,
+        ch.root
+    );
+    assert!(sources.get(RuntimeKind::Gvisor).is_none());
+    assert!(matches!(
+        ReleaseSources::new(vec![fc.clone(), fc.clone()]),
+        Err(ReleaseConfigurationError::DuplicateRuntime { .. })
+    ));
+    for root in [
+        fc.root.clone(),
+        fc.root.join("nested"),
+        directory.path().to_path_buf(),
+    ] {
+        assert!(matches!(
+            ReleaseSources::new(vec![fc.clone(), ReleaseContext { root, ..ch.clone() }]),
+            Err(ReleaseConfigurationError::OverlappingStores { .. })
+        ));
+    }
+    let alias = directory.path().join("alias");
+    std::fs::create_dir_all(&fc.root).unwrap();
+    std::os::unix::fs::symlink(&fc.root, &alias).unwrap();
+    assert!(matches!(
+        ReleaseSources::new(vec![
+            fc.clone(),
+            ReleaseContext {
+                root: alias.join("not-created"),
+                ..ch.clone()
+            }
+        ]),
+        Err(ReleaseConfigurationError::OverlappingStores { .. })
+    ));
+    for root in [
+        PathBuf::from("relative"),
+        directory.path().join("../escape"),
+    ] {
+        assert!(matches!(
+            ReleaseSources::new(vec![ReleaseContext { root, ..ch.clone() }]),
+            Err(ReleaseConfigurationError::InvalidStore { .. })
         ));
     }
 }

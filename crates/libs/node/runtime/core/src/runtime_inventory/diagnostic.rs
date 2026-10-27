@@ -67,9 +67,9 @@ pub struct ScanRoots {
     /// The runtime manager's own kernel install root, in the same layout.
     /// Scanned beside `vendor_kernels`, once when both name one directory.
     pub managed_kernels: Option<PathBuf>,
-    /// The runtime manager's own release install root. Scanned beside
-    /// `runtime_releases`, once when it is the same directory as one of them.
-    pub managed_releases: Option<RuntimeInstallationRoot>,
+    /// The runtime manager's per-runtime release stores. Each is scanned beside
+    /// external roots, once when both name the same runtime and directory.
+    pub managed_releases: Vec<RuntimeInstallationRoot>,
     /// Versioned cache kernels the execution inventory resolves boots from.
     pub cache_kernels: PathBuf,
     /// Legacy flat cache layout, `default/kernel/vmlinux.bin`.
@@ -87,7 +87,7 @@ impl Default for ScanRoots {
             )],
             vendor_kernels: paths::FIRECRACKER_KERNEL_VENDOR_DIR.into(),
             managed_kernels: None,
-            managed_releases: None,
+            managed_releases: Vec::new(),
             cache_kernels: paths::FIRECRACKER_KERNEL_ASSET_DIR.into(),
             cache_legacy_assets: paths::FIRECRACKER_ASSET_DIR.into(),
             runtime_aliases: vec![paths::FIRECRACKER_BIN.into(), paths::JAILER_BIN.into()],
@@ -569,26 +569,16 @@ fn vendor_kernel_roots(roots: &ScanRoots) -> Vec<&Path> {
 /// manager's is scanned once, under the runtime manager's path, which its
 /// install records name, as the kernel roots are.
 fn release_roots(roots: &ScanRoots) -> Vec<&RuntimeInstallationRoot> {
-    let Some(managed) = &roots.managed_releases else {
-        return roots.runtime_releases.iter().collect();
-    };
-    let mut replaced = false;
     let mut found: Vec<&RuntimeInstallationRoot> = roots
         .runtime_releases
         .iter()
-        .map(|root| {
-            if root.kind == managed.kind && same_directory(&root.path, &managed.path) {
-                replaced = true;
-                managed
-            } else {
-                root
-            }
+        .filter(|root| {
+            !roots.managed_releases.iter().any(|managed| {
+                root.kind == managed.kind && same_directory(&root.path, &managed.path)
+            })
         })
         .collect();
-    if !replaced {
-        found.push(managed);
-    }
-    found.dedup_by(|left, right| std::ptr::eq(*left, *right));
+    found.extend(&roots.managed_releases);
     found
 }
 
@@ -645,10 +635,7 @@ pub fn scan(
             scanner.scan_runtime_releases(
                 root,
                 kinds,
-                roots
-                    .managed_releases
-                    .as_ref()
-                    .is_some_and(|managed| managed == root),
+                roots.managed_releases.iter().any(|managed| managed == root),
             );
         }
     }

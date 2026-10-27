@@ -7,7 +7,7 @@
 use super::describe;
 use super::operations::{InstallLimits, InstallOperation};
 use super::publisher::{ArtifactPublisher, NodeArtifactRef, PinSource};
-use super::release::ReleaseContext;
+use super::release::ReleaseSources;
 use super::source::KernelSource;
 use super::staging;
 use super::store::{self, JobOutcome, JobPhase, JobResult};
@@ -33,7 +33,7 @@ pub(crate) struct ExecutorParts {
     pub(crate) limits: InstallLimits,
     pub(crate) host_arch: Arch,
     pub(crate) source: Arc<dyn KernelSource>,
-    pub(crate) releases: Option<ReleaseContext>,
+    pub(crate) releases: ReleaseSources,
     pub(crate) publisher: Arc<dyn ArtifactPublisher>,
     pub(crate) pins: Arc<dyn PinSource>,
 }
@@ -44,7 +44,7 @@ pub(super) struct ExecutorContext {
     pub(super) limits: InstallLimits,
     pub(super) host_arch: Arch,
     pub(super) source: Arc<dyn KernelSource>,
-    pub(super) releases: Option<ReleaseContext>,
+    pub(super) releases: ReleaseSources,
     pub(super) publisher: Arc<dyn ArtifactPublisher>,
     pub(super) pins: Arc<dyn PinSource>,
     db: Arc<Mutex<Connection>>,
@@ -105,7 +105,7 @@ impl InstallExecutor {
             NodeArtifactRef::Release(release, digest) => self
                 .context
                 .releases
-                .as_ref()
+                .get(release.kind)
                 .map(|context| {
                     context
                         .root
@@ -247,7 +247,7 @@ impl InstallExecutor {
                         let context = self
                             .context
                             .releases
-                            .as_ref()
+                            .get(release.release.kind)
                             .ok_or_else(|| JobError::permanent("release source disabled"))?;
                         let (digest, size) = self
                             .prepare_release(context, release, digest, root, cancellation)
