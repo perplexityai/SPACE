@@ -1195,7 +1195,9 @@ fn bound_cold_boot_uses_the_recorded_runtime_and_never_the_node_default() {
 fn compatible_selection_preserves_exact_before_fallback() {
     use crate::catalog::CompiledEnvironment;
     use crate::selection::{self, CompatibleSelection, ExecutionPolicy};
-    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let mut catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    // These scenarios exercise Firecracker snapshot-format qualification.
+    catalog.retain(|entry| entry.release().release.kind == RuntimeKind::Firecracker);
     let source = catalog[0].definition().execution_requirements().unwrap();
     let all = "e0,fc-1.17.0-linux-6.1.155,fc-1.17.0-linux-6.18.44";
     for exact_installed in [true, false] {
@@ -1266,6 +1268,8 @@ fn restore_falls_back_after_revocation_without_boot_files() {
     use crate::catalog::CompiledEnvironment;
     use crate::selection::{self, CompatibleSelection, ExecutionPolicy};
     let mut catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    // These scenarios exercise Firecracker snapshot-format qualification.
+    catalog.retain(|entry| entry.release().release.kind == RuntimeKind::Firecracker);
     let source = catalog[0].definition().execution_requirements().unwrap();
     // Synthetic qualification proves a patch release is eligible because its
     // declared profile matches, not because its version happens to be newer.
@@ -1323,6 +1327,8 @@ fn transient_exact_source_failure_never_selects_another_consumer() {
     use crate::catalog::CompiledEnvironment;
     use crate::selection::{self, CompatibleSelection, ExecutionPolicy, SelectionError};
     let mut catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    // These scenarios exercise Firecracker snapshot-format qualification.
+    catalog.retain(|entry| entry.release().release.kind == RuntimeKind::Firecracker);
     let source = catalog[0].definition().execution_requirements().unwrap();
     let mut release = catalog[0].release().clone();
     release.release.version = "1.15.2".parse().unwrap();

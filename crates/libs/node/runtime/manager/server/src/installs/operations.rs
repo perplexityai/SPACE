@@ -308,11 +308,11 @@ impl Installer {
         expected_digest: Digest,
     ) -> Result<Operation, SubmitOperationError> {
         let context = self.executor.context();
-        if context.source.runtime() != line.runtime {
-            return Err(SubmitOperationError::Disabled);
-        }
-        let listed = context
+        let source = context
             .source
+            .get(line.runtime)
+            .ok_or(SubmitOperationError::Disabled)?;
+        let listed = source
             .list(line, context.host_arch)
             .await?
             .into_iter()

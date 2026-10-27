@@ -120,6 +120,36 @@ pub fn managed_release_directory(release: &RuntimeIdentity, digest: Digest) -> S
     ManagedDirectoryName::release(release, digest).to_string()
 }
 
+/// Read compatibility for releases published before compact locators. Content
+/// authentication still uses the complete digest, never either directory name.
+pub fn release_directory_names(release: &RuntimeIdentity, digest: Digest) -> [String; 2] {
+    [
+        managed_release_directory(release, digest),
+        format!("v{}--{}", release.version, digest.hex_string()),
+    ]
+}
+
+pub fn kernel_directory_names(version: &ArtifactVersion, digest: Digest) -> [String; 2] {
+    [
+        managed_kernel_directory(version, digest),
+        format!("{version}--{}", digest.hex_string()),
+    ]
+}
+
+/// Prefer the compact copy, but never hide an unreadable or invalid preferred
+/// entry by selecting an older copy. Authentication is the caller's next step.
+pub fn existing_artifact_path(root: &Path, names: &[String; 2]) -> std::io::Result<PathBuf> {
+    for name in names {
+        let path = root.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(root.join(&names[0]))
+}
+
 pub fn managed_kernel_directory(version: &ArtifactVersion, digest: Digest) -> String {
     ManagedDirectoryName::kernel(version, digest).to_string()
 }
@@ -385,10 +415,25 @@ impl ArtifactStore {
         RootProtection::Store.verify(&self.releases_root, self.owner)?;
         let _locked = lock_root(&self.releases_root)
             .map_err(|source| io_verify("lock", &self.releases_root, source))?;
-        let target = self
-            .releases_root
-            .join(managed_release_directory(&pin.release, pin.digest()));
+        let target = existing_artifact_path(
+            &self.releases_root,
+            &release_directory_names(&pin.release, pin.digest()),
+        )
+        .map_err(|source| io_verify("inspect", &self.releases_root, source))?;
         self.verify_release_at(pin, &target)
+    }
+
+    /// Verify the selected managed copy without resolving its directory again.
+    /// Both historical and compact locators retain the store ancestry checks.
+    pub(crate) fn verify_managed_release_at(
+        &self,
+        pin: &PinnedRelease,
+        target: &Path,
+    ) -> Result<VerifiedArtifact, VerifyError> {
+        RootProtection::Store.verify(&self.releases_root, self.owner)?;
+        let _locked = lock_root(&self.releases_root)
+            .map_err(|source| io_verify("lock", &self.releases_root, source))?;
+        self.verify_release_at(pin, target)
     }
 
     /// Verify a baked release without adopting or changing its files.
@@ -484,12 +529,21 @@ impl ArtifactStore {
                 io_publish("remove empty execution cache directory", &target, source)
             })?;
         }
+        let source = existing_artifact_path(
+            &self.kernels_root,
+            &kernel_directory_names(&pin.version, pin.sha256),
+        )
+        .map_err(|source| io_publish("inspect", &self.kernels_root, source))?;
+        let source_directory = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("catalog-derived directory name");
         self.publish(
             cache,
             &directory,
             PublishSource::Store {
                 root: &self.kernels_root,
-                directory: &directory,
+                directory: source_directory,
             },
             &[PlannedFile {
                 path: KERNEL_IMAGE,
@@ -615,33 +669,37 @@ impl ArtifactStore {
         let root = &self.releases_root;
         check_root(root, self.owner).map_err(RemoveError::from)?;
         let _locked = lock_root(root).map_err(|source| io("lock", root, source))?;
-        let target = root.join(managed_release_directory(release, digest));
-        if !exists(&target).map_err(|source| io("inspect", &target, source))? {
-            return Ok(RemoveOutcome::Absent);
-        }
-        let layout = crate::runtime_inventory::diagnostic::ReleaseLayout::of(release.kind)
-            .ok_or_else(|| RemoveError::IdentityChanged {
-                path: target.clone(),
-            })?;
-        let mut binaries = Vec::new();
-        for binary in layout.binaries {
-            let path = target.join(binary);
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|source| removal_evidence_error("inspect", &path, source))?;
-            if !metadata.is_file() || metadata.len() > self.max_file_bytes {
-                return Err(RemoveError::IdentityChanged { path });
+        let mut outcome = RemoveOutcome::Absent;
+        for name in release_directory_names(release, digest) {
+            let target = root.join(name);
+            if !exists(&target).map_err(|source| io("inspect", &target, source))? {
+                continue;
             }
-            binaries.push((
-                *binary,
-                sha256_file(&path)
-                    .map_err(|source| removal_evidence_error("hash", &path, source))?,
-            ));
+            let layout = crate::runtime_inventory::diagnostic::ReleaseLayout::of(release.kind)
+                .ok_or_else(|| RemoveError::IdentityChanged {
+                    path: target.clone(),
+                })?;
+            let mut binaries = Vec::new();
+            for binary in layout.binaries {
+                let path = target.join(binary);
+                let metadata = std::fs::symlink_metadata(&path)
+                    .map_err(|source| removal_evidence_error("inspect", &path, source))?;
+                if !metadata.is_file() || metadata.len() > self.max_file_bytes {
+                    return Err(RemoveError::IdentityChanged { path });
+                }
+                binaries.push((
+                    *binary,
+                    sha256_file(&path)
+                        .map_err(|source| removal_evidence_error("hash", &path, source))?,
+                ));
+            }
+            if crate::catalog::release_digest(binaries) != digest {
+                return Err(RemoveError::IdentityChanged { path: target });
+            }
+            remove_directory(root, &target)?;
+            outcome = RemoveOutcome::Removed;
         }
-        if crate::catalog::release_digest(binaries) != digest {
-            return Err(RemoveError::IdentityChanged { path: target });
-        }
-        remove_directory(root, &target)?;
-        Ok(RemoveOutcome::Removed)
+        Ok(outcome)
     }
 
     /// Remove kernel `version` from the store. Blocking.
@@ -658,23 +716,27 @@ impl ArtifactStore {
         let root = &self.kernels_root;
         check_root(root, self.owner).map_err(RemoveError::from)?;
         let _locked = lock_root(root).map_err(|source| io("lock", root, source))?;
-        let target = root.join(managed_kernel_directory(version, digest));
-        if !exists(&target).map_err(|source| io("inspect", &target, source))? {
-            return Ok(RemoveOutcome::Absent);
+        let mut outcome = RemoveOutcome::Absent;
+        for name in kernel_directory_names(version, digest) {
+            let target = root.join(name);
+            if !exists(&target).map_err(|source| io("inspect", &target, source))? {
+                continue;
+            }
+            let image = target.join(KERNEL_IMAGE);
+            let metadata = std::fs::symlink_metadata(&image)
+                .map_err(|source| removal_evidence_error("inspect", &image, source))?;
+            if !metadata.is_file() || metadata.len() > self.max_file_bytes {
+                return Err(RemoveError::IdentityChanged { path: image });
+            }
+            let found = sha256_file(&image)
+                .map_err(|source| removal_evidence_error("hash", &image, source))?;
+            if found != digest {
+                return Err(RemoveError::IdentityChanged { path: image });
+            }
+            remove_directory(root, &target)?;
+            outcome = RemoveOutcome::Removed;
         }
-        let image = target.join(KERNEL_IMAGE);
-        let metadata = std::fs::symlink_metadata(&image)
-            .map_err(|source| removal_evidence_error("inspect", &image, source))?;
-        if !metadata.is_file() || metadata.len() > self.max_file_bytes {
-            return Err(RemoveError::IdentityChanged { path: image });
-        }
-        let found =
-            sha256_file(&image).map_err(|source| removal_evidence_error("hash", &image, source))?;
-        if found != digest {
-            return Err(RemoveError::IdentityChanged { path: image });
-        }
-        remove_directory(root, &target)?;
-        Ok(RemoveOutcome::Removed)
+        Ok(outcome)
     }
 
     /// Make the staging root a directory only `uid` can use, owned by

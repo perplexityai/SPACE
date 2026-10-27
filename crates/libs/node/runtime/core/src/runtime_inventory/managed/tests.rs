@@ -1,4 +1,5 @@
 use super::*;
+use crate::artifact_store::managed_kernel_directory;
 use crate::artifact_store::test_support::*;
 use crate::catalog::PinnedKernel;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
