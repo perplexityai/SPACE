@@ -55,18 +55,25 @@ async fn source_completion_requires_exact_length_successful_trailers_and_no_extr
             runtime: tokio::runtime::Handle::current(),
             cancellation: CancellationToken::new(),
             consumed: 0,
+            hash: Hasher::new(),
             finished: false,
         };
         let result = tokio::task::spawn_blocking(move || {
             let mut input = input;
             let mut decoded = Vec::new();
-            input.read_to_end(&mut decoded).map(|_| decoded)
+            input
+                .read_to_end(&mut decoded)
+                .map(|_| (decoded, input.hash.finish()))
         })
         .await
         .unwrap();
         assert_eq!(result.is_ok(), valid, "{result:?}");
-        if let Ok(bytes) = result {
+        if let Ok((bytes, identity)) = result {
+            use sha2::Digest;
             assert!(bytes.is_empty() || bytes == b"payload");
+            let expected: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+            assert_eq!(identity.sha256, expected);
+            assert_eq!(identity.size_bytes, bytes.len() as u64);
         }
     }
 }
@@ -80,6 +87,7 @@ async fn cancellation_interrupts_a_source_wait_without_waiting_for_the_peer() {
         runtime: tokio::runtime::Handle::current(),
         cancellation: cancellation.clone(),
         consumed: 0,
+        hash: Hasher::new(),
         finished: false,
     };
     let task = tokio::task::spawn_blocking(move || {

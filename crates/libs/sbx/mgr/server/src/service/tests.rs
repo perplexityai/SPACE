@@ -6161,6 +6161,7 @@ pub(crate) mod service_tests {
         std::fs::write(
             provenance_path,
             serde_json::to_vec(&pplx_space_volmgr_client::VerifiedReplicaProvenance {
+                integrity: None,
                 version: pplx_space_volmgr_client::VERIFIED_REPLICA_PROVENANCE_VERSION,
                 subject_id: format!("sandbox:{sandbox_id}"),
                 s3_uri: format!(

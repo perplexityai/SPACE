@@ -380,6 +380,7 @@ async fn memory_and_luks_roles_use_sparse_output_regardless_of_persisted_mode() 
             store,
         );
         let payload = TransferPayload {
+            expected_integrity: None,
             subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
             local_path: local_path.to_string_lossy().into_owned(),
             s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
@@ -1057,6 +1058,7 @@ fn sparse_shadow_advice_warning_omits_sensitive_path() {
 
 fn verified_payload(local_path: &Path) -> TransferPayload {
     TransferPayload {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
         s3_uri: "s3://bucket/snapshots/a/snapshot.luks?region=us-east-2".to_string(),
@@ -1076,6 +1078,7 @@ fn verified_payload(local_path: &Path) -> TransferPayload {
 
 pub(super) fn push_payload(local_path: &Path) -> TransferPayload {
     TransferPayload {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
         s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
@@ -1327,6 +1330,7 @@ fn verified_replica_materialization_compatibility_requires_requested_work() {
 #[test]
 fn file_replica_provenance_matches_only_same_transfer_contract() {
     let base = TransferPayload {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: "/space/snap/opaque-download".to_string(),
         s3_uri: "s3://bucket/snapshots/a/snapshot.luks?region=us-east-2".to_string(),
@@ -1689,6 +1693,7 @@ async fn unspecified_canonical_pull_reuses_legacy_verified_replica() {
         etag: Some("\"etag-a\"".to_string()),
     };
     let legacy_provenance = VerifiedReplicaProvenance {
+        integrity: None,
         version: VERIFIED_REPLICA_PROVENANCE_VERSION,
         subject_id: payload.subject_id.clone(),
         s3_uri: payload.s3_uri.clone(),
@@ -3977,6 +3982,7 @@ fn transfer_payload_raw_defaults_to_false_for_legacy_compatibility() {
 fn transfer_payload_raw_round_trips() {
     let file_mode = FileMode::new(0o660).unwrap();
     let p = TransferPayload {
+        expected_integrity: None,
         subject_id: "template:seed".to_string(),
         local_path: "/tmp/x".to_string(),
         s3_uri: "s3://b/k?region=us-east-2".to_string(),
@@ -4017,6 +4023,7 @@ fn transfer_payload_with_encryption_round_trips() {
         wrapped_dek: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     };
     let p = TransferPayload {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: "/tmp/x".to_string(),
         s3_uri: "s3://b/k?region=us-east-2".to_string(),
@@ -4403,6 +4410,7 @@ fn transfer_payload_raw_suppresses_transparent_decompress() {
     // expected zstd and its decoder dead-ends. `raw = false` (the
     // default) keeps the symmetric decompress-on-zstd behavior.
     let plain = TransferPayload {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: "/tmp/x".to_string(),
         s3_uri: "s3://b/k?region=us-east-2".to_string(),
@@ -4419,6 +4427,7 @@ fn transfer_payload_raw_suppresses_transparent_decompress() {
         entry_role: None,
     };
     let raw = TransferPayload {
+        expected_integrity: None,
         raw: true,
         ..plain.clone()
     };
@@ -4472,6 +4481,7 @@ async fn stage_encrypted_temp_returns_partial_enc_path_on_aad_derivation_error()
         priority: Default::default(),
     };
     let p = TransferPayload {
+        expected_integrity: None,
         // Template subject is unconditionally rejected by
         // `derive_artifact_aads` (before the artifact_id/role checks) —
         // gives us a deterministic Err.
@@ -4659,6 +4669,7 @@ async fn encrypted_compressed_memory_restore_is_sparse() {
         wrapped_dek: vec![0; 16],
     };
     let payload = TransferPayload {
+        expected_integrity: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
         s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
@@ -4915,4 +4926,112 @@ fn benchmark_production_shaped_sparse_accounting_with_metrics() {
         accounting_cpu_us / 1_000,
         outstanding_metric_calls.load(Ordering::Relaxed),
     );
+}
+
+#[tokio::test]
+async fn integrity_pull_checks_plaintext_before_publication_and_does_not_trust_cached_bytes() {
+    let original = b"verified snapshot payload";
+    let expected = pplx_space_volmgr_client::Integrity::parse(
+        &pplx_space_common_core::types::Digest::sha256(Sha256::digest(original).into()).to_string(),
+        original.len() as u64,
+    )
+    .unwrap();
+    for compressed in [false, true] {
+        for stream_decode in [false, true] {
+            for substituted in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let destination = dir.path().join("snapshot.json");
+                // Same length, so a size/provenance-only cache would be unsafe.
+                let untrusted = vec![b'x'; original.len()];
+                std::fs::write(&destination, &untrusted).unwrap();
+                let content = if substituted {
+                    &untrusted[..]
+                } else {
+                    &original[..]
+                };
+                let body = if compressed {
+                    zstd::stream::encode_all(content, 1).unwrap()
+                } else {
+                    content.to_vec()
+                };
+                let store = Arc::new(StreamingMockStore {
+                    inner: MockObjectStore::new([], body),
+                });
+                let executor = TransferExecutor::new_for_test(
+                    TransferExecutorConfig {
+                        stream_decode_pulls: stream_decode,
+                        static_credentials: Some(test_creds()),
+                        ..Default::default()
+                    },
+                    store.clone(),
+                );
+                let mut payload = verified_payload(&destination);
+                payload.raw = false;
+                payload.snapshot_artifact = Some(SnapshotArtifact::Metadata);
+                payload.expected_integrity = Some(expected);
+                let result = executor
+                    .execute_pull(
+                        &test_job("pull"),
+                        &payload,
+                        &test_creds(),
+                        test_target(),
+                        None,
+                        PullExistingPolicy::VerifiedReplica,
+                    )
+                    .await;
+                assert_eq!(
+                    result.is_ok(),
+                    !substituted,
+                    "compressed={compressed}, stream={stream_decode}: {result:?}"
+                );
+                assert_eq!(
+                    std::fs::read(&destination).unwrap(),
+                    if substituted {
+                        &untrusted[..]
+                    } else {
+                        &original[..]
+                    }
+                );
+                assert!(!partial_path(&destination).exists());
+                if !substituted {
+                    let calls = store.inner.get_calls();
+                    executor
+                        .execute_pull(
+                            &test_job("pull"),
+                            &payload,
+                            &test_creds(),
+                            test_target(),
+                            None,
+                            PullExistingPolicy::VerifiedReplica,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        store.inner.get_calls(),
+                        calls,
+                        "matching verified content is reusable"
+                    );
+                    std::fs::write(&destination, &untrusted).unwrap();
+                    executor
+                        .execute_pull(
+                            &test_job("pull"),
+                            &payload,
+                            &test_creds(),
+                            test_target(),
+                            None,
+                            PullExistingPolicy::VerifiedReplica,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(std::fs::read(&destination).unwrap(), original);
+                    if !stream_decode {
+                        assert!(
+                            store.inner.get_calls() > calls,
+                            "changed content must be fetched again"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
