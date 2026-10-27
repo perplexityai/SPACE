@@ -20,7 +20,8 @@ datadog-otel = ["otel", "datadog"]
 [dependencies]
 dashmap = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true, features = ["process", "signal", "fs", "user"] }
+nix = { workspace = true, features = ["process", "signal", "fs", "user", "sched", "mount", "resource"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
@@ -31,6 +32,7 @@ tracing = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-execution-common = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime", "artifact-store"] }
 
