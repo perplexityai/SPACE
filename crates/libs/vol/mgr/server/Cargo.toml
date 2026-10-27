@@ -19,6 +19,7 @@ datadog = ["otel", "pplx-space-common-svc/datadog"]
 datadog-otel = ["otel", "datadog"]
 
 [dependencies]
+aws-lc-rs = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }

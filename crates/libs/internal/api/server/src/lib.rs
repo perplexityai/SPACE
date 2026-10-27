@@ -1165,12 +1165,23 @@ impl ClusterApiService {
         )
         .await?;
 
+        let digests = snapshot_store::artifact_digests(&self.pool, plan.snapshot_id)
+            .await
+            .map_err(|e| Status::internal(format!("recovery artifact integrity: {e}")))?;
         Ok(Response::new(GetQuarantineRecoveryPlanResponse {
             recovery_id: plan.recovery_id.to_string(),
             execution_generation: plan.execution_generation,
             reason_code: plan.reason_code.to_string(),
             target_state: QuarantineRecoveryTargetState::Suspended as i32,
             suspend_snapshot: Some(QuarantineRecoverySuspendSnapshot {
+                artifact_digests: digests
+                    .into_iter()
+                    .map(|d| crate::proto::SnapshotArtifactDigest {
+                        artifact: d.artifact.file_name().to_string(),
+                        digest: d.digest.to_string(),
+                        size_bytes: d.size_bytes,
+                    })
+                    .collect(),
                 snapshot_id: plan.snapshot_id.to_string(),
                 local_artifact_id: plan
                     .local_artifact_id

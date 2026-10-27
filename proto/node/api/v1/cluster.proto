@@ -1245,6 +1245,7 @@ message QuarantineRecoverySuspendSnapshot {
   string local_artifact_id = 2;
   string storage_uri = 3;
   int64 bytes_uploaded = 4;
+  repeated SnapshotArtifactDigest artifact_digests = 5;
 }
 
 message GetQuarantineRecoveryPlanResponse {

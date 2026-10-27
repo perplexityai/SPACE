@@ -3,7 +3,7 @@ use super::*;
 /// `btrfs send` of a read-only snapshot holding one synthetic text file,
 /// captured from a real kernel: header, `SUBVOL`, `MKFILE`, two `WRITE`s and
 /// metadata commands, then `END`.
-const STREAM: &[u8] = include_bytes!("../../../fixtures/btrfs_send_v1.stream");
+const STREAM: &[u8] = include_bytes!("../../fixtures/btrfs_send_v1.stream");
 
 fn check(pieces: &[&[u8]]) -> Result<(), FramingError> {
     let mut framing = SendStreamFraming::new();
@@ -77,4 +77,28 @@ fn a_corrupted_byte_fails_its_command() {
 #[test]
 fn a_stream_without_the_header_fails() {
     assert_eq!(check(&[&STREAM[1..]]), Err(FramingError::BadMagic));
+}
+
+#[test]
+fn only_v1_commands_are_accepted_even_under_a_v1_header() {
+    // The receiver dispatches commands independently of the header version.
+    // In particular, a v1 label must not admit ENCODED_WRITE (25).
+    for version in [1_u32, 2, 3] {
+        for cmd in [0_u16, 1, 22, 23, 24, 25, u16::MAX] {
+            let mut stream = MAGIC.to_vec();
+            stream.extend(version.to_le_bytes());
+            for command in [cmd, END_COMMAND] {
+                let mut header = [0_u8; 10];
+                header[4..6].copy_from_slice(&command.to_le_bytes());
+                let crc = CRC32C.checksum(&header);
+                header[6..10].copy_from_slice(&crc.to_le_bytes());
+                stream.extend(header);
+            }
+            assert_eq!(
+                check(&[&stream]).is_ok(),
+                version == 1 && matches!(cmd, 1 | 22),
+                "version={version}, command={cmd}"
+            );
+        }
+    }
 }
