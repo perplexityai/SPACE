@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration as StdDuration,
 };
@@ -49,6 +50,7 @@ use crate::runtime_route::{
 };
 use crate::upload_admission::{AdmittedUpload, UploadPermit, UploadTenant, body_ended_error};
 use multipart::{multipart_boundary, resolve_multipart_uploads, spool_multipart_uploads};
+use spool_names::{SpoolNames, SpoolPath};
 
 const E2B_FILE_CONTENT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const E2B_FILE_WRITE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
@@ -954,28 +956,33 @@ fn check_spooled_write_len(bytes_written: u64, staged_len: usize) -> Result<(), 
 /// runtime.
 #[derive(Debug, Default)]
 pub(super) struct SpoolFiles {
-    paths: Vec<tempfile::TempPath>,
-    dir: Option<std::path::PathBuf>,
+    paths: Vec<SpoolPath>,
+    /// The process's spool names when unset.
+    names: Option<Arc<SpoolNames>>,
 }
 
 impl SpoolFiles {
     #[cfg(test)]
     pub(super) fn in_dir(dir: std::path::PathBuf) -> Self {
+        Self::with_names(Arc::new(SpoolNames::in_dir(dir)))
+    }
+
+    /// Spools under `names`, shared with every other request that uses them.
+    #[cfg(test)]
+    fn with_names(names: Arc<SpoolNames>) -> Self {
         Self {
             paths: Vec::new(),
-            dir: Some(dir),
+            names: Some(names),
         }
     }
 
     /// Creates a spool file this guard owns from the start, so even a part
     /// abandoned mid-write is removed with the rest.
     pub(super) async fn create(&mut self) -> Result<SpooledUpload, EcwProxyError> {
-        let dir = self.dir.clone().unwrap_or_else(std::env::temp_dir);
+        let names = self.names.clone();
         // Creating the file is a blocking syscall; keep it off the runtime.
-        let tempfile = tokio::task::spawn_blocking(move || {
-            tempfile::Builder::new()
-                .prefix("space-ecw-upload-")
-                .tempfile_in(dir)
+        let (file, path) = tokio::task::spawn_blocking(move || {
+            names.unwrap_or_else(SpoolNames::for_process).create()
         })
         .await
         .map_err(|error| {
@@ -986,10 +993,9 @@ impl SpoolFiles {
             tracing::warn!(%error, "failed to create ECW upload spool file");
             EcwProxyError::internal("Failed to stage upload")
         })?;
-        let (file, path) = tempfile.into_parts();
         let upload = SpooledUpload {
             file: tokio::fs::File::from_std(file),
-            path: path.to_path_buf(),
+            path: path.path().to_path_buf(),
             bytes_written: 0,
         };
         self.paths.push(path);
@@ -1003,13 +1009,8 @@ impl Drop for SpoolFiles {
         if paths.is_empty() {
             return;
         }
-        let remove = move || {
-            for path in paths {
-                if let Err(error) = path.close() {
-                    tracing::warn!(%error, "failed to remove ECW upload spool file");
-                }
-            }
-        };
+        // Each path removes its file as it drops.
+        let remove = move || drop(paths);
         // While unwinding, a failure to spawn the blocking task would panic
         // again and abort, so remove inline instead.
         if std::thread::panicking() {
@@ -1808,5 +1809,6 @@ fn raw_file_write_error(status: tonic::Status) -> EcwProxyError {
 #[cfg(test)]
 mod admission_tests;
 mod multipart;
+mod spool_names;
 #[cfg(test)]
 mod tests;

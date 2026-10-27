@@ -962,6 +962,43 @@ async fn wait_for_empty_spool_dir(dir: &std::path::Path) {
 }
 
 #[tokio::test]
+async fn spool_file_names_are_reused_only_once_their_file_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = Arc::new(SpoolNames::in_dir(dir.path().to_path_buf()));
+    let stage = || async {
+        let mut spool = SpoolFiles::with_names(Arc::clone(&names));
+        let upload = spool.create().await.unwrap();
+        let staged = upload.finish().await.unwrap();
+        (spool, staged.path)
+    };
+
+    let (first, first_path) = stage().await;
+    // A name in use isn't handed out again.
+    let (second, second_path) = stage().await;
+    assert_ne!(first_path, second_path);
+    drop((first, second));
+    wait_for_empty_spool_dir(dir.path()).await;
+
+    // Later requests take the names back rather than new ones.
+    let (third, third_path) = stage().await;
+    assert!(
+        [&first_path, &second_path].contains(&&third_path),
+        "{third_path:?} is a new name"
+    );
+    drop(third);
+    wait_for_empty_spool_dir(dir.path()).await;
+
+    // A file still on disk under a free name is skipped, not overwritten.
+    std::fs::write(&first_path, b"left behind").unwrap();
+    std::fs::write(&second_path, b"left behind").unwrap();
+    let (fourth, fourth_path) = stage().await;
+    assert!(![&first_path, &second_path].contains(&&fourth_path));
+    assert_eq!(std::fs::read(&first_path).unwrap(), b"left behind");
+    assert_eq!(std::fs::read(&second_path).unwrap(), b"left behind");
+    drop(fourth);
+}
+
+#[tokio::test]
 async fn staged_spool_files_are_removed_when_a_later_part_fails() {
     let dir = tempfile::tempdir().unwrap();
     let mut body = multipart_body(&[
