@@ -1301,9 +1301,10 @@ pub struct ClaimLimits {
     /// Of those, operations other than teardowns ([`TEARDOWN_KINDS`]), so
     /// execution slots kept for teardowns are not taken by other work.
     pub non_teardown: u32,
-    /// Of those, teardowns while other work is also due, so execution slots
-    /// kept for other work are not taken by teardowns. With no other work
-    /// due, teardowns may take all `total`.
+    /// Of those, teardowns while this claim also picks other work (at least
+    /// one row under `non_teardown`), so execution slots kept for other work
+    /// are not taken by teardowns. When the other pick is empty, including
+    /// when `non_teardown` is 0, teardowns may take all `total`.
     pub teardown_while_other_due: u32,
 }
 
@@ -1726,7 +1727,11 @@ async fn claim_operations(
     // the slots reserved for teardowns free of it. While other work is due, at
     // most `$13` are teardowns, which keeps the slots reserved for other work
     // free of them; with none due, teardowns may take any free slot. The claim
-    // then takes the first `$1` of both, in the same order.
+    // then takes the first `$1` of both, in the same order. Both picks lock
+    // their rows before that last `LIMIT`, so up to `$12 + $13 - $1` rows stay
+    // locked but unclaimed until this transaction commits. A concurrent
+    // unkeyed claim skips them meanwhile, and a keyed one does not run while
+    // this claim holds the claim lock.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
         "WITH shared AS (
              SELECT org_id, target_id
