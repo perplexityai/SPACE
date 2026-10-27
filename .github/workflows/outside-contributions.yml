@@ -2,7 +2,8 @@ name: Outside contributions
 
 # Thanks people outside the maintainer team when they open a pull request or
 # issue, marks it for triage, and posts the reply that matches the triage label
-# a maintainer adds.
+# a maintainer adds. A pull request that closes an issue labeled
+# triage:accepted skips triage and goes straight to triage:reviewing.
 #
 # pull_request_target runs with a write token even for pull requests from
 # forks, so this workflow must stay inert toward contributor content: it never
@@ -59,10 +60,38 @@ jobs:
           comments="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/comments" \
             --jq '.[].body')"
 
+          # A pull request that closes an issue whose scope a maintainer
+          # already agreed to (triage:accepted) goes straight to review.
+          # GitHub resolves the closing references itself, so only issue
+          # numbers and maintainer-applied label names reach this script.
+          accepted=''
+          if [[ "${KIND}" == pr ]]; then
+            accepted="$(gh api graphql \
+              -f owner="${GH_REPO%%/*}" -f name="${GH_REPO#*/}" -F number="${NUMBER}" \
+              -f query='query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 10) { nodes {
+                      number state repository { nameWithOwner }
+                      labels(first: 50) { nodes { name } }
+                    } }
+                  }
+                }
+              }' \
+              --jq ".data.repository.pullRequest.closingIssuesReferences.nodes[]
+                | select(.repository.nameWithOwner == \"${GH_REPO}\" and .state == \"OPEN\")
+                | select(any(.labels.nodes[]; .name == \"triage:accepted\"))
+                | .number" | head -n 1)"
+          fi
+
           # A rerun after a maintainer already decided must not reopen triage.
-          if grep -qxE 'triage:(needs-issue|investigating|reviewing|declined)' \
+          if grep -qxE 'triage:(needs-issue|investigating|accepted|reviewing|declined)' \
             <<<"${labels}"; then
             echo "Already triaged; leaving labels as they are."
+            accepted=''
+          elif [[ -n "${accepted}" ]]; then
+            gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/labels" \
+              -f 'labels[]=triage:reviewing' >/dev/null
           else
             gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/labels" \
               -f 'labels[]=triage:pending' >/dev/null
@@ -79,10 +108,18 @@ jobs:
           else
             what='issue'
           fi
+          next='A SPACE maintainer will take a look.'
+          if [[ -n "${accepted}" ]]; then
+            # Labels added with this workflow's token start no new workflow
+            # run, so the triage:reviewing reply goes in this comment. Its
+            # marker keeps the reply job from posting it again.
+            next="This closes #${accepted}, whose scope a maintainer already agreed to, so a maintainer will review it next."
+            marker="${marker} <!-- space-outside-contributions:triage:reviewing -->"
+          fi
           # One line per paragraph: GitHub renders every newline in a comment.
           contributing="https://github.com/${GH_REPO}/blob/main/CONTRIBUTING.md"
           body="$(printf '%s\n\n%s' \
-            "Thanks for opening this ${what}! A SPACE maintainer will take a look." \
+            "Thanks for opening this ${what}! ${next}" \
             "[CONTRIBUTING.md](${contributing}) explains how we review outside contributions. ${marker}")"
           gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/comments" \
             -f body="${body}" >/dev/null
@@ -121,6 +158,13 @@ jobs:
               ;;
             triage:investigating)
               text='Thanks, this is useful. We are looking into it and will handle the fix ourselves, so nothing more is needed from you for now.'
+              ;;
+            triage:accepted)
+              if [[ "${KIND}" == pr ]]; then
+                echo "triage:accepted is for issues; use triage:reviewing on pull requests."
+                exit 0
+              fi
+              text="Thanks, the scope looks good and a pull request is welcome. Please include a test that fails without the fix, and put \"Fixes #${NUMBER}\" in the pull request description so it goes straight to review. Agreeing on scope does not guarantee the pull request will be merged."
               ;;
             triage:reviewing)
               text='Thanks! A maintainer is reviewing this now.'

@@ -14,8 +14,10 @@ drafted the issue, say so. The SPACE team will triage proposals and decide
 which work to take on.
 
 Please wait for a maintainer to agree on the scope before opening a pull
-request, except for trivial bug fixes. Agreement to proceed
-does not guarantee that a pull request will be merged.
+request, except for trivial bug fixes. A maintainer agrees by labeling the
+issue `triage:accepted`. Put `Fixes #<issue>` in the pull request description
+so it goes straight to review. Agreement to proceed does not guarantee that a
+pull request will be merged.
 
 Report suspected vulnerabilities privately as described in
 [SECURITY.md](SECURITY.md), rather than in a public issue or pull request.
