@@ -2,9 +2,9 @@
 //! the row stayed `creating`, and the active execution holds the crashed
 //! request's activation-attempt lease. Once that lease has been expired for a
 //! full age window the sweep fails and retires the row: always when the VM is
-//! dead or missing, and with the VM alive only if its execution never became
-//! routable. A routable one is left to its node's activation-completion
-//! receipt. While the lease is live, or expired more recently, the sweep
+//! dead or missing, and with the VM alive unless its node's
+//! activation-completion receipt can still finish it, which takes a routable
+//! execution that still holds its attempt. While the lease is live, or expired more recently, the sweep
 //! leaves the row alone.
 //!
 //! The fake-sink tests pin the reconciler's choice of action. The
@@ -14,7 +14,8 @@
 use super::*;
 
 /// A `creating` candidate whose active execution's activation lease expired
-/// a full age window ago, and which never became routable.
+/// a full age window ago while still holding its attempt, and which never
+/// became routable.
 fn abandoned_create() -> SweepCandidate {
     SweepCandidate {
         activation_abandoned: true,
@@ -23,38 +24,61 @@ fn abandoned_create() -> SweepCandidate {
     }
 }
 
-/// A crashed create whose VM is alive is failed and retired only if the DB
-/// never showed its pod routable, through the fail CAS that re-checks that.
-/// A routable one is left to its node's activation-completion receipt: no
-/// fail, no retire. Neither is converged or hydrated on the way.
+/// A crashed create whose VM is alive is failed and retired unless a
+/// completion receipt can still finish it, through the fail CAS that
+/// re-checks that: one the DB never showed routable, and a routable one whose
+/// adopting start gave the activation up (no attempt left for a receipt to
+/// match). A routable one that still holds its attempt is left to its node's
+/// activation-completion receipt: no fail, no retire. None is converged or
+/// hydrated on the way.
 #[tokio::test(flavor = "current_thread")]
-async fn a_crashed_create_with_a_live_vm_fails_only_if_it_never_became_routable() {
+async fn a_crashed_create_with_a_live_vm_fails_unless_a_receipt_can_finish_it() {
     let never_routable = SweepCandidate {
         routable_execution: false,
         ..abandoned_create()
     };
     let never_routable_id = never_routable.sandbox_id;
-    let routable = SweepCandidate {
+    let routable_given_up = SweepCandidate {
         routable_execution: true,
+        activation_attempt_held: false,
+        ..abandoned_create()
+    };
+    let routable_given_up_id = routable_given_up.sandbox_id;
+    let routable_held = SweepCandidate {
+        routable_execution: true,
+        activation_attempt_held: true,
         ..abandoned_create()
     };
     let sink = FakeSink::new();
-    for id in [never_routable_id, routable.sandbox_id] {
+    for id in [
+        never_routable_id,
+        routable_given_up_id,
+        routable_held.sandbox_id,
+    ] {
         sink.set_probe_verdict(id, ProbeVerdict::AliveOnNode);
         sink.set_routability(id, ExecutionRoutability::Routable);
     }
-    sink.enqueue_candidates(SandboxLifecycle::Creating, vec![never_routable, routable]);
+    sink.enqueue_candidates(
+        SandboxLifecycle::Creating,
+        vec![never_routable, routable_given_up, routable_held],
+    );
     let reconciler = Reconciler::new(sweep_config(), sink);
 
     let report = reconciler.tick().await;
 
-    assert_eq!(reconciler.sink.fail_calls(), vec![never_routable_id]);
+    assert_eq!(
+        reconciler.sink.fail_calls(),
+        vec![never_routable_id, routable_given_up_id]
+    );
     assert_eq!(
         reconciler.sink.fail_guards(),
-        vec![FailGuard::NeverRoutable]
+        vec![FailGuard::NoPendingReceipt, FailGuard::NoPendingReceipt]
     );
-    assert_eq!(reconciler.sink.cleanup_calls(), vec![never_routable_id]);
-    assert_eq!(report.aged_out, 1);
+    assert_eq!(
+        reconciler.sink.cleanup_calls(),
+        vec![never_routable_id, routable_given_up_id]
+    );
+    assert_eq!(report.aged_out, 2);
     assert_eq!(report.deferred, 1);
     assert!(reconciler.sink.converge_calls().is_empty());
     assert!(reconciler.sink.routability_calls().is_empty());
@@ -453,11 +477,11 @@ mod postgres_backed {
             (Lease::Live, false),
             (Lease::NoExpiry, false),
         ] {
-            let id = insert_row(pool, "starting", lease).await?;
+            let id = insert_row(pool, "stopping", lease).await?;
             assert_eq!(
-                listed(&sink, SandboxLifecycle::Starting, id).await?,
+                listed(&sink, SandboxLifecycle::Stopping, id).await?,
                 Some(expected),
-                "starting row, {lease:?}"
+                "stopping row, {lease:?}"
             );
         }
         Ok(())
@@ -543,16 +567,55 @@ mod postgres_backed {
         Ok(())
     }
 
-    /// The sweep fails an alive crashed create only if it never became
-    /// routable. Of crashed creates with the same abandoned lease, the select
-    /// reports the one with a pod IP routable and the others not, and the
-    /// alive arm's fail CAS (`FailGuard::NeverRoutable`) fails only one that
-    /// still isn't: a pod IP committed after the select makes it claim
-    /// nothing.
+    /// Give up the active execution's activation as a start that adopted the
+    /// row and failed before its wake does: clear the attempt, keep the
+    /// expiry.
+    async fn give_up(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = NULL,
+                    activation_attempt_target_state = NULL
+              WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Claim the active execution for a new activation, as a start's
+    /// attempt assignment does: a fresh attempt and a live lease.
+    async fn claim(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = space_uuid_v7(),
+                    activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                    activation_attempt_target_state = 'started'
+              WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The sweep fails an alive crashed create unless a completion receipt
+    /// can still finish it, which takes a routable execution still holding
+    /// its attempt. Of crashed creates with the same abandoned lease, the
+    /// select reports which are routable and which still hold an attempt,
+    /// and the alive arm's fail CAS (`FailGuard::NoPendingReceipt`) fails
+    /// only those no receipt can finish when it runs:
+    /// - one that never became routable fails;
+    /// - one that holds its attempt and became routable, before or after the
+    ///   select, is left to its receipt;
+    /// - one whose adopting start gave the activation up fails even though
+    ///   it's routable, since no attempt is left for a receipt to match;
+    /// - one that a new start claimed after the select is left alone.
+    ///
     /// The plain fail CAS, which a dead or missing VM takes, still fails a
     /// routable create.
     #[tokio::test(flavor = "current_thread")]
-    async fn only_a_create_that_never_became_routable_is_failed_alive() -> TestResult {
+    async fn only_a_create_no_receipt_can_finish_is_failed_alive() -> TestResult {
         let db = pg_test_db().await?;
         let pool = &db.pool;
         // Routability is a Kubernetes contract: the select reports every
@@ -564,6 +627,12 @@ mod postgres_backed {
         make_routable(pool, routable).await?;
         let never_routable = crashed_create().await?;
         let routable_after_select = crashed_create().await?;
+        let given_up = crashed_create().await?;
+        give_up(pool, given_up).await?;
+        make_routable(pool, given_up).await?;
+        let claimed_after_select = crashed_create().await?;
+        give_up(pool, claimed_after_select).await?;
+        make_routable(pool, claimed_after_select).await?;
 
         let listed = sink
             .list_aged_transient(SandboxLifecycle::Creating, age())
@@ -572,24 +641,35 @@ mod postgres_backed {
             listed
                 .iter()
                 .find(|candidate| candidate.sandbox_id == id)
-                .map(|candidate| (candidate.activation_abandoned, candidate.routable_execution))
+                .map(|candidate| {
+                    (
+                        candidate.activation_abandoned,
+                        candidate.routable_execution,
+                        candidate.activation_attempt_held,
+                    )
+                })
         };
-        assert_eq!(reported(routable), Some((true, true)));
-        assert_eq!(reported(never_routable), Some((true, false)));
-        assert_eq!(reported(routable_after_select), Some((true, false)));
+        assert_eq!(reported(routable), Some((true, true, true)));
+        assert_eq!(reported(never_routable), Some((true, false, true)));
+        assert_eq!(reported(routable_after_select), Some((true, false, true)));
+        assert_eq!(reported(given_up), Some((true, true, false)));
+        assert_eq!(reported(claimed_after_select), Some((true, true, false)));
 
         make_routable(pool, routable_after_select).await?;
+        claim(pool, claimed_after_select).await?;
         for (case, id, fails) in [
             ("routable", routable, false),
             ("never routable", never_routable, true),
             ("routable after the select", routable_after_select, false),
+            ("given up", given_up, true),
+            ("claimed after the select", claimed_after_select, false),
         ] {
             let claimed = sink
                 .fail_aged_candidate(
                     id,
                     SandboxLifecycle::Creating,
                     age(),
-                    FailGuard::NeverRoutable,
+                    FailGuard::NoPendingReceipt,
                 )
                 .await?
                 .is_some();

@@ -2,6 +2,244 @@ use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, SnapshotId, UserId
 
 use super::*;
 
+#[cfg(feature = "kubernetes")]
+#[tokio::test]
+async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_env::TestResult {
+    use pplx_space_common_core::{sql, types::SubstrateKind};
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    use pplx_space_public_api::{OperationKind, OperationTargetType};
+
+    use crate::public_operations::{
+        ApiProduct, ClaimPublicOperations, CreateClaimedPublicOperationResult,
+        CreatePublicOperation, PublicOperationStore, ReleaseClaimedPublicOperation,
+    };
+
+    let db = pg_test_db().await?;
+    let source = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, template_id, content_hash, lifecycle, placement,
+             network_policy_generation, managed_by
+         ) VALUES ($1, $2, $3, 'seed', $4, 'started', 'unplaced', 1, $5)"
+    ))
+    .bind(source)
+    .bind(SEED_USER_ID)
+    .bind(SEED_ORG_ID)
+    .bind("sha256:0000000000000000000000000000000000000000000000000000000000000001")
+    .bind(SubstrateKind::Kubernetes)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace, state, active
+         ) VALUES ($1, 7, $2, 'space', 'running', TRUE)"
+    ))
+    .bind(source)
+    .bind(format!("space-sbx-{}-g7", source.as_uuid().simple()))
+    .execute(&db.pool)
+    .await?;
+    let payload = ForkSandboxPayloadV1::new(
+        source,
+        crate::fork_operations::ForkRequest::from_wire(Some(60), Some(1))?,
+        "e2b.example.test".to_string(),
+    );
+    let source_id = source.to_string();
+    let store = PublicOperationStore::new(db.pool.clone());
+    let CreateClaimedPublicOperationResult::Claimed {
+        claim_token,
+        operation,
+    } = store
+        .create_claimed_operation(CreatePublicOperation {
+            org_id: OrgId::from_uuid(SEED_ORG_ID),
+            actor_user_id: Some(UserId::from_uuid(SEED_USER_ID)),
+            api_product: ApiProduct::Native,
+            kind: OperationKind::ForkSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&source_id),
+            payload_json: serde_json::to_value(ForkSandboxPayload::v1(payload))?,
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?
+    else {
+        panic!("new fork must own its claim");
+    };
+    let substrate = Substrate::from_kubernetes(
+        crate::controllers::substrate::kubernetes::tests::substrate_with_store(db.pool.clone()),
+    );
+    let executor = ForkSandboxOperationExecutor::new(
+        db.pool.clone(),
+        substrate.clone(),
+        SandboxController::new(substrate),
+    );
+
+    let result = executor.execute(&claim_token, &operation).await;
+
+    assert_eq!(result.state, OperationState::Queued);
+    // Reclaim through the dispatcher's store API to inspect what the next
+    // executor receives, without selecting a capture on the test's behalf.
+    assert!(
+        store
+            .release_claimed_operation(ReleaseClaimedPublicOperation {
+                claim_token,
+                operation_id: operation.id,
+                progress_message: result.progress_message,
+                retry_after: Duration::ZERO,
+                count_attempt: false,
+            })
+            .await?
+    );
+    let resumed = store
+        .claim_operations(ClaimPublicOperations {
+            limit: 1,
+            claim_stale_after: Duration::from_secs(30),
+            claimable_kinds: &[OperationKind::ForkSandbox],
+        })
+        .await?
+        .operations
+        .pop()
+        .expect("released fork must be claimable");
+    assert_eq!(resumed.id, operation.id);
+    let persisted = decode_fork_payload(resumed.payload)?;
+    assert_eq!(
+        persisted.capture_operation_id(),
+        Some(operation.id),
+        "one execution must pass source freeze and persist its capture leader before yielding"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "kubernetes")]
+#[tokio::test]
+async fn ready_capture_completes_in_one_claim_but_pending_upload_still_yields()
+-> pplx_space_test_env::TestResult {
+    use pplx_space_common_core::{
+        sql,
+        types::{LocalArtifactId, SubstrateKind},
+    };
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    use pplx_space_public_api::{OperationKind, OperationTargetType};
+
+    use crate::fork_operations::ForkSandboxPayload;
+    use crate::public_operations::{
+        ApiProduct, CreateClaimedPublicOperationResult, CreatePublicOperation, PublicOperationStore,
+    };
+
+    for state in [SnapshotState::Ready, SnapshotState::Creating] {
+        let db = pg_test_db().await?;
+        let source = SandboxId::new();
+        let snapshot = SnapshotId::new();
+        let local_artifact = LocalArtifactId::new();
+        let mut payload = ForkSandboxPayloadV1::new(
+            source,
+            crate::fork_operations::ForkRequest::from_wire(Some(60), Some(1))?,
+            "e2b.example.test".to_string(),
+        );
+        payload.freeze_source(7, ForkSourceLifecycle::Started, target_config(), None);
+        payload.record_local_artifact(local_artifact);
+        payload.record_backup_attempt(BackupAttemptId::from_uuid(snapshot.as_uuid()));
+        let target = payload.target_sandbox_id();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, lifecycle, placement, network_policy_generation, managed_by
+             ) VALUES ($1, $3, $4, 'started', 'unplaced', 1, $5), ($2, $3, $4, 'started', 'unplaced', 1, $5)"
+        ))
+        .bind(source)
+        .bind(target)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(SubstrateKind::Kubernetes)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, artifact_kind, artifact_origin, org_id, local_artifact_id
+             ) VALUES ($1, $2, 'disk', $3, 'disk', 'fork', $4, $5)"
+        ))
+        .bind(snapshot)
+        .bind(source)
+        .bind(state.as_str())
+        .bind(SEED_ORG_ID)
+        .bind(local_artifact)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (id, snapshot_id, storage_connection_string)
+             VALUES ($1, $2, 's3://snapshots/example-artifact')"
+        ))
+        .bind(uuid::Uuid::now_v7())
+        .bind(snapshot)
+        .execute(&db.pool)
+        .await?;
+        let source_id = source.to_string();
+        let store = PublicOperationStore::new(db.pool.clone());
+        let CreateClaimedPublicOperationResult::Claimed {
+            claim_token,
+            mut operation,
+        } = store
+            .create_claimed_operation(CreatePublicOperation {
+                org_id: OrgId::from_uuid(SEED_ORG_ID),
+                actor_user_id: Some(UserId::from_uuid(SEED_USER_ID)),
+                api_product: ApiProduct::Native,
+                kind: OperationKind::ForkSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(&source_id),
+                payload_json: serde_json::to_value(ForkSandboxPayload::v1(payload.clone()))?,
+                idempotency: None,
+                traceparent: None,
+            })
+            .await?
+        else {
+            panic!("new fork must own its claim");
+        };
+        payload.set_capture_operation_id(operation.id);
+        ForkOperationStore::new(db.pool.clone())
+            .persist_payload(&claim_token, &operation, &payload)
+            .await?;
+        operation.payload = serde_json::to_value(ForkSandboxPayload::v1(payload))?;
+        let substrate = Substrate::from_kubernetes(
+            crate::controllers::substrate::kubernetes::tests::substrate_with_store(db.pool.clone()),
+        );
+        let executor = ForkSandboxOperationExecutor::new(
+            db.pool.clone(),
+            substrate.clone(),
+            SandboxController::new(substrate),
+        );
+
+        let result = executor.execute(&claim_token, &operation).await;
+
+        match state {
+            SnapshotState::Ready => {
+                assert_eq!(
+                    result.state,
+                    OperationState::Succeeded,
+                    "ready capture must finish without another dispatcher claim: {result:?}"
+                );
+                let PublicOperationResult::Fork(fork) =
+                    serde_json::from_value(result.result_json.expect("completed fork result"))?
+                else {
+                    panic!("expected a fork result");
+                };
+                assert_eq!(fork.results.len(), 1);
+                assert!(matches!(
+                    serde_json::from_value::<ForkTargetOutcome>(fork.results[0].clone())?,
+                    ForkTargetOutcome::Succeeded { sandbox_id, .. } if sandbox_id == target
+                ));
+            }
+            SnapshotState::Creating => {
+                assert_eq!(result.state, OperationState::Queued);
+                assert_eq!(
+                    result.requeue_reason,
+                    PublicOperationRequeueReason::WorkflowProgress
+                );
+                assert!(result.retry_after.is_some_and(|delay| !delay.is_zero()));
+            }
+            SnapshotState::Failed | SnapshotState::Deleting => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn executor_invariants_are_not_reported_as_invalid_client_requests() {
     let ForkExecutionError::Terminal { code, .. } =

@@ -145,6 +145,21 @@ async fn post_command(
     idempotency_key: Option<&str>,
     accept: Option<&str>,
 ) -> TestDbResult<Answer> {
+    post_command_body(
+        fixture,
+        idempotency_key,
+        accept,
+        &json!({"command": ["echo", "hello"]}),
+    )
+    .await
+}
+
+async fn post_command_body(
+    fixture: &Fixture,
+    idempotency_key: Option<&str>,
+    accept: Option<&str>,
+    body: &Value,
+) -> TestDbResult<Answer> {
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(&fixture.commands_path)
@@ -156,7 +171,7 @@ async fn post_command(
     if let Some(accept) = accept {
         request = request.header(header::ACCEPT, accept);
     }
-    let body = serde_json::to_vec(&json!({"command": ["echo", "hello"]}))?;
+    let body = serde_json::to_vec(body)?;
     let response = fixture
         .app
         .clone()
@@ -347,6 +362,73 @@ async fn create_errors_are_unchanged_and_never_open_a_stream() -> TestDbResult<(
     assert_eq!(not_found.content_type.as_deref(), Some("application/json"));
 
     assert!(seen.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_commands_with_a_pty_are_refused_before_the_create() -> TestDbResult<()> {
+    let (origin, seen) = spawn_data_plane(DataPlaneMode::Stream).await;
+    let fixture = fixture(Some(proxy(&origin))).await?;
+    let pty = json!({"rows": 24, "cols": 80});
+    for (key, body) in [
+        ("pty", json!({"command": ["sh"], "pty": pty})),
+        (
+            "stdin-and-pty",
+            json!({"command": ["sh"], "stdin": true, "pty": pty}),
+        ),
+    ] {
+        let refused =
+            post_command_body(&fixture, Some(key), Some("text/event-stream"), &body).await?;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+        let envelope: Value = serde_json::from_str(&refused.body)?;
+        assert_eq!(envelope["code"], "invalid_request", "{envelope}");
+        assert_eq!(envelope["retryable"], false, "{envelope}");
+        assert_eq!(
+            envelope["details"],
+            json!([{"key": "field", "value": "pty"}]),
+            "{envelope}"
+        );
+
+        // Nothing was stored under the key: a different body reusing it
+        // creates a command instead of answering idempotency_conflict.
+        let reused = post_command(&fixture, Some(key), None).await?;
+        assert_eq!(reused.status, StatusCode::CREATED, "{}", reused.body);
+        // A JSON create keeps accepting a pty, for callers that attach over
+        // WebSocket.
+        let json_create =
+            post_command_body(&fixture, Some(&format!("{key}-json")), None, &body).await?;
+        assert_eq!(
+            json_create.status,
+            StatusCode::CREATED,
+            "{}",
+            json_create.body
+        );
+    }
+
+    // A zero-weight event stream is a JSON create, which keeps accepting a pty.
+    let declined = post_command_body(
+        &fixture,
+        Some("declined-stream"),
+        Some("text/event-stream;q=0, application/json"),
+        &json!({"command": ["sh"], "pty": pty}),
+    )
+    .await?;
+    assert_eq!(declined.status, StatusCode::CREATED, "{}", declined.body);
+    assert_eq!(declined.content_type.as_deref(), Some("application/json"));
+    assert!(seen.lock().unwrap().is_empty());
+
+    // Stdin alone streams: the events stream starts it at EOF.
+    for (key, stdin) in [("stdin", true), ("no-stdin", false)] {
+        let streamed = post_command_body(
+            &fixture,
+            Some(key),
+            Some("text/event-stream"),
+            &json!({"command": ["cat"], "stdin": stdin}),
+        )
+        .await?;
+        assert_eq!(streamed.status, StatusCode::CREATED, "{}", streamed.body);
+        assert_eq!(streamed.content_type.as_deref(), Some("text/event-stream"));
+    }
     Ok(())
 }
 

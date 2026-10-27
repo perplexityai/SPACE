@@ -63,6 +63,33 @@ pub(super) fn install_current_guest_with_privilege(
     )
 }
 
+pub(crate) fn install_working_directory(
+    target_root: &Path,
+    working_dir: &Path,
+    as_root: bool,
+) -> Result<(), GuestBundleError> {
+    validate_target_root(target_root)?;
+    let mut file = tempfile::NamedTempFile::new().map_err(|source| GuestBundleError::Io {
+        operation: GuestBundleOperation::Install,
+        path: target_root.to_path_buf(),
+        source,
+    })?;
+    file.write_all(working_dir.as_os_str().as_encoded_bytes())
+        .map_err(|source| GuestBundleError::Io {
+            operation: GuestBundleOperation::Install,
+            path: file.path().to_path_buf(),
+            source,
+        })?;
+    let relative = Path::new("etc/spaced/working-directory");
+    prepare_target_file(
+        target_root,
+        relative,
+        GuestBundleOperation::Install,
+        as_root,
+    )?;
+    install(file.path(), &target_root.join(relative), 0o644, as_root)
+}
+
 pub(super) fn validate_target_root(target_root: &Path) -> Result<(), GuestBundleError> {
     let metadata = fs::symlink_metadata(target_root).map_err(|source| GuestBundleError::Io {
         operation: GuestBundleOperation::Inspect,

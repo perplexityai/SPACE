@@ -195,6 +195,7 @@ class _Process:
 
 class _Sandbox:
     sandbox_id = "sandbox-additional"
+    reports_exited_processes = False
 
     def __init__(self) -> None:
         self.trace: list[str] = []

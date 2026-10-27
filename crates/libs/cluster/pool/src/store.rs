@@ -138,11 +138,7 @@ impl WarmPoolStore {
 
     pub async fn enabled_configs(&self) -> Result<Vec<PoolConfig>> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
-            "SELECT c.id, c.template_release_id, r.template_name,
-                    CASE
-                        WHEN r.hash LIKE 'sha256:%' THEN r.hash
-                        ELSE 'sha256:' || r.hash
-                    END AS content_hash,
+            "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
                     c.disk_io_max_bandwidth_mib_per_sec, c.target_ready_slots, c.refill_per_tick,
                     c.max_warming_slots, c.namespace, c.enabled, c.encryptable,
@@ -160,11 +156,7 @@ impl WarmPoolStore {
 
     pub async fn reconcilable_configs(&self) -> Result<Vec<PoolConfig>> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
-            "SELECT c.id, c.template_release_id, r.template_name,
-                    CASE
-                        WHEN r.hash LIKE 'sha256:%' THEN r.hash
-                        ELSE 'sha256:' || r.hash
-                    END AS content_hash,
+            "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
                     c.disk_io_max_bandwidth_mib_per_sec, c.target_ready_slots, c.refill_per_tick,
                     c.max_warming_slots, c.namespace, c.enabled, c.encryptable,
@@ -195,11 +187,7 @@ impl WarmPoolStore {
     pub async fn recently_disabled_configs(&self, grace: Duration) -> Result<Vec<PoolConfig>> {
         let grace_secs = i64::try_from(grace.as_secs()).unwrap_or(i64::MAX);
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
-            "SELECT c.id, c.template_release_id, r.template_name,
-                    CASE
-                        WHEN r.hash LIKE 'sha256:%' THEN r.hash
-                        ELSE 'sha256:' || r.hash
-                    END AS content_hash,
+            "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
                     c.disk_io_max_bandwidth_mib_per_sec, c.target_ready_slots, c.refill_per_tick,
                     c.max_warming_slots, c.namespace, c.enabled, c.encryptable,
@@ -778,11 +766,7 @@ impl WarmPoolStore {
     async fn delete_empty_disabled_autoscale_configs(&self) -> Result<Vec<PoolConfig>> {
         let mut tx = self.pool.begin().await?;
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
-            "SELECT c.id, c.template_release_id, r.template_name,
-                    CASE
-                        WHEN r.hash LIKE 'sha256:%' THEN r.hash
-                        ELSE 'sha256:' || r.hash
-                    END AS content_hash,
+            "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
                     c.disk_io_max_bandwidth_mib_per_sec, c.target_ready_slots, c.refill_per_tick,
                     c.max_warming_slots, c.namespace, c.enabled, c.encryptable,

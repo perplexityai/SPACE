@@ -906,6 +906,13 @@ impl ClusterApi for ClusterApiService {
         ))
     }
 
+    async fn get_node_runtime_desired_state(
+        &self,
+        request: Request<GetNodeRuntimeDesiredStateRequest>,
+    ) -> Result<Response<GetNodeRuntimeDesiredStateResponse>, Status> {
+        self.node_runtime_desired_state(request).await
+    }
+
     async fn get_node_template_desired_state(
         &self,
         request: Request<GetNodeTemplateDesiredStateRequest>,
@@ -1845,5 +1852,12 @@ impl ClusterApi for ClusterApiService {
         request: Request<GetSuspendSnapshotLocationRequest>,
     ) -> Result<Response<GetSuspendSnapshotLocationResponse>, Status> {
         ClusterApiService::get_suspend_snapshot_location(self, request).await
+    }
+
+    async fn get_execution_currency(
+        &self,
+        request: Request<crate::proto::GetExecutionCurrencyRequest>,
+    ) -> Result<Response<crate::proto::GetExecutionCurrencyResponse>, Status> {
+        ClusterApiService::get_execution_currency(self, request).await
     }
 }

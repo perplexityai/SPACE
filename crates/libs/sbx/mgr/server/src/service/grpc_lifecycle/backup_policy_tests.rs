@@ -83,6 +83,84 @@ fn artifact_backup_request(
 }
 
 #[tokio::test]
+async fn artifact_backup_refuses_a_runtime_upgrade_and_its_internal_copy() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        LOOPBACK_ENDPOINT,
+        STATIC_TOKEN,
+        &token_path,
+    )) {
+        return;
+    }
+    let execution = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+        pplx_space_common_core::types::Arch::X86_64,
+    )
+    .unwrap()
+    .first()
+    .unwrap()
+    .definition()
+    .execution_requirements()
+    .unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+    let operation_id = crate::db::test_fixtures::fence_runtime_upgrade(
+        &conn,
+        &id,
+        execution.environment().unwrap(),
+        None,
+    )
+    .operation_id;
+    let service = SandboxManagerService::for_test(conn);
+
+    // The instance may hold a failed boot's disk until the rollback restores
+    // the preserved copy.
+    let fenced = service
+        .enqueue_artifact_backup(artifact_backup_request(
+            &id,
+            crate::proto::ArtifactKind::Disk,
+            Some(Source::CurrentInstance(
+                crate::proto::CurrentInstanceSource {},
+            )),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(fenced.code(), tonic::Code::Unavailable, "{fenced}");
+    assert!(
+        fenced.message().contains(&operation_id.to_string()),
+        "{fenced}"
+    );
+
+    service
+        .db_conn()
+        .unwrap()
+        .execute(
+            "DELETE FROM sandbox_runtime_upgrades WHERE operation_id = ?1",
+            crate::db::fixture::params![operation_id.to_string()],
+        )
+        .unwrap();
+    let internal = service
+        .enqueue_artifact_backup(artifact_backup_request(
+            &id,
+            crate::proto::ArtifactKind::Disk,
+            Some(Source::SnapshotName(format!(
+                "d-operation-runtime-upgrade-{operation_id}"
+            ))),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        internal.code(),
+        tonic::Code::FailedPrecondition,
+        "{internal}"
+    );
+    assert!(internal.message().contains("internal"), "{internal}");
+    assert_eq!(snapshot_upload_jobs(&service, &id), 0);
+}
+
+#[tokio::test]
 async fn artifact_backup_admission_refuses_sources_it_cannot_back_up() {
     let token_dir = tempfile::tempdir().unwrap();
     let token_path = token_dir.path().join("cluster-api.token");

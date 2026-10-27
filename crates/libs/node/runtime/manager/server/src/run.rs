@@ -18,7 +18,7 @@ use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
 
 use crate::installs::{
     DirectoryCatalog, ExecutorParts, InstallLimits, Installer, KernelSource, NodeManagerPublisher,
-    OpenInstallerError, ReleaseContext, ReleaseSource,
+    OpenInstallerError, ReleaseContext, ReleaseSource, ReleaseSources,
 };
 use crate::service::RuntimeManagerService;
 
@@ -93,6 +93,9 @@ pub enum ReleaseSourceConfig {
     /// [`crate::FIRECRACKER_RELEASE_SOURCE`] is.
     #[cfg(feature = "github")]
     GitHub(crate::ReleaseUrl),
+    /// Cloud Hypervisor's upstream static executable releases.
+    #[cfg(feature = "github")]
+    CloudHypervisorGitHub(crate::ReleaseUrl),
     /// A source the deployment supplies.
     Custom(Arc<dyn ReleaseSource>),
 }
@@ -102,6 +105,11 @@ impl std::fmt::Debug for ReleaseSourceConfig {
         match self {
             #[cfg(feature = "github")]
             Self::GitHub(base) => formatter.debug_tuple("GitHub").field(base).finish(),
+            #[cfg(feature = "github")]
+            Self::CloudHypervisorGitHub(base) => formatter
+                .debug_tuple("CloudHypervisorGitHub")
+                .field(base)
+                .finish(),
             Self::Custom(source) => formatter
                 .debug_tuple("Custom")
                 .field(source.root())
@@ -115,8 +123,19 @@ impl ReleaseSourceConfig {
         match self {
             #[cfg(feature = "github")]
             Self::GitHub(base) => Ok(Arc::new(
-                crate::installs::GitHubReleaseSource::new(base)
-                    .map_err(RunRuntimeManagerError::ReleaseSource)?,
+                crate::installs::GitHubReleaseSource::new(
+                    crate::installs::GitHubRuntime::Firecracker,
+                    base,
+                )
+                .map_err(RunRuntimeManagerError::ReleaseSource)?,
+            )),
+            #[cfg(feature = "github")]
+            Self::CloudHypervisorGitHub(base) => Ok(Arc::new(
+                crate::installs::GitHubReleaseSource::new(
+                    crate::installs::GitHubRuntime::CloudHypervisor,
+                    base,
+                )
+                .map_err(RunRuntimeManagerError::ReleaseSource)?,
             )),
             Self::Custom(source) => Ok(source),
         }
@@ -162,13 +181,15 @@ pub struct RuntimeManagerRunConfig {
     pub kernel_source: Option<KernelSourceConfig>,
     /// Read-only catalog access remains available without an installer.
     pub catalog_dir: PathBuf,
-    pub releases: Option<RuntimeManagerReleaseConfig>,
+    pub releases: Vec<RuntimeManagerReleaseConfig>,
     /// Installs, or none when the service runs list-only.
     pub install: Option<RuntimeManagerInstallConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunRuntimeManagerError {
+    #[error(transparent)]
+    ReleaseConfiguration(#[from] crate::ReleaseConfigurationError),
     #[error("failed to bind the runtime-manager socket {path}: {source}")]
     BindSocket {
         path: PathBuf,
@@ -211,20 +232,23 @@ pub async fn run(
     let kernel_source = config.kernel_source.map(KernelSourceConfig::into_source);
     let mut roots = config.roots;
     let pins = Arc::new(DirectoryCatalog(config.catalog_dir));
-    let releases = match config.releases {
-        Some(releases) => {
-            let source = releases.source.into_source()?;
-            roots.managed_releases = Some(RuntimeInstallationRoot::new(
-                source.runtime(),
-                releases.root.clone(),
-            ));
-            Some(ReleaseContext {
-                root: releases.root,
-                source,
+    let release_contexts = config
+        .releases
+        .into_iter()
+        .map(|release| {
+            Ok(ReleaseContext {
+                source: release.source.into_source()?,
+                root: release.root,
             })
-        }
-        None => None,
-    };
+        })
+        .collect::<Result<Vec<_>, RunRuntimeManagerError>>()?;
+    let releases = tokio::task::spawn_blocking(move || ReleaseSources::new(release_contexts))
+        .await
+        .map_err(RunRuntimeManagerError::Startup)??;
+    roots.managed_releases = releases
+        .iter()
+        .map(|release| RuntimeInstallationRoot::new(release.source.runtime(), release.root.clone()))
+        .collect();
     let installer = match config.install {
         Some(install) => {
             let source = kernel_source
@@ -333,7 +357,7 @@ pub async fn run(
         kernel_installs = installer.is_some(),
         release_installs = installer
             .as_ref()
-            .is_some_and(|installer| installer.releases_root().is_some()),
+            .is_some_and(|installer| installer.releases_enabled()),
         "space-rtmgr listening"
     );
     let shutdown = async move {

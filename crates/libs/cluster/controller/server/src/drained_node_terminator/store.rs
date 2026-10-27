@@ -218,6 +218,58 @@ pub(crate) fn delete_refusal_diagnostics_query(residency: ResidencyEvidence) -> 
 /// `failed` so the reap converges.
 pub(crate) const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
 
+/// `$1` = node id. The give-up candidate claim: the node's pinned `suspended`
+/// rows that have no durable copy, locked in `id` order.
+///
+/// Exposed as a function rather than inlined at the call site so the
+/// lock-footprint and plan tests drive the statement this reconciler actually
+/// runs. Retyped SQL in a test asserts about the test's copy: it keeps passing
+/// after the production statement changes, which is the one failure a
+/// lock-discipline test must not have.
+///
+/// It claims only rows without a durable copy because those are the only rows
+/// [`mark_unrecoverable_sandboxes_lost_query`] can flip: the flip re-checks
+/// `AND NOT {durable}` on the claimed ids. Every pinned `suspended` row with
+/// a durable copy is one the flip can't touch, so locking it buys nothing;
+/// this filter drops those rows from the lock set.
+///
+/// Durability can change between this claim and the flip, in either direction:
+///
+/// * Not durable at the claim and durable by the flip: the row is claimed, and
+///   the flip's own `NOT {durable}` spares it.
+/// * Durable at the claim and not durable by the flip, for example because its
+///   ready copy's storage location was orphaned: the row isn't claimed, so this
+///   tick can't flip it. It still blocks the reap: [`snapshot_blockers_for_node`]
+///   counts a `suspended` row that is `NOT {durable}` by the same predicate,
+///   through `drain_gate_target_pinned_blocks`. So the next
+///   tick's refused delete runs the give-up again and claims it then. That
+///   one-tick miss is accepted; the alternative is locking every durable row
+///   on every tick.
+///
+/// The durability check is wrapped in a scalar subquery, `NOT (SELECT …)`,
+/// for the reason `pinned_local_only_sandboxes_query` gives: a bare `NOT
+/// EXISTS` is pullable, and the planner may realise it as a hash or merge
+/// anti-join over the whole `snapshots` ⋈ `snapshot_storage_locations`
+/// product. Inside a scalar subquery it stays a per-row `SubPlan`, whose
+/// `sn.sandbox_id = s.id` makes each execution an index probe.
+/// `giveup_claim_tests::the_claim_keeps_its_durability_check_fenced` pins that
+/// plan shape.
+///
+/// The statement locks `sandboxes` rows and nothing else: `FOR UPDATE` locks
+/// the rows of its own `FROM` list, and the durability check is a sublink.
+pub(crate) fn gone_node_giveup_claim_query() -> String {
+    let durable = snapshot_durable_for_source_release("s");
+    format!(
+        "SELECT s.id
+           FROM sandboxes s
+          WHERE s.lifecycle = 'suspended'
+            AND s.target_node_id = $1
+            AND NOT (SELECT {durable})
+          ORDER BY s.id
+          FOR UPDATE"
+    )
+}
+
 /// `$1` = node id, `$2` = the kube uid observed at the EC2 cross-check,
 /// `$3` = the candidate ids the caller has already `FOR UPDATE`-claimed in
 /// the same transaction (only those may flip — see the inline comment),
@@ -550,15 +602,16 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // reach — same pre-existing semantics as node_drain's
         // `mark_sandbox_lost`, since `BeginArtifactBackup` does not check
         // the sandbox lifecycle.)
-        let claimed: Vec<SandboxId> = sqlx::query_scalar(sql!(
-            "SELECT id FROM sandboxes
-              WHERE lifecycle = 'suspended' AND target_node_id = $1
-              ORDER BY id
-              FOR UPDATE"
-        ))
-        .bind(node_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        //
+        // Only rows without a durable copy at the claim's snapshot are
+        // claimed; see [`gone_node_giveup_claim_query`] for why the flip could
+        // act on no other row at that snapshot, and for the one-tick miss on a
+        // row that loses durability after it.
+        let claim = gone_node_giveup_claim_query();
+        let claimed: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(claim.as_str())))
+            .bind(node_id)
+            .fetch_all(&mut *tx)
+            .await?;
         if claimed.is_empty() {
             tx.rollback().await?;
             return Ok(Vec::new());
@@ -628,6 +681,35 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
             .bind(&ids)
             .bind(node_id)
             .bind(DEAD_UPLOAD_SETTLE.as_secs().cast_signed())
+            .execute(&mut *tx)
+            .await?;
+            // Drop the given-up sandboxes' queue rows on this node. Once the
+            // sandbox is `failed`, a queued row describes an artifact nobody
+            // will back up, and nothing else removes it: a gone node sends no
+            // census for the mirror to replace its set from, and the table's
+            // only foreign key is on `sandbox_id`, so the row would stay until
+            // the sandbox row is deleted, reading as pending work the node no
+            // longer has.
+            //
+            // Scoped to `node_id`, not just `sandbox_id`: a sandbox can hold
+            // a queue row on another node — the queue is keyed
+            // `(node_id, sandbox_id)` — and that row belongs to that node's
+            // inventory, not to this reap. Deleting by sandbox alone would
+            // silently drop a live node's pending work.
+            //
+            // Lock order is sandboxes-then-queue. The census publish that
+            // writes these rows takes the queue row first (its foreign-key
+            // check on `sandboxes` runs after the insert, and its upsert arm
+            // locks the existing queue row with no check at all), so the two
+            // can deadlock. That needs a census for this same node while its
+            // give-up runs, which a gone node does not send, and the cost would
+            // be a deadlock error retried on the next tick, not lost data.
+            sqlx::query(sql!(
+                "DELETE FROM node_local_backup_pending
+                  WHERE node_id = $1 AND sandbox_id = ANY($2)"
+            ))
+            .bind(node_id)
+            .bind(&ids)
             .execute(&mut *tx)
             .await?;
             sqlx::query(sql!(
@@ -779,3 +861,8 @@ mod substrate_scope_tests;
 /// Postgres-backed stored-lifecycle matrix for the mark-lost give-up.
 #[cfg(test)]
 mod stored_lifecycle_matrix_tests;
+
+/// Plan regression for the give-up claim on a node with a large, durable
+/// pinned history.
+#[cfg(test)]
+mod giveup_claim_tests;

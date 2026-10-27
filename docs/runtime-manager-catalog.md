@@ -1,5 +1,10 @@
 # Runtime manager release and kernel catalog
 
+Diagnostic discovery recognizes Cloud Hypervisor release directories containing
+`bin/cloud-hypervisor`. A valid executable is reported without a memory-state
+format: recognizing the installation does not enable execution, snapshots or
+warm pools. Cloud Hypervisor releases are not yet offered by the install catalog.
+
 The compiled catalog pins installable Firecracker releases and guest kernels for
 both `x86_64` and `aarch64`. Installing an artifact does not select it as a node's
 default. Node-manager selects compiled E0 (Firecracker 1.15.1 / Linux 6.1.155)
@@ -195,3 +200,43 @@ lost-reply retry, runtime-manager restart/outage and host reboot, verify:
 
 This acceptance requires Linux/KVM and deployment evidence; source review and
 syntax checks do not establish continuity on existing nodes.
+
+## Cloud Hypervisor installation
+
+On Linux/x86_64 and Linux/arm64, the compiled catalog includes the upstream Cloud
+Hypervisor v54.0 static executables. Each download and installed-file SHA-256 pin
+names the same bytes; the catalog also carries its fs-verity measurement (SHA-256,
+4096-byte blocks, no salt). The upstream asset digest verifies transfer
+consistency, not independent build provenance. Source:
+[Cloud Hypervisor v54.0](https://github.com/cloud-hypervisor/cloud-hypervisor/releases/tag/v54.0).
+
+Upgrade node-manager first, then runtime-manager. Node-manager provisions the
+new managed CH directory; until it exists, `space-rtmgr status` reports that
+root as absent and exits non-zero. After both services are upgraded, local
+operators can use:
+
+```sh
+space-rtmgr runtimes available --runtime cloud-hypervisor
+space-rtmgr runtimes install cloud-hypervisor-54.0
+space-rtmgr list --kind runtime --wide
+space-rtmgr runtimes uninstall cloud-hypervisor-54.0
+```
+
+The managed release is published under `/space/vendor/artifacts/cloud-hypervisor`,
+independently of Firecracker's store. Runtime-manager's
+`--cloud-hypervisor-release-source` can point at a mirror with the same release
+asset layout; it cannot change the compiled pins. An unsupported host architecture
+is refused with `FailedPrecondition`. Omitting `--runtime` from `runtimes available`
+lists Firecracker releases; pass `--runtime cloud-hypervisor` to list CH.
+
+Release sources must use credential-free HTTPS URLs. Userinfo, query parameters
+and fragments are refused; authentication must not be embedded in these URLs.
+
+Installation does not add a runnable environment, change defaults, or qualify
+any guest kernel, snapshot format or GPU. Diagnostics report the installed CH
+binary without a fake jailer or memory-state format. Template and sandbox
+execution require the CH adapter and a qualified environment separately.
+
+Finish upgrading both artifact services before submitting CH installs. An older
+node-manager lacks the pin and refuses publication. Such a failed operation
+must be resubmitted after the upgrade; existing Firecracker work is unaffected.

@@ -1,0 +1,150 @@
+name: Outside contributions
+
+# Thanks people outside the maintainer team when they open a pull request or
+# issue, marks it for triage, and posts the reply that matches the triage label
+# a maintainer adds.
+#
+# pull_request_target runs with a write token even for pull requests from
+# forks, so this workflow must stay inert toward contributor content: it never
+# checks out, builds, or runs pull request code, and it never places titles,
+# bodies, branch names, or other contributor-controlled text in a shell
+# command. Every reply below is fixed text, and the only event values used are
+# numbers, the repository name, and maintainer-applied label names.
+
+on:
+  pull_request_target:
+    types: [opened, labeled]
+  issues:
+    types: [opened, labeled]
+
+permissions: {}
+
+# One run at a time per item, in order. queue: max keeps every waiting event;
+# the default would replace a waiting run and lose its reply.
+concurrency:
+  group: outside-contributions-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  GH_REPO: ${{ github.repository }}
+  NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+  KIND: ${{ github.event_name == 'pull_request_target' && 'pr' || 'issue' }}
+
+jobs:
+  acknowledge:
+    # Outside authors only: maintainers, collaborators, and bots are skipped.
+    if: >-
+      github.repository == 'perplexityai/SPACE' &&
+      github.event.action == 'opened' &&
+      !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+        github.event.pull_request.author_association || github.event.issue.author_association) &&
+      (github.event.pull_request.user.type || github.event.issue.user.type) != 'Bot'
+    name: Thank the contributor and mark for triage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Add triage:pending and post the thank-you
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Read state first; a failed read stops the job (set -e) rather
+          # than looking like "no label" or "no comment yet".
+          labels="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/labels" \
+            --jq '.[].name')"
+          comments="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/comments" \
+            --jq '.[].body')"
+
+          # A rerun after a maintainer already decided must not reopen triage.
+          if grep -qxE 'triage:(needs-issue|investigating|reviewing|declined)' \
+            <<<"${labels}"; then
+            echo "Already triaged; leaving labels as they are."
+          else
+            gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/labels" \
+              -f 'labels[]=triage:pending' >/dev/null
+          fi
+
+          marker='<!-- space-outside-contributions:thanks -->'
+          if grep -qF "${marker}" <<<"${comments}"; then
+            echo "Thank-you already posted."
+            exit 0
+          fi
+
+          if [[ "${KIND}" == pr ]]; then
+            what='pull request'
+          else
+            what='issue'
+          fi
+          # One line per paragraph: GitHub renders every newline in a comment.
+          contributing="https://github.com/${GH_REPO}/blob/main/CONTRIBUTING.md"
+          body="$(printf '%s\n\n%s' \
+            "Thanks for opening this ${what}! A SPACE maintainer will take a look." \
+            "[CONTRIBUTING.md](${contributing}) explains how we review outside contributions. ${marker}")"
+          gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/comments" \
+            -f body="${body}" >/dev/null
+
+  reply:
+    # Only people with triage access can add labels, so the label is a
+    # maintainer's decision. triage:pending is added by the job above and
+    # needs no reply.
+    if: >-
+      github.repository == 'perplexityai/SPACE' &&
+      github.event.action == 'labeled' &&
+      startsWith(github.event.label.name, 'triage:') &&
+      github.event.label.name != 'triage:pending' &&
+      !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+        github.event.pull_request.author_association || github.event.issue.author_association)
+    name: Post the reply for the triage decision
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Post the reply and clear triage:pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+          case "${LABEL}" in
+            triage:needs-issue)
+              if [[ "${KIND}" == pr ]]; then
+                text='Thanks for the pull request. Before we review it, please open an issue that describes the problem, how to reproduce it, and the approach you have in mind, then link it here. Agreeing on scope first saves everyone time, and we will keep this pull request open in the meantime.'
+              else
+                text='Thanks for the report. Could you add the steps to reproduce the problem and what you expected to happen? That helps us decide on next steps.'
+              fi
+              ;;
+            triage:investigating)
+              text='Thanks, this is useful. We are looking into it and will handle the fix ourselves, so nothing more is needed from you for now.'
+              ;;
+            triage:reviewing)
+              text='Thanks! A maintainer is reviewing this now.'
+              ;;
+            triage:declined)
+              text='Thanks for taking the time to contribute. We have decided not to take this change. We appreciate the effort and hope you will keep contributing to SPACE.'
+              ;;
+            *)
+              echo "No reply configured for ${LABEL}."
+              exit 0
+              ;;
+          esac
+
+          marker="<!-- space-outside-contributions:${LABEL} -->"
+          # A failed read stops the job (set -e) instead of authorizing a post.
+          comments="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/comments" \
+            --jq '.[].body')"
+          if grep -qF "${marker}" <<<"${comments}"; then
+            echo "Reply for ${LABEL} already posted."
+          else
+            gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/comments" \
+              -f body="${text} ${marker}" >/dev/null
+          fi
+
+          # A decision ends the wait for triage. A missing label is fine.
+          gh api --method DELETE \
+            "repos/${GH_REPO}/issues/${NUMBER}/labels/triage%3Apending" >/dev/null 2>&1 || true

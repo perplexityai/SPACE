@@ -41,6 +41,9 @@ pub fn guest_vlan_packets(packets: u64) {
     gauge("node_mgr.guest_vlan_packets", packets as f64, &[]);
 }
 
+/// Lifecycle admission uses the serving method name. Restore admission is tagged
+/// `RestoreVmState`; include the former `LoadSnapshot` label while upgrading nodes.
+/// The `LOAD_SNAPSHOT` configuration suffix remains stable independently of metrics.
 pub fn lifecycle_rejected(method: &'static str, reason: &'static str) {
     counter(
         "node_mgr.lifecycle.rejected",
@@ -77,6 +80,8 @@ pub fn lifecycle_released(method: &'static str, started: Instant) {
 
 /// Waiter outcomes are separate from mutation completion: abandoning a gRPC
 /// request does not cancel tracked host work.
+/// `method` names the serving RPC, including CaptureVmState/RestoreVmState for
+/// snapshot capture and restore.
 pub fn rpc_wait_finished(method: &'static str, outcome: &'static str, started: Instant) {
     let tags = [tag("method", method), tag("outcome", outcome)];
     counter("node_mgr.rpc_wait.outcome", 1, &tags);
@@ -266,6 +271,19 @@ pub fn btrfs_send_stream_rejected(reason: BtrfsSendStreamRejection) {
         "node_mgr.btrfs_send.stream_rejected",
         1,
         &[tag("reason", reason)],
+    );
+}
+
+/// 1 while node-manager enforces the admit-nothing policy it falls back to
+/// when it can't read the cluster execution policy it persisted, else 0. It
+/// drops to 0 on the first inventory read after an application replaces that
+/// policy, even if the application's own record write failed. Emitted on every execution inventory
+/// read, which node-ctl makes each node-status tick.
+pub fn execution_policy_record_unreadable(unreadable: bool) {
+    gauge(
+        "node_mgr.execution.policy_record_unreadable",
+        f64::from(u8::from(unreadable)),
+        &[],
     );
 }
 

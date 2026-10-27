@@ -447,7 +447,9 @@ impl Process for MockBridgeGuest {
             pid: Some(123),
             event: Some(
                 pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Connected(
-                    pplx_space_spaced_common::proto::bridge_guest::ProcessConnected {},
+                    pplx_space_spaced_common::proto::bridge_guest::ProcessConnected {
+                        output_cursor: None,
+                    },
                 ),
             ),
         })];
@@ -469,6 +471,8 @@ impl Process for MockBridgeGuest {
             user: Some("user".into()),
             tag: Some("server".into()),
             pty: Some(false),
+            exit: None,
+            ended_at: None,
         })];
         Ok(Response::new(
             Box::pin(tokio_stream::iter(processes)) as Self::ListProcessesStream

@@ -931,15 +931,13 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
         let stop_calls = stops.clone();
         let sandbox_id = lease.sandbox_id.clone();
         let expected_execution = fence.execution_id.clone();
+        let launch_sandbox = sandbox_id.parse().unwrap();
         let matches = accepted == reference.to_string();
         service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
             launch: Some(Arc::new(move |request| {
-                assert!(request.sandbox_id.is_empty());
-                assert_eq!(
-                    request.verified_runtime.unwrap().environment_reference,
-                    reference.to_string()
-                );
-                Ok(proto::LaunchFirecrackerResponse {
+                assert_eq!(request.sandbox_id, launch_sandbox);
+                assert_eq!(request.environment_reference, Some(reference));
+                Ok(proto::LaunchRuntimeResponse {
                     pid: 0,
                     accepted_environment_reference: accepted.clone(),
                 })
@@ -956,8 +954,14 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
         let result = service
             .launch_admitted_runtime(
                 &lease.sandbox_id,
-                proto::LaunchFirecrackerRequest {
+                proto::LaunchRuntimeRequest {
+                    sandbox_id: lease.sandbox_id.clone(),
+                    runtime: pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32,
                     execution_id: fence.execution_id,
+                    launcher_binary: Some("/runtime/bin/jailer".into()),
+                    runtime_binary: "/runtime/bin/firecracker".into(),
+                    workspace_root: "/runtime/jails".into(),
+                    network_namespace: "/runtime/netns".into(),
                     verified_runtime: Some(proto::VerifiedRuntimeLaunch {
                         sandbox_id: lease.sandbox_id.clone(),
                         environment_reference: reference.to_string(),

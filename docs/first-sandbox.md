@@ -85,7 +85,7 @@ Read `/openapi-m1.json` for exact request constraints and supported fields. This
 
 The example displays decoded stdout and stderr and saves the raw event stream in its run directory. Handle binary output separately rather than displaying it in a terminal.
 
-Command output is a live stream, not durable log storage. Reconnecting with `Last-Event-ID` produces `resync_required`, not a replay of missed output. Keep the transcript when a stream fails; repeat a command only if repeating its effects is safe.
+Command output is a live stream, not durable log storage. The sandbox retains a bounded amount of each process's recent output: reconnecting with `Last-Event-ID`, set to the last `id` received, exactly as received (only output and `resync_required` events carry one), resumes with the output after that event while it is retained, and otherwise produces `resync_required` first. After a process's first 2^33 - 1 output chunks, ids no longer carry its output position, and each reconnect replays the retained output behind `resync_required`. Keep the transcript when a stream fails; repeat a command only if repeating its effects is safe.
 
 ## Inspect and manage the sandbox
 
@@ -98,7 +98,7 @@ python3 examples/first_sandbox.py inspect "$RUN_DIR"
 
 This performs read-only Python API requests. It lists sandboxes before inspecting the saved operation, sandbox, and process list; an individual request failure does not hide the other results. Missing IDs are never used to construct an empty-ID URL. The example rejects a saved run whose origins do not match the current configuration.
 
-An empty process list is expected after hello-world exits. The single-process endpoint is for **running processes**, not history: it returns `not_found` before attachment and after exit. Use the saved event transcript for completed command results.
+An empty process list is expected after hello-world exits. The single-process endpoint returns `not_found` before attachment. After exit it returns the process with `state` `exited` and its exit code for up to 15 minutes, less once many newer processes start, then `not_found`; it is not command history. A sandbox from an older template returns `not_found` as soon as the process exits. Use the saved event transcript for completed command results.
 
 Sandbox and operation IDs can look similar. Use the complete `sbx_…` ID for sandbox paths and `op_…` for operation paths. The returned `session_id` and `process_id` currently contain the same `proc_…` value, but use their respective fields for their URLs.
 

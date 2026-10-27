@@ -8,10 +8,11 @@ use crate::installs::{
 };
 use crate::protection::{self, AuditIdentity, PathRole};
 use crate::run::SERVICE_NAME;
+use pplx_space_common_core::host::linux::identities::{user_names, users};
 use pplx_space_common_core::types::{
     ComponentIdentity, Digest, JobId, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
-use pplx_space_common_svc::{LocalRole, UdsPeerAuthorizer, UdsPeerPrincipal};
+use pplx_space_common_svc::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use pplx_space_execution_common::proto::{self as execution, ArtifactComponentKind};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
     self, ArtifactKinds, ArtifactScan, DigestCache, ScanLimits, ScanRoots, SystemScanClock,
@@ -22,16 +23,24 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
 /// Listing, status, and operation lookups are read-only: root and any local
-/// role may call them.
+/// role, plus node-ctl, may call them.
 const ALLOW_READ: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Observer),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
-/// Installing, uninstalling, and cancelling change what is on the node: root
-/// and the local operator role, as for the other node services.
+/// Destructive operations require root or the local operator role.
 const ALLOW_MUTATE: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Operator),
+];
+
+// Provisioning may add approved artifacts but cannot delete or cancel another
+// operator's work. Publication still independently checks node-manager's pins.
+const ALLOW_INSTALL: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Operator),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
 
 #[derive(Clone)]
@@ -53,7 +62,7 @@ pub struct RuntimeManagerService {
     /// Where available kernels are listed from and installs download from.
     kernel_source: Option<Arc<dyn KernelSource>>,
     pins: Option<Arc<dyn crate::installs::PinSource>>,
-    releases: Option<crate::installs::ReleaseContext>,
+    releases: crate::installs::ReleaseSources,
     /// Present unless the service runs list-only.
     installer: Option<Installer>,
 }
@@ -76,12 +85,12 @@ impl RuntimeManagerService {
             audit_identity: AuditIdentity::of_this_process(),
             peer_authorizer: UdsPeerAuthorizer::new_with_default_local_roles(
                 SERVICE_NAME.as_str(),
-                std::iter::empty(),
+                [UdsPeerAccount::with_linux_user(users::SPACE_NODECTL)],
             ),
             kernel_source: None,
             installer: None,
             pins: None,
-            releases: None,
+            releases: Default::default(),
         }
     }
 
@@ -95,7 +104,7 @@ impl RuntimeManagerService {
     pub(crate) fn with_catalog(
         mut self,
         pins: Arc<dyn crate::installs::PinSource>,
-        releases: Option<crate::installs::ReleaseContext>,
+        releases: crate::installs::ReleaseSources,
     ) -> Self {
         self.pins = Some(pins);
         self.releases = releases;
@@ -355,7 +364,7 @@ impl RuntimeManager for RuntimeManagerService {
             .chain(
                 self.roots
                     .managed_releases
-                    .as_ref()
+                    .iter()
                     .map(|root| root.path.clone()),
             )
             .chain(self.roots.managed_kernels.clone())
@@ -454,10 +463,9 @@ impl RuntimeManager for RuntimeManagerService {
         let artifacts = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let mut artifacts = Vec::new();
-            if kinds.runtimes
-                && let Some(releases) = releases
-            {
+            if kinds.runtimes {
                 for pin in catalog.releases(runtime, architecture) {
+                    let Some(releases) = releases.get(pin.release.kind) else { continue; };
                     if line.is_some_and(|line| {
                         pin.release.version.as_str().parse::<ReleaseLine>().ok()
                             != Some(line.release)
@@ -538,7 +546,7 @@ impl RuntimeManager for RuntimeManagerService {
         request: Request<InstallArtifactRequest>,
     ) -> Result<Response<InstallArtifactResponse>, Status> {
         self.peer_authorizer
-            .authorize_request(&request, "InstallArtifact", ALLOW_MUTATE)?;
+            .authorize_request(&request, "InstallArtifact", ALLOW_INSTALL)?;
         let identity = parse_identity(request.get_ref().identity.as_ref())?;
         let installer = self.installer()?.clone();
         let operation = match identity {

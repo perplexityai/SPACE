@@ -103,6 +103,7 @@ impl OciFixture {
 
 #[derive(Default)]
 struct RecordingRunner {
+    image_working_dir: Option<String>,
     commands: Mutex<Vec<OciCommand>>,
     fail_on: Option<fn(&OciCommand) -> bool>,
     failures_remaining: AtomicUsize,
@@ -286,6 +287,14 @@ impl CommandRunner for RecordingRunner {
             });
         }
         match command {
+            OciCommand::ReadImageConfig { .. } => Ok(CommandResult {
+                stdout: serde_json::to_vec(&serde_json::json!({
+                    "architecture": "amd64", "os": "linux",
+                    "rootfs": {"type": "layers", "diff_ids": []},
+                    "config": {"WorkingDir": self.image_working_dir},
+                }))
+                .unwrap(),
+            }),
             OciCommand::PullImage { .. } => Ok(CommandResult {
                 stdout: format!("{IMAGE_CHAIN_ID_PREFIX}{}\n", self.chain_id()).into_bytes(),
             }),
@@ -388,13 +397,24 @@ fn pulls_only_inspected_platform_metadata(oci_fixture: OciFixture) {
 }
 
 #[rstest]
+#[case(Some("/workspace"), "/workspace")]
+#[case(Some("/directory with spaces"), "/directory with spaces")]
+#[case(Some(""), "/")]
+#[case(None, "/")]
 #[tokio::test]
-async fn resolves_the_manifest_before_containerd_pull(oci_fixture: OciFixture) {
+async fn resolves_the_manifest_before_containerd_pull(
+    oci_fixture: OciFixture,
+    #[case] working_dir: Option<&str>,
+    #[case] expected: &str,
+) {
     let digest: Digest = FIXTURE_MANIFEST_DIGEST
         .parse()
         .expect("valid manifest digest");
     let source = FixtureManifestSource;
-    let runner = Arc::new(RecordingRunner::default());
+    let runner = Arc::new(RecordingRunner {
+        image_working_dir: working_dir.map(str::to_owned),
+        ..Default::default()
+    });
     let expected_reference = oci_fixture
         .request
         .reference
@@ -415,6 +435,7 @@ async fn resolves_the_manifest_before_containerd_pull(oci_fixture: OciFixture) {
             OciCommand::PullImage { reference, .. } if reference == &expected_reference
         )
     }));
+    assert_eq!(rootfs.working_dir, Path::new(expected));
     rootfs.unmount().await.expect("unmount OCI rootfs");
 }
 

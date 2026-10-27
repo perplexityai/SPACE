@@ -76,7 +76,7 @@ impl WatchManager {
     pub(super) fn new(shutdown: CancellationToken) -> Self {
         Self {
             inner: Arc::default(),
-            shutdown,
+            shutdown: shutdown.child_token(),
             tasks: tokio_util::task::TaskTracker::new(),
             scan_slots: paths::new_watch_directory_scan_slots(),
         }
@@ -314,6 +314,7 @@ impl WatchManager {
                 key.recursive,
                 &backend_filter,
                 &self.scan_slots,
+                &self.tasks,
             )
             .await?;
             planned_directories += plan.len();
@@ -322,7 +323,7 @@ impl WatchManager {
                     "file change setup directory budget exceeded",
                 ));
             }
-            let registration = RegisteredWatch::prepare(plan).await?;
+            let registration = RegisteredWatch::prepare(plan, self.tasks.clone()).await?;
             plans.push((key, backend_filter, registration));
         }
 
@@ -454,10 +455,15 @@ impl WatchManager {
             }
         }
 
-        let registration_plan =
-            plan_watch_registration(&key.root, key.recursive, &backend_filter, &self.scan_slots)
-                .await?;
-        let registration = RegisteredWatch::prepare(registration_plan).await?;
+        let registration_plan = plan_watch_registration(
+            &key.root,
+            key.recursive,
+            &backend_filter,
+            &self.scan_slots,
+            &self.tasks,
+        )
+        .await?;
+        let registration = RegisteredWatch::prepare(registration_plan, self.tasks.clone()).await?;
         let mut state = self.inner.lock().await;
         self.add_consumer_locked(&mut state, key, consumer, backend_filter, registration)
     }
@@ -693,6 +699,7 @@ impl WatchManager {
         for (consumer_id, tx, shutdown, bytes) in stream_targets {
             if event.path_encoding() != WatchPathEncoding::Exact {
                 send_stream_loss_and_cancel(
+                    &self.tasks,
                     tx,
                     shutdown,
                     "file watch path cannot be represented exactly",
@@ -703,7 +710,12 @@ impl WatchManager {
             let proto = event.to_proto();
             let size = proto.path.len() + std::mem::size_of::<QueuedFileEvent>();
             let Ok(permit) = bytes.try_acquire_many_owned(size as u32) else {
-                send_stream_loss_and_cancel(tx, shutdown, "file watch stream buffer full");
+                send_stream_loss_and_cancel(
+                    &self.tasks,
+                    tx,
+                    shutdown,
+                    "file watch stream buffer full",
+                );
                 remove_consumers.push(consumer_id);
                 continue;
             };
@@ -717,7 +729,12 @@ impl WatchManager {
                     remove_consumers.push(consumer_id);
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    send_stream_loss_and_cancel(tx, shutdown, "file watch stream buffer full");
+                    send_stream_loss_and_cancel(
+                        &self.tasks,
+                        tx,
+                        shutdown,
+                        "file watch stream buffer full",
+                    );
                     remove_consumers.push(consumer_id);
                 }
             }
@@ -832,7 +849,7 @@ impl WatchManager {
         event: &WatchEvent,
     ) {
         let is_regular_file = event.path_encoding() != WatchPathEncoding::Unsupported
-            && classify_ledger_event_regular_file(event).await;
+            && classify_ledger_event_regular_file(event, &self.tasks).await;
         let mut state = self.inner.lock().await;
         let LedgerState::Active(ledger) = &mut state.ledger else {
             return;
@@ -927,11 +944,12 @@ fn insert_consumer_locked(
 }
 
 fn send_stream_loss_and_cancel(
+    tasks: &tokio_util::task::TaskTracker,
     tx: mpsc::Sender<Result<QueuedFileEvent, Status>>,
     shutdown: CancellationToken,
     message: &'static str,
 ) {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         match tokio::time::timeout(
             Duration::from_millis(100),
             tx.send(Err(Status::resource_exhausted(message))),
@@ -977,7 +995,10 @@ fn nonnegative_time_to_ms(seconds: i64, nanos: i32) -> Result<u64, Status> {
         .ok_or_else(|| Status::invalid_argument("time value is outside the millisecond range"))
 }
 
-async fn classify_ledger_event_regular_file(event: &WatchEvent) -> bool {
+async fn classify_ledger_event_regular_file(
+    event: &WatchEvent,
+    tasks: &tokio_util::task::TaskTracker,
+) -> bool {
     if event.kind() == FileEventKind::Removed {
         return false;
     }
@@ -985,13 +1006,14 @@ async fn classify_ledger_event_regular_file(event: &WatchEvent) -> bool {
         return is_regular_file;
     }
     let path = event.absolute_path().to_owned();
-    tokio::task::spawn_blocking(move || {
-        std::fs::metadata(path)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false)
+    tasks
+        .spawn_blocking(move || {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
 }
 
 struct CancelOnDropStream<S> {

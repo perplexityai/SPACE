@@ -1,5 +1,6 @@
 //! Builder-side use of node-manager's verified environment, separate from guest
 //! process environment variables and from downloadable artifact catalog entries.
+use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION as DEFINITION_SCHEMA;
 use std::path::Path;
 
 use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata, TemplateMetadata};
@@ -21,6 +22,8 @@ pub enum BuildExecutionBindingError {
     Resolve(#[from] tonic::Status),
     #[error("environment resolution timed out: {0}")]
     Timeout(#[from] tokio::time::error::Elapsed),
+    #[error("scratch builder does not implement this boot/compatibility profile")]
+    ScratchProfile,
     #[error("execution binding lacks required {0}")]
     Missing(&'static str),
     #[error("invalid environment definition: {0}")]
@@ -136,6 +139,7 @@ impl BuildExecutionBinding {
             let mut node = pplx_space_node_mgr_client::connect().await?;
             let response = node
                 .resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                    definition_schema_version: DEFINITION_SCHEMA,
                     reference: None,
                     compatible: Some(request.clone()),
                 })
@@ -151,6 +155,7 @@ impl BuildExecutionBinding {
                     // never an unacknowledged upgrade.
                     let response = node
                         .resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                            definition_schema_version: DEFINITION_SCHEMA,
                             reference: Some(fallback_reference.to_string()),
                             compatible: None,
                         })
@@ -172,6 +177,7 @@ impl BuildExecutionBinding {
             let mut node = pplx_space_node_mgr_client::connect().await?;
             Ok::<_, BuildExecutionBindingError>(
                 node.resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                    definition_schema_version: DEFINITION_SCHEMA,
                     compatible: None,
                     reference: reference.map(|value| value.to_string()),
                 })
@@ -227,13 +233,13 @@ impl BuildExecutionBinding {
         command: &mut tokio::process::Command,
         pin: Option<&super::GuestKernelPin>,
     ) -> Result<(), BuildExecutionBindingError> {
-        use pplx_space_common_core::types::{BootProfile, ExecutionCompatibilityProfile};
-        let BootProfile::LinuxDirectV1 { kernel } = &self.definition.descriptor().spec().boot;
+        let (kernel, state_format) = self
+            .definition
+            .firecracker_linux_contract()
+            .ok_or(BuildExecutionBindingError::ScratchProfile)?;
         if pin.is_some_and(|pin| pin.version != kernel.version || pin.digest != kernel.digest) {
             return Err(BuildExecutionBindingError::KernelPin);
         }
-        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-            &self.definition.descriptor().spec().compatibility;
         // Values are resolved observations, never inherited selector ENV values.
         command.env("SPACE_SEED_RUNTIME", self.execution.runtime().kind.as_str());
         command.env(

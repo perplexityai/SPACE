@@ -16,6 +16,8 @@ fn public_process_omits_environment() {
         user: Some("user".to_string()),
         tag: Some("server".to_string()),
         pty: None,
+        exit: None,
+        ended_at: None,
     })
     .expect("valid process");
 
@@ -35,6 +37,77 @@ fn public_process_omits_environment() {
     assert_eq!(process.cwd.as_deref(), Some("/workspace"));
     assert_eq!(process.user.as_deref(), Some("user"));
     assert_eq!(process.tag.as_deref(), Some("server"));
+    // A running process keeps the wire shape it had before exits were
+    // reported, so strict clients see no new field.
+    assert_eq!(
+        serde_json::to_value(&process).unwrap(),
+        serde_json::json!({
+            "process_id": "process-1",
+            "pid": 42,
+            "command": ["python", "-m", "http.server"],
+            "cwd": "/workspace",
+            "user": "user",
+            "tag": "server",
+        })
+    );
+}
+
+// An exited process reports its exit as the stream's `process_exited` does.
+#[test]
+fn public_process_reports_an_exit_like_process_exited() {
+    use spaced_ops::process_exit::Outcome;
+    let ended_at = prost_types::Timestamp {
+        seconds: 1_790_596_800,
+        nanos: 500_000_000,
+    };
+    for (outcome, exit_code, exit_status, signal) in [
+        (
+            Outcome::Exited(spaced_ops::ProcessExited { exit_code: 7 }),
+            7,
+            "exited",
+            None,
+        ),
+        (
+            Outcome::Signaled(spaced_ops::ProcessSignaled { signal: Some(9) }),
+            137,
+            "signaled",
+            Some(9),
+        ),
+        (
+            Outcome::TimedOut(spaced_ops::ProcessTimedOut { signal: Some(9) }),
+            124,
+            "timed_out",
+            Some(9),
+        ),
+        (
+            Outcome::Unknown(spaced_ops::ProcessUnknown {}),
+            1,
+            "unknown",
+            None,
+        ),
+    ] {
+        let process = public_process(spaced_ops::ProcessInfo {
+            process_id: "process-1".to_string(),
+            pid: 42,
+            command: vec!["true".to_string()],
+            exit: Some(spaced_ops::ProcessExit {
+                outcome: Some(outcome),
+            }),
+            ended_at: Some(ended_at),
+            ..Default::default()
+        })
+        .expect("valid process");
+        let json = serde_json::to_value(&process).unwrap();
+        assert_eq!(json["state"], "exited", "{json}");
+        assert_eq!(json["exit_code"], exit_code, "{json}");
+        assert_eq!(json["exit_status"], exit_status, "{json}");
+        assert_eq!(
+            json.get("signal").and_then(|signal| signal.as_i64()),
+            signal.map(i64::from),
+            "{json}"
+        );
+        assert_eq!(json["ended_at"], "2026-09-28T12:00:00.5Z", "{json}");
+    }
 }
 
 #[test]
@@ -48,6 +121,8 @@ fn public_process_rejects_an_invalid_runtime_process_id() {
         user: None,
         tag: None,
         pty: None,
+        exit: None,
+        ended_at: None,
     })
     .expect_err("invalid process id");
 
@@ -100,6 +175,11 @@ fn process_page_orders_processes_and_resumes_after_cursor() {
                 cwd: None,
                 user: None,
                 tag: None,
+                state: None,
+                exit_code: None,
+                exit_status: None,
+                signal: None,
+                ended_at: None,
             })
             .collect::<Vec<_>>()
     };

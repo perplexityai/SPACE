@@ -63,6 +63,14 @@ pub(crate) fn process_start_request(
     }
 }
 
+/// Whether a process session asks for a pty, whose input an SSE stream cannot
+/// carry or close. An unreadable adapter state answers `false` and is reported
+/// by the start itself.
+pub(crate) fn process_session_needs_pty(attached: &AttachedSession) -> bool {
+    serde_json::from_str::<CreateProcessRequest>(&attached.adapter_state_json)
+        .is_ok_and(|request| request.pty.is_some())
+}
+
 fn duration_to_proto(timeout: Option<SimpleDuration>) -> Option<prost_types::Duration> {
     let timeout = timeout?.as_duration();
     Some(prost_types::Duration {
@@ -141,7 +149,7 @@ pub(crate) fn process_event_frames(event: ProcessEvent, output_seq: &mut u64) ->
         Some(spaced_process_event::Event::Exit(exit)) => ProcessFrameBatch {
             frames: vec![DataPlaneServerFrame::ProcessExited {
                 process_id: event.process_id,
-                exit_code: process_exit_code(&exit),
+                exit_code: exit.shell_exit_code(),
                 status: process_exit_status(&exit),
             }],
             output_bytes: 0,
@@ -180,17 +188,6 @@ pub(crate) fn file_event_kind(kind: i32) -> FileEventKind {
         SpacedFileEventKind::Renamed => FileEventKind::Renamed,
         SpacedFileEventKind::Chmod => FileEventKind::Chmod,
         SpacedFileEventKind::Unspecified => FileEventKind::Unknown,
-    }
-}
-
-pub(crate) fn process_exit_code(exit: &ProcessExit) -> i32 {
-    match &exit.outcome {
-        Some(spaced_process_exit::Outcome::Exited(exited)) => exited.exit_code,
-        Some(spaced_process_exit::Outcome::Signaled(signaled)) => {
-            128 + signaled.signal.unwrap_or_default()
-        }
-        Some(spaced_process_exit::Outcome::TimedOut(_)) => 124,
-        Some(spaced_process_exit::Outcome::Unknown(_)) | None => 1,
     }
 }
 
@@ -268,7 +265,12 @@ pub(crate) enum StreamBridgeError {
     ClientClosed,
     #[error("process binding task: {0}")]
     ProcessBindingTask(#[source] tokio::task::JoinError),
+    #[error("{PROCESS_NOT_RETAINED_MESSAGE}")]
+    ProcessNotRetained,
 }
+
+pub(crate) const PROCESS_NOT_RETAINED_MESSAGE: &str =
+    "the command's process is no longer retained; its exit status is unavailable";
 
 pub(crate) fn stream_bridge_error_label(error: &StreamBridgeError) -> &'static str {
     match error {
@@ -284,5 +286,6 @@ pub(crate) fn stream_bridge_error_label(error: &StreamBridgeError) -> &'static s
         StreamBridgeError::InvalidClientFrame => "invalid_client_frame",
         StreamBridgeError::ClientClosed => "client_closed",
         StreamBridgeError::ProcessBindingTask(_) => "process_binding_task",
+        StreamBridgeError::ProcessNotRetained => "process_not_retained",
     }
 }

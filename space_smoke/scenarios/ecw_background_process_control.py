@@ -65,7 +65,9 @@ def background_process_control(test: smoke.CommandSandboxFixture) -> None:
 
         after_term = test.get_process(process.process_id)
         test.verify(
-            after_term is not None and after_term.process_id == process.process_id,
+            after_term is not None
+            and after_term.process_id == process.process_id
+            and after_term.state == "running",
             "background process exited after TERM despite installed handler",
             observed_process_id=process.process_id,
             signal=PROCESS_SIGNAL,
@@ -81,7 +83,7 @@ def background_process_control(test: smoke.CommandSandboxFixture) -> None:
 
         remaining, final = test.wait_until_process_stopped(process.process_id)
         test.verify(
-            final is None
+            (final is None or final.state == "exited")
             and not any(
                 candidate.process_id == process.process_id for candidate in remaining
             ),
@@ -90,3 +92,19 @@ def background_process_control(test: smoke.CommandSandboxFixture) -> None:
             observed_list_process_ids=[candidate.process_id for candidate in remaining],
             observed_get_process_id=None if final is None else final.process_id,
         )
+        # Required where the templates come from this tree; elsewhere an absent
+        # exit is accepted, but a reported one must still be the SIGKILL.
+        if test.reports_exited_processes or (
+            final is not None and final.state == "exited"
+        ):
+            test.verify(
+                final is not None
+                and final.state == "exited"
+                and final.exit_status == "signaled"
+                and final.signal == 9,
+                "killed background command did not report its SIGKILL exit",
+                observed_process_id=None if final is None else final.process_id,
+                observed_state=None if final is None else final.state,
+                observed_exit_status=None if final is None else final.exit_status,
+                observed_signal=None if final is None else final.signal,
+            )

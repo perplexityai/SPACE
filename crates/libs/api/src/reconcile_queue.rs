@@ -2,9 +2,9 @@ use pplx_space_common_core::types::NodeId;
 
 use pplx_space_common_core::{sql, types::SandboxId};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use sqlx::PgPool;
-use uuid::Uuid;
 
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
@@ -52,44 +52,58 @@ pub enum FinalizeSandboxDbDeleteError {
     /// At least one `snapshots` row for the sandbox is in `state='creating'` —
     /// a suspend-snapshot upload is in flight. Caller (HTTP DELETE) maps
     /// this to a 409 Conflict; user retries after the upload finishes.
+    ///
+    /// `idle_for` is how long the stalest such upload has gone without
+    /// activity, as [`in_flight_snapshot_upload_idle_for`] reports it.
     #[error(
         "sandbox has a suspend-snapshot upload in flight; \
          retry the DELETE after the snapshot finalizes"
     )]
-    InFlightSuspendUpload,
+    InFlightSuspendUpload { idle_for: Duration },
     #[error("sandbox has a fork operation in progress; retry the DELETE after the fork completes")]
     ForkInProgress,
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
 
-/// Best-effort, no-lock check for "any snapshot for this sandbox is
-/// currently in `state='creating'`". Used by HTTP DELETE handlers as
-/// a pre-flight gate so a 409 can be returned **before** the runtime
-/// (pod/VM) is torn down. The authoritative race-safe gate is inside
+/// The gate a user DELETE applies for in-flight snapshot uploads: how long
+/// the stalest `creating` snapshot of this sandbox has gone without upload
+/// activity, or `None` when none is in flight. Fork snapshots don't count;
+/// suspend, stop, and named-snapshot backups all do.
+///
+/// Activity is `COALESCE(last_attempt_at, "timestamp")`, the anchor the
+/// stuck-snapshot reaper ages on. The upload worker reuses one row across
+/// its retries and heartbeats `last_attempt_at` at the start of each attempt,
+/// so a slow but live upload reads as recent. Nothing refreshes it during an
+/// attempt, so one long attempt reads as idle for as long as it runs.
+///
+/// HTTP DELETE handlers run it without a lock as a pre-flight gate, so a 409
+/// can be returned **before** the runtime (pod/VM) is torn down. The
+/// authoritative race-safe gate is the same query inside
 /// [`finalize_sandbox_db_delete_user_initiated`] — that one holds a
 /// `FOR UPDATE` lock on the parent `sandboxes` row to serialize
 /// against `BeginArtifactBackup`'s INSERT (which takes the implicit
 /// `FOR KEY SHARE` lock on the same row via the snapshots → sandboxes
-/// foreign key). This helper just catches the common case where the
-/// suspend was already in flight when the DELETE arrived; the narrow
-/// window between this pre-check and the locked finalize is covered
-/// by the locked finalize's own check.
-pub async fn any_creating_snapshot_for_sandbox(
-    pool: &PgPool,
+/// foreign key). The pre-flight just catches the common case where the
+/// upload was already in flight when the DELETE arrived; the narrow
+/// window between it and the locked finalize is covered by the locked
+/// finalize's own check.
+pub async fn in_flight_snapshot_upload_idle_for<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     sandbox_id: SandboxId,
-) -> Result<bool, sqlx::Error> {
-    let row: Option<(Uuid,)> = sqlx::query_as(sql!(
-        "SELECT id FROM snapshots
+) -> Result<Option<Duration>, sqlx::Error> {
+    let idle_secs: Option<f64> = sqlx::query_scalar(sql!(
+        "SELECT EXTRACT(EPOCH FROM NOW() - MIN(COALESCE(last_attempt_at, \"timestamp\")))
+                    ::DOUBLE PRECISION
+         FROM snapshots
          WHERE sandbox_id = $1
            AND state = 'creating'
-           AND artifact_origin IS DISTINCT FROM 'fork'
-         LIMIT 1"
+           AND artifact_origin IS DISTINCT FROM 'fork'"
     ))
     .bind(sandbox_id)
-    .fetch_optional(pool)
+    .fetch_one(executor)
     .await?;
-    Ok(row.is_some())
+    Ok(idle_secs.map(|secs| Duration::from_secs_f64(secs.max(0.0))))
 }
 
 /// Variant of [`finalize_sandbox_db_delete`] safe for user-facing
@@ -137,21 +151,11 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     // appear between this SELECT and the orphan UPDATE inside
     // `finalize_sandbox_db_delete_tx`. A plain SELECT (no row lock)
     // is enough.
-    let in_flight: Option<(Uuid,)> = sqlx::query_as(sql!(
-        "SELECT id FROM snapshots
-         WHERE sandbox_id = $1
-           AND state = 'creating'
-           AND artifact_origin IS DISTINCT FROM 'fork'
-         LIMIT 1"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if in_flight.is_some() {
+    if let Some(idle_for) = in_flight_snapshot_upload_idle_for(&mut *tx, sandbox_id).await? {
         // Drop tx without commit; abandoning the transaction
         // releases the FOR UPDATE lock immediately. Don't issue
         // ROLLBACK explicitly — sqlx will roll back on drop.
-        return Err(FinalizeSandboxDbDeleteError::InFlightSuspendUpload);
+        return Err(FinalizeSandboxDbDeleteError::InFlightSuspendUpload { idle_for });
     }
     if active_fork_source_operation_exists(&mut tx, sandbox_id).await? {
         return Err(FinalizeSandboxDbDeleteError::ForkInProgress);

@@ -536,6 +536,17 @@ impl SandboxManagerService {
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<StartResponse>, Status> {
+        self.start_with_runtime_upgrade(request, None).await
+    }
+
+    /// [`Self::start`] as the cold boot of `runtime_upgrade`, which may pass
+    /// that upgrade's activation fence. The caller's authorization is checked
+    /// exactly as for any Start.
+    pub(super) async fn start_with_runtime_upgrade(
+        &self,
+        request: Request<StartRequest>,
+        runtime_upgrade: Option<crate::db::RuntimeUpgradeOperationId>,
+    ) -> Result<Response<StartResponse>, Status> {
         let peer = self.authorize_peer(&request, "Start", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
         let req = request.get_ref().clone();
         if req.activation_auto_lifecycle.is_some() {
@@ -607,10 +618,11 @@ impl SandboxManagerService {
         let sandbox_id = req.sandbox_id.clone();
         let publish_node_state = !should_skip_node_publish(&request);
         let result = async move {
-            self.start_sandbox_with_authority(
+            self.start_sandbox_with_upgrade_authority(
                 req,
                 restrict_to_template_manager_owned,
                 identity_free_direct_authority,
+                runtime_upgrade,
             )
             .await
         }

@@ -7,8 +7,10 @@ use pplx_space_common_core::types::{OrgId, UserId};
 use uuid::Uuid;
 
 use super::*;
+use crate::public_operations::SubjectSandboxQuota;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, TestDbResult, insert_ready_worker_node, pg_test_db,
+    pg_test_db_with_max_connections,
 };
 
 mod substrate_scope;
@@ -240,6 +242,7 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
             create_request_with_auto_lifecycle(None),
             Some(admitted),
             None,
+            None,
         )
         .await
         .expect("native create should persist an operation");
@@ -253,6 +256,7 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
                 &idempotency_key,
                 create_request_with_auto_lifecycle(None),
                 Some(retried),
+                None,
                 None,
             )
             .await;
@@ -304,6 +308,220 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
         );
     }
     Ok(())
+}
+
+/// A native create past a limit is refused with a non-retryable 429 naming
+/// that limit and records nothing; a replay of an admitted create still
+/// answers, and an uncapped caller (the default) is never refused.
+#[tokio::test]
+async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<()> {
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::PublicErrorEnvelope;
+
+    let db = pg_test_db().await?;
+    let (org_id, user_id) = seed_quota_org(&db.pool).await?;
+    let create = |key: &'static str, quota: Option<SandboxQuota>| {
+        let pool = db.pool.clone();
+        async move {
+            create_native_sandbox_operation(
+                &pool,
+                org_id,
+                user_id,
+                &IdempotencyKey::parse(key).expect("test key parses"),
+                create_request_with_auto_lifecycle(None),
+                None,
+                None,
+                quota,
+            )
+            .await
+        }
+    };
+    let org_limit = |limit| {
+        Some(SandboxQuota {
+            org_id,
+            org_limit: Some(limit),
+            subject: None,
+        })
+    };
+    let refusal = |result: Result<SandboxOperationResponse, PublicApiError>| async move {
+        let refused = result.expect_err("at the limit").into_response();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = refused.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<PublicErrorEnvelope>(&body).unwrap()
+    };
+    let create_operations = || async {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT COUNT(*) FROM public_operations WHERE org_id = $1"
+        ))
+        .bind(org_id)
+        .fetch_one(&db.pool)
+        .await
+    };
+
+    let first = create("quota-first", org_limit(2))
+        .await
+        .expect("under the limit");
+    create("quota-second", org_limit(2))
+        .await
+        .expect("reaches the limit");
+
+    let envelope = refusal(create("quota-third", org_limit(2)).await).await;
+    assert_eq!(envelope.code, PublicErrorCode::QuotaExceeded);
+    assert!(!envelope.retryable, "a delay does not lift the limit");
+    assert!(
+        envelope
+            .message
+            .starts_with("organization sandbox limit of 2 reached"),
+        "{}",
+        envelope.message
+    );
+    assert_eq!(create_operations().await?, 2, "a refusal records nothing");
+
+    let replay = create("quota-first", org_limit(2))
+        .await
+        .expect("a replay of an admitted create is not counted again");
+    assert_eq!(replay.operation_id, first.operation_id);
+
+    create("quota-uncapped", None)
+        .await
+        .expect("an uncapped caller is never refused");
+    assert_eq!(create_operations().await?, 3);
+
+    let per_user = Some(SandboxQuota {
+        org_id,
+        org_limit: None,
+        subject: Some(SubjectSandboxQuota { user_id, limit: 3 }),
+    });
+    let envelope = refusal(create("quota-per-user", per_user).await).await;
+    assert!(!envelope.retryable);
+    assert!(
+        envelope
+            .message
+            .starts_with("sandbox limit of 3 per user reached"),
+        "{}",
+        envelope.message
+    );
+    Ok(())
+}
+
+/// A create that waits out its quota lock answers the retryable 503 instead
+/// of holding its connection until the holder commits.
+#[tokio::test]
+async fn a_native_create_that_waits_out_its_quota_lock_is_retryable() -> TestDbResult<()> {
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::PublicErrorEnvelope;
+
+    let db = pg_test_db_with_max_connections(3).await?;
+    let (org_id, user_id) = seed_quota_org(&db.pool).await?;
+    let holder = hold_org_quota_lock(&db.pool, org_id).await?;
+    let refused = create_native_sandbox_operation(
+        &db.pool,
+        org_id,
+        user_id,
+        &IdempotencyKey::parse("quota-contended").expect("test key parses"),
+        create_request_with_auto_lifecycle(None),
+        None,
+        None,
+        Some(SandboxQuota {
+            org_id,
+            org_limit: Some(1),
+            subject: None,
+        }),
+    )
+    .await
+    .expect_err("the quota lock stays held")
+    .into_response();
+    drop(holder);
+
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        refused
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER)
+    );
+    let body = refused.into_body().collect().await?.to_bytes();
+    let envelope = serde_json::from_slice::<PublicErrorEnvelope>(&body)?;
+    assert_eq!(envelope.code, PublicErrorCode::ServiceUnavailable);
+    assert!(envelope.retryable);
+    Ok(())
+}
+
+async fn seed_quota_org(pool: &PgPool) -> TestDbResult<(OrgId, UserId)> {
+    let org_id = OrgId::new();
+    let user_id = UserId::new();
+    sqlx::query(sql!(
+        "INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $2)"
+    ))
+    .bind(org_id)
+    .bind(format!("quota-{org_id}"))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
+         VALUES ($1, $2, 'hash', 'Quota', $3, 'member')"
+    ))
+    .bind(user_id)
+    .bind(format!("quota-{user_id}@example.com"))
+    .bind(org_id)
+    .execute(pool)
+    .await?;
+    Ok((org_id, user_id))
+}
+
+/// Hold `org_id`'s quota lock exclusively, as an admitted create under a
+/// limit of one does until its transaction ends. Dropping it rolls back.
+async fn hold_org_quota_lock(
+    pool: &PgPool,
+    org_id: OrgId,
+) -> TestDbResult<PublicOperationAdmission> {
+    let key = IdempotencyKey::parse("quota-lock-holder").expect("test key parses");
+    let fingerprint = RequestFingerprint::parse("e".repeat(64)).expect("valid fingerprint");
+    let mut admission = PublicOperationStore::new(pool.clone())
+        .begin_operation_admission(
+            org_id,
+            ApiProduct::Native,
+            &CreatePublicOperationIdempotency {
+                method: HttpOperationMethod::Post,
+                path_template: OperationPathTemplate::new("/sandboxes"),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            },
+        )
+        .await?;
+    let outcome = admission
+        .admit_new_create(SandboxQuota {
+            org_id,
+            org_limit: Some(1),
+            subject: None,
+        })
+        .await?;
+    assert_eq!(outcome, SandboxQuotaOutcome::Admit);
+    Ok(admission)
+}
+
+/// Wait until some backend waits on an advisory lock, as a create queued
+/// on a held quota lock does.
+async fn wait_for_advisory_lock_waiter(pool: &PgPool) -> TestDbResult<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND wait_event_type = 'Lock'
+                    AND wait_event = 'advisory'
+             )"
+        ))
+        .fetch_one(pool)
+        .await?;
+        if waiting {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("no create waited on the quota lock".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 #[test]
@@ -1347,6 +1565,57 @@ mod admission_pool_claim {
             ("claimed".to_string(), Some(claim.claim_id))
         );
         assert_eq!(admission_outcomes(&counters), vec!["outcome:hit"]);
+        Ok(())
+    }
+
+    /// The quota check runs before the claim: a create waiting for its quota
+    /// lock holds no slot, so another create takes the ready one meanwhile,
+    /// and the waiting create is then refused without claiming.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_create_waiting_on_the_quota_holds_no_slot() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::with_max_connections(1, 5).await?;
+        let controller = fixture.controller();
+        let holder = hold_org_quota_lock(&fixture.db.pool, fixture.org_id).await?;
+        let capped_key = IdempotencyKey::parse("quota-claim-capped").expect("test key parses");
+        let capped = create_native_sandbox_operation(
+            &fixture.db.pool,
+            fixture.org_id,
+            fixture.user_id,
+            &capped_key,
+            fixture.request(),
+            None,
+            Some(NativeCreatePoolClaims {
+                controller: &controller,
+                inline: None,
+            }),
+            Some(SandboxQuota {
+                org_id: fixture.org_id,
+                org_limit: Some(1),
+                subject: None,
+            }),
+        );
+        let meanwhile = async {
+            wait_for_advisory_lock_waiter(&fixture.db.pool).await?;
+            let uncapped = fixture
+                .create(Some(&controller), "quota-claim-uncapped", fixture.request())
+                .await
+                .expect("an uncapped create is recorded");
+            assert_eq!(
+                uncapped.sandbox_id,
+                PublicSandboxId::from(fixture.slots[0].reserved_sandbox_id),
+                "the create waiting on the quota must not hold the slot"
+            );
+            drop(holder);
+            TestDbResult::Ok(())
+        };
+        let (capped, meanwhile) = tokio::join!(capped, meanwhile);
+        meanwhile?;
+        let refused = capped.expect_err("the uncapped create filled the org's limit");
+        assert_eq!(
+            refused.into_response().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(fixture.create_operations().await?, 1);
         Ok(())
     }
 

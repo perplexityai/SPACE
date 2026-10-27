@@ -101,3 +101,364 @@ fn session_cursor_round_trips() {
     assert_eq!(parsed.created_at, created_at);
     assert_eq!(parsed.session_id, session_id);
 }
+
+fn wake_policy(on: &[&str]) -> AutoLifecyclePolicy {
+    serde_json::from_value(serde_json::json!({ "wake": { "on": on } })).unwrap()
+}
+
+#[test]
+fn command_admission_follows_lifecycle_and_wake_policy() {
+    use CommandAdmission::*;
+    use SandboxLifecycle::*;
+
+    for lifecycle in SandboxLifecycle::all().iter().copied() {
+        // (with a command or access wake source, without one)
+        let (waking, without_wake) = match lifecycle {
+            Started | Creating | Starting | Resuming | Restoring | Checkpointing => (Admit, Admit),
+            Created | Paused | Suspended | Pausing | Suspending => (AdmitAndWake, Refuse),
+            Stopped | Stopping | Deleting | Failed | Quarantined => (Refuse, Refuse),
+        };
+        for on in [&["command"][..], &["access"], &["access", "command"]] {
+            assert_eq!(
+                command_admission(lifecycle, &wake_policy(on)),
+                waking,
+                "{lifecycle:?} with wake.on={on:?}"
+            );
+        }
+        assert_eq!(
+            command_admission(lifecycle, &AutoLifecyclePolicy::default()),
+            without_wake,
+            "{lifecycle:?} with no wake source"
+        );
+    }
+}
+
+/// `createCommand` and `createProcessSession` against stored sandboxes,
+/// through auth, owner scope and the handler, for the answers a caller
+/// branches on.
+mod not_running {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{Method, Request, header},
+    };
+    use pplx_space_common_core::sql;
+    use pplx_space_db_test_fixtures::{
+        SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db,
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    const KEY: &str = "native-command-admission-key";
+
+    struct Fixture {
+        db: TestDb,
+        app: Router,
+    }
+
+    async fn fixture() -> TestDbResult<Fixture> {
+        let db = pg_test_db().await?;
+        sqlx::query(sql!(
+            "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
+             VALUES ($1, $2, 'native-command-admission', $3, ARRAY['native'])"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(SEED_ORG_ID)
+        .bind(crate::auth::hash_token(KEY))
+        .execute(&db.pool)
+        .await?;
+        let state = AppState::from_pool(db.pool.clone()).await?;
+        let app = Router::new()
+            .nest("/v1", crate::routes::public::v1_router(state.clone()))
+            .with_state(state);
+        Ok(Fixture { db, app })
+    }
+
+    /// A sandbox with no node, as a suspended Kubernetes sandbox is.
+    async fn sandbox(
+        fixture: &Fixture,
+        lifecycle: &str,
+        wake_on: &[&str],
+    ) -> TestDbResult<PublicSandboxId> {
+        let sandbox_id = PublicSandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, auto_lifecycle_json,
+                 network_policy_generation)
+             VALUES ($1, $2, $3, $4, $5, 1)"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(lifecycle)
+        .bind(sqlx::types::Json(wake_policy(wake_on)))
+        .execute(&fixture.db.pool)
+        .await?;
+        Ok(sandbox_id)
+    }
+
+    /// The two routes that start a process: commands and process sessions.
+    const PROCESS_ROUTES: [&str; 2] = ["commands", "process-sessions"];
+
+    async fn command(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+        route: &str,
+    ) -> TestDbResult<(StatusCode, Option<String>, Value)> {
+        let key = Uuid::now_v7().to_string();
+        send(
+            fixture,
+            sandbox_id,
+            route,
+            &key,
+            json!({"command": ["echo", "hello"]}),
+        )
+        .await
+    }
+
+    async fn send(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+        route: &str,
+        key: &str,
+        body: Value,
+    ) -> TestDbResult<(StatusCode, Option<String>, Value)> {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/sandboxes/{sandbox_id}/{route}"))
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("content-type", "application/json")
+            .header("idempotency-key", key)
+            .body(Body::from(serde_json::to_vec(&body)?))?;
+        let response = fixture.app.clone().oneshot(request).await?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()?;
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        Ok((status, retry_after, serde_json::from_slice(&body)?))
+    }
+
+    /// The 409 a caller branches on; `action` is the lifecycle action the
+    /// `wake` detail names, or `None` when no action returns it to running.
+    fn assert_not_running(
+        sandbox_id: PublicSandboxId,
+        state: &str,
+        action: Option<&str>,
+        (status, retry_after, body): &(StatusCode, Option<String>, Value),
+    ) {
+        assert_eq!(*status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "conflict", "{body}");
+        assert_eq!(body["retryable"], false, "{body}");
+        assert_eq!(retry_after.as_deref(), None, "{body}");
+        let mut details = vec![
+            json!({"key": "reason", "value": "sandbox_not_running"}),
+            json!({"key": "state", "value": state}),
+        ];
+        if let Some(action) = action {
+            details.push(json!({
+                "key": "wake",
+                "value": format!("POST /v1/sandboxes/{sandbox_id}:{action}"),
+            }));
+        }
+        assert_eq!(body["details"], Value::Array(details), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_cannot_wake_the_sandbox_is_a_conflict() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        for (lifecycle, wake_on, state, action) in [
+            ("suspended", &[][..], "suspended", Some("wake")),
+            ("paused", &[], "paused", Some("wake")),
+            ("suspending", &[], "suspending", Some("wake")),
+            ("stopped", &[], "stopped", Some("start")),
+            ("stopped", &["command"], "stopped", Some("start")),
+            ("deleting", &["command"], "deleting", None),
+            ("failed", &["access"], "failed", None),
+            // Reports `creating`, but its creation has not started: at rest.
+            ("created", &[], "creating", Some("wake")),
+        ] {
+            let sandbox_id = sandbox(&fixture, lifecycle, wake_on).await?;
+            for route in PROCESS_ROUTES {
+                let answer = command(&fixture, sandbox_id, route).await?;
+                assert_not_running(sandbox_id, state, action, &answer);
+            }
+        }
+        let sessions: i64 = sqlx::query_scalar(sql!("SELECT count(*) FROM data_plane_sessions"))
+            .fetch_one(&fixture.db.pool)
+            .await?;
+        assert_eq!(sessions, 0, "a refused command must not persist a session");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_command_the_sandbox_will_run_is_created() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        for (lifecycle, wake_on) in [
+            ("suspended", &["access"][..]),
+            ("paused", &["command"]),
+            ("suspending", &["access"]),
+            ("created", &["command"]),
+            // Heading to running: the attach waits, whatever the policy.
+            ("creating", &[]),
+            ("restoring", &[]),
+        ] {
+            let sandbox_id = sandbox(&fixture, lifecycle, wake_on).await?;
+            for route in PROCESS_ROUTES {
+                let (status, _, body) = command(&fixture, sandbox_id, route).await?;
+                assert_eq!(status, StatusCode::CREATED, "{route} {lifecycle}: {body}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_lifecycle(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+        lifecycle: &str,
+    ) -> TestDbResult<()> {
+        sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+            .bind(sandbox_id.as_uuid())
+            .bind(lifecycle)
+            .execute(&fixture.db.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The wake operations for `sandbox_id`: actor, product.
+    async fn wakes(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+    ) -> TestDbResult<Vec<(Option<Uuid>, String)>> {
+        Ok(sqlx::query_as(sql!(
+            "SELECT actor_user_id, api_product
+               FROM public_operations
+              WHERE kind = 'wake_sandbox' AND target_id = $1"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_all(&fixture.db.pool)
+        .await?)
+    }
+
+    #[tokio::test]
+    async fn many_commands_on_a_sandbox_at_rest_share_one_system_wake() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["access"]).await?;
+        let answers = futures_util::future::try_join_all((0..20).map(|index| {
+            let route = PROCESS_ROUTES[index % PROCESS_ROUTES.len()];
+            command(&fixture, sandbox_id, route)
+        }))
+        .await?;
+        for (status, _, body) in &answers {
+            assert_eq!(*status, StatusCode::CREATED, "{body}");
+        }
+        assert_eq!(
+            wakes(&fixture, sandbox_id).await?,
+            vec![(None, "native".to_string())],
+            "one actorless command wake for every request"
+        );
+
+        // A running sandbox needs none.
+        let running = sandbox(&fixture, "started", &["access"]).await?;
+        command(&fixture, running, "commands").await?;
+        assert!(wakes(&fixture, running).await?.is_empty());
+        Ok(())
+    }
+
+    /// The sandbox's active operations in the dispatcher's order: kind, actor.
+    async fn queue(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+    ) -> TestDbResult<Vec<(String, Option<Uuid>)>> {
+        Ok(sqlx::query_as(sql!(
+            "SELECT kind, actor_user_id
+               FROM public_operations
+              WHERE target_type = 'sandbox' AND target_id = $1
+                AND state IN ('queued', 'running')
+              ORDER BY requested_at, operation_id"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_all(&fixture.db.pool)
+        .await?)
+    }
+
+    #[tokio::test]
+    async fn a_command_behind_a_queued_suspend_queues_its_own_wake() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        for action in ["wake", "suspend"] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/sandboxes/{sandbox_id}:{action}"))
+                .header("authorization", format!("Bearer {KEY}"))
+                .header("idempotency-key", Uuid::now_v7().to_string())
+                .body(Body::empty())?;
+            let response = fixture.app.clone().oneshot(request).await?;
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{action}");
+        }
+        let caller = Some(SEED_USER_ID);
+
+        // Joining the caller's wake would run it before the suspend and leave
+        // the sandbox suspended for the command.
+        let (status, _, body) = command(&fixture, sandbox_id, "commands").await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let expected = vec![
+            ("wake_sandbox".to_string(), caller),
+            ("suspend_sandbox".to_string(), caller),
+            ("wake_sandbox".to_string(), None),
+        ];
+        assert_eq!(queue(&fixture, sandbox_id).await?, expected);
+
+        // Nothing is queued behind that wake, so the next command joins it.
+        let (status, _, body) = command(&fixture, sandbox_id, "process-sessions").await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(queue(&fixture, sandbox_id).await?, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replayed_request_answers_as_it_did_before_the_sandbox_suspended() -> TestDbResult<()>
+    {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "started", &[]).await?;
+        let body = json!({"command": ["echo", "hello"]});
+        for route in PROCESS_ROUTES {
+            let key = Uuid::now_v7().to_string();
+            set_lifecycle(&fixture, sandbox_id, "started").await?;
+            let (status, _, created) =
+                send(&fixture, sandbox_id, route, &key, body.clone()).await?;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+
+            set_lifecycle(&fixture, sandbox_id, "suspended").await?;
+            let (status, _, replayed) =
+                send(&fixture, sandbox_id, route, &key, body.clone()).await?;
+            assert_eq!(status, StatusCode::CREATED, "{route} replay: {replayed}");
+            let id = if route == "commands" {
+                "session_id"
+            } else {
+                "id"
+            };
+            assert!(created[id].is_string(), "{route}: {created}");
+            assert_eq!(replayed[id], created[id], "{route}");
+            let fresh = command(&fixture, sandbox_id, route).await?;
+            assert_not_running(sandbox_id, "suspended", Some("wake"), &fresh);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_invalid_request_is_refused_before_the_sandbox_state() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &[]).await?;
+        for route in PROCESS_ROUTES {
+            let key = Uuid::now_v7().to_string();
+            let (status, _, body) =
+                send(&fixture, sandbox_id, route, &key, json!({"command": []})).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {body}");
+        }
+        Ok(())
+    }
+}

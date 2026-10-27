@@ -8,7 +8,7 @@ use pplx_space_common_core::types::{
     ContentHash, Digest, IdempotencyKey, MemorySize, OrgId, SandboxId, TemplateName, UserId,
     VcpuCount,
 };
-use pplx_space_db_test_fixtures::{TestDb, TestDbResult, pg_test_db};
+use pplx_space_db_test_fixtures::{TestDb, TestDbResult, pg_test_db_with_max_connections};
 use pplx_space_public_api::{CreateSandboxRequest, OperationId, SandboxOperationResponse};
 use sqlx::types::Json as SqlJson;
 use uuid::Uuid;
@@ -47,7 +47,16 @@ pub(crate) struct AdmissionPoolFixture {
 
 impl AdmissionPoolFixture {
     pub(crate) async fn new(ready_slots: usize) -> TestDbResult<Self> {
-        let db = pg_test_db().await?;
+        Self::with_max_connections(ready_slots, 2).await
+    }
+
+    /// [`Self::new`] over a pool of `max_connections`, for tests that hold
+    /// several transactions open at once.
+    pub(crate) async fn with_max_connections(
+        ready_slots: usize,
+        max_connections: u32,
+    ) -> TestDbResult<Self> {
+        let db = pg_test_db_with_max_connections(max_connections).await?;
         let org_id = OrgId::new();
         let user_id = UserId::new();
         sqlx::query(sql!(
@@ -218,6 +227,7 @@ impl AdmissionPoolFixture {
             request,
             None,
             pool_claims,
+            None,
         )
         .await
     }

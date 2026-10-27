@@ -109,7 +109,7 @@ async fn publish_with_status(
     crate::status::upsert_node_status_from_publish(
         tx,
         node_id,
-        crate::NODE_STATUS_STALE_AFTER_SECS,
+        None,
         None,
         crate::status::SandboxInventoryPrune::Skipped,
         crate::status::LocalBackupInventoryReport::Absent,
@@ -223,7 +223,7 @@ async fn empty_publications_serialize_until_status_receipt_commits() -> TestResu
     crate::status::upsert_node_status_from_publish(
         &mut first,
         node_id,
-        crate::NODE_STATUS_STALE_AFTER_SECS,
+        None,
         None,
         crate::status::SandboxInventoryPrune::Skipped,
         crate::status::LocalBackupInventoryReport::Absent,
@@ -450,19 +450,43 @@ async fn policy_receipts_clear_unknown_evidence_and_commit_atomically() -> TestR
         legacy_unbound_allowed: true,
         allowed_environment_references: vec![reference.clone()],
         default_environment_reference: Some(reference),
+        applied_generation: None,
+        cluster_policy_unreadable: false,
     };
     let invalid = pplx_space_execution_common::proto::ExecutionPolicyObservation {
         schema_version: 99,
         ..valid.clone()
     };
+    // A node enforcing cluster generation 5, whose cluster default was refused
+    // after its configured default was removed.
+    let applied = pplx_space_execution_common::proto::ExecutionPolicyObservation {
+        schema_version: 2,
+        default_environment_reference: None,
+        applied_generation: Some(5),
+        ..valid.clone()
+    };
+    let unreadable = pplx_space_execution_common::proto::ExecutionPolicyObservation {
+        schema_version: 2,
+        legacy_unbound_allowed: false,
+        allowed_environment_references: vec![],
+        default_environment_reference: None,
+        applied_generation: None,
+        cluster_policy_unreadable: true,
+    };
     for (policy, unavailable_report, expected) in [
         (Some(valid.clone()), false, true),
         (Some(invalid), false, false),
+        (Some(applied.clone()), false, true),
+        (Some(unreadable.clone()), false, true),
         (Some(valid.clone()), false, true),
         (None, false, false),
         (Some(valid), false, true),
         (None, true, false),
     ] {
+        let published = policy.as_ref().map(|policy| policy.applied_generation);
+        let unreadable_published = policy
+            .as_ref()
+            .is_some_and(|policy| policy.cluster_policy_unreadable);
         let report = if unavailable_report {
             unavailable()
         } else {
@@ -487,6 +511,10 @@ async fn policy_receipts_clear_unknown_evidence_and_commit_atomically() -> TestR
         };
         let before = read().fetch_one(&db.pool).await?;
         assert_eq!(before.is_some(), expected);
+        if let Some(stored) = &before {
+            assert_eq!(Some(stored.applied_generation()), published);
+            assert_eq!(stored.cluster_policy_unreadable(), unreadable_published);
+        }
         let receipt = || {
             sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
                 "SELECT execution_policy_received_at FROM node_status_snapshots WHERE node_id = $1"

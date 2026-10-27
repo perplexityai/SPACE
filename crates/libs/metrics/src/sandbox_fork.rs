@@ -63,7 +63,9 @@ pub fn completed(outcome: ForkOutcome) {
 
 /// Record one executor attempt in the persisted workflow phase. The latency is
 /// attempt latency rather than end-to-end phase latency because a phase may be
-/// resumed by another controller process after a durable requeue.
+/// resumed by another controller process after a durable requeue. A completed
+/// intermediate phase records success even when the same claim immediately
+/// continues into the next phase; only a real requeue records a retry.
 pub fn phase_attempt(
     phase: ForkPhase,
     source_lifecycle: ForkSourceLifecycle,

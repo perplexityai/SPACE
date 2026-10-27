@@ -9,7 +9,7 @@ identifies bytes; an environment reference identifies a particular combination
 of bytes and execution requirements. Neither reference implies that those bytes
 are installed, usable, or approved for execution on a node.
 
-This first contract supports the compiled **E0** definition: Linux/x86_64 host,
+The original schema-1 contract describes the compiled **E0** definition: Linux/x86_64 host,
 KVM, Firecracker 1.15.1, Linux/x86_64 guest, kernel 6.1.155, a hardware VM boundary,
 and Firecracker snapshot format 9.0.0. The runtime digest covers the pinned
 Firecracker and jailer binaries, not their download archive.
@@ -27,35 +27,98 @@ selection are separate operations.
 | `HostPlatform` | Host OS family plus architecture. Policy cohorts must use both. Linux, Windows and macOS are distinguishable identities, not claims that this build implements their execution adapters. |
 | `GuestPlatform` | Existing guest OS family plus architecture. It is independent of the host. Distribution/release, image provenance and mutable boot state remain template/sandbox concerns. |
 | `RuntimeBinding` | A tagged provider reference. Schema 1 implements only `ManagedRelease`, with an exact binary digest and host target. A host facility must get a distinct provider when its adapter is implemented; it must not be represented by an invented installable artifact. |
-| `BootProfile` | Versioned adapter semantics and immutable boot components. `LinuxDirectV1` names a required guest kernel, targeted at the descriptor's guest platform. The root filesystem comes from the template. Firmware/disk boot and mutable NVRAM are not encoded speculatively. |
-| Backend, payload layout, isolation | Typed vocabularies with only KVM, the Firecracker release layout, and a hardware VM boundary implemented. Isolation classes are categories for allowed-class policy, never a numeric ranking. Unknown/unspecified values are unsupported. |
-| `ExecutionCompatibilityProfile` | Versioned adapter interpretation of compatibility requirements. `FirecrackerSnapshotV1` retains the current `StateFormatIdentity` meaning. It does not promise that arbitrary Firecracker versions can restore each other's snapshots. Machine/device compatibility and per-operation capabilities belong to their first adapter consumer. |
+| `BootProfile` | Schema 2 uses `ArtifactsV1`: a versioned boot contract identifier and immutable inputs with unique roles, kinds, formats, versions and digests. It does not prescribe a kernel, a particular guest OS, or executable filenames. Schema 1 retains `LinuxDirectV1`. Template rootfs and mutable per-VM state keep their existing owners. |
+| Backend, payload layout, isolation | Backend and isolation describe mechanisms rather than runtime brands. Schema 2 uses `CatalogReleaseV1`: the trusted catalog owns binary roles and file layout, including single-binary releases. Download packaging and local paths are not wire contracts. The Firecracker layout remains only for schema-1 compatibility. Unknown/unspecified enum values are unsupported. |
+| `ExecutionCompatibilityProfile` | Schema 2 uses `RuntimeV1`: an immutable machine/device contract identifier and an optional `StateFormatIdentity`. Absence explicitly means no memory-state contract; presence is a format requirement, not permission to restore. Schema 1 retains `FirecrackerSnapshotV1`. Approved replacements and per-operation capabilities remain catalog/adapter policy. |
 
 Schema 1 describes the existing SPACE Firecracker direct-boot adapter. Its
 command-line construction and device configuration remain adapter-owned; CPU,
 memory, disks, and guest userspace remain workload/template inputs. Any future
-environment-selectable boot or device configuration must participate in a new
-profile/schema identity before it can affect execution. Adding a field that
-changes boot or restore meaning while preserving the old reference is invalid.
+environment-selectable boot or device configuration must participate in the
+profile identity before it can affect execution. Schema-2 contracts are data:
+adding a runtime that uses the existing managed-artifact mechanisms requires no
+runtime-specific protobuf arm. Its adapter implements the boot and machine
+contracts, and its catalog qualifies exact artifacts. A genuinely new shared
+concept, such as a host-provided runtime facility, still requires its own model;
+it must not masquerade as a managed release with invented artifacts.
+
+Contract identifiers are bounded validated identifiers (for example a versioned
+adapter ABI name), not free-form JSON, filenames or executable commands. New
+semantics require a new contract identifier and therefore a new environment
+reference. Adding a qualified replacement does not change an existing contract.
+Readers preserve unsupported contracts as descriptions; execution admission
+requires a reference in the node's trusted catalog and an implementing adapter.
+No generic parser infers support from a name or matches arbitrary state versions.
 
 Structural decoding and execution approval are separate:
 
 1. `EnvironmentDescriptor::try_from` requires complete fields and consistent
-   host, runtime target, guest and implemented profiles. It currently rejects
-   non-Firecracker/non-Linux combinations, rather than pretending the existing
-   profile describes them.
+   host target and profiles, rejecting mixed schema-1/schema-2 profiles and
+   duplicate boot roles. The legacy profile remains Firecracker/Linux-specific;
+   the schema-2 envelope is runtime-neutral. Structural acceptance does not
+   certify a host/guest combination or implement its named contracts.
 2. `EnvironmentDefinition` computes the content reference. Wire/document readers
    recompute it and reject a mismatched claimed reference.
-3. `InitialEnvironment::resolve_definition` resolves only the compiled E0
-   reference. A well-formed candidate descriptor or approved downloadable
-   artifact does not expand that set. Existing aarch64 installation pins retain
-   their old meaning; production qualification covers only the x86_64 E0 descriptor.
+3. The compiled environment catalog resolves qualified definitions. A
+   well-formed candidate descriptor or approved downloadable artifact does not
+   expand that set. This protocol extension adds no new qualified environments,
+   installable artifacts or execution adapters.
 4. Execution consumers must separately verify node usability and allowed
    selection. No caller may turn successful decoding into execution permission.
 
 No source URL, cache/vendor path, environment variable, operator label, observed
 health, enforcement mode, or installation job revision is part of this identity.
 Local source/path configuration cannot become a second selection authority.
+
+## Runtime-neutral encoding and rollout
+
+Firecracker catalog definitions and decoded legacy definitions normalize to the
+same generic boot and compatibility profiles used by other managed runtimes.
+The Firecracker builder consumes these profiles; it no longer depends on a
+Firecracker-specific protobuf profile. Runtime adapters still implement their
+own boot and machine contracts.
+
+Representation and identity versions are separate. `schema_version` describes
+the wire representation; `identity_schema_version` describes the canonical
+bytes hashed by the reference (zero retains the historical rule of using the
+wire version). Existing Firecracker definitions use generic schema-2 transport
+with identity version 1. The decoder accepts this combination only when every
+generic requirement maps exactly to the original Firecracker contract. It
+rejects extra artifacts, changed roles/formats/contracts, missing state format,
+and incompatible host/guest/runtime combinations. New definitions use identity
+version 2. Neither encoding conversion nor deployment changes persisted
+references, selection policy, template hashes, or snapshot provenance.
+
+The immutable old representation is retained privately at the codec boundary
+for canonical hashing and stored schema-1 JSON. Consumers see generic profiles.
+Historical records that omitted component formats keep their original binding
+checks; native schema-2 identities require the declared formats.
+
+The environment gRPC protocol accepts and emits only generic schema 2. Retired
+profile and selection fields are removed, including their reservation declarations;
+live field numbers and enum values are unchanged.
+ResolveExecutionEnvironment callers continue advertising schema 2: transitional
+nodes use that capability to return generic definitions during a rolling
+upgrade. Nodes reject clients advertising less than 2. No legacy environment
+response, reader, or Firecracker-specific environment protobuf message remains.
+Selection acknowledgements and persist-before-activation rules are unchanged.
+
+Deployment prerequisite: node-manager, builder, sandbox-manager and operator CLI
+readers must first run the transitional migration that understands generic
+transport with historical identities. Include rollback images in this gate.
+Both deployment orders between that transitional version and this removal are
+supported; jumping from a pre-migration version is not. A later rollback to a
+pre-migration reader requires restoring the transitional server first.
+
+The historical canonical/JSON reader remains because persisted references still
+need it; it is not a legacy gRPC API. Runtime control also uses only the generic
+launch, VM-state, capture and restore routes; the old routes and fallbacks are gone.
+
+Schema-2 artifacts are canonicalized by unique role. Every artifact's kind,
+version, digest and format, both contract identifiers, and the presence/value of
+memory state participate in native schema-2 identity. A kernel-free boot profile
+is representable; its adapter still has to implement it. Synthetic round-trip
+and canonical fixtures exercise the wire shape without qualifying a runtime.
 
 ## Persisted-state provenance and restore compatibility
 
@@ -210,11 +273,16 @@ requests. Failed publications remain reconciliation errors and the next
 periodic tick retries with a new sample. A persistent protocol defect needs a
 publisher fix, not a successful acknowledgement of the rejected report.
 
-The inventory polling period (60 seconds by default) is not a heartbeat
-freshness guarantee. It must not be used to justify the separate 30-second
-node-status freshness window. First-boot artifact staging may exceed the
-five-second collection budget and legitimately report unavailable until a
-later sample succeeds; the previous artifact rows remain in place.
+The inventory polling period (60 seconds by default) isn't itself a heartbeat
+freshness guarantee. The node-status freshness window is derived from the
+node's reported poll interval with margin: two intervals plus 30 seconds,
+150 seconds by default and never more than 10 minutes, so a node that publishes
+only on its tick doesn't read stale between ticks. node-ctl caps its poll
+interval at 285 seconds, the longest whose two ticks plus slack fit in the
+10-minute cap. A publication that reports no interval keeps the node's stored
+window. First-boot artifact staging may exceed the five-second collection
+budget and legitimately report unavailable until a later sample succeeds; the
+previous artifact rows remain in place.
 
 Repeated complete samples advance the collection receipt without replacing
 unchanged runtime, guest, state-format or component rows. Reconciliation deletes
@@ -566,15 +634,15 @@ withdraw E0. Each compiled binding records its qualified lifecycle support; the
 same-environment memory snapshots. Cross-environment restore requires a
 qualified compatible loader; each snapshot retains its original producer binding.
 The 6.1.155 kernel keeps its existing artifact identity when paired with 1.17.0.
-Non-default snapshot capture carries an environment-bound sandbox identity on
-`CreateSnapshot`, with the legacy sandbox ID omitted. Old node-managers reject
-that request before capture or encrypted teardown. New nodes verify the running
-sandbox's metadata and resolve its exact binding for restore before capture.
-This enforces qualification on the serving node even if it restarts between a
-preflight and the mutation. During mixed rollouts non-default suspend can fail
-and leave a resident paused VM; upgrade the node and retry or resume it. E0 and
-legacy capture keep their existing wire shape. Retain qualified node versions
-while their snapshots exist: downgrading a loader is not a retirement operation.
+Non-default snapshot capture carries an environment reference alongside the
+sandbox identity on `CaptureVmState`. The serving node verifies the running
+sandbox's metadata and resolves its exact binding for restore before capture.
+This enforces qualification even if the node restarts between a preflight and
+the mutation. During the bridge rollout, fallback to an older route preserves
+the bound identity and refuses peers that cannot honor it. After removal of the
+legacy routes, all peers and rollback images must meet the rollout gate below.
+Retain qualified node versions while their snapshots exist: downgrading a loader
+is not a retirement operation.
 
 `StartBuild` and `Create` accept an additive environment input. It contains the
 reference and recipe or template; the environment determines the runtime. Legacy
@@ -743,7 +811,8 @@ attempts, including retries, rather than completed launches. Transient exact-sou
 errors follow the existing inventory refresh backoff and the caller's activation
 retry/deadline; selection itself does not wait or write a consumer.
 
-The temporary node settings will yield authority to cluster desired policy.
+Cluster desired policy (below) adds restrictions within these node settings;
+the node settings stay the upper bound on what a node may execute.
 Until placement consumes environment eligibility and fresh usability evidence,
 keep allowed/default policy uniform within each role/host-platform cohort and
 verify that builder outputs work on every worker cohort that may receive them.
@@ -766,6 +835,169 @@ Kind and development nodes. Before upgrading a deployment that needs those exist
 bindings, configure its explicit allowlist while keeping the default at E0. Do not
 expand every development deployment's policy merely because of its name.
 
+### Cluster desired policy
+
+Cluster policy lives in the control-plane tables `runtime_environment_policy`
+and `runtime_environment_states`. Services read and write them only through
+`pplx-space-runtime-environment-policy-store`. The exceptions are the direct SQL
+a cluster administrator runs to reset the policy before rolling back its
+migration, and the `ON DELETE SET NULL` cascade that clears a deleted user from
+the audit columns. Each environment with a state is
+`allowed`, `deprecated` or `blocked`; the first two execute. The policy row names
+the cluster default, the legacy permission and a generation that every store
+write raises. The store keeps the default `allowed`, replaces it but never clears it,
+and refuses a block while the cluster has no default.
+
+Cluster API serves the policy in the `execution_policy` field of
+`GetNodeRuntimeDesiredState` when `SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED`
+is truthy. It's off by default, and the field is then absent, so nodes keep their
+startup settings. An unset default or legacy permission in a served policy
+likewise leaves the node's configured value in place. A policy that can't be read
+fails the whole call rather than coming back absent, since absence would send a
+node back to its startup settings. The setting is read per cluster API replica at
+startup, so while it changes, or during a rolling deploy that changes it, some
+replicas serve the field and others don't. Rolling the cluster API back to a
+binary without the field has the same effect. Nodes apply the field, so a
+missing field sends a node back to its startup settings and lifts any cluster
+block: while replicas disagree, a node alternates between the two on each pass.
+Turning the setting off, or rolling the cluster API back, lifts every block
+for as long as it lasts. Lift blocks deliberately, or keep the cluster API
+serving the field, rather than relying on either.
+Node-manager combines the policy with its own settings by these rules, so policy
+narrows what a node allows, and may pick its default among the environments
+left, but never widens it:
+
+- **Allowed set.** With no cluster default, state rows narrow nothing: the node
+  keeps its configured allowlist. Since the store refuses a block without a
+  default, those rows are normally `allowed` or `deprecated`; only direct SQL
+  can leave a block behind. Once the cluster has a default, the node
+  executes the intersection of its configured allowlist and the policy's
+  executing set. A reference the node doesn't compile or allow is ignored. An
+  environment with no state then doesn't execute, just like a blocked one, so
+  setting the first default narrows every node to the environments that have
+  a state. Mark the environments nodes must keep `allowed` before setting it.
+- **Default.** The node adopts the cluster default when it's in that
+  intersection and its artifacts are installed and verified, by the same
+  inventory resolution a new cold boot uses. Otherwise it keeps its configured
+  default if that's still in the intersection, and has no compiled default if
+  it isn't: a request for the default is then refused rather than run on an
+  environment the cluster removed or one this node can't verify. Unbound work
+  that matches an environment still in the intersection keeps running. The refusal is logged,
+  returned to node-ctl as the `ApplyExecutionPolicy` outcome
+  (`not_allowed` or `unusable`), and visible as a published default that
+  differs from the cluster's at the same applied generation. Install the
+  environment, through the recipe, before making it the default.
+- **Legacy permission.** The node allows unbound historical contracts only when
+  both its own setting and the cluster's allow them. The cluster can revoke
+  `legacy`, never grant it.
+- **aarch64.** No compiled environment qualifies, so the intersection is empty
+  and the node has no compiled default whatever the cluster says. Only the
+  legacy permission applies, and the cluster can revoke it.
+
+**How nodes apply it.** Node-ctl's runtime-provisioning facet forwards the
+`execution_policy` of every `GetNodeRuntimeDesiredState` response to
+node-manager's `ApplyExecutionPolicy`, on each periodic tick and each trigger,
+before that pass's installations so a block doesn't wait for them. An absent
+field, or an older cluster API answering `Unimplemented`, is forwarded as no
+policy, and node-manager returns to its startup settings. A failed fetch
+forwards nothing and keeps the applied policy. Older node-managers answer
+`Unimplemented`, which node-ctl logs and tolerates; they keep enforcing their
+startup settings. Node-manager authorizes only root and node-ctl. It refuses no
+policy for what it names, since a refusal would leave a block unenforced. It
+ignores executing references it can't parse, repeats and ones it doesn't
+compile, treats the default as executing whether listed or not, refuses an
+unparsable default as not allowed while still narrowing, and, like the
+cluster's store, caps no count of references. Applying has its own 10-second
+budget. Within it, node-manager waits at most 1 second for the previous
+application's record write and bounds its check of the default at 3 seconds. A
+slow first inventory discovery refuses a default not yet verified for that
+pass, while a slow or retryable check keeps one already verified, so a rescan
+can't flap it. A verdict restored from the record counts until a check this
+process completes says otherwise. A block is enforced within those 4 seconds of
+the call arriving. A hung write leaves the new policy enforced but not
+persisted, with an `Unavailable` error, rather than cancelling the whole
+application. Applications take effect in arrival order: one that finishes after
+a later arrival has enforced its policy is dropped with `Aborted`, so a slow
+call can't swap an older policy back in.
+
+Node-manager enforces the narrowed policy for every admission decision: exact
+and compatible resolution, launches, preparations and restores. Each re-reads
+the policy for its last check, after any inventory discovery or metadata read,
+and launches and preparations after their lifecycle permit and sandbox lock, so
+a policy applied while it waited still gates it. Later steps, such as the jail
+setup after a launch's check, aren't re-checked. A request that passed that
+check before an application returned can still complete; a block doesn't recall
+it. A restore's state load follows its launch's admission: the launch
+re-checks, and the load into the VM it created doesn't. Captures are the
+exception: they execute nothing, and the restore a capture feeds is narrowed at
+admission, so a capture obeys the node's startup settings, not the cluster
+policy, even while the record is unreadable. A blocked environment's VMs can
+still be suspended and drained, and restore selection resumes them on an
+allowed compatible environment. It's enforced on the resolved environment, so
+unbound work matching a removed compiled environment is refused too. Inventory
+discovery and artifact publication keep using the startup settings, the
+ceiling, so narrowing never needs a rescan. Node-manager persists the received
+cluster policy, with whether its default was verified, in
+`/space/run/node-manager/execution-policy.json`, through pinned descriptors
+that never follow a link, and on restart narrows it against that process's
+startup settings before serving. A restart reuses the recorded verdict on the
+default; the next application checks it again.
+
+It swaps a new policy in before persisting it, so a failed write doesn't delay
+a block in the running process; the failure is returned and the write retried
+on the next application. A restart before that retry succeeds restores the
+previous record, which may not carry the block, until node-ctl next applies
+the policy.
+
+An unreadable record (corrupt, a link, an unknown record schema, or larger than
+8 MiB, twice node-manager's 4 MiB gRPC request bound, so any accepted policy
+fits) fails closed: node-manager admits no new work, with no allowed
+environment, no default and no `legacy`, until node-ctl next applies the
+policy, so a damaged file can never lift a cluster block. An application
+carrying no policy, such as from a cluster that stopped serving the field,
+reopens the node on its startup settings. Running VMs are untouched, and can
+still be captured. The next application replaces the file, or removes it if the
+cluster serves no policy. While the cluster API is unreachable no application
+arrives, so the node stays closed. Node-manager logs the error and reports
+`node_mgr.execution.policy_record_unreadable` as 1 on every inventory read, and
+the published observation carries `cluster_policy_unreadable` (below) whenever
+inventory discovery succeeds; a node whose discovery fails publishes no policy
+at all.
+
+The record outlives the process that wrote it, so whatever stops node-ctl
+applying leaves node-manager on its last record across restarts: node-ctl
+rolled back to a build that doesn't call `ApplyExecutionPolicy`, the facet's
+sync disabled, or a node whose role skips the facet. A node-manager rolled
+back to a build without this RPC ignores the record and enforces its startup
+settings; rolled forward again, it restores that record until the next
+application. A build rolled back under a record with fields it doesn't know
+treats the record as unreadable and fails closed until the next application.
+A node-ctl rolled back to a build without the observation's new fields drops
+them when it forwards the inventory, so the cluster withholds that node's
+schema 2 policy evidence as malformed.
+
+A changed enforced policy marks node status dirty, so node-ctl republishes it.
+The published `ExecutionPolicyObservation` then has `schema_version` 2 and
+either `applied_generation`, possibly with allowed environments and no
+default, or `cluster_policy_unreadable` with nothing allowed. A node
+reporting an unreadable cluster policy has no usable policy evidence, and
+placement should avoid it once placement reads node policy. Nothing reads the
+flag yet: reporting doesn't gate placement, so such a node keeps receiving work
+it refuses with `FailedPrecondition` until node-ctl reapplies the policy. A startup-only node keeps publishing schema 1 with
+neither, which the control plane treats as running its startup policy. Deploy
+cluster readers that accept schema 2, the cluster API and the admin API, before
+node-managers that apply a policy: an older reader withholds schema 2 policy
+evidence as a future schema.
+
+Apply each response in full, and never skip one because of its generation.
+Rolling the schema back and reapplying it restarts the generation at 0. A node
+that accepted only higher generations would then ignore changes until the
+generation passed the last value it saw, and one that skipped equal generations
+could keep a different policy that happened to share a number. The generation
+orders and identifies policy versions only within one schema lifetime. `updated_at`
+on either table isn't policy history: deleting a user changes it through the
+`ON DELETE SET NULL` cascade.
+
 ### Selecting a restore consumer
 
 The snapshot manifest retains original runtime, kernel and state-format identity.
@@ -780,9 +1012,261 @@ or add isolated resume refusal: incident-driven stopping, resource reclamation a
 resume revocation must ship together. Stop and delete remain available. Operators
 must stop affected resident VMs when revoking execution during an incident.
 
-A future kernel or incompatible-state upgrade requires explicit memory-loss
-consent, activation fencing and a preserved matching disk/checkpoint pair. Keep
-the old pair until the new cold boot is verified; a failed cold boot must not
-mutate the only rollback disk. Retention is not permission to restore a revoked
-runtime. Retire the checkpoint through a durable lifecycle operation before later
-object garbage collection, never by deleting S3 vmstate and editing lifecycle rows.
+An incompatible-state upgrade requires explicit memory-loss consent, activation
+fencing and a preserved matching disk/checkpoint pair. Keep the old pair until
+the new cold boot is verified; a failed cold boot must not mutate the only
+rollback disk. Retention is not permission to restore a revoked runtime. Retire
+the checkpoint through a durable lifecycle operation before later object garbage
+collection, never by deleting S3 vmstate and editing lifecycle rows. "Upgrading a
+sandbox's runtime" below is that operation for a sandbox with a local disk.
+
+Moving an existing sandbox to another runtime with the same kernel by cold boot
+discards its memory, so it needs everything above whether or not the state
+format changes; E0 → Firecracker 1.17.0 / Linux 6.1.155 also changes it, from
+9.0.0 to 12.0.0. The compiled catalog records which of these same-kernel
+cold-boot moves are certified, as upgrade edges. `CERTIFIED_UPGRADE_EDGES` in
+`crates/libs/node/runtime/core/src/catalog/environment.rs` lists them, and
+`CompiledEnvironment::upgrade_targets` exposes each environment's targets.
+Listing a pair is the certification decision. An edge must change the runtime,
+and its target must pass the environment-level cold-boot source check
+(`check_cold_boot_source`): the same runtime kind, guest platform and a single
+boot component with the same kernel bytes. The state format may differ,
+because a cold boot loads no memory. A kernel upgrade has no edge and needs its
+own qualification. If any listed edge breaks these rules, names an unknown
+environment or repeats, the catalog withdraws every edge, logs a warning and
+keeps every environment; tests reject such a table before it ships. Two edges
+are certified: E0 → Firecracker 1.17.0 / Linux 6.1.155, and its reverse for an
+upgrade drill. No edge reaches or leaves 1.17.0 / 6.18.44, whose kernel
+differs. The runtime upgrade below follows only certified edges. Compatible
+cold-boot selection for a new sandbox or build, described above, uses the same
+check and doesn't consult edges. An edge doesn't replace the consent, fencing and preserved pair above,
+doesn't move work, and doesn't permit a restore: it carries no memory and
+doesn't qualify a loader.
+
+### Upgrading a sandbox's runtime
+
+Sandbox-manager's internal `UpgradeRuntime` moves a stopped or suspended sandbox
+to another environment by cold boot. Files survive; memory and processes don't.
+Root, a local operator and node-api may call it. A request names a caller-chosen
+operation id, the target reference, the operator authorization it runs under, the
+blocking cold `Start` to run, and whether the sandbox ends started or stopped.
+
+1. **Fence.** One transaction checks that the sandbox is stopped or suspended,
+   that no cleanup or other upgrade owns it, and that the authorization accepts
+   memory loss when the sandbox is suspended. It then inserts a
+   `sandbox_runtime_upgrades` row recording the authorization, the previous
+   consumer and the suspend artifact the sandbox pins. The row is inserted under
+   the sandbox's artifact lock, which snapshot rollback, export, warm start and
+   checkpoint restore hold while they check for it, so none of them can slip in
+   between the check and the fence. The insert is refused if the sandbox's
+   state, pin or saved consumer changed since it was inspected. Until the boot
+   is verified or the old pair is back, the activation claim refuses every
+   other cold start and restore with a retryable `Unavailable`. Export, artifact
+   backup, snapshot rollback and snapshot deletion refuse too, and a warm start
+   or checkpoint restore refuses before it stages anything into the checkpoint
+   directory. Until the old checkpoint is retired, warm start, checkpoint
+   restore and snapshot rollback (which can restage the checkpoint) keep
+   refusing. Only the upgrade's own boot, once its consumer is saved, passes
+   the fence.
+2. **Preserve.** Node-manager takes a read-only btrfs snapshot of the instance
+   subvolume under the internal `d-operation-runtime-upgrade-<operation>` name,
+   which users can't list, delete or roll back to. It holds the rootfs, and for an
+   encrypted sandbox `cow.luks` and the suspend volume. The sandbox's
+   `metadata.json`, the disk's record of its execution, sits outside the
+   subvolume and the boot rewrites it, so sandbox-manager keeps its bytes beside
+   it. The checkpoint directory isn't touched. A sandbox without its local rootfs, or an encrypted one without
+   `cow.luks`, is refused before the fence: a cold start would otherwise boot a
+   fresh template clone.
+3. **Select the consumer.** The move must follow a certified upgrade edge from
+   the environment the sandbox last ran under: its checkpoint's producer when
+   suspended, otherwise its saved consumer. Unbound metadata counts as the
+   compiled environment it satisfies, and a stock E0 snapshot from before boot
+   components were recorded counts as E0; anything else has no edge and is
+   refused before the fence. The target must also keep the disk's runtime kind,
+   guest platform and components, kernel included. Its runtime version and snapshot
+   format may differ: a cold start loads no memory, and neither sandbox-manager's
+   disk binding nor node-manager's cold-boot admission compares state formats.
+   The target is saved as the sandbox's consumer in the same transaction that
+   moves the row to `booting`. The checkpoint's producer evidence isn't rewritten.
+4. **Boot.** The ordinary blocking cold start runs as the caller. It reads the
+   saved consumer, and guest readiness verifies the boot: the transaction that
+   marks the sandbox started also records the upgrade verified, so a later
+   stop or suspend can never make a verified boot look interrupted.
+5. **Settle.** After a verified boot, the old checkpoint is retired and the
+   preserved copy deleted. Then a request to end stopped stops the execution the
+   boot started, never a later one, and only while it's started or paused: the
+   stop's cleanup claim checks that state and execution under the fence every
+   activation claims under. The row becomes
+   `retired`, the record of the authorization. A retired upgrade never touches
+   the sandbox's lifecycle again, so replaying it can't stop a later execution.
+   A stopped sandbox can still hold the checkpoint of a suspend before its
+   stop, which a warm start would load over the disk the boot wrote, so that
+   checkpoint is retired too. Retirement goes by identity, under the artifact
+   lock: it takes a delete lease on the pinned suspend artifact, or for any
+   other checkpoint matches the directory's device, inode and birth time
+   (change time where the filesystem records no birth time), so a newer
+   checkpoint at the same path is never taken. A directory catalogued since is retired through its catalog row.
+   Bytes several rows claim are left, as the reaper leaves them, and the upgrade
+   stays `verified`, refusing warm start and restore, until the conflict
+   clears: the sandbox's next suspend replaces every older suspend row, or an
+   operator resolves it. Moving the bytes off the checkpoint path is the
+   durable retirement: a catalogued checkpoint goes to the snapshot reaper's GC
+   staging, an uncatalogued one to the suspend-garbage lane, and each lane's
+   sweep deletes what the immediate reclaim leaves. An encrypted sandbox's next suspend writes a fresh suspend
+   volume, as after any cold start. The checkpoint's remote copy is the
+   cluster's to retire. A failed boot waits for its cleanup to return the
+   sandbox to its old state, or to stopped if auto-lifecycle stopped a
+   suspended sandbox meanwhile, restores the preserved copy over the instance
+   without touching any other snapshot, puts the kept `metadata.json` back,
+   restores the previous consumer (for a
+   sandbox that had none, the execution its disk records, which its next cold
+   start would bind anyway) and releases the fence. The sandbox is then restorable
+   on its old environment.
+
+A retry with the same operation id resumes from the row: an interrupted upgrade
+rolls back and starts again, and a verified one finishes its retirement. A
+rolled-back upgrade leaves no row, so a retry after it starts over. An upgrade
+that must end stopped leaves the sandbox as it finds it if the sandbox stopped,
+suspended or started another execution first. A
+sandbox-manager recovery loop settles unfinished upgrades at startup and every
+minute without booting or stopping anything: it rolls back, or retires, and
+leaves a sandbox it can't settle yet for the next pass. An upgrade that must end
+stopped stays verified while its sandbox runs, until its caller's retry stops it
+or the sandbox stops some other way. Deleting the sandbox deletes its
+upgrade rows; evicting it removes the preserved copy with the rest of its local
+presence, and the upgrade fails at its next claim.
+
+### Node runtime provisioning
+
+The whole-node `runtime-provisioning` facet reads
+`ClusterApi.GetNodeRuntimeDesiredState` on each periodic inbound tick, even with
+no installed artifacts or templates. The response optionally carries a
+`RuntimeProvisioningRecipe` of immutable compiled environment references. The
+recipe contains neither execution permissions/defaults nor arbitrary download URLs,
+paths or artifact hashes; the response's separate `execution_policy` field
+(see "Cluster desired policy") carries execution policy, which the facet hands
+to node-manager, and installation never reads it. The cluster authenticates the registered node by the
+existing origin check before answering.
+
+The current cluster handler returns no recipe. A recipe store and producer must
+be connected before deployment can request installations; this endpoint does not
+implicitly commission E0. Older cluster services return `Unimplemented`, which
+node-ctl also treats as no recipe. Other fetch errors remain visible failures,
+including a cluster execution policy the cluster API can't read while
+`SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED` is on: that fails the whole
+call, recipe included.
+Neither absence nor an empty recipe uninstalls anything.
+
+Node-ctl validates the complete recipe's size, reference syntax and uniqueness
+before submitting work. It expands host-supported compiled environments into
+distinct artifact identities; unsupported references are reported while supported
+entries continue installing. An unsupported entry prevents reporting convergence,
+but never authorizes unknown artifacts or changes execution selection.
+
+Only valid, digest-matching managed copies satisfy installation intent. Positive
+evidence remains useful when unrelated inventory roots have scan issues: uncertain
+requirements go through idempotent installation, while an inventory RPC failure
+retries on the next tick. Missing identities use the existing `InstallArtifact`
+API with at most four simultaneous polling/submission calls. The entire pass has
+a shared 30-second deadline; timeout errors identify the stage that exhausted it.
+
+Accepted jobs are durable in rtmgr. Node-ctl remembers their IDs and polls them on
+later ticks rather than submitting again. Pending downloads are normal progress,
+not facet failures. Terminal failures and successful jobs whose bytes remain
+unverified are reported, with five minutes of backoff before a fresh submission.
+A success response gets one subsequent inventory pass to observe publication.
+Transient submission RPC failures retry on the next pass without terminal-job
+backoff; a lost acknowledgement rejoins an active job by identity.
+rtmgr owns bounded transfer retries and job deadlines; node-ctl owns retries of
+failed jobs for as long as the recipe requires the artifact. Persistent failures
+remain visible during backoff and need source, node or recipe repair.
+
+The job-ID memo is bounded by the current recipe and cleared for observed
+installations or withdrawn intent. It is not persisted: after a node-ctl restart
+or a lost reply, repeated submissions rejoin active rtmgr jobs. A restart can
+therefore reset the node-ctl backoff. Replacing or withdrawing a recipe never
+cancels accepted jobs; extra artifacts remain installed. No cached intent is
+replayed when recipe lookup fails.
+
+Structured progress logs distinguish installing from converged; the existing
+facet status carries errors for failed operations and unsupported references.
+Unsupported references are included in its `last_error`, published in
+`PublishNodeState.node_status.node_ctl`; the facet has no per-element wire keys.
+Facet success means a successful pass, not an environment-readiness or
+recipe-revision attestation: it can also mean no recipe was assigned. Runtime
+inventory and execution-policy observations continue through `PublishNodeState`;
+node-manager remains the independent publication and execution authority. The
+cluster must compare desired identities against fresh observations, not use the
+facet's last-success time as proof that an environment can run. Recipe changes
+never change the allowlist, default, placement or running sandboxes.
+
+Node-ctl is authorized to read rtmgr and install approved artifacts, but not to
+uninstall or cancel operations. Deploy the rtmgr peer authorization and node-ctl's
+`space-rtmgrclients` supplementary group before assigning a recipe. Existing
+node processes must restart after direct-host group membership changes. New
+node-ctl against old rtmgr reports permission failures without claiming success.
+New cluster endpoints and old node-ctl coexist because provisioning is not
+mandatory until the policy producer explicitly requires it.
+
+The control-plane integration owns recipe storage and admin mutations, cohort
+selection, rollout/convergence tracking, and fresh environment-aware placement.
+It must keep required installations separate from allowed/default execution
+policy and retain compatibility checks at node admission. Retirement and garbage
+collection require a separate reference-aware operation; recipe omission alone
+never grants deletion authority.
+
+
+## Runtime control transport
+
+Environment descriptors and runtime control have separate contracts. Generic
+`LaunchRuntime`, `GetVmState`, `CaptureVmState` and `RestoreVmState` routes cover
+supervisor process launch, resident state, capture and restore. State artifacts
+are named by the qualified runtime profile; the wire format does not require a
+Firecracker snapshot. The FC adapter requires exactly `machine-state` and
+`memory`, and retains the existing path validation, execution fences, encrypted
+volume ownership and restore admission.
+
+`VmStateStorage.directory` and `VmStateStorage.encrypted_volume_mount` are a
+narrow exception to node-manager's rule that new RPCs take domain identifiers
+and derive host paths. These two fields preserve the existing snapshot storage
+contract through the transport migration and remain after legacy routes retire.
+They retain peer authorization, execution fences, sandbox-scoped canonical-root
+validation, and pinned or otherwise authenticated filesystem handling. They do
+not authorize arbitrary host paths or establish a precedent for new path fields.
+
+Prepare/launch at node-manager, pause/resume, cleanup, resource updates, artifact
+installation and guest reporting already use shared method shapes. Configuration
+payloads remain adapter-owned. Diagnostic fields name the runtime process,
+isolation root and outputs rather than a particular VMM. Their protobuf field
+numbers and types are unchanged; generated clients and JSON field names use the
+new runtime terminology. JSON consumers must regenerate with the migration.
+
+The supervisor is a node-local host adapter interface. Its Linux isolation and
+resource inputs describe the host, not the guest OS. An optional containment
+executable supports jailer-based and direct VMM adapters; source locators cannot
+supply trust or replace the requested execution identity. This does not claim a
+Windows or macOS host adapter exists.
+
+The preceding migration release serves both routes and moves FC clients onto the
+generic methods. This release removes the old routes and all method fallbacks.
+Deploy the migration across every participating service, finish in-flight work,
+and update supported rollback images before deploying this release. A rollback
+to an old caller requires restoring the migration server first; it is not a
+supported mixed-version configuration after retirement. Removing protobuf
+reservations does not renumber any live field or change stored identities.
+Persisted environment JSON/canonical compatibility is independent and remains.
+
+For the preceding bridge release only, measure the end-to-end VM-state probe
+latency and timeout rate against nodes that have not yet been upgraded. That
+release tries the generic RPC and then the legacy RPC within the same 500 ms
+deadline; this cleanup release calls only the generic RPC. A bridge-release
+peer-support cache must not be permanent: a reconnecting channel can reach an
+upgraded node where the legacy RPC has been removed. If measurements justify a
+cache, bound its lifetime and invalidate it when the legacy method is absent.
+
+When retiring the legacy RPCs, update lifecycle-admission metric queries for
+`method:LoadSnapshot` to `method:RestoreVmState`; during that rollout, include
+both labels. This is the limiter's metric label, not a change to its capacity
+settings. Keep the existing `LOAD_SNAPSHOT` configuration suffix so deployed
+limits continue to apply. Generic snapshot RPC timing already uses the generic
+method names during the bridge.

@@ -1,5 +1,6 @@
 mod prefetch_catalog;
 mod reconcile_claim_origins;
+mod runtime_desired_state;
 mod substrate_scope;
 #[cfg(feature = "kubernetes")]
 mod template_node_identity;
@@ -219,6 +220,39 @@ async fn transfer_registry_covers_kubernetes_sources() -> TestResult {
             );
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_recipe_authenticates_empty_nodes_without_inventing_policy() -> TestResult {
+    use pplx_space_node_api_client::proto::GetNodeRuntimeDesiredStateRequest;
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let node = NodeId::new();
+    insert_data_plane_worker_node(&fixture.service.pool, node, "192.0.2.20").await?;
+    let message = GetNodeRuntimeDesiredStateRequest {
+        node_id: node.to_string(),
+        role: Some(ProtoNodeRole::Worker as i32),
+    };
+    let error = fixture
+        .service
+        .get_node_runtime_desired_state(Request::new(message.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+    let error = fixture
+        .service
+        .get_node_runtime_desired_state(request_from_node(message.clone(), "192.0.2.21".parse()?))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+    let response = fixture
+        .service
+        .get_node_runtime_desired_state(request_from_node(message, "192.0.2.20".parse()?))
+        .await?
+        .into_inner();
+    assert!(response.recipe.is_none());
     Ok(())
 }
 
@@ -3320,10 +3354,11 @@ async fn seed_unplaced_sandbox(pool: &sqlx::PgPool) -> TestResult<SandboxId> {
 }
 
 /// The address `insert_ready_worker_node` registers nodes at.
-const TEST_WORKER_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+pub(crate) const TEST_WORKER_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// A request that arrived over TCP from `node_ip`.
-fn request_from_node<T>(message: T, node_ip: std::net::IpAddr) -> Request<T> {
+pub(crate) fn request_from_node<T>(message: T, node_ip: std::net::IpAddr) -> Request<T> {
     let mut request = Request::new(message);
     request
         .extensions_mut()
@@ -7210,6 +7245,7 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
 }
 
 mod backup_generation_fence;
+mod execution_currency;
 mod publication;
 mod restoring_routes;
 

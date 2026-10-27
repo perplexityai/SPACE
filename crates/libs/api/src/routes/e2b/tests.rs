@@ -3132,17 +3132,62 @@ fn ecw_host_alias_selects_alias_response_domain() {
     assert_eq!(response.domain.as_deref(), Some(TEST_ECW_ALIAS_HOST));
 }
 
-#[test]
-fn metadata_query_supports_arbitrary_string_keys() {
-    let filters = parse_metadata_query(Some("name=session-123&user=abc")).unwrap();
+#[tokio::test]
+async fn metadata_query_supports_sdk_encoded_strings() {
+    use axum::extract::FromRequestParts;
+
+    // SDK wire queries include the HTTP query layer around two component
+    // encoding layers. Expected strings are the caller's original metadata.
+    for (query, key, value) in [
+        ("metadata=image%3Dpython%25253A3.11", "image", "python:3.11"),
+        (
+            "metadata=user%3Dalice%252540example.com",
+            "user",
+            "alice@example.com",
+        ),
+        ("metadata=path%3D%252Ftmp%252Fa%252520b", "path", "/tmp/a b"),
+        (
+            "metadata=key%252526%25253D%25252B%3Dvalue%252526%25253D%25252B",
+            "key&=+",
+            "value&=+",
+        ),
+        ("metadata=unicode%3Dcaf%2525C3%2525A9", "unicode", "café"),
+        ("metadata=literal%3D%2525253A", "literal", "%3A"),
+        ("metadata=literal%3D%252525253A", "literal", "%253A"),
+        ("metadata=empty%3D", "empty", ""),
+        ("metadata=value%3D%252525", "value", "%"),
+        ("metadata=value%3D%2525252G", "value", "%2G"),
+        // Direct clients can use unescaped or singly encoded values too.
+        ("metadata=image%3Dpython%3A3.11", "image", "python:3.11"),
+        ("metadata=value%3Da%2526b%253Dc%252Bd", "value", "a&b=c+d"),
+    ] {
+        let (mut parts, _) = Request::builder()
+            .uri(format!("/v2/sandboxes?{query}"))
+            .body(())
+            .unwrap()
+            .into_parts();
+        let E2bQuery(query) = E2bQuery::<SandboxListQueryE2b>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_metadata_query(query.metadata.as_deref()).unwrap(),
+            vec![(key.to_owned(), value.to_owned())],
+        );
+    }
     assert_eq!(
-        filters,
+        parse_metadata_query(Some("name=session-123&user=abc")).unwrap(),
         vec![
-            (String::from("name"), String::from("session-123")),
-            (String::from("user"), String::from("abc")),
-        ]
+            ("name".into(), "session-123".into()),
+            ("user".into(), "abc".into())
+        ],
     );
-    parse_metadata_query(Some("invalid")).unwrap_err();
+    for metadata in [None, Some("")] {
+        assert!(parse_metadata_query(metadata).unwrap().is_empty());
+    }
+    for invalid in ["invalid", "value=%FF", "value=%25FF", "%FF=value"] {
+        let err = parse_metadata_query(Some(invalid)).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[test]
@@ -3151,9 +3196,15 @@ fn metadata_query_rejects_duplicate_keys() {
     // `env=prod&env=staging` to the last entry would drop a caller-supplied
     // predicate before the SQL `@>` runs, so we reject it explicitly at the
     // boundary.
-    let err = parse_metadata_query(Some("env=prod&env=staging"))
-        .expect_err("duplicate keys must be rejected");
-    assert!(err.message.contains("duplicate metadata key"), "{err:?}");
+    for metadata in [
+        "env=prod&env=staging",
+        "env=prod&%65nv=staging",
+        "env=prod&%2565nv=staging",
+    ] {
+        let err = parse_metadata_query(Some(metadata))
+            .expect_err("duplicate decoded keys must be rejected");
+        assert!(err.message.contains("duplicate metadata key"), "{err:?}");
+    }
 }
 
 #[test]

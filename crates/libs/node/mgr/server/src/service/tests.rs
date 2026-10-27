@@ -253,7 +253,7 @@ pub(super) mod service_tests {
             .authorize_identity(node_ctl.clone(), "Status", ALLOW_NODE_STATUS)
             .expect("node-ctl needs node status access to publish scheduling snapshots");
         authorizer
-            .authorize_identity(node_ctl.clone(), "GetFirecrackerVmState", ALLOW_NODE_STATUS)
+            .authorize_identity(node_ctl.clone(), "GetVmState", ALLOW_NODE_STATUS)
             .expect("node-ctl may inspect runtime state without gaining mutation access");
         authorizer
             .authorize_identity(node_ctl.clone(), "GetExecutionInventory", ALLOW_NODE_STATUS)
@@ -263,6 +263,59 @@ pub(super) mod service_tests {
             .authorize_identity(node_ctl, "SetNetworkPoolDrain", ALLOW_NODE_ADMIN)
             .expect_err("node-ctl must not get broad node-manager admin access");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn generic_vm_routes_authorize_before_validating_inputs() {
+        use crate::proto::node_manager_server::NodeManager as Rpc;
+
+        fn request<T: Default>(peer: &PeerIdentity) -> Request<T> {
+            let mut request = Request::new(T::default());
+            request.extensions_mut().insert(peer.clone());
+            request
+        }
+
+        let service = service_for_unit_tests().await;
+        for (peer, mutation_code) in [
+            (PeerIdentity::new(0, 0, None), tonic::Code::InvalidArgument),
+            (
+                PeerIdentity::new(
+                    users::SPACE_NODECTL.uid,
+                    users::SPACE_NODECTL.primary_group.gid,
+                    None,
+                ),
+                tonic::Code::PermissionDenied,
+            ),
+        ] {
+            for (method, error, expected) in [
+                (
+                    "GetVmState",
+                    Rpc::get_vm_state(&service, request(&peer))
+                        .await
+                        .unwrap_err(),
+                    tonic::Code::InvalidArgument,
+                ),
+                (
+                    "CaptureVmState",
+                    Rpc::capture_vm_state(&service, request(&peer))
+                        .await
+                        .unwrap_err(),
+                    mutation_code,
+                ),
+                (
+                    "RestoreVmState",
+                    Rpc::restore_vm_state(&service, request(&peer))
+                        .await
+                        .unwrap_err(),
+                    mutation_code,
+                ),
+            ] {
+                assert_eq!(error.code(), expected, "{method}");
+                if expected == tonic::Code::PermissionDenied {
+                    assert!(error.message().ends_with(method));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -678,22 +731,31 @@ pub(super) mod service_tests {
                 assets: vacant.join("assets"),
                 kernels: vacant.join("kernels"),
                 store: crate::config::ArtifactStorePaths {
-                    releases: vacant.join("store/releases"),
+                    releases: [(
+                        pplx_space_common_core::types::RuntimeKind::Firecracker,
+                        vacant.join("store/releases"),
+                    )]
+                    .into(),
                     kernels: vacant.join("store/kernels"),
                     staging: vacant.join("staging"),
                     catalog: vacant.join("catalog"),
                 },
             },
             guest_console_logs: false,
-            execution_policy: pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
-                None,
-                None,
-                &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                    pplx_space_common_core::types::Arch::X86_64,
-                )
-                .unwrap(),
-            )
-            .unwrap(),
+            execution_policy: std::sync::Arc::new(
+                super::execution_policy::ExecutionPolicyState::load(
+                    pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+                        None,
+                        None,
+                        &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                            pplx_space_common_core::types::Arch::X86_64,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                    vacant.join("execution-policy.json"),
+                ),
+            ),
             lifecycle_limiter: std::sync::Arc::new(
                 crate::lifecycle_limiter::tests::default_limiter(),
             ),
@@ -752,7 +814,11 @@ pub(super) mod service_tests {
         }
         std::fs::create_dir(&assets).unwrap();
         let store = crate::config::ArtifactStorePaths {
-            releases: root.path().join("store/releases"),
+            releases: [(
+                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                root.path().join("store/releases"),
+            )]
+            .into(),
             kernels: root.path().join("store/kernels"),
             staging: root.path().join("staging"),
             catalog: root.path().join("catalog"),
@@ -1024,16 +1090,19 @@ pub(super) mod service_tests {
             prepare
                 .extensions_mut()
                 .insert(PeerIdentity::new(0, 0, None));
-            let mut load = Request::new(LoadSnapshotRequest {
+            let mut load = Request::new(crate::proto::RestoreVmStateRequest {
                 execution_fence: Some(execution_fence.clone()),
                 sandbox_id: sandbox_id.clone(),
-                snapshot_path: "../vmstate".into(),
-                mem_file_path: "/memory".into(),
+                artifacts: crate::snapshot_request::tests::artifacts(
+                    "/vmstate".into(),
+                    "/memory".into(),
+                ),
+                rootfs_rate_limit: Some(crate::proto::DriveRateLimit::default()),
                 ..Default::default()
             });
             load.extensions_mut().insert(PeerIdentity::new(0, 0, None));
             let mut prepare = Box::pin(service.prepare_sandbox(prepare));
-            let mut load = Box::pin(service.load_snapshot(load));
+            let mut load = Box::pin(service.restore_vm_state(load));
             if cleanup {
                 // A replacement lease can exist while the old slot's reset
                 // still owns the sandbox. Neither RPC may enter host work or

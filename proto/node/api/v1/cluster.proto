@@ -79,6 +79,12 @@ service ClusterApi {
   // Postgres but whose local side effects are owned by template-manager.
   rpc GetNodeTemplateDesiredState(GetNodeTemplateDesiredStateRequest) returns (GetNodeTemplateDesiredStateResponse);
 
+  // Whole-node runtime intent, including nodes with empty local inventory: the
+  // environments to install, and the cluster's execution environment policy.
+  // Installation never authorizes execution; a node that applies the policy
+  // never executes an environment its own settings don't allow.
+  rpc GetNodeRuntimeDesiredState(GetNodeRuntimeDesiredStateRequest) returns (GetNodeRuntimeDesiredStateResponse);
+
   // Return the control-plane desired sandbox state for node-local sandboxes.
   // This is a cluster -> node facet; observed node-local state is published
   // back through PublishNodeState.
@@ -194,6 +200,15 @@ service ClusterApi {
   // TODO: [legacy] Remove once all restore callers look up exact artifact
   // backups with `GetArtifactBackupLocation`.
   rpc GetSuspendSnapshotLocation(GetSuspendSnapshotLocationRequest) returns (GetSuspendSnapshotLocationResponse);
+
+  // Whether an execution generation of a sandbox is still the sandbox's
+  // active execution, for a node about to start that execution's runtime
+  // again: a kubelet retry of a pod whose first launch failed can arrive after
+  // the control plane retired the execution, and its runtime must not run.
+  // The caller must be the registered node the execution's pod was placed
+  // on; for any other caller, and for an execution with no recorded node, the
+  // answer is `EXECUTION_CURRENCY_UNSPECIFIED`.
+  rpc GetExecutionCurrency(GetExecutionCurrencyRequest) returns (GetExecutionCurrencyResponse);
 
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
   // storage) is owned end to end by the credential manager
@@ -501,6 +516,30 @@ message TemplateDesiredState {
 
 message GetNodeTemplateDesiredStateResponse {
   repeated TemplateDesiredState templates = 1;
+}
+
+// Cluster execution environment policy. An unset optional field means the
+// cluster sets nothing for it and each node keeps its configured value. A node
+// that applies it combines it with its own settings as
+// docs/execution-environments.md describes: the policy may narrow what the node
+// allows and pick its default among those, never widen it.
+message RuntimeEnvironmentDesiredPolicy {
+  // Policy version, raised by every store write. It restarts at 0 if the
+  // policy schema is rolled back and reapplied, so across that boundary a
+  // lower generation can be newer and an equal one can name a different
+  // policy. A node applies each response in full, and never skips one
+  // because of its generation.
+  uint64 generation = 1;
+  // The environment new unbound work binds to.
+  optional string default_environment_ref = 2;
+  // Environments that may execute (allowed and deprecated), the default
+  // included, in a stable order. It narrows a node's allowlist only while
+  // default_environment_ref is set: with no default, an empty or partial
+  // list leaves the node's configured allowlist in place.
+  repeated string executing_environment_refs = 3;
+  // Whether unbound historical contracts that match no compiled environment
+  // may execute.
+  optional bool legacy_unbound_allowed = 4;
 }
 
 message GetNodeSandboxDesiredStateRequest {
@@ -1096,6 +1135,13 @@ message BeginArtifactBackupResponse {
   // predates the field and registered the attempt, which the caller then
   // closes.
   bool fence_verdict_only = 3;
+  // Set when the execution-generation fence ran on this registration and
+  // admitted it. Unset when the fence didn't run: an unbound registration, a
+  // replay of an already-registered attempt, or a fresh attempt for bytes
+  // another attempt registered. A server that predates the field leaves it
+  // unset. A node that wants to know whether a fresh attempt for a capture
+  // the fence refused would now be admitted reads this, not the reply alone.
+  bool generation_fence_admitted = 4;
 }
 
 message FinalizeArtifactBackupRequest {
@@ -1224,6 +1270,26 @@ message GetSandboxSnapshotStorageUriResponse {
   optional string storage_uri = 1;
 }
 
+enum ExecutionCurrency {
+  // Unknown: no execution with that generation is recorded on the caller's
+  // node. A caller proceeds as it would without asking.
+  EXECUTION_CURRENCY_UNSPECIFIED = 0;
+  // The execution is the sandbox's active execution.
+  EXECUTION_CURRENCY_CURRENT = 1;
+  // The control plane retired the execution; its runtime must not run.
+  EXECUTION_CURRENCY_RETIRED = 2;
+}
+
+message GetExecutionCurrencyRequest {
+  string sandbox_id = 1;
+  // Positive.
+  int64 execution_generation = 2;
+}
+
+message GetExecutionCurrencyResponse {
+  ExecutionCurrency currency = 1;
+}
+
 message GetSuspendSnapshotLocationRequest {
   // Sandbox whose latest suspend snapshot location should be returned.
   string sandbox_id = 1;
@@ -1239,4 +1305,31 @@ message GetSuspendSnapshotLocationResponse {
   int64 bytes_uploaded = 3;
   // Empty for snapshots finalized before digests were recorded.
   repeated SnapshotArtifactDigest artifact_digests = 4;
+}
+
+// The server authenticates the registered node independently of these hints.
+message GetNodeRuntimeDesiredStateRequest {
+  string node_id = 1;
+  optional NodeRole role = 2;
+}
+
+message RuntimeProvisioningRecipe {
+  // Immutable compiled environment references, not names, paths or new hashes.
+  // Nodes validate the complete set before submitting any installation.
+  // Omission never authorizes removal. Empty means no required installations.
+  repeated string required_environments = 1;
+}
+
+message GetNodeRuntimeDesiredStateResponse {
+  // Absent means no recipe is assigned; it is not an empty applied recipe.
+  RuntimeProvisioningRecipe recipe = 1;
+  // Absent while the cluster API runs with
+  // SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED off, the default, and from
+  // cluster APIs that serve this RPC without the field (older ones return
+  // UNIMPLEMENTED); nodes then keep their startup
+  // execution settings. Each cluster API replica reads the setting at startup,
+  // so replicas can disagree while it changes. While enabled, a policy that
+  // can't be read fails the whole call, recipe included, rather than coming
+  // back absent.
+  RuntimeEnvironmentDesiredPolicy execution_policy = 2;
 }

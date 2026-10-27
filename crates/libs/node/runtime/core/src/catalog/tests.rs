@@ -39,7 +39,7 @@ fn release_entry(version: &str, architecture: &str) -> serde_json::Value {
 }
 
 #[test]
-fn every_known_release_is_pinned_for_both_architectures() {
+fn compiled_release_layouts_and_initial_pins_are_complete() {
     let catalog = RuntimeCatalog::compiled().unwrap();
     let known = (ReleaseLayout::of(RuntimeKind::Firecracker)
         .unwrap()
@@ -57,6 +57,27 @@ fn every_known_release_is_pinned_for_both_architectures() {
                     .collect::<Vec<_>>(),
                 ["bin/firecracker", "bin/jailer"]
             );
+        }
+    }
+    // Raw CH downloads are the installed executable: both pins must describe
+    // the same bytes, with no synthetic jailer or archive member.
+    let known = (ReleaseLayout::of(RuntimeKind::CloudHypervisor)
+        .unwrap()
+        .known_releases)();
+    assert!(!known.is_empty());
+    for version in known {
+        let release = RuntimeIdentity {
+            kind: RuntimeKind::CloudHypervisor,
+            version: version.parse().unwrap(),
+        };
+        for architecture in [Arch::X86_64, Arch::Aarch64] {
+            let pin = catalog.release(&release, architecture).unwrap();
+            let [binary] = pin.binaries.as_slice() else {
+                panic!("static release must have one executable");
+            };
+            assert_eq!(binary.path, "bin/cloud-hypervisor");
+            assert_eq!(pin.archive_sha256, binary.sha256);
+            assert!(compiled_verity_digest(binary.sha256).unwrap().is_some());
         }
     }
     // The image's kernel, pinned as the image build pins it.

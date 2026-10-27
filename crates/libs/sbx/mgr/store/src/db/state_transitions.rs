@@ -26,6 +26,8 @@ pub enum BeginActivationError {
         kind: ActivationKind,
         state: SandboxState,
     },
+    #[error(transparent)]
+    RuntimeUpgrade(#[from] RuntimeUpgradeFenceError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +209,9 @@ pub struct ActivationRouteAdmission<'a> {
     pub operation_activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub evidence: Option<crate::auto_lifecycle_delete_receipts::RouteEvidence>,
     pub open_claim: Option<&'a route_activation_claims::OpenRouteActivationClaim>,
+    /// The runtime upgrade this activation is the cold boot of. Only the
+    /// upgrade fencing the sandbox, in its `booting` phase, passes the fence.
+    pub runtime_upgrade: Option<RuntimeUpgradeOperationId>,
 }
 
 /// Claim the caller-observed sandbox state for activation.
@@ -240,6 +245,7 @@ pub fn begin_activation_with_route_evidence(
         tx.commit()?;
         return Ok(None);
     }
+    admit_past_runtime_upgrade_fence(&tx, id, route_admission.runtime_upgrade)??;
     let keep_filesystem = true;
     // Only activation authorizes node allocation. Filesystem-only staging keeps
     // an unbound request identity and must not become an allocation predecessor.
@@ -383,6 +389,58 @@ pub fn mark_teardown_suspend_backup_permanently_failed(
         params![reason, now()?, id, staged_artifact.to_string()],
     )?;
     Ok(changed == 1)
+}
+
+/// What [`clear_teardown_suspend_backup_permanently_failed`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TeardownBackupMarkerClear {
+    /// The row carried the marker for the artifact, and no longer does.
+    Cleared,
+    /// The row still stages the artifact as `suspending`, without the marker.
+    Unmarked,
+    /// The row is gone, has left `suspending`, or stages another artifact:
+    /// a cluster-deleted eviction may have claimed it.
+    MovedOn,
+}
+
+/// Clear the terminal-teardown-suspend marker
+/// [`mark_teardown_suspend_backup_permanently_failed`] stamped for
+/// `staged_artifact`, once the cluster admits the backup it refused: the
+/// suspend can publish again. The check and the clear share one transaction,
+/// so a cluster-deleted eviction's claim lands before or after both.
+pub fn clear_teardown_suspend_backup_permanently_failed(
+    conn: &Connection,
+    id: &str,
+    staged_artifact: LocalArtifactId,
+) -> Result<TeardownBackupMarkerClear> {
+    let tx = immediate_transaction(conn)?;
+    let marker = pplx_space_sbx_mgr_protocol::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON;
+    let cleared = tx.execute(
+        "UPDATE sandboxes
+         SET failure_reason = NULL,
+             updated_at = ?1
+         WHERE id = ?2
+           AND state = 'suspending'
+           AND current_local_artifact_id = ?3
+           AND failure_reason = ?4",
+        params![now()?, id, staged_artifact.to_string(), marker],
+    )? == 1;
+    let outcome = if cleared {
+        TeardownBackupMarkerClear::Cleared
+    } else if tx.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM sandboxes
+             WHERE id = ?1 AND state = 'suspending' AND current_local_artifact_id = ?2
+         )",
+        params![id, staged_artifact.to_string()],
+        |row| row.get::<_, bool>(0),
+    )? {
+        TeardownBackupMarkerClear::Unmarked
+    } else {
+        TeardownBackupMarkerClear::MovedOn
+    };
+    tx.commit()?;
+    Ok(outcome)
 }
 
 pub fn mark_cross_node_restore_staging_failed(
@@ -635,6 +693,7 @@ pub fn mark_start_succeeded(
     }
     if changed == 1 {
         route_activation_claims::close_claim(&tx, id)?;
+        verify_booting_runtime_upgrade(&tx, id)?;
     }
     tx.commit()?;
     Ok(changed == 1)

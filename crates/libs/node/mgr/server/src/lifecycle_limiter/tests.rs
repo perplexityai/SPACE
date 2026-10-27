@@ -131,8 +131,8 @@ fn defaults_table_is_complete() {
 }
 
 #[test]
-fn load_snapshot_defaults_retain_restore_burst_queue_headroom() {
-    assert_eq!(LifecycleMethod::LoadSnapshot.default_limits(), (8, 56));
+fn restore_vm_state_defaults_retain_restore_burst_queue_headroom() {
+    assert_eq!(LifecycleMethod::RestoreVmState.default_limits(), (8, 56));
 }
 
 /// Tonic drops the handler future on client

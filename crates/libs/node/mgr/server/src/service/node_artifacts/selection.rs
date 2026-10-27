@@ -29,8 +29,9 @@ impl NodeManagerService {
             ),
         };
         let inventory = self.runtime_inventory().await?;
-        let (definition, selected) = selection::select(&inventory, &self.execution_policy, intent)
-            .map_err(|error| match error {
+        let policy = self.execution_policy();
+        let (definition, selected) =
+            selection::select(&inventory, &policy, intent).map_err(|error| match error {
                 selection::SelectionError::Unavailable(error) => error.into_status(),
                 error => Status::failed_precondition(error.to_string()),
             })?;
@@ -41,7 +42,7 @@ impl NodeManagerService {
                 source_environment = ?source.environment(),
                 consumer_environment = %definition.reference(),
                 mode = ?intent.mode(),
-                source_allowed = source.environment().is_some_and(|reference| self.execution_policy.allows(reference)),
+                source_allowed = source.environment().is_some_and(|reference| policy.allows(reference)),
                 "selected compatible consumer after exact source was absent, revoked or permanently unavailable"
             );
         }

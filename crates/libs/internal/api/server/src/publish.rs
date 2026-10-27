@@ -4,6 +4,7 @@ use super::*;
 use crate::auto_lifecycle_delete_completions::consume_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
 use pplx_space_metrics::internal_api::{LocalBackupQueueOutcome, local_backup_queue_reconcile};
+use pplx_space_node_api_client::node_status_freshness::reported_freshness;
 use pplx_space_placement::StoredSandboxLifecycle;
 
 impl ClusterApiService {
@@ -47,6 +48,12 @@ impl ClusterApiService {
             ));
         }
         let request = request.into_inner();
+        let reported_window = reported_freshness(
+            request
+                .node_status
+                .as_ref()
+                .and_then(|status| status.node_ctl.as_ref()),
+        );
         let node_status = request
             .node_status
             .map(published_node_status_db)
@@ -163,7 +170,7 @@ impl ClusterApiService {
         upsert_node_status_from_publish(
             &mut tx,
             origin.id,
-            NODE_STATUS_STALE_AFTER_SECS,
+            reported_window,
             node_status,
             inventory_prune,
             local_backup_report,

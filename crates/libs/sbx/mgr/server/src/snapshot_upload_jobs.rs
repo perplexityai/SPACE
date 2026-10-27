@@ -671,7 +671,17 @@ pub(crate) enum RegistrationProbe {
     /// The control plane refused the registration because it superseded this
     /// generation.
     Superseded(pplx_space_common_core::types::ExecutionGeneration),
-    /// The control plane answered, and didn't name a superseded generation.
+    /// The control plane ran the generation fence on the verdict-only
+    /// registration and admitted it, so the fence would admit a fresh attempt
+    /// too.
+    Admitted,
+    /// The control plane refused the registration without naming a
+    /// superseded generation, admitted it without running the fence, or
+    /// registered it as a server that predates verdict-only requests does; or
+    /// the payload can't make one. The fence doesn't run on a replay of an
+    /// attempt that has a row, even a failed one, or on a fresh attempt for
+    /// bytes another attempt registered, so that admission says nothing about
+    /// whether a new attempt would be fenced.
     NotSuperseded,
     /// No answer: cluster-api couldn't be reached, or failed in a way a retry
     /// may clear.
@@ -700,16 +710,16 @@ pub(crate) async fn prepared_begin_refused_as_superseded(
             superseded_generation: Some(generation),
             ..
         })) => RegistrationProbe::Superseded(generation),
-        Ok(Ok(reply)) => {
-            if verdict_only_reply_registered(&reply) {
-                finalize_with_cluster_api_failed(
-                    &payload.snapshot_id,
-                    "teardown backup probe re-registered an upload that had already failed",
-                )
-                .await;
-            }
+        Ok(Ok(reply)) if verdict_only_reply_registered(&reply) => {
+            finalize_with_cluster_api_failed(
+                &payload.snapshot_id,
+                "teardown backup probe re-registered an upload that had already failed",
+            )
+            .await;
             RegistrationProbe::NotSuperseded
         }
+        Ok(Ok(reply)) if reply.generation_fence_admitted => RegistrationProbe::Admitted,
+        Ok(Ok(_)) => RegistrationProbe::NotSuperseded,
         Ok(Err(refused)) => match classify_begin_error(refused).kind() {
             pplx_space_common_jobs::JobFailureKind::Permanent => RegistrationProbe::NotSuperseded,
             _ => RegistrationProbe::Unanswered,

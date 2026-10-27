@@ -106,3 +106,40 @@ fn optional_idempotency_key_round_trips_through_proto_shape() {
     );
     assert_eq!(proto_idempotency_key(None), None);
 }
+
+#[test]
+fn process_exits_report_shell_style_exit_codes() {
+    use crate::proto::operations::{
+        ProcessExit, ProcessExited, ProcessSignaled, ProcessTimedOut, ProcessUnknown,
+        process_exit::Outcome,
+    };
+    for (outcome, expected) in [
+        (Some(Outcome::Exited(ProcessExited { exit_code: 7 })), 7),
+        (
+            Some(Outcome::Signaled(ProcessSignaled { signal: Some(9) })),
+            137,
+        ),
+        (
+            Some(Outcome::Signaled(ProcessSignaled { signal: None })),
+            128,
+        ),
+        (
+            Some(Outcome::Signaled(ProcessSignaled {
+                signal: Some(i32::MAX),
+            })),
+            i32::MAX,
+        ),
+        (
+            Some(Outcome::TimedOut(ProcessTimedOut { signal: Some(9) })),
+            124,
+        ),
+        (Some(Outcome::Unknown(ProcessUnknown {})), 1),
+        (None, 1),
+    ] {
+        assert_eq!(
+            ProcessExit { outcome }.shell_exit_code(),
+            expected,
+            "{outcome:?}"
+        );
+    }
+}

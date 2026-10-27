@@ -68,6 +68,8 @@ class NativeConfig:
     ready_timeout_seconds: float = 180
     request_timeout_seconds: float = 15
     poll_interval_seconds: float = 1
+    # Templates built from this tree retain a finished command's exit.
+    reports_exited_processes: bool = True
 
     def __post_init__(self) -> None:
         if not self.api_url or not self.data_plane_url or not self.token:
@@ -608,6 +610,10 @@ class _NativeSandbox:
     _factory: NativeSandboxFactory
     sandbox_id: str
 
+    @property
+    def reports_exited_processes(self) -> bool:
+        return self._factory.config.reports_exited_processes
+
     def get_info(self) -> SandboxInfo:
         response = self._factory._json_request(
             "GET",
@@ -727,10 +733,23 @@ def _native_process(payload: Mapping[str, object]) -> ProcessInfo:
         raise TypeError(
             "Native process response field 'command' was not a string array"
         )
+    # Optional: older APIs report running processes without these fields.
+    state = payload.get("state", "running")
+    exit_status = payload.get("exit_status")
+    signal = payload.get("signal")
+    if not isinstance(state, str) or not state:
+        raise TypeError("Native process response field 'state' was not a string")
+    if exit_status is not None and not isinstance(exit_status, str):
+        raise TypeError("Native process response field 'exit_status' was not a string")
+    if signal is not None and (not isinstance(signal, int) or isinstance(signal, bool)):
+        raise TypeError("Native process response field 'signal' was not an integer")
     return ProcessInfo(
         process_id=_required_string(payload, "process_id"),
         pid=_required_integer(payload, "pid"),
         command=tuple(cast(list[str], command)),
+        state=state,
+        exit_status=exit_status,
+        signal=signal,
     )
 
 

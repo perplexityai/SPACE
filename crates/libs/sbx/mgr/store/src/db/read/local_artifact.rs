@@ -33,6 +33,16 @@ pub fn local_artifact(
     }
 }
 
+/// The identities of `sandbox_id`'s artifact rows whose bytes are at
+/// `local_path`; more than one is a catalog conflict over those bytes.
+pub fn local_artifacts_at_path(
+    conn: &Connection,
+    sandbox_id: &str,
+    local_path: &str,
+) -> Result<Vec<LocalArtifactId>> {
+    crate::db::local_artifact_leases::artifacts_at_path(conn, sandbox_id, local_path)
+}
+
 /// Whether neither an artifact row nor any sandbox's current or
 /// suspend-predecessor pin names `local_artifact_id`, in one statement.
 /// Staging under an unowned identity is garbage.

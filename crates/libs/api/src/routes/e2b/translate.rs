@@ -911,20 +911,35 @@ pub(super) fn parse_metadata_query(
         let (key, value) = pair
             .split_once('=')
             .ok_or_else(|| E2bApiError::bad_request("Invalid metadata query"))?;
+        let key = decode_metadata_component(key)?;
+        let value = decode_metadata_component(value)?;
         // Reject duplicate keys explicitly. JSONB containment is single-value
         // per key, so silently collapsing a `metadata=env=prod&env=staging`
         // request would drop a caller-supplied predicate before SQL ran.
         // Better to fail fast at the boundary than to honor only the last
         // value and leave the caller wondering why their filter didn't
         // narrow.
-        if !seen.insert(key.to_string()) {
+        if !seen.insert(key.clone()) {
             return Err(E2bApiError::bad_request(format!(
                 "duplicate metadata key '{key}' in filter"
             )));
         }
-        filters.push((key.to_string(), value.to_string()));
+        filters.push((key, value));
     }
     Ok(filters)
+}
+
+fn decode_metadata_component(value: &str) -> Result<String, E2bApiError> {
+    // The Python SDK percent-encodes components, then form-encodes them again.
+    // Split pairs before decoding so encoded '&' and '=' stay inside values.
+    // The HTTP extractor already handled the outer query and its '+' semantics.
+    let value = percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map_err(|_| E2bApiError::bad_request("Invalid UTF-8 in metadata query"))?;
+    percent_encoding::percent_decode_str(&value)
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| E2bApiError::bad_request("Invalid UTF-8 in metadata query"))
 }
 
 pub(super) fn parse_state_filter(state: Option<&str>) -> Result<Vec<SandboxStateE2b>, E2bApiError> {

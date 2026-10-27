@@ -211,7 +211,9 @@ message StartRequest {
   // is what the E2B compatibility path does. The native data plane derives this
   // from the data-plane session id so the control plane can return a usable
   // process id before the process exists, and so a retried start is refused
-  // rather than executing the command twice.
+  // rather than executing the command twice. An id stays in use after its
+  // process exits, for as long as the guest retains the exit (15 minutes, or
+  // less once many newer processes start).
   optional string process_id = 12;
 }
 message PtySize {
@@ -228,9 +230,33 @@ message ConnectProcessRequest {
   // follows the live tail. Native public data-plane replay sets this to the
   // number of stdout/stderr events already durably captured so output emitted
   // while a client was disconnected is replayed from the guest journal.
+  //
+  // A cursor outside the retained output ends the stream with a status whose
+  // `space-error-reason` metadata names why:
+  // - past the output the process has written: OUT_OF_RANGE,
+  //   `process-output-cursor-ahead`;
+  // - before the oldest output the guest still retains: RESOURCE_EXHAUSTED,
+  //   `process-output-lagged`, with `space-process-output-first-sequence`
+  //   metadata giving the cursor of that oldest output, in decimal, while the
+  //   guest still holds the process.
+  // Older guests end a lagged stream with RESOURCE_EXHAUSTED and no reason,
+  // and wait for output to reach a cursor past it.
   optional uint64 output_cursor = 3;
+  // With `output_cursor` before the oldest output the guest still retains,
+  // start the stream at that oldest output instead of ending it as lagged.
+  // The guest chooses the start under the lock that also gives the stream
+  // its reader position, so output written meanwhile cannot evict it, and
+  // reports it in `ProcessConnected.output_cursor`. Older guests ignore it.
+  bool resume_from_oldest_retained = 4;
 }
-message ListProcessesRequest {}
+message ListProcessesRequest {
+  // Also list processes that have exited but are still retained, with their
+  // exit. Older guests ignore it and list running processes only.
+  bool include_exited = 1;
+  // List only this process. Older guests ignore it and list every process,
+  // so a caller still selects the one it wants.
+  optional string process_id = 2;
+}
 message ProcessInfo {
   string process_id = 1;
   uint32 pid = 2;
@@ -240,6 +266,9 @@ message ProcessInfo {
   optional string user = 6;
   optional string tag = 7;
   optional bool pty = 8;
+  // Set once the process has exited; only listed with `include_exited`.
+  optional ProcessExit exit = 9;
+  optional google.protobuf.Timestamp ended_at = 10;
 }
 message SendSignalRequest {
   string process_id = 1;
@@ -276,7 +305,13 @@ message ProcessEvent {
   }
 }
 message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
-message ProcessConnected {}
+message ProcessConnected {
+  // The journal cursor of the first output this stream sends, when the
+  // request set `output_cursor`: that cursor, or a later one when
+  // `resume_from_oldest_retained` moved the start past evicted output.
+  // Unset by older guests.
+  optional uint64 output_cursor = 1;
+}
 message ProcessOutput { bytes data = 1; }
 message ProcessExit {
   oneof outcome {

@@ -12,6 +12,8 @@ extern crate pplx_space_metrics_emit;
 
 use pplx_space_metrics_emit::{counter, distribution, gauge, tag};
 
+pub mod payload;
+
 /// Untagged: identity comes from the constant process tags.
 pub fn server_active_requests(depth: usize) {
     distribution("grpc.server.active_requests", depth as f64, &[]);

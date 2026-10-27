@@ -1119,6 +1119,14 @@ These still warn and count as before:
   for lookups that fail with `NoConnections`; Hickory reports exhausted `Busy`
   as `NoConnections` too, so this path does not produce `resolver_busy`.
 
+`gateway.reserved_dns.upstream.request.duration_ms` times each query the
+gateway hands to an upstream connection, from the send to its first response
+or failure, including any wait for a shared reconnect. It is tagged `resolver`
+and `outcome`: `answered`, `timeout` or `no_response` (Hickory's per-attempt
+timeout), `busy`, `error`, or `cancelled` when the send was dropped first.
+Unlike `gateway.reserved_dns.request.duration_ms`, it excludes cache hits,
+local answers and capacity rejections.
+
 `gateway.reserved_dns.upstream_busy.lookup_in_flight` samples only `Busy` that
 reaches Hickory, not sends on closed connections. A send that races the
 connection's exit can still reach Hickory as `Busy`.

@@ -131,3 +131,19 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn runtime_provisioning_refs_are_whole_node_and_round_trip() {
+    let reference = FacetRef::new(FACET_RUNTIME_PROVISIONING, None::<String>);
+    assert_eq!(
+        FacetRef::from_proto(reference.to_proto().unwrap()).unwrap(),
+        reference
+    );
+    let element = FacetRef::new(FACET_RUNTIME_PROVISIONING, Some("e0"));
+    element.to_proto().unwrap_err();
+    let wire = ProtoFacetRef {
+        facet: ProtoReconcileFacet::RuntimeProvisioning as i32,
+        element: Some(facet_ref::Element::Template("e0".into())),
+    };
+    FacetRef::from_proto(wire).unwrap_err();
+}

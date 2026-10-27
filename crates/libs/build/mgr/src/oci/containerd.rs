@@ -66,6 +66,7 @@ impl std::fmt::Display for OciFileOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OciOperation {
     CheckContainerd,
+    ReadImageConfig,
     PullImage,
     TagImage,
     CreateSnapshotView,
@@ -79,6 +80,7 @@ impl OciOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CheckContainerd => "check_containerd",
+            Self::ReadImageConfig => "read_image_config",
             Self::PullImage => "pull_image",
             Self::TagImage => "tag_image",
             Self::CreateSnapshotView => "create_snapshot_view",
@@ -99,6 +101,9 @@ impl std::fmt::Display for OciOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OciCommand {
     CheckContainerd,
+    ReadImageConfig {
+        digest: Digest,
+    },
     PullImage {
         reference: OciReference,
         arch: Arch,
@@ -132,6 +137,7 @@ impl OciCommand {
     const fn operation(&self) -> OciOperation {
         match self {
             Self::CheckContainerd => OciOperation::CheckContainerd,
+            Self::ReadImageConfig { .. } => OciOperation::ReadImageConfig,
             Self::PullImage { .. } => OciOperation::PullImage,
             Self::TagImage { .. } => OciOperation::TagImage,
             Self::CreateSnapshotView { .. } => OciOperation::CreateSnapshotView,
@@ -153,6 +159,13 @@ impl OciCommand {
     fn args(&self) -> Vec<OsString> {
         match self {
             Self::CheckContainerd => vec!["version".into()],
+            Self::ReadImageConfig { digest } => vec![
+                "--namespace".into(),
+                CONTAINERD_NAMESPACE.into(),
+                "content".into(),
+                "get".into(),
+                digest.to_string().into(),
+            ],
             Self::PullImage {
                 reference,
                 arch,
@@ -236,7 +249,9 @@ impl OciCommand {
     const fn output(&self) -> CommandOutput {
         match self {
             Self::CheckContainerd => CommandOutput::Inherit,
-            Self::PullImage { .. } | Self::CreateSnapshotView { .. } => CommandOutput::Capture,
+            Self::PullImage { .. }
+            | Self::CreateSnapshotView { .. }
+            | Self::ReadImageConfig { .. } => CommandOutput::Capture,
             Self::TagImage { .. }
             | Self::MountSnapshot { .. }
             | Self::UnmountSnapshot { .. }
@@ -254,6 +269,10 @@ impl std::fmt::Display for OciCommand {
 
 #[derive(Debug, thiserror::Error)]
 pub enum OciBuildError {
+    #[error("OCI image configuration is invalid: {0}")]
+    ImageConfig(#[source] serde_json::Error),
+    #[error("OCI image working directory must be an absolute path without NUL bytes")]
+    InvalidWorkingDirectory,
     #[error("{operation} failed for {path}: {source}")]
     File {
         operation: OciFileOperation,
@@ -294,10 +313,12 @@ impl OciBuildError {
     pub fn error_kind(&self) -> crate::TemplateBuildErrorKind {
         use crate::TemplateBuildErrorKind as Kind;
         match self {
-            Self::Registry { .. }
+            Self::ImageConfig(_)
+            | Self::InvalidWorkingDirectory
+            | Self::Registry { .. }
             | Self::UnsupportedArch(_)
             | Self::Command {
-                operation: OciOperation::PullImage,
+                operation: OciOperation::PullImage | OciOperation::ReadImageConfig,
                 ..
             } => Kind::ImagePull,
             Self::Storage(_) => Kind::StorageAdmission,
@@ -529,6 +550,7 @@ fn bounded_output(bytes: &[u8]) -> String {
 
 pub struct OciRootfs {
     mount_path: PathBuf,
+    pub(super) working_dir: PathBuf,
     cleanup: Option<OciCleanup>,
 }
 
@@ -810,19 +832,45 @@ async fn mount_with_manifest_source(
     ecr_auth_root: &Path,
     dependencies: OciMountDependencies,
 ) -> Result<OciRootfs, OciBuildError> {
-    let reference =
-        registry::resolve_with_source(&request.reference, arch, manifest_source).await?;
-    mount_with_registry_dependencies(
+    let image = registry::resolve_with_source(&request.reference, arch, manifest_source).await?;
+    let runner = Arc::clone(&dependencies.runner);
+    let mut rootfs = mount_with_registry_dependencies(
         OciMountRequest {
             cache_dir: request.cache_dir,
-            reference,
+            reference: image.reference,
         },
         arch,
         ecr_pull_auth,
         ecr_auth_root,
         dependencies,
     )
-    .await
+    .await?;
+    let output = run(
+        runner.as_ref(),
+        OciCommand::ReadImageConfig {
+            digest: image.config_digest,
+        },
+    )
+    .await?;
+    let config: oci_spec::image::ImageConfiguration =
+        serde_json::from_slice(&output.stdout).map_err(OciBuildError::ImageConfig)?;
+    rootfs.working_dir = config
+        .config()
+        .as_ref()
+        .and_then(|config| config.working_dir().as_ref())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    if !rootfs.working_dir.is_absolute()
+        || rootfs
+            .working_dir
+            .as_os_str()
+            .as_encoded_bytes()
+            .contains(&0)
+    {
+        return Err(OciBuildError::InvalidWorkingDirectory);
+    }
+    Ok(rootfs)
 }
 
 #[cfg(test)]
@@ -1038,6 +1086,7 @@ async fn mount_with_registry_dependencies(
         return Err(error);
     }
     Ok(OciRootfs {
+        working_dir: PathBuf::from("/"),
         mount_path: mount_path.clone(),
         cleanup: Some(cleanup),
     })

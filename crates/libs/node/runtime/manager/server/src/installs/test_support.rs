@@ -1,5 +1,7 @@
 //! In-memory kernel and release sources, and their fixtures, for tests.
 
+use super::release_source::ReleasePayload;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -321,14 +323,8 @@ impl ReleaseSource for FakeReleaseSource {
             .join(&format!("firecracker-v{version}-{architecture}.tgz"))
     }
 
-    fn archive_member(
-        &self,
-        release: &RuntimeIdentity,
-        architecture: Arch,
-        binary: &str,
-    ) -> String {
-        let version = release.version.as_str();
-        format!("release-v{version}-{architecture}/{binary}-v{version}-{architecture}")
+    fn payload(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleasePayload {
+        super::release_source::firecracker_payload(release, architecture)
     }
 
     async fn open(&self, archive: &ReleaseUrl) -> Result<ReleaseChunks, ReleaseSourceError> {
@@ -607,4 +603,37 @@ pub(crate) fn staging_holds_no_job(staging: &Path) -> bool {
                 .iter()
                 .all(|kind| kind.is_dir() && entries(kind).is_empty())
     })
+}
+
+pub(crate) struct FakeExecutableSource {
+    pub(crate) location: super::release_source::ReleaseUrl,
+    pub(crate) bytes: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl ReleaseSource for FakeExecutableSource {
+    fn runtime(&self) -> RuntimeKind {
+        RuntimeKind::CloudHypervisor
+    }
+
+    fn root(&self) -> &super::release_source::ReleaseUrl {
+        &self.location
+    }
+
+    fn archive(&self, _: &RuntimeIdentity, _: Arch) -> super::release_source::ReleaseUrl {
+        self.location.clone()
+    }
+
+    fn payload(&self, _: &RuntimeIdentity, _: Arch) -> ReleasePayload {
+        ReleasePayload::Executable
+    }
+
+    async fn open(
+        &self,
+        _: &super::release_source::ReleaseUrl,
+    ) -> Result<super::release_source::ReleaseChunks, ReleaseSourceError> {
+        Ok(Box::pin(futures_util::stream::iter([Ok(
+            bytes::Bytes::copy_from_slice(&self.bytes),
+        )])))
+    }
 }

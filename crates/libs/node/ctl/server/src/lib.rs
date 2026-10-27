@@ -19,6 +19,9 @@ use pplx_space_common_svc::{
     AcquireOutcome, DEFAULT_DRAIN_TIMEOUT, LocalHealthServer, LocalRole, ServiceMutex,
     UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
+use pplx_space_node_api_client::node_status_freshness::{
+    DEFAULT_NODE_CTL_POLL_INTERVAL, MAX_NODE_CTL_POLL_INTERVAL, NODE_STATUS_OUTBOUND_RECONCILER,
+};
 use pplx_space_node_api_client::proto::cluster_api_client::ClusterApiClient;
 use pplx_space_node_api_client::proto::node_ctl_server::{NodeCtl, NodeCtlServer};
 use pplx_space_node_api_client::proto::{
@@ -59,15 +62,17 @@ const NETWORK_POLICY_RECONCILER: &str = "network-policies";
 const SANDBOX_DESIRED_STATE_RECONCILER: &str = "sandbox-desired-state";
 const TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER: &str = "template-base-snapshot-policy";
 const TEMPLATE_DESIRED_STATE_RECONCILER: &str = "template-desired-state";
+const RUNTIME_PROVISIONING_RECONCILER: &str = "runtime-provisioning";
 const NODE_STATE_OUTBOUND_RECONCILER: &str = "node-state-outbound";
 const NETWORK_POLICY_OUTBOUND_RECONCILER: &str = "network-policy-outbound";
 const SANDBOX_INVENTORY_OUTBOUND_RECONCILER: &str = "sandbox-inventory-outbound";
 const TEMPLATE_INVENTORY_OUTBOUND_RECONCILER: &str = "template-inventory-outbound";
-const NODE_STATUS_OUTBOUND_RECONCILER: &str = "node-status-outbound";
 /// Where the binary looks for the node-ctl TOML config by default.
 pub const DEFAULT_NODE_CTL_CONFIG_PATH: &str = "/space/config/nodectl.toml";
 const DEFAULT_DISABLE_TTL_SECS: u64 = 10 * 60;
-pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
+/// The cluster derives node-status freshness from this interval; see
+/// `pplx_space_node_api_client::node_status_freshness`.
+pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = DEFAULT_NODE_CTL_POLL_INTERVAL.as_secs();
 const CLUSTER_RECONCILE_DRAIN_MAX_BATCHES: usize = 16;
 const WORK_QUEUE_CAPACITY: usize = 1024;
 const CLUSTER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -408,6 +413,7 @@ struct NodeCtlWorker {
     resource_status_reader: NodeResourceStatusReader,
     network_pool_status_reader: NetworkPoolStatusReader,
     orphan_inventory: orphan_inventory::Observer,
+    runtime_provisioning: Arc<facets::Provisioning>,
     /// The Kubernetes node-local controller when this node runs one.
     node_objects: Option<Box<dyn NodeObjectReconciles>>,
     rx: mpsc::Receiver<WorkItem>,
@@ -561,6 +567,7 @@ pub async fn run(
         resource_status_reader,
         network_pool_status_reader,
         orphan_inventory: orphan_inventory::Observer::default(),
+        runtime_provisioning: Arc::default(),
         #[cfg(feature = "kubernetes")]
         node_objects: kubernetes_controller
             .map(|controller| Box::new(controller) as Box<dyn NodeObjectReconciles>),
@@ -694,10 +701,25 @@ fn read_node_ctl_config(path: &Path) -> Result<NodeCtlConfig, RunNodeCtlError> {
 }
 
 fn resolve_poll_interval(cli: &NodeCtlRunConfig, config: &NodeCtlConfig) -> u64 {
-    cli.poll_interval_secs
+    let requested = cli
+        .poll_interval_secs
         .or(config.reconciliation.poll_interval_secs)
-        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
-        .max(1)
+        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
+    bound_poll_interval(Duration::from_secs(requested)).as_secs()
+}
+
+/// At least a second, and no longer than the cluster's node-status freshness
+/// window fully covers: a longer interval would leave a healthy idle node
+/// reading stale between its ticks.
+fn bound_poll_interval(requested: Duration) -> Duration {
+    if requested > MAX_NODE_CTL_POLL_INTERVAL {
+        tracing::warn!(
+            requested_secs = requested.as_secs(),
+            max_secs = MAX_NODE_CTL_POLL_INTERVAL.as_secs(),
+            "poll interval exceeds what the cluster's node-status freshness window covers; using the maximum"
+        );
+    }
+    requested.clamp(Duration::from_secs(1), MAX_NODE_CTL_POLL_INTERVAL)
 }
 
 fn resolve_cluster_node_api_endpoint(config: &NodeCtlConfig) -> Option<String> {
@@ -725,6 +747,7 @@ fn init_reconciliation_status(conn: &Connection, poll_interval_secs: u64) -> rus
         SANDBOX_DESIRED_STATE_RECONCILER,
         TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
         TEMPLATE_DESIRED_STATE_RECONCILER,
+        RUNTIME_PROVISIONING_RECONCILER,
         NODE_STATE_OUTBOUND_RECONCILER,
         NETWORK_POLICY_OUTBOUND_RECONCILER,
         SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
@@ -1198,6 +1221,7 @@ impl NodeCtlWorker {
                     let node_id = self.node_id.clone();
                     let node_role = self.node_role;
                     let poll_interval = self.poll_interval;
+                    let provisioning = self.runtime_provisioning.clone();
                     let facet_token = shutdown_token.child_token();
                     let (scope_kind, scope_items) = facet_scope_span_fields(&scope);
                     let span = tracing::info_span!(
@@ -1222,7 +1246,7 @@ impl NodeCtlWorker {
                                     facet.name(),
                                     FACET_RUN_TIMEOUT.as_secs()
                                 )),
-                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone(), poll_interval) => result,
+                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone(), poll_interval, &provisioning) => result,
                             };
                             (facet, status_name, started_at, result)
                         }
@@ -1502,6 +1526,7 @@ impl NodeCtlWorker {
             SANDBOX_DESIRED_STATE_RECONCILER,
             TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
             TEMPLATE_DESIRED_STATE_RECONCILER,
+            RUNTIME_PROVISIONING_RECONCILER,
             NODE_STATE_OUTBOUND_RECONCILER,
             NETWORK_POLICY_OUTBOUND_RECONCILER,
             SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
@@ -2082,6 +2107,7 @@ fn inbound_reconciler_name(facet: facets::FacetKind) -> &'static str {
         facets::FacetKind::SandboxDesiredState => SANDBOX_DESIRED_STATE_RECONCILER,
         facets::FacetKind::TemplateBaseSnapshotPolicy => TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER,
         facets::FacetKind::TemplateDesiredState => TEMPLATE_DESIRED_STATE_RECONCILER,
+        facets::FacetKind::RuntimeProvisioning => RUNTIME_PROVISIONING_RECONCILER,
         facets::FacetKind::SandboxInventory
         | facets::FacetKind::TemplateInventory
         | facets::FacetKind::NodeStatus => NODE_STATE_OUTBOUND_RECONCILER,
@@ -2096,7 +2122,8 @@ fn outbound_reconciler_name(facet: facets::FacetKind) -> &'static str {
         facets::FacetKind::NodeStatus => NODE_STATUS_OUTBOUND_RECONCILER,
         facets::FacetKind::SandboxDesiredState
         | facets::FacetKind::TemplateBaseSnapshotPolicy
-        | facets::FacetKind::TemplateDesiredState => NODE_STATE_OUTBOUND_RECONCILER,
+        | facets::FacetKind::TemplateDesiredState
+        | facets::FacetKind::RuntimeProvisioning => NODE_STATE_OUTBOUND_RECONCILER,
     }
 }
 

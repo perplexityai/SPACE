@@ -27,6 +27,8 @@ impl TryFrom<&crate::proto::ExecutionPolicyObservation> for ExecutionPolicyObser
             allowed,
             default,
             value.legacy_unbound_allowed,
+            value.applied_generation,
+            value.cluster_policy_unreadable,
         )?)
     }
 }
@@ -44,6 +46,8 @@ impl From<&ExecutionPolicyObservation> for crate::proto::ExecutionPolicyObservat
             default_environment_reference: value
                 .default_environment_reference()
                 .map(|reference| reference.to_string()),
+            applied_generation: value.applied_generation(),
+            cluster_policy_unreadable: value.cluster_policy_unreadable(),
         }
     }
 }

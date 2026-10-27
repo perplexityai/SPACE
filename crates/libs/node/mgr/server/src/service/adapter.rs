@@ -1,5 +1,6 @@
 use super::*;
 use crate::proto::{CloneCapabilitiesRequest, CloneCapabilitiesResponse};
+use pplx_space_node_runtime_core::launch_admission::runtime_operation_status;
 use tracing::Instrument as _;
 
 struct RpcWait {
@@ -70,6 +71,13 @@ impl NodeManager for NodeManagerService {
         request: Request<crate::proto::ResolveExecutionEnvironmentRequest>,
     ) -> Result<Response<crate::proto::ResolveExecutionEnvironmentResponse>, Status> {
         NodeManagerService::resolve_execution_environment(self, request).await
+    }
+
+    async fn apply_execution_policy(
+        &self,
+        request: Request<crate::proto::ApplyExecutionPolicyRequest>,
+    ) -> Result<Response<crate::proto::ApplyExecutionPolicyResponse>, Status> {
+        NodeManagerService::apply_execution_policy(self, request).await
     }
 
     async fn get_execution_inventory(
@@ -276,36 +284,52 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::resume_sandbox(self, request).await
     }
 
-    async fn get_firecracker_vm_state(
+    async fn get_vm_state(
         &self,
-        request: Request<GetFirecrackerVmStateRequest>,
-    ) -> Result<Response<GetFirecrackerVmStateResponse>, Status> {
-        NodeManagerService::get_firecracker_vm_state(self, request).await
+        request: Request<crate::proto::GetVmStateRequest>,
+    ) -> Result<Response<crate::proto::GetVmStateResponse>, Status> {
+        NodeManagerService::get_vm_state(self, request)
+            .await
+            .map_err(runtime_operation_status)
     }
 
-    async fn create_snapshot(
+    async fn capture_vm_state(
         &self,
-        request: Request<CreateSnapshotRequest>,
-    ) -> Result<Response<CreateSnapshotResponse>, Status> {
+        request: Request<crate::proto::CaptureVmStateRequest>,
+    ) -> Result<Response<crate::proto::CaptureVmStateResponse>, Status> {
         let sandbox_id = request.get_ref().sandbox_id.clone();
-        observe_rpc(
-            "CreateSnapshot",
-            sandbox_id,
-            NodeManagerService::create_snapshot(self, request),
-        )
+        observe_rpc("CaptureVmState", sandbox_id, async {
+            self.authorize_peer(&request, "CaptureVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+            let (metadata, extensions, input) = request.into_parts();
+            let input = crate::snapshot_request::FirecrackerCapture::try_from(input)?;
+            NodeManagerService::capture_firecracker_state(
+                self,
+                Request::from_parts(metadata, extensions, input),
+            )
+            .await
+            .map_err(runtime_operation_status)?;
+            Ok(Response::new(crate::proto::CaptureVmStateResponse {}))
+        })
         .await
     }
 
-    async fn load_snapshot(
+    async fn restore_vm_state(
         &self,
-        request: Request<LoadSnapshotRequest>,
-    ) -> Result<Response<LoadSnapshotResponse>, Status> {
+        request: Request<crate::proto::RestoreVmStateRequest>,
+    ) -> Result<Response<crate::proto::RestoreVmStateResponse>, Status> {
         let sandbox_id = request.get_ref().sandbox_id.clone();
-        observe_rpc(
-            "LoadSnapshot",
-            sandbox_id,
-            NodeManagerService::load_snapshot(self, request),
-        )
+        observe_rpc("RestoreVmState", sandbox_id, async {
+            self.authorize_peer(&request, "RestoreVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+            let (metadata, extensions, input) = request.into_parts();
+            let input = crate::snapshot_request::FirecrackerRestore::try_from(input)?;
+            NodeManagerService::restore_firecracker_state(
+                self,
+                Request::from_parts(metadata, extensions, input),
+            )
+            .await
+            .map_err(runtime_operation_status)?;
+            Ok(Response::new(crate::proto::RestoreVmStateResponse {}))
+        })
         .await
     }
 
@@ -348,6 +372,13 @@ impl NodeManager for NodeManagerService {
         request: Request<RollbackBtrfsSnapshotRequest>,
     ) -> Result<Response<RollbackBtrfsSnapshotResponse>, Status> {
         NodeManagerService::rollback_btrfs_snapshot(self, request).await
+    }
+
+    async fn restore_instance_snapshot(
+        &self,
+        request: Request<RestoreInstanceSnapshotRequest>,
+    ) -> Result<Response<RestoreInstanceSnapshotResponse>, Status> {
+        NodeManagerService::restore_instance_snapshot(self, request).await
     }
 
     async fn get_disk_usage(

@@ -261,7 +261,8 @@ they end or the pod's termination grace period kills the process. A second stop
 signal ends the drain the way the deadline does, but at once: a `Process.Start`
 still opening is cut the way SIGKILL would cut it. At the deadline: native
 event streams end, and a client that reconnects with `Last-Event-ID` resumes
-the live stream but doesn't get the output it missed; native WebSockets close
+a process's output after the last event it received while the guest still
+retains it, and a file watch's live stream; native WebSockets close
 with 1012, including ones still opening their backend stream, and the client
 re-attaches the same session (a process or terminal session doesn't start its
 process again); ECW connect streams end with `unavailable` and need a new

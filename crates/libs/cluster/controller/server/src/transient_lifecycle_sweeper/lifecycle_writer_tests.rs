@@ -12,8 +12,8 @@
 //! substrate scope (`r4`), the marked-`restoring` exemption (`r6`), the
 //! current-cycle snapshot exemption (`r7`), the restore lease and the
 //! converge age (`r10`, `r13`), the revert's snapshot window (`r11`,
-//! `r15`), and the `creating` fail CAS's activation-owner check
-//! (`tests/crashed_create.rs`).
+//! `r15`), and the activation-owner check on the fail, converge and revert
+//! CASes (`tests/activation_owner.rs`, `tests/crashed_create.rs`).
 //!
 //! The sink runs over the direct substrate, which labels its rows
 //! `managed_by = 'space'` and needs no node or Kubernetes API for these

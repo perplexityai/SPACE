@@ -48,6 +48,7 @@ pplx-space-cluster-trigger-queue = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-common-svc = { workspace = true }
+pplx-space-env-vars = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
@@ -61,6 +62,7 @@ pplx-space-public-api = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-snapshot-store = { workspace = true }
+pplx-space-runtime-environment-policy-store = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]

@@ -435,6 +435,12 @@ enum CleanupAdmissionMode {
     ObservedExecution {
         execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     },
+    /// Only while the sandbox is in `state` and still running the node
+    /// execution `execution` began: a later activation is someone else's.
+    ObservedActivation {
+        state: SandboxState,
+        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+    },
     AutoLifecycleDelete {
         expectation: crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation,
     },
@@ -443,10 +449,24 @@ enum CleanupAdmissionMode {
 impl CleanupAdmissionMode {
     const fn observed_state(self) -> Option<SandboxState> {
         match self {
-            Self::ObservedState { state, .. } => Some(state),
+            Self::ObservedState { state, .. } | Self::ObservedActivation { state, .. } => {
+                Some(state)
+            }
             Self::Unfenced | Self::ObservedExecution { .. } | Self::AutoLifecycleDelete { .. } => {
                 None
             }
+        }
+    }
+
+    const fn observed_activation(
+        self,
+    ) -> Option<pplx_space_common_core::types::SandboxActivationAttemptId> {
+        match self {
+            Self::ObservedActivation { execution, .. } => Some(execution),
+            Self::Unfenced
+            | Self::ObservedState { .. }
+            | Self::ObservedExecution { .. }
+            | Self::AutoLifecycleDelete { .. } => None,
         }
     }
 
@@ -461,7 +481,9 @@ impl CleanupAdmissionMode {
             Self::ObservedExecution {
                 execution_generation,
             } => Some(execution_generation),
-            Self::Unfenced | Self::AutoLifecycleDelete { .. } => None,
+            Self::Unfenced | Self::ObservedActivation { .. } | Self::AutoLifecycleDelete { .. } => {
+                None
+            }
         }
     }
 
@@ -472,7 +494,11 @@ impl CleanupAdmissionMode {
                 execution_generation,
                 ..
             } => execution_generation.is_some(),
-            Self::ObservedExecution { .. } | Self::AutoLifecycleDelete { .. } => true,
+            // An activation-fenced stop must never fall back to unpersisted
+            // cleanup, which would skip the execution check.
+            Self::ObservedExecution { .. }
+            | Self::ObservedActivation { .. }
+            | Self::AutoLifecycleDelete { .. } => true,
         }
     }
 
@@ -481,7 +507,10 @@ impl CleanupAdmissionMode {
     ) -> Option<crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation> {
         match self {
             Self::AutoLifecycleDelete { expectation } => Some(expectation),
-            Self::Unfenced | Self::ObservedState { .. } | Self::ObservedExecution { .. } => None,
+            Self::Unfenced
+            | Self::ObservedState { .. }
+            | Self::ObservedExecution { .. }
+            | Self::ObservedActivation { .. } => None,
         }
     }
 
@@ -785,6 +814,40 @@ impl SandboxManagerService {
         .await
     }
 
+    /// A graceful blocking stop, admitted only while `sandbox_id` is in
+    /// `state`, started or paused, and still running the node execution
+    /// `execution` began.
+    pub(super) async fn admit_stop_for_activation(
+        &self,
+        sandbox_id: SandboxId,
+        state: SandboxState,
+        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+    ) -> Result<CleanupAdmission, CleanupAdmissionError> {
+        // The claim checks that the sandbox is still in `state`, so admitting
+        // only a running state leaves an execution already at rest, such as
+        // one the user suspended, alone.
+        if !matches!(state, SandboxState::Started | SandboxState::Paused) {
+            return Err(
+                Status::aborted(format!("the execution to stop is {state}, not running")).into(),
+            );
+        }
+        self.admit_lifecycle_cleanup_inner(
+            sandbox_id,
+            CleanupAdmissionSpec {
+                mode: CleanupAdmissionMode::ObservedActivation { state, execution },
+                template_filter: None,
+                require_template_owner: false,
+                target_state: SandboxState::Stopping,
+                keep_filesystem: true,
+                completion: CleanupCompletion::MarkStopped,
+                immediate_kill: false,
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::BeforeTermination,
+                persist_intent: false,
+            },
+        )
+        .await
+    }
+
     pub(super) async fn admit_lifecycle_cleanup_for_observed_execution(
         &self,
         sandbox_id: SandboxId,
@@ -1059,6 +1122,23 @@ impl SandboxManagerService {
             if current_state != Some(observed_state) {
                 return Err(Status::aborted(format!(
                     "cleanup lifecycle changed from {observed_state} to {current_state:?}"
+                ))
+                .into());
+            }
+        }
+        // Read under the cleanup fence every activation claims under, so no
+        // restart can slip in between this check and the claim below.
+        if let Some(observed_execution) = mode.observed_activation() {
+            let current_execution = crate::db::read::sandbox(&transaction, &sandbox_id_string)
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "inspect node execution during cleanup admission failed: {error}"
+                    ))
+                })?
+                .and_then(|row| row.node_execution_id);
+            if current_execution != Some(observed_execution) {
+                return Err(Status::aborted(format!(
+                    "cleanup execution changed from {observed_execution} to {current_execution:?}"
                 ))
                 .into());
             }
@@ -2820,8 +2900,7 @@ impl SandboxManagerService {
     /// [`BeforeStopFlush`].
     async fn resume_paused_vm_before_flush(&self, sandbox_id: &str) -> Result<(), StopFlushError> {
         let id = SandboxId::from_str(sandbox_id).map_err(StopFlushError::SandboxId)?;
-        let state =
-            crate::firecracker_via_nodemgr::get_firecracker_vm_state(id, &self.node_manager).await;
+        let state = crate::runtime_via_nodemgr::get_vm_state(id, &self.node_manager).await;
         if let Err(error) = &state {
             tracing::debug!(%sandbox_id, %error, "VM state unreadable before the stop flush");
         }
@@ -2909,13 +2988,13 @@ pub(super) enum BeforeStopFlush {
 
 impl BeforeStopFlush {
     pub(super) fn for_vm_state(
-        state: Option<pplx_space_node_runtime_core::fc_api::FirecrackerVmState>,
+        state: Option<pplx_space_node_runtime_core::vm_state::VmState>,
     ) -> Self {
-        use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+        use pplx_space_node_runtime_core::vm_state::VmState;
         match state {
-            Some(FirecrackerVmState::Running) | None => Self::Flush,
-            Some(FirecrackerVmState::Paused) => Self::ResumeThenFlush,
-            Some(FirecrackerVmState::NotStarted) => Self::NotRunning,
+            Some(VmState::Running) | None => Self::Flush,
+            Some(VmState::Paused) => Self::ResumeThenFlush,
+            Some(VmState::NotStarted) => Self::NotRunning,
         }
     }
 }

@@ -90,10 +90,17 @@ impl PublicSessionStore {
         }
     }
 
-    pub async fn create_session(
+    /// Create a session, or replay the one this idempotency key created;
+    /// a new session only when `admit` allows it.
+    ///
+    /// `admit` runs only after the idempotency lookup misses, so a retry of a
+    /// request that already created its session replays it even if the state
+    /// `admit` judges has changed since.
+    pub async fn create_session<E>(
         &self,
         input: CreatePublicSession<'_>,
-    ) -> Result<PublicSession, PublicSessionStoreError> {
+        admit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<PublicSession, E>, PublicSessionStoreError> {
         let fingerprint = request_fingerprint(input.fingerprint_payload)?;
         let mut tx = self.pool.begin().await?;
 
@@ -126,7 +133,11 @@ impl PublicSessionStore {
                 row,
                 Some(token),
                 self.data_plane_base_url.as_str(),
-            );
+            )
+            .map(Ok);
+        }
+        if let Err(refusal) = admit() {
+            return Ok(Err(refusal));
         }
         let session_id = DataPlaneSessionId::new_for_kind(input.kind);
         let scope = input.kind.connect_scope();
@@ -224,6 +235,7 @@ impl PublicSessionStore {
         );
 
         PublicSessionRow::try_into_public(row, Some(token), self.data_plane_base_url.as_str())
+            .map(Ok)
     }
 
     pub async fn fetch_session(

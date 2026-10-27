@@ -417,6 +417,7 @@ where
                             local_artifact_id: request.local_artifact_id,
                             backup_attempt_id: request.backup_attempt_id,
                             fence_verdict_only: request.fence_verdict_only,
+                            generation_fence_admitted: false,
                         })
                     })
                     .await

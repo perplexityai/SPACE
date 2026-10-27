@@ -220,7 +220,14 @@ pub fn setup_namespace_sysctls(ns: &str) -> Result<(), NetworkOpError> {
     write_sysctl(Some(ns), "net.ipv4.ip_forward", "1").map_err(NetworkOpError::transient)?;
     write_sysctl(Some(ns), "net.ipv4.conf.tap0.rp_filter", "0")
         .map_err(NetworkOpError::transient)?;
-    write_sysctl(Some(ns), "net.ipv4.conf.all.rp_filter", "0").map_err(NetworkOpError::transient)
+    write_sysctl(Some(ns), "net.ipv4.conf.all.rp_filter", "0")
+        .map_err(NetworkOpError::transient)?;
+    // A host's src_valid_mark=1 (Tailscale, wg-quick) carries into the namespace and makes the
+    // TPROXY'd guest packets martians. Either all or tap0 counts (IN_DEV_ORCONF), so pin both.
+    write_sysctl(Some(ns), "net.ipv4.conf.tap0.src_valid_mark", "0")
+        .map_err(NetworkOpError::transient)?;
+    write_sysctl(Some(ns), "net.ipv4.conf.all.src_valid_mark", "0")
+        .map_err(NetworkOpError::transient)
 }
 
 pub fn add_host_route(net: &NetId, ns: Option<&str>) -> Result<(), NetworkOpError> {

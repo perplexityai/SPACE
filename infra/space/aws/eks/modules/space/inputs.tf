@@ -16,7 +16,7 @@ variable "credential_service_egress_enabled" {
 }
 
 variable "credential_service_client_security_group_id" {
-  description = "Caller-owned client security group attached to the cred-authority node pool when credential_service_egress_enabled is true. The calling root owns the private egress endpoints that admit it; this module creates none."
+  description = "Caller-owned client security group attached to the cred-authority node pool when credential_service_egress_enabled is true. The calling root owns the private egress endpoints that admit it; this module creates none. The pool's node group stays on its launch-template version, so a changed ID reaches its nodes only once the group is rolled onto the new version (see aws_eks_node_group.managed in the eks-cluster module). Have the endpoints admit the new security group before the roll, and keep the old one, and its admission, until the roll has finished: until then the group still launches nodes with it."
   type        = string
   default     = null
   nullable    = true

@@ -31,9 +31,11 @@ mod restore;
 mod started_recovery;
 mod wake;
 mod worker_clients;
+use delete::delete_sandbox_pod_with_throttle_retry;
 #[cfg(test)]
-use delete::{K8S_THROTTLE_DELETE_RETRY_ATTEMPTS, retry_kube_delete_throttling};
-use delete::{delete_sandbox_pod_with_throttle_retry, lingering_sandbox_pod_names};
+use delete::{
+    K8S_THROTTLE_DELETE_RETRY_ATTEMPTS, lingering_sandbox_pod_names, retry_kube_delete_throttling,
+};
 #[cfg(test)]
 use ensure_pod::restore_placement_sample;
 #[cfg(test)]

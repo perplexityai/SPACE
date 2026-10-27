@@ -525,18 +525,18 @@ async fn a_stops_guest_flush_is_decided_from_the_state_it_supersedes() {
 #[test]
 fn a_stops_flush_resumes_a_paused_vm_first() {
     use crate::service::cleanup::BeforeStopFlush;
-    use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+    use pplx_space_node_runtime_core::vm_state::VmState;
     assert_eq!(
-        BeforeStopFlush::for_vm_state(Some(FirecrackerVmState::Paused)),
+        BeforeStopFlush::for_vm_state(Some(VmState::Paused)),
         BeforeStopFlush::ResumeThenFlush
     );
     assert_eq!(
-        BeforeStopFlush::for_vm_state(Some(FirecrackerVmState::Running)),
+        BeforeStopFlush::for_vm_state(Some(VmState::Running)),
         BeforeStopFlush::Flush
     );
     assert_eq!(BeforeStopFlush::for_vm_state(None), BeforeStopFlush::Flush);
     assert_eq!(
-        BeforeStopFlush::for_vm_state(Some(FirecrackerVmState::NotStarted)),
+        BeforeStopFlush::for_vm_state(Some(VmState::NotStarted)),
         BeforeStopFlush::NotRunning
     );
 }

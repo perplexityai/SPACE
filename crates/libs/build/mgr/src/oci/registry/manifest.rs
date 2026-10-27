@@ -2,7 +2,7 @@ use oci_spec::distribution::Reference as OciReference;
 use oci_spec::image::{Arch as OciArch, Descriptor, ImageIndex, ImageManifest, Os};
 use serde::Deserialize;
 
-use super::{Arch, Digest, ManifestPayload, ManifestSource, RegistryError};
+use super::{Arch, Digest, ManifestPayload, ManifestSource, RegistryError, ResolvedImage};
 
 const MAX_INDEX_DEPTH: usize = 4;
 
@@ -17,7 +17,7 @@ pub(super) async fn resolve(
     reference: &OciReference,
     arch: Arch,
     source: &dyn ManifestSource,
-) -> Result<OciReference, RegistryError> {
+) -> Result<ResolvedImage, RegistryError> {
     let selector = reference
         .digest()
         .or_else(|| reference.tag())
@@ -32,10 +32,22 @@ pub(super) async fn resolve(
         match document {
             RegistryDocument::Manifest(manifest) => {
                 reject_alternate_urls(manifest.config())?;
+                if manifest.config().size() > 4 * 1024 * 1024 {
+                    return Err(RegistryError::ImageConfigTooLarge);
+                }
                 for layer in manifest.layers() {
                     reject_alternate_urls(layer)?;
                 }
-                return Ok(reference.clone_with_digest(root_digest.to_string()));
+                let config_digest = manifest
+                    .config()
+                    .digest()
+                    .to_string()
+                    .parse()
+                    .map_err(|source| RegistryError::InvalidManifestDigest { source })?;
+                return Ok(ResolvedImage {
+                    reference: reference.clone_with_digest(root_digest.to_string()),
+                    config_digest,
+                });
             }
             RegistryDocument::Index(index) => {
                 let selected = selected_platform(index.manifests(), arch)?;

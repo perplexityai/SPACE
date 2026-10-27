@@ -332,16 +332,15 @@ fn execute_one(
     // Atomic rename into a `.gc-pending-<id>` sibling. Linux's
     // open-file semantics keep any in-flight reader's fd valid; new
     // opens of the original path fail with ENOENT. The lease holds
-    // the row in 'deleting' across the rename.
-    let candidate_local_path = lease.local_path();
-    let staging = format!("{candidate_local_path}.gc-pending-{candidate_id_str}");
-    let disk_present = match std::fs::rename(candidate_local_path, &staging) {
-        Ok(()) => true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+    // the row in 'deleting' across the rename, and from here a failed
+    // commit leaves it 'deleting' for startup recovery rather than
+    // 'ready' advertising a missing path.
+    let staging_to_clean = match lease.vacate_to_gc_staging() {
+        Ok(staging) => staging,
         Err(err) => {
             warn!(
                 local_artifact_id = %candidate_id,
-                local_path = %candidate_local_path,
+                local_path = %lease.local_path(),
                 error = %err,
                 "snapshot reaper: rename to staging path failed; lease will roll state back",
             );
@@ -350,10 +349,6 @@ fn execute_one(
             return Err(format!("rename failed: {err}"));
         }
     };
-    // The bytes are no longer at local_path: if the commit below fails, the
-    // row must stay 'deleting' for startup recovery rather than return to
-    // 'ready' advertising a missing path.
-    lease.mark_path_vacated();
 
     // Finalize: DELETE the row. The DELETE is gated by `state =
     // 'deleting'` so a concurrent rollback (impossible while we
@@ -365,7 +360,6 @@ fn execute_one(
     // returns, via node-mgr's `DeleteCacheArtifact` RPC. Returning
     // the path lets the async caller invoke that without making
     // the per-candidate blocking phase itself dial gRPC.
-    let staging_to_clean = disk_present.then_some(staging);
     Ok((EvictionOutcome::Deleted, staging_to_clean))
 }
 

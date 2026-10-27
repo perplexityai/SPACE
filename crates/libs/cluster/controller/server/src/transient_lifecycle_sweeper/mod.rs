@@ -53,22 +53,26 @@
 //!   `persist_pod_metadata` write) and the row then converges; no such pod
 //!   defers the row, still `restoring`, until something hydrates it or the
 //!   VM retires into the revert path below.
-//! - **alive + `creating`, owner gone, never routable** — a create whose API
-//!   process died after its pod was placed, before its execution became
-//!   routable (`running` with a pod IP), leaves the VM running and the row
-//!   `creating`. The candidate select never
-//!   lists a `creating` row whose active execution holds an
-//!   activation-attempt lease that hasn't been expired for a full age window:
-//!   until then the request may still be running and finalize the row
-//!   itself. Once it has, the row fails and retires like a dead one rather
-//!   than converging: the client that asked for it usually never got its id,
-//!   and nothing records what else the request asked for. The fail CAS
-//!   re-checks that the execution is still unroutable.
+//! - **alive + `creating`, owner gone, no receipt can finish it** — a create
+//!   whose API process died after its pod was placed, before its execution
+//!   became routable (`running` with a pod IP), leaves the VM running and the
+//!   row `creating`. So does a start that adopted such a row and gave its
+//!   activation up before its wake, routable or not: it clears the attempt a
+//!   completion receipt would match on. The candidate select never lists a `creating` row whose
+//!   active execution's activation-attempt lease (or the expiry an owner left
+//!   when it gave the activation up) hasn't been expired for a full age
+//!   window: until then the request may still be running and finalize the
+//!   row itself. Once it has, the row fails and retires like a dead one
+//!   rather than converging: the client that asked for it usually never got
+//!   its id, and nothing records what else the request asked for. The fail
+//!   CAS re-checks that no receipt can finish it yet.
 //! - **alive + `creating`, otherwise** — defer. A crashed create whose
 //!   execution became routable still holds its attempt, so the node's
 //!   activation-completion receipt moves it to `started`. A `creating` row
-//!   whose execution holds no attempt (never assigned, or already released)
-//!   has nothing to show its owner is gone.
+//!   whose execution has no lease at all has nothing to show its owner is
+//!   gone: a non-blocking warm-pool adoption never takes one, and an
+//!   activation that finished releases its lease entirely even if its
+//!   lifecycle write then failed.
 //! - **alive + anything else** — defer; a later slice may converge those.
 //! - **`restoring` (dormant / dead / missing) with a ready durable
 //!   snapshot** — revert to `suspended` and retire the leftover execution;
@@ -90,6 +94,44 @@
 //! candidate set is large — must not stretch one tick to tens of minutes or
 //! act on verdicts gathered long before. Candidates on unprobed nodes defer
 //! to the next tick.
+//!
+//! ## Owner check
+//!
+//! A row in an activation-owned lifecycle (`creating`, `starting`,
+//! `resuming`, `restoring`, `pausing`, `checkpointing`;
+//! [`is_activation_owned`]) can have an owner, the request bringing the
+//! sandbox up, which holds an activation-attempt lease on the active
+//! execution. For `pausing` and `checkpointing` that owner is a start that
+//! runs on the row before it settles; the pause or checkpoint itself takes no
+//! attempt, so a row without one is swept as before. The candidate select never lists such a row, and
+//! the fail, converge and revert CASes refuse it, until that lease has ended
+//! a full age window ago: until then the owner may still be running, and
+//! acting on its row makes its own transition lose. Age alone can't show
+//! that, because the lease's TTL outlives any one API-to-node call but not a
+//! whole activation.
+//!
+//! An owner that gives up an activation it never dispatched clears its
+//! attempt but keeps the time it gave up as the lease's expiry, so a row it
+//! leaves behind is covered too. For a `creating` row that's a start which
+//! adopted a crashed create's row and failed: once the window has passed,
+//! the row is failed and retired whether its VM is alive, dead or missing,
+//! even though whoever called the start knows its id. That holds even when
+//! the start had recorded the pod routable: unlike a crashed create that
+//! became routable, the row holds no attempt for the node's
+//! activation-completion receipt to finish. Failed cleanup reads such an
+//! execution as finished, since it reached `running`, so a retire that
+//! doesn't complete can leave it to repair the row to `started`.
+//!
+//! For `restoring` the restore lease usually says the same thing, since
+//! materialization sets both to the same window, but a `restoring` row whose
+//! restore lease was cleared still has its wake's attempt. The
+//! unrestorable-`restoring` fail doesn't apply this check; it matches only a
+//! row with no active execution.
+//!
+//! Of these lifecycles only `creating` and `restoring` are ever written to
+//! the row today: the start and resume paths keep the row's old lifecycle
+//! while they run, and nothing writes `pausing` or `checkpointing`. The other
+//! arms keep the check in place if a writer starts using them.
 //!
 //! ## Drift safety
 //!
@@ -187,6 +229,24 @@ pub(crate) const SWEEPABLE_LIFECYCLES: &[SandboxLifecycle] = &[
     SandboxLifecycle::Stopping,
     SandboxLifecycle::Checkpointing,
 ];
+
+/// Whether a row in `lifecycle` can be owned by a request holding an
+/// activation-attempt lease on the active execution: the create, start,
+/// resume, or wake or restore bringing the sandbox up, or a start that runs
+/// while the row is still `pausing` or `checkpointing` (start materializes an
+/// execution from either). The sweep doesn't act on such a row while that
+/// lease may still be its owner's; see "Owner check" in the module docs.
+pub(crate) const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        SandboxLifecycle::Creating
+            | SandboxLifecycle::Starting
+            | SandboxLifecycle::Resuming
+            | SandboxLifecycle::Restoring
+            | SandboxLifecycle::Pausing
+            | SandboxLifecycle::Checkpointing
+    )
+}
 
 fn emit_transient_sweep_event(
     sandbox_id: SandboxId,
@@ -901,8 +961,8 @@ pub struct FailedCleanupCandidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstActivation {
     /// It finished (the execution reached `running`), or the execution holds no
-    /// attempt. The row may be repaired to `started` when its node reports
-    /// the VM started.
+    /// lease at all: no attempt and no expiry. The row may be repaired to
+    /// `started` when its node reports the VM started.
     Finished,
     /// It never reached `running` and still holds an activation attempt (the
     /// route's or a later one) whose lease hasn't expired: its owner may still be
@@ -914,6 +974,10 @@ pub enum FirstActivation {
     /// As `InFlight`, but the lease has expired. The row is `failed`, so the
     /// create can't finish even if its owner is still working. Retired even
     /// with its VM alive, never repaired to `started`.
+    ///
+    /// It also covers an activation its last owner gave up without
+    /// dispatching it (`give_up_activation_attempt_best_effort`): no attempt,
+    /// but the expiry the owner cut to when it gave up, now passed.
     Abandoned,
 }
 
@@ -949,15 +1013,19 @@ pub struct CommandReadyPendingCandidate {
 pub enum FailGuard {
     /// Only the candidate select's guards.
     Aged,
-    /// Also that the row's active execution still isn't routable. The sweep
-    /// fails an alive abandoned create only if it never became routable; one
-    /// that did is left to its node's activation-completion receipt, so a pod
-    /// IP committed between the select and the CAS (a read of the pod records
-    /// one) makes the CAS claim nothing. The pod-IP write doesn't take the
-    /// sandbox row lock, so one that lands after the CAS, before the retire,
-    /// isn't caught: the retire's pod fence checks the pod's identity, not its
-    /// IP.
-    NeverRoutable,
+    /// Also that no activation-completion receipt can still finish the row:
+    /// its active execution isn't both routable and holding an attempt. The
+    /// sweep fails an alive abandoned create unless a receipt can still move
+    /// it to `started`, which takes a routable execution and the attempt the
+    /// receipt matches on. So a pod IP committed between the select and the
+    /// CAS (a read of the pod records one) makes the CAS claim nothing while
+    /// an attempt is held, and an attempt claimed in between does too while
+    /// the execution is routable. An owner that gave its activation up holds
+    /// no attempt, so a routable row it left behind still fails. The pod-IP
+    /// write doesn't take the sandbox row lock, so one that lands after the
+    /// CAS, before the retire, isn't caught: the retire's pod fence checks the
+    /// pod's identity, not its IP.
+    NoPendingReceipt,
 }
 
 /// DB-side surface the sweeper depends on. Implementations:
@@ -996,7 +1064,9 @@ pub trait SweepSink: Send + Sync + 'static {
     /// flip time (running + pod IP, or a non-k8s substrate) — the act-phase
     /// routability proof is stale the moment a concurrent wake replaces the
     /// active execution, so the wake-target contract must be enforced inside
-    /// the CAS itself. Returns whether this call claimed the row.
+    /// the CAS itself. It also applies the activation-owner check (see
+    /// "Owner check" in the module docs) under the sandbox row lock. Returns
+    /// whether this call claimed the row.
     fn converge_restoring(
         &self,
         sandbox_id: SandboxId,
@@ -1052,6 +1122,9 @@ pub trait SweepSink: Send + Sync + 'static {
     /// selected, and a fenced release of the abandoned pod's runtime is held
     /// until the next suspend.
     ///
+    /// Like the converge CAS, it applies the activation-owner check under the
+    /// sandbox row lock.
+    ///
     /// Returns what the write needs to be undone, or `None` if it claimed
     /// nothing.
     fn revert_to_suspended(
@@ -1063,9 +1136,11 @@ pub trait SweepSink: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<Option<RevertedToSuspended>, sqlx::Error>> + Send;
 
     /// CAS one provably-unrecoverable row from `lifecycle` to `'failed'`,
-    /// with the same evacuation-exemption guards as the candidate select,
-    /// plus whatever `guard` adds. Returns whether this call claimed the row;
-    /// cleanup runs only on claimed rows.
+    /// with the same guards as the candidate select, including the
+    /// activation-owner check for an activation-owned lifecycle, which it
+    /// applies under the sandbox row lock, plus whatever `guard` adds.
+    /// Returns whether this call claimed the row; cleanup runs only on
+    /// claimed rows.
     fn fail_aged_candidate(
         &self,
         sandbox_id: SandboxId,
@@ -1871,12 +1946,12 @@ impl<S: SweepSink> Reconciler<S> {
     ) {
         let sandbox_id = candidate.sandbox_id;
         let lifecycle_label = candidate.lifecycle.to_string();
-        // `decide` fails an alive create only if it never became routable;
-        // the CAS re-checks that, as it re-checks the owner.
+        // `decide` fails an alive create only if no completion receipt can
+        // still finish it; the CAS re-checks that, as it re-checks the owner.
         let guard = if candidate.lifecycle == SandboxLifecycle::Creating
             && verdict == ProbeVerdict::AliveOnNode
         {
-            FailGuard::NeverRoutable
+            FailGuard::NoPendingReceipt
         } else {
             FailGuard::Aged
         };

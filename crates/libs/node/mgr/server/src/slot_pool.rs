@@ -589,7 +589,9 @@ pub struct NetworkPool {
 }
 
 impl NetworkPool {
-    fn mark_node_status_dirty(&self) {
+    /// Ask node-ctl to republish node status. The pool owns the process's
+    /// sink; other node-status changes, such as the execution policy, mark here.
+    pub(crate) fn mark_node_status_dirty(&self) {
         self.node_status_dirty.mark_node_status_dirty();
     }
 

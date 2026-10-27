@@ -20,9 +20,20 @@ fn a_release_archive_is_an_https_url() {
         "https:///a.tgz",
         "https://a b",
         "https://example.test/a.tgz?token=1",
+        "https://user:secret@example.test/a.tgz",
+        "https://user@example.test/a.tgz",
+        "https://@example.test/a.tgz",
+        "https://example.test/a.tgz#secret",
     ] {
         value.parse::<ReleaseUrl>().expect_err(value);
     }
+    "https://example.test/releases/@stable"
+        .parse::<ReleaseUrl>()
+        .unwrap();
+    let error = "https://example.test/a.tgz?token=synthetic-private-value"
+        .parse::<ReleaseUrl>()
+        .unwrap_err();
+    assert!(!format!("{error:?}: {error}").contains("synthetic-private-value"));
 }
 
 #[test]

@@ -932,6 +932,13 @@ pub(super) fn validate_slot_ready(
             "namespace rp_filter is not disabled".to_string(),
         ));
     }
+    if !net::try_ns_sysctl_check(&ns, "net.ipv4.conf.tap0.src_valid_mark", "0")?
+        || !net::try_ns_sysctl_check(&ns, "net.ipv4.conf.all.src_valid_mark", "0")?
+    {
+        return Err(SlotValidationError::Invalid(
+            "namespace src_valid_mark is not disabled".to_string(),
+        ));
+    }
     Ok(())
 }
 

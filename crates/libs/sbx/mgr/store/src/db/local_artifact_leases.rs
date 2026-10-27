@@ -257,6 +257,30 @@ pub fn count_artifacts_at_path(conn: &Connection, local_path: &str) -> Result<u6
     )
 }
 
+db_private_outside_tests! {
+    /// The identities of `sandbox_id`'s artifact rows at `local_path`.
+    fn artifacts_at_path(
+        conn: &Connection,
+        sandbox_id: &str,
+        local_path: &str,
+    ) -> Result<Vec<LocalArtifactId>> {
+        let mut statement = conn.prepare(
+            "SELECT local_artifact_id FROM local_artifacts
+              WHERE sandbox_id = ?1 AND local_path = ?2
+              ORDER BY local_artifact_id",
+        )?;
+        let ids = statement
+            .query_map(params![sandbox_id, local_path], |row| row.get::<_, String>(0))?
+            .map(|id| {
+                id.map_err(Error::from)?
+                    .parse::<LocalArtifactId>()
+                    .map_err(|error| Error::decode(0, rusqlite::types::Type::Text, error))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+}
+
 /// Reset every `restoring` row to `ready`; the number reset.
 pub fn reset_restoring_artifacts(conn: &Connection) -> Result<usize> {
     conn.execute(

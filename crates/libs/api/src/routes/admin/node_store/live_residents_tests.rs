@@ -204,7 +204,7 @@ async fn in_tx_local_snapshots(pool: &PgPool, node: NodeId) -> TestResult<i64> {
         super::sandbox_occupancy_for_node_in_tx(&mut tx, node, ResidencyEvidence::LifecycleOnly)
             .await?;
     tx.commit().await?;
-    Ok(occupancy.local_snapshots)
+    Ok(occupancy.drain_blockers)
 }
 
 async fn live(pool: &PgPool, node_id: NodeId) -> TestResult<NodeLiveResidents> {

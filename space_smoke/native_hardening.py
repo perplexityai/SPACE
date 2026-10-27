@@ -169,6 +169,7 @@ class NativeHardeningFixture:
         token: str | None = None,
         api_url: str | None = None,
         timeout: float | None = None,
+        accept: str = "application/json",
     ) -> NativeResponse:
         """Return HTTP failures unchanged; transport failures raise safely.
 
@@ -210,7 +211,7 @@ class NativeHardeningFixture:
                     self._create_origins[idempotency_key] = base
                 self._uncertain_creates.add(idempotency_key)
         headers = {
-            "Accept": "application/json",
+            "Accept": accept,
             "Authorization": f"Bearer {self.config.token if token is None else token}",
         }
         if idempotency_key is not None:

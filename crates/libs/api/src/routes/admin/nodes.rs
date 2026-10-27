@@ -920,6 +920,34 @@ pub async fn dispatch_node_action(
     apply_drain_action(state, actor, node_id, action, drain_request).await
 }
 
+/// The 409 body for a refused `:terminate`.
+///
+/// Extracted from the handler for the same reason as
+/// [`terminate_blocked_by_occupancy`] below: so the keys it emits are
+/// testable without a handler, a database and an authenticated request.
+/// They need testing because one of them exists for a reader outside this
+/// repository's type system.
+///
+/// `sandboxes_drain_blockers` is the count's real name — it is
+/// `drain_gate_blockers_for_node`, not a count of local snapshots.
+/// `sandboxes_local_snapshots` is emitted alongside it as an alias of the same
+/// number. `scripts/space-rollout-mng.py` reads `sandboxes_drain_blockers` off
+/// this body and falls back to the alias, and a copy of the tool from before it
+/// read the new key reads only the alias. That tool drives `:terminate`
+/// unattended across a rollout, and its classification keys on
+/// `sandboxes_active`, so dropping the alias wouldn't break an older copy; it
+/// would silently null the count in the event an operator reads to see *why* a
+/// wave stalled. Retire the alias once no such copy runs.
+fn terminate_conflict_body(occupancy: &node_store::TerminateOccupancy) -> serde_json::Value {
+    serde_json::json!({
+        "error": "node still holds sandboxes; terminating would destroy \
+                  resident sandboxes or strand local-disk snapshots",
+        "sandboxes_active": occupancy.active,
+        "sandboxes_drain_blockers": occupancy.drain_blockers,
+        "sandboxes_local_snapshots": occupancy.drain_blockers,
+    })
+}
+
 /// Pure predicate behind the `:terminate` occupancy guard: does this node still
 /// hold something that terminating would destroy or strand?
 ///
@@ -928,8 +956,8 @@ pub async fn dispatch_node_action(
 /// `controllers::sandbox::lifecycle`. Both halves matter, and the
 /// `active` half is the one that was computed and not checked; see the call site
 /// for what that cost.
-fn terminate_blocked_by_occupancy(occupancy: &node_store::SandboxOccupancy) -> bool {
-    occupancy.active > 0 || occupancy.local_snapshots > 0
+fn terminate_blocked_by_occupancy(occupancy: &node_store::TerminateOccupancy) -> bool {
+    occupancy.active > 0 || occupancy.drain_blockers > 0
 }
 
 /// The 501 for an action [`DrainAction::runs_without_node_drain`] excludes,
@@ -1535,8 +1563,10 @@ async fn apply_drain_action(
     // A fence honoured by every placement writer and the provider-termination
     // path would be needed to close that race.
     //
-    // * `local_snapshots` — a suspended sandbox may retain its only snapshot
-    //   on the node named by `target_node_id`; terminating would strand it.
+    // * `drain_blockers` — a row the drain gate holds the node for: a suspended
+    //   sandbox whose only snapshot is on the node named by `target_node_id`,
+    //   a `suspending` or non-evacuation `restoring` row pinned there, or an
+    //   upload still in flight from it; terminating would strand it.
     // * `active` — a resident sandbox dies with the instance. Both this route
     //   and the drained-node terminator must check residency before advancing.
     //   `space-rollout-mng.py` calls this route automatically for drained nodes.
@@ -1571,12 +1601,7 @@ async fn apply_drain_action(
             });
             return (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "node still holds sandboxes; terminating would destroy \
-                              resident sandboxes or strand local-disk snapshots",
-                    "sandboxes_active": occupancy.active,
-                    "sandboxes_local_snapshots": occupancy.local_snapshots,
-                })),
+                Json(terminate_conflict_body(&occupancy)),
             )
                 .into_response();
         }

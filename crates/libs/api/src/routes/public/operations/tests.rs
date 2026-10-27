@@ -122,6 +122,21 @@ fn accept_header_detects_event_stream() {
 }
 
 #[test]
+fn accept_header_event_stream_with_zero_weight_is_not_acceptable() {
+    for (accept, expected) in [
+        ("text/event-stream;q=0", false),
+        ("text/event-stream; Q=0.000", false),
+        ("text/event-stream;q=0, application/json", false),
+        ("text/event-stream;q=0.1", true),
+        ("text/event-stream;q=0, text/event-stream", true),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, accept.parse().unwrap());
+        assert_eq!(accepts_event_stream(&headers), expected, "{accept}");
+    }
+}
+
+#[test]
 fn operation_terminal_helpers_cover_states_and_events() {
     assert!(operation_state_is_terminal(OperationState::Succeeded));
     assert!(operation_state_is_terminal(OperationState::Failed));

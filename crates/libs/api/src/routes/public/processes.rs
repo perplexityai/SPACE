@@ -11,7 +11,8 @@ use pplx_space_common_core::types::{ProcessId, ProcessSignal};
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_public_api::{
-    ProcessMutationResponse, ProcessSignalRequest, PublicPage, PublicProcess, PublicSandboxId,
+    DataPlaneProcessExitStatus, ProcessMutationResponse, ProcessSignalRequest, ProcessState,
+    PublicPage, PublicProcess, PublicSandboxId,
 };
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{SpacedKillProcessRequest, SpacedSendSignalRequest};
@@ -59,7 +60,8 @@ pub async fn list_processes(
 ) -> Result<Json<PublicPage<PublicProcess>>, PublicApiError> {
     let cursor = query.cursor()?;
     let limit = query.limit();
-    let processes = fetch_public_processes(authorized, &state, org.id, &sandbox_id).await?;
+    let processes =
+        fetch_public_processes(authorized, &state, org.id, &sandbox_id, false, None).await?;
 
     Ok(Json(process_page(processes, cursor.as_ref(), limit)?))
 }
@@ -100,7 +102,18 @@ pub async fn get_process(
 ) -> Result<Json<PublicProcess>, PublicApiError> {
     let process_id = ProcessId::parse(process_id)
         .map_err(|_| PublicApiError::bad_request("invalid process id"))?;
-    let processes = fetch_public_processes(authorized, &state, org.id, &sandbox_id).await?;
+    // Also an exited process the sandbox still retains, with its exit; the
+    // list stays running-only. A guest that predates the filter lists every
+    // process, so this still selects the one asked for.
+    let processes = fetch_public_processes(
+        authorized,
+        &state,
+        org.id,
+        &sandbox_id,
+        true,
+        Some(&process_id),
+    )
+    .await?;
     let Some(process) = processes
         .into_iter()
         .find(|process| process.process_id == process_id)
@@ -212,6 +225,8 @@ async fn fetch_public_processes(
     state: &AppState,
     org_id: OrgId,
     sandbox_id: &str,
+    include_exited: bool,
+    process_id: Option<&ProcessId>,
 ) -> Result<Vec<PublicProcess>, PublicApiError> {
     let sandbox = ensure_sandbox_owner(authorized, state, org_id, sandbox_id).await?;
     let sandbox_id = PublicSandboxId::from(sandbox.id);
@@ -223,6 +238,8 @@ async fn fetch_public_processes(
             &sandbox,
             SandboxApiMetricIdentity::native("process_list"),
             sandbox_id.into(),
+            include_exited,
+            process_id,
         )
         .await
         .map_err(controller_error)?;
@@ -279,6 +296,18 @@ fn public_process(info: spaced_ops::ProcessInfo) -> Result<PublicProcess, Public
         PublicApiError::internal()
             .with_classification(ResponseOrigin::Node, ResponseKind::BackendStatus)
     })?;
+    // A running process keeps its earlier wire shape: every exit field,
+    // `state` included, is absent until the process has exited.
+    let exit = info.exit.as_ref();
+    let (exit_status, signal) = exit.map(public_process_exit).unzip();
+    let ended_at = info
+        .ended_at
+        .filter(|_| exit.is_some())
+        .and_then(|ended_at| {
+            time::OffsetDateTime::from_unix_timestamp(ended_at.seconds)
+                .ok()?
+                .checked_add(time::Duration::nanoseconds(ended_at.nanos.into()))
+        });
     Ok(PublicProcess {
         process_id,
         pid: info.pid,
@@ -286,7 +315,30 @@ fn public_process(info: spaced_ops::ProcessInfo) -> Result<PublicProcess, Public
         cwd: info.cwd,
         user: info.user,
         tag: info.tag,
+        state: exit.map(|_| ProcessState::Exited),
+        exit_code: exit.map(spaced_ops::ProcessExit::shell_exit_code),
+        exit_status,
+        signal: signal.flatten(),
+        ended_at,
     })
+}
+
+/// The exit's status, as the stream's `process_exited` reports it, and its
+/// signal.
+fn public_process_exit(
+    exit: &spaced_ops::ProcessExit,
+) -> (DataPlaneProcessExitStatus, Option<i32>) {
+    use spaced_ops::process_exit::Outcome;
+    match &exit.outcome {
+        Some(Outcome::Exited(_)) => (DataPlaneProcessExitStatus::Exited, None),
+        Some(Outcome::Signaled(signaled)) => {
+            (DataPlaneProcessExitStatus::Signaled, signaled.signal)
+        }
+        Some(Outcome::TimedOut(timed_out)) => {
+            (DataPlaneProcessExitStatus::TimedOut, timed_out.signal)
+        }
+        Some(Outcome::Unknown(_)) | None => (DataPlaneProcessExitStatus::Unknown, None),
+    }
 }
 
 fn process_page(

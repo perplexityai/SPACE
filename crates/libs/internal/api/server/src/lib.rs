@@ -23,6 +23,7 @@ pub mod ingress_activation;
 mod node_inventory;
 mod route_identity;
 mod run;
+mod runtime_desired_state;
 mod sandbox_service_ports;
 mod trusted_storage;
 mod visibility_observations;
@@ -54,9 +55,10 @@ use pplx_space_common_core::types::{
     SnapshotKind, SnapshotName, SnapshotState, SubstrateKind, TemplateName,
 };
 use pplx_space_common_svc::types::{
-    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
-    FACET_TEMPLATE_BASE_SNAPSHOT_POLICY, FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
-    NODE_RECONCILE_CLAIM_STALE_SECS, NetworkPolicyTarget, ReconcileFacet,
+    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
+    FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NODE_RECONCILE_CLAIM_STALE_SECS,
+    NetworkPolicyTarget, ReconcileFacet,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -76,7 +78,8 @@ use crate::proto::{
     GetArtifactBackupLocationResponse, GetDataPlaneOrgRevocationEpochRequest,
     GetDataPlaneOrgRevocationEpochResponse, GetDataPlaneSessionRevocationStateRequest,
     GetDataPlaneSessionRevocationStateResponse, GetNodeNetworkPolicyStateRequest,
-    GetNodeNetworkPolicyStateResponse, GetNodeSandboxDesiredStateRequest,
+    GetNodeNetworkPolicyStateResponse, GetNodeRuntimeDesiredStateRequest,
+    GetNodeRuntimeDesiredStateResponse, GetNodeSandboxDesiredStateRequest,
     GetNodeSandboxDesiredStateResponse, GetNodeTemplateBaseSnapshotPolicyStateRequest,
     GetNodeTemplateBaseSnapshotPolicyStateResponse, GetNodeTemplateDesiredStateRequest,
     GetNodeTemplateDesiredStateResponse, GetQuarantineRecoveryPlanRequest,
@@ -154,7 +157,6 @@ const SUPPORTED_TEMPLATE_RUNTIMES: &[RuntimeKind] = &[RuntimeKind::Firecracker];
 const NODE_RECONCILE_CLAIM_DEFAULT_LIMIT: i64 = 256;
 const NODE_RECONCILE_MAX_ATTEMPTS: i32 = 16;
 const NODE_RECONCILE_MAX_RETRY_DELAY_SECS: i64 = 300;
-const NODE_STATUS_STALE_AFTER_SECS: i64 = 30;
 
 fn db_guest_port_to_proto(value: i32) -> u32 {
     u16::try_from(value).map(u32::from).unwrap_or(0)
@@ -319,6 +321,10 @@ pub struct ClusterApiService {
     /// than a `static` so each instance — and each test fixture — owns its own.
     /// See `template_visibility_cache`.
     template_visibility_cache: template_visibility_cache::TemplateVisibilityCache,
+    /// Whether `GetNodeRuntimeDesiredState` serves the cluster policy. Off
+    /// unless `from_env_with_security_state` reads it on, so tests don't
+    /// inherit the developer's shell.
+    runtime_desired_state: runtime_desired_state::RuntimeDesiredState,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -583,6 +589,7 @@ impl ClusterApiService {
             template_releases_store,
             route_ed25519_authority,
             ecw_credential_keyring,
+            runtime_desired_state: runtime_desired_state::RuntimeDesiredState::Disabled,
         }
     }
 
@@ -633,6 +640,7 @@ impl ClusterApiService {
         service.trusted_template_storage =
             trusted_storage::TrustedTemplateStorageBuckets::from_env()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        service.runtime_desired_state = runtime_desired_state::RuntimeDesiredState::from_env();
         Ok(service)
     }
 
@@ -955,6 +963,7 @@ impl ClusterApiService {
         // node, so a stale runtime on a node the sandbox has since moved off
         // still learns so and releases itself instead of retrying a
         // permission refusal.
+        let mut generation_fence_admitted = false;
         if outcome == snapshot_store::InsertOutcome::Created
             && let Some(execution_generation) = execution_generation
             && !snapshot_store::artifact_registered_by_another_attempt(
@@ -972,6 +981,7 @@ impl ClusterApiService {
                 execution_generation,
             )
             .await?;
+            generation_fence_admitted = true;
         }
         // Authorize on the persisted row: a replay stays bound to the node
         // that registered the attempt even after retirement or relocation,
@@ -1000,6 +1010,7 @@ impl ClusterApiService {
             local_artifact_id: local_artifact_id.to_string(),
             backup_attempt_id: backup_attempt_id.to_string(),
             fence_verdict_only: req.fence_verdict_only,
+            generation_fence_admitted,
         }))
     }
 
@@ -1557,6 +1568,7 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 mod adapter;
 mod auto_lifecycle_delete_completions;
 mod backup_generation_fence;
+mod execution_currency;
 mod execution_observation;
 mod metadata;
 mod node_local_backup_pending;

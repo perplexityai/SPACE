@@ -251,25 +251,29 @@ pub fn decide(candidate: &SweepCandidate, verdict: ProbeVerdict) -> SweepAction 
                 SweepAction::HydrateThenConverge { target }
             }
         }
-        // A create whose owner is gone after its VM came up, and which never
-        // became routable: the candidate select never lists a `creating` row
-        // whose activation lease is live or recently expired, and
-        // `activation_abandoned` says this one's expired a full window ago.
-        // It fails rather than converges. The request that would have
-        // returned the sandbox died: a synchronous create's client never got
-        // the id and usually retries into a second sandbox, and nothing
-        // records what else the request asked for (file-change tracking, say)
-        // for a converge to honor. There is no earlier snapshot to protect,
-        // and the retire keeps node-local state.
+        // A create whose owner is gone after its VM came up, and which no
+        // completion receipt can still finish: the candidate select never lists a `creating` row
+        // whose activation lease is live or recently ended, and
+        // `activation_abandoned` says this one's ended (expired, or given up
+        // by its owner) a full window ago. It fails rather than converges.
+        // The request that would have returned the sandbox died: a
+        // synchronous create's client never got the id and usually retries
+        // into a second sandbox, and nothing records what else the request
+        // asked for (file-change tracking, say) for a converge to honor.
+        // There is no earlier snapshot to protect, and the retire keeps
+        // node-local state.
         //
-        // A routable one defers instead. Its node's activation-completion
-        // receipt moves it to `started` on the attempt it still holds, and
-        // failing it first would only race that receipt and failed cleanup's
-        // repair. The fail CAS re-checks routability (`FailGuard`).
+        // A routable one that still holds its attempt defers instead. Its
+        // node's activation-completion receipt moves it to `started` on that
+        // attempt, and failing it first would only race the receipt and
+        // failed cleanup's repair. A routable one whose owner gave the
+        // activation up holds no attempt for a receipt to match, so nothing
+        // else will finish it, and it fails like one that never became
+        // routable. The fail CAS re-checks both (`FailGuard`).
         ProbeVerdict::AliveOnNode
             if candidate.lifecycle == SandboxLifecycle::Creating
                 && candidate.activation_abandoned
-                && !candidate.routable_execution =>
+                && !(candidate.routable_execution && candidate.activation_attempt_held) =>
         {
             SweepAction::FailAndRetire
         }
