@@ -237,7 +237,7 @@ fn inspect_entry(
             };
             if !matches!(
                 comm.trim(),
-                "firecracker" | "space-spaced-ho" | "space-netgtw-sv"
+                "firecracker" | "cloud-hyperviso" | "space-spaced-ho" | "space-netgtw-sv"
             ) {
                 return Ok(());
             }
