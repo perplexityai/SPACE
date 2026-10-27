@@ -1256,10 +1256,8 @@ pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, Pub
             "Idempotency-Key header is required",
         ));
     };
-    let value = pplx_space_public_api::limits::validate_idempotency_key(value.as_bytes())
-        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
-    IdempotencyKey::parse(value)
-        .map_err(|error| PublicApiError::bad_request(format!("invalid Idempotency-Key: {error}")))
+    IdempotencyKey::parse_header(value.as_bytes())
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))
 }
 
 fn validate_update_request(request: &UpdateSandboxRequest) -> Result<(), PublicApiError> {

@@ -972,21 +972,14 @@ fn parse_if_match_generation(headers: &HeaderMap) -> Result<Option<u64>, ApiErro
 fn template_delete_idempotency_key(
     headers: &HeaderMap,
 ) -> Result<IdempotencyKey, ApiErrorResponse> {
-    let Some(value) = headers
-        .get(IDEMPOTENCY_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(value) = headers.get(IDEMPOTENCY_KEY_HEADER) else {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "Idempotency-Key header is required",
         ));
     };
-    IdempotencyKey::parse(value).map_err(|error| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            format!("invalid Idempotency-Key: {error}"),
-        )
-    })
+    IdempotencyKey::parse_header(value.as_bytes())
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))
 }
 
 fn template_delete_fingerprint(

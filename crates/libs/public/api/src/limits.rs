@@ -49,8 +49,10 @@ pub const MIN_SANDBOX_DISK_MIB: u32 = 1;
 /// Largest writable disk a sandbox can request.
 pub const MAX_SANDBOX_DISK_MIB: u32 = (MAX_SANDBOX_ROOTFS_BYTES / (1024 * 1024)) as u32;
 
-/// Maximum byte length of a native `Idempotency-Key` header.
-pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
+/// Maximum byte length of a native `Idempotency-Key` header, which the API
+/// checks with `IdempotencyKey::parse_header`.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize =
+    pplx_space_common_core::types::MAX_IDEMPOTENCY_KEY_HEADER_BYTES;
 
 /// A request field these limits cover, named as in the request body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,36 +159,6 @@ pub fn validate_update_request(request: &UpdateSandboxRequest) -> Result<(), Req
         validate_resources(resources)?;
     }
     Ok(())
-}
-
-/// Why an `Idempotency-Key` header value was rejected.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum IdempotencyKeyError {
-    #[error("Idempotency-Key must not be empty")]
-    Empty,
-    #[error("Idempotency-Key exceeds {MAX_IDEMPOTENCY_KEY_BYTES} bytes")]
-    TooLong,
-    #[error("Idempotency-Key must contain only printable ASCII characters, spaces and tabs")]
-    InvalidEncoding,
-}
-
-/// Checks a native `Idempotency-Key` header value: 1 to
-/// [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes of printable ASCII, space or tab: what an
-/// HTTP header value can carry as text, without obs-text.
-pub fn validate_idempotency_key(value: &[u8]) -> Result<&str, IdempotencyKeyError> {
-    if value.is_empty() {
-        return Err(IdempotencyKeyError::Empty);
-    }
-    if value.len() > MAX_IDEMPOTENCY_KEY_BYTES {
-        return Err(IdempotencyKeyError::TooLong);
-    }
-    if !value
-        .iter()
-        .all(|byte| byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t'))
-    {
-        return Err(IdempotencyKeyError::InvalidEncoding);
-    }
-    std::str::from_utf8(value).map_err(|_| IdempotencyKeyError::InvalidEncoding)
 }
 
 fn validate_resources(resources: &SandboxResources) -> Result<(), RequestLimitError> {

@@ -13,6 +13,9 @@ use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 64 * 1024;
+/// Maximum byte length of an `Idempotency-Key` HTTP header, which every API
+/// route that takes one checks with [`IdempotencyKey::parse_header`].
+pub const MAX_IDEMPOTENCY_KEY_HEADER_BYTES: usize = 1024;
 const MAX_UNIX_SIGNAL_NUMBER: i32 = 64;
 pub const MAX_PROCESS_ID_BYTES: usize = 128;
 /// Bound on a guest user name, shared by the runtime parser and the
@@ -371,6 +374,17 @@ impl ProcessSignal {
     }
 }
 
+/// Why an `Idempotency-Key` header value was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum IdempotencyKeyHeaderError {
+    #[error("Idempotency-Key must not be empty")]
+    Empty,
+    #[error("Idempotency-Key exceeds {MAX_IDEMPOTENCY_KEY_HEADER_BYTES} bytes")]
+    TooLong,
+    #[error("Idempotency-Key must contain only printable ASCII characters, spaces and tabs")]
+    InvalidEncoding,
+}
+
 /// Client-provided idempotency key for mutating process APIs.
 ///
 /// Use this to deduplicate retries without treating the key as a process ID or
@@ -408,6 +422,40 @@ impl IdempotencyKey {
             return Err(ProcessParseError("idempotency key is too long"));
         }
         Ok(Self(value))
+    }
+
+    /// Parses an `Idempotency-Key` HTTP header value: 1 to
+    /// [`MAX_IDEMPOTENCY_KEY_HEADER_BYTES`] bytes of printable ASCII, space or
+    /// tab, which is what an HTTP header value can carry as text, without
+    /// obs-text. API routes use this rule; [`IdempotencyKey::parse`] keeps its
+    /// wider cap for keys that are already stored or travel between services.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use pplx_space_guest_process::*;
+    /// assert!(IdempotencyKey::parse_header(b"request-1").is_ok());
+    /// assert_eq!(
+    ///     IdempotencyKey::parse_header("r\u{e9}quest".as_bytes()),
+    ///     Err(IdempotencyKeyHeaderError::InvalidEncoding)
+    /// );
+    /// ```
+    pub fn parse_header(value: &[u8]) -> Result<Self, IdempotencyKeyHeaderError> {
+        if value.is_empty() {
+            return Err(IdempotencyKeyHeaderError::Empty);
+        }
+        if value.len() > MAX_IDEMPOTENCY_KEY_HEADER_BYTES {
+            return Err(IdempotencyKeyHeaderError::TooLong);
+        }
+        if !value
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t'))
+        {
+            return Err(IdempotencyKeyHeaderError::InvalidEncoding);
+        }
+        let value =
+            std::str::from_utf8(value).map_err(|_| IdempotencyKeyHeaderError::InvalidEncoding)?;
+        Ok(Self(value.to_owned()))
     }
 
     /// Returns this key only if it is within an endpoint-owned length cap.

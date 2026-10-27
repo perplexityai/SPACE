@@ -637,3 +637,38 @@ async fn admin_pinned_create_follows_the_running_substrate() -> TestResult {
     }
     Ok(())
 }
+
+/// Admin sandbox actions take the same `Idempotency-Key` rule as the native
+/// routes.
+#[test]
+fn admin_idempotency_key_is_header_text_within_the_cap() {
+    let with_key = |value: &[u8]| {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IDEMPOTENCY_KEY_HEADER,
+            axum::http::HeaderValue::from_bytes(value).unwrap(),
+        );
+        headers
+    };
+    let max = "k".repeat(1024);
+    assert_eq!(
+        idempotency_key(&with_key(max.as_bytes())).unwrap().as_str(),
+        max
+    );
+
+    for (headers, message) in [
+        (HeaderMap::new(), "Idempotency-Key header is required"),
+        (
+            with_key(format!("{max}k").as_bytes()),
+            "Idempotency-Key exceeds 1024 bytes",
+        ),
+        (
+            with_key("clé".as_bytes()),
+            "Idempotency-Key must contain only printable ASCII characters, spaces and tabs",
+        ),
+    ] {
+        let error = idempotency_key(&headers).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{message}");
+        assert_eq!(error.message, message);
+    }
+}

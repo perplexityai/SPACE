@@ -1,5 +1,6 @@
 use super::{
-    IdempotencyKey, MAX_IDEMPOTENCY_KEY_BYTES, MAX_PROCESS_COMMAND_ARGS, MAX_PROCESS_COMMAND_BYTES,
+    IdempotencyKey, IdempotencyKeyHeaderError, MAX_IDEMPOTENCY_KEY_BYTES,
+    MAX_IDEMPOTENCY_KEY_HEADER_BYTES, MAX_PROCESS_COMMAND_ARGS, MAX_PROCESS_COMMAND_BYTES,
     ProcessCommand, ProcessParseError, ProcessSignal,
 };
 
@@ -30,4 +31,42 @@ fn idempotency_key_uses_endpoint_owned_length_cap() {
     assert_eq!(key.clone().ensure_len_at_most(9), Ok(key));
     IdempotencyKey::parse("x".repeat(4097)).unwrap();
     IdempotencyKey::parse("x".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1)).unwrap_err();
+}
+
+#[test]
+fn idempotency_key_header_is_header_text_within_the_cap() {
+    let at_max = "k".repeat(MAX_IDEMPOTENCY_KEY_HEADER_BYTES);
+    assert_eq!(
+        IdempotencyKey::parse_header(at_max.as_bytes()).map(|key| key.as_str().to_owned()),
+        Ok(at_max)
+    );
+    assert_eq!(
+        IdempotencyKey::parse_header("k".repeat(MAX_IDEMPOTENCY_KEY_HEADER_BYTES + 1).as_bytes()),
+        Err(IdempotencyKeyHeaderError::TooLong)
+    );
+    assert_eq!(
+        IdempotencyKey::parse_header(b""),
+        Err(IdempotencyKeyHeaderError::Empty)
+    );
+    for accepted in ["!~", "two words", "tab\tseparated"] {
+        assert_eq!(
+            IdempotencyKey::parse_header(accepted.as_bytes()).map(|key| key.as_str().to_owned()),
+            Ok(accepted.to_owned()),
+            "{accepted:?}"
+        );
+    }
+    for invalid in [
+        &b"a\0b"[..],
+        b"a\x01b",
+        b"a\rb",
+        b"a\x7fb",
+        "ключ".as_bytes(),
+        b"\xff",
+    ] {
+        assert_eq!(
+            IdempotencyKey::parse_header(invalid),
+            Err(IdempotencyKeyHeaderError::InvalidEncoding),
+            "{invalid:?}"
+        );
+    }
 }

@@ -646,11 +646,9 @@ async fn persisted_fork_wait_timeout(
 fn parse_idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, E2bApiError> {
     let value = headers
         .get(IDEMPOTENCY_KEY_HEADER)
-        .ok_or_else(|| E2bApiError::bad_request("Idempotency-Key header is required"))?
-        .to_str()
-        .map_err(|_| E2bApiError::bad_request("Idempotency-Key must be valid ASCII"))?;
-    IdempotencyKey::parse(value)
-        .map_err(|error| E2bApiError::bad_request(format!("invalid Idempotency-Key: {error}")))
+        .ok_or_else(|| E2bApiError::bad_request("Idempotency-Key header is required"))?;
+    IdempotencyKey::parse_header(value.as_bytes())
+        .map_err(|error| E2bApiError::bad_request(error.to_string()))
 }
 
 #[cfg(test)]

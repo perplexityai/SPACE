@@ -971,21 +971,14 @@ fn parse_spec(
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, AdminSandboxActionError> {
-    let Some(value) = headers
-        .get(IDEMPOTENCY_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(value) = headers.get(IDEMPOTENCY_KEY_HEADER) else {
         return Err(AdminSandboxActionError::new(
             StatusCode::BAD_REQUEST,
             "Idempotency-Key header is required",
         ));
     };
-    IdempotencyKey::parse(value).map_err(|error| {
-        AdminSandboxActionError::new(
-            StatusCode::BAD_REQUEST,
-            format!("invalid Idempotency-Key: {error}"),
-        )
-    })
+    IdempotencyKey::parse_header(value.as_bytes())
+        .map_err(|error| AdminSandboxActionError::new(StatusCode::BAD_REQUEST, error.to_string()))
 }
 
 fn lifecycle_request_fingerprint(

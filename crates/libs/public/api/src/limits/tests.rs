@@ -328,45 +328,6 @@ fn update_checks_vcpu_and_memory() {
 }
 
 #[test]
-fn idempotency_key_is_header_text_within_the_cap() {
-    let at_max = "k".repeat(MAX_IDEMPOTENCY_KEY_BYTES);
-    assert_eq!(
-        validate_idempotency_key(at_max.as_bytes()),
-        Ok(at_max.as_str())
-    );
-    assert_eq!(validate_idempotency_key(b"!~"), Ok("!~"));
-    assert_eq!(
-        validate_idempotency_key("k".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1).as_bytes()),
-        Err(IdempotencyKeyError::TooLong)
-    );
-    assert_eq!(
-        validate_idempotency_key(b""),
-        Err(IdempotencyKeyError::Empty)
-    );
-    for accepted in ["!~", "two words", "tab\tseparated"] {
-        assert_eq!(
-            validate_idempotency_key(accepted.as_bytes()),
-            Ok(accepted),
-            "{accepted:?}"
-        );
-    }
-    for invalid in [
-        &b"a\0b"[..],
-        b"a\x01b",
-        b"a\rb",
-        b"a\x7fb",
-        "ключ".as_bytes(),
-        b"\xff",
-    ] {
-        assert_eq!(
-            validate_idempotency_key(invalid),
-            Err(IdempotencyKeyError::InvalidEncoding),
-            "{invalid:?}"
-        );
-    }
-}
-
-#[test]
 fn field_names_match_the_request_body() {
     let names = [
         RequestField::Name,

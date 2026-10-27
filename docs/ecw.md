@@ -143,6 +143,8 @@ The following compatibility limits are important:
   reaches 8 MiB of estimated JSON, always returning at least one sandbox. A
   page that ends early still sets `x-next-token`, which the SDK paginator
   follows; a client must not treat a short page as the last one.
+- Sandbox fork takes the native `Idempotency-Key` rule: 1 to 1024 printable
+  ASCII characters, spaces or tabs.
 - The legacy create `secure` field is ignored, matching E2B's newer
   always-secure behavior. `network.allowPublicTraffic=true` is rejected because
   ECW data-plane access is token-authenticated.
