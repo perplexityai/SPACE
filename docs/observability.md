@@ -698,12 +698,16 @@ counts that write once.
 Firecracker's ERROR log lines are re-logged by sandbox-manager as
 `firecracker error` with `sandbox_id` and the line in `firecracker_message`, at
 most 20 in a burst and then one every 15 seconds per sandbox;
-`suppressed_since_last` counts the lines skipped. A line can carry
-guest-written values, so it is cut to 512 bytes and its control characters
-are replaced. WARN, INFO and DEBUG lines are not forwarded; Firecracker warns
-on every snapshot restore. `sandbox.vm.diagnostics` is therefore not emitted
-with `source:firecracker` and `level:warn`. The watchdog's failure-time
-evidence still includes the tail of Firecracker's log, WARN lines included.
+`suppressed_since_last` counts the lines skipped. Firecracker's SIGPIPE line
+(`Received signal 13, ...`) is the exception: the VMM continues after it and
+`vsock` `tx_write_fails` counts the write that raised it, so it is logged at
+DEBUG, is not counted in `sandbox.vm.diagnostics`, and does not spend the
+sandbox's allowance. A line can carry guest-written values, so it is cut to
+512 bytes and its control characters are replaced. WARN, INFO and DEBUG lines
+are not forwarded; Firecracker warns on every snapshot restore.
+`sandbox.vm.diagnostics` is therefore not emitted with `source:firecracker` and
+`level:warn`. The watchdog's failure-time evidence still includes the tail of
+Firecracker's log, WARN lines included.
 
 spaced records its own WARN and ERROR callsites (level, target, source file and
 line, and a count), never message text or field values, which can carry a

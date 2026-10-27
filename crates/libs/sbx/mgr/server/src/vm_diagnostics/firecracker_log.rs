@@ -3,9 +3,12 @@
 //!
 //! Only ERROR lines are re-logged. Firecracker warns on every snapshot restore,
 //! so WARN lines stay in the file, where the watchdog's failure-time tail of it
-//! still reads them. Reading a regular file never affects the VMM; each poll
-//! reads at most [`MAX_READ_BYTES`]. Polls block: they run on the shared log
-//! poll's blocking job, never on the runtime.
+//! still reads them. Its SIGPIPE line is an ERROR it does not act on: the VMM
+//! continues, and `vsock` `tx_write_fails` counts the write that raised it, so
+//! that line is logged at DEBUG and never spends the sandbox's budget. Reading
+//! a regular file never affects the VMM; each poll reads at most
+//! [`MAX_READ_BYTES`]. Polls block: they run on the shared log poll's blocking
+//! job, never on the runtime.
 //!
 //! That one job reads every VM's log, and the jail is the sandbox's to write,
 //! so the shared poll reads only regular files. The path is opened without
@@ -26,6 +29,9 @@ const MAX_READ_BYTES: u64 = 64 * 1024;
 /// A partial line longer than this is not Firecracker's and is dropped.
 const MAX_LINE_BYTES: usize = 8 * 1024;
 const MAX_MESSAGE_BYTES: usize = 512;
+/// What Firecracker's SIGPIPE handler logs, after which the VMM continues. The
+/// signal is raised by a vsock write to a host peer that has gone.
+const SIGPIPE_MESSAGE_PREFIX: &str = "Received signal 13, code ";
 
 /// Bytes one poll read from a log, not yet accepted.
 pub(super) struct LogRead {
@@ -127,6 +133,13 @@ fn forward_line(sandbox_id: &str, line: &str, budget: &mut LogBudget) {
     let Some(message) = error_message(line) else {
         return;
     };
+    if message.starts_with(SIGPIPE_MESSAGE_PREFIX) {
+        tracing::debug!(
+            sandbox_id,
+            "firecracker SIGPIPE: a vsock host peer went away"
+        );
+        return;
+    }
     let Some(suppressed) = budget.admit() else {
         pplx_space_metrics::sandbox::vm::vm_diagnostics(
             VmDiagnosticSource::Firecracker,
@@ -157,3 +170,7 @@ fn error_message(line: &str) -> Option<&str> {
     let (header, message) = header_and_message.split_once("] ")?;
     (header.rsplit(':').next()? == "ERROR").then(|| message.trim_end())
 }
+
+#[cfg(test)]
+#[path = "firecracker_log_tests.rs"]
+mod tests;
