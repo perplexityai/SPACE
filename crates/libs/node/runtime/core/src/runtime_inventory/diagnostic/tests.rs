@@ -95,6 +95,8 @@ impl ScanClock for SettledClock {
 }
 
 const KERNELS_ONLY: ArtifactKinds = ArtifactKinds {
+    initrds: false,
+    firmware: false,
     runtimes: false,
     kernels: true,
 };
@@ -672,6 +674,8 @@ fn a_deadline_during_hashing_leaves_the_digest_unknown() {
         &roots,
         limits,
         ArtifactKinds {
+            initrds: false,
+            firmware: false,
             runtimes: false,
             kernels: true,
         },
@@ -694,6 +698,8 @@ fn digests_are_reused_until_the_image_changes() {
     write(&image_path, &image);
     let mut cache = DigestCache::default();
     let kernels_only = ArtifactKinds {
+        initrds: false,
+        firmware: false,
         runtimes: false,
         kernels: true,
     };
@@ -718,6 +724,8 @@ fn digests_are_reused_until_the_image_changes() {
 
     // A runtime-only scan leaves kernel digests alone.
     let runtimes_only = ArtifactKinds {
+        initrds: false,
+        firmware: false,
         runtimes: true,
         kernels: false,
     };
@@ -879,6 +887,8 @@ fn no_supported_kinds_skips_even_damaged_roots() {
         &roots,
         LIMITS,
         ArtifactKinds {
+            initrds: false,
+            firmware: false,
             runtimes: false,
             kernels: false,
         },
@@ -909,6 +919,8 @@ fn the_kind_filter_skips_other_roots() {
         &roots,
         LIMITS,
         ArtifactKinds {
+            initrds: false,
+            firmware: false,
             runtimes: true,
             kernels: false,
         },
@@ -1268,6 +1280,8 @@ fn filtered_listings_retain_the_other_kinds_bounded_digest_cache() {
     };
     for kinds in [
         ArtifactKinds {
+            initrds: false,
+            firmware: false,
             runtimes: true,
             kernels: false,
         },
@@ -1337,4 +1351,73 @@ fn managed_runtime_roots_keep_same_version_releases_and_failures_separate() {
             assert_ne!(fc.digest, ch.digest);
         }
     }
+}
+
+#[test]
+fn managed_auxiliary_files_are_filtered_hashed_and_never_inferred_as_kernels() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = roots(dir.path());
+    roots.managed_kernels = Some(dir.path().join("managed/kernels"));
+    let store = dir.path().join("managed/boot-artifacts");
+    let bytes = b"opaque boot payload";
+    let digest = Digest::sha256(Sha256::digest(bytes).into());
+    let version: ArtifactVersion = "driver-bundle-1".parse().unwrap();
+    let directory = ManagedDirectoryName::kernel(&version, digest);
+    for kind in [
+        ArtifactComponentKind::Initrd,
+        ArtifactComponentKind::Firmware,
+    ] {
+        let path = store.join(format!("{kind}-{directory}"));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(crate::catalog::BOOT_ARTIFACT_IMAGE), bytes).unwrap();
+    }
+    let mut cache = DigestCache::default();
+    for (initrds, firmware, expected) in [
+        (true, false, ArtifactComponentKind::Initrd),
+        (false, true, ArtifactComponentKind::Firmware),
+    ] {
+        let scan = scan(
+            &roots,
+            LIMITS,
+            ArtifactKinds {
+                runtimes: false,
+                kernels: false,
+                initrds,
+                firmware,
+            },
+            &SettledClock,
+            &mut cache,
+        );
+        assert!(scan.is_complete());
+        assert_eq!(scan.artifacts.len(), 1);
+        let artifact = &scan.artifacts[0];
+        assert_eq!(artifact.origin.kind, ArtifactKind::Component(expected));
+        assert_eq!(artifact.digest, Some(digest));
+        assert_eq!(
+            artifact.version,
+            Some(ScannedVersion::Component(version.clone()))
+        );
+        assert_eq!(artifact.status, ArtifactStatus::Valid);
+        assert!(artifact.architecture.is_none());
+        assert!(artifact.role.is_none());
+    }
+    let initrd = store
+        .join(format!("initrd-{directory}"))
+        .join(crate::catalog::BOOT_ARTIFACT_IMAGE);
+    std::fs::write(&initrd, b"tampered payload").unwrap();
+    let scan = scan(
+        &roots,
+        LIMITS,
+        ArtifactKinds::ALL,
+        &SettledClock,
+        &mut cache,
+    );
+    assert_eq!(
+        scan.artifacts
+            .iter()
+            .find(|artifact| artifact.path == initrd)
+            .unwrap()
+            .status,
+        ArtifactStatus::Invalid
+    );
 }

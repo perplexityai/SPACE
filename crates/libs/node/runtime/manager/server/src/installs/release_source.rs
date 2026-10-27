@@ -88,13 +88,64 @@ impl std::fmt::Display for ReleaseUrl {
     }
 }
 
+/// Source locations keep existing HTTPS job encodings unchanged. Local feeds
+/// are explicitly configured by the host operator; callers cannot choose a path.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ReleaseLocation {
+    Https(ReleaseUrl),
+    Local(super::local_source::LocalSourcePath),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReleaseLocationError {
+    #[error(transparent)]
+    Https(#[from] ReleaseUrlParseError),
+    #[error(transparent)]
+    Local(#[from] super::local_source::LocalSourcePathError),
+}
+impl FromStr for ReleaseLocation {
+    type Err = ReleaseLocationError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.starts_with("file:") {
+            Ok(Self::Local(value.parse()?))
+        } else {
+            Ok(Self::Https(value.parse()?))
+        }
+    }
+}
+impl TryFrom<String> for ReleaseLocation {
+    type Error = ReleaseLocationError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+impl From<ReleaseLocation> for String {
+    fn from(value: ReleaseLocation) -> Self {
+        value.to_string()
+    }
+}
+impl From<ReleaseUrl> for ReleaseLocation {
+    fn from(value: ReleaseUrl) -> Self {
+        Self::Https(value)
+    }
+}
+impl std::fmt::Display for ReleaseLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Https(url) => url.fmt(f),
+            Self::Local(path) => path.fmt(f),
+        }
+    }
+}
+
 /// A release payload and its pinned checksum: everything an
 /// install needs, and the request a release install job carries.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiableRelease {
     pub release: RuntimeIdentity,
     pub architecture: Arch,
-    pub archive: ReleaseUrl,
+    pub archive: ReleaseLocation,
     /// The downloaded payload's SHA-256, as pinned.
     pub sha256: Digest,
 }
@@ -104,17 +155,17 @@ pub struct VerifiableRelease {
 pub enum ReleaseSourceError {
     #[error("fetching {location} failed")]
     Fetch {
-        location: ReleaseUrl,
+        location: ReleaseLocation,
         #[source]
         source: BoxError,
     },
     #[error("{location} did not answer within {}s", after.as_secs())]
     TimedOut {
-        location: ReleaseUrl,
+        location: ReleaseLocation,
         after: Duration,
     },
     #[error("{location} is not served by this source")]
-    Foreign { location: ReleaseUrl },
+    Foreign { location: ReleaseLocation },
 }
 
 pub type ReleaseChunks =
@@ -147,10 +198,10 @@ pub trait ReleaseSource: Send + Sync {
     fn runtime(&self) -> RuntimeKind;
 
     /// The source's root, for listings and records.
-    fn root(&self) -> &ReleaseUrl;
+    fn root(&self) -> ReleaseLocation;
 
     /// Where `release`'s archive for `architecture` is.
-    fn archive(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleaseUrl;
+    fn archive(&self, release: &RuntimeIdentity, architecture: Arch) -> ReleaseLocation;
 
     /// Packaging and required members. Paths written on the node come only
     /// from the runtime's catalog layout, never from archive contents.
@@ -158,7 +209,17 @@ pub trait ReleaseSource: Send + Sync {
 
     /// The payload's bytes, in order. The stream is not bounded as a whole:
     /// the caller bounds how long it waits for each chunk.
-    async fn open(&self, archive: &ReleaseUrl) -> Result<ReleaseChunks, ReleaseSourceError>;
+    async fn open(&self, archive: &ReleaseLocation) -> Result<ReleaseChunks, ReleaseSourceError>;
+}
+
+/// Existing packaging is shared by network and local delivery adapters.
+/// A new runtime must define its delivery layout before being configured.
+pub(super) fn release_payload(release: &RuntimeIdentity, architecture: Arch) -> ReleasePayload {
+    if release.kind == RuntimeKind::Firecracker {
+        firecracker_payload(release, architecture)
+    } else {
+        ReleasePayload::Executable
+    }
 }
 
 /// Map the compiled Firecracker layout to the upstream archive's member names.

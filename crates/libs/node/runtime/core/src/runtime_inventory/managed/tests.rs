@@ -1149,3 +1149,174 @@ fn discovered_initial_failure_is_not_replaced_by_an_unrelated_runtime_error() {
         }
     }
 }
+
+#[test]
+fn auxiliary_boot_inputs_are_authenticated_watched_and_required_only_by_their_binding() {
+    use crate::catalog::{CompiledEnvironment, PinnedBootArtifact, PinnedFile, PinnedRelease};
+    use pplx_space_common_core::types::ComponentIdentity;
+    let fixture = Fixture::new();
+    let initial = synthetic_initial_environment();
+    let cache = fixture._dir.path().join("cache/firecracker");
+    std::fs::create_dir_all(&cache).unwrap();
+    let kernel_source = fixture.staging.join("firecracker/kernels/base/6.1.155");
+    std::fs::create_dir_all(&kernel_source).unwrap();
+    std::fs::write(kernel_source.join(KERNEL_IMAGE), binary(42)).unwrap();
+    fixture
+        .store
+        .publish_kernel(initial.kernel(), &staged("base"))
+        .unwrap();
+    let release = PinnedRelease {
+        release: RuntimeIdentity {
+            kind: RuntimeKind::CloudHypervisor,
+            version: "54.0.0".parse().unwrap(),
+        },
+        architecture: Arch::X86_64,
+        archive_sha256: sha256(b"archive"),
+        binaries: vec![PinnedFile {
+            path: "bin/cloud-hypervisor",
+            sha256: sha256(&binary(73)),
+        }],
+    };
+    let root = fixture.releases.join(managed_release_directory(
+        &release.release,
+        release.digest(),
+    ));
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    let executable = root.join("bin/cloud-hypervisor");
+    std::fs::write(&executable, binary(73)).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pin = PinnedBootArtifact::new(
+        ComponentIdentity {
+            kind: ArtifactComponentKind::Initrd,
+            version: "test-modules-v1".parse().unwrap(),
+            digest: sha256(&binary(74)),
+        },
+        Arch::X86_64,
+        4096,
+    )
+    .unwrap();
+    let environment = CompiledEnvironment::for_test(release, initial.kernel().clone(), "", false)
+        .with_boot_artifact_for_test(
+            pin.clone(),
+            "initramfs".parse().unwrap(),
+            "linux-initramfs".parse().unwrap(),
+        );
+    let requirements = environment.definition().execution_requirements().unwrap();
+    let requested = ExecutionMetadata::new(
+        requirements.runtime().clone(),
+        GuestPlatform {
+            os: GuestOperatingSystem::Linux,
+            architecture: host_arch().unwrap(),
+        },
+        None,
+        requirements.components().to_vec(),
+    )
+    .unwrap()
+    .with_environment(environment.definition().reference());
+    let discover = || {
+        let mut inventory = RuntimeInventory::discover_with_store(
+            &fixture.store,
+            &initial,
+            &fixture._dir.path().join("vendor"),
+            &cache.join("assets"),
+            &cache.join("kernels"),
+        )
+        .unwrap();
+        inventory
+            .include_environment(&fixture.store, &environment, &cache.join("kernels"))
+            .unwrap();
+        inventory
+    };
+    let resolve = |inventory: &RuntimeInventory| {
+        inventory.resolve(
+            Some(&requested),
+            RuntimeKind::CloudHypervisor,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+    };
+    let absent = discover();
+    resolve(&absent).unwrap_err();
+    absent
+        .resolve(
+            None,
+            RuntimeKind::Firecracker,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+        .unwrap();
+
+    let source = fixture
+        .staging
+        .join("components/initrd/modules/test-modules-v1");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join(crate::catalog::BOOT_ARTIFACT_IMAGE), binary(74)).unwrap();
+    fixture.store.prepare_roots().unwrap();
+    fixture
+        .store
+        .publish_boot_artifact(&pin, &staged("modules"))
+        .unwrap();
+    assert!(
+        !absent.check_files_unchanged(),
+        "publication must invalidate an unavailable binding"
+    );
+    let ready = discover();
+    let selected = resolve(&ready).unwrap();
+    let module = selected
+        .component(
+            ArtifactComponentKind::Initrd,
+            Some(&"initramfs".parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(module.metadata.digest, Some(pin.identity().digest));
+    assert!(
+        crate::boot::initramfs_component(&selected.execution)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        module.metadata.format.as_ref().unwrap().as_str(),
+        "linux-initramfs"
+    );
+    assert_eq!(module.integrity, ExecutionSourceIntegrity::CatalogSha256);
+    assert!(
+        module
+            .path
+            .starts_with(cache.join("managed/boot-artifacts"))
+    );
+    assert_eq!(std::fs::read(&module.path).unwrap(), binary(74));
+    let vendor_image = fixture
+        .store
+        .boot_artifacts_root()
+        .join(crate::artifact_store::boot_artifact_directory(
+            pin.identity(),
+        ))
+        .join(crate::catalog::BOOT_ARTIFACT_IMAGE);
+    assert_ne!(
+        std::fs::metadata(&vendor_image).unwrap().ino(),
+        std::fs::metadata(&module.path).unwrap().ino()
+    );
+
+    std::fs::write(&module.path, binary(75)).unwrap();
+    assert!(!ready.check_files_unchanged());
+    let corrupt = discover();
+    resolve(&corrupt).unwrap_err();
+    corrupt
+        .resolve(
+            None,
+            RuntimeKind::Firecracker,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&module.path).unwrap(),
+        binary(75),
+        "corrupt existing bytes are refused, never overwritten"
+    );
+    std::fs::remove_file(&module.path).unwrap();
+    assert!(!corrupt.check_files_unchanged());
+    resolve(&discover()).unwrap();
+    assert_eq!(
+        std::fs::read(&module.path).unwrap(),
+        binary(74),
+        "an empty cache directory is recoverable"
+    );
+}
