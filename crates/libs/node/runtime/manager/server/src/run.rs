@@ -61,6 +61,8 @@ pub enum KernelSourceConfig {
     S3(StorageUri),
     /// A source the deployment supplies.
     Custom(Arc<dyn KernelSource>),
+    #[cfg(feature = "github")]
+    CloudHypervisor,
 }
 
 impl std::fmt::Debug for KernelSourceConfig {
@@ -68,20 +70,27 @@ impl std::fmt::Debug for KernelSourceConfig {
         match self {
             #[cfg(feature = "s3")]
             Self::S3(root) => formatter.debug_tuple("S3").field(root).finish(),
+            #[cfg(feature = "github")]
+            Self::CloudHypervisor => formatter.write_str("CloudHypervisor"),
             Self::Custom(source) => formatter
                 .debug_tuple("Custom")
-                .field(source.root())
+                .field(&source.root())
                 .finish(),
         }
     }
 }
 
 impl KernelSourceConfig {
-    fn into_source(self) -> Arc<dyn KernelSource> {
+    fn into_source(self) -> Result<Arc<dyn KernelSource>, RunRuntimeManagerError> {
         match self {
             #[cfg(feature = "s3")]
-            Self::S3(root) => Arc::new(crate::installs::S3KernelSource::new(root)),
-            Self::Custom(source) => source,
+            Self::S3(root) => Ok(Arc::new(crate::installs::S3KernelSource::new(root))),
+            Self::Custom(source) => Ok(source),
+            #[cfg(feature = "github")]
+            Self::CloudHypervisor => Ok(Arc::new(
+                crate::installs::https_kernel::CloudHypervisorKernels::new()
+                    .map_err(RunRuntimeManagerError::KernelSource)?,
+            )),
         }
     }
 }
@@ -112,7 +121,7 @@ impl std::fmt::Debug for ReleaseSourceConfig {
                 .finish(),
             Self::Custom(source) => formatter
                 .debug_tuple("Custom")
-                .field(source.root())
+                .field(&source.root())
                 .finish(),
         }
     }
@@ -178,7 +187,7 @@ pub struct RuntimeManagerRunConfig {
     pub limits: ScanLimits,
     pub list_admission_timeout: Duration,
     /// Where published kernels are listed and downloaded from.
-    pub kernel_source: Option<KernelSourceConfig>,
+    pub kernel_sources: Vec<KernelSourceConfig>,
     /// Read-only catalog access remains available without an installer.
     pub catalog_dir: PathBuf,
     pub releases: Vec<RuntimeManagerReleaseConfig>,
@@ -188,6 +197,11 @@ pub struct RuntimeManagerRunConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunRuntimeManagerError {
+    #[error(transparent)]
+    DuplicateKernelSource(#[from] crate::installs::source::DuplicateKernelSource),
+    #[cfg(feature = "github")]
+    #[error(transparent)]
+    KernelSource(#[from] crate::installs::https_kernel::KernelSourceBuildError),
     #[error(transparent)]
     ReleaseConfiguration(#[from] crate::ReleaseConfigurationError),
     #[error("failed to bind the runtime-manager socket {path}: {source}")]
@@ -229,7 +243,10 @@ pub async fn run(
         source,
     })?;
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
-    let kernel_source = config.kernel_source.map(KernelSourceConfig::into_source);
+    let mut kernel_source = crate::installs::source::KernelSources::default();
+    for source in config.kernel_sources {
+        kernel_source.insert(source.into_source()?)?;
+    }
     let mut roots = config.roots;
     let pins = Arc::new(DirectoryCatalog(config.catalog_dir));
     let release_contexts = config
@@ -251,9 +268,10 @@ pub async fn run(
         .collect();
     let installer = match config.install {
         Some(install) => {
-            let source = kernel_source
-                .clone()
-                .ok_or(RunRuntimeManagerError::NoKernelSource)?;
+            if kernel_source.is_empty() {
+                return Err(RunRuntimeManagerError::NoKernelSource);
+            }
+            let source = kernel_source.clone();
             let audited = config.state_dir.clone();
             let report = tokio::task::spawn_blocking(move || {
                 crate::protection::audit(
@@ -342,9 +360,7 @@ pub async fn run(
         config.list_admission_timeout,
     )
     .with_catalog(pins, releases);
-    if let Some(source) = kernel_source {
-        service = service.with_kernel_source(source);
-    }
+    service = service.with_kernel_source(kernel_source);
     let pruner = installer
         .clone()
         .map(|installer| tokio::spawn(installer.prune_finished_jobs(shutdown_token.child_token())));

@@ -34,7 +34,9 @@ pub enum ExecutionPolicyObservationError {
     Duplicate(EnvironmentReference),
     #[error("execution policy default {0} is outside its allowlist")]
     DefaultNotAllowed(EnvironmentReference),
-    #[error("execution policy with allowed environments requires a default")]
+    #[error(
+        "execution policy with allowed environments requires a compiled or permitted legacy default"
+    )]
     MissingDefault,
     #[error(
         "execution policy schema {schema_version} needs exactly one of an applied generation or an unreadable cluster policy, and schema 1 neither"
@@ -79,7 +81,7 @@ impl ExecutionPolicyObservation {
                     reference,
                 ));
             }
-            None if !unique.is_empty() && !applied => {
+            None if !unique.is_empty() && !applied && !legacy_unbound_allowed => {
                 return Err(ExecutionPolicyObservationError::MissingDefault);
             }
             _ => {}
