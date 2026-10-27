@@ -1136,8 +1136,8 @@ async fn untracked_runtime_actions_without_placement_are_unavailable() -> TestRe
 /// policy, read when it executes, still lets the session's activity wake it:
 /// allowed, it wakes the paused resident; not allowed, it fails as a conflict
 /// and leaves the sandbox paused. A wake marked for access, as for a
-/// reattach to a running process, needs `access`; an unmarked one is a
-/// command's. A caller's `:wake` is not policy-gated.
+/// reattach to a running process, needs `access`; so does an unmarked one,
+/// whose activity is unknown. A caller's `:wake` is not policy-gated.
 #[tokio::test(flavor = "current_thread")]
 async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> TestResult {
     use crate::controllers::substrate::ExecutionActivityKind::{Access, Command};
@@ -1172,7 +1172,8 @@ async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> Test
         (None, None, access, true),
         (None, Some(&["command"]), command, true),
         (None, Some(&["command"]), access, false),
-        (None, Some(&["command"]), None, true),
+        // Unmarked: queued by an older API, or its record expired.
+        (None, Some(&["command"]), None, false),
     ] {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, "paused", "space").await?;

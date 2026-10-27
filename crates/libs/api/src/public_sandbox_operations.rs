@@ -992,7 +992,7 @@ fn completed_lifecycle_target_state(
 /// activity wake it (see [`implicit_wake_marker`]). Nothing else creates one,
 /// with one exception: `public_operations.actor_user_id` is `ON DELETE SET
 /// NULL`, so a caller's queued `:wake` whose user is deleted before it runs is
-/// recognized here too, and refused if the policy forbids a command wake; no
+/// recognized here too, and refused if the policy forbids an access wake; no
 /// caller remains to want it. A controller without this check runs it as the
 /// plain `:wake` the policy allowed at enqueue. A caller's `:wake` joins the
 /// system's wake only while it is queued, giving it that caller as its actor,
@@ -1021,13 +1021,15 @@ pub(crate) const fn implicit_wake_marker(activity: ExecutionActivityKind) -> Ope
 }
 
 /// The activity an [`implicit_wake_marker`] names. A wake with none, queued
-/// before the marker existed or whose record expired, is a command's: every
-/// such wake was queued for a new command or process session.
+/// by an API from before the marker or whose record expired while it waited,
+/// is judged for access, the stricter rule: it wakes the sandbox only where
+/// any session may, never under a policy that wakes for commands alone on
+/// behalf of what may be a reattach.
 fn implicit_wake_marker_activity(marker: Option<OperationPathTemplate>) -> ExecutionActivityKind {
-    if marker == Some(IMPLICIT_WAKE_FOR_ACCESS) {
-        ExecutionActivityKind::Access
-    } else {
+    if marker == Some(IMPLICIT_WAKE_FOR_COMMAND) {
         ExecutionActivityKind::Command
+    } else {
+        ExecutionActivityKind::Access
     }
 }
 
