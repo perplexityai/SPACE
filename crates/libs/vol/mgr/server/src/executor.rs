@@ -1,5 +1,6 @@
 pub(crate) mod copy;
 mod decode_admission;
+pub(crate) mod integrity;
 mod stream_push;
 use decode_admission::{
     CappedDecode, DecodeGate, DecodedOutputCap, copy_decode_capped, is_output_cap_exceeded,
@@ -174,6 +175,8 @@ impl<'de> serde::Deserialize<'de> for FileMode {
 /// re-typed via [`parse_subject_id_with_legacy_fallback`] at execute time.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_integrity: Option<pplx_space_volmgr_client::Integrity>,
     #[serde(alias = "sandbox_id")]
     pub subject_id: String,
     pub local_path: String,
@@ -1024,6 +1027,7 @@ async fn apply_file_mode(
 /// `Clone` is cheap — `S3ObjectStore` is internally `Arc`-wrapped.
 #[derive(Clone)]
 pub struct TransferExecutor {
+    completion_store: integrity::CompletionStore,
     node_manager: Option<pplx_space_node_mgr_client::NodeManagerGrpcClient>,
     store: Arc<dyn ObjectStore>,
     config: TransferExecutorConfig,
@@ -1084,14 +1088,24 @@ pub struct TransferExecutorConfig {
 }
 
 impl TransferExecutor {
-    pub fn new(config: TransferExecutorConfig, shadow_staging_dir: PathBuf) -> Self {
-        Self::with_store(config, Arc::new(S3ObjectStore::new()), shadow_staging_dir)
+    pub fn new(
+        config: TransferExecutorConfig,
+        shadow_staging_dir: PathBuf,
+        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    ) -> Self {
+        Self::with_store(
+            config,
+            Arc::new(S3ObjectStore::new()),
+            shadow_staging_dir,
+            integrity::CompletionStore::Database(db),
+        )
     }
 
     fn with_store(
         config: TransferExecutorConfig,
         store: Arc<dyn ObjectStore>,
         shadow_staging_dir: PathBuf,
+        completion_store: integrity::CompletionStore,
     ) -> Self {
         let total = resolved_codec_concurrency(config.codec_concurrency);
         let codec = CodecAdmission::new(total, config.codec_priority_reserve);
@@ -1109,6 +1123,7 @@ impl TransferExecutor {
         };
         let shadow_comparisons = ShadowComparisonController::new();
         Self {
+            completion_store,
             node_manager: None,
             stream_push: StreamPushConfig::new(&config.snapshot_upload_mode, total),
             store,
@@ -1151,6 +1166,7 @@ impl TransferExecutor {
             config,
             store,
             std::env::temp_dir().join("space-volmgr-shadow-tests"),
+            integrity::CompletionStore::UnpersistedTest,
         )
     }
 
@@ -1412,6 +1428,11 @@ impl TransferExecutor {
         cancellation: CancellationToken,
     ) -> Result<i64, JobError> {
         let p = TransferPayload::from_json(&job.payload)?;
+        if matches!(job.kind.as_str(), "push" | "push_btrfs_send")
+            && let Some(receipt) = integrity::receipt(job)?
+        {
+            return bytes_len_to_job_i64(receipt.size_bytes, "completed upload size");
+        }
 
         let subject = parse_subject_id_with_legacy_fallback(&p.subject_id).map_err(|e| {
             JobError::permanent_with_reason(
@@ -1640,6 +1661,7 @@ impl TransferExecutor {
         let entry_futures = art.entries.iter().zip(uris.iter()).map(|(entry, uri)| {
             let cancellation = cancellation.clone();
             let synthetic = TransferPayload {
+                expected_integrity: None,
                 subject_id: art.subject_id.clone(),
                 local_path: entry.local_path.clone(),
                 s3_uri: entry.s3_uri.clone(),
@@ -1944,7 +1966,12 @@ impl TransferExecutor {
         target: ObjectTarget<'_>,
         options: PushExecutionOptions<'_>,
     ) -> Result<i64, JobError> {
-        let result = self
+        let identity = if options.cleanup_staged {
+            Some(integrity::hash_file(Path::new(p.upload_source()), &options.cancellation).await?)
+        } else {
+            None
+        };
+        let mut result = self
             .execute_push_inner(
                 job,
                 p,
@@ -1954,6 +1981,13 @@ impl TransferExecutor {
                 options.cancellation,
             )
             .await;
+        if result.is_ok()
+            && let Some(identity) = identity
+        {
+            // Keep the immutable source until the receipt is durable.
+            self.completion_store.record(job, identity)?;
+            result = bytes_len_to_job_i64(identity.size_bytes, "uploaded plaintext size");
+        }
         // Single-file pushes clean their staged source here. Artifact entries
         // pass `cleanup_staged = false`: a per-entry success is NOT terminal
         // for the artifact (a sibling may force a retry that must re-read this

@@ -216,7 +216,8 @@ impl VolumeManagerService {
             .with_kind_priority_bands(PULL_KIND, config.pull_priority_bands);
         let btrfs_push_enabled = config.executor.compress
             && config.executor.snapshot_upload_mode.buffer_budget_bytes() > 0;
-        let executor = TransferExecutor::new(config.executor, staging.root().to_path_buf());
+        let executor =
+            TransferExecutor::new(config.executor, staging.root().to_path_buf(), db.clone());
         let shadow_comparisons = executor.shadow_comparison_controller();
         let worker = BackgroundWorker::new(Arc::clone(&db), executor, worker_config);
         Ok(Self {
@@ -643,7 +644,15 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         "cancelled" => TransferJobStatus::Cancelled,
         _ => TransferJobStatus::Unspecified,
     };
+    let integrity = if status == TransferJobStatus::Completed {
+        crate::executor::integrity::receipt(&job)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map(Into::into)
+    } else {
+        None
+    };
     Ok(TransferJob {
+        integrity,
         job_id: job.job_id.to_string(),
         status: transfer_job_status_code(status),
         kind: job.kind,
@@ -730,6 +739,7 @@ async fn register_push_job(
     // Single-file pushes are always plaintext: envelope encryption is a
     // property of an artifact (`PushFilesAsync`), never a single file.
     let payload = TransferPayload {
+        expected_integrity: None,
         subject_id: req.subject_id.clone(),
         local_path: req.local_path.clone(),
         s3_uri: req.s3_uri.clone(),
@@ -865,6 +875,14 @@ fn submit_pull<E: JobExecutor>(
     // no submit-time-vs-execute-time race to defend against: nothing in
     // the staging area would help.
     let payload = TransferPayload {
+        expected_integrity: req
+            .expected_integrity
+            .clone()
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|e: pplx_space_volmgr_client::IntegrityParseError| {
+                Status::invalid_argument(e.to_string())
+            })?,
         subject_id: req.subject_id.clone(),
         local_path: req.local_path.clone(),
         s3_uri: req.s3_uri.clone(),
@@ -902,6 +920,12 @@ fn submit_pull<E: JobExecutor>(
     if let Some(scope) = transfer_scope_id {
         dk.push_str("\0scope=");
         dk.push_str(&scope.to_string());
+    }
+    if let Some(expected) = &req.expected_integrity {
+        dk.push_str(&format!(
+            "\0integrity={}:{}",
+            expected.digest, expected.size_bytes
+        ));
     }
     worker.submit_with_priority(
         PULL_KIND,

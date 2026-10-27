@@ -29,6 +29,7 @@ pub(super) fn file_replica_provenance(
     local_size: u64,
 ) -> VerifiedReplicaProvenance {
     VerifiedReplicaProvenance {
+        integrity: p.expected_integrity,
         version: VERIFIED_REPLICA_PROVENANCE_VERSION,
         subject_id: p.subject_id.clone(),
         s3_uri: p.s3_uri.clone(),
@@ -83,6 +84,36 @@ pub(super) fn materialization_is_compatible(
 }
 
 impl TransferExecutor {
+    pub(super) async fn integrity_cache_is_compatible(
+        &self,
+        p: &TransferPayload,
+        local_path: &Path,
+        mode: MaterializationMode,
+    ) -> bool {
+        let Ok(bytes) = tokio::fs::read(verified_replica_provenance_path(local_path)).await else {
+            return false;
+        };
+        let Ok(record) = serde_json::from_slice::<FileReplicaProvenance>(&bytes) else {
+            return false;
+        };
+        let replica = &record.replica;
+        let mode = if matches!(
+            p.effective_snapshot_artifact(),
+            Some(SnapshotArtifact::EncryptedSnapshotVolume | SnapshotArtifact::EncryptedRootfsCow)
+        ) {
+            MaterializationMode::Disabled
+        } else {
+            mode
+        };
+        replica.version == VERIFIED_REPLICA_PROVENANCE_VERSION
+            && replica.integrity == p.expected_integrity
+            && replica.subject_id == p.subject_id
+            && replica.s3_uri == p.s3_uri
+            && replica.raw == p.raw
+            && replica.snapshot_artifact == p.snapshot_artifact
+            && materialization_is_compatible(mode, record.materialization.as_ref())
+    }
+
     pub(super) async fn validate_existing_file_replica(
         &self,
         p: &TransferPayload,

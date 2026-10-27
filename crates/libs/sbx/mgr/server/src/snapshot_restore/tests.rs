@@ -265,6 +265,7 @@ fn write_test_replica_provenance(
     std::fs::write(
         verified_replica_provenance_path(path),
         serde_json::to_vec(&pplx_space_volmgr_client::VerifiedReplicaProvenance {
+            integrity: None,
             version: pplx_space_volmgr_client::VERIFIED_REPLICA_PROVENANCE_VERSION,
             subject_id: format!("sandbox:{sandbox_id}"),
             s3_uri: restore_artifact_uri(config, artifact.file_name()),
@@ -1498,6 +1499,7 @@ fn plan_response(
         target_state,
         suspend_snapshot: Some(
             pplx_space_node_api_client::proto::QuarantineRecoverySuspendSnapshot {
+                artifact_digests: Vec::new(),
                 snapshot_id: snapshot_id.to_string(),
                 local_artifact_id: local_artifact_id.to_string(),
                 storage_uri: storage_uri.to_string(),
