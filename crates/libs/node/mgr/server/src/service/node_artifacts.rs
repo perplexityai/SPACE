@@ -9,7 +9,9 @@
 //! names an artifact by what it is, never by a path. A catalog that cannot
 //! be loaded safely refuses the request, not node-manager's startup.
 
-use pplx_space_common_core::types::{Arch, ArtifactVersion, RuntimeIdentity, RuntimeVersion};
+use pplx_space_common_core::types::{
+    Arch, ArtifactVersion, ComponentIdentity, RuntimeIdentity, RuntimeVersion,
+};
 use pplx_space_common_svc::UdsPeerPrincipal;
 use pplx_space_common_svc::core::host::linux::identities::user_names;
 use pplx_space_node_runtime_core::artifact_store::{
@@ -305,6 +307,7 @@ const MAX_ARTIFACT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 enum Artifact {
     Release(RuntimeIdentity, pplx_space_common_core::types::Digest),
     Kernel(ArtifactVersion, pplx_space_common_core::types::Digest),
+    Boot(ComponentIdentity),
 }
 
 impl Artifact {
@@ -314,6 +317,7 @@ impl Artifact {
                 *release == initial.release().release && *digest == initial.release().digest()
             }
             Self::Kernel(_, digest) => *digest == initial.kernel().sha256,
+            Self::Boot(_) => false,
         }
     }
 
@@ -327,6 +331,13 @@ impl Artifact {
                     && *digest == environment.release().digest()
             }
             Self::Kernel(_, digest) => *digest == environment.kernel().sha256,
+            Self::Boot(identity) => environment
+                .definition()
+                .descriptor()
+                .spec()
+                .boot
+                .components()
+                .any(|(_, component, _)| component == identity),
         }
     }
 
@@ -363,12 +374,16 @@ impl Artifact {
             }
             Some(node_artifact::Artifact::Component(component)) => {
                 use pplx_space_execution_common::proto::ArtifactComponentKind;
-                match ArtifactComponentKind::try_from(component.kind) {
-                    Ok(ArtifactComponentKind::Kernel) => {}
-                    Ok(ArtifactComponentKind::Unspecified) | Err(_) => {
+                let named = ArtifactComponentKind::try_from(component.kind)
+                    .map_err(|_| Status::invalid_argument("unknown component kind"))?;
+                match named {
+                    ArtifactComponentKind::Kernel
+                    | ArtifactComponentKind::Initrd
+                    | ArtifactComponentKind::Firmware => {}
+                    ArtifactComponentKind::Unspecified => {
                         return Err(Status::invalid_argument("a component kind is required"));
                     }
-                    Ok(_) => {
+                    _ => {
                         return Err(Status::failed_precondition(
                             "no publisher for this component kind",
                         ));
@@ -380,7 +395,17 @@ impl Artifact {
                     .digest
                     .parse()
                     .map_err(|_| Status::invalid_argument("invalid component digest"))?;
-                Ok(Self::Kernel(version, digest))
+                let kind = pplx_space_common_core::types::ArtifactComponentKind::try_from(named)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                if kind == pplx_space_common_core::types::ArtifactComponentKind::Kernel {
+                    Ok(Self::Kernel(version, digest))
+                } else {
+                    Ok(Self::Boot(ComponentIdentity {
+                        kind,
+                        version,
+                        digest,
+                    }))
+                }
             }
             None => Err(Status::invalid_argument("name the artifact")),
         }
@@ -553,7 +578,11 @@ fn execution_roots_overlap(
     let vendor_kernels = std::path::Path::new(
         pplx_space_common_core::host::linux::paths::FIRECRACKER_KERNEL_VENDOR_DIR,
     );
-    for managed in [root, paths.store.kernels.as_path()] {
+    for managed in [
+        root,
+        paths.store.kernels.as_path(),
+        &paths.store.kernels.with_file_name("boot-artifacts"),
+    ] {
         let managed = resolve(managed)?;
         for execution in [
             paths.vendor.as_path(),
@@ -573,7 +602,9 @@ fn execution_roots_overlap(
 fn artifact_runtime(artifact: &Artifact) -> pplx_space_common_core::types::RuntimeKind {
     match artifact {
         Artifact::Release(release, _) => release.kind,
-        Artifact::Kernel(..) => pplx_space_common_core::types::RuntimeKind::Firecracker,
+        Artifact::Kernel(..) | Artifact::Boot(..) => {
+            pplx_space_common_core::types::RuntimeKind::Firecracker
+        }
     }
 }
 
@@ -690,6 +721,11 @@ impl NodeManagerService {
                         }
                         store.publish_release(pin, &staged).map_err(publish_status)
                     }
+                    Artifact::Boot(identity) => {
+                        let pin = catalog.boot_artifact(identity, architecture)
+                            .ok_or_else(|| Status::failed_precondition("boot artifact is not pinned for this node"))?;
+                        store.publish_boot_artifact(pin, &staged).map_err(publish_status)
+                    }
                     Artifact::Kernel(version, digest) => {
                         let pin = catalog
                             .kernel(version, architecture)
@@ -785,6 +821,9 @@ impl NodeManagerService {
                         .map_err(remove_status),
                     Artifact::Kernel(version, digest) => {
                         store.remove_kernel(version, *digest).map_err(remove_status)
+                    }
+                    Artifact::Boot(identity) => {
+                        store.remove_boot_artifact(identity).map_err(remove_status)
                     }
                 }
             })

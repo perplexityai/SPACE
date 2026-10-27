@@ -44,7 +44,7 @@ fn a_verifiable_release_round_trips_as_a_job_payload() {
             version: RuntimeVersion::parse("1.16.2").unwrap(),
         },
         architecture: Arch::X86_64,
-        archive: archive(),
+        archive: archive().into(),
         sha256: format!("sha256:{HEX}").parse().unwrap(),
     };
     let json = serde_json::to_value(&release).unwrap();

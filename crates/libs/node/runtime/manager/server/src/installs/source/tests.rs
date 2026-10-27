@@ -11,6 +11,10 @@ fn a_line_is_named_by_major_and_minor_with_or_without_patch_or_v() {
         );
     }
     assert_eq!("1.15.3".parse::<ReleaseLine>().unwrap().to_string(), "1.15");
+    assert_eq!(
+        "54.0.0+space.1".parse::<ReleaseLine>().unwrap(),
+        ReleaseLine::new(54, 0)
+    );
 }
 
 #[test]
@@ -38,6 +42,10 @@ fn anything_else_is_not_a_line() {
         "vv1.15",
         "+1.15",
         "1.+15",
+        "54.0.0+",
+        "54.0.0+space..1",
+        "54.0.0+../other",
+        "54.0.0-rc1+space.1",
     ] {
         value.parse::<ReleaseLine>().expect_err(value);
     }
@@ -49,6 +57,7 @@ fn kernel_versions_are_the_names_the_source_uses() {
         ("6.1.155", "6.1.155+"),
         ("5.10.245-no-acpi", "5.10.245"),
         ("7.2.8+", "7.2.8+"),
+        ("6.1.155-space-gpu", "6.1.155-space-gpu"),
     ] {
         let version = value.parse::<KernelVersion>().unwrap();
         assert_eq!(version.to_string(), value);
@@ -154,6 +163,7 @@ fn kernel_locations_preserve_durable_strings_and_reject_other_schemes() {
     for text in [
         "s3://artifacts.test/kernels/image?region=us-east-1",
         "https://artifacts.example.test/kernels/Image-arm64",
+        "file:///opt/artifacts/kernels/image",
     ] {
         let location: KernelLocation = text.parse().unwrap();
         let encoded = serde_json::to_value(&location).unwrap();
@@ -163,7 +173,7 @@ fn kernel_locations_preserve_durable_strings_and_reject_other_schemes() {
             location
         );
     }
-    for text in ["file:///etc/passwd", "http://artifacts.example.test/kernel"] {
+    for text in ["file://remote/path", "http://artifacts.example.test/kernel"] {
         text.parse::<KernelLocation>().unwrap_err();
     }
 }
