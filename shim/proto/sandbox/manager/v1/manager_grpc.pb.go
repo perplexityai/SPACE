@@ -46,6 +46,7 @@ const (
 	SandboxManager_PrepareTeardownSuspend_FullMethodName                 = "/space.sandbox.manager.v1.SandboxManager/PrepareTeardownSuspend"
 	SandboxManager_EnqueueArtifactBackup_FullMethodName                  = "/space.sandbox.manager.v1.SandboxManager/EnqueueArtifactBackup"
 	SandboxManager_EvictClusterDeletedSandbox_FullMethodName             = "/space.sandbox.manager.v1.SandboxManager/EvictClusterDeletedSandbox"
+	SandboxManager_UpgradeRuntime_FullMethodName                         = "/space.sandbox.manager.v1.SandboxManager/UpgradeRuntime"
 	SandboxManager_EnableSnapshots_FullMethodName                        = "/space.sandbox.manager.v1.SandboxManager/EnableSnapshots"
 	SandboxManager_DisableSnapshots_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/DisableSnapshots"
 	SandboxManager_ListSnapshots_FullMethodName                          = "/space.sandbox.manager.v1.SandboxManager/ListSnapshots"
@@ -181,6 +182,14 @@ type SandboxManagerClient interface {
 	// that the sandbox was deleted; the handler enforces that the local row
 	// is still `suspended` and quiescent before tearing down.
 	EvictClusterDeletedSandbox(ctx context.Context, in *EvictClusterDeletedSandboxRequest, opts ...grpc.CallOption) (*EvictClusterDeletedSandboxResponse, error)
+	// Internal-only: move a stopped or suspended sandbox with a local disk to
+	// another execution environment by cold boot. Fences every other activation,
+	// keeps the old disk/checkpoint pair until the boot is verified, then retires
+	// the old checkpoint. Files survive; memory and processes don't. A failed
+	// boot restores the old pair and releases the fence. Idempotent per
+	// `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
+	// upgrade leaves no row behind, so a retry after it starts over.
+	UpgradeRuntime(ctx context.Context, in *UpgradeRuntimeRequest, opts ...grpc.CallOption) (*UpgradeRuntimeResponse, error)
 	// Enable rolling btrfs snapshots for a sandbox.
 	EnableSnapshots(ctx context.Context, in *EnableSnapshotsRequest, opts ...grpc.CallOption) (*EnableSnapshotsResponse, error)
 	// Disable rolling btrfs snapshots for a sandbox.
@@ -558,6 +567,16 @@ func (c *sandboxManagerClient) EvictClusterDeletedSandbox(ctx context.Context, i
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(EvictClusterDeletedSandboxResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_EvictClusterDeletedSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) UpgradeRuntime(ctx context.Context, in *UpgradeRuntimeRequest, opts ...grpc.CallOption) (*UpgradeRuntimeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpgradeRuntimeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_UpgradeRuntime_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1258,6 +1277,14 @@ type SandboxManagerServer interface {
 	// that the sandbox was deleted; the handler enforces that the local row
 	// is still `suspended` and quiescent before tearing down.
 	EvictClusterDeletedSandbox(context.Context, *EvictClusterDeletedSandboxRequest) (*EvictClusterDeletedSandboxResponse, error)
+	// Internal-only: move a stopped or suspended sandbox with a local disk to
+	// another execution environment by cold boot. Fences every other activation,
+	// keeps the old disk/checkpoint pair until the boot is verified, then retires
+	// the old checkpoint. Files survive; memory and processes don't. A failed
+	// boot restores the old pair and releases the fence. Idempotent per
+	// `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
+	// upgrade leaves no row behind, so a retry after it starts over.
+	UpgradeRuntime(context.Context, *UpgradeRuntimeRequest) (*UpgradeRuntimeResponse, error)
 	// Enable rolling btrfs snapshots for a sandbox.
 	EnableSnapshots(context.Context, *EnableSnapshotsRequest) (*EnableSnapshotsResponse, error)
 	// Disable rolling btrfs snapshots for a sandbox.
@@ -1456,6 +1483,9 @@ func (UnimplementedSandboxManagerServer) EnqueueArtifactBackup(context.Context, 
 }
 func (UnimplementedSandboxManagerServer) EvictClusterDeletedSandbox(context.Context, *EvictClusterDeletedSandboxRequest) (*EvictClusterDeletedSandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EvictClusterDeletedSandbox not implemented")
+}
+func (UnimplementedSandboxManagerServer) UpgradeRuntime(context.Context, *UpgradeRuntimeRequest) (*UpgradeRuntimeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpgradeRuntime not implemented")
 }
 func (UnimplementedSandboxManagerServer) EnableSnapshots(context.Context, *EnableSnapshotsRequest) (*EnableSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnableSnapshots not implemented")
@@ -2079,6 +2109,24 @@ func _SandboxManager_EvictClusterDeletedSandbox_Handler(srv interface{}, ctx con
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxManagerServer).EvictClusterDeletedSandbox(ctx, req.(*EvictClusterDeletedSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_UpgradeRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpgradeRuntimeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).UpgradeRuntime(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_UpgradeRuntime_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).UpgradeRuntime(ctx, req.(*UpgradeRuntimeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3064,6 +3112,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "EvictClusterDeletedSandbox",
 			Handler:    _SandboxManager_EvictClusterDeletedSandbox_Handler,
+		},
+		{
+			MethodName: "UpgradeRuntime",
+			Handler:    _SandboxManager_UpgradeRuntime_Handler,
 		},
 		{
 			MethodName: "EnableSnapshots",

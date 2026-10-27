@@ -125,6 +125,16 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
                 .await
                 .map(|_| ()),
             service
+                .restore_instance_snapshot(root_request(
+                    crate::proto::RestoreInstanceSnapshotRequest {
+                        sandbox_id: id.into(),
+                        snapshot_name: "d-operation-runtime-upgrade-test".into(),
+                        execution_fence: None,
+                    },
+                ))
+                .await
+                .map(|_| ()),
+            service
                 .delete_btrfs_snapshot(root_request(crate::proto::DeleteBtrfsSnapshotRequest {
                     sandbox_id: id.into(),
                     snapshot_name: snapshot_name.into(),

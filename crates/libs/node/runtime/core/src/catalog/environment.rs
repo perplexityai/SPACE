@@ -327,6 +327,40 @@ impl CompiledEnvironment {
     pub fn upgrade_targets(&self) -> &[EnvironmentReference] {
         &self.upgrade_targets
     }
+
+    /// The compiled environment `execution` ran under: its binding, or for
+    /// unbound metadata the environment whose definition it satisfies. A stock
+    /// initial-environment snapshot written before boot components were
+    /// recorded counts as the initial environment, as policy admission
+    /// treats it. Anything else is no compiled environment.
+    pub fn of_execution<'a>(
+        catalog: &'a [Self],
+        execution: &ExecutionMetadata,
+    ) -> Option<&'a Self> {
+        if let Some(reference) = execution.environment() {
+            return catalog
+                .iter()
+                .find(|entry| entry.definition.reference() == reference);
+        }
+        catalog
+            .iter()
+            .find(|entry| entry.definition.check_execution(execution).is_ok())
+            .or_else(|| {
+                catalog.iter().find(|entry| {
+                    entry.is_initial()
+                        && execution.components().is_empty()
+                        && entry
+                            .definition
+                            .execution_requirements()
+                            .is_ok_and(|required| {
+                                execution.runtime() == required.runtime()
+                                    && execution.guest() == required.guest()
+                                    && required.state_format().is_some()
+                                    && execution.state_format() == required.state_format()
+                            })
+                })
+            })
+    }
 }
 
 /// Edges are optional metadata, so an invalid table withdraws every edge and

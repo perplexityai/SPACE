@@ -109,6 +109,15 @@ service SandboxManager {
   // is still `suspended` and quiescent before tearing down.
   rpc EvictClusterDeletedSandbox(EvictClusterDeletedSandboxRequest) returns (EvictClusterDeletedSandboxResponse);
 
+  // Internal-only: move a stopped or suspended sandbox with a local disk to
+  // another execution environment by cold boot. Fences every other activation,
+  // keeps the old disk/checkpoint pair until the boot is verified, then retires
+  // the old checkpoint. Files survive; memory and processes don't. A failed
+  // boot restores the old pair and releases the fence. Idempotent per
+  // `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
+  // upgrade leaves no row behind, so a retry after it starts over.
+  rpc UpgradeRuntime(UpgradeRuntimeRequest) returns (UpgradeRuntimeResponse);
+
   // Enable rolling btrfs snapshots for a sandbox.
   rpc EnableSnapshots(EnableSnapshotsRequest) returns (EnableSnapshotsResponse);
 
@@ -1058,6 +1067,55 @@ message EvictClusterDeletedSandboxRequest {
 }
 
 message EvictClusterDeletedSandboxResponse {}
+
+// The audited operator action an upgrade runs under: an environment block or
+// an upgrade campaign. Every upgrade records it.
+message RuntimeUpgradeAuthorization {
+  string authorization_id = 1;
+  string reason = 2;
+  // The operator accepts discarding the memory and processes of a suspended
+  // sandbox's checkpoint. Required to upgrade a suspended sandbox.
+  bool memory_loss = 3;
+}
+
+message UpgradeRuntimeRequest {
+  string sandbox_id = 1;
+  // Caller-chosen UUID naming this upgrade. Retries reuse it.
+  string operation_id = 2;
+  // Complete reference of the environment to boot under. It must keep the
+  // disk's guest platform, kernel and components; the runtime and its
+  // snapshot format may differ.
+  string target_environment = 3;
+  RuntimeUpgradeAuthorization authorization = 4;
+  // The cold start the upgrade runs, with the route identity and start
+  // context a Start would carry. It must name `sandbox_id`, block until guest
+  // readiness, and leave checkpoint, warm-start, restore-as-new and
+  // stopped-target fields unset.
+  StartRequest start = 5;
+  // Lifecycle after a verified boot: STARTED (or unspecified) leaves the new
+  // execution running; STOPPED stops it again, unless the sandbox stopped,
+  // suspended or started another execution first, which the upgrade leaves
+  // as it is.
+  WakeTargetState target_state = 6;
+}
+
+enum RuntimeUpgradeOutcome {
+  RUNTIME_UPGRADE_OUTCOME_UNSPECIFIED = 0;
+  // The sandbox booted under the target and its old checkpoint is retired.
+  RUNTIME_UPGRADE_OUTCOME_UPGRADED = 1;
+  // Nothing to do: a suspended sandbox's checkpoint was produced by the
+  // target, or any other sandbox's saved consumer is the target. Nothing is
+  // fenced or booted, so this says nothing about whether the local disk could
+  // boot. Never returned while another upgrade owns the sandbox, which may
+  // still roll its consumer back.
+  RUNTIME_UPGRADE_OUTCOME_ALREADY_ON_TARGET = 2;
+}
+
+message UpgradeRuntimeResponse {
+  RuntimeUpgradeOutcome outcome = 1;
+  // Present when this call ran the cold boot.
+  optional StartResponse start = 2;
+}
 
 message EnableSnapshotsRequest { string sandbox_id = 1; }
 message EnableSnapshotsResponse {}

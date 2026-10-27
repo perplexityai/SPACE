@@ -333,6 +333,10 @@ pub mod paths {
         format!("{}/snapshots", sandbox_cache_dir(sandbox_id))
     }
 
+    /// Prefix of sandbox-manager's internal operation snapshots under
+    /// [`sandbox_snapshots_dir`]. Users can't list, delete or roll back to them.
+    pub const INTERNAL_OPERATION_SNAPSHOT_PREFIX: &str = "d-operation-";
+
     /// Returns the directory path for one sandbox snapshot.
     pub fn sandbox_snapshot_dir(sandbox_id: &str, snapshot_name: &str) -> String {
         format!("{}/{snapshot_name}", sandbox_snapshots_dir(sandbox_id))

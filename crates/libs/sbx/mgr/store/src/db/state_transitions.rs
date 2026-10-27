@@ -26,6 +26,8 @@ pub enum BeginActivationError {
         kind: ActivationKind,
         state: SandboxState,
     },
+    #[error(transparent)]
+    RuntimeUpgrade(#[from] RuntimeUpgradeFenceError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +209,9 @@ pub struct ActivationRouteAdmission<'a> {
     pub operation_activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub evidence: Option<crate::auto_lifecycle_delete_receipts::RouteEvidence>,
     pub open_claim: Option<&'a route_activation_claims::OpenRouteActivationClaim>,
+    /// The runtime upgrade this activation is the cold boot of. Only the
+    /// upgrade fencing the sandbox, in its `booting` phase, passes the fence.
+    pub runtime_upgrade: Option<RuntimeUpgradeOperationId>,
 }
 
 /// Claim the caller-observed sandbox state for activation.
@@ -240,6 +245,7 @@ pub fn begin_activation_with_route_evidence(
         tx.commit()?;
         return Ok(None);
     }
+    admit_past_runtime_upgrade_fence(&tx, id, route_admission.runtime_upgrade)??;
     let keep_filesystem = true;
     // Only activation authorizes node allocation. Filesystem-only staging keeps
     // an unbound request identity and must not become an allocation predecessor.
@@ -687,6 +693,7 @@ pub fn mark_start_succeeded(
     }
     if changed == 1 {
         route_activation_claims::close_claim(&tx, id)?;
+        verify_booting_runtime_upgrade(&tx, id)?;
     }
     tx.commit()?;
     Ok(changed == 1)

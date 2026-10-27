@@ -26,9 +26,10 @@ use std::str::FromStr;
 use tracing::Instrument;
 
 const CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX: &str = "d-stop-";
-const OPERATION_DISK_ARTIFACT_PREFIX: &str = "d-operation-";
+const OPERATION_DISK_ARTIFACT_PREFIX: &str =
+    pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
 
-fn is_internal_snapshot_name(snapshot_name: &str) -> bool {
+pub(super) fn is_internal_snapshot_name(snapshot_name: &str) -> bool {
     snapshot_name.starts_with(CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX)
         || snapshot_name.starts_with(OPERATION_DISK_ARTIFACT_PREFIX)
 }
@@ -1248,7 +1249,8 @@ impl SandboxManagerService {
                 "cleanup owns this sandbox; retain its snapshots",
             ));
         }
-        Ok(())
+        // A rollback would rewrite the disk an upgrade preserved or is booting.
+        super::runtime_upgrade::refuse_runtime_upgrade_fence_in(&db, sandbox_id)
     }
 
     pub(super) async fn delete_snapshots(
@@ -1393,6 +1395,9 @@ impl SandboxManagerService {
         let artifact_guard = artifact_lock.lock().await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.require_snapshot_mutation_ownership(&sandbox.id)?;
+        // A full rollback restages the canonical checkpoint, which a verified
+        // upgrade still owes the retirement of the old runtime's checkpoint at.
+        self.refuse_unretired_runtime_upgrade(&sandbox.id)?;
         // A suspended sandbox's restore source is its pinned suspend artifact,
         // whose memory image was captured against the current rootfs. Below,
         // the rollback rewrites that rootfs, and for an `f-*` restart it also

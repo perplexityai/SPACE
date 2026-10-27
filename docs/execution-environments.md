@@ -1012,12 +1012,13 @@ or add isolated resume refusal: incident-driven stopping, resource reclamation a
 resume revocation must ship together. Stop and delete remain available. Operators
 must stop affected resident VMs when revoking execution during an incident.
 
-A future kernel or incompatible-state upgrade requires explicit memory-loss
-consent, activation fencing and a preserved matching disk/checkpoint pair. Keep
-the old pair until the new cold boot is verified; a failed cold boot must not
-mutate the only rollback disk. Retention is not permission to restore a revoked
-runtime. Retire the checkpoint through a durable lifecycle operation before later
-object garbage collection, never by deleting S3 vmstate and editing lifecycle rows.
+An incompatible-state upgrade requires explicit memory-loss consent, activation
+fencing and a preserved matching disk/checkpoint pair. Keep the old pair until
+the new cold boot is verified; a failed cold boot must not mutate the only
+rollback disk. Retention is not permission to restore a revoked runtime. Retire
+the checkpoint through a durable lifecycle operation before later object garbage
+collection, never by deleting S3 vmstate and editing lifecycle rows. "Upgrading a
+sandbox's runtime" below is that operation for a sandbox with a local disk.
 
 Moving an existing sandbox to another runtime with the same kernel by cold boot
 discards its memory, so it needs everything above whether or not the state
@@ -1036,11 +1037,104 @@ environment or repeats, the catalog withdraws every edge, logs a warning and
 keeps every environment; tests reject such a table before it ships. Two edges
 are certified: E0 → Firecracker 1.17.0 / Linux 6.1.155, and its reverse for an
 upgrade drill. No edge reaches or leaves 1.17.0 / 6.18.44, whose kernel
-differs. Nothing consumes the edges yet. Compatible cold-boot selection for a
-new sandbox or build, described above, uses the same check and doesn't consult
-edges. An edge doesn't replace the consent, fencing and preserved pair above,
+differs. The runtime upgrade below follows only certified edges. Compatible
+cold-boot selection for a new sandbox or build, described above, uses the same
+check and doesn't consult edges. An edge doesn't replace the consent, fencing and preserved pair above,
 doesn't move work, and doesn't permit a restore: it carries no memory and
 doesn't qualify a loader.
+
+### Upgrading a sandbox's runtime
+
+Sandbox-manager's internal `UpgradeRuntime` moves a stopped or suspended sandbox
+to another environment by cold boot. Files survive; memory and processes don't.
+Root, a local operator and node-api may call it. A request names a caller-chosen
+operation id, the target reference, the operator authorization it runs under, the
+blocking cold `Start` to run, and whether the sandbox ends started or stopped.
+
+1. **Fence.** One transaction checks that the sandbox is stopped or suspended,
+   that no cleanup or other upgrade owns it, and that the authorization accepts
+   memory loss when the sandbox is suspended. It then inserts a
+   `sandbox_runtime_upgrades` row recording the authorization, the previous
+   consumer and the suspend artifact the sandbox pins. The row is inserted under
+   the sandbox's artifact lock, which snapshot rollback, export, warm start and
+   checkpoint restore hold while they check for it, so none of them can slip in
+   between the check and the fence. The insert is refused if the sandbox's
+   state, pin or saved consumer changed since it was inspected. Until the boot
+   is verified or the old pair is back, the activation claim refuses every
+   other cold start and restore with a retryable `Unavailable`. Export, artifact
+   backup, snapshot rollback and snapshot deletion refuse too, and a warm start
+   or checkpoint restore refuses before it stages anything into the checkpoint
+   directory. Until the old checkpoint is retired, warm start, checkpoint
+   restore and snapshot rollback (which can restage the checkpoint) keep
+   refusing. Only the upgrade's own boot, once its consumer is saved, passes
+   the fence.
+2. **Preserve.** Node-manager takes a read-only btrfs snapshot of the instance
+   subvolume under the internal `d-operation-runtime-upgrade-<operation>` name,
+   which users can't list, delete or roll back to. It holds the rootfs, and for an
+   encrypted sandbox `cow.luks` and the suspend volume. The sandbox's
+   `metadata.json`, the disk's record of its execution, sits outside the
+   subvolume and the boot rewrites it, so sandbox-manager keeps its bytes beside
+   it. The checkpoint directory isn't touched. A sandbox without its local rootfs, or an encrypted one without
+   `cow.luks`, is refused before the fence: a cold start would otherwise boot a
+   fresh template clone.
+3. **Select the consumer.** The move must follow a certified upgrade edge from
+   the environment the sandbox last ran under: its checkpoint's producer when
+   suspended, otherwise its saved consumer. Unbound metadata counts as the
+   compiled environment it satisfies, and a stock E0 snapshot from before boot
+   components were recorded counts as E0; anything else has no edge and is
+   refused before the fence. The target must also keep the disk's runtime kind,
+   guest platform and components, kernel included. Its runtime version and snapshot
+   format may differ: a cold start loads no memory, and neither sandbox-manager's
+   disk binding nor node-manager's cold-boot admission compares state formats.
+   The target is saved as the sandbox's consumer in the same transaction that
+   moves the row to `booting`. The checkpoint's producer evidence isn't rewritten.
+4. **Boot.** The ordinary blocking cold start runs as the caller. It reads the
+   saved consumer, and guest readiness verifies the boot: the transaction that
+   marks the sandbox started also records the upgrade verified, so a later
+   stop or suspend can never make a verified boot look interrupted.
+5. **Settle.** After a verified boot, the old checkpoint is retired and the
+   preserved copy deleted. Then a request to end stopped stops the execution the
+   boot started, never a later one, and only while it's started or paused: the
+   stop's cleanup claim checks that state and execution under the fence every
+   activation claims under. The row becomes
+   `retired`, the record of the authorization. A retired upgrade never touches
+   the sandbox's lifecycle again, so replaying it can't stop a later execution.
+   A stopped sandbox can still hold the checkpoint of a suspend before its
+   stop, which a warm start would load over the disk the boot wrote, so that
+   checkpoint is retired too. Retirement goes by identity, under the artifact
+   lock: it takes a delete lease on the pinned suspend artifact, or for any
+   other checkpoint matches the directory's device, inode and birth time
+   (change time where the filesystem records no birth time), so a newer
+   checkpoint at the same path is never taken. A directory catalogued since is retired through its catalog row.
+   Bytes several rows claim are left, as the reaper leaves them, and the upgrade
+   stays `verified`, refusing warm start and restore, until the conflict
+   clears: the sandbox's next suspend replaces every older suspend row, or an
+   operator resolves it. Moving the bytes off the checkpoint path is the
+   durable retirement: a catalogued checkpoint goes to the snapshot reaper's GC
+   staging, an uncatalogued one to the suspend-garbage lane, and each lane's
+   sweep deletes what the immediate reclaim leaves. An encrypted sandbox's next suspend writes a fresh suspend
+   volume, as after any cold start. The checkpoint's remote copy is the
+   cluster's to retire. A failed boot waits for its cleanup to return the
+   sandbox to its old state, or to stopped if auto-lifecycle stopped a
+   suspended sandbox meanwhile, restores the preserved copy over the instance
+   without touching any other snapshot, puts the kept `metadata.json` back,
+   restores the previous consumer (for a
+   sandbox that had none, the execution its disk records, which its next cold
+   start would bind anyway) and releases the fence. The sandbox is then restorable
+   on its old environment.
+
+A retry with the same operation id resumes from the row: an interrupted upgrade
+rolls back and starts again, and a verified one finishes its retirement. A
+rolled-back upgrade leaves no row, so a retry after it starts over. An upgrade
+that must end stopped leaves the sandbox as it finds it if the sandbox stopped,
+suspended or started another execution first. A
+sandbox-manager recovery loop settles unfinished upgrades at startup and every
+minute without booting or stopping anything: it rolls back, or retires, and
+leaves a sandbox it can't settle yet for the next pass. An upgrade that must end
+stopped stays verified while its sandbox runs, until its caller's retry stops it
+or the sandbox stops some other way. Deleting the sandbox deletes its
+upgrade rows; evicting it removes the preserved copy with the rest of its local
+presence, and the upgrade fails at its next claim.
 
 ### Node runtime provisioning
 

@@ -367,6 +367,8 @@ impl SandboxManagerService {
         let CleanupLockTryResult::Acquired(fence) = self.try_cleanup_fence(&id) else {
             return Err(Status::aborted("sandbox cleanup is in progress"));
         };
+        // A fenced upgrade may be booting the instance or restoring it.
+        self.refuse_runtime_upgrade_fence(&id)?;
         let sandbox = self.lookup_sandbox(&id)?;
 
         // Reject export of a running sandbox — rootfs is being mutated

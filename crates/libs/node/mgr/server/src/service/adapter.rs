@@ -374,6 +374,13 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::rollback_btrfs_snapshot(self, request).await
     }
 
+    async fn restore_instance_snapshot(
+        &self,
+        request: Request<RestoreInstanceSnapshotRequest>,
+    ) -> Result<Response<RestoreInstanceSnapshotResponse>, Status> {
+        NodeManagerService::restore_instance_snapshot(self, request).await
+    }
+
     async fn get_disk_usage(
         &self,
         request: Request<GetDiskUsageRequest>,

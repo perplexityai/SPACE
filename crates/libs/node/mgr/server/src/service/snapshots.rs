@@ -13,6 +13,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX as INTERNAL_INSTANCE_SNAPSHOT_PREFIX;
+
 enum CaptureDestination {
     Plain(crate::runtime_paths::CreateSnapshotPaths),
     Encrypted(pplx_space_common_core::types::NodeSpacePath),
@@ -1078,11 +1080,10 @@ impl NodeManagerService {
             let sandbox = super::trusted_paths::open_directory(Path::new(&format!(
                 "{CACHE_DIR}/{sandbox_id}"
             )))?;
-            let snapshots = super::artifact_fs::directory(&sandbox, "snapshots".as_ref())
-                .map_err(super::artifact_fs::error)?;
-            let source = super::artifact_fs::directory(&snapshots, snapshot_name.as_ref())
-                .map_err(super::artifact_fs::error)?;
-            super::artifact_fs::rollback(&sandbox, &source, gids::SPACE_CACHE_RW)?;
+            restore_instance_snapshot_in(&sandbox, &snapshot_name, gids::SPACE_CACHE_RW)?;
+            let snapshots =
+                super::artifact_fs::directory(&sandbox, BTRFS_SNAPSHOTS_DIR_NAME.as_ref())
+                    .map_err(super::artifact_fs::error)?;
 
             // Prune snapshots newer than the target
             let target_name = &snapshot_name;
@@ -1116,6 +1117,62 @@ impl NodeManagerService {
         .await
     }
 
+    pub(super) async fn restore_instance_snapshot(
+        &self,
+        request: Request<RestoreInstanceSnapshotRequest>,
+    ) -> Result<Response<RestoreInstanceSnapshotResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "RestoreInstanceSnapshot",
+            ALLOW_NODE_ADMIN_OR_SBXMGR,
+        )?;
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        self.run_artifact_mutation(&sandbox_id, |service| async move {
+            service.restore_instance_snapshot_inner(request).await
+        })
+        .await
+    }
+
+    /// [`Self::rollback_btrfs_snapshot_inner`] without its pruning, for
+    /// sandbox-manager's own rollback copies. A rollback prunes every snapshot
+    /// whose name sorts after the target's, which would delete a user's
+    /// snapshots when the target is an internal copy.
+    async fn restore_instance_snapshot_inner(
+        &self,
+        request: Request<RestoreInstanceSnapshotRequest>,
+    ) -> Result<Response<RestoreInstanceSnapshotResponse>, Status> {
+        let req = request.get_ref();
+        let sandbox_id = req.sandbox_id.clone();
+        validate_sandbox_id(&sandbox_id)?;
+        validate_snapshot_name(&req.snapshot_name)?;
+        if !req
+            .snapshot_name
+            .starts_with(INTERNAL_INSTANCE_SNAPSHOT_PREFIX)
+        {
+            return Err(Status::invalid_argument(format!(
+                "instance restore accepts only {INTERNAL_INSTANCE_SNAPSHOT_PREFIX} snapshots"
+            )));
+        }
+        let snapshot_name = req.snapshot_name.clone();
+        let gate = self.lock_sandbox_cgroups(&sandbox_id).await;
+        self.check_filesystem_execution(&sandbox_id, req.execution_fence.as_ref())
+            .await?;
+        self.off_runtime("restore instance snapshot", move || {
+            let _gate = gate;
+            if super::runtime::firecracker_before_jail_rebuild(&sandbox_id)?.is_some() {
+                return Err(Status::failed_precondition(
+                    "stop the runtime before instance restore",
+                ));
+            }
+            let sandbox = super::trusted_paths::open_directory(Path::new(&format!(
+                "{CACHE_DIR}/{sandbox_id}"
+            )))?;
+            restore_instance_snapshot_in(&sandbox, &snapshot_name, gids::SPACE_CACHE_RW)?;
+            Ok(Response::new(RestoreInstanceSnapshotResponse {}))
+        })
+        .await
+    }
+
     pub(super) async fn get_disk_usage(
         &self,
         request: Request<GetDiskUsageRequest>,
@@ -1144,6 +1201,20 @@ impl NodeManagerService {
             missing_ids,
         }))
     }
+}
+
+/// Replace `sandbox`'s instance with a writable copy of one of its snapshots.
+/// Every snapshot, the source included, stays where it is.
+fn restore_instance_snapshot_in(
+    sandbox: &std::fs::File,
+    snapshot_name: &str,
+    gid: u32,
+) -> Result<(), Status> {
+    let snapshots = super::artifact_fs::directory(sandbox, BTRFS_SNAPSHOTS_DIR_NAME.as_ref())
+        .map_err(super::artifact_fs::error)?;
+    let source = super::artifact_fs::directory(&snapshots, snapshot_name.as_ref())
+        .map_err(super::artifact_fs::error)?;
+    super::artifact_fs::rollback(sandbox, &source, gid)
 }
 
 /// Try `btrfs subvolume delete` first, fall back to

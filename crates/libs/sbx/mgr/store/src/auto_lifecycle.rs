@@ -122,6 +122,9 @@ pub struct AutoLifecycleCoordinator {
     /// the wake lock is already held on the same task, and
     /// `tokio::sync::Mutex` is non-reentrant.
     staging_locks: Arc<LifecycleLockRegistry>,
+    /// Serializes the drivers of one sandbox's runtime upgrade: its RPC and
+    /// the recovery loop. The upgrade's own cold start takes the other locks.
+    runtime_upgrade_locks: Arc<LifecycleLockRegistry>,
     /// Instant of the most recent completed wake per canonical sandbox id.
     /// Read by the suspend path both to surface suspend-shortly-after-wake
     /// oscillation (each cycle pays a full suspend snapshot) and to arbitrate
@@ -148,6 +151,10 @@ impl AutoLifecycleCoordinator {
 
     pub fn artifact_lock(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
         lifecycle_lock(&self.artifact_locks, sandbox_id)
+    }
+
+    pub fn runtime_upgrade_lock(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
+        lifecycle_lock(&self.runtime_upgrade_locks, sandbox_id)
     }
 
     pub async fn artifact_publication_locks(

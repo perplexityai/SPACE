@@ -77,6 +77,7 @@ pub(crate) mod fork_artifact;
 mod gateway_authority;
 pub(crate) mod network_policy;
 mod restart_admission;
+mod runtime_upgrade;
 mod suspend_snapshot_publication;
 mod template_apps;
 
@@ -304,6 +305,13 @@ const ALLOW_SANDBOX_POOL_ADOPT: &[UdsPeerPrincipal] = &[
 const ALLOW_SANDBOX_START_CONTEXT: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+];
+/// The callers that run lifecycle work for the control plane. Every one is
+/// also allowed Start and Stop, which an upgrade runs as its caller.
+const ALLOW_SANDBOX_RUNTIME_UPGRADE: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Operator),
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
 ];
 // Cluster-deleted evictions are driven by node-ctl's desired-state facet
@@ -1089,6 +1097,15 @@ pub enum RefundInterruptedSnapshotUploadAttemptsError {
 }
 
 impl SandboxManagerService {
+    /// The sandbox cache root: [`CACHE_DIR`], or a test's own root.
+    pub(super) fn cache_root(&self) -> &Path {
+        #[cfg(test)]
+        if let Some(root) = self.create_cache_dir.as_deref() {
+            return root;
+        }
+        Path::new(CACHE_DIR)
+    }
+
     pub(crate) fn db_conn(&self) -> Result<crate::db::ConnectionGuard<'_>, Status> {
         self.db.lock().map_err(|_| {
             // Poison is not recoverable connection health. Keep ownership

@@ -139,6 +139,10 @@ service NodeManager {
   rpc ListBtrfsSnapshots(ListBtrfsSnapshotsRequest) returns (ListBtrfsSnapshotsResponse);
   // Roll back: replace instance subvolume with a writable copy of a snapshot, prune newer snapshots.
   rpc RollbackBtrfsSnapshot(RollbackBtrfsSnapshotRequest) returns (RollbackBtrfsSnapshotResponse);
+  // Replace the instance subvolume with a writable copy of one internal
+  // snapshot, leaving every other snapshot in place. The runtime must be
+  // stopped. Only `d-operation-` snapshots are accepted.
+  rpc RestoreInstanceSnapshot(RestoreInstanceSnapshotRequest) returns (RestoreInstanceSnapshotResponse);
   // Get exclusive disk usage for a batch of sandboxes.
   rpc GetDiskUsage(GetDiskUsageRequest) returns (GetDiskUsageResponse);
   // Flush host filesystem caches for the sandbox rootfs backing file.
@@ -943,6 +947,12 @@ message CreateBtrfsSnapshotRequest {
 }
 message CreateBtrfsSnapshotResponse {}
 
+message RestoreInstanceSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_name = 2;
+  ExecutionFence execution_fence = 3;
+}
+message RestoreInstanceSnapshotResponse {}
 message DeleteBtrfsSnapshotRequest {
   string sandbox_id = 1;
   string snapshot_name = 2;

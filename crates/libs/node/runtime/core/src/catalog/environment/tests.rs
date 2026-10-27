@@ -258,3 +258,52 @@ fn memory_state_requires_qualification_and_a_declared_format() {
         );
     }
 }
+
+#[test]
+fn an_execution_is_attributed_to_the_environment_it_ran_under() {
+    let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let e0 = find(&environments, "e0");
+    let e1 = find(&environments, E1);
+    let attributed = |execution: &ExecutionMetadata| {
+        CompiledEnvironment::of_execution(&environments, execution).map(CompiledEnvironment::name)
+    };
+
+    // Bound metadata names its environment.
+    let bound = e1.definition().execution_requirements().unwrap();
+    assert_eq!(attributed(&bound), Some(E1));
+
+    // Unbound metadata that satisfies a definition belongs to it.
+    let bound_e0 = e0.definition().execution_requirements().unwrap();
+    let unbound = ExecutionMetadata::new(
+        bound_e0.runtime().clone(),
+        bound_e0.guest(),
+        bound_e0.state_format().cloned(),
+        bound_e0.components().to_vec(),
+    )
+    .unwrap();
+    assert_eq!(unbound.environment(), None);
+    assert_eq!(attributed(&unbound), Some("e0"));
+
+    // A stock E0 snapshot from before boot components were recorded.
+    let stock = ExecutionMetadata::new(
+        bound_e0.runtime().clone(),
+        bound_e0.guest(),
+        bound_e0.state_format().cloned(),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(attributed(&stock), Some("e0"));
+
+    // A historical contract no compiled environment describes.
+    let custom = ExecutionMetadata::new(
+        RuntimeIdentity {
+            kind: RuntimeKind::Firecracker,
+            version: "1.14.0".parse().unwrap(),
+        },
+        bound_e0.guest(),
+        bound_e0.state_format().cloned(),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(attributed(&custom), None);
+}

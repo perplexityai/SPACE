@@ -753,7 +753,7 @@ impl LocalArtifacts {
         let mut deleting_finished = 0usize;
         let mut deleting_deferred = 0usize;
         for (id, local_path) in stuck_deleting {
-            let staging = format!("{local_path}.gc-pending-{id}");
+            let staging = gc_pending_staging_path(&local_path, &id);
             let (original_present, staging_present) = match (
                 std::path::Path::new(&local_path).try_exists(),
                 std::path::Path::new(&staging).try_exists(),
@@ -960,6 +960,12 @@ impl Drop for RestoreLease {
     }
 }
 
+/// Where a deleted artifact's bytes wait for removal. Startup recovery and the
+/// reaper's orphan sweep recognize exactly this shape.
+pub(crate) fn gc_pending_staging_path(local_path: &str, id: impl std::fmt::Display) -> String {
+    format!("{local_path}.gc-pending-{id}")
+}
+
 /// Active checkout of an artifact in `Deleting` state. The caller is
 /// expected to perform any on-disk cleanup (rename, rmdir), record it with
 /// [`Self::mark_path_vacated`], and then call [`Self::commit`] to remove the
@@ -1000,6 +1006,21 @@ impl DeleteLease {
     /// longer rolls the row back to `ready`.
     pub fn mark_path_vacated(&mut self) {
         self.on_drop = DeleteDrop::KeepDeleting;
+    }
+
+    /// Rename the bytes to their GC staging sibling and record that they left
+    /// `local_path`. Returns the staging path, or `None` when nothing was at
+    /// `local_path`. On a rename error the bytes stay and a dropped lease
+    /// returns the row to `ready`.
+    pub(crate) fn vacate_to_gc_staging(&mut self) -> std::io::Result<Option<String>> {
+        let staging = gc_pending_staging_path(&self.local_path, self.id);
+        let present = match std::fs::rename(&self.local_path, &staging) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        self.mark_path_vacated();
+        Ok(present.then_some(staging))
     }
 
     /// Return the row to `ready` because `local_path` still exists, surfacing

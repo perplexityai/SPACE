@@ -214,6 +214,14 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::evict_cluster_deleted_sandbox(self, request).await
     }
 
+    async fn upgrade_runtime(
+        &self,
+        request: Request<crate::proto::UpgradeRuntimeRequest>,
+    ) -> Result<Response<crate::proto::UpgradeRuntimeResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
+        SandboxManagerService::upgrade_runtime(self, request).await
+    }
+
     async fn kill(&self, request: Request<KillRequest>) -> Result<Response<KillResponse>, Status> {
         record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::kill(self, request).await

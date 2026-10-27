@@ -427,9 +427,7 @@ impl SandboxManagerService {
             },
         )?;
 
-        let cache_dir = std::path::Path::new(CACHE_DIR);
-        #[cfg(test)]
-        let cache_dir = self.create_cache_dir.as_deref().unwrap_or(cache_dir);
+        let cache_dir = self.cache_root();
         if let Err(status) = ensure_sandbox_cache_root_in(cache_dir, &id) {
             create_cleanup.cleanup_after_failure(
                 SandboxQuarantineReasonCode::CreateInterrupted,
@@ -657,9 +655,7 @@ impl SandboxManagerService {
         let id = &sandbox.id;
         let original_state = sandbox.state;
         let mut uuid8 = sandbox.uuid8.clone();
-        let cache_root = std::path::Path::new(CACHE_DIR);
-        #[cfg(test)]
-        let cache_root = self.create_cache_dir.as_deref().unwrap_or(cache_root);
+        let cache_root = self.cache_root();
         let prepare_source = start_stage_timeout(
             "restore.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
@@ -790,12 +786,14 @@ impl SandboxManagerService {
                         route_identity_provenance,
                     ),
                     open_claim: open_route_activation.as_ref(),
+                    runtime_upgrade: None,
                 },
             )
             .map_err(|error| {
-                Status::internal(format!(
-                    "failed to claim restoring state before restore prepare: {error}"
-                ))
+                super::runtime_upgrade::begin_activation_status(
+                    error,
+                    "failed to claim restoring state before restore prepare",
+                )
             })?
         };
         let Some(cleanup_episode) = cleanup_episode else {

@@ -1,7 +1,7 @@
 use super::{
     ENC_SNAPSHOT_JAIL_SUBDIR, ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME,
-    pin_encrypted_snapshot_bind, reown_encrypted_snapshot_inputs, set_snapshot_export_modes,
-    validate_cache_artifact_path,
+    pin_encrypted_snapshot_bind, reown_encrypted_snapshot_inputs, restore_instance_snapshot_in,
+    set_snapshot_export_modes, validate_cache_artifact_path,
 };
 use crate::proto::node_manager_server::NodeManager as _;
 use std::os::unix::fs::PermissionsExt;
@@ -775,4 +775,79 @@ async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// A rollback prunes every snapshot that sorts after its target. Restoring an
+/// internal copy must leave the sandbox's other snapshots, and the copy
+/// itself, where they are.
+#[test]
+fn instance_restore_replaces_only_the_instance() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("instance")).unwrap();
+    std::fs::write(root.join("instance/rootfs.ext4"), "booted").unwrap();
+    let preserved = "d-operation-runtime-upgrade-019a0000-0000-7000-8000-000000000001";
+    let others = [
+        "d-1m-20990101T000000Z",
+        "f-1h-20990101T000000Z",
+        "d-manual-20990101T000000Z",
+        "d-stop-ffffffff-ffff-7fff-bfff-ffffffffffff",
+        "zz-later",
+    ];
+    for name in std::iter::once(preserved).chain(others) {
+        let snapshot = root.join("snapshots").join(name);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("rootfs.ext4"), name).unwrap();
+    }
+    let sandbox = super::super::trusted_paths::open_directory(&root).unwrap();
+
+    restore_instance_snapshot_in(&sandbox, preserved, nix::unistd::getegid().as_raw()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("instance/rootfs.ext4")).unwrap(),
+        preserved
+    );
+    for name in std::iter::once(preserved).chain(others) {
+        assert_eq!(
+            std::fs::read_to_string(root.join("snapshots").join(name).join("rootfs.ext4")).unwrap(),
+            name,
+            "{name} must survive the restore"
+        );
+    }
+    assert!(
+        restore_instance_snapshot_in(&sandbox, "missing", 0)
+            .unwrap_err()
+            .code()
+            != tonic::Code::Ok
+    );
+}
+
+#[tokio::test]
+async fn instance_restore_accepts_only_internal_snapshots() {
+    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    for name in [
+        "d-1m-20260922T120000Z",
+        "manual",
+        "../d-operation-x",
+        "d-operation",
+    ] {
+        let mut request = tonic::Request::new(crate::proto::RestoreInstanceSnapshotRequest {
+            sandbox_id: sandbox_id.clone(),
+            snapshot_name: name.into(),
+            execution_fence: None,
+        });
+        request
+            .extensions_mut()
+            .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+        let error = service
+            .restore_instance_snapshot(request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::InvalidArgument,
+            "{name}: {error}"
+        );
+    }
 }

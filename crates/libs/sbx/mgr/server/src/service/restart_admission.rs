@@ -217,6 +217,7 @@ restart_rpcs! {
     SandboxPrepareTeardownSuspend => ("/space.sandbox.manager.v1.SandboxManager/PrepareTeardownSuspend", StateWriter),
     SandboxEnqueueArtifactBackup => ("/space.sandbox.manager.v1.SandboxManager/EnqueueArtifactBackup", StateWriter),
     SandboxEvictClusterDeletedSandbox => ("/space.sandbox.manager.v1.SandboxManager/EvictClusterDeletedSandbox", StateWriter),
+    SandboxUpgradeRuntime => ("/space.sandbox.manager.v1.SandboxManager/UpgradeRuntime", StateWriter),
     SandboxEnableSnapshots => ("/space.sandbox.manager.v1.SandboxManager/EnableSnapshots", StateWriter),
     SandboxDisableSnapshots => ("/space.sandbox.manager.v1.SandboxManager/DisableSnapshots", StateWriter),
     SandboxListSnapshots => ("/space.sandbox.manager.v1.SandboxManager/ListSnapshots", ReadOnly),

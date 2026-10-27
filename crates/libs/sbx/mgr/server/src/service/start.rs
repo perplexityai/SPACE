@@ -119,6 +119,9 @@ struct StartSandboxContext {
     open_activation_claim_eligible: bool,
     restore_artifact_as_new: Option<RestoreArtifactAsNewContext>,
     identity_free_direct_authority: IdentityFreeDirectActivationAuthority,
+    /// Set only by the runtime upgrade operation, never from the wire: this
+    /// cold boot is that upgrade's, and may pass its activation fence.
+    runtime_upgrade: Option<crate::db::RuntimeUpgradeOperationId>,
 }
 
 struct StartSandboxLookup {
@@ -407,6 +410,7 @@ impl StartSandboxContext {
             open_activation_claim_eligible,
             restore_artifact_as_new,
             identity_free_direct_authority: IdentityFreeDirectActivationAuthority::Denied,
+            runtime_upgrade: None,
         })
     }
 }
@@ -1264,6 +1268,10 @@ impl SandboxManagerService {
             )
             .await?,
         );
+        // Adoption and remote staging below write the checkpoint before the
+        // activation claim, and a retiring upgrade's checkpoint may be stale; a
+        // runtime upgrade inserts its fence under this lock.
+        self.refuse_unretired_runtime_upgrade(&sandbox.id)?;
         let mut sandbox = self.lookup_sandbox(&sandbox.id)?;
         let mut remote_stage_completed = false;
 
@@ -1613,6 +1621,19 @@ impl SandboxManagerService {
         admit_warm_start(sandbox)?;
 
         self.ensure_snapshot_restore_supported("start_from_warm")?;
+        // Staging writes the checkpoint directory and moves the row before the
+        // restore's activation claim, so a runtime upgrade that still owes its
+        // retirement is checked first, under the lock its fence is inserted under.
+        let artifact_guard = start_stage(
+            "warm.artifact_lock_wait",
+            &sandbox.id,
+            wait_for_activation_admission(
+                &sandbox.id,
+                self.auto_lifecycle.artifact_lock(&sandbox.id).lock_owned(),
+            ),
+        )
+        .await?;
+        self.refuse_unretired_runtime_upgrade(&sandbox.id)?;
         tracing::Span::current().record(
             "start_execution_path",
             SandboxStartExecutionPath::WarmSnapshot.as_str(),
@@ -1688,6 +1709,7 @@ impl SandboxManagerService {
             let db = self.db_conn()?;
             write_warm_start_restaged(&db, &sandbox.id)?;
         }
+        drop(artifact_guard);
 
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.resolve_start_context_route_identity(&sandbox, ctx)?;
@@ -1740,9 +1762,36 @@ impl SandboxManagerService {
         restrict_to_template_manager_owned: bool,
         identity_free_direct_authority: IdentityFreeDirectActivationAuthority,
     ) -> Result<Response<StartResponse>, Status> {
+        self.start_sandbox_with_upgrade_authority(
+            req,
+            restrict_to_template_manager_owned,
+            identity_free_direct_authority,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn start_sandbox_with_upgrade_authority(
+        &self,
+        req: StartRequest,
+        restrict_to_template_manager_owned: bool,
+        identity_free_direct_authority: IdentityFreeDirectActivationAuthority,
+        runtime_upgrade: Option<crate::db::RuntimeUpgradeOperationId>,
+    ) -> Result<Response<StartResponse>, Status> {
         let sandbox_id = &req.sandbox_id;
         let mut start_ctx = StartSandboxContext::from_request(&req)?;
         start_ctx.identity_free_direct_authority = identity_free_direct_authority;
+        if runtime_upgrade.is_some()
+            && (!start_ctx.checkpoint.is_empty()
+                || start_ctx.from_warm
+                || start_ctx.restore_artifact_as_new.is_some()
+                || start_ctx.target_state != SandboxState::Started)
+        {
+            return Err(Status::invalid_argument(
+                "a runtime upgrade boots only by a cold start into the started lifecycle",
+            ));
+        }
+        start_ctx.runtime_upgrade = runtime_upgrade;
         let req_vcpu = start_ctx.req_vcpu;
         let req_memory_mib = start_ctx.req_memory_mib;
         let checkpoint = start_ctx.checkpoint.clone();
@@ -2020,12 +2069,14 @@ impl SandboxManagerService {
                         start_ctx.route_identity_provenance,
                     ),
                     open_claim: open_route_activation.as_ref(),
+                    runtime_upgrade: start_ctx.runtime_upgrade,
                 },
             )
             .map_err(|error| {
-                Status::internal(format!(
-                    "failed to claim starting state before cold activation: {error}"
-                ))
+                super::runtime_upgrade::begin_activation_status(
+                    error,
+                    "failed to claim starting state before cold activation",
+                )
             })
         };
         let cleanup_episode = match cleanup_episode {
