@@ -174,6 +174,8 @@ pub enum BuildError {
     ExecutionBinding(#[from] BuildExecutionBindingError),
     #[error("no guest exit strategy for build runtime {0}")]
     UnsupportedGuestExit(pplx_space_common_core::types::RuntimeKind),
+    #[error("recipe builds require an ext4 image with a guest agent; import opaque disks instead")]
+    UnsupportedGuestImage,
     #[error(transparent)]
     Environment(#[from] BuildEnvironmentError),
     #[error(transparent)]
@@ -227,7 +229,8 @@ impl BuildError {
             Self::Environment(_)
             | Self::Recipe(_)
             | Self::TemplateRef(_)
-            | Self::OciGuestSeed(_) => TemplateBuildErrorKind::Recipe,
+            | Self::OciGuestSeed(_)
+            | Self::UnsupportedGuestImage => TemplateBuildErrorKind::Recipe,
             Self::Ssh(error) => error.error_kind(),
             Self::Step { source, .. } => source.recipe_step_error_kind(),
             Self::OciImageAssembly(error) => error.error_kind(),
@@ -775,6 +778,9 @@ impl TemplateBuilder {
         })
         .await?;
         let base_metadata = &resolved_base.metadata;
+        if base_metadata.guest_image.unwrap_or_default() != Default::default() {
+            return Err(BuildError::UnsupportedGuestImage);
+        }
         let base_execution = base_metadata
             .execution_metadata()
             .map_err(BuildExecutionBindingError::from)?
@@ -1264,6 +1270,7 @@ impl TemplateBuilder {
         let (spaced_version, spaced_compatibility_family) =
             template_guest_runtime_metadata(&resolved_base, oci_guest_runtime.as_ref());
         let mut tmeta = TemplateMetadata {
+            guest_image: None,
             schema_version: None,
             execution: None,
             id: template_id.to_string(),

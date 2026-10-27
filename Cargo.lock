@@ -6585,6 +6585,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 

@@ -254,7 +254,9 @@ impl Artifact {
                 release == &environment.release().release
                     && *digest == environment.release().digest()
             }
-            Self::Kernel(_, digest) => *digest == environment.kernel().sha256,
+            Self::Kernel(_, digest) => environment
+                .kernel()
+                .is_some_and(|kernel| *digest == kernel.sha256),
             Self::Boot(identity) => environment
                 .definition()
                 .descriptor()
