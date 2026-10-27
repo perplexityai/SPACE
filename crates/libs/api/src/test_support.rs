@@ -75,3 +75,73 @@ pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
         redis_url: None,
     }
 }
+
+/// Run `request` while this holds `public_operations` locked, so that the
+/// request's first read of that table waits. While it waits, record the
+/// row of `sandbox_id` for `create`, a queued or running native create of it, and finish
+/// `create`, each as its execution does; then release the lock and return
+/// what `request` returned. The request's earlier reads of the sandbox row
+/// therefore miss it, and its read of the create sees it finished.
+pub(crate) async fn finish_create_while_a_request_reads_operations<T: Send + 'static>(
+    pool: &PgPool,
+    create: pplx_space_public_api::OperationId,
+    sandbox_id: pplx_space_public_api::PublicSandboxId,
+    request: impl std::future::Future<Output = T> + Send + 'static,
+) -> pplx_space_db_test_fixtures::TestDbResult<T> {
+    use pplx_space_common_core::sql;
+    use sqlx::{Connection, PgConnection};
+
+    // Outside the pool, which the request and the wait below draw on.
+    let mut connection = PgConnection::connect_with(&pool.connect_options()).await?;
+    let mut lock = connection.begin().await?;
+    sqlx::query(sql!(
+        "LOCK TABLE public_operations IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(&mut *lock)
+    .await?;
+    let request = tokio::spawn(request);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND wait_event_type = 'Lock'
+                    AND wait_event = 'relation'
+             )"
+        ))
+        .fetch_one(pool)
+        .await?;
+        if waiting {
+            break;
+        }
+        if request.is_finished() || std::time::Instant::now() >= deadline {
+            return Err("the request never read public_operations".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, network_policy_override_json,
+             network_policy_generation)
+         SELECT $2, actor_user_id, org_id, 'started', $3, 1
+         FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(create.as_uuid())
+    .bind(sandbox_id.as_uuid())
+    .bind(sqlx::types::Json(
+        pplx_space_net_common::NetworkPolicyV1::default(),
+    ))
+    .execute(&mut *lock)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET state = 'succeeded', claim_token = '', completed_at = NOW(), updated_at = NOW()
+         WHERE operation_id = $1"
+    ))
+    .bind(create.as_uuid())
+    .execute(&mut *lock)
+    .await?;
+    lock.commit().await?;
+    connection.close().await?;
+    Ok(request.await?)
+}

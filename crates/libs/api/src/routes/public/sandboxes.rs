@@ -926,10 +926,17 @@ async fn enqueue_lifecycle_operation(
         }
         ObservePublicOperationIdempotency::Missing => {}
     }
-    if !admission
-        .sandbox_belongs_to_org(SandboxId::from_uuid(sandbox_id.as_uuid()), org_id)
-        .await?
-    {
+    let target = SandboxId::from_uuid(sandbox_id.as_uuid());
+    // A create answers before its sandbox has a row. A delete in between
+    // cancels or waits for that create, so it must not miss it.
+    let found = if action == SandboxLifecycleAction::Delete {
+        admission
+            .delete_target_belongs_to_org(target, org_id)
+            .await?
+    } else {
+        admission.sandbox_belongs_to_org(target, org_id).await?
+    };
+    if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
     }
     let sandbox_id_string = sandbox_id.to_string();

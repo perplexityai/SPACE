@@ -136,12 +136,12 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
             },
             None => SandboxAccessScope::LocalOrg { org_id },
         };
-        let sandbox = state
+        let mut sandbox = state
             .sandbox_controller
             .scoped_sandbox(&state.pool, &scope, sandbox_id.into())
             .await
             .map_err(super::sandboxes::controller_error)?;
-        let Some(sandbox) = sandbox else {
+        if sandbox.is_none() {
             let matched = parts
                 .extensions
                 .get::<axum::extract::MatchedPath>()
@@ -154,24 +154,44 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
                 && relative
                     == Some(pplx_space_public_api::routes::DELETE_SANDBOX.relative_runtime_path())
             {
-                // Deleted targets have no live owner row. Only an exact replay
-                // of an operation in the caller's owner scope may pass; the
-                // handler rechecks idempotency under its admission lock.
+                // Deleted targets have no live owner row, and neither has a
+                // target whose create has yet to execute. Only an exact replay
+                // of an operation in the caller's owner scope, or a create in
+                // flight there, may pass; the handler rechecks both under its
+                // admission lock.
+                let mut headers = parts.headers.clone();
                 if let Some(subject_id) = subject_id {
-                    namespace_idempotency_key(&mut parts.headers, subject_id)?;
+                    namespace_idempotency_key(&mut headers, subject_id)?;
                 }
                 if super::sandboxes::delete_replay_in_owner_scope(
                     &state.pool,
                     org_id,
                     subject_id,
-                    &parts.headers,
+                    &headers,
                     sandbox_id,
                 )
                 .await?
+                    || PublicOperationStore::new(state.pool.clone())
+                        .sandbox_create_in_flight_in_owner_scope(
+                            org_id,
+                            subject_id,
+                            &sandbox_id.to_string(),
+                        )
+                        .await?
                 {
+                    parts.headers = headers;
                     return Ok(Request::from_parts(parts, body));
                 }
+                // A create commits its row before it leaves flight, so one
+                // that finished since the first read has a row by now.
+                sandbox = state
+                    .sandbox_controller
+                    .scoped_sandbox(&state.pool, &scope, sandbox_id.into())
+                    .await
+                    .map_err(super::sandboxes::controller_error)?;
             }
+        }
+        let Some(sandbox) = sandbox else {
             return Err(PublicApiError::not_found("sandbox not found"));
         };
         if owner.is_some() && sandbox.owner_source != SandboxOwnerSource::FederatedIdentity {

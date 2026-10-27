@@ -810,6 +810,91 @@ async fn delete_replay_survives_target_removal_without_crossing_tenant_or_reques
     Ok(())
 }
 
+/// Record a native create of a new sandbox in the seed org, queued and
+/// without its sandbox row.
+async fn queued_native_create(pool: &PgPool) -> TestDbResult<SandboxOperationResponse> {
+    Ok(create_native_sandbox_operation(
+        pool,
+        OrgId::from_uuid(SEED_ORG_ID),
+        UserId::from_uuid(SEED_USER_ID),
+        &IdempotencyKey::parse("queued-native-create")?,
+        create_request_with_auto_lifecycle(None),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("native create should be admitted"))
+}
+
+fn delete_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(IDEMPOTENCY_KEY_HEADER, "early-delete".parse().unwrap());
+    headers
+}
+
+/// The create records its row and finishes after the delete's admission has
+/// missed the row but before it looks for the create, so it finds no create
+/// in flight either. It reads the row again and admits the delete.
+#[tokio::test]
+async fn a_delete_admitted_while_its_create_records_the_row_is_not_lost() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let created = queued_native_create(&db.pool).await?;
+    let pool = db.pool.clone();
+    let result = crate::test_support::finish_create_while_a_request_reads_operations(
+        &db.pool,
+        created.operation_id,
+        created.sandbox_id,
+        async move {
+            enqueue_lifecycle_operation(
+                &pool,
+                OrgId::from_uuid(SEED_ORG_ID),
+                UserId::from_uuid(SEED_USER_ID),
+                delete_headers(),
+                &created.sandbox_id.to_string(),
+                SandboxLifecycleAction::Delete,
+                None,
+            )
+            .await
+        },
+    )
+    .await?;
+    let (status, Json(deleted)) = result
+        .map_err(|error| format!("the delete was refused: {}", error.into_response().status()))?;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(deleted.sandbox_id, created.sandbox_id);
+    assert_ne!(deleted.operation_id, created.operation_id);
+    Ok(())
+}
+
+/// Another organization's create in flight is not a delete target: the
+/// delete is the unknown sandbox's 404, and the create stays queued.
+#[tokio::test]
+async fn a_delete_never_sees_another_orgs_create_in_flight() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let created = queued_native_create(&db.pool).await?;
+    let result = enqueue_lifecycle_operation(
+        &db.pool,
+        OrgId::from_uuid(Uuid::now_v7()),
+        UserId::from_uuid(SEED_USER_ID),
+        delete_headers(),
+        &created.sandbox_id.to_string(),
+        SandboxLifecycleAction::Delete,
+        None,
+    )
+    .await;
+    let status = result.map_or_else(|error| error.into_response().status(), |(status, _)| status);
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let state: String = sqlx::query_scalar(sql!(
+        "SELECT state FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(created.operation_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(state, "queued");
+    Ok(())
+}
+
 #[tokio::test]
 async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbResult<()> {
     let db = pg_test_db().await?;

@@ -1125,3 +1125,180 @@ fn federated_idempotency_key_is_checked_before_it_is_hashed() {
     assert!(namespace_idempotency_key(&mut rejected, subject_id).is_err());
     assert_eq!(rejected["idempotency-key"].len(), max + 1, "left unhashed");
 }
+
+async fn operation_outcome(
+    pool: &sqlx::PgPool,
+    operation_id: &Value,
+) -> TestDbResult<(String, Option<Value>)> {
+    let operation_id: OperationId = operation_id.as_str().unwrap().parse()?;
+    let (state, error): (String, Option<sqlx::types::Json<Value>>) = sqlx::query_as(sql!(
+        "SELECT state, terminal_error_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(pool)
+    .await?;
+    Ok((state, error.map(|error| error.0)))
+}
+
+/// A delete that arrives before its sandbox's create has recorded the
+/// sandbox row is admitted, not answered as an unknown sandbox. It cancels
+/// the create, which never runs, and then succeeds with nothing to delete.
+/// Its key replays it before and after it runs; once the create is gone, a
+/// new delete is unknown again.
+#[tokio::test]
+async fn a_delete_before_its_sandboxs_row_exists_cancels_the_create() -> TestDbResult<()> {
+    use crate::controllers::sandbox::SandboxController;
+    use crate::public_operation_driver::{
+        OperationExecutionConfig, OperationExecutor, drive_claimed_operation,
+    };
+    use crate::public_operations::{ClaimLimits, ClaimPublicOperations};
+    use crate::public_sandbox_operations::SandboxLifecycleOperationExecutor;
+    use pplx_space_public_api::OperationKind;
+    use std::time::Duration;
+
+    for owner in [HeaderMap::new(), owner_headers(ORG, "101")] {
+        let fixture = fixture().await?;
+        let pool = &fixture.db.pool;
+        let (status, created) = send(
+            &fixture.app,
+            Method::POST,
+            "/v1/sandboxes",
+            grant_headers(owner.clone()),
+            json!({"template":"seed:latest"}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
+        let (status, deleted) = send(
+            &fixture.app,
+            Method::DELETE,
+            &path,
+            owner.clone(),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+        assert_eq!(deleted["sandbox_id"], created["sandbox_id"]);
+        assert_ne!(deleted["operation_id"], created["operation_id"]);
+        let (state, error) = operation_outcome(pool, &created["operation_id"]).await?;
+        assert_eq!(state, "canceled");
+        let error = error.expect("a canceled create carries its error");
+        assert_eq!(error["reason"], "superseded_by_delete");
+        assert_eq!(error["delete_operation_id"], deleted["operation_id"]);
+        let (status, replay) = send(
+            &fixture.app,
+            Method::DELETE,
+            &path,
+            owner.clone(),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+        assert_eq!(replay["operation_id"], deleted["operation_id"]);
+
+        let store = PublicOperationStore::new(pool.clone());
+        let mut claim = store
+            .claim_operations(ClaimPublicOperations {
+                limits: ClaimLimits::any(8),
+                claim_stale_after: Duration::from_secs(60),
+                claimable_kinds: &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox],
+            })
+            .await?;
+        let operation = claim.operations.pop().expect("the delete is claimable");
+        assert!(
+            claim.operations.is_empty(),
+            "the canceled create never runs"
+        );
+        assert_eq!(json!(operation.id), deleted["operation_id"]);
+        let executor = SandboxLifecycleOperationExecutor::new(
+            pool.clone(),
+            SandboxController::new(crate::test_support::direct_substrate(pool)),
+        );
+        drive_claimed_operation(
+            store,
+            claim.claim_token,
+            OperationExecutionConfig::default(),
+            operation.clone(),
+            OperationExecutor::Dispatcher,
+            async move { executor.execute(&operation).await.into() },
+        )
+        .await?;
+        let (state, _) = operation_outcome(pool, &deleted["operation_id"]).await?;
+        assert_eq!(state, "succeeded");
+        let rows: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes"))
+            .fetch_one(pool)
+            .await?;
+        assert_eq!(rows, 0);
+
+        let (status, replay) = send(
+            &fixture.app,
+            Method::DELETE,
+            &path,
+            owner.clone(),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+        assert_eq!(replay["operation_id"], deleted["operation_id"]);
+        let mut fresh = owner.clone();
+        fresh.insert("idempotency-key", "new-delete".parse()?);
+        let (status, response) =
+            send(&fixture.app, Method::DELETE, &path, fresh, Value::Null).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    }
+    Ok(())
+}
+
+/// A create still in flight lets only its own owner scope delete its
+/// sandbox: every other caller gets the unknown sandbox's 404, and the
+/// create stays queued.
+#[tokio::test]
+async fn a_create_in_flight_is_deletable_only_in_its_owner_scope() -> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let created = create(&fixture, ORG, "101").await?;
+    let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
+    for headers in [
+        owner_headers(ORG, "102"),
+        owner_headers(OTHER_ORG, "101"),
+        HeaderMap::new(),
+    ] {
+        let (status, response) =
+            send(&fixture.app, Method::DELETE, &path, headers, Value::Null).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    }
+    let (state, _) = operation_outcome(&fixture.db.pool, &created["operation_id"]).await?;
+    assert_eq!(state, "queued");
+    Ok(())
+}
+
+/// The create records its row and finishes after the delete's authorization
+/// has missed the row but before it looks for the create, so it finds no
+/// create in flight either. It reads the row again and admits the delete.
+#[tokio::test]
+async fn a_delete_racing_its_creates_row_insert_is_still_admitted() -> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let created = create(&fixture, ORG, "101").await?;
+    let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
+    let app = fixture.app.clone();
+    let (status, deleted) = crate::test_support::finish_create_while_a_request_reads_operations(
+        &fixture.db.pool,
+        created["operation_id"].as_str().unwrap().parse()?,
+        created["sandbox_id"].as_str().unwrap().parse()?,
+        async move {
+            send(
+                &app,
+                Method::DELETE,
+                &path,
+                owner_headers(ORG, "101"),
+                Value::Null,
+            )
+            .await
+        },
+    )
+    .await??;
+    assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+    assert_eq!(deleted["sandbox_id"], created["sandbox_id"]);
+    let (state, _) = operation_outcome(&fixture.db.pool, &deleted["operation_id"]).await?;
+    assert_eq!(state, "queued");
+    Ok(())
+}
