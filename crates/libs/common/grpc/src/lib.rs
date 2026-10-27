@@ -78,7 +78,7 @@ pub use policy::{
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryPolicy,
 };
 pub use queued_slots::{QueuedSlotWait, QueuedSlots, SlotRequest};
-pub use request_admission::{RequestAdmission, RequestPermit};
+pub use request_admission::{RequestAdmission, RequestLifetime, RequestPermit};
 pub use request_body::PreserveInputErrors;
 pub use retry::{
     ClientConnectFailureCause, client_connect_failure_cause, is_client_connect_failure,

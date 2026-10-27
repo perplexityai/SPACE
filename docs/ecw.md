@@ -115,6 +115,13 @@ timeout, refresh, pause, resume, and fork flows used by the tested Python SDK.
 It also supports the SDK's template-build flow and the command, filesystem,
 watch, and port operations exercised by the ECW smoke suite.
 
+Sandbox list metadata filters use the Python SDK encoding: percent-encode each
+key and value, form-encode the pairs, then encode that string as the `metadata` query
+parameter. ECW decodes exactly two component layers after HTTP query extraction
+and rejects duplicate decoded keys or invalid UTF-8. Literal percent sequences
+must use the same encoding; a hand-written, singly encoded `%3A` is interpreted
+as `:`, not as the literal string `%3A`. Malformed percent escapes remain literal.
+
 Lifecycle names differ across the two APIs:
 
 | ECW operation | SPACE operation |

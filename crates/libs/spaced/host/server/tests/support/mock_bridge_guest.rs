@@ -471,6 +471,8 @@ impl Process for MockBridgeGuest {
             user: Some("user".into()),
             tag: Some("server".into()),
             pty: Some(false),
+            exit: None,
+            ended_at: None,
         })];
         Ok(Response::new(
             Box::pin(tokio_stream::iter(processes)) as Self::ListProcessesStream

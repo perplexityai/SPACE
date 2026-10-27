@@ -1,0 +1,2 @@
+DROP INDEX sandbox_runtime_upgrades_by_sandbox;
+DROP TABLE sandbox_runtime_upgrades;

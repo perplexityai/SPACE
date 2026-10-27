@@ -28,7 +28,7 @@ use crate::public_operations::{
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const INITIAL_FORK_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const MAX_FORK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_FORK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FORK_HTTP_WAIT_SLACK: Duration = Duration::from_secs(5);
 
 fn fork_http_wait_timeout(hard_deadline: Duration) -> Duration {
@@ -500,11 +500,22 @@ async fn wait_for_fork_outcome(
     operation_id: pplx_space_public_api::OperationId,
     max_wait: Duration,
 ) -> Result<ForkOperationOutcome, E2bApiError> {
+    poll_fork_outcome(max_wait, || store.fetch_fork_outcome(org_id, operation_id)).await
+}
+
+async fn poll_fork_outcome<F>(
+    max_wait: Duration,
+    mut fetch: impl FnMut() -> F,
+) -> Result<ForkOperationOutcome, E2bApiError>
+where
+    F: std::future::Future<
+            Output = Result<Option<ForkOperationOutcome>, PublicOperationStoreError>,
+        >,
+{
     tokio::time::timeout(max_wait, async {
         let mut poll_interval = INITIAL_FORK_POLL_INTERVAL;
         loop {
-            if let Some(outcome) = store
-                .fetch_fork_outcome(org_id, operation_id)
+            if let Some(outcome) = fetch()
                 .await
                 // The poll re-reads the operation row on every tick, so it is
                 // the longest-lived reader in the handler and the most likely

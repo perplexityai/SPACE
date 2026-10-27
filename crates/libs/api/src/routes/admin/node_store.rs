@@ -23,7 +23,7 @@ use pplx_space_common_svc::sql::sandbox_residency::{
 #[cfg(test)]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
 use pplx_space_sandbox_portability::{
-    inflight_suspend_upload_exists, inflight_suspend_upload_from_node_exists,
+    drain_gate_blockers_for_node, inflight_suspend_upload_exists,
     snapshot_durable_for_source_release,
 };
 use serde::Serialize;
@@ -107,6 +107,28 @@ pub(super) struct NodeSandboxRow {
 pub(super) struct SandboxOccupancy {
     pub(super) active: i64,
     pub(super) local_snapshots: i64,
+}
+
+/// What the `:terminate` guard counts, kept separate from
+/// [`SandboxOccupancy`] on purpose.
+///
+/// The two are produced by different statements for different jobs.
+/// `SandboxOccupancy` is what the node *listing* reports, and its
+/// `local_snapshots` is a diagnostic an operator reads. This one is what the
+/// 409 is *decided* on, and its second term is the shared node-drain gate
+/// (`drain_gate_blockers_for_node`) so the endpoint and the reconciler cannot
+/// disagree about whether a node is safe to terminate.
+///
+/// Sharing one struct would have forced one meaning on both, and the
+/// meanings are genuinely different — see the comment on the statement.
+#[derive(Debug)]
+pub(super) struct TerminateOccupancy {
+    pub(super) active: i64,
+    /// Rows the node-drain gate counts against this node. Named for what it
+    /// is rather than for the field it replaced: it is not a count of local
+    /// snapshots and reading it as one is how the previous divergence went
+    /// unnoticed.
+    pub(super) drain_blockers: i64,
 }
 
 /// The lifecycle scope of the `active` occupancy count: everything that has
@@ -791,27 +813,20 @@ pub(super) async fn sandbox_occupancy_for_node_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
     residency: ResidencyEvidence,
-) -> Result<SandboxOccupancy, sqlx::Error> {
-    // Same marker-aware `snapshot_durable_for_source_release` portability
-    // filter as `occupancy_for_nodes`: routed through the shared predicate so
-    // the `:terminate` 409 guard matches what the admin listing surfaces, and
-    // matches the node-drain source-release guards — an evacuation-marked
-    // sandbox blocks `:terminate` until its newest full snapshot is `ready`.
-    //
-    // The `OR {inflight_upload}` term also blocks termination while a
-    // suspend-snapshot upload is still in flight *from* this node
-    // (`snapshots.state='creating'`, `source_node_id = $1`) — including
-    // the case where the sandbox's `target_node_id` has drifted to
-    // another node, which the `target_node_id = $1` clause alone would
-    // miss. Terminating mid-upload kills the worker holding the only
-    // durable copy. A row matching both clauses is still counted once
-    // (COUNT over a single `sandboxes` scan), so no double-count.
+) -> Result<TerminateOccupancy, sqlx::Error> {
+    // Both properties the hand-written predicate used to provide are now
+    // properties of the shared gate, so they are asserted there rather than
+    // restated here: an evacuation-marked sandbox blocks until its newest
+    // full snapshot is `ready` (`snapshot_durable_for_source_release`), and a
+    // suspend upload still in flight *from* this node blocks even when the
+    // sandbox's `target_node_id` has since drifted elsewhere — the gate's
+    // second arm drives from `snapshots.source_node_id` precisely so that
+    // drift cannot hide it. Terminating mid-upload kills the worker holding
+    // the only durable copy.
     //
     // Quarantined sandboxes remain active placement blockers by design:
     // quarantine preserves the hot-node association until a quarantine-aware
     // release or cleanup path decides it is safe to drop.
-    let snapshot_exists = snapshot_durable_for_source_release("sandboxes");
-    let inflight_upload = inflight_suspend_upload_from_node_exists("sandboxes", "$1");
     // `active` routes through the shared `active_resident_predicate` rather than
     // through this module's `active_occupancy_lifecycles`. The two agree on the
     // exclusion list — the helper is exactly that list — but the shared
@@ -827,26 +842,49 @@ pub(super) async fn sandbox_occupancy_for_node_in_tx(
     // on. `$1` is a bound parameter, which is the shape that keeps the heartbeat
     // subquery a once-per-execution InitPlan.
     let active = active_resident_predicate("sandboxes", "$1", residency);
+    // The second count is `drain_gate_blockers_for_node`, not a third
+    // hand-written gate. Two things change by routing it here.
+    //
+    // **It stops disagreeing with the reconciler.** The previous predicate
+    // counted `lifecycle = 'suspended'` only, so a `suspending` row, or a
+    // non-evacuation `restoring` row, pinned to the node by `target_node_id`
+    // was invisible to it. When such a row's `active_node_id` is NULL, the
+    // `active` half, which keys on `active_node_id`, cannot see it either; an
+    // in-flight user restore of a suspended sandbox is the common case. The
+    // node-drain gate counts those rows (`drain_gate_target_pinned_blocks`),
+    // so `:terminate` would accept a `drained` node that had picked up such a
+    // row since it drained, one the gate would hold, and `space-rollout-mng.py`
+    // drives that endpoint unattended.
+    //
+    // **It stops scanning the table.** The old statement had no `WHERE` at
+    // all — the node predicates lived inside the `FILTER`s — so both counts
+    // were paid over the whole `sandboxes` table on every `:terminate`. Each
+    // count is now its own node-scoped subquery.
+    //
+    // What this deliberately does *not* do is redefine the listing's
+    // `local_snapshots`. That number is reported, not gated on, and it and
+    // `drain_blockers` legitimately differ — the listing's in-flight branch
+    // inlines the legacy freshness gate while the blocker fragment takes the
+    // artifact-exact arm (see
+    // `live_residents_tests::an_artifact_mismatched_inflight_upload_counts_the_sandbox_once`).
+    // Collapsing the reported count into the gate would erase a distinction
+    // an operator reading the listing may need; collapsing the *decision*
+    // into the gate is the whole point.
+    let blockers = drain_gate_blockers_for_node("$1");
     let query = format!(
         "SELECT
-     COUNT(*) FILTER (WHERE {active})::BIGINT AS active,
-     COUNT(*) FILTER (
-         WHERE (
-                 lifecycle = 'suspended'
-                 AND target_node_id = $1
-                 AND NOT {snapshot_exists}
-               )
-            OR ({inflight_upload} AND NOT {snapshot_exists})
-     )::BIGINT AS local_snapshots
- FROM sandboxes"
+     (SELECT COUNT(*)::BIGINT FROM sandboxes WHERE {active}) AS active,
+     (SELECT COUNT(*)::BIGINT FROM (
+{blockers}
+          ) gate_blockers) AS drain_blockers"
     );
     let row: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(node_id)
         .fetch_one(&mut **tx)
         .await?;
-    Ok(SandboxOccupancy {
+    Ok(TerminateOccupancy {
         active: row.0,
-        local_snapshots: row.1,
+        drain_blockers: row.1,
     })
 }
 
@@ -1247,3 +1285,8 @@ mod in_flight_drain_tests;
 /// handler's `deferred[]` tail depends on.
 #[cfg(test)]
 mod pinned_local_only_plan_tests;
+/// The `:terminate` guard and the node-drain gate must count the same rows.
+/// Postgres-backed, and each case also shows the pre-change guard disagreed —
+/// otherwise the agreement proves nothing.
+#[cfg(test)]
+mod terminate_gate_agreement_tests;

@@ -38,6 +38,7 @@ async fn only_explicit_finish_completes_a_worker_upload() {
             None,
             tokio_util::sync::CancellationToken::new(),
             Arc::new(UploadBufferPool::new()),
+            tokio_util::task::TaskTracker::new(),
         )
         .await;
         assert_eq!(result.is_ok(), finished);
@@ -200,6 +201,7 @@ async fn write_frames(
         None,
         tokio_util::sync::CancellationToken::new(),
         Arc::new(UploadBufferPool::new()),
+        tokio_util::task::TaskTracker::new(),
     )
     .await
 }

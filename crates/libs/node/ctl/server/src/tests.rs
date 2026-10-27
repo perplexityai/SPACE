@@ -1,5 +1,17 @@
 use super::*;
 
+#[test]
+fn poll_interval_is_bounded_by_what_the_cluster_window_covers() {
+    let max = MAX_NODE_CTL_POLL_INTERVAL;
+    assert_eq!(bound_poll_interval(Duration::ZERO), Duration::from_secs(1));
+    assert_eq!(
+        bound_poll_interval(DEFAULT_NODE_CTL_POLL_INTERVAL),
+        DEFAULT_NODE_CTL_POLL_INTERVAL
+    );
+    assert_eq!(bound_poll_interval(max), max);
+    assert_eq!(bound_poll_interval(max + Duration::from_secs(1)), max);
+}
+
 #[tokio::test]
 async fn mutex_timeout_never_transfers_ownership() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -366,6 +378,25 @@ async fn timer_test_worker(
         rx,
     };
     (worker, tx, db, passes)
+}
+
+/// The published node-ctl status names the node-status reconciler with the
+/// interval stored for it in `reconciliation_status`. The cluster derives its
+/// freshness window from that entry. This covers the table-to-publication
+/// path; `run` seeding the table from the interval it polls at isn't covered.
+#[tokio::test]
+async fn published_node_ctl_status_reports_the_node_status_poll_interval() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (worker, _tx, db, _passes) = timer_test_worker(dir.path()).await;
+    let configured_secs = 45;
+    init_reconciliation_status(&db.lock().expect("lock node-ctl db"), configured_secs)
+        .expect("reseed statuses");
+
+    let status = worker.node_ctl_status_for_publish();
+    assert_eq!(
+        pplx_space_node_api_client::node_status_freshness::reported_status_poll_interval(&status),
+        Some(Duration::from_secs(configured_secs)),
+    );
 }
 
 /// When each outbound reconciler last completed a pass (0: never).

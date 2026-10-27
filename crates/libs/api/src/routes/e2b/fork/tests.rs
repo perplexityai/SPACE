@@ -241,15 +241,33 @@ fn idempotent_replay_does_not_need_an_additional_client_slot() {
     assert!(!fork_admission_needs_client_slot(false));
 }
 
-#[test]
-fn fork_outcome_polling_backs_off_to_a_bounded_interval() {
-    let mut interval = Duration::from_millis(250);
-    for _ in 0..10 {
-        interval = next_fork_poll_interval(interval);
-    }
+#[tokio::test(start_paused = true)]
+async fn completed_fork_is_observed_within_one_second_without_busy_polling() {
+    for ready_after in [Duration::from_millis(8_200), Duration::from_millis(60_200)] {
+        let started = tokio::time::Instant::now();
+        let ready_at = started + ready_after;
+        let mut reads = 0;
+        let outcome = poll_fork_outcome(Duration::from_secs(90), || {
+            reads += 1;
+            std::future::ready(Ok(Some(if tokio::time::Instant::now() >= ready_at {
+                ForkOperationOutcome::Succeeded(serde_json::json!({"sandboxes": []}))
+            } else {
+                ForkOperationOutcome::Pending
+            })))
+        })
+        .await
+        .unwrap();
 
-    assert_eq!(interval, Duration::from_secs(5));
-    assert_eq!(next_fork_poll_interval(interval), Duration::from_secs(5));
+        assert!(matches!(outcome, ForkOperationOutcome::Succeeded(_)));
+        assert!(
+            tokio::time::Instant::now() - ready_at <= Duration::from_secs(1),
+            "completed fork waited more than one second for observation"
+        );
+        assert!(
+            reads <= ready_after.as_secs() + 5,
+            "pending forks must back off rather than busy-poll"
+        );
+    }
 }
 
 /// Forking a legacy local source through the federated bridge keeps local

@@ -14,6 +14,8 @@ async fn collection_outcomes_keep_failure_distinct_from_empty_success() {
                 legacy_unbound_allowed: true,
                 allowed_environment_references: vec![format!("sha256:{}", "11".repeat(32))],
                 default_environment_reference: Some(format!("sha256:{}", "11".repeat(32))),
+                applied_generation: None,
+                cluster_policy_unreadable: false,
             },
         ),
         runtimes: vec![RuntimeInstallation {

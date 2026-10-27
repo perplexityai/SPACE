@@ -878,6 +878,30 @@ pub(super) fn sandbox_rootfs_exists_in(
         .try_exists()
 }
 
+/// Older node-managers left instance/ private to the VM owner. Ask the
+/// privileged publisher to repair traversal before anything inspects the
+/// retained rootfs.
+pub(super) async fn repair_retained_instance_traversal(
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    cache_dir: &std::path::Path,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    if sandbox_rootfs_exists_in(cache_dir, sandbox_id)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        connect_node(node_manager)
+            .await
+            .map_err(|error| Status::unavailable(format!("repair retained instance: {error}")))?
+            .prepare_sandbox_artifact_dir(
+                pplx_space_node_mgr_client::proto::PrepareSandboxArtifactDirRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn template_source_for_sandbox_prepare(
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
@@ -898,21 +922,7 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
     sandbox: &crate::db::SandboxRow,
     cache_dir: &std::path::Path,
 ) -> Result<SandboxPrepareSource, Status> {
-    if sandbox_rootfs_exists_in(cache_dir, &sandbox.id)
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
-    {
-        // Older node-managers left instance/ private to the VM owner. The
-        // privileged publisher repairs traversal before selecting any template.
-        connect_node(node_manager)
-            .await
-            .map_err(|error| Status::unavailable(format!("repair retained instance: {error}")))?
-            .prepare_sandbox_artifact_dir(
-                pplx_space_node_mgr_client::proto::PrepareSandboxArtifactDirRequest {
-                    sandbox_id: sandbox.id.clone(),
-                },
-            )
-            .await?;
-    }
+    repair_retained_instance_traversal(node_manager, cache_dir, &sandbox.id).await?;
     if sandbox_rootfs_exists_in(cache_dir, &sandbox.id).map_err(|error| {
         Status::failed_precondition(format!(
             "inspect retained rootfs for {}: {error}",
@@ -988,7 +998,7 @@ fn bind_saved_execution(
     bind_disk_execution(sandbox.execution_metadata.as_ref(), observed)
 }
 
-fn bind_disk_execution(
+pub(super) fn bind_disk_execution(
     saved: Option<&pplx_space_common_core::types::ExecutionMetadata>,
     observed: pplx_space_common_core::types::ExecutionMetadata,
 ) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {

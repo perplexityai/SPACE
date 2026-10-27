@@ -121,7 +121,14 @@ impl SpacedHostClient {
         .await
     }
 
-    pub async fn list_processes(&self) -> Result<Vec<proto::ProcessInfo>, tonic::Status> {
+    /// Running processes, and with `include_exited` also those that have
+    /// exited but are still retained. With `process_id`, a guest that
+    /// supports the filter lists only that process; an older one lists all.
+    pub async fn list_processes(
+        &self,
+        include_exited: bool,
+        process_id: Option<&str>,
+    ) -> Result<Vec<proto::ProcessInfo>, tonic::Status> {
         tokio::time::timeout(
             PROCESS_LIST_TIMEOUT,
             pplx_space_spaced_common::retry_status(
@@ -132,7 +139,10 @@ impl SpacedHostClient {
                     let mut client = self.process.clone();
                     async move {
                         let mut stream = client
-                            .list_processes(ListProcessesRequest {})
+                            .list_processes(ListProcessesRequest {
+                                include_exited,
+                                process_id: process_id.map(str::to_owned),
+                            })
                             .await?
                             .into_inner();
                         let mut processes = Vec::new();

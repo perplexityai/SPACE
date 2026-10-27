@@ -100,6 +100,7 @@ class _Script:
         self.marker = ""
         self.process_failure = process_failure
         self.process_running = False
+        self.process_killed = False
 
 
 def _handler(script: _Script) -> type[BaseHTTPRequestHandler]:
@@ -244,6 +245,7 @@ def _handler(script: _Script) -> type[BaseHTTPRequestHandler]:
                     return
                 if script.process_failure != "terminal_timeout":
                     script.process_running = False
+                    script.process_killed = True
                 self._json(200, {"ok": True})
                 return
             self.send_error(404)
@@ -306,6 +308,20 @@ def _handler(script: _Script) -> type[BaseHTTPRequestHandler]:
                 self._json(200, {"data": data, "next_cursor": None})
                 return
             if parsed.path == (f"/v1/sandboxes/{_SANDBOX_ID}/processes/{_PROCESS_ID}"):
+                if script.process_killed:
+                    # The native API keeps a recently exited process's exit.
+                    self._json(
+                        200,
+                        {
+                            **_process_payload(),
+                            "state": "exited",
+                            "exit_code": 137,
+                            "exit_status": "signaled",
+                            "signal": 9,
+                            "ended_at": "2026-09-28T12:00:00Z",
+                        },
+                    )
+                    return
                 if not script.process_running:
                     self.send_error(404)
                     return

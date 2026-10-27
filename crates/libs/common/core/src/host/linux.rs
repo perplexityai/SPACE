@@ -58,6 +58,9 @@ pub mod paths {
     pub const NODE_MANAGER_STATE_DIR: &str = "/space/run/node-manager";
     pub const NODE_MANAGER_STATE_FILE: &str = "/space/run/node-manager/state.json";
     pub const NODE_MANAGER_DB: &str = "/space/run/node-manager/node-manager.db";
+    /// The cluster execution policy node-manager last applied, kept across restarts.
+    pub const NODE_MANAGER_EXECUTION_POLICY_FILE: &str =
+        "/space/run/node-manager/execution-policy.json";
     pub const RUNTIME_SUPERVISOR_SOCKET: &str =
         "/space/run/runtime-supervisor/runtime-supervisor.sock";
     pub const RUNTIME_SUPERVISOR_STATE_DIR: &str = "/space/run/runtime-supervisor";
@@ -81,6 +84,8 @@ pub mod paths {
     pub const NODE_ARTIFACTS_DIR: &str = "/space/vendor/artifacts";
     /// Managed Firecracker releases. Execution never scans this root.
     pub const NODE_FIRECRACKER_DIR: &str = "/space/vendor/artifacts/firecracker";
+    /// Managed Cloud Hypervisor releases, separate from execution caches.
+    pub const NODE_CLOUD_HYPERVISOR_DIR: &str = "/space/vendor/artifacts/cloud-hypervisor";
     /// Managed guest kernels. Existing vendor/cache execution paths stay separate.
     pub const NODE_KERNELS_DIR: &str = "/space/vendor/artifacts/kernels";
     pub const SANDBOX_MANAGER_SOCKET: &str = "/space/run/sandbox-manager/sandbox-manager.sock";
@@ -327,6 +332,10 @@ pub mod paths {
     pub fn sandbox_snapshots_dir(sandbox_id: &str) -> String {
         format!("{}/snapshots", sandbox_cache_dir(sandbox_id))
     }
+
+    /// Prefix of sandbox-manager's internal operation snapshots under
+    /// [`sandbox_snapshots_dir`]. Users can't list, delete or roll back to them.
+    pub const INTERNAL_OPERATION_SNAPSHOT_PREFIX: &str = "d-operation-";
 
     /// Returns the directory path for one sandbox snapshot.
     pub fn sandbox_snapshot_dir(sandbox_id: &str, snapshot_name: &str) -> String {

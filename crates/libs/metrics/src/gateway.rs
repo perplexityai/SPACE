@@ -195,6 +195,45 @@ pub fn reserved_dns_upstream_closed(resolver: &str, outcome: ReservedDnsUpstream
     );
 }
 
+metric_vocabulary!(
+    /// How one reserved-DNS query sent on an upstream connection ended.
+    ReservedDnsUpstreamResponseOutcome {
+        /// The upstream answered.
+        Answered => "answered",
+        /// Hickory reported a timeout.
+        Timeout => "timeout",
+        /// The stream ended unanswered, as Hickory 0.26 reports a timeout.
+        NoResponse => "no_response",
+        /// The open connection was at its request limit.
+        Busy => "busy",
+        /// Any other transport or connection error.
+        Error => "error",
+        /// The caller dropped the send before any response.
+        Cancelled => "cancelled",
+    }
+);
+
+/// `gateway.reserved_dns.upstream.request.duration_ms`: time from handing one
+/// query to an upstream connection to its first response or failure, tagged
+/// `resolver` and `outcome`. Unlike `request.duration_ms` it excludes cache
+/// hits, local answers and capacity rejections, so it is the upstream
+/// request/response time.
+pub fn reserved_dns_upstream_request(
+    resolver: &str,
+    outcome: ReservedDnsUpstreamResponseOutcome,
+    latency_ms: f64,
+) {
+    timing_ms(
+        "gateway.reserved_dns.upstream.request.duration_ms",
+        latency_ms,
+        &[
+            tag("resolver", resolver),
+            tag("outcome", outcome.as_str()),
+            tag("git_sha", pplx_space_observability::git_sha()),
+        ],
+    );
+}
+
 /// One reserved-DNS duration sample; its count gives request outcomes.
 pub fn reserved_dns_request_outcome(
     resolver: &str,

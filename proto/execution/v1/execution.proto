@@ -95,8 +95,9 @@ message ArtifactComponentInstallation {
 message NodeExecutionInventory {
   repeated RuntimeInstallation runtimes = 1;
   repeated ArtifactComponentInstallation components = 2;
-  // Effective startup policy, independent of installed/usable artifacts. Absence
-  // means unknown support, never implicit E0 approval.
+  // Effective policy: the startup settings, narrowed by any applied cluster
+  // policy. Independent of installed/usable artifacts. Absence means unknown
+  // support, never implicit E0 approval.
   ExecutionPolicyObservation policy = 3;
 }
 
@@ -107,6 +108,15 @@ message ExecutionPolicyObservation {
   optional string default_environment_reference = 3;
   // Permission for unbound historical contracts, not an environment identity.
   bool legacy_unbound_allowed = 4;
+  // The cluster policy generation this policy enforces, with schema_version 2.
+  // Absent with schema_version 1: the node runs its startup policy only. A
+  // schema 2 policy may have allowed environments and no default.
+  optional uint64 applied_generation = 5;
+  // With schema_version 2 and no applied_generation: the node can't read the
+  // cluster policy it persisted, so it admits no new work (empty allowlist,
+  // no default, no legacy) until the policy is reapplied. Running VMs are
+  // untouched. Treat the node as having no usable policy evidence.
+  bool cluster_policy_unreadable = 6;
 }
 
 // Environment definitions are additive data contracts. Sending one to a peer
@@ -138,7 +148,9 @@ enum IsolationClass {
 
 enum RuntimePayloadLayout {
   RUNTIME_PAYLOAD_LAYOUT_UNSPECIFIED = 0;
-  RUNTIME_PAYLOAD_LAYOUT_FIRECRACKER_RELEASE_V1 = 1;
+  // The trusted artifact catalog owns executable roles and file layout.
+  // Archive formats, paths, and per-runtime binary counts are not wire contracts.
+  RUNTIME_PAYLOAD_LAYOUT_CATALOG_RELEASE_V1 = 2;
 }
 
 message ManagedRuntimeRelease {
@@ -155,11 +167,6 @@ message RuntimeBinding {
   }
 }
 
-message LinuxDirectBootV1 {
-  // All identity fields are required. Target is EnvironmentDescriptor.guest.
-  EnvironmentComponent kernel = 1;
-}
-
 message EnvironmentComponent {
   ArtifactComponentKind kind = 1;
   string version = 2;
@@ -168,18 +175,37 @@ message EnvironmentComponent {
 
 message BootProfile {
   oneof profile {
-    LinuxDirectBootV1 linux_direct_v1 = 1;
+    ArtifactBootProfileV1 artifacts_v1 = 2;
   }
 }
 
-message FirecrackerSnapshotCompatibilityV1 {
-  StateFormatIdentity state_format = 1;
+// Runtime-neutral boot inputs. The versioned contract names immutable boot
+// semantics implemented by the adapter; it never names a node-local path.
+message ArtifactBootProfileV1 {
+  string contract = 1;
+  repeated BootArtifact artifacts = 2;
+}
+
+message BootArtifact {
+  // Unique within this boot profile; e.g. boot, firmware, or system-disk.
+  string role = 1;
+  EnvironmentComponent component = 2;
+  string format = 3;
 }
 
 message ExecutionCompatibilityProfile {
   oneof profile {
-    FirecrackerSnapshotCompatibilityV1 firecracker_snapshot_v1 = 1;
+    RuntimeCompatibilityV1 runtime_v1 = 2;
   }
+}
+
+message RuntimeCompatibilityV1 {
+  // Immutable machine/device ABI contract, qualified by the trusted catalog.
+  // Adding an approved replacement does not change this identifier.
+  string contract = 1;
+  // Absent means this environment has no memory-state contract. It does not
+  // mean unknown or a default format. Presence alone does not grant restore.
+  StateFormatIdentity state_format = 2;
 }
 
 message EnvironmentDescriptor {
@@ -193,8 +219,13 @@ message EnvironmentDescriptor {
 }
 
 message EnvironmentDefinition {
+  // Only generic transport schema 2 is supported.
   uint32 schema_version = 1;
   // SHA-256 over versioned canonical semantic fields, not protobuf wire bytes.
   string reference = 2;
   EnvironmentDescriptor descriptor = 3;
+  // Canonical identity encoding, independent of the transport schema. Zero
+  // retains the historical rule: use schema_version. A schema-2 representation
+  // may carry identity 1 only when it exactly represents the legacy contract.
+  uint32 identity_schema_version = 4;
 }

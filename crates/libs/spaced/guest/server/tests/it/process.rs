@@ -624,7 +624,7 @@ async fn bridge_guest_process_pty_start_input_and_resize_work() {
     let process_id = started.process_id;
 
     let mut list_stream = client
-        .list_processes(bridge_guest::ListProcessesRequest {})
+        .list_processes(bridge_guest::ListProcessesRequest::default())
         .await
         .expect("list processes response")
         .into_inner();
@@ -772,7 +772,7 @@ async fn bridge_guest_process_list_returns_running_processes() {
     .await;
 
     let mut stream = client
-        .list_processes(bridge_guest::ListProcessesRequest {})
+        .list_processes(bridge_guest::ListProcessesRequest::default())
         .await
         .expect("list processes")
         .into_inner();
@@ -854,7 +854,7 @@ async fn bridge_guest_process_start_timeout_kills_process() {
     let process_id = &started.process_id;
 
     let mut list_stream = client
-        .list_processes(bridge_guest::ListProcessesRequest {})
+        .list_processes(bridge_guest::ListProcessesRequest::default())
         .await
         .expect("list processes response")
         .into_inner();

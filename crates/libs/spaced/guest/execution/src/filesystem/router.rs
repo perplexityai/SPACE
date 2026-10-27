@@ -3,8 +3,6 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
-use std::task::{Context, Poll};
-#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
@@ -43,7 +41,6 @@ const MAX_GUEST_FILESYSTEM_EXECUTIONS: usize = 128;
 /// this is a real deadline rather than a poll interval.
 pub(crate) const DEFAULT_CANCELLATION_GRACE: std::time::Duration =
     std::time::Duration::from_secs(5);
-const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 use pplx_space_common_grpc::{PreserveInputErrors, RequestAdmission, RequestPermit};
 use pplx_space_spaced_guest_protocol::filesystem_limits;
@@ -140,12 +137,18 @@ enum LedgerEvidence {
     Lost,
 }
 
+/// Owned filesystem operations sharing the service's admission and worker state.
+///
+/// Obtain this handle from [`crate::ExecutionService::filesystem_service`]. It
+/// implements the generated `Filesystem` trait and accepts native uploads via
+/// [`Self::write_file`]. Clones share all capacity and lifecycle state.
 #[derive(Clone)]
-pub(crate) struct FilesystemRouter {
+pub struct FilesystemHandle {
     default_user: GuestUserName,
     operations: Operations,
     tasks: TaskTracker,
     shutdown: CancellationToken,
+    pub(crate) lifecycle: crate::lifecycle::Lifecycle,
     execution_slots: Arc<tokio::sync::Semaphore>,
     payload_slots: Arc<tokio::sync::Semaphore>,
     backend: Backend,
@@ -156,9 +159,57 @@ pub(crate) struct FilesystemRouter {
     #[cfg(target_os = "linux")]
     ledger_evidence: Arc<Mutex<HashMap<GuestUserName, LedgerEvidence>>>,
     cancellation_grace: std::time::Duration,
+    native_upload_idle_timeout: std::time::Duration,
 }
 
-impl FilesystemRouter {
+impl std::fmt::Debug for FilesystemHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilesystemHandle").finish_non_exhaustive()
+    }
+}
+
+impl FilesystemHandle {
+    pub(crate) fn with_native_upload_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.native_upload_idle_timeout = timeout;
+        self
+    }
+
+    /// Upload from a native stream, including borrowed and non-`Unpin` streams.
+    ///
+    /// Uses the same message limits, admission and supervised write path as gRPC.
+    /// Waiting for each input message (including `Open`) is bounded by
+    /// [`crate::ExecutionServiceConfig::native_upload_idle_timeout`]. Expiry
+    /// returns `DeadlineExceeded` and cancels the upload; it does not roll back
+    /// append effects or establish that a fresh-key retry is safe. Cleanup can
+    /// retain capacity after the response. Service backpressure is not input idle
+    /// time. Callers can separately bound the whole upload with a deadline.
+    pub async fn write_file<S>(
+        &self,
+        request: Request<S>,
+    ) -> Result<Response<WriteResponse>, Status>
+    where
+        S: Stream<Item = Result<WriteRequest, Status>> + Send,
+    {
+        let (metadata, extensions, incoming) = request.into_parts();
+        tokio::pin!(incoming);
+        let idle_timeout = self.native_upload_idle_timeout;
+        let bounded = futures_util::stream::unfold(Some(incoming.as_mut()), |input| async move {
+            let mut input = input?;
+            match tokio::time::timeout(idle_timeout, input.next()).await {
+                Ok(Some(message)) => Some((message, Some(input))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(Status::deadline_exceeded(
+                        "native upload input idle timeout",
+                    )),
+                    None,
+                )),
+            }
+        });
+        self.write_from_stream(Request::from_parts(metadata, extensions, bounded))
+            .await
+    }
+
     pub(crate) fn grpc_service(
         &self,
     ) -> RequestAdmission<PreserveInputErrors<PublicFilesystemServer<Self>>> {
@@ -170,39 +221,27 @@ impl FilesystemRouter {
             pplx_space_common_grpc::QueuedSlots::new(self.payload_slots.clone()),
             filesystem_limits::PAYLOAD_METHODS,
         )
+        .with_observation(pplx_space_metrics::payload::Budget::GuestFilesystem)
     }
 
     pub(crate) async fn drain(&self) {
-        self.shutdown.cancel();
+        self.lifecycle.close();
+        self.lifecycle.wait().await;
         self.tasks.close();
-        let drain = async {
-            match &self.backend {
-                Backend::Direct(service) => {
-                    // A blocked Direct mutation must not delay watch cancellation.
-                    tokio::join!(service.watch_manager.shutdown(), async {
-                        self.tasks.wait().await;
-                        service.tasks.close();
-                        service.tasks.wait().await;
-                    });
-                }
-                #[cfg(target_os = "linux")]
-                Backend::Workers(pool) => {
-                    self.tasks.wait().await;
-                    pool.drain().await;
-                }
+        self.tasks.wait().await;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service.tasks.close();
+                service.tasks.wait().await;
+                service.watch_manager.shutdown().await;
             }
-        };
-        if tokio::time::timeout(SHUTDOWN_BUDGET, drain).await.is_err() {
-            tracing::error!(
-                "filesystem shutdown budget exceeded; execution outcome remains unknown"
-            );
+            #[cfg(target_os = "linux")]
+            Backend::Workers(pool) => pool.drain().await,
         }
     }
 
     async fn executor(&self, user: GuestUserName) -> Result<Executor, Status> {
-        if self.shutdown.is_cancelled() {
-            return Err(crate::refused(Status::unavailable("guest shutting down")));
-        }
+        crate::execution::require_running(&self.shutdown)?;
         match &self.backend {
             Backend::Direct(service) => {
                 let mut service = service.clone();
@@ -230,6 +269,7 @@ impl FilesystemRouter {
             // payloads, outstanding file I/O, and worker termination/reaping.
             let _permits = permits;
             if cancelled.is_cancelled() {
+                _permits.1.observe_cancellation();
                 return Err(Status::cancelled("filesystem dispatch cancelled before execution"));
             }
             let execution = reservation.dispatch();
@@ -239,6 +279,7 @@ impl FilesystemRouter {
                 tokio::select! {
                     result = &mut call => result,
                     _ = cancelled.cancelled() => {
+                        _permits.1.observe_cancellation();
                         match tokio::time::timeout(cancellation_grace, &mut call).await {
                             Ok(result) => result,
                             Err(_) => {
@@ -302,24 +343,56 @@ impl FilesystemRouter {
         let executor = self.executor(user).await?;
         let cancelled = self.shutdown.child_token();
         let _on_drop = cancelled.clone().drop_guard();
-        self.supervise(
-            executor,
-            reservation,
-            command,
-            cancelled,
-            (permit, admission),
-        )
-        .await
-        .map_err(|_| operations::unknown_outcome())?
+        let request_lifetime = admission.request_lifetime();
+        request_lifetime
+            .observe(self.supervise(
+                executor,
+                reservation,
+                command,
+                cancelled,
+                (permit, admission),
+            ))
+            .await
+            .map_err(|_| operations::unknown_outcome())?
+    }
+
+    pub(crate) async fn write_from_stream<S>(
+        &self,
+        mut request: Request<S>,
+    ) -> Result<Response<WriteResponse>, Status>
+    where
+        S: Stream<Item = Result<WriteRequest, Status>> + Send,
+    {
+        let _operation = self.lifecycle.admit()?;
+        let admission = crate::payload::acquire(
+            &self.payload_slots,
+            1,
+            pplx_space_metrics::payload::Budget::GuestFilesystem,
+            request.extensions_mut().remove::<RequestPermit>(),
+        )?;
+        let incoming = request.into_inner();
+        tokio::pin!(incoming);
+        admission
+            .request_lifetime()
+            .observe(self.write_stream(incoming.as_mut(), admission))
+            .await
     }
 
     async fn write_stream(
         &self,
-        first: WriteRequest,
-        mut incoming: Pin<Box<dyn Stream<Item = Result<WriteRequest, Status>> + Send>>,
+        mut incoming: Pin<&mut (dyn Stream<Item = Result<WriteRequest, Status>> + Send)>,
         admission: RequestPermit,
     ) -> Result<Response<WriteResponse>, Status> {
         use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
+        let first = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => {
+                return Err(crate::refused(Status::unavailable("guest shutting down")));
+            }
+            first = incoming.next() => first,
+        }
+        .transpose()?
+        .ok_or_else(|| Status::invalid_argument("write requires open"))?;
         crate::payload::check_message(&first, filesystem_limits::MAX_MESSAGE_BYTES)?;
         let Some(Message::Open(open)) = first.message else {
             return Err(Status::invalid_argument("first write message must be open"));
@@ -473,7 +546,7 @@ impl FilesystemRouter {
             #[cfg(target_os = "linux")]
             FilesystemExecutionMode::IdentityWorkers => {
                 Backend::Workers(super::worker::WorkerPool::new(
-                    shutdown.clone(),
+                    shutdown.child_token(),
                     guest_cgroups,
                     worker_executable
                         .ok_or(crate::CreateExecutionServiceError::MissingWorkerExecutable)?,
@@ -489,6 +562,7 @@ impl FilesystemRouter {
             default_user,
             operations: Operations::new(),
             tasks: TaskTracker::new(),
+            lifecycle: crate::lifecycle::Lifecycle::new(shutdown.clone()),
             shutdown,
             execution_slots: Arc::new(tokio::sync::Semaphore::new(MAX_GUEST_FILESYSTEM_EXECUTIONS)),
             payload_slots: Arc::new(tokio::sync::Semaphore::new(
@@ -502,6 +576,7 @@ impl FilesystemRouter {
             #[cfg(target_os = "linux")]
             ledger_evidence: Arc::new(Mutex::new(HashMap::new())),
             cancellation_grace,
+            native_upload_idle_timeout: crate::execution::DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT,
         })
     }
 
@@ -579,6 +654,7 @@ impl FilesystemRouter {
         &self,
         user: Option<String>,
         request: R,
+        stream_end: CancellationToken,
         call: impl AsyncFnOnce(
             &mut FilesystemClient<tonic::transport::Channel>,
             R,
@@ -588,13 +664,60 @@ impl FilesystemRouter {
         let response = self
             .observe_worker_result(&worker, call(&mut worker.client.clone(), request).await)
             .await?;
-        Ok(Response::new(Box::pin(FailureAwareStream {
-            inner: Box::pin(response.into_inner()),
-            router: self.clone(),
+        Ok(Response::new(self.forward_stream(
+            response.into_inner(),
             worker,
-            runtime_handle: tokio::runtime::Handle::current(),
-            failure_recorded: false,
-        })))
+            stream_end,
+        )))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn forward_stream<T: Send + 'static>(
+        &self,
+        incoming: impl Stream<Item = Result<T, Status>> + Send + 'static,
+        worker: super::worker::WorkerClient,
+        stream_end: CancellationToken,
+    ) -> RoutedStream<T> {
+        let router = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // Keep cancellation outside the bounded data queue: a stalled reader
+        // must neither delay cleanup nor turn a truncated response into EOF.
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        self.tasks.spawn(async move {
+            tokio::pin!(incoming);
+            let failure = loop {
+                let message = tokio::select! {
+                    biased;
+                    _ = stream_end.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
+                    _ = tx.closed() => break None,
+                    message = incoming.next() => message,
+                };
+                let Some(message) = message else {
+                    break None;
+                };
+                let failed = message.as_ref().is_err_and(is_worker_transport_failure);
+                if failed {
+                    let cleanup = router.clone();
+                    let failed_worker = worker.clone();
+                    router.tasks.spawn(async move {
+                        cleanup.record_worker_failure(&failed_worker).await;
+                    });
+                }
+                tokio::select! {
+                    biased;
+                    _ = stream_end.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
+                    sent = tx.send(message) => if sent.is_err() { break None; },
+                }
+                if failed {
+                    break None;
+                }
+            };
+            let _ = completion_tx.send(failure.map_or(Ok(()), Err));
+        });
+        Box::pin(super::terminal::with_completion(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+            completion_rx,
+        )) as RoutedStream<T>
     }
 
     /// Read through a descriptor the user's worker opened: the worker checks
@@ -643,7 +766,7 @@ impl FilesystemRouter {
                 }
             };
             if ended.as_ref().is_some_and(is_worker_transport_failure) {
-                tokio::spawn(async move {
+                router.tasks.clone().spawn(async move {
                     router.record_worker_failure(&leased).await;
                 });
             }
@@ -654,6 +777,8 @@ impl FilesystemRouter {
             length,
             worker,
             worker_ended,
+            self.tasks.clone(),
+            self.shutdown.clone(),
         )))
     }
 
@@ -937,39 +1062,8 @@ fn is_worker_transport_failure(status: &Status) -> bool {
 #[cfg(target_os = "linux")]
 type RoutedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
-#[cfg(target_os = "linux")]
-struct FailureAwareStream<T> {
-    inner: RoutedStream<T>,
-    router: FilesystemRouter,
-    worker: super::worker::WorkerClient,
-    runtime_handle: tokio::runtime::Handle,
-    failure_recorded: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl<T> Stream for FailureAwareStream<T> {
-    type Item = Result<T, Status>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        let result = this.inner.as_mut().poll_next(cx);
-        if let Poll::Ready(Some(Err(status))) = &result
-            && is_worker_transport_failure(status)
-            && !this.failure_recorded
-        {
-            this.failure_recorded = true;
-            let router = this.router.clone();
-            let worker = this.worker.clone();
-            this.runtime_handle.spawn(async move {
-                router.record_worker_failure(&worker).await;
-            });
-        }
-        result
-    }
-}
-
 #[tonic::async_trait]
-impl Filesystem for FilesystemRouter {
+impl Filesystem for FilesystemHandle {
     type ListInfoStream = GuestFileInfoStream;
     // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4.
     type ListStream = Pin<
@@ -1009,9 +1103,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<StatRequest>,
     ) -> Result<Response<StatResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.stat(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.stat(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
@@ -1027,14 +1126,24 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<ListRequest>,
     ) -> Result<Response<Self::ListInfoStream>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.list(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.list(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
-                self.stream(request.user.take(), request, FilesystemClient::list)
-                    .await
+                self.stream(
+                    request.user.take(),
+                    request,
+                    self.shutdown.clone(),
+                    FilesystemClient::list,
+                )
+                .await
             }
         }
     }
@@ -1043,9 +1152,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.read(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.read(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
@@ -1056,37 +1170,29 @@ impl Filesystem for FilesystemRouter {
                 {
                     return Ok(Response::new(stream));
                 }
-                self.stream(user, request, FilesystemClient::read).await
+                self.stream(user, request, self.shutdown.clone(), FilesystemClient::read)
+                    .await
             }
         }
     }
 
     async fn write(
         &self,
-        mut request: Request<tonic::Streaming<WriteRequest>>,
+        request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
-        let admission = crate::payload::acquire(
-            &self.payload_slots,
-            1,
-            request.extensions_mut().remove::<RequestPermit>(),
-        )?;
-        let mut incoming = request.into_inner();
-        let first = incoming
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("write requires open"))?;
-        self.write_stream(first, Box::pin(incoming), admission)
-            .await
+        self.write_from_stream(request).await
     }
 
     async fn write_batch(
         &self,
         mut request: Request<WriteBatchRequest>,
     ) -> Result<Response<WriteBatchResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         let admission = crate::payload::admit(
             &mut request,
             &self.payload_slots,
             filesystem_limits::BATCH_REQUEST_WEIGHT,
+            pplx_space_metrics::payload::Budget::GuestFilesystem,
             filesystem_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
@@ -1119,9 +1225,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<MkdirRequest>,
     ) -> Result<Response<MkdirResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.mkdir(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.mkdir(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
@@ -1137,9 +1248,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<RemoveRequest>,
     ) -> Result<Response<RemoveResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.remove(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.remove(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
@@ -1155,10 +1271,12 @@ impl Filesystem for FilesystemRouter {
         &self,
         mut request: Request<RenameRequest>,
     ) -> Result<Response<RenameResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         let admission = crate::payload::admit(
             &mut request,
             &self.payload_slots,
             1,
+            pplx_space_metrics::payload::Budget::GuestFilesystem,
             filesystem_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
@@ -1182,9 +1300,16 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<NormalizeWatchRootRequest>,
     ) -> Result<Response<NormalizeWatchRootResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.normalize_watch_root(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(
+                        move |service| async move { service.normalize_watch_root(request).await },
+                    )
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
@@ -1200,14 +1325,24 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.watch(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.watch(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
-                self.stream(request.user.take(), request, FilesystemClient::watch)
-                    .await
+                self.stream(
+                    request.user.take(),
+                    request,
+                    self.lifecycle.closed(),
+                    FilesystemClient::watch,
+                )
+                .await
             }
         }
     }
@@ -1216,9 +1351,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<CreateWatcherRequest>,
     ) -> Result<Response<CreateWatcherResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.create_watcher(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.create_watcher(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 self.prune_watcher_routes().await;
@@ -1253,9 +1393,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<GetWatcherEventsRequest>,
     ) -> Result<Response<GetWatcherEventsResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.get_watcher_events(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.get_watcher_events(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let request = request.into_inner();
@@ -1278,9 +1423,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<RemoveWatcherRequest>,
     ) -> Result<Response<RemoveWatcherResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.remove_watcher(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.remove_watcher(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let request = request.into_inner();
@@ -1322,9 +1472,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<EnableFileChangesRequest>,
     ) -> Result<Response<EnableFileChangesResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.enable_file_changes(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.enable_file_changes(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
@@ -1343,9 +1498,16 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<DisableFileChangesRequest>,
     ) -> Result<Response<DisableFileChangesResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.disable_file_changes(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(
+                        move |service| async move { service.disable_file_changes(request).await },
+                    )
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();
@@ -1363,9 +1525,14 @@ impl Filesystem for FilesystemRouter {
         &self,
         request: Request<GetModifiedFilesRequest>,
     ) -> Result<Response<GetModifiedFilesResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
         crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
         match &self.backend {
-            Backend::Direct(service) => service.get_modified_files(request).await,
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.get_modified_files(request).await })
+                    .await
+            }
             #[cfg(target_os = "linux")]
             Backend::Workers(_) => {
                 let mut request = request.into_inner();

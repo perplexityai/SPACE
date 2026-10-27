@@ -84,9 +84,9 @@ fn missing_recipe_and_old_servers_do_not_become_empty_recipes() {
         }),
         Err(Status::unimplemented("older cluster")),
     ] {
-        assert_eq!(recipe_from_response(response).unwrap(), None);
+        assert_eq!(desired_from_response(response).unwrap(), (None, None));
     }
-    let empty = recipe_from_response(Ok(GetNodeRuntimeDesiredStateResponse {
+    let (empty, _) = desired_from_response(Ok(GetNodeRuntimeDesiredStateResponse {
         recipe: Some(recipe(&[])),
         execution_policy: None,
     }))
@@ -98,10 +98,133 @@ fn missing_recipe_and_old_servers_do_not_become_empty_recipes() {
         Code::InvalidArgument,
     ] {
         assert!(matches!(
-            recipe_from_response(Err(Status::new(code, "synthetic"))),
+            desired_from_response(Err(Status::new(code, "synthetic"))),
             Err(ProvisioningError::Fetch(_))
         ));
     }
+}
+
+fn desired_policy() -> RuntimeEnvironmentDesiredPolicy {
+    let [e0, e1] = ["e0", "fc-1.17.0-linux-6.1.155"]
+        .map(|name| recipe(&[name]).required_environments.pop().unwrap());
+    RuntimeEnvironmentDesiredPolicy {
+        generation: 12,
+        default_environment_ref: Some(e1.clone()),
+        executing_environment_refs: vec![e0, e1],
+        legacy_unbound_allowed: Some(false),
+    }
+}
+
+#[derive(Default)]
+struct FakePolicyApplier {
+    requests: Mutex<Vec<node_manager::ApplyExecutionPolicyRequest>>,
+    reply: Mutex<Option<Result<node_manager::ApplyExecutionPolicyResponse, Status>>>,
+}
+
+impl PolicyApplier for FakePolicyApplier {
+    async fn apply(
+        &self,
+        request: node_manager::ApplyExecutionPolicyRequest,
+    ) -> Result<node_manager::ApplyExecutionPolicyResponse, Status> {
+        self.requests.lock().unwrap().push(request);
+        self.reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Ok(Default::default()))
+    }
+}
+
+#[tokio::test]
+async fn every_response_policy_reaches_node_manager_in_full() {
+    let manager = FakePolicyApplier::default();
+    let served = desired_policy();
+    // The same generation twice is applied twice: generations restart at 0
+    // when the schema is reapplied, so none is ever skipped.
+    for _ in 0..2 {
+        apply_policy(&manager, Some(served.clone())).await.unwrap();
+    }
+    // The bootstrap seed is generation 0 with nothing set; it's still a policy,
+    // so the node publishes that it applied it.
+    let bootstrap = RuntimeEnvironmentDesiredPolicy {
+        generation: 0,
+        default_environment_ref: None,
+        executing_environment_refs: vec![],
+        legacy_unbound_allowed: None,
+    };
+    apply_policy(&manager, Some(bootstrap)).await.unwrap();
+    // An absent policy is forwarded too: node-manager returns to its startup
+    // settings rather than keeping the last cluster policy.
+    apply_policy(&manager, None).await.unwrap();
+    let requests = manager.requests.lock().unwrap();
+    let expected = node_manager::ClusterExecutionPolicy {
+        generation: served.generation,
+        default_environment_reference: served.default_environment_ref.clone(),
+        executing_environment_references: served.executing_environment_refs.clone(),
+        legacy_unbound_allowed: served.legacy_unbound_allowed,
+    };
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].policy.as_ref(), Some(&expected));
+    assert_eq!(requests[1].policy.as_ref(), Some(&expected));
+    assert_eq!(
+        requests[2].policy,
+        Some(node_manager::ClusterExecutionPolicy::default())
+    );
+    assert_eq!(requests[3].policy, None);
+}
+
+#[tokio::test]
+async fn policy_application_failures_are_visible_except_for_older_node_managers() {
+    let manager = FakePolicyApplier::default();
+    for outcome in [
+        node_manager::ClusterDefaultOutcome::Unusable,
+        node_manager::ClusterDefaultOutcome::NotAllowed,
+    ] {
+        // A refused default is reported, not a failed pass.
+        *manager.reply.lock().unwrap() = Some(Ok(node_manager::ApplyExecutionPolicyResponse {
+            enforced: None,
+            default_outcome: outcome as i32,
+        }));
+        apply_policy(&manager, Some(desired_policy()))
+            .await
+            .unwrap();
+    }
+    *manager.reply.lock().unwrap() = Some(Err(Status::unimplemented("older node-manager")));
+    apply_policy(&manager, Some(desired_policy()))
+        .await
+        .unwrap();
+    for code in [
+        Code::Unavailable,
+        Code::InvalidArgument,
+        Code::PermissionDenied,
+    ] {
+        *manager.reply.lock().unwrap() = Some(Err(Status::new(code, "synthetic")));
+        assert!(matches!(
+            apply_policy(&manager, Some(desired_policy())).await,
+            Err(ProvisioningError::ApplyPolicy(error)) if error.code() == code
+        ));
+    }
+}
+
+struct StalledPolicyApplier;
+
+impl PolicyApplier for StalledPolicyApplier {
+    async fn apply(
+        &self,
+        _request: node_manager::ApplyExecutionPolicyRequest,
+    ) -> Result<node_manager::ApplyExecutionPolicyResponse, Status> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_policy_application_times_out_within_its_budget() {
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        apply_policy(&StalledPolicyApplier, Some(desired_policy())).await,
+        Err(ProvisioningError::PolicyTimeout)
+    ));
+    assert_eq!(started.elapsed(), POLICY_BUDGET);
 }
 
 fn observation(identity: &runtime::ArtifactIdentity) -> runtime::ExecutionArtifact {

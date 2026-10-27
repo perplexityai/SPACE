@@ -88,6 +88,7 @@ mod pool;
 mod quarantine;
 mod quarantine_recovery;
 mod restore_transfer_scopes;
+mod runtime_upgrades;
 mod sandboxes;
 mod startup_recovery;
 mod state_transitions;
@@ -102,6 +103,7 @@ pub use pool::*;
 pub use quarantine::*;
 pub use quarantine_recovery::*;
 pub use restore_transfer_scopes::*;
+pub use runtime_upgrades::*;
 pub use sandboxes::*;
 pub use startup_recovery::*;
 pub use state_transitions::*;
@@ -124,12 +126,14 @@ pub mod read {
     mod cleanup_job;
     mod counts;
     mod local_artifact;
+    mod runtime_upgrade;
     mod sandbox;
     mod sandbox_view;
     mod state_page;
     pub use cleanup_job::*;
     pub use counts::*;
     pub use local_artifact::*;
+    pub use runtime_upgrade::*;
     pub use sandbox::*;
     pub use sandbox_view::*;
     pub use state_page::*;
@@ -155,6 +159,7 @@ pub mod scan {
     mod rowless_restore_scopes;
     mod sandbox_pages;
     mod unbound_executions;
+    mod unsettled_runtime_upgrades;
     pub use all_sandboxes::*;
     pub use by_peer::*;
     pub use due_auto_lifecycle::*;
@@ -169,6 +174,7 @@ pub mod scan {
     pub use rowless_restore_scopes::*;
     pub use sandbox_pages::*;
     pub use unbound_executions::*;
+    pub use unsettled_runtime_upgrades::*;
 
     #[cfg(test)]
     mod tests;
@@ -510,6 +516,10 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     )?;
     tx.execute(
         "DELETE FROM sandbox_restore_transfer_scopes WHERE sandbox_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM sandbox_runtime_upgrades WHERE sandbox_id = ?1",
         params![id],
     )?;
     Ok(())

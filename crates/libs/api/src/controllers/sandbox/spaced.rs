@@ -1,7 +1,7 @@
 use super::*;
 use axum::http::StatusCode;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, GuestUserName, NodeManagedBy, PodUid, RouteGeneration,
+    ExecutionGeneration, GuestUserName, NodeManagedBy, PodUid, ProcessId, RouteGeneration,
     SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SubstrateKind,
 };
 use pplx_space_common_svc::space_api_route_ed25519::{
@@ -604,12 +604,17 @@ impl SandboxController {
             })?
     }
 
+    /// Running processes, and with `include_exited` also the exited ones the
+    /// sandbox still retains. With `process_id`, only that one, from a
+    /// sandbox whose guest supports the filter; an older guest lists all.
     pub async fn spaced_list_processes(
         &self,
         pool: &PgPool,
         sandbox: &Sandbox,
         metric_identity: SandboxApiMetricIdentity,
         id: SandboxId,
+        include_exited: bool,
+        process_id: Option<&ProcessId>,
     ) -> Result<SpacedListProcessesResponse, ControllerError> {
         let mut client = self
             .spaced_client(
@@ -622,7 +627,10 @@ impl SandboxController {
         client
             .spaced_list_processes(SpacedListProcessesRequest {
                 sandbox_id: id.to_string(),
-                operation: Some(spaced_ops::ListProcessesRequest {}),
+                operation: Some(spaced_ops::ListProcessesRequest {
+                    include_exited,
+                    process_id: process_id.map(|process_id| process_id.as_str().to_owned()),
+                }),
             })
             .await
     }

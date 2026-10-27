@@ -25,10 +25,11 @@ Ready to run code? Follow [Your first sandbox](../first-sandbox.md) for a comple
 
 ## Run commands
 
-- **Attach to start execution.** Creating a command alone does not run it. Process endpoints show running processes, not command history.
+- **Attach to start execution.** Creating a command alone does not run it. The process list shows running processes, not command history.
 - **Use the session token**, not your management API token. Check the returned URL against your configured stream origin and session path; never follow redirects with credentials.
 - **Create and attach in one request** by sending `Accept: text/event-stream` with the create. The response is the event stream, preceded by a `command` frame whose `command` field is the handle. If the server answers with the JSON handle instead, attach as usual.
 - **Save output as it arrives.** Streams are live, with no replay. Check `process_exited`; a closed connection alone is not success. See [command output](../first-sandbox.md#read-command-output).
+- **Reattach promptly to read a missed exit.** For up to 15 minutes after a command exits, reattaching reports its `process_exited`, and getting its process returns `state` `exited` with the same `exit_code` and `exit_status`. Test for `state` `exited`: a running process omits `state` today and may report `running` later. The window counts the sandbox's running time, so time it spends suspended does not count. It ends sooner once many newer processes start in the sandbox, and does not survive a restart of the sandbox's agent. Sandboxes from templates built before this window existed keep the earlier behavior until their template is rebuilt: reattaching reports the exit for about a minute, and getting the process returns `not_found` as soon as it exits. After the window, an HTTP reattach and getting the process return a non-retryable `404` `not_found`; a WebSocket reattach gets an `error` frame with `retryable` `false`. If the sandbox never recorded the session's first attach, a reattach after the window returns `400` "command could not be started" instead. Output is not replayed. To reattach once the attachment token has expired, resend the command's create request with its original `Idempotency-Key` and body; it returns the same session with a fresh token.
 
 ## Retry safely
 

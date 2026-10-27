@@ -852,6 +852,14 @@ open_wire_enum!(DataPlaneProcessExitStatus, "data-plane process exit status", {
     Unknown => "unknown",
 });
 
+// Today only an exited process reports a state and a running one omits it.
+// `Running` is listed so a later server may send it without a new enum value:
+// clients test `state == "exited"`, never whether `state` is present.
+open_wire_enum!(ProcessState, "process state", {
+    Running => "running",
+    Exited => "exited",
+});
+
 open_wire_enum!(DataPlaneResyncReason, "data-plane resync reason", {
     ProcessStreamReconnected => "process_stream_reconnected",
     FileWatchRestarted => "file_watch_restarted",
@@ -1057,6 +1065,50 @@ pub struct PublicProcess {
     pub cwd: Option<String>,
     pub user: Option<String>,
     pub tag: Option<String>,
+    /// `exited` once the process has ended, with the exit fields below. Test
+    /// for `exited`: a running process omits `state` today, but may report
+    /// `running`. A finished process stays visible for a bounded time after
+    /// it exits; then it is `not_found`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub state: Option<ProcessState>,
+    /// Set when `state` is `exited`: the same value as `process_exited`'s
+    /// `exit_code`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub exit_code: Option<i32>,
+    /// Set when `state` is `exited`: the same value as `process_exited`'s
+    /// `status`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub exit_status: Option<DataPlaneProcessExitStatus>,
+    /// The signal that ended the process, when `exit_status` is `signaled` or
+    /// `timed_out` and the sandbox reported it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub signal: Option<i32>,
+    /// When the process ended, by the sandbox's clock.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "time::serde::rfc3339::option"
+        )
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_date_time")
+    )]
+    pub ended_at: Option<time::OffsetDateTime>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -2025,14 +2077,69 @@ pub struct PublicErrorEnvelope {
     /// the sandbox is yours and the path inside it does not exist; any other
     /// `not_found`, including a missing or unowned sandbox, carries none. A
     /// `conflict` from replaying a session create whose session has ended
-    /// carries `{"key": "reason", "value": "session_ended"}`. An
-    /// `invalid_request` for a command streamed with a `pty` carries
-    /// `{"key": "field", "value": "pty"}`.
+    /// carries `{"key": "reason", "value": "session_ended"}`. A `conflict`
+    /// refusing a command because the sandbox is not running carries `reason`
+    /// (`sandbox_not_running`), `state` (the sandbox's lifecycle state) and,
+    /// unless the sandbox is deleting or failed, `wake` (the request that
+    /// returns it to running). An `invalid_request` for a command streamed
+    /// with a `pty` carries `{"key": "field", "value": "pty"}`.
     pub details: Vec<PublicErrorDetail>,
 }
 
 /// [`PublicErrorDetail::key`] naming which resource a `not_found` is about.
 pub const NOT_FOUND_RESOURCE_DETAIL_KEY: &str = "resource";
+
+/// [`CONFLICT_REASON_DETAIL_KEY`] value when work needs a running sandbox and
+/// the sandbox's wake policy does not let this request wake it.
+pub const CONFLICT_REASON_SANDBOX_NOT_RUNNING: &str = "sandbox_not_running";
+
+/// [`PublicErrorDetail::key`] carrying the sandbox's [`SandboxLifecycleState`]
+/// alongside [`CONFLICT_REASON_SANDBOX_NOT_RUNNING`].
+pub const SANDBOX_STATE_DETAIL_KEY: &str = "state";
+
+/// [`PublicErrorDetail::key`] carrying the method and path that return the
+/// sandbox to running, alongside [`CONFLICT_REASON_SANDBOX_NOT_RUNNING`]:
+/// the wake action, or the start action for a stopped sandbox, which wake
+/// refuses. Omitted for a sandbox that no action returns to running.
+pub const SANDBOX_WAKE_DETAIL_KEY: &str = "wake";
+
+/// The ordered details of a [`CONFLICT_REASON_SANDBOX_NOT_RUNNING`] conflict,
+/// shared by the management API and the data plane so both answer the same.
+pub fn sandbox_not_running_details(
+    sandbox_id: PublicSandboxId,
+    state: &SandboxLifecycleState,
+) -> Vec<PublicErrorDetail> {
+    let wake = match state {
+        SandboxLifecycleState::Stopping | SandboxLifecycleState::Stopped => {
+            Some(routes::START_SANDBOX)
+        }
+        SandboxLifecycleState::Deleting
+        | SandboxLifecycleState::Deleted
+        | SandboxLifecycleState::Failed => None,
+        _ => Some(routes::WAKE_SANDBOX),
+    }
+    .map(|action| {
+        let path = action
+            .path()
+            .replace("{sandbox_id}", &sandbox_id.to_string());
+        format!("POST {path}")
+    });
+    [
+        Some((
+            CONFLICT_REASON_DETAIL_KEY,
+            CONFLICT_REASON_SANDBOX_NOT_RUNNING.to_string(),
+        )),
+        Some((SANDBOX_STATE_DETAIL_KEY, state.as_str().to_string())),
+        wake.map(|wake| (SANDBOX_WAKE_DETAIL_KEY, wake)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(key, value)| PublicErrorDetail {
+        key: key.to_string(),
+        value,
+    })
+    .collect()
+}
 
 /// [`NOT_FOUND_RESOURCE_DETAIL_KEY`] value of a `not_found` for a guest path in
 /// a sandbox the caller owns. Never set for the sandbox itself, so a missing

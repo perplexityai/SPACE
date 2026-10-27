@@ -449,3 +449,60 @@ fn reupload_restoring_marker_classifies_restoring_refusals_only() {
         "reupload failed: status: Unavailable, message: \"node-api not reachable\""
     ));
 }
+
+/// Alternation, then the longer side's tail, in order — both ways round, and
+/// with either side empty, so the page builder can't drop or reorder a row.
+#[test]
+fn interleave_alternates_then_appends_the_longer_tail() {
+    assert_eq!(interleave(vec![1, 3, 5], vec![2, 4]), vec![1, 2, 3, 4, 5]);
+    assert_eq!(interleave(vec![1], vec![2, 3, 4]), vec![1, 2, 3, 4]);
+    assert_eq!(interleave(Vec::<i32>::new(), vec![1, 2]), vec![1, 2]);
+    assert_eq!(interleave(vec![1, 2], Vec::<i32>::new()), vec![1, 2]);
+}
+
+/// An unnamed row on a gated page is reported as a census gap only when the
+/// queue page could have held it. With the queue page full, the row may be a
+/// queued one the page cut off, and the label must not raise the operator
+/// signal for a node whose census is fine.
+#[test]
+fn a_full_queue_page_never_reads_as_a_census_gap() {
+    let named = PinnedLocalCandidate {
+        sandbox_id: SandboxId::new(),
+        queued_artifact: Some(QueuedArtifact {
+            artifact_id: LocalArtifactId::new(),
+            artifact_kind: ArtifactKind::Full,
+        }),
+    };
+    let unnamed = PinnedLocalCandidate {
+        sandbox_id: SandboxId::new(),
+        queued_artifact: None,
+    };
+    assert_eq!(
+        gated_page_source(false, &[named, unnamed]),
+        PinnedLocalSource::HistoryQueueIncomplete
+    );
+    assert_eq!(
+        gated_page_source(true, &[named, unnamed]),
+        PinnedLocalSource::Queue
+    );
+    assert_eq!(gated_page_source(false, &[named]), PinnedLocalSource::Queue);
+}
+
+/// A gentle drain never sends an unnamed backup: a row naming no artifact is
+/// withheld there, and goes out unnamed only when the drain mode allows it. A
+/// named row is always sent.
+#[test]
+fn a_gentle_drain_withholds_only_the_unnamed_backup() {
+    let named = (LocalArtifactId::new(), ArtifactKind::Full);
+    assert!(
+        withholds_unnamed_backup(None, false),
+        "unnamed under a gentle drain"
+    );
+    assert!(!withholds_unnamed_backup(None, true));
+    for allow_current_instance in [false, true] {
+        assert!(!withholds_unnamed_backup(
+            Some(&named),
+            allow_current_instance
+        ));
+    }
+}

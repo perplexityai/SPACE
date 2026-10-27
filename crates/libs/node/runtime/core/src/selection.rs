@@ -10,7 +10,10 @@ use pplx_space_execution_common::environment::{
 };
 
 mod policy;
-pub use policy::{ALLOWED_ENVIRONMENTS, DEFAULT_ENVIRONMENT, ExecutionPolicy, PolicyError};
+pub use policy::{
+    ALLOWED_ENVIRONMENTS, ClusterDefault, ClusterExecutionPolicy, DEFAULT_ENVIRONMENT,
+    DefaultOutcome, ExecutionPolicy, NarrowedPolicy, PolicyError,
+};
 
 /// Callers must persist the returned exact binding before effectful work. Exact
 /// requests and retries continue to use `RuntimeInventory::resolve` directly.

@@ -98,7 +98,7 @@ python3 examples/first_sandbox.py inspect "$RUN_DIR"
 
 This performs read-only Python API requests. It lists sandboxes before inspecting the saved operation, sandbox, and process list; an individual request failure does not hide the other results. Missing IDs are never used to construct an empty-ID URL. The example rejects a saved run whose origins do not match the current configuration.
 
-An empty process list is expected after hello-world exits. The single-process endpoint is for **running processes**, not history: it returns `not_found` before attachment and after exit. Use the saved event transcript for completed command results.
+An empty process list is expected after hello-world exits. The single-process endpoint returns `not_found` before attachment. After exit it returns the process with `state` `exited` and its exit code for up to 15 minutes, less once many newer processes start, then `not_found`; it is not command history. A sandbox from an older template returns `not_found` as soon as the process exits. Use the saved event transcript for completed command results.
 
 Sandbox and operation IDs can look similar. Use the complete `sbx_…` ID for sandbox paths and `op_…` for operation paths. The returned `session_id` and `process_id` currently contain the same `proc_…` value, but use their respective fields for their URLs.
 

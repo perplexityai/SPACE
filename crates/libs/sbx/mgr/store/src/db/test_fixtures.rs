@@ -32,6 +32,42 @@ pub fn update_runtime_fields(
     sandboxes::update_runtime_fields_with_activation_owner(conn, sandbox_id, None, fields)
 }
 
+/// Fence a runtime upgrade of a stopped or suspended `sandbox_id` to
+/// `target`, under a test authorization that accepts memory loss.
+pub fn fence_runtime_upgrade(
+    conn: &Connection,
+    sandbox_id: &str,
+    target: pplx_space_common_core::types::EnvironmentReference,
+    checkpoint_dir_identity: Option<&str>,
+) -> RuntimeUpgradeRecord {
+    let sandbox = get_sandbox(conn, sandbox_id).unwrap().unwrap();
+    match begin_runtime_upgrade(
+        conn,
+        NewRuntimeUpgrade {
+            operation_id: RuntimeUpgradeOperationId::from_uuid(uuid::Uuid::now_v7()),
+            sandbox_id,
+            observed: ObservedSandbox::of(&sandbox),
+            target_environment: target,
+            target_state: RuntimeUpgradeTargetState::Started,
+            authorization: &RuntimeUpgradeAuthorization {
+                id: "block-e0".into(),
+                reason: "runtime advisory".into(),
+                memory_loss: true,
+            },
+            checkpoint_dir_identity,
+            previous_execution: sandbox
+                .execution_metadata
+                .as_ref()
+                .expect("the fixture's sandbox has a saved consumer"),
+        },
+    )
+    .unwrap()
+    {
+        BeginRuntimeUpgrade::Fenced(record) => *record,
+        other => panic!("expected a fenced runtime upgrade, got {other:?}"),
+    }
+}
+
 /// [`begin_activation_with_route_evidence`] with no route evidence.
 pub fn begin_activation(
     conn: &Connection,

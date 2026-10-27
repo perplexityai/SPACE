@@ -34,23 +34,48 @@ use pplx_space_node_runtime_core::runtime_inventory::{
 };
 
 impl NodeManagerService {
+    #[cfg(test)]
     pub(super) fn allowed_definition(
         &self,
         reference: Option<pplx_space_common_core::types::EnvironmentReference>,
         mode: ExecutionSelectionMode,
     ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
-        select_definition(&self.execution_policy, reference, mode)
+        self.allowed_definition_in(PolicyScope::Effective, reference, mode)
     }
 
-    async fn require_verified_environment_layout(&self) -> Result<(), Status> {
+    pub(super) fn allowed_definition_in(
+        &self,
+        scope: PolicyScope,
+        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+        mode: ExecutionSelectionMode,
+    ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
+        select_definition(&self.execution_policy_in(scope), reference, mode)
+    }
+
+    fn execution_policy_in(
+        &self,
+        scope: PolicyScope,
+    ) -> std::sync::Arc<pplx_space_node_runtime_core::selection::ExecutionPolicy> {
+        match scope {
+            PolicyScope::Effective => self.execution_policy(),
+            PolicyScope::Startup => std::sync::Arc::new(self.execution_policy.startup().clone()),
+        }
+    }
+
+    pub(super) async fn require_verified_environment_layout(&self) -> Result<(), Status> {
         if !cfg!(target_os = "linux") {
             return Err(Status::failed_precondition(
                 "verified managed execution requires a Linux host",
             ));
         }
         let paths = self.runtime_paths.clone();
+        let store = artifact_store(
+            &paths.store,
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+        )?;
         self.off_runtime("verify environment layout", move || {
-            separate_store(&paths).map_err(|error| Status::failed_precondition(describe(&error)))
+            separate_store(&paths, store.releases_root())
+                .map_err(|error| Status::failed_precondition(describe(&error)))
         })
         .await
     }
@@ -64,8 +89,15 @@ impl NodeManagerService {
             "ResolveExecutionEnvironment",
             super::ALLOW_NODE_STATUS,
         )?;
-        self.require_verified_environment_layout().await?;
         let request = request.into_inner();
+        if request.definition_schema_version
+            < pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION
+        {
+            return Err(Status::failed_precondition(
+                "generic environment schema 2 is required",
+            ));
+        }
+        self.require_verified_environment_layout().await?;
         if let Some(compatible) = request.compatible {
             if request.reference.is_some() {
                 return Err(Status::invalid_argument(
@@ -84,7 +116,38 @@ impl NodeManagerService {
             .map_err(|error: pplx_space_common_core::types::DigestParseError| {
                 Status::invalid_argument(error.to_string())
             })?;
-        let definition = self.allowed_definition(reference, ExecutionSelectionMode::NewColdBoot)?;
+        let (definition, execution) = self
+            .resolve_new_cold_boot(&self.execution_policy(), reference)
+            .await?;
+        // Re-read after discovery, so a policy applied meanwhile still gates
+        // the binding callers persist.
+        self.execution_policy()
+            .check_execution(&execution, ExecutionSelectionMode::NewColdBoot)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(
+            crate::proto::ResolveExecutionEnvironmentResponse {
+                accepted_selection: 0,
+                definition: Some((&definition).into()),
+                execution: Some((&execution).into()),
+            },
+        ))
+    }
+
+    /// Resolve `reference`, or the policy default, for a new cold boot against
+    /// verified inventory, as admission would. Pass one policy for the whole
+    /// decision, even if node-ctl applies another meanwhile.
+    pub(super) async fn resolve_new_cold_boot(
+        &self,
+        policy: &pplx_space_node_runtime_core::selection::ExecutionPolicy,
+        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+    ) -> Result<
+        (
+            pplx_space_execution_common::environment::EnvironmentDefinition,
+            pplx_space_common_core::types::ExecutionMetadata,
+        ),
+        Status,
+    > {
+        let definition = select_definition(policy, reference, ExecutionSelectionMode::NewColdBoot)?;
         let requested = definition
             .execution_requirements()
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -99,16 +162,10 @@ impl NodeManagerService {
         let execution = definition
             .bind_execution(resolved.execution)
             .map_err(|error| Status::failed_precondition(describe(&error)))?;
-        self.execution_policy
+        policy
             .check_execution(&execution, ExecutionSelectionMode::NewColdBoot)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        Ok(Response::new(
-            crate::proto::ResolveExecutionEnvironmentResponse {
-                accepted_selection: 0,
-                definition: Some((&definition).into()),
-                execution: Some((&execution).into()),
-            },
-        ))
+        Ok((definition, execution))
     }
 
     pub(super) async fn resolve_bound_execution(
@@ -117,10 +174,22 @@ impl NodeManagerService {
         runtime: pplx_space_common_core::types::RuntimeKind,
         mode: ExecutionSelectionMode,
     ) -> Result<ResolvedExecutionEnvironment, Status> {
+        self.resolve_bound_execution_in(PolicyScope::Effective, requested, runtime, mode)
+            .await
+    }
+
+    pub(super) async fn resolve_bound_execution_in(
+        &self,
+        scope: PolicyScope,
+        requested: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+        mode: ExecutionSelectionMode,
+    ) -> Result<ResolvedExecutionEnvironment, Status> {
+        let policy = self.execution_policy_in(scope);
         let definition =
             if let Some(reference) = requested.and_then(|metadata| metadata.environment()) {
                 self.require_verified_environment_layout().await?;
-                let definition = self.allowed_definition(Some(reference), mode)?;
+                let definition = select_definition(&policy, Some(reference), mode)?;
                 if let Some(requested) = requested {
                     definition
                         .check_execution(requested)
@@ -141,7 +210,11 @@ impl NodeManagerService {
                     identity != &initial.release().release
                         && (files.integrity() == ExecutionSourceIntegrity::FsVerity
                             || files.paths().any(|path| {
-                                path.starts_with(&self.runtime_paths.store.releases)
+                                self.runtime_paths
+                                    .store
+                                    .releases
+                                    .values()
+                                    .any(|root| path.starts_with(root))
                                     && !path.starts_with(&self.runtime_paths.vendor)
                             }))
                 };
@@ -166,11 +239,23 @@ impl NodeManagerService {
                 .bind_execution(resolved.execution)
                 .map_err(|error| Status::failed_precondition(describe(&error)))?;
         }
-        self.execution_policy
+        // Re-read after the awaits above, so a policy applied meanwhile
+        // still gates this admission.
+        self.execution_policy_in(scope)
             .check_execution(&resolved.execution, mode)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         Ok(resolved)
     }
+}
+
+const UNREADABLE_POLICY: &str = "node can't read its persisted cluster execution policy and admits no new work until the policy is reapplied";
+
+/// Which policy a decision obeys. Admission obeys the effective policy;
+/// captures, which execute nothing, obey the startup settings.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PolicyScope {
+    Effective,
+    Startup,
 }
 
 fn select_definition(
@@ -178,8 +263,15 @@ fn select_definition(
     reference: Option<pplx_space_common_core::types::EnvironmentReference>,
     mode: ExecutionSelectionMode,
 ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
+    if policy.cluster_policy_unreadable() {
+        return Err(Status::failed_precondition(UNREADABLE_POLICY));
+    }
     let reference = reference.or(policy.default_reference()).ok_or_else(|| {
-        Status::failed_precondition("host has no qualified initial execution environment")
+        Status::failed_precondition(if policy.default_withdrawn() {
+            "node has no usable default execution environment under the cluster policy"
+        } else {
+            "host has no qualified initial execution environment"
+        })
     })?;
     if !policy.allows(reference) {
         return Err(Status::failed_precondition(
@@ -295,11 +387,19 @@ impl Artifact {
     }
 }
 
+/// Initial execution discovery is Firecracker-based. Before another runtime
+/// becomes executable, extend managed-root filtering here and overlap
+/// checks here and in `require_verified_environment_layout` to cover its store.
+/// Publication and removal already check the selected runtime's store separately.
 pub(super) fn execution_inventory(
     paths: &crate::config::RuntimePaths,
     policy: &pplx_space_node_runtime_core::selection::ExecutionPolicy,
 ) -> Result<super::RuntimeInventory, Status> {
-    if execution_roots_overlap(paths)
+    let store = artifact_store(
+        &paths.store,
+        pplx_space_common_core::types::RuntimeKind::Firecracker,
+    )?;
+    if execution_roots_overlap(paths, store.releases_root())
         .map_err(|error| Status::failed_precondition(describe(&error)))?
     {
         tracing::warn!(
@@ -318,12 +418,6 @@ pub(super) fn execution_inventory(
         .map_err(super::RuntimeInventoryError::into_status);
     }
     let initial = initial_environment()?;
-    let store = ArtifactStore::new(
-        &paths.store.releases,
-        &paths.store.kernels,
-        &paths.store.staging,
-        MAX_ARTIFACT_FILE_BYTES,
-    );
     let mut inventory = super::RuntimeInventory::discover_with_store(
         &store,
         initial,
@@ -420,8 +514,11 @@ fn remove_status(error: RemoveError) -> Status {
 /// Earlier prototype images linked execution roots into the store. Refuse
 /// mutations there while retaining the existing external execution path. Root-owned deployment
 /// configuration is stable during a mutation; recheck it on each request.
-fn separate_store(paths: &crate::config::RuntimePaths) -> Result<(), std::io::Error> {
-    if execution_roots_overlap(paths)? {
+fn separate_store(
+    paths: &crate::config::RuntimePaths,
+    root: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    if execution_roots_overlap(paths, root)? {
         Err(std::io::Error::other(
             "execution and managed artifact roots overlap; repair provisioning before managing artifacts",
         ))
@@ -430,7 +527,10 @@ fn separate_store(paths: &crate::config::RuntimePaths) -> Result<(), std::io::Er
     }
 }
 
-fn execution_roots_overlap(paths: &crate::config::RuntimePaths) -> Result<bool, std::io::Error> {
+fn execution_roots_overlap(
+    paths: &crate::config::RuntimePaths,
+    root: &std::path::Path,
+) -> Result<bool, std::io::Error> {
     fn resolve(path: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
         match std::fs::canonicalize(path) {
             Ok(path) => Ok(path),
@@ -450,7 +550,7 @@ fn execution_roots_overlap(paths: &crate::config::RuntimePaths) -> Result<bool, 
     let vendor_kernels = std::path::Path::new(
         pplx_space_common_core::host::linux::paths::FIRECRACKER_KERNEL_VENDOR_DIR,
     );
-    for managed in [&paths.store.releases, &paths.store.kernels] {
+    for managed in [root, paths.store.kernels.as_path()] {
         let managed = resolve(managed)?;
         for execution in [
             paths.vendor.as_path(),
@@ -467,6 +567,28 @@ fn execution_roots_overlap(paths: &crate::config::RuntimePaths) -> Result<bool, 
     Ok(false)
 }
 
+fn artifact_runtime(artifact: &Artifact) -> pplx_space_common_core::types::RuntimeKind {
+    match artifact {
+        Artifact::Release(release, _) => release.kind,
+        Artifact::Kernel(..) => pplx_space_common_core::types::RuntimeKind::Firecracker,
+    }
+}
+
+fn artifact_store(
+    paths: &crate::config::ArtifactStorePaths,
+    runtime: pplx_space_common_core::types::RuntimeKind,
+) -> Result<ArtifactStore, Status> {
+    let root = paths.releases.get(&runtime).ok_or_else(|| {
+        Status::failed_precondition(format!("no managed release store configured for {runtime}"))
+    })?;
+    Ok(ArtifactStore::new(
+        root,
+        &paths.kernels,
+        &paths.staging,
+        MAX_ARTIFACT_FILE_BYTES,
+    ))
+}
+
 impl NodeManagerService {
     /// The slot an artifact-store change runs in, or `RESOURCE_EXHAUSTED`
     /// while another holds it, which the runtime manager retries.
@@ -477,60 +599,58 @@ impl NodeManagerService {
             .map_err(|_| Status::resource_exhausted("the artifact store is busy; retry"))
     }
 
-    fn artifact_store(&self) -> ArtifactStore {
-        let paths = &self.runtime_paths.store;
-        ArtifactStore::new(
-            &paths.releases,
-            &paths.kernels,
-            &paths.staging,
-            MAX_ARTIFACT_FILE_BYTES,
-        )
+    fn artifact_store(&self, artifact: &Artifact) -> Result<ArtifactStore, Status> {
+        let runtime = artifact_runtime(artifact);
+        artifact_store(&self.runtime_paths.store, runtime)
     }
 
     /// Best-effort preparation of the separate managed store. Existing launch
     /// roots and aliases are never moved or repaired here.
     pub(crate) async fn prepare_artifact_store(&self) {
-        let store = self.artifact_store();
-        let paths = self.runtime_paths.clone();
-        let prepared = tokio::task::spawn_blocking(move || {
-            separate_store(&paths)?;
-            store.prepare_roots()?;
-            if let Some(account) = nix::unistd::User::from_name(user_names::SPACE_RTMGR)
-                .map_err(std::io::Error::other)?
-            {
-                store.ensure_staging_root(account.uid.as_raw(), account.gid.as_raw())?;
+        for (&runtime, root) in &self.runtime_paths.store.releases {
+            let stores = &self.runtime_paths.store;
+            let store = ArtifactStore::new(
+                root,
+                &stores.kernels,
+                &stores.staging,
+                MAX_ARTIFACT_FILE_BYTES,
+            );
+            let paths = self.runtime_paths.clone();
+            let cleanup_store = store.clone();
+            let cleanup_paths = paths.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                separate_store(&paths, store.releases_root())?;
+                store.prepare_roots()?;
+                if let Some(account) = nix::unistd::User::from_name(user_names::SPACE_RTMGR)
+                    .map_err(std::io::Error::other)?
+                {
+                    store.ensure_staging_root(account.uid.as_raw(), account.gid.as_raw())?;
+                }
+                Ok::<_, std::io::Error>(())
+            })
+            .await;
+            match prepared {
+                Ok(Ok(())) => tracing::info!(%runtime, "managed artifact store prepared"),
+                Ok(Err(error)) => {
+                    tracing::warn!(%runtime, %error, "artifact store preparation incomplete; requests recheck the store")
+                }
+                Err(error) => {
+                    tracing::warn!(%runtime, %error, "artifact store preparation task failed")
+                }
             }
-            Ok::<_, std::io::Error>(())
-        })
-        .await;
-        match prepared {
-            Ok(Ok(())) => tracing::info!("managed artifact store prepared"),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "artifact store preparation incomplete; requests recheck the store; execution roots unchanged")
-            }
-            Err(error) => {
-                tracing::warn!(%error, "artifact store preparation failed; execution roots unchanged")
-            }
+            self.device_op_tasks.spawn_blocking(move || {
+                match separate_store(&cleanup_paths, cleanup_store.releases_root()).and_then(|()| cleanup_store.clear_leftovers()) {
+                    Ok(cleared) => tracing::info!(%runtime, cleared, "managed artifact leftovers cleared"),
+                    Err(error) => tracing::warn!(%runtime, %error, "managed artifact cleanup failed; retry on next startup"),
+                }
+            });
         }
-        // Warm in the tracked background lane. Inventory consumers still await
-        // the same serialized discovery; unrelated lifecycle RPCs can serve.
+        // Warm in the tracked background lane. Inventory consumers await the same
+        // serialized discovery; unrelated lifecycle RPCs can serve.
         let service = self.clone();
         self.device_op_tasks.spawn(async move {
             if let Err(error) = service.runtime_inventory().await {
                 tracing::warn!(%error, "execution cache preparation incomplete; inventory requests retry binding discovery");
-            }
-        });
-        // Reclaim independently of staging/account provisioning, and never hold
-        // node readiness behind recursive deletion. Tracked for shutdown.
-        let store = self.artifact_store();
-        let paths = self.runtime_paths.clone();
-        self.device_op_tasks.spawn_blocking(move || {
-            let result = separate_store(&paths).and_then(|()| store.clear_leftovers());
-            match result {
-                Ok(cleared) => tracing::info!(cleared, "managed artifact leftovers cleared"),
-                Err(error) => {
-                    tracing::warn!(%error, "managed artifact cleanup failed; retry on next startup")
-                }
             }
         });
     }
@@ -545,11 +665,11 @@ impl NodeManagerService {
         let staged = StagedName::parse(request.staging_name)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let architecture = host_arch()?;
-        let store = self.artifact_store();
+        let store = self.artifact_store(&artifact)?;
         let paths = self.runtime_paths.clone();
         let catalog_dir = self.runtime_paths.store.catalog.clone();
         let publication = self.publish_artifact_work(artifact.clone(), move || {
-                separate_store(&paths)
+                separate_store(&paths, store.releases_root())
                     .map_err(|error| Status::failed_precondition(describe(&error)))?;
                 let catalog = RuntimeCatalog::load(&catalog_dir)
                     .map_err(|error| Status::failed_precondition(describe(&error)))?;
@@ -595,7 +715,8 @@ impl NodeManagerService {
         publish: impl FnOnce() -> Result<Publication, Status> + Send + 'static,
     ) -> Result<Publication, Status> {
         let initial = initial_environment()?;
-        let policy = self.execution_policy.clone();
+        // Inventory is discovered against the startup ceiling.
+        let policy = self.execution_policy.startup().clone();
         let affects_execution = artifact.belongs_to_initial(initial)
             || policy.catalog().iter().any(|environment| {
                 policy.allows(environment.definition().reference())
@@ -645,7 +766,7 @@ impl NodeManagerService {
         self.authorize_peer(&request, "RemoveArtifact", ALLOW_ROOT_OR_RTMGR)?;
         let artifact = Artifact::parse(request.get_ref().artifact.as_ref())?;
         artifact.check_removal(initial_environment()?)?;
-        let store = self.artifact_store();
+        let store = self.artifact_store(&artifact)?;
         let paths = self.runtime_paths.clone();
         let slot = self.artifact_slot()?;
         // Only unselected candidates reach removal. Neither external files
@@ -653,7 +774,7 @@ impl NodeManagerService {
         let outcome = self
             .off_runtime("remove artifact", move || {
                 let _slot = slot;
-                separate_store(&paths)
+                separate_store(&paths, store.releases_root())
                     .map_err(|error| Status::failed_precondition(describe(&error)))?;
                 match &artifact {
                     Artifact::Release(release, digest) => store

@@ -19,6 +19,9 @@ use pplx_space_common_svc::{
     AcquireOutcome, DEFAULT_DRAIN_TIMEOUT, LocalHealthServer, LocalRole, ServiceMutex,
     UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
+use pplx_space_node_api_client::node_status_freshness::{
+    DEFAULT_NODE_CTL_POLL_INTERVAL, MAX_NODE_CTL_POLL_INTERVAL, NODE_STATUS_OUTBOUND_RECONCILER,
+};
 use pplx_space_node_api_client::proto::cluster_api_client::ClusterApiClient;
 use pplx_space_node_api_client::proto::node_ctl_server::{NodeCtl, NodeCtlServer};
 use pplx_space_node_api_client::proto::{
@@ -64,11 +67,12 @@ const NODE_STATE_OUTBOUND_RECONCILER: &str = "node-state-outbound";
 const NETWORK_POLICY_OUTBOUND_RECONCILER: &str = "network-policy-outbound";
 const SANDBOX_INVENTORY_OUTBOUND_RECONCILER: &str = "sandbox-inventory-outbound";
 const TEMPLATE_INVENTORY_OUTBOUND_RECONCILER: &str = "template-inventory-outbound";
-const NODE_STATUS_OUTBOUND_RECONCILER: &str = "node-status-outbound";
 /// Where the binary looks for the node-ctl TOML config by default.
 pub const DEFAULT_NODE_CTL_CONFIG_PATH: &str = "/space/config/nodectl.toml";
 const DEFAULT_DISABLE_TTL_SECS: u64 = 10 * 60;
-pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
+/// The cluster derives node-status freshness from this interval; see
+/// `pplx_space_node_api_client::node_status_freshness`.
+pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = DEFAULT_NODE_CTL_POLL_INTERVAL.as_secs();
 const CLUSTER_RECONCILE_DRAIN_MAX_BATCHES: usize = 16;
 const WORK_QUEUE_CAPACITY: usize = 1024;
 const CLUSTER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -697,10 +701,25 @@ fn read_node_ctl_config(path: &Path) -> Result<NodeCtlConfig, RunNodeCtlError> {
 }
 
 fn resolve_poll_interval(cli: &NodeCtlRunConfig, config: &NodeCtlConfig) -> u64 {
-    cli.poll_interval_secs
+    let requested = cli
+        .poll_interval_secs
         .or(config.reconciliation.poll_interval_secs)
-        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
-        .max(1)
+        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
+    bound_poll_interval(Duration::from_secs(requested)).as_secs()
+}
+
+/// At least a second, and no longer than the cluster's node-status freshness
+/// window fully covers: a longer interval would leave a healthy idle node
+/// reading stale between its ticks.
+fn bound_poll_interval(requested: Duration) -> Duration {
+    if requested > MAX_NODE_CTL_POLL_INTERVAL {
+        tracing::warn!(
+            requested_secs = requested.as_secs(),
+            max_secs = MAX_NODE_CTL_POLL_INTERVAL.as_secs(),
+            "poll interval exceeds what the cluster's node-status freshness window covers; using the maximum"
+        );
+    }
+    requested.clamp(Duration::from_secs(1), MAX_NODE_CTL_POLL_INTERVAL)
 }
 
 fn resolve_cluster_node_api_endpoint(config: &NodeCtlConfig) -> Option<String> {

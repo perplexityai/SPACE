@@ -16,7 +16,7 @@ impl ExpectedSpacedHostPeer {
     }
 }
 
-pub(super) fn validate_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
+pub(crate) fn validate_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
     if sandbox_id.len() < 8 {
         return Err(Status::invalid_argument(
             "sandbox_id must be at least 8 characters",

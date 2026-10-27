@@ -28,17 +28,16 @@ use crate::proto::{
     BtrfsEncodeSnapshotRootfsSendRequest, BtrfsEncodeSnapshotRootfsSendResponse,
     BtrfsFinalizeTemplateSubvolumeRequest, BtrfsFinalizeTemplateSubvolumeResponse,
     BtrfsReceiveInstanceRequest, BtrfsReceiveInstanceResponse, CaptureSandboxEndpointProofRequest,
-    CleanupSandboxRequest, CleanupSandboxResponse, CloneSandboxRequest, CloneSandboxResponse,
-    CompletePreparedRootfsRequest, CompletePreparedRootfsResponse, CreateBtrfsSnapshotRequest,
-    CreateBtrfsSnapshotResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    DeleteBtrfsSnapshotRequest, DeleteBtrfsSnapshotResponse, DeleteCacheArtifactRequest,
-    DeleteCacheArtifactResponse, DenyPortRequest, DenyPortResponse, ExposePortRequest,
-    ExposePortResponse, GetDiskUsageRequest, GetDiskUsageResponse, GetExecutionInventoryRequest,
-    GetFirecrackerVmStateRequest, GetFirecrackerVmStateResponse, InspectSandboxRequest,
-    InspectSandboxResponse, LaunchRequest, LaunchResponse, LaunchSandboxRequest,
-    LaunchSandboxResponse, ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
-    ListNetworkLeasesRequest, ListNetworkLeasesResponse, ListOrphanCandidatesRequest,
-    ListOrphanCandidatesResponse, LoadSnapshotRequest, LoadSnapshotResponse, MissingDiskUsageId,
+    CaptureVmStateResponse, CleanupSandboxRequest, CleanupSandboxResponse, CloneSandboxRequest,
+    CloneSandboxResponse, CompletePreparedRootfsRequest, CompletePreparedRootfsResponse,
+    CreateBtrfsSnapshotRequest, CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotRequest,
+    DeleteBtrfsSnapshotResponse, DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+    DenyPortRequest, DenyPortResponse, ExposePortRequest, ExposePortResponse, GetDiskUsageRequest,
+    GetDiskUsageResponse, GetExecutionInventoryRequest, GetVmStateRequest, GetVmStateResponse,
+    InspectSandboxRequest, InspectSandboxResponse, LaunchRequest, LaunchResponse,
+    LaunchSandboxRequest, LaunchSandboxResponse, ListBtrfsSnapshotsRequest,
+    ListBtrfsSnapshotsResponse, ListNetworkLeasesRequest, ListNetworkLeasesResponse,
+    ListOrphanCandidatesRequest, ListOrphanCandidatesResponse, MissingDiskUsageId,
     MissingDiskUsageReason, NetworkLease, NetworkPoolConfigInfo, NetworkPoolStatusRequest,
     NetworkPoolStatusResponse, NetworkProtocol, NodeResourceStatusRequest,
     NodeResourceStatusResponse, PauseSandboxRequest, PauseSandboxResponse,
@@ -49,7 +48,8 @@ use crate::proto::{
     PublishArtifactResponse, ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
     ReleaseRequest, ReleaseResponse, RemoveArtifactRequest, RemoveArtifactResponse,
     RepairNetworkPoolRequest, RepairNetworkPoolResponse, ReservePreparedRootfsRequest,
-    ReservePreparedRootfsResponse, ResumeSandboxRequest, ResumeSandboxResponse,
+    ReservePreparedRootfsResponse, RestoreInstanceSnapshotRequest, RestoreInstanceSnapshotResponse,
+    RestoreVmStateResponse, ResumeSandboxRequest, ResumeSandboxResponse,
     RollbackBtrfsSnapshotRequest, RollbackBtrfsSnapshotResponse, SandboxEndpointProof,
     SetNetworkPoolConfigRequest, SetNetworkPoolConfigResponse, SetNetworkPoolDrainRequest,
     SetNetworkPoolDrainResponse, StopProcessRequest, StopProcessResponse, SyncGuestRequest,
@@ -216,7 +216,7 @@ pub struct NodeManagerService {
     runtime_inventory: std::sync::Arc<ArcSwapOption<RuntimeInventory>>,
     runtime_inventory_refresh_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     runtime_paths: crate::config::RuntimePaths,
-    execution_policy: pplx_space_node_runtime_core::selection::ExecutionPolicy,
+    execution_policy: std::sync::Arc<execution_policy::ExecutionPolicyState>,
     guest_console_logs: bool,
     lifecycle_limiter: std::sync::Arc<crate::lifecycle_limiter::LifecycleLimiter>,
     disk_admission: std::sync::Arc<DiskAdmission>,
@@ -312,15 +312,15 @@ impl NodeManagerService {
         request: Request<GetExecutionInventoryRequest>,
     ) -> Result<Response<pplx_space_execution_common::proto::NodeExecutionInventory>, Status> {
         self.authorize_peer(&request, "GetExecutionInventory", ALLOW_NODE_STATUS)?;
+        // Before discovery, so a node that can't report inventory still reports this.
+        pplx_space_metrics::node_manager::execution_policy_record_unreadable(
+            self.execution_policy().cluster_policy_unreadable(),
+        );
         let inventory = self.runtime_inventory().await?;
         let mut report = inventory.to_proto();
-        let policy = pplx_space_common_core::types::ExecutionPolicyObservation::new(
-            pplx_space_common_core::types::EXECUTION_POLICY_SCHEMA_VERSION,
-            self.execution_policy.allowed_references().collect(),
-            self.execution_policy.default_reference(),
-            self.execution_policy.legacy_unbound_allowed(),
-        )
-        .map_err(|error| Status::internal(error.to_string()))?;
+        // After discovery, so an application that landed meanwhile is the one published.
+        let policy = execution_policy::observation(&self.execution_policy())
+            .map_err(|error| Status::internal(error.to_string()))?;
         report.policy = Some((&policy).into());
         Ok(Response::new(report))
     }
@@ -360,6 +360,14 @@ impl NodeManagerService {
             .await
             .map_err(crate::slot_pool::PoolOpenError::StartupTask)??;
         let disk_admission = std::sync::Arc::new(DiskAdmission::new(settings.disk_admission).await);
+        let startup_policy = settings.execution_policy;
+        let record_path = settings.execution_policy_record;
+        let execution_policy = task_tracker
+            .spawn_blocking(move || {
+                execution_policy::ExecutionPolicyState::load(startup_policy, record_path)
+            })
+            .await
+            .map_err(crate::slot_pool::PoolOpenError::StartupTask)?;
         let prepared_rootfs_reservations = prepared_rootfs::PreparedRootfsReservations::recover(
             &disk_admission,
             std::path::Path::new(CACHE_DIR),
@@ -403,7 +411,7 @@ impl NodeManagerService {
             runtime_inventory: std::sync::Arc::default(),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: settings.runtime_paths,
-            execution_policy: settings.execution_policy,
+            execution_policy: std::sync::Arc::new(execution_policy),
             guest_console_logs: settings.guest_console_logs,
             lifecycle_limiter: std::sync::Arc::new(
                 settings
@@ -459,7 +467,8 @@ impl NodeManagerService {
             .await;
         let snapshot = self.runtime_inventory.clone();
         let paths = self.runtime_paths.clone();
-        let policy = self.execution_policy.clone();
+        // Discover against the startup ceiling: narrowing never needs a rescan.
+        let policy = self.execution_policy.startup().clone();
         self.off_runtime("discover runtime inventory", move || {
             let _guard = guard;
             if let Some(inventory) = snapshot.load_full()
@@ -711,6 +720,7 @@ pub(crate) mod disk_io_ceiling;
 mod encrypted_volumes;
 mod endpoint_attestation;
 mod execution_fence;
+mod execution_policy;
 mod gateway_isolation;
 mod launch_prepare;
 mod network_helpers;
@@ -726,8 +736,10 @@ mod snapshots;
 #[cfg(test)]
 mod tests;
 pub(crate) mod trusted_paths;
-mod validation;
+pub(crate) mod validation;
 
 pub(crate) use cleanup_helpers::RetainedCacheCleanupError;
 pub(crate) use cleanup_helpers::neutralize_retained_cache_owned_by_uid;
 use network_helpers::*;
+
+use crate::snapshot_request::{FirecrackerCapture, FirecrackerRestore};

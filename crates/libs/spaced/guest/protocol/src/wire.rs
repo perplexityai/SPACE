@@ -92,5 +92,24 @@ pub fn proto_globs(values: &[RelativeGlobPattern]) -> Vec<String> {
         .collect()
 }
 
+impl crate::proto::operations::ProcessExit {
+    /// The shell-style exit code a process exit is reported with, in the
+    /// stream's `process_exited` and in the process API alike: the process's
+    /// own code, 128 plus the signal for a signaled exit, 124 for a timeout,
+    /// and 1 when the outcome is unknown.
+    pub fn shell_exit_code(&self) -> i32 {
+        use crate::proto::operations::process_exit::Outcome;
+        match &self.outcome {
+            Some(Outcome::Exited(exited)) => exited.exit_code,
+            // The signal comes from the guest: saturate rather than overflow.
+            Some(Outcome::Signaled(signaled)) => {
+                128_i32.saturating_add(signaled.signal.unwrap_or_default())
+            }
+            Some(Outcome::TimedOut(_)) => 124,
+            Some(Outcome::Unknown(_)) | None => 1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -101,8 +101,8 @@ async fn terminating_a_sandbox_ends_its_processes_and_forgets_them() {
     let table = SimProcessTable::default();
     let live_stream = table.start("sbx-a", spec(&["sleep", "30"])).await;
     drop(table.start("sbx-b", spec(&["sleep", "30"])).await);
-    assert_eq!(table.list("sbx-a").await.len(), 1);
-    let process_id = table.list("sbx-a").await[0].process_id.clone();
+    assert_eq!(table.list("sbx-a", false, None).await.len(), 1);
+    let process_id = table.list("sbx-a", false, None).await[0].process_id.clone();
 
     table.terminate_sandbox("sbx-a").await;
 
@@ -118,13 +118,13 @@ async fn terminating_a_sandbox_ends_its_processes_and_forgets_them() {
         ),
         "a stream open across teardown sees the process end: {events:?}"
     );
-    assert!(table.list("sbx-a").await.is_empty());
+    assert!(table.list("sbx-a", false, None).await.is_empty());
     assert!(matches!(
         table.connect("sbx-a", &process_id, None).await,
         Err(SimProcessError::NotFound { .. })
     ));
     assert_eq!(
-        table.list("sbx-b").await.len(),
+        table.list("sbx-b", false, None).await.len(),
         1,
         "other sandboxes are untouched"
     );
@@ -156,7 +156,7 @@ async fn background_start_ends_after_started_and_keeps_the_process() {
         events[0],
         sbx::spaced_process_event::Event::Started(_)
     ));
-    let running = table.list("sbx").await;
+    let running = table.list("sbx", false, None).await;
     assert_eq!(running.len(), 1);
     // Connecting later still replays from the cursor and follows the exit.
     let process_id = running[0].process_id.clone();
@@ -175,10 +175,18 @@ async fn background_start_ends_after_started_and_keeps_the_process() {
 async fn signaling_an_exited_process_is_not_found() {
     let table = SimProcessTable::default();
     drop(table.start("sbx", spec(&["sleep", "30"])).await);
-    let process_id = table.list("sbx").await[0].process_id.clone();
+    let process_id = table.list("sbx", false, None).await[0].process_id.clone();
 
     table.kill("sbx", &process_id).await.unwrap();
-    assert!(table.list("sbx").await.is_empty());
+    assert!(table.list("sbx", false, None).await.is_empty());
+    // Listed when asked, with its exit, as the guest retains one.
+    let exited = table.list("sbx", true, Some(&process_id)).await;
+    let [exited] = exited.as_slice() else {
+        panic!("the exited process is listed when asked: {exited:?}");
+    };
+    assert_eq!(exited.exit, Some(signaled(9)), "{exited:?}");
+    assert!(exited.ended_at.is_some(), "{exited:?}");
+    assert!(table.list("sbx", true, Some("sim-proc-0")).await.is_empty());
 
     assert!(matches!(
         table.kill("sbx", &process_id).await,

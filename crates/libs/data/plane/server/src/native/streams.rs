@@ -37,14 +37,7 @@ pub(super) async fn initial_process_stream(
     input: ProcessInput,
 ) -> Result<tonic::Streaming<ProcessEvent>, StreamBridgeError> {
     if let Some(process_id) = attached.backend_process_id.as_ref() {
-        return connect_process_stream(
-            client,
-            &attached.sandbox_id,
-            process_id,
-            output_cursor,
-            attached.space_api_route_token.as_ref(),
-        )
-        .await;
+        return reconnect_process_stream(client, attached, process_id, output_cursor).await;
     }
 
     if input == ProcessInput::ConnectOnly {
@@ -79,16 +72,48 @@ pub(super) async fn initial_process_stream(
         Err(StreamBridgeError::BackendStatus(status))
             if status.code() == tonic::Code::AlreadyExists =>
         {
-            connect_process_stream(
+            reconnect_process_stream(
                 client,
-                &attached.sandbox_id,
+                attached,
                 &process_id_for_session(session_id),
                 output_cursor,
-                attached.space_api_route_token.as_ref(),
             )
             .await
         }
         result => result,
+    }
+}
+
+/// Connects to the process this session already started. The guest retains a
+/// completed process's exit for a bounded window, so a reattach after the
+/// command ended still reports it; once the record is gone, its definitive
+/// `NotFound` names that instead of a command that could not be started.
+async fn reconnect_process_stream(
+    client: &mut WorkerApiClient<GrpcClientTrace<Channel>>,
+    attached: &AttachedSession,
+    process_id: &ProcessId,
+    output_cursor: Option<u64>,
+) -> Result<tonic::Streaming<ProcessEvent>, StreamBridgeError> {
+    connect_process_stream(
+        client,
+        &attached.sandbox_id,
+        process_id,
+        output_cursor,
+        attached.space_api_route_token.as_ref(),
+    )
+    .await
+    .map_err(process_not_retained)
+}
+
+pub(super) fn process_not_retained(error: StreamBridgeError) -> StreamBridgeError {
+    match error {
+        StreamBridgeError::BackendStatus(status)
+            if status.code() == tonic::Code::NotFound
+                && pplx_space_common_grpc::is_terminal_guest_process_error(&status) =>
+        {
+            StreamBridgeError::ProcessNotRetained
+        }
+        error => error,
     }
 }
 
@@ -181,6 +206,16 @@ pub(super) fn process_stream_start_http_error(error: &StreamBridgeError) -> Resp
     if let Some(response) = backend_refusal_http_error(error) {
         return response;
     }
+    if matches!(error, StreamBridgeError::ProcessNotRetained) {
+        return data_plane_http_error(
+            StatusCode::NOT_FOUND,
+            DataPlaneHttpErrorCode::NotFound,
+            PROCESS_NOT_RETAINED_MESSAGE,
+            false,
+            ResponseOrigin::Node,
+            ResponseKind::BackendStatus,
+        );
+    }
     // The sandbox's disk or quota is full: not retryable until space is freed,
     // and named as such rather than as a generic start failure.
     if let StreamBridgeError::BackendStatus(status) = error
@@ -271,7 +306,11 @@ pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneSe
     // The bridge logs the error.
     DataPlaneServerFrame::Error {
         code: DataPlaneErrorCode::BackendStreamError,
-        message: STREAM_OPEN_FAILED.to_string(),
+        message: match error {
+            StreamBridgeError::ProcessNotRetained => PROCESS_NOT_RETAINED_MESSAGE,
+            _ => STREAM_OPEN_FAILED,
+        }
+        .to_string(),
         retryable,
     }
 }

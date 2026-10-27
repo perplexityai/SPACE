@@ -26,9 +26,10 @@ use std::str::FromStr;
 use tracing::Instrument;
 
 const CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX: &str = "d-stop-";
-const OPERATION_DISK_ARTIFACT_PREFIX: &str = "d-operation-";
+const OPERATION_DISK_ARTIFACT_PREFIX: &str =
+    pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
 
-fn is_internal_snapshot_name(snapshot_name: &str) -> bool {
+pub(super) fn is_internal_snapshot_name(snapshot_name: &str) -> bool {
     snapshot_name.starts_with(CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX)
         || snapshot_name.starts_with(OPERATION_DISK_ARTIFACT_PREFIX)
 }
@@ -259,11 +260,13 @@ impl SandboxManagerService {
         let req = request.get_ref();
         let route_auth =
             self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::ListProcesses)?;
-        if req.operation.is_none() {
+        let Some(operation) = req.operation.as_ref() else {
             return Err(Status::invalid_argument(
                 "spaced operation payload is required",
             ));
-        }
+        };
+        let include_exited = operation.include_exited;
+        let process_id = operation.process_id.clone();
         let sandbox = self
             .ensure_active_for_read_only_guest_activity(
                 Some(route_auth.clone()),
@@ -277,7 +280,7 @@ impl SandboxManagerService {
         route_auth.authorize_sandbox(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
         let processes = client
-            .list_processes()
+            .list_processes(include_exited, process_id.as_deref())
             .await?
             .into_iter()
             .map(process_info_to_spaced)
@@ -1246,7 +1249,8 @@ impl SandboxManagerService {
                 "cleanup owns this sandbox; retain its snapshots",
             ));
         }
-        Ok(())
+        // A rollback would rewrite the disk an upgrade preserved or is booting.
+        super::runtime_upgrade::refuse_runtime_upgrade_fence_in(&db, sandbox_id)
     }
 
     pub(super) async fn delete_snapshots(
@@ -1391,6 +1395,9 @@ impl SandboxManagerService {
         let artifact_guard = artifact_lock.lock().await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.require_snapshot_mutation_ownership(&sandbox.id)?;
+        // A full rollback restages the canonical checkpoint, which a verified
+        // upgrade still owes the retirement of the old runtime's checkpoint at.
+        self.refuse_unretired_runtime_upgrade(&sandbox.id)?;
         // A suspended sandbox's restore source is its pinned suspend artifact,
         // whose memory image was captured against the current rootfs. Below,
         // the rollback rewrites that rootfs, and for an `f-*` restart it also

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Run the portable typed smoke inventory against the local Kind/Firecracker stack.
 # Usage: scripts/tests/smoke-kind-typed.sh [all|ecw|network_policy|local|native] [INDEX/COUNT]
+#   Every target needs an admin session token: SPACE_API_TOKEN, or
+#   SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE to read one from, or the seeded root
+#   account this script logs in as when neither is set.
 # Each shard needs its own isolated Kind stack; scenarios within it stay serial.
 #   `all` is the full inventory: every scenario on the ECW API surface, then every scenario
 #   that also supports the native /v1 surface on that surface. The two passes are separate
 #   runner processes because the surface is process-wide; `all` runs both, repeats both
 #   passes' summaries (counts and every scenario that did not pass) at the end, and exits
-#   with the first nonzero status. `native` runs only the second pass. Both need
-#   SPACE_API_TOKEN (an admin session bearer token) or SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE to
-#   read one from.
+#   with the first nonzero status. `native` runs only the second pass.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +33,18 @@ if ! command -v uv >/dev/null 2>&1; then
   echo "ERROR: uv is required; run infra/space/kind/scripts/install-prereqs.sh" >&2
   exit 2
 fi
+for bin in curl jq; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "ERROR: the typed Kind smoke needs ${bin} to obtain an admin token" >&2
+    exit 2
+  fi
+done
+
+# Paths removed on exit. One trap for the whole script: a second `trap ... EXIT`
+# replaces the first rather than adding to it, so each owner appends here
+# instead of installing its own.
+CLEANUP_PATHS=()
+trap 'rm -rf ${CLEANUP_PATHS[@]+"${CLEANUP_PATHS[@]}"}' EXIT
 
 # As in ci/scripts/run-python-tests.sh: CI checks that uv.lock still matches
 # pyproject.toml (--locked); local runs use the lock as committed (--frozen),
@@ -41,15 +54,58 @@ if [[ -n "${CI:-}" ]]; then
   UV_LOCK_MODE=--locked
 fi
 
-require_native_token() {
-  if [[ -z "${SPACE_API_TOKEN:-}" && -n "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE:-}" ]]; then
+# An admin session token, for every target rather than just the native pass:
+# the local scenarios that drive `/admin/api/v1` (the `:terminate` drain gate)
+# need one too, and a scenario that cannot authenticate reports inconclusive
+# rather than failing, which would read as "not covered" every local run.
+# Minted here from the seeded root account when the caller supplied neither
+# form, so a bench run matches what CI hands the suite.
+resolve_admin_token() {
+  if [[ -z "${SPACE_API_TOKEN:-}" && -n "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE:-}" && -s "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}" ]]; then
     SPACE_API_TOKEN="$(<"$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")"
     export SPACE_API_TOKEN
   fi
   if [[ -z "${SPACE_API_TOKEN:-}" ]]; then
-    echo "ERROR: the native API surface needs SPACE_API_TOKEN or SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE" >&2
+    local api_url="${API_URL:-http://127.0.0.1:8080}"
+    # The body is built by jq and sent to curl on stdin, as in
+    # infra/space/kind/scripts/wait-node-publication.sh, so a password
+    # containing a quote or backslash still makes valid JSON.
+    SPACE_API_TOKEN="$(jq -nc \
+        --arg email "${ADMIN_EMAIL:-root@local}" \
+        --arg password "${ADMIN_PASSWORD:-${SPACE_CONSOLE_PASSWORD:-password}}" \
+        '{email: $email, password: $password}' \
+      | curl -fsS -m 10 -X POST "${api_url}/auth/v1/sessions" \
+          -H 'content-type: application/json' --data-binary @- \
+      | jq -r '.token // empty')" || SPACE_API_TOKEN=""
+    export SPACE_API_TOKEN
+  fi
+  if [[ -z "${SPACE_API_TOKEN:-}" ]]; then
+    echo "ERROR: could not obtain an admin session token from the Kind API" >&2
+    echo "       Set SPACE_API_TOKEN or SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE." >&2
     exit 2
   fi
+  # The adapter's admin requests read only the file, and the drain-gate
+  # scenario's `:terminate` POST prefers SPACE_API_TOKEN, so two different
+  # tokens would split one run across two credentials.
+  if [[ -n "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE:-}" && -s "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}" \
+        && "$(<"$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")" != "$SPACE_API_TOKEN" ]]; then
+    echo "ERROR: SPACE_API_TOKEN and SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE hold different tokens" >&2
+    echo "       Set one of them, or make them agree." >&2
+    exit 2
+  fi
+  if [[ -z "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE:-}" || ! -s "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}" ]]; then
+    SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE="$(mktemp)"
+    # Registered before anything is written to it: under `set -e` a failed
+    # chmod or write exits here, and the trap must still find the file.
+    CLEANUP_PATHS+=("$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
+    chmod 0600 "$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE"
+    printf '%s' "$SPACE_API_TOKEN" >"$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE"
+    export SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE
+  fi
+}
+
+require_native_token() {
+  resolve_admin_token
   # The native client defaults its data plane to the API URL; on Kind the public data
   # plane is port-forwarded separately (same default the ECW surface uses).
   export SPACE_DATA_PLANE_URL="${SPACE_DATA_PLANE_URL:-http://127.0.0.1:8090}"
@@ -79,8 +135,8 @@ prepare_native_kind() {
 # `local.private_template_build_isolation` needs a second organization with a
 # service user. Organizations are not per-run fixtures (a deleted template keeps
 # its ownership record), so one stable organization per bench, found by slug or
-# created on first use, serves every run. Without an operator token this does
-# nothing and the scenario reports its own missing input.
+# created on first use, serves every run. Every target resolves an admin token
+# before this runs, so the token check below only matters to a direct caller.
 BUILD_FOREIGN_ORG_SLUG="space-smoke-build-foreign"
 
 ensure_build_foreign_org() {
@@ -142,7 +198,7 @@ case "$TARGET" in
     prepare_native_kind
     ensure_build_foreign_org
     logs="$(mktemp -d)"
-    trap 'rm -rf "$logs"' EXIT
+    CLEANUP_PATHS+=("$logs")
     ecw_rc=0
     native_rc=0
     run_surface ecw --all 2>&1 | tee "$logs/ecw" || ecw_rc=$?
@@ -168,13 +224,18 @@ case "$TARGET" in
     ;;
   native)
     prepare_native_kind
-    exec env SPACE_SMOKE_API_SURFACE=native uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run --all "${SHARD_ARGS[@]}"
+    # Not `exec`: that replaces the shell before its EXIT trap runs, and the
+    # trap is what removes a minted token file.
+    env SPACE_SMOKE_API_SURFACE=native uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run --all "${SHARD_ARGS[@]}"
+    exit $?
     ;;
   ecw|network_policy|local)
+    resolve_admin_token
     if [[ "$TARGET" == local ]]; then
       ensure_build_foreign_org
     fi
-    exec env SPACE_SMOKE_API_SURFACE=ecw uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run --category "$TARGET" "${SHARD_ARGS[@]}"
+    env SPACE_SMOKE_API_SURFACE=ecw uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run --category "$TARGET" "${SHARD_ARGS[@]}"
+    exit $?
     ;;
   *)
     echo "ERROR: unknown typed smoke target: $TARGET" >&2

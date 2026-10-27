@@ -28,8 +28,8 @@ use pplx_space_node_api_client::proto::{
     UnstableResolveSandboxServiceRouteRequest, UnstableResolveSandboxServiceRouteResponse,
 };
 use pplx_space_sbx_mgr_client::proto::{
-    SpacedProcessExit, SpacedProcessExited, SpacedProcessOutput, spaced_process_event,
-    spaced_process_exit,
+    SpacedProcessExit, SpacedProcessExited, SpacedProcessOutput, SpacedProcessSignaled,
+    SpacedProcessTimedOut, SpacedProcessUnknown, spaced_process_event, spaced_process_exit,
 };
 use std::borrow::Cow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3624,27 +3624,49 @@ fn process_events_map_to_native_data_plane_frames() {
         }]
     );
 
-    let exited = process_event_frames(
-        ProcessEvent {
-            process_id: "proc-1".to_string(),
-            pid: Some(7),
-            event: Some(spaced_process_event::Event::Exit(SpacedProcessExit {
-                outcome: Some(spaced_process_exit::Outcome::Exited(SpacedProcessExited {
-                    exit_code: 13,
+    // Each outcome's shell-style code, as `getProcess` reports it too.
+    for (outcome, exit_code, status) in [
+        (
+            spaced_process_exit::Outcome::Exited(SpacedProcessExited { exit_code: 13 }),
+            13,
+            DataPlaneProcessExitStatus::Exited,
+        ),
+        (
+            spaced_process_exit::Outcome::Signaled(SpacedProcessSignaled { signal: Some(9) }),
+            137,
+            DataPlaneProcessExitStatus::Signaled,
+        ),
+        (
+            spaced_process_exit::Outcome::TimedOut(SpacedProcessTimedOut { signal: Some(9) }),
+            124,
+            DataPlaneProcessExitStatus::TimedOut,
+        ),
+        (
+            spaced_process_exit::Outcome::Unknown(SpacedProcessUnknown {}),
+            1,
+            DataPlaneProcessExitStatus::Unknown,
+        ),
+    ] {
+        let exited = process_event_frames(
+            ProcessEvent {
+                process_id: "proc-1".to_string(),
+                pid: Some(7),
+                event: Some(spaced_process_event::Event::Exit(SpacedProcessExit {
+                    outcome: Some(outcome),
                 })),
-            })),
-        },
-        &mut seq,
-    );
-    assert_eq!(exited.output_bytes, 0);
-    assert_eq!(
-        exited.frames,
-        vec![DataPlaneServerFrame::ProcessExited {
-            process_id: "proc-1".to_string(),
-            exit_code: 13,
-            status: DataPlaneProcessExitStatus::Exited,
-        }]
-    );
+            },
+            &mut seq,
+        );
+        assert_eq!(exited.output_bytes, 0);
+        assert_eq!(
+            exited.frames,
+            vec![DataPlaneServerFrame::ProcessExited {
+                process_id: "proc-1".to_string(),
+                exit_code,
+                status,
+            }]
+        );
+    }
 }
 
 #[test]

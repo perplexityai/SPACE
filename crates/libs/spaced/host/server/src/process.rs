@@ -103,18 +103,28 @@ impl Process for SpacedHostService {
 
     async fn list_processes(
         &self,
-        _request: Request<ListProcessesRequest>,
+        request: Request<ListProcessesRequest>,
     ) -> Result<Response<Self::ListProcessesStream>, Status> {
+        let ListProcessesRequest {
+            include_exited,
+            process_id,
+        } = request.into_inner();
         let guest_stream = self
             .call_bridge_guest_process(
                 "bridge_guest_process_list",
                 BridgeGuestOperationBudget::ProcessMetadata,
-                |mut client| async move {
-                    client
-                        .list_processes(
-                            pplx_space_spaced_common::proto::bridge_guest::ListProcessesRequest {},
-                        )
-                        .await
+                |mut client| {
+                    let process_id = process_id.clone();
+                    async move {
+                        client
+                            .list_processes(
+                                pplx_space_spaced_common::proto::bridge_guest::ListProcessesRequest {
+                                    include_exited,
+                                    process_id,
+                                },
+                            )
+                            .await
+                    }
                 },
             )
             .await?;

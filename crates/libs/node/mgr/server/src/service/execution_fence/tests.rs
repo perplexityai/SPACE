@@ -394,6 +394,14 @@ async fn canonical_artifact_rpcs_reject_missing_or_superseded_execution_before_h
                 .await
                 .map(|_| ()),
             service
+                .restore_instance_snapshot(request(crate::proto::RestoreInstanceSnapshotRequest {
+                    sandbox_id: sandbox.clone(),
+                    snapshot_name: "d-operation-runtime-upgrade-test".into(),
+                    execution_fence: wire.clone(),
+                }))
+                .await
+                .map(|_| ()),
+            service
                 .btrfs_encode_rootfs_send(request(crate::proto::BtrfsEncodeRootfsSendRequest {
                     sandbox_id: sandbox.clone(),
                     execution_fence: wire,

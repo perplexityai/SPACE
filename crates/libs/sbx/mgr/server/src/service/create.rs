@@ -427,9 +427,7 @@ impl SandboxManagerService {
             },
         )?;
 
-        let cache_dir = std::path::Path::new(CACHE_DIR);
-        #[cfg(test)]
-        let cache_dir = self.create_cache_dir.as_deref().unwrap_or(cache_dir);
+        let cache_dir = self.cache_root();
         if let Err(status) = ensure_sandbox_cache_root_in(cache_dir, &id) {
             create_cleanup.cleanup_after_failure(
                 SandboxQuarantineReasonCode::CreateInterrupted,
@@ -657,9 +655,7 @@ impl SandboxManagerService {
         let id = &sandbox.id;
         let original_state = sandbox.state;
         let mut uuid8 = sandbox.uuid8.clone();
-        let cache_root = std::path::Path::new(CACHE_DIR);
-        #[cfg(test)]
-        let cache_root = self.create_cache_dir.as_deref().unwrap_or(cache_root);
+        let cache_root = self.cache_root();
         let prepare_source = start_stage_timeout(
             "restore.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
@@ -746,6 +742,17 @@ impl SandboxManagerService {
             .transition(SandboxState::Restoring)
             .map_err(Status::from)?;
 
+        let open_route_activation = open_activation_claim_eligible
+            .then(|| {
+                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                    &space_api_route_identity,
+                    route_identity_provenance,
+                )
+            })
+            .flatten();
+        self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
+            .await?;
+
         // Serialize the whole activation boundary with cleanup. A cleanup
         // admitted for the previous execution must either finish before this
         // restore claims the row, or observe the attached replacement
@@ -761,14 +768,6 @@ impl SandboxManagerService {
             activation_lock_owner.lock(),
         )
         .await?;
-        let open_route_activation = open_activation_claim_eligible
-            .then(|| {
-                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
-                    &space_api_route_identity,
-                    route_identity_provenance,
-                )
-            })
-            .flatten();
 
         let cleanup_episode = {
             let db = self.db_conn()?;
@@ -787,12 +786,14 @@ impl SandboxManagerService {
                         route_identity_provenance,
                     ),
                     open_claim: open_route_activation.as_ref(),
+                    runtime_upgrade: None,
                 },
             )
             .map_err(|error| {
-                Status::internal(format!(
-                    "failed to claim restoring state before restore prepare: {error}"
-                ))
+                super::runtime_upgrade::begin_activation_status(
+                    error,
+                    "failed to claim restoring state before restore prepare",
+                )
             })?
         };
         let Some(cleanup_episode) = cleanup_episode else {
@@ -1158,15 +1159,14 @@ impl SandboxManagerService {
             let mut spaced_host_client = node_client.clone();
             let load_snapshot = async {
                 snapshot_client
-                    .load_snapshot(LoadSnapshotRequest {
+                    .restore_vm_state(RestoreVmStateRequest {
                         execution_fence: Some(execution_fence.into()),
                         sandbox_id: id.clone(),
-                        snapshot_path: "/vmstate".to_string(),
-                        mem_file_path: "/memory".to_string(),
-                        source_dir: Some(snapshot_dir.clone()),
-                        // Restore configuration was checked before activation;
-                        // unsupported backends must never reach node-manager.
-                        snapshot_volume_mount_dir: snapshot_volume_mount_dir.clone(),
+                        artifacts: super::snapshot_capture::artifacts(),
+                        storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
+                            directory: Some(snapshot_dir.clone()),
+                            encrypted_volume_mount: snapshot_volume_mount_dir.clone(),
+                        }),
                         rootfs_rate_limit: self
                             .rootfs_rate_limiter(
                                 sandbox.user.kind() == SandboxOwnerKind::Builder,

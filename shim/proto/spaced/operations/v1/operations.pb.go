@@ -2353,7 +2353,9 @@ type StartRequest struct {
 	// is what the E2B compatibility path does. The native data plane derives this
 	// from the data-plane session id so the control plane can return a usable
 	// process id before the process exists, and so a retried start is refused
-	// rather than executing the command twice.
+	// rather than executing the command twice. An id stays in use after its
+	// process exits, for as long as the guest retains the exit (15 minutes, or
+	// less once many newer processes start).
 	ProcessId     *string `protobuf:"bytes,12,opt,name=process_id,json=processId,proto3,oneof" json:"process_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2659,7 +2661,13 @@ func (x *ConnectProcessRequest) GetResumeFromOldestRetained() bool {
 }
 
 type ListProcessesRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Also list processes that have exited but are still retained, with their
+	// exit. Older guests ignore it and list running processes only.
+	IncludeExited bool `protobuf:"varint,1,opt,name=include_exited,json=includeExited,proto3" json:"include_exited,omitempty"`
+	// List only this process. Older guests ignore it and list every process,
+	// so a caller still selects the one it wants.
+	ProcessId     *string `protobuf:"bytes,2,opt,name=process_id,json=processId,proto3,oneof" json:"process_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2694,16 +2702,33 @@ func (*ListProcessesRequest) Descriptor() ([]byte, []int) {
 	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{39}
 }
 
+func (x *ListProcessesRequest) GetIncludeExited() bool {
+	if x != nil {
+		return x.IncludeExited
+	}
+	return false
+}
+
+func (x *ListProcessesRequest) GetProcessId() string {
+	if x != nil && x.ProcessId != nil {
+		return *x.ProcessId
+	}
+	return ""
+}
+
 type ProcessInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ProcessId     string                 `protobuf:"bytes,1,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
-	Pid           uint32                 `protobuf:"varint,2,opt,name=pid,proto3" json:"pid,omitempty"`
-	Command       []string               `protobuf:"bytes,3,rep,name=command,proto3" json:"command,omitempty"`
-	Cwd           *string                `protobuf:"bytes,4,opt,name=cwd,proto3,oneof" json:"cwd,omitempty"`
-	Env           map[string]string      `protobuf:"bytes,5,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	User          *string                `protobuf:"bytes,6,opt,name=user,proto3,oneof" json:"user,omitempty"`
-	Tag           *string                `protobuf:"bytes,7,opt,name=tag,proto3,oneof" json:"tag,omitempty"`
-	Pty           *bool                  `protobuf:"varint,8,opt,name=pty,proto3,oneof" json:"pty,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ProcessId string                 `protobuf:"bytes,1,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
+	Pid       uint32                 `protobuf:"varint,2,opt,name=pid,proto3" json:"pid,omitempty"`
+	Command   []string               `protobuf:"bytes,3,rep,name=command,proto3" json:"command,omitempty"`
+	Cwd       *string                `protobuf:"bytes,4,opt,name=cwd,proto3,oneof" json:"cwd,omitempty"`
+	Env       map[string]string      `protobuf:"bytes,5,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	User      *string                `protobuf:"bytes,6,opt,name=user,proto3,oneof" json:"user,omitempty"`
+	Tag       *string                `protobuf:"bytes,7,opt,name=tag,proto3,oneof" json:"tag,omitempty"`
+	Pty       *bool                  `protobuf:"varint,8,opt,name=pty,proto3,oneof" json:"pty,omitempty"`
+	// Set once the process has exited; only listed with `include_exited`.
+	Exit          *ProcessExit           `protobuf:"bytes,9,opt,name=exit,proto3,oneof" json:"exit,omitempty"`
+	EndedAt       *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=ended_at,json=endedAt,proto3,oneof" json:"ended_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2792,6 +2817,20 @@ func (x *ProcessInfo) GetPty() bool {
 		return *x.Pty
 	}
 	return false
+}
+
+func (x *ProcessInfo) GetExit() *ProcessExit {
+	if x != nil {
+		return x.Exit
+	}
+	return nil
+}
+
+func (x *ProcessInfo) GetEndedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.EndedAt
+	}
+	return nil
 }
 
 type SendSignalRequest struct {
@@ -4198,8 +4237,12 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x1bresume_from_oldest_retained\x18\x04 \x01(\bR\x18resumeFromOldestRetainedB\n" +
 	"\n" +
 	"\b_timeoutB\x10\n" +
-	"\x0e_output_cursor\"\x16\n" +
-	"\x14ListProcessesRequest\"\xd3\x02\n" +
+	"\x0e_output_cursor\"p\n" +
+	"\x14ListProcessesRequest\x12%\n" +
+	"\x0einclude_exited\x18\x01 \x01(\bR\rincludeExited\x12\"\n" +
+	"\n" +
+	"process_id\x18\x02 \x01(\tH\x00R\tprocessId\x88\x01\x01B\r\n" +
+	"\v_process_id\"\xe7\x03\n" +
 	"\vProcessInfo\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\x12\x10\n" +
@@ -4209,14 +4252,19 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x03env\x18\x05 \x03(\v20.space.spaced.operations.v1.ProcessInfo.EnvEntryR\x03env\x12\x17\n" +
 	"\x04user\x18\x06 \x01(\tH\x01R\x04user\x88\x01\x01\x12\x15\n" +
 	"\x03tag\x18\a \x01(\tH\x02R\x03tag\x88\x01\x01\x12\x15\n" +
-	"\x03pty\x18\b \x01(\bH\x03R\x03pty\x88\x01\x01\x1a6\n" +
+	"\x03pty\x18\b \x01(\bH\x03R\x03pty\x88\x01\x01\x12@\n" +
+	"\x04exit\x18\t \x01(\v2'.space.spaced.operations.v1.ProcessExitH\x04R\x04exit\x88\x01\x01\x12:\n" +
+	"\bended_at\x18\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampH\x05R\aendedAt\x88\x01\x01\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x06\n" +
 	"\x04_cwdB\a\n" +
 	"\x05_userB\x06\n" +
 	"\x04_tagB\x06\n" +
-	"\x04_pty\"J\n" +
+	"\x04_ptyB\a\n" +
+	"\x05_exitB\v\n" +
+	"\t_ended_at\"J\n" +
 	"\x11SendSignalRequest\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\x12\x16\n" +
@@ -4426,24 +4474,26 @@ var file_spaced_operations_v1_operations_proto_depIdxs = []int32{
 	41, // 19: space.spaced.operations.v1.PtyConfig.size:type_name -> space.spaced.operations.v1.PtySize
 	72, // 20: space.spaced.operations.v1.ConnectProcessRequest.timeout:type_name -> google.protobuf.Duration
 	70, // 21: space.spaced.operations.v1.ProcessInfo.env:type_name -> space.spaced.operations.v1.ProcessInfo.EnvEntry
-	41, // 22: space.spaced.operations.v1.ResizePtyRequest.size:type_name -> space.spaced.operations.v1.PtySize
-	57, // 23: space.spaced.operations.v1.ProcessEvent.started:type_name -> space.spaced.operations.v1.ProcessStarted
-	58, // 24: space.spaced.operations.v1.ProcessEvent.connected:type_name -> space.spaced.operations.v1.ProcessConnected
-	59, // 25: space.spaced.operations.v1.ProcessEvent.stdout:type_name -> space.spaced.operations.v1.ProcessOutput
-	59, // 26: space.spaced.operations.v1.ProcessEvent.stderr:type_name -> space.spaced.operations.v1.ProcessOutput
-	60, // 27: space.spaced.operations.v1.ProcessEvent.exit:type_name -> space.spaced.operations.v1.ProcessExit
-	71, // 28: space.spaced.operations.v1.ProcessStarted.start_time:type_name -> google.protobuf.Timestamp
-	61, // 29: space.spaced.operations.v1.ProcessExit.exited:type_name -> space.spaced.operations.v1.ProcessExited
-	62, // 30: space.spaced.operations.v1.ProcessExit.signaled:type_name -> space.spaced.operations.v1.ProcessSignaled
-	63, // 31: space.spaced.operations.v1.ProcessExit.timed_out:type_name -> space.spaced.operations.v1.ProcessTimedOut
-	64, // 32: space.spaced.operations.v1.ProcessExit.unknown:type_name -> space.spaced.operations.v1.ProcessUnknown
-	72, // 33: space.spaced.operations.v1.OpenLoopbackBridgeRequest.wait_timeout:type_name -> google.protobuf.Duration
-	2,  // 34: space.spaced.operations.v1.OpenLoopbackBridgeResponse.status:type_name -> space.spaced.operations.v1.LoopbackBridgeStatus
-	35, // [35:35] is the sub-list for method output_type
-	35, // [35:35] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	60, // 22: space.spaced.operations.v1.ProcessInfo.exit:type_name -> space.spaced.operations.v1.ProcessExit
+	71, // 23: space.spaced.operations.v1.ProcessInfo.ended_at:type_name -> google.protobuf.Timestamp
+	41, // 24: space.spaced.operations.v1.ResizePtyRequest.size:type_name -> space.spaced.operations.v1.PtySize
+	57, // 25: space.spaced.operations.v1.ProcessEvent.started:type_name -> space.spaced.operations.v1.ProcessStarted
+	58, // 26: space.spaced.operations.v1.ProcessEvent.connected:type_name -> space.spaced.operations.v1.ProcessConnected
+	59, // 27: space.spaced.operations.v1.ProcessEvent.stdout:type_name -> space.spaced.operations.v1.ProcessOutput
+	59, // 28: space.spaced.operations.v1.ProcessEvent.stderr:type_name -> space.spaced.operations.v1.ProcessOutput
+	60, // 29: space.spaced.operations.v1.ProcessEvent.exit:type_name -> space.spaced.operations.v1.ProcessExit
+	71, // 30: space.spaced.operations.v1.ProcessStarted.start_time:type_name -> google.protobuf.Timestamp
+	61, // 31: space.spaced.operations.v1.ProcessExit.exited:type_name -> space.spaced.operations.v1.ProcessExited
+	62, // 32: space.spaced.operations.v1.ProcessExit.signaled:type_name -> space.spaced.operations.v1.ProcessSignaled
+	63, // 33: space.spaced.operations.v1.ProcessExit.timed_out:type_name -> space.spaced.operations.v1.ProcessTimedOut
+	64, // 34: space.spaced.operations.v1.ProcessExit.unknown:type_name -> space.spaced.operations.v1.ProcessUnknown
+	72, // 35: space.spaced.operations.v1.OpenLoopbackBridgeRequest.wait_timeout:type_name -> google.protobuf.Duration
+	2,  // 36: space.spaced.operations.v1.OpenLoopbackBridgeResponse.status:type_name -> space.spaced.operations.v1.LoopbackBridgeStatus
+	37, // [37:37] is the sub-list for method output_type
+	37, // [37:37] is the sub-list for method input_type
+	37, // [37:37] is the sub-list for extension type_name
+	37, // [37:37] is the sub-list for extension extendee
+	0,  // [0:37] is the sub-list for field type_name
 }
 
 func init() { file_spaced_operations_v1_operations_proto_init() }
@@ -4476,6 +4526,7 @@ func file_spaced_operations_v1_operations_proto_init() {
 	file_spaced_operations_v1_operations_proto_msgTypes[34].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[35].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[38].OneofWrappers = []any{}
+	file_spaced_operations_v1_operations_proto_msgTypes[39].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[40].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[51].OneofWrappers = []any{
 		(*ProcessEvent_Started)(nil),

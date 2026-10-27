@@ -11,9 +11,8 @@ fn create_snapshot_accepts_runtime_scoped_destinations() {
     let paths = RuntimePaths::firecracker()
         .create_snapshot_paths(
             sandbox_id,
-            "/vmstate",
-            "/memory",
-            Some(sandbox_snapshot_dir.to_str().unwrap()),
+            &SnapshotFiles::parse("/vmstate".into(), "/memory".into()).unwrap(),
+            Some(&NodeSpacePath::parse(sandbox_snapshot_dir.clone()).unwrap()),
         )
         .unwrap();
 
@@ -32,9 +31,8 @@ fn create_snapshot_accepts_runtime_scoped_destinations() {
     let paths = RuntimePaths::firecracker()
         .create_snapshot_paths(
             sandbox_id,
-            "/vmstate",
-            "/memory",
-            Some(template_staging_dir.to_str().unwrap()),
+            &SnapshotFiles::parse("/vmstate".into(), "/memory".into()).unwrap(),
+            Some(&NodeSpacePath::parse(template_staging_dir.clone()).unwrap()),
         )
         .unwrap();
 
@@ -45,24 +43,18 @@ fn create_snapshot_accepts_runtime_scoped_destinations() {
 }
 
 #[test]
-fn create_snapshot_rejects_traversal_and_unexpected_artifacts() {
-    let runtime = RuntimePaths::firecracker();
-
-    runtime
-        .create_snapshot_paths("sbx_123", "/../vmstate", "/memory", None)
-        .unwrap_err();
-    runtime
-        .create_snapshot_paths("sbx_123", "/vmstate", "/not-memory", None)
-        .unwrap_err();
-    runtime
-        .create_snapshot_paths("sbx_123", "/vmstate", "/memory", Some("/tmp/snapshot"))
-        .unwrap_err();
-    runtime
-        .create_snapshot_paths(
-            "sbx_123",
-            "/vmstate",
-            "/memory",
-            Some(pplx_space_common_core::host::linux::paths::TEMPLATE_DIR),
-        )
-        .unwrap_err();
+fn create_snapshot_rejects_destinations_outside_the_sandbox_roots() {
+    let files = SnapshotFiles::parse("/vmstate".into(), "/memory".into()).unwrap();
+    for path in [
+        "/tmp/snapshot",
+        pplx_space_common_core::host::linux::paths::TEMPLATE_DIR,
+    ] {
+        RuntimePaths::firecracker()
+            .create_snapshot_paths(
+                "sbx_123",
+                &files,
+                Some(&NodeSpacePath::parse(path).unwrap()),
+            )
+            .unwrap_err();
+    }
 }

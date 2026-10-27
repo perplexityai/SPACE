@@ -211,7 +211,9 @@ message StartRequest {
   // is what the E2B compatibility path does. The native data plane derives this
   // from the data-plane session id so the control plane can return a usable
   // process id before the process exists, and so a retried start is refused
-  // rather than executing the command twice.
+  // rather than executing the command twice. An id stays in use after its
+  // process exits, for as long as the guest retains the exit (15 minutes, or
+  // less once many newer processes start).
   optional string process_id = 12;
 }
 message PtySize {
@@ -247,7 +249,14 @@ message ConnectProcessRequest {
   // reports it in `ProcessConnected.output_cursor`. Older guests ignore it.
   bool resume_from_oldest_retained = 4;
 }
-message ListProcessesRequest {}
+message ListProcessesRequest {
+  // Also list processes that have exited but are still retained, with their
+  // exit. Older guests ignore it and list running processes only.
+  bool include_exited = 1;
+  // List only this process. Older guests ignore it and list every process,
+  // so a caller still selects the one it wants.
+  optional string process_id = 2;
+}
 message ProcessInfo {
   string process_id = 1;
   uint32 pid = 2;
@@ -257,6 +266,9 @@ message ProcessInfo {
   optional string user = 6;
   optional string tag = 7;
   optional bool pty = 8;
+  // Set once the process has exited; only listed with `include_exited`.
+  optional ProcessExit exit = 9;
+  optional google.protobuf.Timestamp ended_at = 10;
 }
 message SendSignalRequest {
   string process_id = 1;

@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod cluster;
+pub mod node_status_freshness;
 
 pub mod proto {
     tonic::include_proto!("space.node.api.v1");

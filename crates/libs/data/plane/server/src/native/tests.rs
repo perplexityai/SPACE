@@ -414,6 +414,132 @@ async fn full_guest_storage_is_named_and_not_retryable() {
     assert_eq!(body["error"]["retryable"], false);
 }
 
+// Reattaching to a session whose process the guest no longer retains names
+// that, rather than reporting a command that could not be started. A node's
+// own `NotFound`, not the guest's, keeps its retryable answer.
+#[tokio::test]
+async fn reattach_to_a_process_no_longer_retained_names_it() {
+    use http_body_util::BodyExt;
+    use prost::Message as _;
+    if !binding_fake_test_process() {
+        return;
+    }
+    for (guest, expected_status, expected_message, retryable) in [
+        (
+            true,
+            StatusCode::NOT_FOUND,
+            PROCESS_NOT_RETAINED_MESSAGE,
+            false,
+        ),
+        (
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "process event stream is not available",
+            true,
+        ),
+    ] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut route = crate::tests::route_response_with_token(session_id, None);
+        route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+        route.backend_process_id =
+            Some(pplx_space_public_api::process_id_for_session(session_id).to_string());
+        let route = route.encode_to_vec();
+        let service = axum::Router::new().fallback(move |request: Request<Body>| {
+            let route = route.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                if path.ends_with("/Check") {
+                    return crate::tests::grpc_test_response(vec![8, 1]);
+                }
+                if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                    return crate::tests::grpc_test_response(route);
+                }
+                assert!(
+                    path.ends_with("/SpacedConnectProcess"),
+                    "a bound session reconnects rather than starting: {path}"
+                );
+                let mut status = tonic::Status::not_found("process not found");
+                if guest {
+                    status
+                        .metadata_mut()
+                        .insert("space-guest-process-error", "terminal".parse().unwrap());
+                }
+                status.into_http::<Body>()
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, service).await.unwrap();
+        });
+        let mut state = crate::tests::test_data_plane_state().await;
+        state.cluster_api = ClusterApiClients::service_only(
+            pplx_space_node_api_client::cluster::connect(endpoint, "test")
+                .await
+                .unwrap(),
+        );
+        let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+        let response = tower::ServiceExt::oneshot(
+            router(state),
+            Request::get(format!("/v1/sessions/{session_id}/events"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), expected_status, "guest={guest}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], expected_message, "{body}");
+        assert_eq!(body["error"]["retryable"], retryable, "{body}");
+    }
+    let DataPlaneServerFrame::Error {
+        message, retryable, ..
+    } = stream_start_error_frame(&StreamBridgeError::ProcessNotRetained)
+    else {
+        panic!("expected error frame")
+    };
+    assert_eq!(message, PROCESS_NOT_RETAINED_MESSAGE);
+    assert!(!retryable, "WebSocket agrees with SSE");
+}
+
+// A stream that loses its backend and finds the guest no longer retains the
+// process names that, not retryable, rather than inviting another reattach.
+#[tokio::test]
+async fn mid_stream_reconnect_to_a_process_no_longer_retained_names_it() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|opened, _| {
+            if opened == 0 {
+                // The first stream connects, then loses its backend.
+                vec![
+                    connected(),
+                    FakeReply::End(tonic::Status::unavailable("backend restarted")),
+                ]
+            } else {
+                vec![FakeReply::Refuse(
+                    pplx_space_common_grpc::mark_guest_process_error(tonic::Status::not_found(
+                        "process not found",
+                    )),
+                )]
+            }
+        }),
+    )
+    .await;
+    let (_state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    assert!(seen.contains(PROCESS_NOT_RETAINED_MESSAGE), "{seen}");
+    assert!(seen.contains(r#""retryable":false"#), "{seen}");
+    assert_eq!(fake.opens.lock().unwrap().len(), 2, "reconnected once");
+}
+
 /// How a fake cluster API answers `BindDataPlaneSessionProcess` once the test
 /// adds a `release` permit.
 #[derive(Clone, Copy)]

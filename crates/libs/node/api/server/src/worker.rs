@@ -7,7 +7,7 @@ use crate::proto::{
     TriggerStateReconciliationResponse,
 };
 use crate::restart_handoff::RpcReplaySafety;
-use crate::uds_per_sandbox_limiter::{UdsPerSandboxLimiter, UdsPerSandboxPermit};
+use crate::uds_per_sandbox_limiter::{SandboxBudget, UdsPerSandboxLimiter, UdsPerSandboxPermit};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -243,6 +243,7 @@ impl WorkerApiService {
 
     async fn limited_sbx_unary<Req, Resp, F, Fut>(
         &self,
+        budget: SandboxBudget,
         method: &'static str,
         request: Request<Req>,
         call: F,
@@ -255,16 +256,17 @@ impl WorkerApiService {
     {
         let sandbox_id = request.get_ref().sandbox_id().to_owned();
         record_sandbox_id(&tracing::Span::current(), &sandbox_id);
-        let client = self.clients.sbx();
-        self.limited_sbx_operation(method, &sandbox_id, move || {
-            crate::restart_handoff::call_with_restart_handoff(
-                method,
-                RpcReplaySafety::RequiresProof,
-                request,
-                client,
-                call,
-            )
-        })
+        let _permit = self
+            .uds_per_sandbox_limiter
+            .acquire_in(budget, method, &sandbox_id)
+            .await?;
+        crate::restart_handoff::call_with_restart_handoff(
+            method,
+            RpcReplaySafety::RequiresProof,
+            request,
+            self.clients.sbx(),
+            call,
+        )
         .await
     }
 
@@ -394,7 +396,6 @@ macro_rules! sandbox_scoped_requests {
 
 sandbox_scoped_requests!(
     pplx_space_sbx_mgr_client::proto::StartRequest,
-    pplx_space_sbx_mgr_client::proto::KillRequest,
     pplx_space_sbx_mgr_client::proto::PauseRequest,
     pplx_space_sbx_mgr_client::proto::ResumeRequest,
     pplx_space_sbx_mgr_client::proto::WakeRequest,
@@ -452,16 +453,36 @@ macro_rules! fwd {
 macro_rules! fwd_sbx {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
-            .limited_sbx_unary($method, $req, |mut client, request| async move {
-                client.$rpc(request).await
-            })
+            .limited_sbx_unary(
+                SandboxBudget::Shared,
+                $method,
+                $req,
+                |mut client, request| async move { client.$rpc(request).await },
+            )
             .await
     };
 }
 
-// For state-writing RPCs that deliberately skip the per-sandbox limiter
-// (bulk or non-sandbox-scoped operations). They still receive the
-// restart-drain marker, so they must still replay across a handoff.
+// Only for SpacedKillProcess, SpacedSendSignal and SpacedListProcesses (which
+// also backs single-process reads): they stop or inspect a sandbox's processes,
+// so they take reserved permits that streams and other calls cannot use up.
+macro_rules! fwd_sbx_reserved {
+    ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
+        $service
+            .limited_sbx_unary(
+                SandboxBudget::Reserved,
+                $method,
+                $req,
+                |mut client, request| async move { client.$rpc(request).await },
+            )
+            .await
+    };
+}
+
+// For state-writing RPCs that deliberately skip the per-sandbox limiter: bulk
+// or non-sandbox-scoped operations, and sandbox stop, kill and delete, which
+// must stay available while a sandbox's calls hold its permits. They still
+// receive the restart-drain marker, so they must still replay across a handoff.
 macro_rules! fwd_sbx_handoff {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
@@ -635,7 +656,7 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::KillRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::KillResponse>, Status> {
         record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
-        fwd_sbx!(self, "KillSandbox", kill, r)
+        fwd_sbx_handoff!(self, "KillSandbox", kill, r)
     }
 
     async fn delete_sandbox(
@@ -1019,14 +1040,14 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedListProcessesRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedListProcessesResponse>, Status>
     {
-        fwd_sbx!(self, "SpacedListProcesses", spaced_list_processes, r)
+        fwd_sbx_reserved!(self, "SpacedListProcesses", spaced_list_processes, r)
     }
 
     async fn spaced_send_signal(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedSendSignalRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedSendSignalResponse>, Status> {
-        fwd_sbx!(self, "SpacedSendSignal", spaced_send_signal, r)
+        fwd_sbx_reserved!(self, "SpacedSendSignal", spaced_send_signal, r)
     }
 
     async fn spaced_send_input(
@@ -1054,7 +1075,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedKillProcessRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedKillProcessResponse>, Status> {
-        fwd_sbx!(self, "SpacedKillProcess", spaced_kill_process, r)
+        fwd_sbx_reserved!(self, "SpacedKillProcess", spaced_kill_process, r)
     }
 
     async fn spaced_open_loopback_bridge(

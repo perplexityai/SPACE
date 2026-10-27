@@ -453,6 +453,8 @@ fn process_info_to_e2b_splits_command_and_preserves_config() {
         user: Some("user".to_string()),
         tag: Some("server".to_string()),
         pty: None,
+        exit: None,
+        ended_at: None,
     };
 
     let response = process_info_to_e2b(info);
@@ -479,6 +481,8 @@ fn process_stdout_stream_uses_pty_metadata_when_present() {
         user: None,
         tag: None,
         pty: None,
+        exit: None,
+        ended_at: None,
     };
 
     assert_eq!(

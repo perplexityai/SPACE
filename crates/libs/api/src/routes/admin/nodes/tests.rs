@@ -1066,9 +1066,9 @@ fn terminate_is_blocked_by_either_half_of_occupancy() {
 
     for (active, local_snapshots, blocked, why) in cases {
         assert_eq!(
-            terminate_blocked_by_occupancy(&SandboxOccupancy {
+            terminate_blocked_by_occupancy(&node_store::TerminateOccupancy {
                 active,
-                local_snapshots,
+                drain_blockers: local_snapshots,
             }),
             blocked,
             "active={active} local_snapshots={local_snapshots}: {why}"
@@ -2279,4 +2279,36 @@ async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() 
         tx.rollback().await?;
     }
     Ok(())
+}
+/// The refused-`:terminate` body keeps the key `space-rollout-mng.py` reads.
+///
+/// `sandboxes_local_snapshots` is an alias for `sandboxes_drain_blockers`,
+/// held for a reader this repository's types cannot see: a copy of the rollout
+/// tool from before it read `sandboxes_drain_blockers` pulls only the alias
+/// off this JSON when it reports a refusal. Nothing else would catch its
+/// removal — the classification keys on `sandboxes_active`, so dropping the
+/// alias nulls an operator's count silently rather than failing anything.
+#[test]
+fn the_terminate_conflict_body_keeps_the_key_the_rollout_tool_reads() {
+    let body = terminate_conflict_body(&node_store::TerminateOccupancy {
+        active: 0,
+        drain_blockers: 3,
+    });
+
+    assert_eq!(
+        body["sandboxes_drain_blockers"], 3,
+        "the count's real name must carry it"
+    );
+    assert_eq!(
+        body["sandboxes_local_snapshots"], 3,
+        "and so must the alias — a copy of `scripts/space-rollout-mng.py` from \
+         before the real name reads only this key off this body; a null here is \
+         a blank count in the event an operator reads to diagnose a stalled \
+         rollout wave"
+    );
+    assert_eq!(
+        body["sandboxes_active"], 0,
+        "the classification key the tool branches on stays put; this is why \
+         dropping the alias would be silent rather than loud"
+    );
 }

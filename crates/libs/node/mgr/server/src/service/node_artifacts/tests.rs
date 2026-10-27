@@ -1,5 +1,6 @@
 use super::*;
 use crate::proto::{ComponentArtifact, RuntimeReleaseArtifact};
+use pplx_space_common_core::types::RuntimeKind;
 
 fn release(runtime_kind: i32, version: &str) -> NodeArtifact {
     NodeArtifact {
@@ -120,20 +121,28 @@ fn execution_roots_must_not_alias_the_managed_store() {
         assets: dir.path().join("execution/assets"),
         kernels: dir.path().join("execution/kernels"),
         store: crate::config::ArtifactStorePaths {
-            releases: dir.path().join("managed/releases"),
+            releases: [(
+                RuntimeKind::Firecracker,
+                dir.path().join("managed/releases"),
+            )]
+            .into(),
             kernels: dir.path().join("managed/kernels"),
             staging: dir.path().join("staging"),
             catalog: dir.path().join("catalog"),
         },
     };
-    std::fs::create_dir_all(&paths.store.releases).unwrap();
+    std::fs::create_dir_all(&paths.store.releases[&RuntimeKind::Firecracker]).unwrap();
     std::fs::create_dir_all(paths.vendor.parent().unwrap()).unwrap();
-    separate_store(&paths).unwrap();
-    std::os::unix::fs::symlink(&paths.store.releases, &paths.vendor).unwrap();
-    assert!(separate_store(&paths).is_err());
+    separate_store(&paths, &paths.store.releases[&RuntimeKind::Firecracker]).unwrap();
+    std::os::unix::fs::symlink(
+        &paths.store.releases[&RuntimeKind::Firecracker],
+        &paths.vendor,
+    )
+    .unwrap();
+    assert!(separate_store(&paths, &paths.store.releases[&RuntimeKind::Firecracker]).is_err());
     std::fs::remove_file(&paths.vendor).unwrap();
     paths.kernels = paths.store.kernels.clone();
-    assert!(separate_store(&paths).is_err());
+    assert!(separate_store(&paths, &paths.store.releases[&RuntimeKind::Firecracker]).is_err());
 }
 
 #[tokio::test]
@@ -192,8 +201,11 @@ fn prototype_overlap_keeps_external_execution_but_refuses_mutations() {
     use crate::service::tests::service_tests::installed_runtime;
     use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
     let (_fixture, mut paths) = installed_runtime();
-    paths.store.releases = paths.vendor.clone();
-    assert!(separate_store(&paths).is_err());
+    paths
+        .store
+        .releases
+        .insert(RuntimeKind::Firecracker, paths.vendor.clone());
+    assert!(separate_store(&paths, &paths.store.releases[&RuntimeKind::Firecracker]).is_err());
     let inventory = execution_inventory(&paths, &initial_policy()).unwrap();
     let selected = inventory
         .resolve(
@@ -232,12 +244,14 @@ async fn publication_preserves_available_inventory_until_replacement_is_ready() 
         let (_fixture, paths) = installed_runtime();
         let mut service = service_for_unit_tests().await;
         service.runtime_paths = paths;
-        service.execution_policy = pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
-            Some(allowed),
-            None,
-            &catalog,
-        )
-        .unwrap();
+        service.set_startup_execution_policy_for_test(
+            pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+                Some(allowed),
+                None,
+                &catalog,
+            )
+            .unwrap(),
+        );
         let inventory = Arc::new(
             RuntimeInventory::discover(
                 [RuntimeInstallationRoot::new(
@@ -290,24 +304,34 @@ async fn publication_preserves_available_inventory_until_replacement_is_ready() 
 }
 
 #[tokio::test]
-async fn environment_resolution_requires_authorization_and_verified_inventory() {
+async fn environment_resolution_requires_authorization_schema_and_verified_inventory() {
     use crate::service::tests::service_tests::{root_request, service_for_unit_tests};
     let service = service_for_unit_tests().await;
-    let request = || crate::proto::ResolveExecutionEnvironmentRequest {
-        reference: None,
-        compatible: None,
-    };
-    let error = service
-        .resolve_execution_environment(Request::new(request()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::Unauthenticated);
-    // No installed E0 is never reported as a usable binding, even for root.
-    let error = service
-        .resolve_execution_environment(root_request(request()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    for definition_schema_version in [0, 1, 2] {
+        let request = || crate::proto::ResolveExecutionEnvironmentRequest {
+            definition_schema_version,
+            reference: None,
+            compatible: None,
+        };
+        let error = service
+            .resolve_execution_environment(Request::new(request()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let error = service
+            .resolve_execution_environment(root_request(request()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let schema_refusal = "generic environment schema 2 is required";
+        if definition_schema_version < 2 {
+            assert_eq!(error.message(), schema_refusal);
+        } else {
+            // Schema 2 reaches host/inventory validation; missing E0 still
+            // cannot produce a usable binding, even for root.
+            assert_ne!(error.message(), schema_refusal);
+        }
+    }
 }
 
 fn initial_policy() -> pplx_space_node_runtime_core::selection::ExecutionPolicy {
@@ -369,7 +393,7 @@ async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
     for managed in [true, false] {
         let (_fixture, paths) = installed_runtime();
         let runtime_root = if managed {
-            &paths.store.releases
+            &paths.store.releases[&RuntimeKind::Firecracker]
         } else {
             &paths.vendor
         };
@@ -379,7 +403,10 @@ async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
         symlink("v1.15.1", runtime_root.join("default")).unwrap();
         // Inject a discovered snapshot to isolate service admission. Core
         // store tests cover byte verification.
-        for (root, version) in [(&paths.vendor, "1.16.0"), (&paths.store.releases, "1.17.0")] {
+        for (root, version) in [
+            (&paths.vendor, "1.16.0"),
+            (&paths.store.releases[&RuntimeKind::Firecracker], "1.17.0"),
+        ] {
             let bin = root.join(format!("v{version}/bin"));
             std::fs::create_dir_all(&bin).unwrap();
             for name in ["firecracker", "jailer"] {
@@ -390,7 +417,10 @@ async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
             RuntimeInventory::discover(
                 [
                     RuntimeInstallationRoot::new(RuntimeKind::Firecracker, &paths.vendor),
-                    RuntimeInstallationRoot::new(RuntimeKind::Firecracker, &paths.store.releases),
+                    RuntimeInstallationRoot::new(
+                        RuntimeKind::Firecracker,
+                        &paths.store.releases[&RuntimeKind::Firecracker],
+                    ),
                 ],
                 &paths.assets,
                 &paths.kernels,
@@ -489,15 +519,17 @@ async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
                 }
             }
         }
-        service.execution_policy = pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
-            Some("e0"),
-            None,
-            &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                pplx_space_common_core::types::Arch::X86_64,
+        service.set_startup_execution_policy_for_test(
+            pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+                Some("e0"),
+                None,
+                &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                    pplx_space_common_core::types::Arch::X86_64,
+                )
+                .unwrap(),
             )
             .unwrap(),
-        )
-        .unwrap();
+        );
         for mode in [
             ExecutionSelectionMode::NewColdBoot,
             ExecutionSelectionMode::ExistingColdBoot,
@@ -540,13 +572,17 @@ async fn legacy_runtime_placement_is_not_hidden_by_a_compiled_environment() {
     )
     .unwrap();
     let mut service = service_for_unit_tests().await;
-    service.execution_policy = pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
-        Some("e0,fc-1.17.0-linux-6.1.155"),
-        None,
-        &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+    service.set_startup_execution_policy_for_test(
+        pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+            Some("e0,fc-1.17.0-linux-6.1.155"),
+            None,
+            &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                Arch::X86_64,
+            )
             .unwrap(),
-    )
-    .unwrap();
+        )
+        .unwrap(),
+    );
     service.runtime_paths = paths;
     service.runtime_inventory.store(Some(Arc::new(inventory)));
     let report = service
@@ -589,4 +625,32 @@ fn artifact_rpc_status_preserves_missing_paths_and_transient_io() {
             code
         );
     }
+}
+
+#[test]
+fn managed_release_routing_is_exact_and_an_unrelated_overlap_does_not_block_it() {
+    use crate::service::tests::service_tests::installed_runtime;
+    let (fixture, mut paths) = installed_runtime();
+    let ch_root = fixture.path().join("store/cloud-hypervisor");
+    paths
+        .store
+        .releases
+        .insert(RuntimeKind::CloudHypervisor, ch_root.clone());
+    let fc = artifact_store(&paths.store, RuntimeKind::Firecracker).unwrap();
+    let ch = artifact_store(&paths.store, RuntimeKind::CloudHypervisor).unwrap();
+    assert_ne!(fc.releases_root(), ch.releases_root());
+    assert_eq!(ch.releases_root(), ch_root);
+    assert_eq!(
+        artifact_store(&paths.store, RuntimeKind::Gvisor)
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition,
+    );
+    paths
+        .store
+        .releases
+        .insert(RuntimeKind::CloudHypervisor, paths.vendor.clone());
+    let ch = artifact_store(&paths.store, RuntimeKind::CloudHypervisor).unwrap();
+    assert!(separate_store(&paths, ch.releases_root()).is_err());
+    separate_store(&paths, fc.releases_root()).unwrap();
 }

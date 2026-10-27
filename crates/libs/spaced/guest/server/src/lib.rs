@@ -371,6 +371,7 @@ impl SpacedGuestService {
                 guest_memory_bytes: meta::guest_mem_total_bytes(),
                 worker_executable,
                 identity_policy: pplx_space_spaced_guest_execution::IdentityPolicy::Guest,
+                ..Default::default()
             },
             guest_cgroups.map(|cgroups| Arc::clone(&cgroups.placement)),
         )?;
@@ -517,7 +518,11 @@ impl SpacedGuestService {
         let mut bridge_error = None;
         let drain = async {
             tokio::join!(
-                self.inner.execution.drain(),
+                async {
+                    if let Err(error) = self.inner.execution.drain().await {
+                        tracing::warn!(%error, "guest execution cleanup remains pending");
+                    }
+                },
                 self.inner.loopback_bridge.shutdown(),
                 async {
                     if !local_done {

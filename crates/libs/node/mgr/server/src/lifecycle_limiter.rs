@@ -3,7 +3,7 @@
 //! Background: the on-node edge rate limiter caps total in-flight
 //! requests at 512 global / 128 per peer with no awareness of which method is
 //! being served. Lifecycle RPCs (Allocate, PrepareSandbox, Launch,
-//! LaunchSandbox, LoadSnapshot, CleanupSandbox, Release) do far more host work
+//! LaunchSandbox, RestoreVmState, CleanupSandbox, Release) do far more host work
 //! per call (btrfs subvolumes, recursive chown, mount/umount, jailer launch)
 //! than the light read-only RPCs they share quota with. Without explicit per-method
 //! caps, a flood of expensive lifecycle calls can monopolize the runtime and
@@ -32,15 +32,15 @@ use std::time::Instant;
 
 use tonic::Status;
 
-/// Lifecycle method identifier. Kept as a small enum so that metric tag values
-/// and env-var names cannot drift from the limiter's internal table.
+/// Lifecycle method identifier with explicit metric and configuration mappings.
+/// Configuration suffixes remain stable when RPC names change.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LifecycleMethod {
     Allocate,
     PrepareSandbox,
     Launch,
     LaunchSandbox,
-    LoadSnapshot,
+    RestoreVmState,
     CleanupSandbox,
     Release,
     Filesystem,
@@ -52,7 +52,7 @@ impl LifecycleMethod {
         LifecycleMethod::PrepareSandbox,
         LifecycleMethod::Launch,
         LifecycleMethod::LaunchSandbox,
-        LifecycleMethod::LoadSnapshot,
+        LifecycleMethod::RestoreVmState,
         LifecycleMethod::CleanupSandbox,
         LifecycleMethod::Release,
         LifecycleMethod::Filesystem,
@@ -64,7 +64,7 @@ impl LifecycleMethod {
             LifecycleMethod::PrepareSandbox => "PrepareSandbox",
             LifecycleMethod::Launch => "Launch",
             LifecycleMethod::LaunchSandbox => "LaunchSandbox",
-            LifecycleMethod::LoadSnapshot => "LoadSnapshot",
+            LifecycleMethod::RestoreVmState => "RestoreVmState",
             LifecycleMethod::CleanupSandbox => "CleanupSandbox",
             LifecycleMethod::Release => "Release",
             LifecycleMethod::Filesystem => "Filesystem",
@@ -77,7 +77,8 @@ impl LifecycleMethod {
             LifecycleMethod::PrepareSandbox => "PREPARE_SANDBOX",
             LifecycleMethod::Launch => "LAUNCH",
             LifecycleMethod::LaunchSandbox => "LAUNCH_SANDBOX",
-            LifecycleMethod::LoadSnapshot => "LOAD_SNAPSHOT",
+            // Retain deployed restore limits across the RPC rename.
+            LifecycleMethod::RestoreVmState => "LOAD_SNAPSHOT",
             LifecycleMethod::CleanupSandbox => "CLEANUP_SANDBOX",
             LifecycleMethod::Release => "RELEASE",
             LifecycleMethod::Filesystem => "FILESYSTEM",
@@ -96,7 +97,7 @@ impl LifecycleMethod {
             // Snapshot loading is resource-intensive during restored-VM
             // bring-up; cap active work while allowing larger restore bursts
             // to wait rather than failing admission.
-            LifecycleMethod::LoadSnapshot => (8, 56),
+            LifecycleMethod::RestoreVmState => (8, 56),
             LifecycleMethod::CleanupSandbox => (8, 24),
             LifecycleMethod::Release => (32, 96),
             LifecycleMethod::Filesystem => (4, 16),

@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{OrgId, SnapshotId};
 
 use std::{
     future::Future,
+    ops::ControlFlow,
     time::{Duration, Instant},
 };
 
@@ -33,9 +34,9 @@ use crate::fork_operation_store::{
     CaptureLeaderObservation, ForkOperationStore, PrepareCopiedArtifact,
 };
 use crate::fork_operations::{
-    ForkCaptureProgress, ForkSandboxLifetimeSeconds, ForkSandboxPayloadV1, ForkSourceLifecycle,
-    ForkSourceLifecycleParseError, ForkTargetConfig, ForkTargetOutcome, ForkWorkflowPhase,
-    decode_fork_payload, fork_restore_activation_lease_seconds,
+    ForkCaptureProgress, ForkSandboxLifetimeSeconds, ForkSandboxPayload, ForkSandboxPayloadV1,
+    ForkSourceLifecycle, ForkSourceLifecycleParseError, ForkTargetConfig, ForkTargetOutcome,
+    ForkWorkflowPhase, decode_fork_payload, fork_restore_activation_lease_seconds,
 };
 use crate::models::CreateSandboxRequest;
 use crate::public_operations::{ClaimedPublicOperation, PublicOperationRequeueReason};
@@ -198,31 +199,48 @@ impl ForkSandboxOperationExecutor {
         claim_token: &str,
         operation: &ClaimedPublicOperation,
     ) -> PublicOperationExecutionResult {
-        let started_at = Instant::now();
-        let (phase, source_lifecycle) = fork_metric_dimensions(&operation.payload);
-        let result = self.execute_result(claim_token, operation).await;
-        let (outcome, retry_kind) = classify_fork_attempt(&result);
-        if let Some(retry_kind) = retry_kind {
-            pplx_space_metrics::sandbox_fork::retry(phase, source_lifecycle, retry_kind);
+        let mut operation = operation.clone();
+        // Only completed, durably persisted phases continue under this claim.
+        // Pending work still releases it with the normal retry/backpressure policy.
+        loop {
+            let started_at = Instant::now();
+            let (phase, source_lifecycle) = fork_metric_dimensions(&operation.payload);
+            let step = self.execute_step(claim_token, &operation).await;
+            let (outcome, retry_kind) = match &step {
+                ControlFlow::Continue(_) => (
+                    pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::Succeeded,
+                    None,
+                ),
+                ControlFlow::Break(result) => classify_fork_attempt(result),
+            };
+            if let Some(retry_kind) = retry_kind {
+                pplx_space_metrics::sandbox_fork::retry(phase, source_lifecycle, retry_kind);
+            }
+            pplx_space_metrics::sandbox_fork::phase_attempt(
+                phase,
+                source_lifecycle,
+                outcome,
+                started_at,
+            );
+            match step {
+                ControlFlow::Continue(payload) => operation.payload = payload,
+                ControlFlow::Break(result) => return result,
+            }
         }
-        pplx_space_metrics::sandbox_fork::phase_attempt(
-            phase,
-            source_lifecycle,
-            outcome,
-            started_at,
-        );
-        result
     }
 
-    async fn execute_result(
+    async fn execute_step(
         &self,
         claim_token: &str,
         operation: &ClaimedPublicOperation,
-    ) -> PublicOperationExecutionResult {
-        match self.execute_inner(claim_token, operation).await {
-            Ok(result) => result,
-            Err(error @ ForkExecutionError::Terminal { .. })
-            | Err(error @ ForkExecutionError::DeadlineExceeded { .. }) => {
+    ) -> ControlFlow<PublicOperationExecutionResult, serde_json::Value> {
+        let error = match self.execute_phase(claim_token, operation).await {
+            Ok(step) => return step,
+            Err(error) => error,
+        };
+        ControlFlow::Break(match error {
+            error @ ForkExecutionError::Terminal { .. }
+            | error @ ForkExecutionError::DeadlineExceeded { .. } => {
                 let (code, message, outcome) = match error {
                     ForkExecutionError::Terminal { code, message } => (
                         code,
@@ -242,7 +260,7 @@ impl ForkSandboxOperationExecutor {
                         error = ?error,
                         "terminal fork target cleanup will be retried"
                     );
-                    return retry("terminal fork target cleanup is pending");
+                    return ControlFlow::Break(retry("terminal fork target cleanup is pending"));
                 }
                 match self
                     .store
@@ -251,10 +269,10 @@ impl ForkSandboxOperationExecutor {
                 {
                     Ok(true) => {}
                     Ok(false) => {
-                        return retry(
+                        return ControlFlow::Break(retry(
                             "failed to scrub terminal fork credentials: claim superseded"
                                 .to_string(),
-                        );
+                        ));
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -262,7 +280,9 @@ impl ForkSandboxOperationExecutor {
                             %error,
                             "terminal fork credential scrub will be retried"
                         );
-                        return retry("terminal fork credential scrub is pending");
+                        return ControlFlow::Break(retry(
+                            "terminal fork credential scrub is pending",
+                        ));
                     }
                 }
                 let (snapshot_id, storage_location_id) = terminal_copied_artifact_ids(operation.id);
@@ -271,7 +291,9 @@ impl ForkSandboxOperationExecutor {
                     .retire_copied_artifact(snapshot_id, storage_location_id)
                     .await
                 {
-                    return retry(format!("failed to retire terminal fork artifact: {error}"));
+                    return ControlFlow::Break(retry(format!(
+                        "failed to retire terminal fork artifact: {error}"
+                    )));
                 }
                 pplx_space_metrics::sandbox_fork::completed(outcome);
                 if let Some(source_id) = operation.target_id.as_deref() {
@@ -286,9 +308,9 @@ impl ForkSandboxOperationExecutor {
                 }
                 failed(code, message)
             }
-            Err(ForkExecutionError::Retry(message)) => retry(message),
-            Err(ForkExecutionError::Wait(message)) => wait(message),
-        }
+            ForkExecutionError::Retry(message) => retry(message),
+            ForkExecutionError::Wait(message) => wait(message),
+        })
     }
 
     async fn cleanup_terminal_targets(
@@ -363,17 +385,19 @@ impl ForkSandboxOperationExecutor {
         }
     }
 
-    async fn execute_inner(
+    async fn execute_phase(
         &self,
         claim_token: &str,
         operation: &ClaimedPublicOperation,
-    ) -> Result<PublicOperationExecutionResult, ForkExecutionError> {
+    ) -> Result<ControlFlow<PublicOperationExecutionResult, serde_json::Value>, ForkExecutionError>
+    {
         let mut payload = decode_fork_payload(operation.payload.clone()).map_err(|error| {
             ForkExecutionError::terminal(format!("invalid fork payload: {error}"))
         })?;
         // The deadline belongs to the admitted operation, not to the current
         // availability gate. A rollout may disable new admissions while
         // previously admitted work still needs to terminalize.
+        // Same-claim continuations re-read this budget before each phase.
         let remaining = self
             .remaining_deadline(operation, payload.hard_deadline())
             .await?;
@@ -386,26 +410,33 @@ impl ForkSandboxOperationExecutor {
                 .await?;
             return self
                 .deadline_result(claim_token, operation, &mut payload)
-                .await;
+                .await
+                .map(ControlFlow::Break);
         }
         if payload.target_config().is_none() {
             self.freeze_source(claim_token, operation, &mut payload)
                 .await?;
-            return Err(ForkExecutionError::Wait(
-                "fork source and target configuration frozen".to_string(),
-            ));
+            return serde_json::to_value(ForkSandboxPayload::v1(payload))
+                .map(ControlFlow::Continue)
+                .map_err(ForkExecutionError::retry_error);
         }
 
         if payload.fork_snapshot_id().is_none() {
             self.materialize_artifact(claim_token, operation, &mut payload, remaining)
                 .await?;
-            return Err(ForkExecutionError::Wait(
-                "fork artifact materialization is in progress".to_string(),
-            ));
+            if payload.fork_snapshot_id().is_none() {
+                return Err(ForkExecutionError::Wait(
+                    "fork artifact materialization is in progress".to_string(),
+                ));
+            }
+            return serde_json::to_value(ForkSandboxPayload::v1(payload))
+                .map(ControlFlow::Continue)
+                .map_err(ForkExecutionError::retry_error);
         }
 
         self.restore_targets(claim_token, operation, &mut payload, remaining)
             .await
+            .map(ControlFlow::Break)
     }
 
     async fn freeze_source(

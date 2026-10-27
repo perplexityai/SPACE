@@ -45,6 +45,11 @@ impl OpenRouteActivationClaim {
         })
     }
 
+    /// The execution the claimed activation runs.
+    pub fn execution_generation(&self) -> ExecutionGeneration {
+        self.execution_generation
+    }
+
     pub fn requested_generation(&self) -> u64 {
         // ExecutionGeneration admits only positive i64 values.
         self.route_generation

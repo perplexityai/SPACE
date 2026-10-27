@@ -157,7 +157,6 @@ const SUPPORTED_TEMPLATE_RUNTIMES: &[RuntimeKind] = &[RuntimeKind::Firecracker];
 const NODE_RECONCILE_CLAIM_DEFAULT_LIMIT: i64 = 256;
 const NODE_RECONCILE_MAX_ATTEMPTS: i32 = 16;
 const NODE_RECONCILE_MAX_RETRY_DELAY_SECS: i64 = 300;
-const NODE_STATUS_STALE_AFTER_SECS: i64 = 30;
 
 fn db_guest_port_to_proto(value: i32) -> u32 {
     u16::try_from(value).map(u32::from).unwrap_or(0)
@@ -964,6 +963,7 @@ impl ClusterApiService {
         // node, so a stale runtime on a node the sandbox has since moved off
         // still learns so and releases itself instead of retrying a
         // permission refusal.
+        let mut generation_fence_admitted = false;
         if outcome == snapshot_store::InsertOutcome::Created
             && let Some(execution_generation) = execution_generation
             && !snapshot_store::artifact_registered_by_another_attempt(
@@ -981,6 +981,7 @@ impl ClusterApiService {
                 execution_generation,
             )
             .await?;
+            generation_fence_admitted = true;
         }
         // Authorize on the persisted row: a replay stays bound to the node
         // that registered the attempt even after retirement or relocation,
@@ -1009,6 +1010,7 @@ impl ClusterApiService {
             local_artifact_id: local_artifact_id.to_string(),
             backup_attempt_id: backup_attempt_id.to_string(),
             fence_verdict_only: req.fence_verdict_only,
+            generation_fence_admitted,
         }))
     }
 
@@ -1566,6 +1568,7 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 mod adapter;
 mod auto_lifecycle_delete_completions;
 mod backup_generation_fence;
+mod execution_currency;
 mod execution_observation;
 mod metadata;
 mod node_local_backup_pending;

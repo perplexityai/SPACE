@@ -571,6 +571,7 @@ pub async fn create_command(
         public_id,
         request,
         idempotency_key,
+        || Ok(()),
     )
     .await?;
 

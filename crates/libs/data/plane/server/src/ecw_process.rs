@@ -1004,7 +1004,11 @@ async fn list_processes(
 ) -> Result<Vec<spaced_ops::ProcessInfo>, EcwProxyError> {
     let message = SpacedListProcessesRequest {
         sandbox_id: route.sandbox_id.to_string(),
-        operation: Some(spaced_ops::ListProcessesRequest {}),
+        // E2B lists and selects running processes only.
+        operation: Some(spaced_ops::ListProcessesRequest {
+            include_exited: false,
+            process_id: None,
+        }),
     };
     let (response, _route) = retryable_bounded_node_api_unary(
         state,

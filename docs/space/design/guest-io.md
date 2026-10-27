@@ -79,7 +79,7 @@ whether or not a ceiling is set. The unset case preserves the original bytes.
 Snapshot loads clamp the saved assignment before applying it, then verify the
 loaded drive before adoption or resume. Reusing an existing cold-boot VM also
 verifies the ceiling before returning its launch response. An idle restore
-launch skips that check until `LoadSnapshot` installs the drives. The sweep
+launch skips that check until `RestoreVmState` installs the drives. The sweep
 keeps a VM with no drives pending, without a failure or a verified-cache entry.
 A background sweep also lowers running VMs, starting immediately and
 repeating every ten seconds, with at most four targets in flight and a

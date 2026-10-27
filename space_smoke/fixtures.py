@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     ConcurrentRestoreControl,
+    DrainGateControl,
     NodeDrainControl,
     NodeGroupControl,
     NodeFenceControl,
@@ -104,6 +105,7 @@ from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
+from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.storage_exchange import StorageExchangeScopingAssertions
@@ -1296,6 +1298,12 @@ class CommandSandboxFixture:
     def kill_process(self, process_id: str) -> bool:
         return self._process_sandbox().kill_process(process_id)
 
+    @property
+    def reports_exited_processes(self) -> bool:
+        """Whether the smoke requires `get_process` to report a recently exited process."""
+
+        return self._process_sandbox().reports_exited_processes
+
     def wait_until_process_stopped(
         self, process_id: str
     ) -> tuple[tuple[ProcessInfo, ...], ProcessInfo | None]:
@@ -1303,9 +1311,8 @@ class CommandSandboxFixture:
         while True:
             processes = self.list_processes()
             process = self.get_process(process_id)
-            if (
-                not any(item.process_id == process_id for item in processes)
-                and process is None
+            if not any(item.process_id == process_id for item in processes) and (
+                process is None or process.state == "exited"
             ):
                 return processes, process
             remaining = deadline - time.monotonic()
@@ -3017,6 +3024,23 @@ class KindEcw(Ecw):
                 self, self._leader_election_control, self._context.scope
             )
         return self._leader_election_assertions
+
+    _drain_gate_control: DrainGateControl | None = None
+    _drain_gate_assertions: DrainGateAssertions | None = None
+
+    @property
+    def drain_gate(self) -> DrainGateAssertions:
+        """Privileged assertions for the admin `:terminate` occupancy guard."""
+
+        if self._drain_gate_control is None:
+            raise SmokeConfigurationError(
+                "drain gate control is only available on the kind backend"
+            )
+        if self._drain_gate_assertions is None:
+            self._drain_gate_assertions = DrainGateAssertions(
+                self, self._drain_gate_control, self._context.scope
+            )
+        return self._drain_gate_assertions
 
     _startup_recovery_control: StartupRecoveryControl | None = None
     _startup_recovery_assertions: StartupRecoveryAssertions | None = None

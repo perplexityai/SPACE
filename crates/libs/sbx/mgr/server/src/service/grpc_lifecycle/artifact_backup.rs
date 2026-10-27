@@ -653,6 +653,9 @@ impl SandboxManagerService {
             .lock_artifact_for_sandbox(sandbox_id)
             .await
             .map_err(|status| artifact_backup_lookup_error(status, full_current_instance))?;
+        // A runtime upgrade's failed boot leaves its disk in the instance until
+        // the rollback restores the preserved copy; it must not be captured.
+        self.refuse_runtime_upgrade_fence(&sandbox.id)?;
         if full_current_instance {
             self.ensure_snapshot_restore_supported("enqueue_artifact_backup")?;
         }
@@ -678,6 +681,13 @@ impl SandboxManagerService {
                     pplx_space_common_core::types::SnapshotName::parse(value).map_err(|err| {
                         Status::invalid_argument(format!("invalid snapshot_name: {err}"))
                     })?;
+                if crate::service::grpc_spaced_process_snapshots::is_internal_snapshot_name(
+                    name.as_str(),
+                ) {
+                    return Err(Status::failed_precondition(format!(
+                        "snapshot {name} is an internal snapshot artifact"
+                    )));
+                }
                 let existing = self
                     .local_artifacts
                     .get_named(&sandbox.id, &name)

@@ -5,28 +5,7 @@ use pplx_space_common_core::types::{EnvironmentReference, SandboxArtifactMetadat
 use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
 use std::io::Read;
 
-pub(super) fn normalize(
-    request: &mut crate::proto::CreateSnapshotRequest,
-) -> Result<Option<EnvironmentReference>, Status> {
-    let Some(input) = request.environment.as_ref() else {
-        return Ok(None);
-    };
-    if !request.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument(
-            "snapshot identities are mutually exclusive",
-        ));
-    }
-    let sandbox_id = input
-        .sandbox_id
-        .parse::<SandboxId>()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let reference = input
-        .reference
-        .parse::<EnvironmentReference>()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    request.sandbox_id = sandbox_id.to_string();
-    Ok(Some(reference))
-}
+use super::super::node_artifacts::PolicyScope;
 
 fn validate_binding(
     requested: Option<EnvironmentReference>,
@@ -50,8 +29,12 @@ impl NodeManagerService {
         sandbox_id: String,
         reference: Option<EnvironmentReference>,
     ) -> Result<(), Status> {
+        // A capture executes nothing, and restore admission is narrowed, so
+        // captures obey the startup settings, not the cluster policy: a blocked
+        // environment's VMs can still be suspended and resumed elsewhere.
         if let Some(reference) = reference {
-            self.allowed_definition(
+            self.allowed_definition_in(
+                PolicyScope::Startup,
                 Some(reference),
                 ExecutionSelectionMode::PersistedStateRestore,
             )?;
@@ -116,7 +99,8 @@ impl NodeManagerService {
                 Ok(())
             };
         }
-        self.resolve_bound_execution(
+        self.resolve_bound_execution_in(
+            PolicyScope::Startup,
             Some(&execution),
             execution.runtime().kind,
             ExecutionSelectionMode::PersistedStateRestore,

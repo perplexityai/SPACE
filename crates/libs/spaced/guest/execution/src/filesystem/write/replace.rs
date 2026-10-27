@@ -42,6 +42,8 @@ pub(super) struct Replacement {
     upload: std::fs::File,
     /// Committed or discarded, so there is nothing left to remove.
     settled: bool,
+    tasks: tokio_util::task::TaskTracker,
+    _ownership: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 
 impl Drop for Replacement {
@@ -50,7 +52,9 @@ impl Drop for Replacement {
             return;
         }
         let temporary = std::mem::take(&mut self.temporary);
+        let operation = self.tasks.token();
         let remove = move || {
+            let _operation = operation;
             if let Err(error) = std::fs::remove_file(&temporary) {
                 tracing::debug!(%error, "failed to remove an abandoned write's temporary file");
             }
@@ -163,13 +167,15 @@ pub(super) async fn open_write_target(
     destination: PathBuf,
     append: bool,
     owner_uid: u32,
+    tasks: tokio_util::task::TaskTracker,
 ) -> Result<WriteTarget, Status> {
     if !append {
         let target = destination.clone();
-        let replacement = tokio::task::spawn_blocking(move || open_replacement(target, owner_uid))
-            .await
-            .map_err(|error| Status::internal(format!("file open task failed: {error}")))?
-            .map_err(map_io_error)?;
+        let replacement =
+            tokio::task::spawn_blocking(move || open_replacement(target, owner_uid, tasks))
+                .await
+                .map_err(|error| Status::internal(format!("file open task failed: {error}")))?
+                .map_err(map_io_error)?;
         if let Some((file, replacement)) = replacement {
             return Ok(WriteTarget {
                 file: tokio::fs::File::from_std(file),
@@ -200,6 +206,7 @@ pub(super) async fn open_write_target(
 fn open_replacement(
     destination: PathBuf,
     owner_uid: u32,
+    tasks: tokio_util::task::TaskTracker,
 ) -> io::Result<Option<(std::fs::File, Replacement)>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let metadata = match std::fs::symlink_metadata(&destination) {
@@ -268,6 +275,8 @@ fn open_replacement(
         existing,
         upload: file,
         settled: false,
+        _ownership: tasks.token(),
+        tasks,
     };
     let file = replacement.upload.try_clone()?;
     if let Some(metadata) = metadata {

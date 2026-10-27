@@ -108,6 +108,12 @@ class Event(enum.StrEnum):
     TERMINATE_BLOCKED_PHASE_DRIFT = "terminate_blocked_phase_drift"
     TERMINATE_REFUSED_UNKNOWN = "terminate_refused_unknown"
     TERMINATE_BLOCKED_LOCAL_SNAPSHOTS = "terminate_blocked_local_snapshots"
+    # The `:terminate` guard refused on its drain-gate half: rows the node-drain
+    # reconciler would also hold the node for (`suspending`, non-evacuation
+    # `restoring`, a non-durable `suspended`, an upload in flight from it).
+    # Distinct from the listing's local-snapshot count, which has no
+    # `suspending` or non-evacuation `restoring` arm.
+    TERMINATE_BLOCKED_DRAIN_GATE = "terminate_blocked_drain_gate"
     TERMINATE_BLOCKED_REPLACE_SEMANTICS = "terminate_blocked_replace_semantics"
     NODE_STUCK = "node_stuck"
     DRAINING = "draining"
@@ -477,11 +483,22 @@ def set_mng_scaling(
 
 
 # How often a still-blocked `drained` node is re-reported. The terminate wave
-# re-POSTs it every poll interval, and `detect_stuck` cannot see it (that pass
-# only looks at `DRAINING`), so a one-shot log line means a node wedged early in
-# a multi-hour rollout goes unnoticed for the rest of it. Fifteen minutes is
-# frequent enough to notice and sparse enough not to bury the event stream.
+# asks again every `TERMINATE_BLOCKED_RETRY_SEC`, and `detect_stuck` cannot see it
+# (that pass only looks at `DRAINING`), so a one-shot log line means a node wedged
+# early in a multi-hour rollout goes unnoticed for the rest of it. A report is due
+# once this much has passed since the last one, and lands on the first retry after
+# that, so the gap is at least this and short of it plus one retry gap (longer if
+# ticks are skipped). A refusal that moves to the other half of the guard is reported
+# at once. Frequent enough to notice, sparse enough not to bury the event stream.
 BLOCKED_REPORT_INTERVAL_SEC = 900.0
+
+# How long a node the `:terminate` guard refused waits before it's POSTed again.
+# The refusal is the guard's own answer, so re-asking every poll interval only
+# repeats it; asking again after 15 minutes would hold a wave that long after the
+# blocker clears. The node is asked again on the first poll at least this long after
+# the refusal, which keeps the delay small against a multi-hour rollout while taking
+# the refused node out of every tick's POSTs.
+TERMINATE_BLOCKED_RETRY_SEC = 120.0
 
 
 class AdminApi:
@@ -1196,16 +1213,21 @@ def pick_terminate_candidates(
     left `drained` between this tick's poll and its POST. Sorted by `instance_id`
     for deterministic order across reruns.
 
-    Nodes with `sandboxes_local_snapshots > 0` are excluded: the admin
-    `:terminate` endpoint refuses them with 409 (terminating would strand
-    suspended snapshots pinned to local disk), and the listing's
-    `sandboxes_local_snapshots` agrees with that guard per node. Without this
-    filter the deterministic sort puts the blocked node first every tick and its
-    409 costs a round trip each time.
+    **Neither listing count is filtered on here**; the endpoint decides, and
+    `run_terminate_pass` handles its refusal as a paced skip. The listing's
+    `sandboxes_local_snapshots` disagrees with the guard both ways. It misses
+    a `suspending` or non-evacuation `restoring` row pinned to the node, which
+    the guard refuses on. And its in-flight arm still uses the legacy freshness
+    gate (`legacy_upload` in `admin/node_store/single_node_occupancy.rs`, and
+    the note in `admin/node_store.rs::batched_occupancy_rows`), so it counts a
+    `creating` row naming a non-current artifact, on a source node that isn't
+    the sandbox's target, that the guard doesn't count. Screening on it would
+    hold a node with only that row out of the wave on every tick without ever
+    asking.
 
-    **`sandboxes_active` is deliberately not filtered on here**, even though the
-    endpoint now refuses on it too. The listing's `active` count is intentionally
-    *not* census-aware while the endpoint's is (see
+    The same goes for `sandboxes_active`, which the endpoint also refuses on.
+    The listing's `active` count is intentionally *not* census-aware while the
+    endpoint's is (see
     `admin/node_store.rs::occupancy_for_nodes` for why the multi-node scan can't
     afford the discount). Gating on the listing's number would therefore exclude
     nodes the endpoint would happily terminate — a worker whose own census
@@ -1231,11 +1253,136 @@ def pick_terminate_candidates(
             if n.rollout_phase == DrainPhase.DRAINED
             and n.admin is not None
             and n.admin.id not in already_terminated_ids
-            and n.admin.sandboxes_local_snapshots == 0
             and n.admin.terminate_decrement_capacity
         ),
         key=lambda n: n.instance_id,
     )
+
+
+@dataclasses.dataclass
+class TerminateState:
+    """What the terminate wave remembers between ticks."""
+
+    # Nodes whose `:terminate` POST was accepted; never re-POSTed.
+    issued: set[str] = dataclasses.field(default_factory=set)
+    # Node id -> monotonic time before which a refused node isn't re-POSTed.
+    retry_after: dict[str, float] = dataclasses.field(default_factory=dict)
+    # Node id -> the event its refusal was last reported under, and when.
+    reported: dict[str, tuple[Event, float]] = dataclasses.field(default_factory=dict)
+
+
+def run_terminate_pass(
+    api: Any,
+    candidates: list[NodeStatus],
+    *,
+    cohort: str,
+    state: TerminateState,
+    now: float,
+) -> None:
+    """POST `:terminate` for each candidate, and act on what the guard answers.
+
+    The endpoint is the authoritative occupancy check: it decides on the same
+    drain-gate predicate the node-drain reconciler holds a node on, which the
+    listing's counts don't reproduce. So a refusal is only knowable by asking,
+    and the wave keeps going past a refused node.
+
+    An occupancy refusal is a paced skip. The node isn't POSTed again for
+    `TERMINATE_BLOCKED_RETRY_SEC`, and it's reported under the event that names
+    which half of the guard refused: again once `BLOCKED_REPORT_INTERVAL_SEC`
+    has passed, or at once when the refusal moves to the other half. It isn't
+    added to `issued`, so it's asked again once the retry interval passes, and it
+    self-clears when the blocker does.
+
+    Three different 409s come back from this endpoint, so the refusal is
+    classified on which key is *present* rather than on which is absent:
+
+    * `sandboxes_active` -> the occupancy guard refused;
+    * `current_drain_phase` -> the node left `drained` between this tick's
+      listing poll and this POST (the cluster's own `drained_node_terminator`
+      flips it on a 60s tick, or an operator undrained), and the transition check
+      fires before occupancy is even read;
+    * neither -> `db_error` mapped a Postgres serialization failure or deadlock
+      (40001 / 40P01) to a 409 whose body is just `{"error": ...}`. Transient and
+      retryable, and nothing to do with sandboxes.
+    """
+
+    for ns in candidates:
+        assert ns.admin is not None
+        node_id = ns.admin.id
+        if state.retry_after.get(node_id, float("-inf")) > now:
+            continue
+        refusal = api.terminate(node_id)
+        if refusal is None:
+            state.issued.add(node_id)
+            state.retry_after.pop(node_id, None)
+            emit_event(
+                Event.TERMINATE_STARTED,
+                cohort=cohort,
+                node_id=node_id,
+                k8s_node_name=ns.admin.k8s_node_name,
+                instance_id=ns.instance_id,
+            )
+            continue
+        if "current_drain_phase" in refusal:
+            emit_event(
+                Event.TERMINATE_BLOCKED_PHASE_DRIFT,
+                cohort=cohort,
+                node_id=node_id,
+                k8s_node_name=ns.admin.k8s_node_name,
+                instance_id=ns.instance_id,
+                current_drain_phase=refusal.get("current_drain_phase"),
+            )
+            continue
+        if "sandboxes_active" not in refusal:
+            emit_event(
+                Event.TERMINATE_REFUSED_UNKNOWN,
+                cohort=cohort,
+                node_id=node_id,
+                k8s_node_name=ns.admin.k8s_node_name,
+                instance_id=ns.instance_id,
+                error=refusal.get("error"),
+            )
+            continue
+        state.retry_after[node_id] = now + TERMINATE_BLOCKED_RETRY_SEC
+        # The guard's own count. An endpoint from before the field existed sent
+        # only the alias, counted by its older guard: non-durable `suspended`
+        # rows and uploads in flight from the node, without the `suspending`
+        # and non-evacuation `restoring` arms. It's the closest count that
+        # endpoint has.
+        drain_blockers = refusal.get(
+            "sandboxes_drain_blockers", refusal.get("sandboxes_local_snapshots")
+        )
+        if refusal.get("sandboxes_active"):
+            event = Event.TERMINATE_BLOCKED_ACTIVE_SANDBOXES
+            fields = {
+                "sandboxes_active": refusal.get("sandboxes_active"),
+                "sandboxes_drain_blockers": drain_blockers,
+            }
+        else:
+            event = Event.TERMINATE_BLOCKED_DRAIN_GATE
+            fields = {"sandboxes_drain_blockers": drain_blockers}
+        # Re-reported on a cadence rather than once: `detect_stuck` can't see a
+        # `drained` node (that pass skips anything not in `DRAINING`), so one
+        # line at the start of a multi-hour rollout, then silence, is how a
+        # wedged node goes unnoticed. A refusal that moves to the other half of
+        # the guard is reported at once, so the latest line always names the
+        # half now refusing.
+        last = state.reported.get(node_id)
+        if (
+            last is not None
+            and last[0] == event
+            and now - last[1] < BLOCKED_REPORT_INTERVAL_SEC
+        ):
+            continue
+        state.reported[node_id] = (event, now)
+        emit_event(
+            event,
+            cohort=cohort,
+            node_id=node_id,
+            k8s_node_name=ns.admin.k8s_node_name,
+            instance_id=ns.instance_id,
+            **fields,
+        )
 
 
 def pick_terminate_blocked_by_replace_semantics(
@@ -1248,6 +1395,10 @@ def pick_terminate_blocked_by_replace_semantics(
     would auto-replace, and the rollout's monotonic shrink invariant
     would break. Surface so the operator can re-drain them with
     `replace_after_terminate=false` via the admin CLI (or directly).
+
+    Whatever the listing's local-snapshot count says: these nodes are never
+    POSTed, so no refusal names their blocker, and the listing's count can
+    name one the `:terminate` guard doesn't hold the node for.
     """
 
     return [
@@ -1255,18 +1406,19 @@ def pick_terminate_blocked_by_replace_semantics(
         for n in source
         if n.rollout_phase == DrainPhase.DRAINED
         and n.admin is not None
-        and n.admin.sandboxes_local_snapshots == 0
         and not n.admin.terminate_decrement_capacity
     ]
 
 
 def pick_terminate_blocked_by_snapshots(source: list[NodeStatus]) -> list[NodeStatus]:
-    """Drained source nodes pinned by local-disk snapshots.
+    """Drained source nodes the listing shows holding local-disk snapshots.
 
-    Surfaced separately so the operator can see why the rollout is not
-    progressing. The blocker clears once S3-export suspend reaches every
-    affected sandbox (or the operator moves them); the next tick will then
-    include the node in `pick_terminate_candidates`.
+    A hint naming the likely blocker, so the operator reaches for the
+    local-snapshot remedies. It doesn't hold the node back: the listing's count
+    doesn't affect whether the node is a terminate candidate, and the guard's
+    refusal is what's paced and re-reported (`run_terminate_pass`). A node with
+    replace-after-terminate semantics isn't a candidate either way, and
+    `pick_terminate_blocked_by_replace_semantics` names it for that.
     """
 
     return [
@@ -1276,6 +1428,37 @@ def pick_terminate_blocked_by_snapshots(source: list[NodeStatus]) -> list[NodeSt
         and n.admin is not None
         and n.admin.sandboxes_local_snapshots > 0
     ]
+
+
+def report_local_snapshot_hints(
+    source: list[NodeStatus],
+    *,
+    cohort: str,
+    logged: set[str],
+    terminated: set[str],
+) -> None:
+    """Name local-disk snapshots as the likely blocker, once per node.
+
+    The cadence belongs to the guard's refusal, which `run_terminate_pass`
+    re-reports; this line only points the operator at the local-snapshot
+    remedies (durable S3 suspend or manual cleanup). A node already terminated
+    isn't blocked, so it isn't named, including one the listing still shows in
+    `drained` on the tick its POST was accepted.
+    """
+
+    for ns in pick_terminate_blocked_by_snapshots(source):
+        assert ns.admin is not None
+        if ns.admin.id in logged or ns.admin.id in terminated:
+            continue
+        logged.add(ns.admin.id)
+        emit_event(
+            Event.TERMINATE_BLOCKED_LOCAL_SNAPSHOTS,
+            cohort=cohort,
+            node_id=ns.admin.id,
+            k8s_node_name=ns.admin.k8s_node_name,
+            instance_id=ns.instance_id,
+            sandboxes_local_snapshots=ns.admin.sandboxes_local_snapshots,
+        )
 
 
 def source_remaining_live(source: list[NodeStatus]) -> int:
@@ -1577,8 +1760,7 @@ def run_loop(cfg: Config, aws: AwsClients, api: AdminApi) -> int:
     stuck_logged: set[str] = set()
     drain_issued: set[str] = set()
     untainted_target_nodes: set[str] = set()
-    terminate_issued: set[str] = set()
-    active_blocked_logged: dict[str, float] = {}
+    terminate_state = TerminateState()
     snapshot_blocked_logged: set[str] = set()
     replace_blocked_logged: set[str] = set()
 
@@ -2266,7 +2448,7 @@ def run_loop(cfg: Config, aws: AwsClients, api: AdminApi) -> int:
             # forever.
             if source_mng.status == "UPDATING":
                 pending_terminate = pick_terminate_candidates(
-                    source, already_terminated_ids=frozenset(terminate_issued)
+                    source, already_terminated_ids=frozenset(terminate_state.issued)
                 )
                 if pending_terminate:
                     emit_event(
@@ -2278,126 +2460,22 @@ def run_loop(cfg: Config, aws: AwsClients, api: AdminApi) -> int:
                     )
                 time.sleep(cfg.poll_interval_sec)
                 continue
-            for ns in pick_terminate_candidates(
-                source, already_terminated_ids=frozenset(terminate_issued)
-            ):
-                assert ns.admin is not None
-                refusal = api.terminate(ns.admin.id)
-                if refusal is not None:
-                    # The endpoint is the authoritative occupancy check — it is
-                    # census-aware and the listing above is not — so a refusal is
-                    # only knowable by asking. Keep the wave going, and do not add
-                    # the node to `terminate_issued`, so the next tick re-asks and
-                    # it self-clears when the blocker does.
-                    #
-                    # Three different 409s come back from this endpoint, so
-                    # classify on which key is *present* rather than on which is
-                    # absent — an absence test silently lumps the third case in
-                    # with whichever branch it falls to.
-                    #
-                    #   `sandboxes_active`     -> the occupancy guard refused.
-                    #   `current_drain_phase`  -> the node left `drained` between
-                    #                             this tick's listing poll and
-                    #                             this POST (the cluster's own
-                    #                             `drained_node_terminator` flips
-                    #                             it on a 60s tick, or an
-                    #                             operator undrained), and the
-                    #                             transition check fires before
-                    #                             occupancy is even read.
-                    #   neither                -> `db_error` mapped a Postgres
-                    #                             serialization failure or
-                    #                             deadlock (40001 / 40P01) to a
-                    #                             409 whose body is just
-                    #                             `{"error": ...}`. Transient and
-                    #                             retryable, and nothing to do
-                    #                             with sandboxes.
-                    if "current_drain_phase" in refusal:
-                        emit_event(
-                            Event.TERMINATE_BLOCKED_PHASE_DRIFT,
-                            cohort=cfg.cohort,
-                            node_id=ns.admin.id,
-                            k8s_node_name=ns.admin.k8s_node_name,
-                            instance_id=ns.instance_id,
-                            current_drain_phase=refusal.get("current_drain_phase"),
-                        )
-                        continue
-                    if "sandboxes_active" not in refusal:
-                        emit_event(
-                            Event.TERMINATE_REFUSED_UNKNOWN,
-                            cohort=cfg.cohort,
-                            node_id=ns.admin.id,
-                            k8s_node_name=ns.admin.k8s_node_name,
-                            instance_id=ns.instance_id,
-                            error=refusal.get("error"),
-                        )
-                        continue
-                    # M6: the occupancy guard refuses on either half, and
-                    # `pick_terminate_candidates` screens on a listing polled
-                    # earlier in the tick — so a suspend that lands in between
-                    # produces `sandboxes_active: 0` with a nonzero snapshot
-                    # count. Reporting that as an active-sandbox block sends the
-                    # operator to a runbook entry whose diagnostic returns zero
-                    # rows and says "nothing to fix".
-                    if not refusal.get("sandboxes_active"):
-                        emit_event(
-                            Event.TERMINATE_BLOCKED_LOCAL_SNAPSHOTS,
-                            cohort=cfg.cohort,
-                            node_id=ns.admin.id,
-                            k8s_node_name=ns.admin.k8s_node_name,
-                            instance_id=ns.instance_id,
-                            sandboxes_local_snapshots=refusal.get(
-                                "sandboxes_local_snapshots"
-                            ),
-                        )
-                        continue
-                    # Re-reported on a cadence rather than once: this node is
-                    # re-POSTed every poll interval for as long as it stays
-                    # blocked, and `detect_stuck` cannot see it (that pass skips
-                    # anything not in `DRAINING`). One line at the start of a
-                    # multi-hour rollout, then silence, is how a wedged node goes
-                    # unnoticed.
-                    now = time.monotonic()
-                    last = active_blocked_logged.get(ns.admin.id)
-                    if last is None or now - last >= BLOCKED_REPORT_INTERVAL_SEC:
-                        active_blocked_logged[ns.admin.id] = now
-                        emit_event(
-                            Event.TERMINATE_BLOCKED_ACTIVE_SANDBOXES,
-                            cohort=cfg.cohort,
-                            node_id=ns.admin.id,
-                            k8s_node_name=ns.admin.k8s_node_name,
-                            instance_id=ns.instance_id,
-                            sandboxes_active=refusal.get("sandboxes_active"),
-                            sandboxes_local_snapshots=refusal.get(
-                                "sandboxes_local_snapshots"
-                            ),
-                        )
-                    continue
-                terminate_issued.add(ns.admin.id)
-                emit_event(
-                    Event.TERMINATE_STARTED,
-                    cohort=cfg.cohort,
-                    node_id=ns.admin.id,
-                    k8s_node_name=ns.admin.k8s_node_name,
-                    instance_id=ns.instance_id,
-                )
+            run_terminate_pass(
+                api,
+                pick_terminate_candidates(
+                    source, already_terminated_ids=frozenset(terminate_state.issued)
+                ),
+                cohort=cfg.cohort,
+                state=terminate_state,
+                now=time.monotonic(),
+            )
 
-            # Surface drained nodes blocked by local-disk snapshots once
-            # each. Admin `:terminate` would 409 on these; logging the
-            # blocker lets the operator unstick them (durable S3 suspend
-            # or manual cleanup) without parsing a `tick_error` traceback.
-            for ns in pick_terminate_blocked_by_snapshots(source):
-                assert ns.admin is not None
-                if ns.admin.id in snapshot_blocked_logged:
-                    continue
-                snapshot_blocked_logged.add(ns.admin.id)
-                emit_event(
-                    Event.TERMINATE_BLOCKED_LOCAL_SNAPSHOTS,
-                    cohort=cfg.cohort,
-                    node_id=ns.admin.id,
-                    k8s_node_name=ns.admin.k8s_node_name,
-                    instance_id=ns.instance_id,
-                    sandboxes_local_snapshots=ns.admin.sandboxes_local_snapshots,
-                )
+            report_local_snapshot_hints(
+                source,
+                cohort=cfg.cohort,
+                logged=snapshot_blocked_logged,
+                terminated=terminate_state.issued,
+            )
 
             # Surface drained nodes whose drain was started without
             # `replace_after_terminate=false`. Terminating them would let
