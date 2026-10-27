@@ -1,8 +1,9 @@
 use super::*;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, ExecutionGeneration, NodeId, PodUid, RouteGeneration, SandboxId,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    AutoLifecyclePolicy, ExecutionGeneration, NodeId, PodUid, RouteGeneration,
+    SandboxActivationAttemptId, SandboxId, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel,
+    SpaceApiRouteIdentity,
 };
 
 #[tokio::test]
@@ -155,20 +156,16 @@ fn restart_test_info(sandbox_id: &str) -> SidecarInfo {
 
 #[test]
 fn sidecar_restart_queue_deduplicates_and_releases_after_completion() {
+    let now = Instant::now();
+    let spaced = || SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a"));
     let mut queue = SidecarRestartQueue::default();
-    let spaced = SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a"));
-    let spaced_key = spaced.key();
-    assert!(queue.schedule(spaced));
-    assert!(
-        !queue.schedule(SidecarRestartRequest::SpacedHost(restart_test_info(
-            "sandbox-a"
-        )))
-    );
-    assert!(
-        queue.schedule(SidecarRestartRequest::NetGateway(restart_test_info(
-            "sandbox-a"
-        )))
-    );
+    let spaced_key = spaced().key();
+    assert!(queue.schedule(spaced(), now));
+    assert!(!queue.schedule(spaced(), now));
+    assert!(queue.schedule(
+        SidecarRestartRequest::NetGateway(restart_test_info("sandbox-a")),
+        now
+    ));
 
     assert_eq!(queue.pop_front().expect("spaced request").key(), spaced_key);
     assert_eq!(
@@ -176,36 +173,126 @@ fn sidecar_restart_queue_deduplicates_and_releases_after_completion() {
         SidecarKind::NetGateway
     );
     assert!(queue.pop_front().is_none());
-    assert!(
-        !queue.schedule(SidecarRestartRequest::SpacedHost(restart_test_info(
-            "sandbox-a"
-        )))
-    );
+    assert!(!queue.schedule(spaced(), now));
 
     queue.complete(&spaced_key);
-    assert!(
-        queue.schedule(SidecarRestartRequest::SpacedHost(restart_test_info(
-            "sandbox-a"
-        )))
-    );
+    assert!(queue.schedule(spaced(), now));
 }
 
 #[test]
 fn sidecar_restart_queue_prunes_stale_pending_generation() {
+    let now = Instant::now();
+    let spaced = || SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a"));
     let mut queue = SidecarRestartQueue::default();
-    let stale = SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a"));
-    let key = stale.key();
-    assert!(queue.schedule(stale));
+    let key = spaced().key();
+    assert!(queue.schedule(spaced(), now));
+    queue.stop(SidecarRestartRequest::NetGateway(restart_test_info(
+        "sandbox-a",
+    )));
 
     queue.retain_pending(|_| false);
 
     assert!(queue.pending.is_empty());
-    assert!(!queue.scheduled.contains(&key));
+    assert!(!queue.scheduled.contains_key(&key));
+    assert!(queue.held.is_empty());
+    assert!(queue.schedule(spaced(), now));
+}
+
+#[test]
+fn sidecar_restart_queue_backs_off_failures_until_the_attempt_changes() {
+    let gateway = || SidecarRestartRequest::NetGateway(restart_test_info("sandbox-a"));
+    let mut queue = SidecarRestartQueue::default();
+    let mut now = Instant::now();
+    let mut delays = Vec::new();
+    for _ in 0..6 {
+        assert!(queue.schedule(gateway(), now));
+        let request = queue.pop_front().expect("scheduled request");
+        let delay = queue.defer(request);
+        assert!(!queue.schedule(gateway(), now + delay - Duration::from_millis(1)));
+        delays.push(delay.as_secs());
+        now += delay;
+    }
+    assert_eq!(delays, [5, 10, 20, 40, 60, 60]);
+
+    let mut replaced = restart_test_info("sandbox-a");
+    replaced.netgtw_pid = Some(40_003);
     assert!(
-        queue.schedule(SidecarRestartRequest::SpacedHost(restart_test_info(
-            "sandbox-a"
-        )))
+        queue.schedule(SidecarRestartRequest::NetGateway(replaced), now),
+        "a new gateway PID must not inherit the previous backoff"
     );
+    let request = queue.pop_front().expect("scheduled request");
+    queue.succeed(&request.key());
+    assert!(queue.schedule(gateway(), now), "success clears the backoff");
+}
+
+// A Launch NOT_FOUND is node-manager reporting that the fenced execution holds
+// no network lease, so retrying the same attempt cannot succeed. The restart
+// stops until the sandbox's execution or sidecar authority changes; other
+// refusals stay retryable after a backoff.
+#[tokio::test]
+async fn sidecar_restart_stops_when_node_manager_holds_no_allocation() {
+    let a_day_later = Instant::now() + Duration::from_secs(86_400);
+    for kind in [SidecarKind::SpacedHost, SidecarKind::NetGateway] {
+        for (code, stopped) in [
+            (tonic::Code::NotFound, true),
+            (tonic::Code::Unavailable, false),
+        ] {
+            let case = format!("{kind:?} restart answered {code:?}");
+            let sandbox_id = SandboxId::new().to_string();
+            let conn = crate::db::test_conn();
+            insert_test_sandbox(&conn, &sandbox_id, crate::state::SandboxState::Started);
+            set_runtime_fields(&conn, &sandbox_id, test_route_identity());
+            let db = crate::db::SharedConnection::new(conn);
+            let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+                .unary(
+                    "Launch",
+                    move |_: pplx_space_node_mgr_client::proto::LaunchRequest| {
+                        Err::<pplx_space_node_mgr_client::proto::LaunchResponse, _>(
+                            tonic::Status::new(code, "synthetic launch refusal"),
+                        )
+                    },
+                )
+                .serve();
+            let mut info = restart_test_info(&sandbox_id);
+            info.node_execution_id = Some(SandboxActivationAttemptId::new());
+            let request = |info: &SidecarInfo| match kind {
+                SidecarKind::SpacedHost => SidecarRestartRequest::SpacedHost(info.clone()),
+                SidecarKind::NetGateway => SidecarRestartRequest::NetGateway(info.clone()),
+            };
+            let sidecars = Arc::new(Mutex::new(HashMap::from([(
+                sandbox_id.clone(),
+                info.clone(),
+            )])));
+            let mut queue = SidecarRestartQueue::default();
+            assert!(queue.schedule(request(&info), Instant::now()), "{case}");
+            let outcome = start_sidecar_restart(
+                queue.pop_front().expect("scheduled request"),
+                &db,
+                &sidecars,
+                &NetworkPolicyReconcileQueue::default(),
+                &Arc::new(Mutex::new(HashMap::new())),
+                &pplx_space_feature_flags::FeatureFlagClient::disabled(),
+                &node_manager.connector(),
+            )
+            .await;
+            finish_sidecar_restart(&mut queue, outcome);
+
+            assert_eq!(node_manager.calls(), ["Launch"], "{case}");
+            assert_eq!(
+                queue.schedule(request(&info), a_day_later),
+                !stopped,
+                "{case}"
+            );
+            if stopped {
+                let mut reactivated = info.clone();
+                reactivated.node_execution_id = Some(SandboxActivationAttemptId::new());
+                assert!(
+                    queue.schedule(request(&reactivated), Instant::now()),
+                    "{case}: a new execution must be restartable"
+                );
+            }
+        }
+    }
 }
 
 #[test]
