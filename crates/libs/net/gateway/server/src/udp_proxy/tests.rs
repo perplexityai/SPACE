@@ -474,8 +474,12 @@ async fn reserved_udp_capacity_rejection_reaches_the_guest_as_servfail() {
         TaskTracker::new(),
     )
     .unwrap();
-    let _saturated = Arc::clone(&proxy.reserved_dns_task_slots)
-        .try_acquire_many_owned(MAX_ACTIVE_RESERVED_DNS_DATAGRAMS as u32)
+    let _saturated = Arc::clone(
+        proxy
+            .reserved_dns_task_slots
+            .get(ReservedResolver::Cloudflare),
+    )
+    .try_acquire_many_owned(MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER as u32)
         .unwrap();
     let flow = FlowKey {
         guest_src: guest.local_addr().unwrap(),

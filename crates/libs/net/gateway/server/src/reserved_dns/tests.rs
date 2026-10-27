@@ -605,3 +605,13 @@ impl ResolverBackend for BlockingResolver {
         })
     }
 }
+
+#[test]
+fn exhausted_resolver_slots_do_not_block_the_other_resolver() {
+    let slots = ResolverSlots::new(1);
+    let _google = slots.get(ReservedResolver::Google).try_acquire().unwrap();
+    let _cloudflare = slots
+        .get(ReservedResolver::Cloudflare)
+        .try_acquire()
+        .unwrap();
+}

@@ -35,8 +35,10 @@ use crate::egress::{
 };
 use crate::known_egress::KnownEgressState;
 use crate::orig_dst;
-use crate::reserved_dns::{ReservedDnsCore, ReservedResolver, ResolveOutcome};
-use crate::resource_budget::{MAX_ACTIVE_RESERVED_DNS_DATAGRAMS, MAX_ACTIVE_UDP_SESSIONS};
+use crate::reserved_dns::{ReservedDnsCore, ReservedResolver, ResolveOutcome, ResolverSlots};
+use crate::resource_budget::{
+    MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER, MAX_ACTIVE_UDP_SESSIONS,
+};
 use crate::state::{GatewayNetworkState, PolicyNotReady, TrafficPolicy};
 use crate::stats::ProxyStats;
 
@@ -390,7 +392,7 @@ struct UdpProxy {
     reserved_dns: ReservedDnsCore,
     shutdown_token: CancellationToken,
     reserved_dns_tasks: TaskTracker,
-    reserved_dns_task_slots: Arc<Semaphore>,
+    reserved_dns_task_slots: ResolverSlots,
     listener_ready: AsyncFd<std::net::UdpSocket>,
     // Guest datagrams promote a mapping in this cache. Response activity still
     // updates `last_active_ms` for the normal idle timeout, but under capacity
@@ -435,7 +437,9 @@ impl UdpProxy {
             reserved_dns,
             shutdown_token,
             reserved_dns_tasks,
-            reserved_dns_task_slots: Arc::new(Semaphore::new(MAX_ACTIVE_RESERVED_DNS_DATAGRAMS)),
+            reserved_dns_task_slots: ResolverSlots::new(
+                MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER,
+            ),
             // SAFETY: AsyncFd owns this open socket. The proxy only borrows it
             // for I/O and never replaces or closes its registered descriptor.
             listener_ready: unsafe { AsyncFd::register(listener)? },
@@ -751,9 +755,11 @@ impl UdpProxy {
         policy_cancellation: CancellationToken,
         response_socket_factory: impl FnOnce(SocketAddr) -> std::io::Result<UdpSocket>,
     ) {
-        let permit = Arc::clone(&self.reserved_dns_task_slots).try_acquire_owned();
+        let slots = self.reserved_dns_task_slots.get(resolver);
+        let permit = Arc::clone(slots).try_acquire_owned();
         pplx_space_metrics::gateway::reserved_dns_udp_in_flight(
-            MAX_ACTIVE_RESERVED_DNS_DATAGRAMS - self.reserved_dns_task_slots.available_permits(),
+            resolver.as_str(),
+            MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER - slots.available_permits(),
         );
         let permit = match permit {
             Ok(permit) => permit,
