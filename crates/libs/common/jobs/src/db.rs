@@ -213,6 +213,27 @@ pub fn update_active_job_payload(
     )? == 1)
 }
 
+/// Update execution-owned payload state while the caller holds the service's
+/// connection mutex. Keep the claim and input fence in the jobs owner; all
+/// writers on this unleased queue must use that same serialization fence.
+pub fn update_job_attempt_payload(
+    conn: &Connection,
+    job: &Job,
+    payload: &str,
+) -> rusqlite::Result<bool> {
+    let Some(current) = get_job(conn, &job.job_id)? else {
+        return Ok(false);
+    };
+    if current.status != "running"
+        || current.attempts != job.attempts
+        || current.lease_owner != job.lease_owner
+        || current.payload != job.payload
+    {
+        return Ok(false);
+    }
+    update_active_job_payload(conn, &job.job_id, payload, current.priority)
+}
+
 /// Restart recovery for a single service-owned kind. Unlike inventory recovery,
 /// this does not materialize all pending jobs or reset another worker's jobs.
 pub fn reset_running_kind(conn: &Connection, kind: &str) -> rusqlite::Result<usize> {
@@ -633,6 +654,36 @@ pub fn complete_job_attempt(
              completed_at = datetime('now')
          WHERE job_id = ?1 AND status = 'running' AND attempts = ?3",
         params![job_id, bytes, expected_attempts],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Publish a domain result and completion together, fenced to the exact input
+/// and execution claim. The service must keep ownership until this commits;
+/// attempt counts alone are not generations (yield can refund them).
+pub fn complete_job_with_payload(
+    conn: &Connection,
+    job: &Job,
+    bytes: i64,
+    payload: &str,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        sql!(
+            "UPDATE jobs
+             SET status = 'completed', bytes_processed = ?2, payload = ?3,
+                 error = NULL, error_kind = NULL, failure_reason = NULL,
+                 completed_at = datetime('now')
+             WHERE job_id = ?1 AND status = 'running' AND attempts = ?4
+               AND lease_owner IS ?5 AND payload = ?6"
+        ),
+        params![
+            job.job_id,
+            bytes,
+            payload,
+            job.attempts,
+            job.lease_owner,
+            job.payload
+        ],
     )?;
     Ok(changed == 1)
 }

@@ -1,5 +1,8 @@
 use pplx_space_common_core::types::JobId;
 
+mod integrity;
+pub use integrity::{Integrity, IntegrityParseError};
+
 pub mod proto {
     tonic::include_proto!("space.volume.manager.v1");
 }
@@ -125,6 +128,8 @@ pub fn verified_replica_provenance_path(local_path: impl AsRef<Path>) -> PathBuf
 /// because the JSON record is itself the cross-process contract.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiedReplicaProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<Integrity>,
     pub version: u32,
     pub subject_id: String,
     pub s3_uri: String,
@@ -403,6 +408,7 @@ where
     Wait: FnMut(GetTransferJobRequest) -> WaitFuture,
     WaitFuture: Future<Output = Result<tonic::Response<GetTransferJobResponse>, tonic::Status>>,
 {
+    let expected_integrity = request.expected_integrity.clone();
     request.existing_file_policy = ExistingFilePolicy::VerifiedReplica as i32;
     let started_at = tokio::time::Instant::now();
     let response = submit_pull_file_with_retry(request, started_at, config.max_total, submit)
@@ -421,6 +427,17 @@ where
     let job = response
         .job
         .ok_or_else(|| EnsureFileReplicaError::EmptyJob { job_id })?;
+
+    if job.status == TransferJobStatus::Completed as i32
+        && let Some(expected) = expected_integrity
+        && (job.integrity.as_ref() != Some(&expected)
+            || job.bytes_transferred != expected.size_bytes)
+    {
+        return Err(EnsureFileReplicaError::Failed {
+            job_id,
+            error: "volume-manager did not confirm the expected content identity".into(),
+        });
+    }
 
     match TransferJobStatus::try_from(job.status).ok() {
         Some(TransferJobStatus::Completed) => Ok(EnsureFileReplicaOutput {

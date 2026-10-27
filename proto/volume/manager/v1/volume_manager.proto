@@ -265,6 +265,15 @@ message PullFileRequest {
     SnapshotArtifact snapshot_artifact = 8;
     // UUID identifying the restore attempt that owns this destination.
     optional string transfer_scope_id = 9;
+    // Trusted identity of the decoded file. Checked before publication and
+    // on cached-file reuse. Completion must echo the verified identity.
+    ContentIntegrity expected_integrity = 10;
+}
+
+message ContentIntegrity {
+    // Canonical sha256:<64 lowercase hex> of the decoded file bytes.
+    string digest = 1;
+    uint64 size_bytes = 2;
 }
 
 enum ExistingFilePolicy {
@@ -439,6 +448,9 @@ message TransferJob {
     // with more than one had a failed attempt; `error` is cleared on
     // completion, `attempts` never is.
     uint32            attempts          = 13;
+    // Present only for a completed single-file upload or verified download.
+    // Persisted with the job; absence is not proof of verification.
+    ContentIntegrity integrity = 14;
 }
 
 message GetTransferJobRequest {
