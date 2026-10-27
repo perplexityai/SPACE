@@ -151,6 +151,96 @@ async fn the_org_limit_counts_every_owner_and_a_subject_limit_its_own() -> TestR
     Ok(())
 }
 
+/// An in-flight create is matched to a live row only by the target its
+/// public sandbox id spells, the text `PUBLIC_SANDBOX_ID_PREFIX || id::text`,
+/// under either plan mode. Matched, it is counted once, by the row and as
+/// the row's owner; any other target, including other spellings of the same
+/// uuid, names no row and counts the create as its requester's, without
+/// failing the count.
+#[tokio::test]
+async fn a_create_is_matched_to_its_row_only_by_its_public_sandbox_id() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(2).await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let store = PublicOperationStore::new(pool.clone());
+    let prefix = pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
+    let other_org_id = seed_org(pool).await?;
+    let other_org_owner = seed_user(pool, other_org_id, None).await?;
+    let row_ids = [(); 9].map(|()| SandboxId::new());
+    let public_id = |row: usize| PublicSandboxId::from_uuid(row_ids[row].as_uuid()).to_string();
+    let uuid_text = |row: usize| row_ids[row].as_uuid().hyphenated().to_string();
+    let uppercase = format!("{prefix}{}", uuid_text(3).to_uppercase());
+    let unhyphenated = format!("{prefix}{}", row_ids[4].as_uuid().simple());
+    let other_prefix = format!("sbz_{}", uuid_text(6));
+    // A hyphen moved one place left: five hex groups still, but not where a
+    // uuid's text puts them, and not input `uuid` accepts.
+    let mut misplaced = uuid_text(7);
+    misplaced.remove(8);
+    misplaced.insert(7, '-');
+    let misplaced = format!("{prefix}{misplaced}");
+    let not_a_uuid = format!("{prefix}not-a-sandbox-id");
+    // Where the case's row is: live or non-terminal in the create's org, or
+    // live in another org.
+    #[derive(Clone, Copy)]
+    enum Row {
+        Started,
+        Deleting,
+        OtherOrg,
+    }
+    use Row::{Deleting, OtherOrg, Started};
+    // (case, its row, target, where the row is, the create counted)
+    let cases = [
+        ("its public id", 0, public_id(0), Started, false),
+        ("a non-terminal row", 1, public_id(1), Deleting, false),
+        ("another org's row", 2, public_id(2), OtherOrg, true),
+        ("uppercase hex", 3, uppercase, Started, true),
+        ("no hyphens", 4, unhyphenated, Started, true),
+        ("no prefix", 5, uuid_text(5), Started, true),
+        ("another prefix", 6, other_prefix, Started, true),
+        ("a misplaced hyphen", 7, misplaced, Started, true),
+        ("not a uuid", 8, not_a_uuid, Started, true),
+    ];
+    for (case, row, target, placement, counted) in cases {
+        let org_id = seed_org(pool).await?;
+        let owner = seed_user(pool, org_id, None).await?;
+        let requester = seed_user(pool, org_id, Some("requester")).await?;
+        let (row_owner, row_org, lifecycle) = match placement {
+            Started => (owner, org_id, "started"),
+            Deleting => (owner, org_id, "deleting"),
+            OtherOrg => (other_org_owner, other_org_id, "started"),
+        };
+        seed_sandbox(pool, row_ids[row], row_owner, row_org, lifecycle).await?;
+        match store
+            .create_operation(native_create(org_id, requester, &target, None))
+            .await?
+        {
+            CreatePublicOperationResult::Created(_) => {}
+            other => return Err(format!("create was not recorded: {other:?}").into()),
+        }
+        let row_counted = !matches!(placement, OtherOrg);
+        let expected = (
+            i64::from(row_counted) + i64::from(counted),
+            i64::from(counted),
+        );
+        for plan_cache_mode in ["force_custom_plan", "force_generic_plan"] {
+            let mut tx = pool.begin().await?;
+            let set_mode = format!("SET LOCAL plan_cache_mode = {plan_cache_mode}");
+            sqlx::query(sqlx::AssertSqlSafe(sql!(set_mode.as_str())))
+                .execute(&mut *tx)
+                .await?;
+            let held = sandboxes_held_tx(&mut tx, org_id, Some(requester)).await?;
+            tx.rollback().await?;
+            assert_eq!(
+                (held.org, held.subject),
+                expected,
+                "a create targeting {case} ({target}), {plan_cache_mode}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A create near either limit takes that limit's lock exclusively: it waits
 /// for a racing create holding the lock and, once that one commits, counts
 /// it.
