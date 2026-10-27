@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn sandbox_selector_deduplicates_lease_generations_not_sandboxes() {
+    let id = "01900000-0000-7000-8000-000012345678";
+    let leases = vec![
+        NetworkLease {
+            sandbox_id: id.into(),
+            ..Default::default()
+        },
+        NetworkLease {
+            sandbox_id: id.into(),
+            ..Default::default()
+        },
+        NetworkLease::default(),
+    ];
+    for selector in [id, "12345678"] {
+        assert_eq!(
+            resolve_selector_from_leases(&leases, &selector.parse().unwrap()).unwrap(),
+            id
+        );
+    }
+    let mut ambiguous = leases;
+    ambiguous.push(NetworkLease {
+        sandbox_id: "01900000-0000-7000-8001-000012345678".into(),
+        ..Default::default()
+    });
+    assert!(
+        resolve_selector_from_leases(&ambiguous, &"12345678".parse().unwrap())
+            .unwrap_err()
+            .contains("Ambiguous")
+    );
+}
+
+#[test]
 fn command_errors_are_fallible_and_preserve_operator_guidance() {
     for (input, expected) in [("tcp", NetworkProtocol::Tcp), ("udp", NetworkProtocol::Udp)] {
         assert_eq!(parse_protocol(input).unwrap(), expected);
