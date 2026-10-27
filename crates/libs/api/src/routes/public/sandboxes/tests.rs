@@ -2097,3 +2097,39 @@ async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
     );
     Ok(())
 }
+
+/// The public sandbox has no env, so env bytes do not count toward a native
+/// page's budget.
+#[tokio::test]
+async fn sandbox_list_budget_ignores_env() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let newest = OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+    let mut expected = Vec::new();
+    for offset in 0..3 {
+        let created_at = newest - time::Duration::seconds(offset);
+        let id = insert_legacy_sandbox(&db.pool, created_at, 16).await?;
+        sqlx::query(pplx_space_common_core::sql!(
+            "UPDATE sandboxes SET env = $2 WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(SqlJson(
+            serde_json::json!({ "LARGE": "e".repeat(3 * 1024 * 1024) }),
+        ))
+        .execute(&db.pool)
+        .await?;
+        expected.push(id);
+    }
+
+    let rows = fetch_sandboxes_page(
+        &db.pool,
+        OrgId::from_uuid(SEED_ORG_ID),
+        None,
+        None,
+        MAX_SANDBOX_LIST_LIMIT,
+    )
+    .await?;
+    assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), expected);
+    let page = sandboxes_page(rows, MAX_SANDBOX_LIST_LIMIT).unwrap();
+    assert!(page.next_cursor.is_none());
+    Ok(())
+}

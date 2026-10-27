@@ -1117,8 +1117,8 @@ const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
             s.created_at,
             s.updated_at";
 
-const PUBLIC_SANDBOX_FROM: &str = "FROM sandboxes s
-     LEFT JOIN sandbox_direct_route_identities direct_route
+/// The joins of a public sandbox row onto `s`.
+const PUBLIC_SANDBOX_JOINS: &str = "LEFT JOIN sandbox_direct_route_identities direct_route
        ON direct_route.sandbox_id = s.id
      LEFT JOIN sandbox_observed_states sos
        ON sos.sandbox_id = s.id
@@ -1128,10 +1128,9 @@ const PUBLIC_SANDBOX_FROM: &str = "FROM sandboxes s
       AND failure_observation.facet = $1
       AND failure_observation.element = s.id::TEXT";
 
-/// The first sandbox the list shows after the page walk's current row: the
-/// org's live sandboxes, owned by subject $12 or, without one, by a local
-/// user.
-const PAGE_NEXT_ROW: &str = "SELECT s.id, s.created_at
+/// The sandboxes the list shows after the cursor: the org's live sandboxes,
+/// owned by subject $12 or, without one, by a local user.
+const PAGE_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
     FROM sandboxes s
     WHERE s.org_id = $8
       AND s.lifecycle <> 'deleted'
@@ -1140,9 +1139,9 @@ const PAGE_NEXT_ROW: &str = "SELECT s.id, s.created_at
             SELECT 1 FROM users owner WHERE owner.id = s.user_id
               AND owner.owner_source = 'local'
         )))
-      AND (s.created_at, s.id) < (walk.created_at, walk.id)
+      AND {after_cursor}
     ORDER BY s.created_at DESC, s.id DESC
-    LIMIT 1";
+    LIMIT {max_rows}";
 
 const PAGE_WALK_PARAMS: PageWalkParams = PageWalkParams {
     cursor_created_at: "$9",
@@ -1150,6 +1149,8 @@ const PAGE_WALK_PARAMS: PageWalkParams = PageWalkParams {
     max_rows: "$11",
     max_bytes: "$13",
     row_overhead_bytes: "$14",
+    // The public sandbox has no env.
+    lists_env: false,
 };
 
 #[derive(Clone, Copy)]
@@ -1164,16 +1165,18 @@ fn public_sandbox_query(query: PublicSandboxQuery) -> sqlx::AssertSqlSafe<String
     let sql = match query {
         PublicSandboxQuery::ById => format!(
             "{PUBLIC_SANDBOX_SELECT}, FALSE AS has_next
-             {PUBLIC_SANDBOX_FROM}
+             FROM sandboxes s
+             {PUBLIC_SANDBOX_JOINS}
              WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
         ),
         PublicSandboxQuery::Page => format!(
             "{page_rows}
              {PUBLIC_SANDBOX_SELECT}, page.has_next
-             {PUBLIC_SANDBOX_FROM}
-             JOIN page_rows page ON page.id = s.id
-             ORDER BY s.created_at DESC, s.id DESC",
-            page_rows = page_rows_cte(PAGE_NEXT_ROW, &PAGE_WALK_PARAMS),
+             FROM page_rows page
+             JOIN sandboxes s ON s.id = page.id
+             {PUBLIC_SANDBOX_JOINS}
+             ORDER BY page.position",
+            page_rows = page_rows_cte(PAGE_CANDIDATE_ROWS, &PAGE_WALK_PARAMS),
         ),
     };
     sqlx::AssertSqlSafe(sql!(sql))

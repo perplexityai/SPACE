@@ -47,43 +47,37 @@ struct ScopedPageRow {
     has_next: bool,
 }
 
-/// The local org's sandboxes ($1) after the walk's current row, matching
-/// the metadata filter $5.
-const LOCAL_ORG_NEXT_ROW: &str = "SELECT s.id, s.created_at
+/// The local org's sandboxes ($1) after the cursor, matching the metadata
+/// filter $5.
+const LOCAL_ORG_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
     FROM sandboxes s
     JOIN users owner_user ON owner_user.id = s.user_id
     WHERE owner_user.owner_source = 'local'
       AND s.org_id = $1
-      AND (s.created_at, s.id) < (walk.created_at, walk.id)
+      AND {after_cursor}
       AND ($5::jsonb IS NULL OR s.metadata @> $5::jsonb)
     ORDER BY s.created_at DESC, s.id DESC
-    LIMIT 1";
+    LIMIT {max_rows}";
 
 static LOCAL_ORG_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
-    let page_rows = page_rows_cte(
-        LOCAL_ORG_NEXT_ROW,
+    scoped_page_sql(
+        LOCAL_ORG_CANDIDATE_ROWS,
         &PageWalkParams {
             cursor_created_at: "$2",
             cursor_id: "$3",
             max_rows: "$4",
             max_bytes: "$6",
             row_overhead_bytes: "$7",
+            lists_env: true,
         },
-    );
-    sandbox_query(&format!(
-        "{page_rows}
-         SELECT {{sandbox_columns}}, page.has_next
-         FROM {{sandbox_from}}
-         JOIN page_rows page ON page.id = s.id
-         ORDER BY s.created_at DESC, s.id DESC"
-    ))
+    )
 });
 
 /// The federated subject's sandboxes ($1-$3) and the key org's legacy local
-/// sandboxes ($8) after the walk's current row, matching the metadata filter
-/// $7. Each arm keeps its own index-backed `ORDER BY` / `LIMIT`; the outer
-/// sort picks the newer of the two candidates.
-const FEDERATED_SUBJECT_NEXT_ROW: &str = "SELECT candidate.id, candidate.created_at
+/// sandboxes ($8) after the cursor, matching the metadata filter $7. Each
+/// arm keeps its own index-backed `ORDER BY` / `LIMIT`; the outer sort merges
+/// the two candidate lists.
+const FEDERATED_SUBJECT_CANDIDATE_ROWS: &str = "SELECT candidate.id, candidate.created_at
     FROM (
         (SELECT s.id, s.created_at
          FROM sandboxes s
@@ -94,43 +88,51 @@ const FEDERATED_SUBJECT_NEXT_ROW: &str = "SELECT candidate.id, candidate.created
            AND owner_org.upstream_issuer = $1
            AND owner_org.upstream_org_id = $2
            AND owner_user.upstream_subject_id = $3
-           AND (s.created_at, s.id) < (walk.created_at, walk.id)
+           AND {after_cursor}
            AND ($7::jsonb IS NULL OR s.metadata @> $7::jsonb)
          ORDER BY s.created_at DESC, s.id DESC
-         LIMIT 1)
+         LIMIT {max_rows})
         UNION ALL
         (SELECT s.id, s.created_at
          FROM sandboxes s
          JOIN users owner_user ON owner_user.id = s.user_id
          WHERE owner_user.owner_source = 'local'
            AND s.org_id = $8
-           AND (s.created_at, s.id) < (walk.created_at, walk.id)
+           AND {after_cursor}
            AND ($7::jsonb IS NULL OR s.metadata @> $7::jsonb)
          ORDER BY s.created_at DESC, s.id DESC
-         LIMIT 1)
+         LIMIT {max_rows})
     ) candidate
     ORDER BY candidate.created_at DESC, candidate.id DESC
-    LIMIT 1";
+    LIMIT {max_rows}";
 
 static FEDERATED_SUBJECT_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
-    let page_rows = page_rows_cte(
-        FEDERATED_SUBJECT_NEXT_ROW,
+    scoped_page_sql(
+        FEDERATED_SUBJECT_CANDIDATE_ROWS,
         &PageWalkParams {
             cursor_created_at: "$4",
             cursor_id: "$5",
             max_rows: "$6",
             max_bytes: "$9",
             row_overhead_bytes: "$10",
+            lists_env: true,
         },
-    );
+    )
+});
+
+/// An ECW list page statement: the page walk over `candidate_rows`, then the
+/// full sandbox row of each page row.
+fn scoped_page_sql(candidate_rows: &str, params: &PageWalkParams) -> String {
+    let page_rows = page_rows_cte(candidate_rows, params);
     sandbox_query(&format!(
         "{page_rows}
          SELECT {{sandbox_columns}}, page.has_next
-         FROM {{sandbox_from}}
-         JOIN page_rows page ON page.id = s.id
-         ORDER BY s.created_at DESC, s.id DESC"
+         FROM page_rows page
+         JOIN sandboxes s ON s.id = page.id
+         {{sandbox_join_tail}}
+         ORDER BY page.position"
     ))
-});
+}
 
 fn sandbox_in_scope(sandbox: &Sandbox, scope: &SandboxAccessScope) -> bool {
     match (scope, sandbox.owner_source) {
