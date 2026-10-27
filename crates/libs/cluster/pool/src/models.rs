@@ -39,12 +39,12 @@ pub struct PoolConfig {
     pub updated_at: OffsetDateTime,
 }
 
-/// A `kubernetes_pool_configs` row that a config read could not decode into a
-/// [`PoolConfig`]. The read skips the row and reports it here, so one bad
-/// release or shape cannot stop the reconciler for every other template. The
-/// identity fields stay raw strings: they are the values that failed to parse.
+/// A `kubernetes_pool_configs` row that is not a valid [`PoolConfig`].
+///
+/// The fields keep the raw values from the row, because a raw value is the
+/// value that did not parse. `error` gives the first field that did not parse.
 #[derive(Debug)]
-pub struct UndecodablePoolConfig {
+pub struct InvalidPoolConfigRow {
     pub id: Uuid,
     pub template_release_id: Uuid,
     pub template_name: String,
@@ -52,11 +52,17 @@ pub struct UndecodablePoolConfig {
     pub error: PoolError,
 }
 
-/// The result of a config read: the rows that decoded, and the rows it skipped.
+/// The result of one config read.
+///
+/// A read does not fail because of one invalid row. It puts each valid row in
+/// `configs` and each invalid row in `invalid_rows`. Thus one bad release or
+/// shape cannot stop the reconciler for all other templates.
 #[derive(Debug, Default)]
-pub struct DecodedPoolConfigs {
+pub struct PoolConfigRead {
+    /// The rows that parsed into a [`PoolConfig`].
     pub configs: Vec<PoolConfig>,
-    pub undecodable: Vec<UndecodablePoolConfig>,
+    /// The rows that did not parse. The caller must report them.
+    pub invalid_rows: Vec<InvalidPoolConfigRow>,
 }
 
 /// A pool config joined with its live slot counts, as served by the

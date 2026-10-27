@@ -12,9 +12,9 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    ClaimedPoolSlot, ClaimedSlotBindSource, DecodedPoolConfigs, ManualPoolConfigSpec, NewPoolSlot,
-    OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigWithCounts, PoolError, PoolSlot,
-    PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
+    ClaimedPoolSlot, ClaimedSlotBindSource, ManualPoolConfigSpec, NewPoolSlot,
+    OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts, PoolError,
+    PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
     ReservedPoolSlot, Result,
     models::{
         PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease, memory_to_mib_i32,
@@ -136,7 +136,7 @@ impl WarmPoolStore {
         &self.pool
     }
 
-    pub async fn enabled_configs(&self) -> Result<DecodedPoolConfigs> {
+    pub async fn enabled_configs(&self) -> Result<PoolConfigRead> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
@@ -154,7 +154,7 @@ impl WarmPoolStore {
         Ok(decode_config_rows(rows))
     }
 
-    pub async fn reconcilable_configs(&self) -> Result<DecodedPoolConfigs> {
+    pub async fn reconcilable_configs(&self) -> Result<PoolConfigRead> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
@@ -184,7 +184,7 @@ impl WarmPoolStore {
     /// this grace period. That bounded tombstone prevents a stale per-config
     /// metric group from looking active after a manual disable, including when
     /// an already-empty config no longer qualifies for normal reconciliation.
-    pub async fn recently_disabled_configs(&self, grace: Duration) -> Result<DecodedPoolConfigs> {
+    pub async fn recently_disabled_configs(&self, grace: Duration) -> Result<PoolConfigRead> {
         let grace_secs = i64::try_from(grace.as_secs()).unwrap_or(i64::MAX);
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
@@ -398,7 +398,7 @@ impl WarmPoolStore {
     /// This sequence intentionally is not transactional: it relies on
     /// `space-cluster-controller` running as a singleton `Recreate` deployment.
     /// Add serialization or a transaction before calling it concurrently.
-    pub async fn autoscale_configs(&self, namespace: &str) -> Result<DecodedPoolConfigs> {
+    pub async fn autoscale_configs(&self, namespace: &str) -> Result<PoolConfigRead> {
         let candidates = self.autoscale_candidates().await?;
 
         for candidate in &candidates {
@@ -763,11 +763,11 @@ impl WarmPoolStore {
         Ok(())
     }
 
-    /// Rows that do not decode are deleted too: the decode only builds the
-    /// identity for the final inactive state, and an empty, disabled
-    /// autoscaler row has no other use. They are returned in
-    /// [`DecodedPoolConfigs::undecodable`] so the caller can report them.
-    async fn delete_empty_disabled_autoscale_configs(&self) -> Result<DecodedPoolConfigs> {
+    /// This also deletes invalid rows. The decode only gives the identity for
+    /// the last inactive state, and an empty, disabled autoscaler row has no
+    /// other use. Invalid rows are in [`PoolConfigRead::invalid_rows`], so the
+    /// caller can report them.
+    async fn delete_empty_disabled_autoscale_configs(&self) -> Result<PoolConfigRead> {
         let mut tx = self.pool.begin().await?;
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
@@ -788,12 +788,12 @@ impl WarmPoolStore {
         ))
         .fetch_all(&mut *tx)
         .await?;
-        let configs = decode_config_rows(rows);
-        let config_ids = configs
+        let read = decode_config_rows(rows);
+        let config_ids = read
             .configs
             .iter()
             .map(|config| config.id)
-            .chain(configs.undecodable.iter().map(|config| config.id))
+            .chain(read.invalid_rows.iter().map(|row| row.id))
             .collect::<Vec<_>>();
         sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_configs
@@ -804,7 +804,7 @@ impl WarmPoolStore {
         .await?;
         tx.commit().await?;
 
-        Ok(configs)
+        Ok(read)
     }
 
     pub async fn slot_counts(&self, config_id: Uuid) -> Result<PoolSlotCounts> {

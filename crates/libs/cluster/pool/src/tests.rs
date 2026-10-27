@@ -4261,12 +4261,12 @@ async fn config_reads_decode_blake3_release_hashes() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn config_reads_skip_an_undecodable_row_and_keep_the_others() -> TestResult {
-    // One release carries a hash the decoder cannot parse (here `sha256:`
-    // prepended to a `blake3:` value, the shape the store SQL produced before
-    // it read hashes as stored). Before this change that one row failed every
-    // config read, so no template got a warm pool. Each read must skip the
-    // bad row, report it, and still return the good rows.
+async fn config_reads_keep_valid_rows_when_one_row_is_invalid() -> TestResult {
+    // One release has a hash that does not parse: `sha256:` before a
+    // `blake3:` value. The store SQL made this value before it read hashes as
+    // stored. Before this change, this one row caused each config read to
+    // fail, and no template got a warm pool. Each read must return the valid
+    // row in `configs` and the invalid row in `invalid_rows`.
     let fixture = postgres_fixture().await?;
     let good_release_id = Uuid::now_v7();
     let good_config_id = Uuid::now_v7();
@@ -4295,13 +4295,13 @@ async fn config_reads_skip_an_undecodable_row_and_keep_the_others() -> TestResul
     ] {
         assert_eq!(read.configs.len(), 1);
         assert_eq!(read.configs[0].id, good_config_id);
-        assert_eq!(read.undecodable.len(), 1);
-        let skipped = &read.undecodable[0];
-        assert_eq!(skipped.id, bad_config_id);
-        assert_eq!(skipped.template_release_id, bad_release_id);
-        assert_eq!(skipped.template_name, "broken");
-        assert_eq!(skipped.content_hash, bad_hash);
-        assert!(matches!(skipped.error, PoolError::ContentHash(_)));
+        assert_eq!(read.invalid_rows.len(), 1);
+        let invalid = &read.invalid_rows[0];
+        assert_eq!(invalid.id, bad_config_id);
+        assert_eq!(invalid.template_release_id, bad_release_id);
+        assert_eq!(invalid.template_name, "broken");
+        assert_eq!(invalid.content_hash, bad_hash);
+        assert!(matches!(invalid.error, PoolError::ContentHash(_)));
     }
 
     sqlx::query(
@@ -4317,19 +4317,19 @@ async fn config_reads_skip_an_undecodable_row_and_keep_the_others() -> TestResul
         .recently_disabled_configs(Duration::from_secs(10 * 60))
         .await?;
     assert!(recently_disabled.configs.is_empty());
-    assert_eq!(recently_disabled.undecodable.len(), 1);
-    assert_eq!(recently_disabled.undecodable[0].id, bad_config_id);
+    assert_eq!(recently_disabled.invalid_rows.len(), 1);
+    assert_eq!(recently_disabled.invalid_rows[0].id, bad_config_id);
 
-    // The autoscaler deletes the empty, disabled row even though it does not
-    // decode, and reports it; the good manual config is not touched.
+    // The autoscaler deletes the empty, disabled row although it is invalid,
+    // and reports it. The valid manual config stays.
     let retired = fixture.store.autoscale_configs("space").await?;
     assert!(retired.configs.is_empty());
-    assert_eq!(retired.undecodable.len(), 1);
-    assert_eq!(retired.undecodable[0].id, bad_config_id);
+    assert_eq!(retired.invalid_rows.len(), 1);
+    assert_eq!(retired.invalid_rows[0].id, bad_config_id);
     let remaining = fixture.store.reconcilable_configs().await?;
     assert_eq!(remaining.configs.len(), 1);
     assert_eq!(remaining.configs[0].id, good_config_id);
-    assert!(remaining.undecodable.is_empty());
+    assert!(remaining.invalid_rows.is_empty());
 
     Ok(())
 }

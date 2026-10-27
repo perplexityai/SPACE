@@ -20,10 +20,10 @@ mod tests;
 pub use error::{PoolError, Result};
 #[cfg(feature = "kubernetes")]
 pub use models::{
-    ClaimedPoolSlot, ClaimedSlotBindSource, DecodedPoolConfigs, ManualPoolConfigSpec, NewPoolSlot,
-    OpenPoolSlotDeleteLock, PoolAssignment, PoolConfig, PoolConfigWithCounts, PoolSlot,
-    PoolSlotCounts, ProtectedTemplateRelease, ReleasePoolConfigWithCounts, ReservedPoolSlot,
-    UndecodablePoolConfig,
+    ClaimedPoolSlot, ClaimedSlotBindSource, InvalidPoolConfigRow, ManualPoolConfigSpec,
+    NewPoolSlot, OpenPoolSlotDeleteLock, PoolAssignment, PoolConfig, PoolConfigRead,
+    PoolConfigWithCounts, PoolSlot, PoolSlotCounts, ProtectedTemplateRelease,
+    ReleasePoolConfigWithCounts, ReservedPoolSlot,
 };
 #[cfg(feature = "kubernetes")]
 pub use owner::{PoolConfigOwner, PoolConfigOwnerParseError};
