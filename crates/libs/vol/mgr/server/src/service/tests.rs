@@ -1,6 +1,55 @@
 use super::*;
 
 #[tokio::test]
+async fn object_ranges_validate_before_submission_and_deduplicate_by_exact_contract() {
+    let (_db, worker) = test_worker_with_active_limit(10);
+    let request = PullFileRequest {
+        subject_id: "template:range-fixture".into(),
+        s3_uri: "s3://fixture/pack?region=us-east-1".into(),
+        local_path: "/tmp/range-fixture".into(),
+        raw: true,
+        object_range: Some(crate::proto::ObjectByteRange {
+            offset: 3,
+            length: 4,
+            object_size: 10,
+            version_id: None,
+        }),
+        ..Default::default()
+    };
+    let first = submit_pull(&worker, &request, MaterializationMode::Disabled).unwrap();
+    assert_eq!(
+        first,
+        submit_pull(&worker, &request, MaterializationMode::Disabled).unwrap()
+    );
+    let saved = worker.get_job(&first).unwrap().unwrap();
+    let payload = TransferPayload::from_json(&saved.payload).unwrap();
+    assert_eq!(payload.object_range.unwrap().offset(), 3);
+    let mut different = request.clone();
+    different.object_range.as_mut().unwrap().offset = 4;
+    assert_ne!(
+        first,
+        submit_pull(&worker, &different, MaterializationMode::Disabled).unwrap()
+    );
+    let mut invalid = request.clone();
+    invalid.raw = false;
+    assert_eq!(
+        submit_pull(&worker, &invalid, MaterializationMode::Disabled)
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let mut invalid = request;
+    invalid.object_range.as_mut().unwrap().length = u64::MAX;
+    assert_eq!(
+        submit_pull(&worker, &invalid, MaterializationMode::Disabled)
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(worker.list_jobs(None, None, 100).unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn copy_jobs_deduplicate_live_work_without_claiming_a_pull_writer_barrier() {
     let temp = tempfile::tempdir().unwrap();
     let service = test_service(&temp).await;
@@ -373,6 +422,7 @@ async fn rpc_authorization_rejects_group_members_and_separates_subject_kinds() {
         &service,
         request_from_peer(
             PullFileRequest {
+                object_range: None,
                 subject_id: sandbox_subject.to_string(),
                 s3_uri: "s3://other-tenant/snapshot?region=us-east-1".to_string(),
                 local_path: "/tmp/caller-chosen".to_string(),
@@ -978,6 +1028,7 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
     let (db, _worker) = test_worker();
     let scope = TransferScopeId::new();
     let payload = TransferPayload {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: "/space/cache/snapshot.luks".to_string(),
         s3_uri: "s3://bucket/snapshot.luks?region=us-east-2".to_string(),
@@ -1040,6 +1091,7 @@ fn transfer_scope_lookup_is_not_hidden_by_newer_terminal_jobs() {
 async fn submit_pull_does_not_reuse_job_with_different_materialization() {
     let (db, worker) = test_worker_with_active_limit(2);
     let req = PullFileRequest {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshots/a/snapshot.luks?region=us-east-2".to_string(),
         local_path: "/space/cache/sandboxes/sbx/snapshot/snapshot.luks".to_string(),
@@ -1052,6 +1104,7 @@ async fn submit_pull_does_not_reuse_job_with_different_materialization() {
     };
     let file_mode = Some(FileMode::new(0o600).unwrap());
     let payload = TransferPayload {
+        object_range: None,
         subject_id: req.subject_id.clone(),
         local_path: req.local_path.clone(),
         s3_uri: req.s3_uri.clone(),
@@ -1441,6 +1494,7 @@ async fn pull_artifact_retry_allows_scoped_job_after_incompatible_legacy_complet
 async fn submit_pull_persists_explicit_snapshot_artifact_for_opaque_path() {
     let (_db, worker) = test_worker();
     let req = PullFileRequest {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
         local_path: "/space/cache/replacements/download-7b47".to_string(),
@@ -1459,6 +1513,7 @@ async fn submit_pull_persists_explicit_snapshot_artifact_for_opaque_path() {
 async fn submit_pull_persists_and_versions_rootfs_assignment() {
     let (_db, worker) = test_worker();
     let req = PullFileRequest {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshots/a/rootfs?region=us-east-2".to_string(),
         local_path: "/space/cache/sandboxes/sbx/snapshot/rootfs".to_string(),
@@ -1502,6 +1557,7 @@ async fn submit_pull_persists_and_versions_rootfs_assignment() {
 async fn submit_pull_preserves_unspecified_artifact_for_canonical_path() {
     let (_db, worker) = test_worker();
     let req = PullFileRequest {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshots/a/snapshot.luks?region=us-east-2".to_string(),
         local_path: "/space/cache/sandboxes/sbx/snapshot/snapshot.luks".to_string(),
@@ -1520,6 +1576,7 @@ async fn submit_pull_preserves_unspecified_artifact_for_canonical_path() {
 async fn protected_priority_pull_is_admitted_when_default_band_is_full() {
     let (db, worker) = test_worker();
     let request = |name: &str, priority: i32| PullFileRequest {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: format!("s3://bucket/snapshots/a/{name}?region=us-east-2"),
         local_path: format!("/space/cache/sandboxes/sbx/snapshot/{name}"),

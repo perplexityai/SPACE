@@ -547,6 +547,9 @@ impl TemplateManagerService {
         &self,
         template: &str,
     ) -> SnapshotReconcileOutcome {
+        if !self.background_template_in_scope(template) {
+            return SnapshotReconcileOutcome::default();
+        }
         let template = template.to_string();
         let reconcile_lock = {
             let mut locks = match self.snapshot_reconcile_locks.lock() {

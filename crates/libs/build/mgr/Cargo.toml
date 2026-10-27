@@ -12,6 +12,7 @@ workspace = true
 
 [features]
 default = []
+experimental-chunked-templates = ["dep:pplx-space-template-mgr", "dep:pplx-space-sqlite", "dep:rusqlite"]
 aws-ecr = ["dep:aws-config", "dep:aws-sdk-ecr"]
 otel = ["pplx-space-template-mgr-client/otel"]
 datadog = ["otel", "pplx-space-template-mgr-client/datadog"]
@@ -28,6 +29,7 @@ jiff = { workspace = true }
 oci-spec = { workspace = true, features = ["image"] }
 object = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }
+rusqlite = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 semver = { workspace = true }
@@ -41,6 +43,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 # internal
+pplx-space-sqlite = { workspace = true, optional = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-svc = { workspace = true }
@@ -54,6 +57,7 @@ pplx-space-object-store = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
+pplx-space-template-mgr = { workspace = true, optional = true, features = ["experimental-chunked-templates"] }
 
 [dev-dependencies]
 libc = { workspace = true }

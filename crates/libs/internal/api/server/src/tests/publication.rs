@@ -17,6 +17,7 @@ async fn publication_requires_authenticated_authority_before_any_write() -> Test
     assert_eq!(error.code(), Code::PermissionDenied);
     let error = service
         .register_template_release(Request::new(RegisterTemplateReleaseRequest {
+            chunk_representations: Vec::new(),
             system_publication_grant_id: None,
             tenant_publication_grant_id: None,
             template_name: "seed".into(),

@@ -148,6 +148,67 @@ pub fn copy_on_descriptors(source: &File, destination: &File, len: u64) -> io::R
     copy_contents(source, destination, len, false)
 }
 
+/// Clone a bounded extent between pinned files, falling back to an exact copy
+/// when this filesystem or extent layout cannot reflink. The caller owns the
+/// destination range and keeps the source immutable for the whole operation.
+pub fn copy_range_on_descriptors(
+    source: &File,
+    source_offset: u64,
+    destination: &File,
+    destination_offset: u64,
+    length: u64,
+) -> io::Result<bool> {
+    let source_length = source.metadata()?.len();
+    let destination_length = destination.metadata()?.len();
+    if length == 0
+        || source_offset
+            .checked_add(length)
+            .is_none_or(|end| end > source_length)
+        || destination_offset
+            .checked_add(length)
+            .is_none_or(|end| end > destination_length)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "extent exceeds its pinned file bounds",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let range = libc::file_clone_range {
+            src_fd: i64::from(source.as_raw_fd()),
+            src_offset: source_offset,
+            src_length: length,
+            dest_offset: destination_offset,
+        };
+        // SAFETY: the UAPI struct and both borrowed descriptors remain live
+        // through the synchronous kernel copy. Only destination data changes.
+        if unsafe { libc::ioctl(destination.as_raw_fd(), libc::FICLONERANGE, &range) } == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EXDEV | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ENOSYS)
+        ) {
+            return Err(error);
+        }
+    }
+    let mut buffer = vec![0_u8; length.min(1 << 20) as usize];
+    let mut copied = 0;
+    while copied < length {
+        let count = (length - copied).min(buffer.len() as u64) as usize;
+        let span = buffer
+            .get_mut(..count)
+            .ok_or_else(|| io::Error::other("copy buffer capacity was exceeded"))?;
+        source.read_exact_at(span, source_offset + copied)?;
+        destination.write_all_at(span, destination_offset + copied)?;
+        copied += count as u64;
+    }
+    Ok(false)
+}
+
 fn copy_contents(
     source: &File,
     destination: &File,

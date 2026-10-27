@@ -1,3 +1,4 @@
+mod chunk_representations;
 mod prefetch_catalog;
 mod reconcile_claim_origins;
 mod runtime_desired_state;
@@ -388,6 +389,7 @@ async fn register_release(
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            chunk_representations: Vec::new(),
             system_publication_grant_id: None,
             tenant_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
@@ -412,6 +414,7 @@ async fn register_release_with_execution(
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            chunk_representations: Vec::new(),
             system_publication_grant_id: None,
             tenant_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
@@ -826,6 +829,7 @@ async fn build_release_keeps_the_submitting_org_and_rejects_another_owner() -> T
     let name = format!("owned-build-{}", Uuid::now_v7());
     register_template_with_org(&fixture.service, &name, Some(OrgId::from_uuid(owner))).await?;
     let request = RegisterTemplateReleaseRequest {
+        chunk_representations: Vec::new(),
         system_publication_grant_id: None,
         tenant_publication_grant_id: None,
         template_name: name.clone(),
@@ -844,6 +848,7 @@ async fn build_release_keeps_the_submitting_org_and_rejects_another_owner() -> T
     let rejected = fixture
         .service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            chunk_representations: Vec::new(),
             org_id: Some(other.to_string()),
             ..request
         }))
@@ -1083,6 +1088,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let retagged = fixture
         .service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            chunk_representations: Vec::new(),
             system_publication_grant_id: None,
             tenant_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
@@ -1286,6 +1292,7 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
         let error = fixture
             .service
             .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+                chunk_representations: Vec::new(),
                 system_publication_grant_id: None,
                 tenant_publication_grant_id: None,
                 template_name: "code-runtime".into(),

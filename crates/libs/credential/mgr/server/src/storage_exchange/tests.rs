@@ -87,6 +87,71 @@ fn template_request(template: &TemplateName, scope: &str) -> ExchangeTokenReques
     }
 }
 
+#[tokio::test]
+async fn chunk_namespace_credentials_are_template_scoped_and_conditional_create_only() {
+    let template = TemplateName::parse("chunk-fixture").unwrap();
+    let store = TestStore {
+        templates: HashMap::from([(template.clone(), None)]),
+        ..Default::default()
+    };
+    let mut request = template_request(
+        &template,
+        &format!("{STORAGE_READ_SCOPE} {STORAGE_WRITE_SCOPE}"),
+    );
+    request.resource = format!("arn:aws:s3:::fixture/templates/{template}/chunks/v1/*");
+    let builder = caller(ClientService::BuildManager, "builder", "uid");
+    let authorized = authorize_exchange(&store, &builder, request.clone())
+        .await
+        .unwrap();
+    let policy: serde_json::Value =
+        serde_json::from_str(&authorized.session_policy().unwrap()).unwrap();
+    let statements = policy["Statement"].as_array().unwrap();
+    assert_eq!(statements.len(), 2);
+    assert_eq!(
+        statements[0]["Action"],
+        serde_json::json!(["s3:GetObject", "s3:GetObjectVersion"])
+    );
+    assert_eq!(statements[1]["Action"], "s3:PutObject");
+    assert_eq!(
+        statements[1]["Condition"],
+        serde_json::json!({"StringEquals":{"s3:if-none-match":"*"}})
+    );
+    authorize_exchange(
+        &store,
+        &caller(ClientService::VolumeManager, "worker", "uid"),
+        request.clone(),
+    )
+    .await
+    .unwrap_err();
+    for key in [
+        "templates/another/chunks/v1/*".to_string(),
+        format!("templates/{template}/chunks/v1/rootfs.ext4"),
+        format!("templates/{template}/chunks/v1/p-short.zstpack"),
+        format!(
+            "templates/{template}/chunks/v1/nested/p-{}.zstpack",
+            "a".repeat(64)
+        ),
+    ] {
+        let mut malformed = request.clone();
+        malformed.resource = format!("arn:aws:s3:::fixture/{key}");
+        authorize_exchange(&store, &builder, malformed)
+            .await
+            .unwrap_err();
+    }
+    request.scope = Some(STORAGE_READ_SCOPE.into());
+    request.resource = format!(
+        "arn:aws:s3:::fixture/templates/{template}/chunks/v1/p-{}.zstpack",
+        "a".repeat(64)
+    );
+    authorize_exchange(
+        &store,
+        &caller(ClientService::VolumeManager, "worker", "uid"),
+        request,
+    )
+    .await
+    .unwrap();
+}
+
 fn sandbox_request(sandbox_id: SandboxId) -> ExchangeTokenRequest {
     let sandbox = sandbox_id.to_string();
     let snapshot = uuid::Uuid::now_v7();
@@ -812,6 +877,7 @@ fn session_policy_is_exact_and_enforces_the_sts_size_limit() {
     )
     .unwrap();
     let authorized = AuthorizedExchange {
+        immutable_chunks: false,
         actor: parsed.actor,
         subject: parsed.subject,
         resource: parsed.resource,
@@ -855,6 +921,7 @@ fn session_policy_is_exact_and_enforces_the_sts_size_limit() {
     );
 
     let oversized = AuthorizedExchange {
+        immutable_chunks: false,
         resource: S3Resource {
             bucket: "space-snapshots".into(),
             key: format!("{}/object", "a".repeat(1_890)),
@@ -877,6 +944,7 @@ fn ambient_or_static_credentials_are_never_a_vend_result() {
     )
     .unwrap();
     let authorized = AuthorizedExchange {
+        immutable_chunks: false,
         actor: parsed.actor,
         subject: parsed.subject,
         resource: parsed.resource,

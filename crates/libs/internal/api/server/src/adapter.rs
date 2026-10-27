@@ -342,6 +342,11 @@ impl ClusterApi for ClusterApiService {
             None => Vec::new(),
         };
         let execution_metadata = validated_execution_metadata(request.execution.as_ref())?;
+        let representations = super::template_chunks::validate(
+            request.chunk_representations,
+            &hash,
+            &self.trusted_template_storage,
+        )?;
 
         let mut tx = self
             .pool
@@ -380,7 +385,7 @@ impl ClusterApi for ClusterApiService {
         let release_org_id = self
             .lock_template_for_publication(&mut tx, &template_name, template_org)
             .await?;
-        let release = ensure_template_release(
+        let mut release = ensure_template_release(
             &mut tx,
             template_name.as_str(),
             runtime,
@@ -389,6 +394,10 @@ impl ClusterApi for ClusterApiService {
             execution_metadata.as_ref(),
         )
         .await?;
+
+        release.chunk_representations = sqlx::types::Json(
+            super::template_chunks::attach(&mut tx, release.id, &representations).await?,
+        );
 
         let mut tag_rows = Vec::with_capacity(tags.len());
         for tag in &tags {
@@ -467,6 +476,13 @@ impl ClusterApi for ClusterApiService {
                 runtime: first.release_type.clone(),
                 hash: first.release_hash.clone(),
                 created_at: format_time(first.release_created_at),
+                chunk_representations: first
+                    .chunk_representations
+                    .0
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
             },
             None => {
                 return Err(Status::not_found("template release not found"));
@@ -560,6 +576,13 @@ impl ClusterApi for ClusterApiService {
                 runtime: first.release_type.clone(),
                 hash: first.release_hash.clone(),
                 created_at: format_time(first.release_created_at),
+                chunk_representations: first
+                    .chunk_representations
+                    .0
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
             },
             None => {
                 return Err(Status::not_found("template release not found"));
@@ -631,6 +654,11 @@ impl ClusterApi for ClusterApiService {
                     runtime: release.runtime,
                     hash: release.hash,
                     created_at: format_time(release.created_at),
+                    chunk_representations: release
+                        .chunk_representations
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                 }),
                 storage_locations: release
                     .storage_locations

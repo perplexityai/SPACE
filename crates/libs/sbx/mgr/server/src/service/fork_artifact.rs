@@ -645,6 +645,7 @@ async fn pull_object(
 ) -> Result<u64, Status> {
     let response = bounded_transfer(
         volmgr.pull_file(PullFileRequest {
+            object_range: None,
             subject_id: format!("sandbox:{sandbox_id}"),
             s3_uri: artifact_uri(config, artifact),
             local_path: local_path.to_string_lossy().into_owned(),

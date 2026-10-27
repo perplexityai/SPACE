@@ -36,6 +36,8 @@ mod attempts;
 mod content_md5;
 mod copy;
 mod download;
+mod immutable;
+pub use immutable::ImmutablePut;
 #[cfg(test)]
 mod test_support;
 mod timeouts;
@@ -265,6 +267,20 @@ struct RangedDownloadPlan<'a> {
 /// instance can serve any bucket in any region.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Conditional create of a bounded content-addressed object. An existing
+    /// object is acknowledged only after checking its full bytes; no overwrite
+    /// or multipart fallback is allowed.
+    async fn put_immutable_file(
+        &self,
+        _creds: &ObjectCredentials,
+        _target: ObjectTarget<'_>,
+        _source: &Path,
+        _digest: pplx_space_common_core::types::Digest,
+    ) -> Result<ImmutablePut, ObjectStoreError> {
+        Err(ObjectStoreError::Put(
+            "immutable create is unsupported by this backend".into(),
+        ))
+    }
     /// Select this capability before starting a producer. Unsupported backends
     /// keep their file-backed path; there is no implicit buffering fallback.
     fn streaming_upload(&self) -> Option<&dyn StreamingUpload> {
@@ -334,6 +350,20 @@ pub trait ObjectStore: Send + Sync {
         target: ObjectTarget<'_>,
         dst: &Path,
     ) -> Result<u64, ObjectStoreError>;
+
+    /// Download only the declared bytes, validating Content-Range, object EOF,
+    /// optional version and exact body length. There is no full-object fallback.
+    async fn get_file_range(
+        &self,
+        _creds: &ObjectCredentials,
+        _target: ObjectTarget<'_>,
+        _dst: &Path,
+        _range: &pplx_space_common_core::types::ObjectByteRange,
+    ) -> Result<u64, ObjectStoreError> {
+        Err(ObjectStoreError::Get(
+            "this backend does not support exact object ranges".into(),
+        ))
+    }
 
     /// Like [`Self::get_file`], but applies `stream`'s transform inline on
     /// the ranged single-writer path so `dst` receives transformed (e.g.
@@ -892,6 +922,60 @@ impl S3ObjectStore {
 
 #[async_trait]
 impl ObjectStore for S3ObjectStore {
+    async fn put_immutable_file(
+        &self,
+        creds: &ObjectCredentials,
+        target: ObjectTarget<'_>,
+        source: &Path,
+        digest: pplx_space_common_core::types::Digest,
+    ) -> Result<ImmutablePut, ObjectStoreError> {
+        self.create_immutable_file(creds, target, source, digest)
+            .await
+    }
+    async fn get_file_range(
+        &self,
+        creds: &ObjectCredentials,
+        target: ObjectTarget<'_>,
+        dst: &Path,
+        range: &pplx_space_common_core::types::ObjectByteRange,
+    ) -> Result<u64, ObjectStoreError> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let response = self
+            .base
+            .get_object()
+            .bucket(target.bucket)
+            .key(target.key)
+            .range(range.request_header())
+            .set_version_id(range.version_id().map(str::to_owned))
+            .customize()
+            .config_override(self.op_config(creds, &target, S3Operation::GetObject))
+            .send()
+            .await
+            .map_err(|error| classify_get_error(error, target.bucket, target.key))?;
+        if response.content_range() != Some(range.response_header().as_str())
+            || response.content_length() != Some(range.length() as i64)
+            || range
+                .version_id()
+                .is_some_and(|expected| response.version_id() != Some(expected))
+        {
+            return Err(ObjectStoreError::Get(
+                "object range response disagrees with its authenticated bounds or version".into(),
+            ));
+        }
+        let mut source = response.body.into_async_read().take(range.length() + 1);
+        let mut output = tokio::fs::File::create(dst).await?;
+        let received = tokio::io::copy(&mut source, &mut output).await?;
+        if received != range.length() {
+            return Err(ObjectStoreError::RangeLengthMismatch {
+                range: range.request_header(),
+                got: received as usize,
+                expected: range.length(),
+            });
+        }
+        output.flush().await?;
+        Ok(received)
+    }
+
     fn streaming_upload(&self) -> Option<&dyn StreamingUpload> {
         Some(self)
     }
@@ -2299,5 +2383,7 @@ impl Drop for AbortGuard {
     }
 }
 
+#[cfg(test)]
+mod range_tests;
 #[cfg(test)]
 mod tests;

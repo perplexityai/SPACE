@@ -59,6 +59,9 @@
 //!   addressing.
 
 use crate::rootfs_backing::RootfsBackingPolicy;
+
+#[cfg(feature = "experimental-chunked-templates")]
+pub(crate) mod experimental;
 use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -338,6 +341,8 @@ pub enum PullOutcome {
 #[derive(Clone, Default)]
 pub struct VolumePuller {
     pub(crate) backing_policy: RootfsBackingPolicy,
+    #[cfg(feature = "experimental-chunked-templates")]
+    pub(crate) delivery: Option<experimental::Config>,
     in_flight: Arc<Mutex<HashMap<PullKey, Arc<InFlightPull>>>>,
     /// Optional handle to tmplmgr's shared durable background worker
     /// (see [`crate::background_jobs`]). When set, `try_pull_from`
@@ -367,6 +372,8 @@ impl VolumePuller {
     ) -> Self {
         Self {
             backing_policy: RootfsBackingPolicy::default(),
+            #[cfg(feature = "experimental-chunked-templates")]
+            delivery: None,
             in_flight: Arc::default(),
             background_worker: Some(background_worker),
         }
@@ -487,13 +494,7 @@ impl VolumePuller {
             .unwrap_or_else(Instant::now);
         let tags = pull_metric_tags(spec.name, spec.req_hash, spec.req_tag, spec.trigger);
         let result = self
-            .pull_resolved(
-                db,
-                spec.name.to_string(),
-                release.hash,
-                release.storage_uris,
-                &tags,
-            )
+            .pull_resolved(db, spec.name.to_string(), release, &tags)
             .await;
         let outcome = result.outcome.into_outcome();
 
@@ -510,10 +511,10 @@ impl VolumePuller {
         &self,
         db: Arc<std::sync::Mutex<rusqlite::Connection>>,
         name: String,
-        resolved_hash: String,
-        storage_uris: Vec<String>,
+        release: ResolvedRelease,
         base_tags: &[String],
     ) -> PullTaskResult {
+        let resolved_hash = &release.hash;
         let key = PullKey::new(name.clone(), resolved_hash.clone());
         loop {
             let (flight, started) = self.start_or_join_flight(key.clone());
@@ -525,11 +526,15 @@ impl VolumePuller {
                 );
                 let db = Arc::clone(&db);
                 let name = name.clone();
-                let resolved_hash = resolved_hash.clone();
-                let storage_uris = storage_uris.clone();
+                let release = release.clone();
                 let base_tags = base_tags.to_vec();
                 let background_worker = self.background_worker.clone();
                 let backing_policy = self.backing_policy;
+                #[cfg(feature = "experimental-chunked-templates")]
+                let delivery = self
+                    .delivery
+                    .as_ref()
+                    .and_then(|config| config.for_template(&name));
                 // The caller that starts the pull waits for it below, so the
                 // pull runs under that caller's span.
                 tokio::spawn(
@@ -537,11 +542,12 @@ impl VolumePuller {
                         let (outcome, path_taken) = pull_resolved_owner(
                             db,
                             &name,
-                            &resolved_hash,
-                            &storage_uris,
+                            &release,
                             &base_tags,
                             background_worker.as_ref(),
                             backing_policy,
+                            #[cfg(feature = "experimental-chunked-templates")]
+                            delivery,
                         )
                         .await;
                         guard.finish(PullTaskResult::new(&outcome, path_taken));
@@ -832,26 +838,11 @@ async fn pull_inner(
         return PullOutcome::ClassifiedFailure(PullFailure::TemplateNotGeneric);
     }
 
-    let ResolvedRelease {
-        hash: resolved_hash,
-        storage_uris,
-        ..
-    } = release;
-
-    // Record the resolved hash on the surrounding `pull` span so every log
-    // line emitted below this point carries both `template` and `content_hash`
-    // automatically — without us threading them as explicit parameters through
-    // every helper.
-    tracing::Span::current().record("content_hash", resolved_hash.as_str());
-    info!(
-        template = name,
-        content_hash = %resolved_hash,
-        storage_locations = storage_uris.len(),
-        "resolved template release; starting pull"
-    );
-
+    tracing::Span::current().record("content_hash", release.hash.as_str());
+    info!(template = name, content_hash = %release.hash,
+        storage_locations = release.storage_uris.len(), "resolved template release; starting pull");
     let result = puller
-        .pull_resolved(db, name.to_string(), resolved_hash, storage_uris, base_tags)
+        .pull_resolved(db, name.to_string(), release, base_tags)
         .await;
     *path_taken = result.path;
     result.outcome.into_outcome()
@@ -901,8 +892,7 @@ fn record_phase(base_tags: &[String], phase: &'static str, result: &'static str,
 async fn pull_resolved_owner(
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     name: &str,
-    resolved_hash: &str,
-    storage_uris: &[String],
+    release: &ResolvedRelease,
     base_tags: &[String],
     background_worker: Option<
         &pplx_space_common_jobs::BackgroundWorker<
@@ -910,7 +900,25 @@ async fn pull_resolved_owner(
         >,
     >,
     backing_policy: RootfsBackingPolicy,
+    #[cfg(feature = "experimental-chunked-templates")] delivery: Option<experimental::Selection>,
 ) -> (PullOutcome, PullPath) {
+    #[cfg(feature = "experimental-chunked-templates")]
+    if let Some(selection) = delivery {
+        let result =
+            experimental::pull(db, name, release, selection, backing_policy, base_tags).await;
+        return match result {
+            Ok(path) => (PullOutcome::Materialized, path),
+            Err(status) => (
+                PullOutcome::DownstreamFailure {
+                    failure: PullFailure::StorageUnavailable,
+                    status,
+                },
+                PullPath::FreshPull,
+            ),
+        };
+    }
+    let resolved_hash = release.hash.as_str();
+    let storage_uris = &release.storage_uris;
     // DB fast-path: a prior call (or startup recovery) already committed
     // this build. This check intentionally runs inside the owner task too:
     // a caller may have won the flight after another caller finished between
@@ -1017,7 +1025,9 @@ fn classify_find_release_status(status: Status) -> FindReleaseError {
 
 /// An immutable release resolved by ClusterApi, authorized when caller-scoped.
 /// `visibility` is advisory prefetch metadata, not authorization evidence.
+#[derive(Clone)]
 pub(crate) struct ResolvedRelease {
+    pub(crate) chunks: Vec<pplx_space_node_api_client::chunk_representation::ChunkRepresentation>,
     pub(crate) hash: String,
     pub(crate) storage_uris: Vec<String>,
     pub(crate) visibility: TemplateVisibility,
@@ -1180,7 +1190,24 @@ fn parse_release_response(
             "release is local-only; no object-store storage_locations registered"
         );
     }
+    let chunks = release
+        .chunk_representations
+        .into_iter()
+        .map(pplx_space_node_api_client::chunk_representation::ChunkRepresentation::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| FindReleaseError::InvalidResponse)?;
+    if chunks.len() > 5
+        || chunks.iter().enumerate().any(|(i, item)| {
+            chunks.iter().take(i).any(|previous| {
+                previous.chunk_size() == item.chunk_size()
+                    || previous.image_blake3() != item.image_blake3()
+            })
+        })
+    {
+        return Err(FindReleaseError::InvalidResponse);
+    }
     Ok(ResolvedRelease {
+        chunks,
         hash: hash.to_string(),
         storage_uris,
         visibility,
@@ -1413,6 +1440,41 @@ async fn try_pull_from(
     >,
     backing_policy: RootfsBackingPolicy,
 ) -> Result<(), PullError> {
+    let result = try_pull_from_inner(
+        Arc::clone(&db),
+        name,
+        content_hash,
+        parts,
+        base_tags,
+        background_worker,
+        backing_policy,
+    )
+    .await;
+    if result.is_err() {
+        cleanup_failed_pull(
+            &db,
+            name,
+            content_hash,
+            Path::new(&format!("{TEMPLATE_DIR}/{name}/{content_hash}")),
+        )
+        .await;
+    }
+    result
+}
+
+async fn try_pull_from_inner(
+    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    name: &str,
+    content_hash: &str,
+    parts: &StorageUri,
+    base_tags: &[String],
+    background_worker: Option<
+        &pplx_space_common_jobs::BackgroundWorker<
+            crate::background_jobs::TemplateBackgroundExecutor,
+        >,
+    >,
+    backing_policy: RootfsBackingPolicy,
+) -> Result<(), PullError> {
     // Parse the template name into the typed identity that becomes the
     // SubjectId we hand to volume-manager. This is also the *only* boundary
     // parse we need on the local-input side; credmgr-side identity (AWS STS
@@ -1452,15 +1514,6 @@ async fn try_pull_from(
     }
     let digest_dir = format!("{TEMPLATE_DIR}/{name}/{content_hash}");
     let digest_dir_existed = Path::new(&digest_dir).exists();
-    // Arm the cleanup guard before any subvolume create / file write
-    // touches the digest dir. Any error path below — including the
-    // create_subvolume fallback's plain-dir path, vol-mgr connect
-    // failure, manifest parse failure, hash mismatch, and atomic write
-    // failure — drops the guard, which wipes the dir so the next
-    // caller's `digest_dir_existed` adoption can't pick up partial
-    // bytes. Disarmed below right before the final `Ok(())` once the
-    // sqlite upsert has committed.
-    let cleanup_guard = PullCleanupGuard::new(name, content_hash, &digest_dir);
     if !digest_dir_existed {
         // Create the digest dir as a btrfs subvolume via node-manager.
         // The ioctl requires CAP_SYS_ADMIN, so delegate to privileged
@@ -1536,7 +1589,8 @@ async fn try_pull_from(
         PullOptions::control("manifest"),
         base_tags,
     );
-    let (meta_bytes, man_bytes) = tokio::try_join!(metadata_fut, manifest_fut)?;
+    let (meta_result, manifest_result) = tokio::join!(metadata_fut, manifest_fut);
+    let (meta_bytes, man_bytes) = (meta_result?, manifest_result?);
     pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), meta_bytes);
     pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), man_bytes);
 
@@ -1627,11 +1681,8 @@ async fn try_pull_from(
         "vol-mgr pull plan resolved from manifest"
     );
 
-    // 4. Parallel-pull every entry in the plan. `try_join_all` mirrors
-    //    the previous `try_join!`'s short-circuit semantics: the first
-    //    failure aborts the join and the remaining pulls keep running on
-    //    vol-mgr's side (vol-mgr's `BackgroundWorker` doesn't observe our
-    //    cancellation).
+    // 4. Drain every parallel transfer before cleanup or releasing the owner
+    // flight. A failed sibling must not cancel our wait for another transfer.
     let pull_futs: Vec<_> = pull_plan
         .iter()
         .map(|entry| {
@@ -1645,7 +1696,10 @@ async fn try_pull_from(
             )
         })
         .collect();
-    let pull_bytes = futures_util::future::try_join_all(pull_futs).await?;
+    let pull_bytes = futures_util::future::join_all(pull_futs)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
     for bytes in &pull_bytes {
         pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), *bytes);
     }
@@ -1701,7 +1755,6 @@ async fn try_pull_from(
         // and silently upsert a `state=ready` DB row pointing at
         // unverified bytes. Wipe the dir so recovery declines and a fresh
         // pull is forced.
-        cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(&digest_dir)).await;
         return Err(PullError::HashMismatch {
             expected: content_hash.to_string(),
             actual: rootfs_outcome.rootfs_hash,
@@ -1902,7 +1955,6 @@ async fn try_pull_from(
                 "materialized template build from object-store volume"
             );
             crate::node_state_sync::mark_template_dirty(&db_for_mark, name);
-            cleanup_guard.disarm();
             Ok(())
         }
         Ok(Err(err)) => {
@@ -2218,33 +2270,15 @@ async fn recover_from_digest_dir(
 /// be present, so removing `rootfs.ext4` alone is enough) even when
 /// the empty subvolume root persists.
 ///
-/// Subvolume-aware order:
-///  1. If RO (a prior install ran far enough to flip it), clear the
-///     flag first — `btrfs subvolume delete` rejects RO targets.
-///  2. Try `delete_subvolume_if_present`. On non-btrfs hosts / plain-dir
-///     installs this returns an error, which we tolerate and fall
-///     through to `remove_dir_all` for the directory case.
-///  3. Plain `remove_dir_all` as the fallback path.
+/// Delete a read-only subvolume directly. If the privileged operation is
+/// unavailable, retain it for retry rather than clearing its protection.
 pub(crate) fn cleanup_digest_dir_sync(digest_dir: &Path) -> std::io::Result<()> {
     if !digest_dir.exists() {
         return Ok(());
     }
     if pplx_space_common_core::host::btrfs::is_subvolume(digest_dir) {
-        // The RO clear is what makes both delete attempts below
-        // possible on an installed (read-only) build; a refusal here
-        // means the `remove_dir_all` fallthrough will EROFS, so record
-        // it — otherwise that EROFS is indistinguishable from the
-        // pre-subvolume-aware bug this path fixed.
-        if let Err(err) = pplx_space_common_core::host::btrfs::set_readonly(digest_dir, false) {
-            warn!(
-                dir = %digest_dir.display(),
-                %err,
-                "clearing subvolume read-only flag failed ahead of local delete"
-            );
-        }
-        if pplx_space_common_core::host::btrfs::delete_subvolume_if_present(digest_dir).is_ok() {
-            return Ok(());
-        }
+        return pplx_space_common_core::host::btrfs::delete_subvolume_if_present(digest_dir)
+            .map_err(std::io::Error::other);
     }
     std::fs::remove_dir_all(digest_dir)
 }
@@ -2259,139 +2293,44 @@ async fn cleanup_digest_dir_local_fallback(digest_dir: PathBuf) -> std::io::Resu
         .map_err(|join_err| std::io::Error::other(format!("spawn_blocking join: {join_err}")))?
 }
 
-async fn cleanup_digest_dir_after_hash_mismatch(name: &str, content_hash: &str, digest_dir: &Path) {
-    match crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash).await {
-        Ok(()) => {
-            info!(
-                dir = %digest_dir.display(),
-                reason = "hash_mismatch",
-                "removed digest dir to prevent recovery from adopting bad bytes (via nodemgr)"
-            );
-            return;
-        }
-        Err(err) => warn!(
-            error = %err,
-            dir = %digest_dir.display(),
-            "nodemgr delete_template_subvolume failed after hash mismatch; trying local fallback"
-        ),
-    }
-    // Local fallback: even if the privileged subvolume-delete path
-    // EPERMs (production tmplmgr is non-root), the recursive
-    // file-removal still wipes the artifact files so the next call's
-    // recovery cannot mistake unverified bytes for a ready build.
-    if let Err(err) = cleanup_digest_dir_local_fallback(digest_dir.to_path_buf()).await {
-        warn!(
-            error = %err,
-            dir = %digest_dir.display(),
-            "local fallback cleanup also failed after hash mismatch; recovery may adopt bad bytes on the next call"
-        );
-    } else {
-        info!(
-            dir = %digest_dir.display(),
-            reason = "hash_mismatch",
-            "removed digest dir via local fallback after nodemgr RPC failed"
-        );
-    }
-}
-
-/// Best-effort RAII cleanup for an in-flight `pull_inner` digest dir.
-///
-/// On entry, `pull_inner` creates the digest dir (as a btrfs subvolume
-/// when possible) and proceeds through ~14 fallible steps — vol-mgr
-/// connect, metadata + manifest fetch, hash verify, manifest rewrite,
-/// permission normalization, …, sqlite upsert. Without a guard, any
-/// `return Err` between subvolume create and the final upsert leaks an
-/// empty subvolume that the next retry adopts via `digest_dir_existed`,
-/// permanently blocking a clean install of that `(name, content_hash)`.
-///
-/// The guard is armed at digest-dir creation and explicitly
-/// [`Self::disarm`]ed right before `pull_inner` returns `Ok(())`. On any
-/// other exit path, Drop spawns an async `BtrfsDeleteTemplateSubvolume`
-/// RPC against node-manager — fire-and-forget on the calling tokio
-/// runtime. Drop itself is sync (Rust requirement) so it can't await;
-/// the spawn means the cleanup runs eventually unless the runtime is
-/// already shutting down, in which case the next pull's recovery
-/// catches up via `cleanup_digest_dir_after_hash_mismatch`.
-struct PullCleanupGuard {
-    name: String,
-    content_hash: String,
-    digest_dir: Option<PathBuf>,
-}
-
-impl PullCleanupGuard {
-    fn new(name: &str, content_hash: &str, digest_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            name: name.to_string(),
-            content_hash: content_hash.to_string(),
-            digest_dir: Some(digest_dir.into()),
-        }
-    }
-
-    /// Mark the install successful. Drop becomes a no-op.
-    fn disarm(mut self) {
-        self.digest_dir = None;
-    }
-}
-
-impl Drop for PullCleanupGuard {
-    fn drop(&mut self) {
-        let Some(dir) = self.digest_dir.take() else {
-            return;
-        };
-        let name = std::mem::take(&mut self.name);
-        let content_hash = std::mem::take(&mut self.content_hash);
-
-        // Cleanup goes through node-manager (the privileged delete
-        // path). Drop must be sync, so we spawn a fire-and-forget
-        // task on the current tokio runtime. If no runtime is
-        // available (Drop fired outside an async context — shouldn't
-        // happen during pull_inner, but be defensive), the next
-        // pull's hash-mismatch / recovery cleanup catches up.
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            warn!(
-                dir = %dir.display(),
-                template = %name,
-                content_hash = %content_hash,
-                "PullCleanupGuard fired outside a tokio runtime; partial \
-                 digest dir may remain until the next recovery pass picks it up"
-            );
-            return;
-        };
-        handle.spawn(async move {
-            match crate::btrfs_via_nodemgr::delete_template_subvolume(&name, &content_hash).await {
-                Ok(()) => {
-                    info!(
-                        dir = %dir.display(),
-                        reason = "pull_failed",
-                        "removed digest dir on pull failure (via nodemgr)"
-                    );
-                    return;
-                }
-                Err(err) => warn!(
-                    error = %err,
-                    dir = %dir.display(),
-                    "nodemgr delete_template_subvolume failed on pull failure; trying local fallback"
-                ),
-            }
-            // Same fallback as `cleanup_digest_dir_after_hash_mismatch`:
-            // wipe the artifact files locally so the next pull's
-            // recovery doesn't adopt partial bytes when the nodemgr
-            // RPC is transiently unavailable.
-            if let Err(err) = cleanup_digest_dir_local_fallback(dir.clone()).await {
-                warn!(
-                    error = %err,
-                    dir = %dir.display(),
-                    "local fallback cleanup also failed on pull failure; \
-                     recovery may adopt partial bytes on the next call"
-                );
-            } else {
-                info!(
-                    dir = %dir.display(),
-                    reason = "pull_failed",
-                    "removed digest dir via local fallback after nodemgr RPC failed"
-                );
-            }
+/// Complete cleanup while the owning flight still excludes retries. A dropped
+/// owner leaves unadmitted files for recovery, never a delayed deletion task.
+async fn cleanup_failed_pull(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    name: &str,
+    hash: &str,
+    directory: &Path,
+) {
+    #[cfg(feature = "experimental-chunked-templates")]
+    {
+        let removable = db.lock().ok().and_then(|conn| {
+            crate::chunked_rootfs::cache::store::begin_retirement(&conn, name, hash).ok()
         });
+        if removable != Some(true) {
+            warn!(
+                template = name,
+                content_hash = hash,
+                "failed pull cleanup deferred: source leased or database unavailable"
+            );
+            return;
+        }
+    }
+    #[cfg(not(feature = "experimental-chunked-templates"))]
+    let _ = db;
+    if let Err(error) = crate::btrfs_via_nodemgr::delete_template_subvolume(name, hash).await {
+        warn!(%error, template = name, "failed pull privileged cleanup failed; trying local delete");
+        if let Err(error) = cleanup_digest_dir_local_fallback(directory.to_path_buf()).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%error, template = name, "failed pull cleanup retained for recovery");
+            return;
+        }
+    }
+    #[cfg(feature = "experimental-chunked-templates")]
+    if let Ok(conn) = db.lock()
+        && let Err(error) = crate::db::delete_build(&conn, name, hash)
+    {
+        warn!(%error, template = name, "could not finish failed pull retirement");
     }
 }
 
@@ -2498,6 +2437,7 @@ fn build_pull_file_request(
     options: PullOptions,
 ) -> PullFileRequest {
     PullFileRequest {
+        object_range: None,
         subject_id,
         s3_uri,
         local_path,
@@ -2820,8 +2760,6 @@ async fn materialize_rootfs(
                         );
                     }
                 }
-                cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(digest_dir))
-                    .await;
                 return Err(error);
             }
         }
@@ -2871,8 +2809,6 @@ async fn materialize_rootfs(
                     actual = %actual,
                     "decoded bytes disagree with the manifest's expanded digest"
                 );
-                cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(digest_dir))
-                    .await;
                 return Err(PullError::HashMismatch { expected, actual });
             }
             Ok(Err(error)) => {
@@ -2919,7 +2855,6 @@ async fn materialize_rootfs(
                 actual = %stats.compressed_hash,
                 "manifest .zst digest mismatch — compressed object disagrees with manifest"
             );
-            cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(digest_dir)).await;
             return Err(PullError::HashMismatch {
                 expected: target.expected_compressed_digest.clone(),
                 actual: stats.compressed_hash,

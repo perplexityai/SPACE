@@ -318,6 +318,18 @@ fn execute_precheck(
         return Ok(PrecheckOutcome::SkipPinned);
     }
 
+    #[cfg(feature = "experimental-chunked-templates")]
+    if !crate::chunked_rootfs::cache::store::retire_in_transaction(
+        &tx,
+        &candidate.name,
+        &candidate.content_hash,
+    )? {
+        // Persist retirement to stop new chunk readers; leave existing readers
+        // and the backing untouched. A later eviction pass retries the build.
+        tx.commit()?;
+        return Ok(PrecheckOutcome::SkipActive);
+    }
+
     // Compare-and-swap: only proceed when the row is still
     // `state='ready'`. A zero-row UPDATE means the row was deleted
     // out from under us OR another path (manual delete, parallel
@@ -343,6 +355,12 @@ fn execute_precheck(
 /// ordering: snapshots first (FK-bound) then the build row.
 fn execute_finalize(conn: &Connection, candidate: &EvictionCandidate) -> rusqlite::Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    #[cfg(feature = "experimental-chunked-templates")]
+    crate::chunked_rootfs::cache::store::forget_retired(
+        &tx,
+        &candidate.name,
+        &candidate.content_hash,
+    )?;
     tx.execute(
         "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2",
         params![candidate.name, candidate.content_hash],
@@ -616,6 +634,14 @@ pub(crate) async fn reap_stuck_deleting(
                         &conn,
                         rusqlite::TransactionBehavior::Immediate,
                     )?;
+                    #[cfg(feature = "experimental-chunked-templates")]
+                    {
+                        if !crate::chunked_rootfs::cache::store::retire_in_transaction(&tx, &n, &h)?
+                        {
+                            return Ok(());
+                        }
+                        crate::chunked_rootfs::cache::store::forget_retired(&tx, &n, &h)?;
+                    }
                     tx.execute(
                         "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2",
                         params![n, h],

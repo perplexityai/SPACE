@@ -15,6 +15,7 @@ name = "space-buildmgr-svc"
 path = "src/main.rs"
 
 [features]
+experimental-chunked-templates = ["pplx-space-build-mgr-server/experimental-chunked-templates"]
 default = ["aws-ecr"]
 k8s = ["pplx-space-build-mgr-server/k8s"]
 aws-ecr = ["pplx-space-build-mgr-server/aws-ecr"]

@@ -305,7 +305,25 @@ async fn drop_invalid_digest_dir(
         reason = %rejection,
         "dropping invalid digest dir during startup recovery"
     );
+    #[cfg(feature = "experimental-chunked-templates")]
+    {
+        let removable = db.lock().ok().and_then(|conn| {
+            crate::chunked_rootfs::cache::store::begin_retirement(&conn, name, hash_name).ok()
+        });
+        if removable != Some(true) {
+            tracing::warn!(
+                template = name,
+                content_hash = hash_name,
+                "startup cleanup deferred because a verified source is leased or its registry is unavailable"
+            );
+            return;
+        }
+    }
     remove_digest_dir_from_disk(digest_dir).await;
+    if digest_dir.exists() {
+        // Keep the deletion fence until filesystem cleanup actually succeeds.
+        return;
+    }
     if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
         tracing::warn!(
             template = %name,
@@ -439,7 +457,7 @@ async fn reconcile_digest_dir_against_db(
     }
 }
 
-fn cleanup_transient_template_name_dirs() {
+fn cleanup_transient_template_name_dirs(service: &TemplateManagerService) {
     let Ok(entries) = std::fs::read_dir(TEMPLATE_DIR) else {
         return;
     };
@@ -451,6 +469,9 @@ fn cleanup_transient_template_name_dirs() {
         let Some(base) = name.strip_suffix(".old") else {
             continue;
         };
+        if !service.background_template_in_scope(base) {
+            continue;
+        }
         let final_dir = format!("{TEMPLATE_DIR}/{base}");
         if !Path::new(&final_dir).exists() {
             tracing::info!(
@@ -470,7 +491,7 @@ fn cleanup_transient_template_name_dirs() {
     }
 }
 
-fn cleanup_transient_digest_staging_dirs() {
+fn cleanup_transient_digest_staging_dirs(service: &TemplateManagerService) {
     let Ok(entries) = std::fs::read_dir(TEMPLATE_DIR) else {
         return;
     };
@@ -479,7 +500,10 @@ fn cleanup_transient_digest_staging_dirs() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name.ends_with(".old") {
+        if name.starts_with('.')
+            || name.ends_with(".old")
+            || !service.background_template_in_scope(&name)
+        {
             continue;
         }
         let Ok(sub_entries) = std::fs::read_dir(entry.path()) else {
@@ -610,12 +634,10 @@ async fn reconcile_base_snapshots_for_template(
     }
 }
 
-async fn prune_catalog_rows_missing_on_disk(
-    db: &Arc<Mutex<rusqlite::Connection>>,
-    artifact_store: &TemplateArtifactStore,
-) {
-    let db = Arc::clone(db);
-    let artifact_store = artifact_store.clone();
+async fn prune_catalog_rows_missing_on_disk(service: &TemplateManagerService) {
+    let service = service.clone();
+    let db = Arc::clone(&service.db);
+    let artifact_store = service.artifact_store.clone();
     match tokio::task::spawn_blocking(move || {
         let Ok(conn) = db.lock() else {
             tracing::warn!(
@@ -655,6 +677,9 @@ async fn prune_catalog_rows_missing_on_disk(
             }
         };
         for (name, content_hash) in &stuck {
+            if !service.background_template_in_scope(name) {
+                continue;
+            }
             if artifact_store.build_artifacts_missing(name, content_hash) {
                 tracing::info!(
                     template = %name,
@@ -678,6 +703,9 @@ async fn prune_catalog_rows_missing_on_disk(
 
         let builds = crate::db::list_builds(&conn).unwrap_or_default();
         for build in &builds {
+            if !service.background_template_in_scope(&build.name) {
+                continue;
+            }
             if artifact_store.build_artifacts_missing(&build.name, &build.content_hash) {
                 tracing::warn!(
                     template = %build.name,
@@ -690,6 +718,9 @@ async fn prune_catalog_rows_missing_on_disk(
 
         let remaining_builds = crate::db::list_builds(&conn).unwrap_or_default();
         for build in &remaining_builds {
+            if !service.background_template_in_scope(&build.name) {
+                continue;
+            }
             let snaps = crate::db::list_snapshots(&conn, &build.name, &build.content_hash)
                 .unwrap_or_default();
             for snap in &snaps {
@@ -715,6 +746,13 @@ async fn prune_catalog_rows_missing_on_disk(
         }
 
         drop(conn);
+        // Digest pin sweeping has node-wide scope. Leave existing pins alone
+        // during an explicitly scoped experiment; ordinary service mode keeps
+        // its normal sweep, and task build deletion still removes its pins.
+        #[cfg(feature = "experimental-chunked-templates")]
+        if service.volume_puller.delivery.is_some() {
+            return;
+        }
         match crate::pinned_digests::PinnedDigestsStore::new(Arc::clone(&db))
             .prune_without_local_builds()
         {
@@ -752,7 +790,7 @@ impl TemplateManagerService {
     /// cleanup path without running the full recovery sweep, and so the
     /// delete-template crash window has a single named hook.
     pub(super) async fn prune_stale_template_artifact_db_rows(&self) {
-        prune_catalog_rows_missing_on_disk(&self.db, &self.artifact_store).await;
+        prune_catalog_rows_missing_on_disk(self).await;
     }
 
     /// Spawn startup recovery without delaying the template-manager gRPC bind.
@@ -787,8 +825,8 @@ impl TemplateManagerService {
 
     /// Reconcile DB with disk and recover background loops needed after startup.
     pub async fn run_startup_recovery(&self) {
-        cleanup_transient_template_name_dirs();
-        cleanup_transient_digest_staging_dirs();
+        cleanup_transient_template_name_dirs(self);
+        cleanup_transient_digest_staging_dirs(self);
 
         if let Ok(entries) = std::fs::read_dir(TEMPLATE_DIR) {
             for entry in entries.flatten() {
@@ -796,7 +834,11 @@ impl TemplateManagerService {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') || name.ends_with(".old") || name.ends_with(".importing") {
+                if name.starts_with('.')
+                    || name.ends_with(".old")
+                    || name.ends_with(".importing")
+                    || !self.background_template_in_scope(&name)
+                {
                     continue;
                 }
 
@@ -833,6 +875,13 @@ impl TemplateManagerService {
         }
 
         self.prune_stale_template_artifact_db_rows().await;
+
+        // Pools reconcile all template names. The delivery experiment uses
+        // explicit cold clones and must not create or retire unrelated VMs.
+        #[cfg(feature = "experimental-chunked-templates")]
+        if self.volume_puller.delivery.is_some() {
+            return;
+        }
 
         {
             let Ok(mut handle) = self.pool_handle.lock() else {

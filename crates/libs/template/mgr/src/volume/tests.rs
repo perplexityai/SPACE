@@ -16,6 +16,7 @@ fn authorized_release_fixture() -> AuthorizedReleaseFixture {
     let response = FindTemplateReleaseResponse {
         authorized_org_id: Some(org.to_string()),
         release: Some(TemplateRelease {
+            chunk_representations: Vec::new(),
             template_name: "base".into(),
             runtime: DEFAULT_RUNTIME.into(),
             hash: hash.clone(),

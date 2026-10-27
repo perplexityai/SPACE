@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [features]
+experimental-chunked-templates = ["pplx-space-build-mgr/experimental-chunked-templates"]
 test-hooks = ["pplx-space-common-svc/test-hooks"]
 default = []
 k8s = ["pplx-space-common-svc/k8s"]

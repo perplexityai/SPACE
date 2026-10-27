@@ -2,6 +2,8 @@
 
 pub mod background_jobs;
 pub mod btrfs_via_nodemgr;
+#[cfg(feature = "experimental-chunked-templates")]
+pub mod chunked_rootfs;
 mod content_hash;
 pub use content_hash::TemplateHashConfigError;
 pub mod db;

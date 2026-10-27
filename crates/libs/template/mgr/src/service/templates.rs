@@ -1,6 +1,22 @@
 use super::*;
 
 impl TemplateManagerService {
+    #[cfg(feature = "experimental-chunked-templates")]
+    fn retire_template_chunk_sources(&self, template: &str) -> Result<(), Status> {
+        let conn = self
+            .db
+            .lock()
+            .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+        if !crate::chunked_rootfs::cache::store::begin_template_retirement(&conn, template)
+            .map_err(|error| Status::internal(format!("retire template chunk sources: {error}")))?
+        {
+            return Err(Status::unavailable(
+                "template images are leased by active chunk readers; retry deletion",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn delete_template(
         &self,
         request: Request<DeleteTemplateRequest>,
@@ -105,6 +121,9 @@ impl TemplateManagerService {
         &self,
         template: &str,
     ) -> Result<(), Status> {
+        #[cfg(feature = "experimental-chunked-templates")]
+        self.retire_template_chunk_sources(template)?;
+
         let template_dir = template_artifacts_dir(&self.artifact_store.root, template);
         let subvolumes: Vec<std::path::PathBuf> = tokio::task::spawn_blocking({
             let template_dir = template_dir.clone();
@@ -194,6 +213,9 @@ impl TemplateManagerService {
     }
 
     async fn delete_template_local_state(&self, template: &str) -> Result<(), Status> {
+        #[cfg(feature = "experimental-chunked-templates")]
+        self.retire_template_chunk_sources(template)?;
+
         let db = Arc::clone(&self.db);
         let name = template.to_string();
         tokio::task::spawn_blocking(move || {

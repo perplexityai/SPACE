@@ -51,6 +51,9 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+mod readonly_identity;
+pub use readonly_identity::{ReadonlySubvolumeIdentity, readonly_subvolume_identity};
+
 const BTRFS_FILESYSTEM_USAGE_TIMEOUT: Duration = Duration::from_secs(2);
 // `balance status` is a fast ioctl; `balance start --bg` forks the worker and
 // returns once the kernel accepts the operation. Neither should approach this.

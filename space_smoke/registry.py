@@ -15,10 +15,12 @@ from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.native_recovery import KindNativeHardeningFixture
 from space_smoke.runtime import ScenarioContext
 from space_smoke.services import SmokeServices
+from space_smoke.template_delivery import TemplateDeliveryFixture
 
 # The fixture type is the scenario's capability declaration; requesting a
 # privileged fixture narrows the backends the scenario may run on.
 FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
+    TemplateDeliveryFixture: frozenset({"deployed"}),
     NativeHardeningFixture: frozenset({"kind", "deployed"}),
     KindNativeHardeningFixture: frozenset({"kind"}),
     CommandSandboxFixture: frozenset({"kind", "deployed"}),
@@ -175,7 +177,7 @@ def scenario(
                 f"{getattr(fixture_type, '__name__', fixture_type)!r}"
             )
         if "native" in supported_surfaces and fixture_type not in (
-            CommandSandboxFixture, NativeHardeningFixture, KindNativeHardeningFixture
+            CommandSandboxFixture, NativeHardeningFixture, KindNativeHardeningFixture, TemplateDeliveryFixture
         ):
             raise TypeError(
                 "Native API scenarios require CommandSandboxFixture or NativeHardeningFixture"

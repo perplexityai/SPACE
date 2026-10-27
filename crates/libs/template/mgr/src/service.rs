@@ -279,26 +279,11 @@ impl Drop for ImportStagingGuard {
 /// between subvolume creation and the atomic rename.
 fn remove_staging_path(path: &Path) -> std::io::Result<()> {
     if pplx_space_common_core::host::btrfs::is_subvolume(path) {
-        // Clear RO first if some future import path stamps it pre-
-        // rename — today nothing does, but `btrfs subvolume delete`
-        // rejects RO targets and we want this helper to stay correct
-        // if that ever changes.
-        let _ = pplx_space_common_core::host::btrfs::set_readonly(path, false);
-        match pplx_space_common_core::host::btrfs::delete_subvolume_if_present(path) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %err,
-                    "btrfs subvolume delete failed on staging dir; falling back to remove_dir_all",
-                );
-                // Fall through to remove_dir_all — useful for the
-                // unusual case where the dir reports as a subvolume
-                // but the delete still rejects (kernel bug, mount-
-                // option mismatch, …). On the common path the
-                // subvolume delete already succeeded above.
-            }
-        }
+        // A read-only subvolume can be deleted without making its extents
+        // writable. If the privileged operation is unavailable, retain it
+        // for recovery instead of weakening its backing protection.
+        return pplx_space_common_core::host::btrfs::delete_subvolume_if_present(path)
+            .map_err(std::io::Error::other);
     }
     std::fs::remove_dir_all(path)
 }
@@ -1474,6 +1459,15 @@ impl TemplateManagerService {
         self
     }
 
+    #[cfg(feature = "experimental-chunked-templates")]
+    pub(crate) fn with_experimental_delivery(
+        mut self,
+        selection: Option<crate::volume::experimental::Config>,
+    ) -> Self {
+        self.volume_puller.delivery = selection;
+        self
+    }
+
     pub(crate) fn with_rootfs_backing_policy(
         mut self,
         policy: crate::rootfs_backing::RootfsBackingPolicy,
@@ -1542,7 +1536,21 @@ impl TemplateManagerService {
         });
     }
 
+    fn background_template_in_scope(&self, name: &str) -> bool {
+        #[cfg(feature = "experimental-chunked-templates")]
+        if let Some(delivery) = &self.volume_puller.delivery {
+            // A scoped delivery experiment must not repair or reconcile the
+            // surrounding cache merely because its daemon was restarted.
+            return delivery.for_template(name).is_some();
+        }
+        let _ = name;
+        true
+    }
+
     fn normalize_template_name_dir_once(&self, name: &str, path: &Path) {
+        if !self.background_template_in_scope(name) {
+            return;
+        }
         {
             let Ok(mut normalized) = self.normalized_template_dirs.lock() else {
                 tracing::warn!(
@@ -1879,6 +1887,9 @@ impl TemplateManagerService {
         digest_dir: String,
         trigger: &'static str,
     ) {
+        if !self.background_template_in_scope(&template_id) {
+            return;
+        }
         let service = self.clone();
         let digest_path = PathBuf::from(&digest_dir);
         {
@@ -2246,7 +2257,29 @@ impl TemplateManagerService {
                 .await;
         };
         let digest_path = Path::new(digest_dir);
-        let replaced_path = replace_template_build_dir(&staging_guard.path, digest_path)?;
+        // A verified source is immutable for its entire registry lifetime,
+        // including retirement. Refreshing its metadata requires the ordinary
+        // guarded delete/reinstall path, not renaming and thawing its backing.
+        let replaced_path = {
+            #[cfg(feature = "experimental-chunked-templates")]
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+            #[cfg(feature = "experimental-chunked-templates")]
+            if crate::chunked_rootfs::cache::store::has_registered_source(
+                &conn,
+                template_id,
+                content_hash,
+            )
+            .map_err(|error| Status::internal(format!("check source registry: {error}")))?
+            {
+                return Err(Status::failed_precondition(
+                    "verified source metadata is immutable; use guarded build deletion before replacement",
+                ));
+            }
+            replace_template_build_dir(&staging_guard.path, digest_path)?
+        };
         staging_guard.disarm();
         if let Err(error) = self
             .upsert_build_from_digest_dir(

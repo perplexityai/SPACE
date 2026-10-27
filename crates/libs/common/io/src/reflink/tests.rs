@@ -1,3 +1,46 @@
+#[test]
+fn extent_copy_preserves_surrounding_bytes_and_rejects_out_of_bounds_ranges() {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileExt;
+
+    let source = tempfile::tempfile().unwrap();
+    let destination = tempfile::tempfile().unwrap();
+    let source_bytes = b"header:chunk-content:trailer";
+    source.write_all_at(source_bytes, 0).unwrap();
+    destination.write_all_at(&[0xaa; 32], 0).unwrap();
+
+    // Unaligned extents exercise the byte-copy fallback even on btrfs.
+    assert!(!super::copy_range_on_descriptors(&source, 7, &destination, 9, 13).unwrap());
+    let mut expected = [0xaa; 32];
+    expected[9..22].copy_from_slice(b"chunk-content");
+    let mut observed = [0; 32];
+    destination.read_exact_at(&mut observed, 0).unwrap();
+    assert_eq!(observed, expected);
+
+    for (source_offset, destination_offset, length) in [
+        (0, 0, 0),
+        (u64::MAX, 0, 1),
+        (0, u64::MAX, 1),
+        (25, 0, 8),
+        (0, 31, 2),
+    ] {
+        let error = super::copy_range_on_descriptors(
+            &source,
+            source_offset,
+            &destination,
+            destination_offset,
+            length,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        destination.read_exact_at(&mut observed, 0).unwrap();
+        assert_eq!(observed, expected);
+    }
+    let mut original = vec![0; source_bytes.len()];
+    source.read_exact_at(&mut original, 0).unwrap();
+    assert_eq!(&original, source_bytes);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn nocow_preparation_clones_shared_extents_and_rejects_aliases() {

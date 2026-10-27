@@ -271,6 +271,7 @@ pub(crate) struct AuthorizedExchange {
     pub(crate) organization_id: Option<OrgId>,
     role_override: Option<VendRoleArn>,
     pub(crate) copy_source: Option<S3Resource>,
+    immutable_chunks: bool,
 }
 
 impl AuthorizedExchange {
@@ -300,6 +301,18 @@ impl AuthorizedExchange {
                 "Condition": self.resource.list_prefix_condition(),
             }),
         ];
+        if self.immutable_chunks {
+            // Session permissions intersect the vend role: append-only packs
+            // cannot be overwritten or deleted with these credentials.
+            statements.clear();
+            if self.actions.read {
+                statements.push(serde_json::json!({"Effect":"Allow", "Action":["s3:GetObject", "s3:GetObjectVersion"], "Resource":self.resource.policy_arn()}));
+            }
+            if self.actions.write {
+                statements.push(serde_json::json!({"Effect":"Allow", "Action":"s3:PutObject", "Resource":self.resource.policy_arn(),
+                    "Condition":{"StringEquals":{"s3:if-none-match":"*"}}}));
+            }
+        }
         if let Some(source) = &self.copy_source {
             statements.extend([
                 serde_json::json!({
@@ -469,15 +482,14 @@ async fn authorize_single_exchange(
                 .template_owner(template)
                 .await?
                 .ok_or(StorageExchangeError::UnknownSubject)?;
-            let SubjectResource::TemplateRelease(hash) = subject_resource else {
-                unreachable!("template validation returns the release hash")
-            };
+
             // A registered release is immutable. The builder vends write
             // credentials before RegisterTemplateRelease, so first publication
             // and upload retries pass, while a rewrite of any already-published
             // release prefix (including the platform's system templates) is
             // refused no matter which template the caller names.
-            if parsed.actions.includes_write()
+            if let SubjectResource::TemplateRelease(hash) = subject_resource
+                && parsed.actions.includes_write()
                 && store.template_release_published(template, &hash).await?
             {
                 return Err(StorageExchangeError::ReleaseAlreadyPublished);
@@ -495,6 +507,7 @@ async fn authorize_single_exchange(
         organization_id,
         role_override,
         copy_source: None,
+        immutable_chunks: matches!(subject_resource, SubjectResource::TemplateChunks),
     })
 }
 
@@ -621,7 +634,11 @@ fn validate_subject_resource(
             validate_snapshot_resource(*sandbox_id, resource).map(SubjectResource::Snapshot)
         }
         StorageSubject::Resource(SubjectId::Template(template)) => {
-            validate_template_resource(template, resource).map(SubjectResource::TemplateRelease)
+            if is_template_chunk_resource(template, resource) {
+                Ok(SubjectResource::TemplateChunks)
+            } else {
+                validate_template_resource(template, resource).map(SubjectResource::TemplateRelease)
+            }
         }
         StorageSubject::BuildInput(digest) => {
             validate_build_input_resource(digest, resource).map(|()| SubjectResource::BuildInput)
@@ -635,6 +652,7 @@ enum SubjectResource {
     Snapshot(SnapshotResource),
     /// The release hash segment of `templates/<name>/<hash>[/<file>]`.
     TemplateRelease(ContentHash),
+    TemplateChunks,
     BuildInput,
 }
 
@@ -721,6 +739,34 @@ fn valid_snapshot_artifact(value: &str) -> bool {
     ]
     .into_iter()
     .any(|artifact| artifact.file_name() == value)
+}
+
+fn is_template_chunk_resource(template: &TemplateName, resource: &S3Resource) -> bool {
+    let segments: Vec<_> = resource.key.split('/').collect();
+    let Some(marker) = segments.iter().rposition(|segment| *segment == "templates") else {
+        return false;
+    };
+    let Some(tail) = segments.get(marker + 1..) else {
+        return false;
+    };
+    match (resource.prefix, tail) {
+        (true, [name, "chunks", "v1"]) => *name == template.as_str(),
+        (false, [name, "chunks", "v1", object]) if *name == template.as_str() => object
+            .strip_prefix("p-")
+            .and_then(|value| value.strip_suffix(".zstpack"))
+            .or_else(|| {
+                object
+                    .strip_prefix("m-")
+                    .and_then(|value| value.strip_suffix(".json"))
+            })
+            .is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            }),
+        _ => false,
+    }
 }
 
 fn validate_template_resource(

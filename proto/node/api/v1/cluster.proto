@@ -256,6 +256,20 @@ message TemplateRelease {
   string runtime = 3;       // 'fc' (extends as DB CHECK relaxes)
   string hash = 4;
   string created_at = 5;    // RFC3339
+  // Optional, authenticated representations of this same logical rootfs.
+  repeated TemplateChunkRepresentation chunk_representations = 6;
+}
+
+message TemplateChunkRepresentation {
+  uint32 format_version = 1;
+  uint64 chunk_size_bytes = 2;
+  string index_digest = 3;       // full blake3:<hex>
+  string manifest_digest = 4;    // full blake3:<hex>
+  string image_blake3 = 5;       // full logical rootfs, independent of legacy hash
+  // S3 namespace containing m-<manifest hex>.json and p-<object hex>.zstpack.
+  // Every object is immutable; this prefix is checked by publication policy.
+  string storage_prefix = 6;
+  uint64 manifest_bytes = 7;    // authenticated length, 1..64 MiB
 }
 
 // Who may launch a template (mirrors `templates.visibility`). Carried on the
@@ -348,6 +362,9 @@ message RegisterTemplateReleaseRequest {
   optional string system_publication_grant_id = 9;
   // Tenant counterpart of `system_publication_grant_id`, for `org_id`.
   optional string tenant_publication_grant_id = 10;
+  // Attach only after all packs and the manifest have been stored. Existing
+  // representations are immutable; identical retries are harmless.
+  repeated TemplateChunkRepresentation chunk_representations = 11;
 }
 
 message RegisterTemplateReleaseResponse {

@@ -292,7 +292,6 @@ async fn bootable_artifact_hash_rejects_when_bytes_disagree() {
 #[tokio::test]
 async fn prune_drops_deleting_row_when_artifacts_missing() {
     let root = tempfile::tempdir().unwrap();
-    let store = TemplateArtifactStore::new(root.path());
     let conn = crate::db::test_conn();
 
     let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -318,10 +317,11 @@ async fn prune_drops_deleting_row_when_artifacts_missing() {
     .unwrap();
     // Artifacts intentionally missing.
 
-    let db = Arc::new(Mutex::new(conn));
-    prune_catalog_rows_missing_on_disk(&db, &store).await;
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+    prune_catalog_rows_missing_on_disk(&service).await;
 
-    let count: i64 = db
+    let count: i64 = service
+        .db
         .lock()
         .unwrap()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |r| r.get(0))
@@ -340,7 +340,6 @@ async fn prune_drops_deleting_row_when_artifacts_missing() {
 #[tokio::test]
 async fn prune_restores_deleting_row_when_artifacts_intact() {
     let root = tempfile::tempdir().unwrap();
-    let store = TemplateArtifactStore::new(root.path());
     let conn = crate::db::test_conn();
 
     let hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -372,10 +371,11 @@ async fn prune_restores_deleting_row_when_artifacts_intact() {
     )
     .unwrap();
 
-    let db = Arc::new(Mutex::new(conn));
-    prune_catalog_rows_missing_on_disk(&db, &store).await;
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+    prune_catalog_rows_missing_on_disk(&service).await;
 
-    let state: String = db
+    let state: String = service
+        .db
         .lock()
         .unwrap()
         .query_row(

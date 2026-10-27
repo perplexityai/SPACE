@@ -730,6 +730,7 @@ async fn register_push_job(
     // Single-file pushes are always plaintext: envelope encryption is a
     // property of an artifact (`PushFilesAsync`), never a single file.
     let payload = TransferPayload {
+        object_range: None,
         subject_id: req.subject_id.clone(),
         local_path: req.local_path.clone(),
         s3_uri: req.s3_uri.clone(),
@@ -746,9 +747,7 @@ async fn register_push_job(
         entry_role: None,
     }
     .to_json();
-    // `raw` is meaningless on push (we always upload exactly the bytes the
-    // caller gave us, optionally pre-compressed by vol-mgr's `compress`
-    // config); pass `false` so push jobs share the same dedup namespace.
+    // Push encoding remains governed by the service compression configuration.
     let dk = dedup_key(
         "push",
         &req.subject_id,
@@ -864,7 +863,31 @@ fn submit_pull<E: JobExecutor>(
     // Pull writes to `local_path` (it doesn't read from it), so there's
     // no submit-time-vs-execute-time race to defend against: nothing in
     // the staging area would help.
+    let object_range = req
+        .object_range
+        .as_ref()
+        .map(|range| {
+            if !req.raw || requested_snapshot_artifact.is_some() {
+                return Err(Status::invalid_argument(
+                    "object ranges require a raw non-snapshot transfer",
+                ));
+            }
+            pplx_space_common_core::types::ObjectByteRange::new(
+                range.offset,
+                range.length,
+                range.object_size,
+                range.version_id.clone(),
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))
+        })
+        .transpose()?;
+    let range_key = object_range
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| Status::internal(format!("serialize object range: {error}")))?;
     let payload = TransferPayload {
+        object_range,
         subject_id: req.subject_id.clone(),
         local_path: req.local_path.clone(),
         s3_uri: req.s3_uri.clone(),
@@ -895,6 +918,10 @@ fn submit_pull<E: JobExecutor>(
             encryption: None,
         },
     );
+    if let Some(range_key) = range_key {
+        dk.push_str("\0object-range=");
+        dk.push_str(&range_key);
+    }
     if let Some(rootfs_mode) = assignment.rootfs_mode {
         dk.push_str("\0rootfs-materialization=");
         dk.push_str(rootfs_mode.as_str());

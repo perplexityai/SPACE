@@ -44,6 +44,7 @@ pub mod network;
 pub mod node;
 pub mod node_fs;
 pub mod node_group;
+pub mod object_range;
 pub mod object_store;
 pub mod path;
 #[cfg(feature = "sqlx")]
@@ -60,6 +61,7 @@ pub mod snapshot;
 mod sqlite;
 pub mod subject;
 pub mod template;
+pub mod template_chunks;
 #[cfg(feature = "serde")]
 pub mod template_runtime;
 pub mod time;
@@ -89,6 +91,7 @@ pub use network::*;
 pub use node::*;
 pub use node_fs::*;
 pub use node_group::*;
+pub use object_range::{ObjectByteRange, ObjectByteRangeError};
 pub use object_store::*;
 pub use path::*;
 pub use privacy::*;

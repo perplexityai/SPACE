@@ -52,6 +52,7 @@ fn registration(name: &str, org: Option<Uuid>) -> RegisterTemplateRequest {
 
 fn release(name: &str, org: Option<Uuid>) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
+        chunk_representations: Vec::new(),
         system_publication_grant_id: None,
         tenant_publication_grant_id: None,
         template_name: name.into(),
@@ -503,6 +504,7 @@ async fn run() -> TestResult {
     client
         .register_template_release(request(
             RegisterTemplateReleaseRequest {
+                chunk_representations: Vec::new(),
                 tenant_publication_grant_id: Some(tenant_grant.to_string()),
                 ..release("tenant-output", Some(owner))
             },
@@ -570,6 +572,7 @@ async fn run() -> TestResult {
         client
             .register_template_release(request(
                 RegisterTemplateReleaseRequest {
+                    chunk_representations: Vec::new(),
                     tenant_publication_grant_id: Some(adoption_grant.to_string()),
                     ..release("tenant-output", Some(owner))
                 },
@@ -684,6 +687,7 @@ fn tenant_release(
     grant: Option<String>,
 ) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
+        chunk_representations: Vec::new(),
         hash: format!("sha256:{}", hash.to_string().repeat(64)),
         tenant_publication_grant_id: grant,
         ..release(name, Some(org))

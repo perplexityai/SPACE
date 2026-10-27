@@ -357,6 +357,7 @@ fn registration_requests_carry_publication_authority() {
 
 fn sample_release_request() -> RegisterRequest {
     RegisterRequest::Release(Box::new(RegisterTemplateReleaseRequest {
+        chunk_representations: Vec::new(),
         system_publication_grant_id: None,
         tenant_publication_grant_id: None,
         template_name: sample_template().as_str().to_string(),

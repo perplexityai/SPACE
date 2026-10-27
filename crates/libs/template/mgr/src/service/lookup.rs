@@ -629,6 +629,20 @@ impl TemplateManagerService {
         content_hash: &str,
         nodemgr_deadline: tokio::time::Instant,
     ) -> Result<(), Status> {
+        #[cfg(feature = "experimental-chunked-templates")]
+        {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+            if !crate::chunked_rootfs::cache::store::begin_retirement(&conn, name, content_hash)
+                .map_err(|error| Status::internal(format!("retire verified source: {error}")))?
+            {
+                return Err(Status::unavailable(
+                    "template image is leased by an active chunk reader; retry deletion",
+                ));
+            }
+        }
         let build_dir = build_artifacts_dir(&self.artifact_store.root, name, content_hash);
         let is_subvol = tokio::task::spawn_blocking({
             let build_dir = build_dir.clone();

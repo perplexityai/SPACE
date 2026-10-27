@@ -182,6 +182,52 @@ impl ObjectStore for MockObjectStore {
         tokio::fs::write(dst, &self.body).await?;
         Ok(self.body.len() as u64)
     }
+
+    async fn get_file_range(
+        &self,
+        _creds: &ObjectCredentials,
+        _target: ObjectTarget<'_>,
+        dst: &Path,
+        range: &pplx_space_common_core::types::ObjectByteRange,
+    ) -> Result<u64, ObjectStoreError> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        let start = range.offset() as usize;
+        tokio::fs::write(dst, &self.body[start..start + range.length() as usize]).await?;
+        Ok(range.length())
+    }
+}
+
+#[tokio::test]
+async fn object_range_pull_replaces_unverified_existing_output_and_keeps_raw_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pack-range");
+    for policy in [
+        PullExistingPolicy::LegacySkipPresent,
+        PullExistingPolicy::VerifiedReplica,
+    ] {
+        std::fs::write(&path, b"untrusted old output").unwrap();
+        let store = Arc::new(MockObjectStore::new([], b"abcdefghij".to_vec()));
+        let executor = test_executor(store.clone());
+        let mut payload = verified_payload(&path);
+        payload.snapshot_artifact = None;
+        payload.object_range =
+            Some(pplx_space_common_core::types::ObjectByteRange::new(3, 4, 10, None).unwrap());
+        let bytes = executor
+            .execute_pull(
+                &test_job("pull"),
+                &payload,
+                &test_creds(),
+                test_target(),
+                None,
+                policy,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, 4);
+        assert_eq!(std::fs::read(&path).unwrap(), b"defg");
+        assert_eq!(store.get_calls(), 1);
+        assert_eq!(store.head_calls(), 0);
+    }
 }
 
 /// Mock that exercises the streaming-decode path: feeds `body` through
@@ -380,6 +426,7 @@ async fn memory_and_luks_roles_use_sparse_output_regardless_of_persisted_mode() 
             store,
         );
         let payload = TransferPayload {
+            object_range: None,
             subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
             local_path: local_path.to_string_lossy().into_owned(),
             s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
@@ -1057,6 +1104,7 @@ fn sparse_shadow_advice_warning_omits_sensitive_path() {
 
 fn verified_payload(local_path: &Path) -> TransferPayload {
     TransferPayload {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
         s3_uri: "s3://bucket/snapshots/a/snapshot.luks?region=us-east-2".to_string(),
@@ -1076,6 +1124,7 @@ fn verified_payload(local_path: &Path) -> TransferPayload {
 
 pub(super) fn push_payload(local_path: &Path) -> TransferPayload {
     TransferPayload {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
         s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
@@ -1327,6 +1376,7 @@ fn verified_replica_materialization_compatibility_requires_requested_work() {
 #[test]
 fn file_replica_provenance_matches_only_same_transfer_contract() {
     let base = TransferPayload {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: "/space/snap/opaque-download".to_string(),
         s3_uri: "s3://bucket/snapshots/a/snapshot.luks?region=us-east-2".to_string(),
@@ -3977,6 +4027,7 @@ fn transfer_payload_raw_defaults_to_false_for_legacy_compatibility() {
 fn transfer_payload_raw_round_trips() {
     let file_mode = FileMode::new(0o660).unwrap();
     let p = TransferPayload {
+        object_range: None,
         subject_id: "template:seed".to_string(),
         local_path: "/tmp/x".to_string(),
         s3_uri: "s3://b/k?region=us-east-2".to_string(),
@@ -4017,6 +4068,7 @@ fn transfer_payload_with_encryption_round_trips() {
         wrapped_dek: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     };
     let p = TransferPayload {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: "/tmp/x".to_string(),
         s3_uri: "s3://b/k?region=us-east-2".to_string(),
@@ -4403,6 +4455,7 @@ fn transfer_payload_raw_suppresses_transparent_decompress() {
     // expected zstd and its decoder dead-ends. `raw = false` (the
     // default) keeps the symmetric decompress-on-zstd behavior.
     let plain = TransferPayload {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: "/tmp/x".to_string(),
         s3_uri: "s3://b/k?region=us-east-2".to_string(),
@@ -4419,6 +4472,7 @@ fn transfer_payload_raw_suppresses_transparent_decompress() {
         entry_role: None,
     };
     let raw = TransferPayload {
+        object_range: None,
         raw: true,
         ..plain.clone()
     };
@@ -4472,6 +4526,7 @@ async fn stage_encrypted_temp_returns_partial_enc_path_on_aad_derivation_error()
         priority: Default::default(),
     };
     let p = TransferPayload {
+        object_range: None,
         // Template subject is unconditionally rejected by
         // `derive_artifact_aads` (before the artifact_id/role checks) —
         // gives us a deterministic Err.
@@ -4659,6 +4714,7 @@ async fn encrypted_compressed_memory_restore_is_sparse() {
         wrapped_dek: vec![0; 16],
     };
     let payload = TransferPayload {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
         s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),

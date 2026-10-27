@@ -11,6 +11,7 @@ use pplx_space_common_core::types::{NodeId, NodeRole, OrgId, SubstrateKind};
 use std::net::IpAddr;
 
 use pplx_space_common_core::sql;
+use pplx_space_node_api_client::chunk_representation::ChunkRepresentation;
 use serde::Deserialize;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
@@ -28,6 +29,7 @@ pub(super) struct LatestRelease {
     pub(super) hash: String,
     pub(super) created_at: OffsetDateTime,
     pub(super) storage_locations: Vec<LatestReleaseStorage>,
+    pub(super) chunk_representations: Vec<ChunkRepresentation>,
 }
 
 /// Storage location as it comes back from the per-release
@@ -57,6 +59,7 @@ struct LatestReleaseRow {
     hash: String,
     created_at: OffsetDateTime,
     storage_locations: Json<Vec<LatestReleaseStorage>>,
+    chunk_representations: Json<Vec<ChunkRepresentation>>,
 }
 
 /// Which part of the catalog a lookup may see. The handler derives it from
@@ -220,6 +223,7 @@ impl TemplateReleasesStore {
                     r.type            AS release_type,
                     r.hash            AS release_hash,
                     r.created_at      AS release_created_at,
+                    r.chunk_representations,
                     s.id              AS storage_id,
                     s.storage_connection_string AS storage_connection_string,
                     s.created_at      AS storage_created_at
@@ -247,6 +251,7 @@ impl TemplateReleasesStore {
                     r.type            AS release_type,
                     r.hash            AS release_hash,
                     r.created_at      AS release_created_at,
+                    r.chunk_representations,
                     s.id              AS storage_id,
                     s.storage_connection_string AS storage_connection_string,
                     s.created_at      AS storage_created_at
@@ -322,6 +327,7 @@ impl TemplateReleasesStore {
                     r.type            AS release_type,
                     r.hash            AS release_hash,
                     r.created_at      AS release_created_at,
+                    r.chunk_representations,
                     s.id              AS storage_id,
                     s.storage_connection_string AS storage_connection_string,
                     s.created_at      AS storage_created_at
@@ -345,6 +351,7 @@ impl TemplateReleasesStore {
                     r.type            AS release_type,
                     r.hash            AS release_hash,
                     r.created_at      AS release_created_at,
+                    r.chunk_representations,
                     s.id              AS storage_id,
                     s.storage_connection_string AS storage_connection_string,
                     s.created_at      AS storage_created_at
@@ -442,6 +449,7 @@ impl TemplateReleasesStore {
                     r.type AS runtime,
                     r.hash,
                     r.created_at,
+                    r.chunk_representations,
                     COALESCE(
                         json_agg(
                             json_build_object(
@@ -457,7 +465,7 @@ impl TemplateReleasesStore {
                         '[]'::json
                     ) AS storage_locations
              FROM (
-                 SELECT rel.id, rel.template_name, rel.type, rel.hash, rel.created_at
+                 SELECT rel.id, rel.template_name, rel.type, rel.hash, rel.created_at, rel.chunk_representations
                  FROM template_releases rel
                  JOIN templates tpl ON tpl.name = rel.template_name
                  WHERE rel.template_name = $1
@@ -492,7 +500,7 @@ impl TemplateReleasesStore {
              ) r
              LEFT JOIN template_release_storage_locations s
                ON s.template_release_id = r.id
-             GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at
+             GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.chunk_representations
              ORDER BY r.created_at DESC, r.id DESC"
             ))
             .bind(template_name)
@@ -508,6 +516,7 @@ impl TemplateReleasesStore {
                     r.type AS runtime,
                     r.hash,
                     r.created_at,
+                    r.chunk_representations,
                     COALESCE(
                         json_agg(
                             json_build_object(
@@ -523,7 +532,7 @@ impl TemplateReleasesStore {
                         '[]'::json
                     ) AS storage_locations
              FROM (
-                 SELECT id, template_name, type, hash, created_at
+                 SELECT id, template_name, type, hash, created_at, chunk_representations
                  FROM template_releases
                  WHERE template_name = $1 AND type = $2
                  ORDER BY created_at DESC, id DESC
@@ -531,7 +540,7 @@ impl TemplateReleasesStore {
              ) r
              LEFT JOIN template_release_storage_locations s
                ON s.template_release_id = r.id
-             GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at
+             GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.chunk_representations
              ORDER BY r.created_at DESC, r.id DESC"
             ))
             .bind(template_name)
@@ -551,6 +560,7 @@ impl TemplateReleasesStore {
                 hash: row.hash,
                 created_at: row.created_at,
                 storage_locations: row.storage_locations.0,
+                chunk_representations: row.chunk_representations.0,
             })
             .collect())
     }
@@ -570,7 +580,7 @@ pub(super) async fn insert_release(
          FROM templates
          WHERE name = $1
          ON CONFLICT (template_name, hash) DO NOTHING
-         RETURNING id, template_name, type, hash, org_id, created_at"
+         RETURNING id, template_name, type, hash, org_id, created_at, chunk_representations"
     ))
     .bind(template_name)
     .bind(runtime)
@@ -593,6 +603,41 @@ pub(super) async fn fill_execution_metadata(
     ))
     .bind(release_id)
     .bind(execution)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn find_release(
+    executor: impl sqlx::PgExecutor<'_>,
+    template_name: &str,
+    hash: &str,
+) -> Result<Option<super::TemplateReleaseRow>, sqlx::Error> {
+    let bare_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+    sqlx::query_as(sql!(
+        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at, r.chunk_representations
+         FROM template_releases r
+         WHERE r.template_name = $1 AND r.hash IN ($2, $3)
+         ORDER BY EXISTS (
+             SELECT 1 FROM template_release_storage_locations l WHERE l.template_release_id = r.id
+         ) DESC, r.created_at ASC
+         LIMIT 1"
+    ))
+    .bind(template_name).bind(hash).bind(bare_hash)
+    .fetch_optional(executor).await
+}
+
+/// The caller holds the release lock and has compared immutable commitments.
+pub(super) async fn set_chunk_representations(
+    executor: impl sqlx::PgExecutor<'_>,
+    release_id: Uuid,
+    representations: &[ChunkRepresentation],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE template_releases SET chunk_representations = $2 WHERE id = $1"
+    ))
+    .bind(release_id)
+    .bind(Json(representations))
     .execute(executor)
     .await?;
     Ok(())

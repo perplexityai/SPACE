@@ -21,6 +21,7 @@ fn batch_entry_semantic_artifact_wire_shape_is_pinned() {
         snapshot_artifact: SnapshotArtifact::Memory as i32,
     };
     let single_pull = PullFileRequest {
+        object_range: None,
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         s3_uri: "s3://bucket/snapshot?region=us-east-2".to_string(),
         local_path: "/space/snapshot/output".to_string(),

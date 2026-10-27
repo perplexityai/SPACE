@@ -12,6 +12,7 @@ workspace = true
 
 [features]
 default = []
+experimental-chunked-templates = []
 otel = ["pplx-space-common-svc/otel"]
 datadog = ["otel", "pplx-space-common-svc/datadog"]
 # Deprecated for one release; use otel and datadog.

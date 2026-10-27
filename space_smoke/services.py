@@ -65,6 +65,7 @@ from space_smoke.runtime import (
     SubprocessExecutor,
 )
 from space_smoke.template_build import build_dedicated_template
+from space_smoke.template_delivery import DeliveryBench, TemplateDeliveryFixture
 
 
 class MissingToolError(RuntimeError):
@@ -112,6 +113,7 @@ class SmokeServices:
     template_override: str | None = None
     native: CommandSandboxFactory | None = None
     api_surface: str = ECW_API_SURFACE
+    template_delivery: DeliveryBench | None = None
 
     def bootstrap(self) -> bool:
         """Prepare the selected environment once before suite dispatch.
@@ -158,10 +160,14 @@ class SmokeServices:
         sandbox: SandboxConfig,
         sandbox_count: int = 1,
     ) -> Fixture:
-        if fixture_type not in (CommandSandboxFixture, Ecw, KindEcw, NativeHardeningFixture, KindNativeHardeningFixture):
+        if fixture_type not in (CommandSandboxFixture, Ecw, KindEcw, NativeHardeningFixture, KindNativeHardeningFixture, TemplateDeliveryFixture):
             raise SmokeConfigurationError(
                 f"unsupported smoke fixture: {fixture_type.__name__}"
             )
+        if fixture_type is TemplateDeliveryFixture:
+            if self.template_delivery is None:
+                raise SmokeConfigurationError("template delivery bench is not configured")
+            return cast(Fixture, TemplateDeliveryFixture(context, self.template_delivery))
         if fixture_type in (NativeHardeningFixture, KindNativeHardeningFixture):
             if self.api_surface != NATIVE_API_SURFACE or not isinstance(
                 self.native, NativeSandboxFactory
@@ -459,7 +465,7 @@ class SmokeServices:
         *,
         required_tools: Iterable[str] | None = None,
     ) -> SmokeServices:
-        if scenario.fixture_type not in (CommandSandboxFixture, Ecw, KindEcw, NativeHardeningFixture, KindNativeHardeningFixture):
+        if scenario.fixture_type not in (CommandSandboxFixture, Ecw, KindEcw, NativeHardeningFixture, KindNativeHardeningFixture, TemplateDeliveryFixture):
             raise SmokeConfigurationError(
                 f"unsupported smoke fixture: {scenario.fixture_type.__name__}"
             )
@@ -489,6 +495,12 @@ class SmokeServices:
         for tool in selected_tools:
             if shutil.which(tool) is None:
                 raise MissingToolError(f"required command not found: {tool}")
+
+        if scenario.fixture_type is TemplateDeliveryFixture:
+            if backend != DEPLOYED_BACKEND:
+                raise SmokeConfigurationError("template delivery requires an explicitly deployed bench")
+            return cls(kind=None, ecw=None, api_key="", owns_api_key=False,
+                       api_surface=api_surface, template_delivery=DeliveryBench.from_environment(values))
 
         if api_surface == NATIVE_API_SURFACE:
             token = values.get("SPACE_API_TOKEN") or None

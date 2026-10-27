@@ -54,6 +54,7 @@ impl Catalog {
             .await?;
         service
             .register_template_release(publisher(RegisterTemplateReleaseRequest {
+                chunk_representations: Vec::new(),
                 template_name: TEMPLATE.into(),
                 runtime: "fc".into(),
                 hash: format!("sha256:{}", "a".repeat(64)),

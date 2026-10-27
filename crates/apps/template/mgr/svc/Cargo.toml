@@ -15,6 +15,7 @@ name = "space-tmplmgr-svc"
 path = "src/main.rs"
 
 [features]
+experimental-chunked-templates = ["pplx-space-template-mgr/experimental-chunked-templates"]
 default = []
 otel = [
     "pplx-space-common-svc/otel",

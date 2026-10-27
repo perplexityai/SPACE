@@ -2282,6 +2282,7 @@ async fn pull_artifact_inner(
     let output = match ensure_file_replica_with_config(
         volmgr,
         PullFileRequest {
+            object_range: None,
             subject_id: format!("sandbox:{}", identity.credential_subject_id),
             s3_uri: s3_uri.clone(),
             // The sibling temp is deterministic per source URI, so a

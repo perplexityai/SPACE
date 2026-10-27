@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod chunk_representation;
 pub mod cluster;
 pub mod node_status_freshness;
 

@@ -55,6 +55,8 @@ pub struct TemplateMgrRunConfig {
 /// there is no type-erased I/O variant here.
 #[derive(Debug, thiserror::Error)]
 pub enum RunTemplateMgrError {
+    #[error("invalid experimental template delivery setting: {0}")]
+    ExperimentalDelivery(String),
     #[error("invalid template hash configuration: {0}")]
     TemplateHash(#[source] crate::TemplateHashConfigError),
     #[error("invalid template rootfs backing policy: {0}")]
@@ -153,6 +155,15 @@ async fn run_service(
         &pplx_space_common_core::env::ProcessEnvironment,
     )
     .map_err(RunTemplateMgrError::TemplateHash)?;
+    #[cfg(feature = "experimental-chunked-templates")]
+    let delivery = crate::volume::experimental::Config::from_env()
+        .map_err(|error| RunTemplateMgrError::ExperimentalDelivery(error.to_string()))?;
+    #[cfg(not(feature = "experimental-chunked-templates"))]
+    if std::env::var_os("SPACE_TEMPLATE_EXPERIMENTAL_DELIVERY").is_some() {
+        return Err(RunTemplateMgrError::ExperimentalDelivery(
+            "binary was built without experimental-chunked-templates".into(),
+        ));
+    }
     let backing_policy = crate::rootfs_backing::RootfsBackingPolicy::from_env()
         .map_err(RunTemplateMgrError::RootfsBacking)?;
     if backing_policy == crate::rootfs_backing::RootfsBackingPolicy::NoCow {
@@ -177,6 +188,9 @@ async fn run_service(
     .map_err(RunTemplateMgrError::Migrate)?;
 
     let conn = crate::db::open().map_err(RunTemplateMgrError::OpenDatabase)?;
+    #[cfg(feature = "experimental-chunked-templates")]
+    crate::chunked_rootfs::cache::store::recover_leases_after_exclusive_start(&conn)
+        .map_err(RunTemplateMgrError::InitializeService)?;
 
     tracing::info!(%backing_policy,
         "template rootfs backing policy applies to new materializations only; existing cache entries remain unchanged");
@@ -185,6 +199,8 @@ async fn run_service(
         .map_err(RunTemplateMgrError::InitializeService)?
         .with_rootfs_backing_policy(backing_policy)
         .with_production_hash_algorithm(production_hash_algorithm);
+    #[cfg(feature = "experimental-chunked-templates")]
+    let service = service.with_experimental_delivery(delivery);
 
     // Re-arm any durable background jobs that were in flight (i.e.
     // `status='running'`) when the previous tmplmgr exited. Without

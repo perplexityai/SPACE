@@ -67,6 +67,7 @@ async fn prefetch_resolution_rechecks_cached_generic_after_privacy_transition(
     fixture
         .service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            chunk_representations: Vec::new(),
             template_name: "prefetch-transition".into(),
             runtime: "fc".into(),
             hash: generic_hash.clone(),
@@ -110,6 +111,7 @@ async fn prefetch_resolution_rechecks_cached_generic_after_privacy_transition(
     fixture
         .service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            chunk_representations: Vec::new(),
             template_name: "prefetch-transition".into(),
             runtime: "fc".into(),
             hash: private_hash.clone(),

@@ -174,6 +174,10 @@ impl<'de> serde::Deserialize<'de> for FileMode {
 /// re-typed via [`parse_subject_id_with_legacy_fallback`] at execute time.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferPayload {
+    /// Present only for exact raw range pulls. Deserialize validates all bounds
+    /// again so recovery cannot bypass the original request checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_range: Option<pplx_space_common_core::types::ObjectByteRange>,
     #[serde(alias = "sandbox_id")]
     pub subject_id: String,
     pub local_path: String,
@@ -1413,6 +1417,17 @@ impl TransferExecutor {
     ) -> Result<i64, JobError> {
         let p = TransferPayload::from_json(&job.payload)?;
 
+        if p.object_range.is_some()
+            && (job.kind != "pull"
+                || !p.raw
+                || p.encryption.is_some()
+                || p.effective_snapshot_artifact().is_some())
+        {
+            return Err(JobError::Permanent(
+                "object ranges require a raw plaintext pull".into(),
+            ));
+        }
+
         let subject = parse_subject_id_with_legacy_fallback(&p.subject_id).map_err(|e| {
             JobError::permanent_with_reason(
                 JobFailureReason::InvalidInput,
@@ -1640,6 +1655,7 @@ impl TransferExecutor {
         let entry_futures = art.entries.iter().zip(uris.iter()).map(|(entry, uri)| {
             let cancellation = cancellation.clone();
             let synthetic = TransferPayload {
+                object_range: None,
                 subject_id: art.subject_id.clone(),
                 local_path: entry.local_path.clone(),
                 s3_uri: entry.s3_uri.clone(),

@@ -13,6 +13,7 @@ use crate::template_visibility_cache::TemplateVisibilityCache;
 use super::status::*;
 use super::*;
 use pplx_space_common_core::sql;
+use pplx_space_node_api_client::chunk_representation::ChunkRepresentation;
 
 // ── Template metadata: row types and helpers ──────────────────────────────
 
@@ -453,6 +454,7 @@ pub(super) struct TemplateReleaseRow {
     pub(super) hash: String,
     pub(super) org_id: Option<OrgId>,
     pub(super) created_at: OffsetDateTime,
+    pub(super) chunk_representations: Json<Vec<ChunkRepresentation>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -1067,6 +1069,7 @@ pub(super) struct FindTemplateReleaseRow {
     pub(super) storage_id: Option<Uuid>,
     pub(super) storage_connection_string: Option<String>,
     pub(super) storage_created_at: Option<OffsetDateTime>,
+    pub(super) chunk_representations: Json<Vec<ChunkRepresentation>>,
 }
 
 pub(super) fn trimmed_required(value: &str, field: &str) -> Result<String, Status> {
@@ -1493,25 +1496,11 @@ async fn find_template_release_row(
     template_name: &str,
     hash: &str,
 ) -> Result<Option<TemplateReleaseRow>, Status> {
-    let bare_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
-    sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at
-         FROM template_releases r
-         WHERE r.template_name = $1
-           AND r.hash IN ($2, $3)
-         ORDER BY EXISTS (
-                      SELECT 1
-                      FROM template_release_storage_locations l
-                      WHERE l.template_release_id = r.id) DESC,
-                  r.created_at ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(hash)
-    .bind(bare_hash)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
+    super::template_releases_store::find_release(&mut **tx, template_name, hash)
+        .await
+        .map_err(|error| {
+            crate::template_publication::storage_status("query template_release", &error)
+        })
 }
 
 /// Release identity is immutable. A row without evidence may be filled once;
@@ -1690,6 +1679,12 @@ pub(super) fn template_release_proto(row: TemplateReleaseRow) -> TemplateRelease
         runtime: row.release_type,
         hash: row.hash,
         created_at: format_time(row.created_at),
+        chunk_representations: row
+            .chunk_representations
+            .0
+            .into_iter()
+            .map(Into::into)
+            .collect(),
     }
 }
 

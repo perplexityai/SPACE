@@ -1,3 +1,6 @@
+#[cfg(feature = "experimental-chunked-templates")]
+mod chunks;
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -89,6 +92,11 @@ impl TemplatePublication {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
+    #[error("chunk publication requested from a binary without experimental-chunked-templates")]
+    ChunkFeatureUnavailable,
+    #[cfg(feature = "experimental-chunked-templates")]
+    #[error("chunk publication: {0}")]
+    Chunks(#[from] chunks::Error),
     #[error("authorize operator system build: {0}")]
     AuthorizeSystemBuild(#[source] tonic::Status),
     #[error("invalid system publication grant returned by ClusterApi: {0}")]
@@ -149,6 +157,9 @@ impl PublishError {
     /// publish.
     pub fn error_kind(&self) -> crate::TemplateBuildErrorKind {
         match self {
+            Self::ChunkFeatureUnavailable => crate::TemplateBuildErrorKind::Publish,
+            #[cfg(feature = "experimental-chunked-templates")]
+            Self::Chunks(_) => crate::TemplateBuildErrorKind::Publish,
             Self::CompressedRootfsNotReady { .. } => crate::TemplateBuildErrorKind::Timeout,
             Self::AuthorizeSystemBuild(_)
             | Self::InvalidSystemGrant(_)
@@ -261,6 +272,12 @@ async fn publish_build_from_dir(
     publish_tags: &[String],
     publication: TemplatePublication,
 ) -> Result<(), PublishError> {
+    #[cfg(feature = "experimental-chunked-templates")]
+    let chunk_config = chunks::Config::from_env(template)?;
+    #[cfg(not(feature = "experimental-chunked-templates"))]
+    if std::env::var_os("SPACE_TEMPLATE_CHUNK_SIZES").is_some() {
+        return Err(PublishError::ChunkFeatureUnavailable);
+    }
     let release_tags = release_tags(content_hash, publish_tags);
     let execution = load_build_execution_metadata(build_dir).await?;
 
@@ -278,6 +295,10 @@ async fn publish_build_from_dir(
         recorded_release_locations(cluster_api, template, content_hash, publication.org()).await?;
 
     let Some(object_store) = ObjectStoreConfig::from_env_optional()? else {
+        #[cfg(feature = "experimental-chunked-templates")]
+        if chunk_config.is_some() {
+            return Err(chunks::Error::Config("chunk publication requires object storage").into());
+        }
         let registration = release_registration(recorded_locations.is_some(), None, execution);
         register_cluster_release(
             cluster_api,
@@ -356,18 +377,66 @@ async fn publish_build_from_dir(
             }
         }
     };
+    #[cfg(feature = "experimental-chunked-templates")]
+    let chunk_upload = match chunk_config {
+        Some(config) => {
+            Some(chunks::publish(config, &object_store, template, content_hash, build_dir).await?)
+        }
+        None => None,
+    };
     let registration = release_registration(published, Some(&storage_uri), execution);
-
-    register_cluster_release(
-        cluster_api,
+    let request = release_registration_request(
         template,
         content_hash,
         &release_tags,
         registration.storage_locations,
         publication,
         registration.execution,
+    );
+    #[cfg(feature = "experimental-chunked-templates")]
+    let request = {
+        let mut request = request;
+        if let Some(uploaded) = &chunk_upload {
+            request.chunk_representations = uploaded.representations.clone();
+        }
+        request
+    };
+    let result = register_with_transient_retry(
+        cluster_api,
+        template,
+        RegisterRequest::Release(Box::new(request)),
     )
-    .await?;
+    .await;
+    #[cfg(feature = "experimental-chunked-templates")]
+    let result = match result {
+        Err(status)
+            if matches!(
+                status.code(),
+                Code::Unavailable | Code::Unknown | Code::DeadlineExceeded | Code::Internal
+            ) =>
+        {
+            if let Some(uploaded) = &chunk_upload
+                && chunks::confirm(
+                    cluster_api,
+                    template,
+                    content_hash,
+                    publication,
+                    &uploaded.representations,
+                )
+                .await
+            {
+                Ok(())
+            } else {
+                Err(status)
+            }
+        }
+        other => other,
+    };
+    result.map_err(PublishError::RegisterTemplateRelease)?;
+    #[cfg(feature = "experimental-chunked-templates")]
+    if let Some(uploaded) = chunk_upload {
+        uploaded.acknowledge().await?;
+    }
     Ok(())
 }
 
@@ -671,6 +740,7 @@ fn release_registration_request(
     execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
 ) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
+        chunk_representations: Vec::new(),
         system_publication_grant_id: publication.system_grant().map(|grant| grant.to_string()),
         tenant_publication_grant_id: publication.tenant_grant().map(|grant| grant.to_string()),
         template_name: template.as_str().to_string(),

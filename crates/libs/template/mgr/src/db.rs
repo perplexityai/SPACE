@@ -13,7 +13,10 @@ pub const DB_PATH: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_M
 pub fn open() -> Result<Connection, pplx_space_sqlite::SqliteError> {
     pplx_space_sqlite::open_rusqlite(
         Path::new(DB_PATH),
-        pplx_space_sqlite::RusqliteOpenOptions::default(),
+        pplx_space_sqlite::RusqliteOpenOptions {
+            synchronous_normal: !cfg!(feature = "experimental-chunked-templates"),
+            ..Default::default()
+        },
     )
 }
 
@@ -25,9 +28,11 @@ fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>>
 pub fn init_in_memory(conn: &mut Connection) {
     let service = sqlx::migrate!("../../../../db/template-manager");
     let common = sqlx::migrate!("../../../../db/common");
+    let publisher = sqlx::migrate!("../../../../db/template-chunk-publisher");
     for migration in common
         .iter()
         .chain(service.iter())
+        .chain(publisher.iter())
         .filter(|migration| migration.migration_type.is_up_migration())
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
@@ -166,6 +171,50 @@ fn normalize_build_date(s: &str) -> String {
 }
 
 pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
+    let transaction = immediate_transaction(conn)?;
+    upsert_build_in_transaction(&transaction, b)?;
+    transaction.commit()
+}
+
+#[cfg(feature = "experimental-chunked-templates")]
+pub fn upsert_verified_build(
+    conn: &Connection,
+    build: &BuildUpsert<'_>,
+    binding: crate::chunked_rootfs::delivery::Binding,
+    manifest: &crate::chunked_rootfs::delivery::AuthenticatedManifest,
+    source: &crate::chunked_rootfs::cache::PinnedSource,
+) -> Result<Option<uuid::Uuid>> {
+    let name = build
+        .name
+        .parse::<pplx_space_common_core::types::TemplateName>()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    if build.state != "ready" || build.content_hash != binding.rootfs_digest.to_string() {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::other("verified admission must belong to its ready build"),
+        )));
+    }
+    let transaction = immediate_transaction(conn)?;
+    if !upsert_build_in_transaction(&transaction, build)? {
+        return Ok(None);
+    }
+    source
+        .validate_admission_path()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let id = crate::chunked_rootfs::cache::store::admit(
+        &transaction,
+        &name,
+        binding,
+        manifest,
+        source.identity(),
+    )?;
+    transaction.commit()?;
+    Ok(Some(id))
+}
+
+pub(crate) fn upsert_build_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    b: &BuildUpsert<'_>,
+) -> Result<bool> {
     let manifest: pplx_space_common_core::types::TemplateManifest =
         serde_json::from_str(b.manifest_json)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
@@ -220,10 +269,10 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     // is a no-op when the row is mid-eviction; the pull's caller
     // sees the build as still NotFound after re-resolution and
     // surfaces NotFound to its caller cleanly.
-    let tx = immediate_transaction(conn)?;
     let rows = tx.execute(
         "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, created_at, last_used_at, runtime_version, guest_os, state_format_name, state_format_version, execution_metadata_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14
+         WHERE NOT EXISTS (SELECT 1 FROM chunk_template_deletions WHERE template_name = ?1)
          ON CONFLICT(name, content_hash) DO UPDATE SET build_date = ?3, manifest_json = ?4, runtime = ?5, arch = ?6, artifact_size_bytes = ?7, state = ?8, runtime_version = ?10, guest_os = ?11, state_format_name = ?12, state_format_version = ?13, execution_metadata_json = ?14
          WHERE template_builds.state != 'deleting'",
         params![b.name, b.content_hash, build_date_utc, b.manifest_json, b.runtime, b.arch, saturating_u64_to_i64(b.artifact_size_bytes), b.state, ts, runtime_version, guest_os, state_format_name, state_format_version, execution_json],
@@ -232,10 +281,9 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
         tracing::warn!(
             template = b.name,
             content_hash = b.content_hash,
-            "upsert_build no-op: row is in state='deleting'; concurrent eviction won the race"
+            "upsert_build no-op: build or template deletion is in progress"
         );
-        tx.commit()?;
-        return Ok(());
+        return Ok(false);
     }
     tx.execute(
         "DELETE FROM template_build_components WHERE name = ?1 AND content_hash = ?2",
@@ -258,8 +306,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
             )?;
         }
     }
-    tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Whether the build for `(name, content_hash)` exists locally and
@@ -410,23 +457,36 @@ pub fn list_builds_by_name(conn: &Connection, name: &str) -> Result<Vec<BuildRow
 }
 
 pub fn delete_build(conn: &Connection, name: &str, content_hash: &str) -> Result<()> {
-    conn.execute(
+    let tx = immediate_transaction(conn)?;
+    #[cfg(feature = "experimental-chunked-templates")]
+    {
+        if !crate::chunked_rootfs::cache::store::retire_in_transaction(&tx, name, content_hash)? {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other("cannot delete a build leased by chunk readers"),
+            )));
+        }
+        crate::chunked_rootfs::cache::store::forget_retired(&tx, name, content_hash)?;
+    }
+
+    tx.execute(
         "DELETE FROM template_build_components WHERE name = ?1 AND content_hash = ?2",
         params![name, content_hash],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2",
         params![name, content_hash],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM template_builds WHERE name = ?1 AND content_hash = ?2",
         params![name, content_hash],
     )?;
-    Ok(())
+    tx.commit()
 }
 
 pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> {
     let tx = immediate_transaction(conn)?;
+    #[cfg(feature = "experimental-chunked-templates")]
+    crate::chunked_rootfs::cache::store::forget_template_retired(&tx, name)?;
     tx.execute(
         "DELETE FROM template_snapshots WHERE name = ?1",
         params![name],
@@ -441,6 +501,8 @@ pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> 
         "DELETE FROM template_settings WHERE template = ?1",
         params![name],
     )?;
+    #[cfg(feature = "experimental-chunked-templates")]
+    crate::chunked_rootfs::cache::store::finish_template_retirement(&tx, name)?;
     tx.commit()?;
     Ok(())
 }

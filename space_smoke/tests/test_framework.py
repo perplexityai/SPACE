@@ -172,6 +172,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native.m1_generated_sdk_conformance",
                 "native.resident_pause",
                 "native.stopped_restart_preserves_rootfs",
+                "native.template_delivery_exact_bytes",
                 "native_concurrency.command_idempotency",
                 "native_concurrency.create_idempotency",
                 "native_concurrency.independent_commands",

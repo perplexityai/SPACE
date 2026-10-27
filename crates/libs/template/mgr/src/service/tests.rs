@@ -1035,27 +1035,48 @@ fn delete_template_build_preserves_db_row_when_subvolume_removal_fails() {
 
 #[test]
 fn stale_build_row_after_disk_first_crash_is_pruned_by_recovery_cleanup() {
-    let temp = tempfile::tempdir().unwrap();
-    let template = "delete-build-crash-prune-test";
     let content_hash = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-
-    let conn = crate::db::test_conn();
-    insert_ready_build(&conn, template, content_hash);
-    let service = TemplateManagerService::new_with_template_root(conn, temp.path()).unwrap();
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    runtime.block_on(service.prune_stale_template_artifact_db_rows());
-
-    let conn = service.db.lock().unwrap();
-    assert!(
-        crate::db::get_build(&conn, template, content_hash)
-            .unwrap()
-            .is_none(),
-        "recovery cleanup must prune DB rows for disk-removed builds"
-    );
+    let cases = [
+        false,
+        #[cfg(feature = "experimental-chunked-templates")]
+        true,
+    ];
+    for experimental in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::test_conn();
+        for template in ["existing-template", "chunk-fixture-target"] {
+            insert_ready_build(&conn, template, content_hash);
+        }
+        let service = TemplateManagerService::new_with_template_root(conn, temp.path()).unwrap();
+        #[cfg(feature = "experimental-chunked-templates")]
+        let service = {
+            let mut service = service;
+            if experimental {
+                service.volume_puller.delivery = Some(
+                    crate::volume::experimental::Config::for_test("chunk-fixture-"),
+                );
+            }
+            service
+        };
+        runtime.block_on(service.prune_stale_template_artifact_db_rows());
+        let conn = service.db.lock().unwrap();
+        assert!(
+            crate::db::get_build(&conn, "chunk-fixture-target", content_hash)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::db::get_build(&conn, "existing-template", content_hash)
+                .unwrap()
+                .is_some(),
+            experimental,
+            "an experiment must leave unrelated catalog rows alone",
+        );
+    }
 }
 
 #[test]
@@ -1205,6 +1226,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                     assert_eq!(resolved_tag, tag.unwrap_or_default());
                     assert_eq!(caller, scoped.then_some(org));
                     Ok(ResolvedRelease {
+                        chunks: Vec::new(),
                         hash: selected.clone(),
                         storage_uris: vec![],
                         visibility:
@@ -1295,29 +1317,52 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
 
 #[test]
 fn reconcile_desired_base_snapshot_deletes_when_policy_disabled() {
-    let conn = crate::db::test_conn();
-    crate::db::update_template_snapshot_policy(
-        &conn,
-        "codex-disabled-base-snapshot-test",
-        false,
-        2,
-        1024,
-    )
-    .unwrap();
-    let service = TemplateManagerService::new(conn).unwrap();
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let outcome = runtime
-        .block_on(service.reconcile_desired_base_snapshot("codex-disabled-base-snapshot-test"));
-
-    assert!(outcome.reconciled);
-    assert!(!outcome.snapshot_built);
-    assert!(!outcome.snapshot_deleted);
-    assert!(outcome.content_hash.is_none());
-    assert!(outcome.error.is_none());
+    let cases = [
+        ("codex-disabled-base-snapshot-test", false, true),
+        #[cfg(feature = "experimental-chunked-templates")]
+        ("existing-template", true, false),
+        #[cfg(feature = "experimental-chunked-templates")]
+        ("chunk-fixture-target", true, true),
+    ];
+    for (template, experimental, reconciled) in cases {
+        let conn = crate::db::test_conn();
+        crate::db::update_template_snapshot_policy(&conn, template, false, 2, 1024).unwrap();
+        let service = TemplateManagerService::new(conn).unwrap();
+        #[cfg(feature = "experimental-chunked-templates")]
+        let service = {
+            let mut service = service;
+            if experimental {
+                service.volume_puller.delivery = Some(
+                    crate::volume::experimental::Config::for_test("chunk-fixture-"),
+                );
+            }
+            service
+        };
+        #[cfg(not(feature = "experimental-chunked-templates"))]
+        let _ = experimental;
+        let before = crate::db::get_template_settings(&service.db.lock().unwrap(), template)
+            .unwrap()
+            .unwrap();
+        let outcome = runtime.block_on(service.reconcile_desired_base_snapshot(template));
+        assert_eq!(outcome.reconciled, reconciled, "{template}");
+        assert!(!outcome.snapshot_built);
+        assert!(!outcome.snapshot_deleted);
+        assert!(outcome.content_hash.is_none());
+        assert!(outcome.error.is_none());
+        if !reconciled {
+            let after = crate::db::get_template_settings(&service.db.lock().unwrap(), template)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.last_snapshot_reconcile_completed_at,
+                before.last_snapshot_reconcile_completed_at,
+            );
+        }
+    }
 }
 
 #[test]
