@@ -760,6 +760,14 @@ impl PublicOperationStore {
                 .await?
                 .map(|joinable| joinable.operation_id)
         };
+        // A join keeps the marker of the wake it joins, whatever this
+        // caller's activity. Each caller's activity was allowed by the policy
+        // when it asked, so the wake's rule can refuse the joiner's only if
+        // the policy narrowed in between, as from `access` to `command` under
+        // a wake marked for access that a new command joins. Judged when it
+        // runs, that wake is refused; the joiner's next attach finds nothing
+        // coming and queues a fresh wake for its own activity, so the edge
+        // heals itself.
         if let Some(operation_id) = existing {
             tx.commit().await?;
             return Ok(CreatePublicOperationResult::Existing(
