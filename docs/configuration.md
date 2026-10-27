@@ -179,7 +179,8 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_TEMPLATE_PREFETCH_TAGS` | `seed:latest`, `code-runtime:latest` | |
 | `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | retired | Ignored; prefetch requires confirmed generic visibility. |
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
-| `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
+| `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON object of exact template names or trailing-`*` prefixes to runtime MiB sizes. Also supplies the build VM default. |
+| `SPACE_TEMPLATE_BUILD_SCRATCH_DISK_MIB` | unset | Same rule syntax, providing a minimum build VM rootfs capacity without increasing the published runtime disk. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
 | `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. A tenant-list account must likewise present the grant the API issued before dispatching that organization's build of that template, from the builder node the grant is bound to; it authorizes one release. |
 | `SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS` | empty | |
@@ -190,6 +191,20 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_BUILD_EXPORT_<NAME>` | unset = not exported | Opt a value into recipe `env_refs` as guest variable `NAME`; see [build environment exports](../templates/firecracker/seed/README.md#build-environment-exports). |
 | `SPACE_BUILDER_ECR_REPOSITORIES` | unset | JSON. |
 | `SPACE_UBUNTU_APT_MIRROR` | preserve base sources when building from an image or template; `https://archive.ubuntu.com/ubuntu` when creating a seed | An explicit value rewrites Ubuntu archive/security sources during the build. Without it, inherited sources keep their transport and trust requirements, including in builds derived from older or custom templates. |
+
+Build scratch capacity is temporary working space on the root filesystem, not a
+separate disk. For example, runtime rules `{"batch-*":4096}` and scratch rules
+`{"batch-*":8192}` build on at least 8 GiB and publish a 4 GiB runtime disk.
+A scratch rule never reduces the normal build capacity. Both maps use exact-name
+precedence followed by the longest prefix; `null` disables a matching rule.
+Builds based on an existing template still need enough build capacity for the
+base rootfs, and publishing rejects a compacted filesystem larger than the runtime
+capacity. Existing templates are unchanged.
+
+Native protobuf recipes accept `build_config.scratch_disk_bytes`; TOML recipes
+accept `[metadata].scratch_disk_size_mb`. Omitted fields preserve existing sizing.
+Upgrade build-manager and recipe-forwarding services before enabling scratch
+rules in the API: older services can discard the optional protobuf field.
 
 Direct/systemd deployments can publish API-submitted template builds without
 Kubernetes projected credentials. Generate a separate random publisher secret

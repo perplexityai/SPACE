@@ -83,13 +83,21 @@ fn build_vm_start_request_delegates_direct_identity_to_sandbox_manager() {
 }
 
 #[test]
-fn build_vm_rootfs_size_uses_explicit_recipe_disk_or_twenty_gib_default() {
-    assert_eq!(
-        build_vm_rootfs_size_mb(None),
-        DEFAULT_BUILD_VM_ROOTFS_SIZE_MB
-    );
-    assert_eq!(build_vm_rootfs_size_mb(Some(4096)), 4096);
-    assert_eq!(build_vm_rootfs_size_mb(Some(32768)), 32768);
+fn build_vm_rootfs_size_preserves_runtime_capacity_and_allows_larger_scratch() {
+    for (runtime, scratch, expected) in [
+        (None, None, DEFAULT_BUILD_VM_ROOTFS_SIZE_MB),
+        (Some(4096), None, 4096),
+        (Some(4096), Some(8192), 8192),
+        (Some(8192), Some(4096), 8192),
+        (None, Some(40960), 40960),
+    ] {
+        let config = crate::recipe::BuildConfig {
+            disk_size_mb: runtime,
+            scratch_disk_size_mb: scratch,
+            ..Default::default()
+        };
+        assert_eq!(build_vm_rootfs_size_mb(&config), expected);
+    }
 }
 
 #[test]

@@ -1343,6 +1343,7 @@ fn template_build_config_proto(config: TemplateBuildConfig) -> build_proto::reci
         vcpu: config.vcpu,
         memory_bytes: config.memory_bytes,
         disk_bytes: config.disk_bytes,
+        scratch_disk_bytes: None,
         // The REST build API does not expose the balloon setting yet.
         balloon: None,
     }

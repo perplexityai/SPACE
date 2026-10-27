@@ -553,8 +553,11 @@ fn build_vm_create_request(
     request
 }
 
-fn build_vm_rootfs_size_mb(runtime_disk_size_mb: Option<u32>) -> u32 {
-    runtime_disk_size_mb.unwrap_or(DEFAULT_BUILD_VM_ROOTFS_SIZE_MB)
+fn build_vm_rootfs_size_mb(config: &recipe::BuildConfig) -> u32 {
+    config
+        .disk_size_mb
+        .unwrap_or(DEFAULT_BUILD_VM_ROOTFS_SIZE_MB)
+        .max(config.scratch_disk_size_mb.unwrap_or(0))
 }
 
 fn build_vm_start_request(sandbox_id: String, vcpu: u32, memory_mib: u32) -> StartRequest {
@@ -825,7 +828,7 @@ impl TemplateBuilder {
         })
         .await?;
 
-        let build_rootfs_size_mib = build_vm_rootfs_size_mb(recipe.build_config.disk_size_mb);
+        let build_rootfs_size_mib = build_vm_rootfs_size_mb(&recipe.build_config);
 
         // Register the build sandbox before materializing its rootfs.
         let sandbox_id = build_phase(template_id, BuildPhase::CreateBuildVm, async {
@@ -1674,6 +1677,7 @@ fn validate_scratch_recipe(recipe: &Recipe) -> Result<(), BuildError> {
     if recipe.build_config.vcpu.is_some()
         || recipe.build_config.memory_mib.is_some()
         || recipe.build_config.disk_size_mb.is_some()
+        || recipe.build_config.scratch_disk_size_mb.is_some()
         || recipe.build_config.balloon.is_some()
     {
         return Err(BuildError::message(

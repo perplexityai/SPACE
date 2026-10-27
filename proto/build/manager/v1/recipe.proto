@@ -23,6 +23,10 @@ message Recipe {
     optional uint64 memory_bytes = 2;
     // Guest rootfs capacity in bytes.
     optional uint64 disk_bytes = 3;
+    // Minimum build VM rootfs capacity, independent of the published runtime disk.
+    // This is temporary working space on the rootfs, not a separate device.
+    // Unset preserves disk_bytes/default sizing; never reduces that capacity.
+    optional uint64 scratch_disk_bytes = 5;
     // Opt-in guest balloon device (requires runtime support) recorded in the built template's
     // metadata. Sandboxes get it only when they cold-boot from the build,
     // including when its base snapshot is created; restores keep the device

@@ -168,6 +168,7 @@ pub struct BuildConfig {
     pub vcpu: Option<u8>,
     pub memory_mib: Option<u32>,
     pub disk_size_mb: Option<u32>,
+    pub scratch_disk_size_mb: Option<u32>,
     /// Recorded in the built template's metadata for its sandboxes'
     /// cold boots; the build VM itself boots with its base's setting.
     pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
@@ -285,6 +286,7 @@ pub struct TomlRecipeMetadata {
     pub vcpu: Option<u8>,
     pub memory_mib: Option<u32>,
     pub disk_size_mb: Option<u32>,
+    pub scratch_disk_size_mb: Option<u32>,
     /// Same shape as template `metadata.json` `balloon`.
     pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
 }
@@ -479,6 +481,11 @@ impl TomlRecipe {
                     .map_err(|_overflow| RecipeAdapterError::DiskOverflow {
                         value: self.metadata.disk_size_mb.unwrap_or_default(),
                     })?,
+                scratch_disk_bytes: self
+                    .metadata
+                    .scratch_disk_size_mb
+                    .map(u64::from)
+                    .map(|mb| mb * 1024 * 1024),
                 balloon: self.metadata.balloon.map(balloon_proto),
             }),
             origin: Some(origin),
@@ -675,6 +682,13 @@ impl TryFrom<build_proto::recipe::BuildConfig> for BuildConfig {
                 .transpose()
                 .map_err(|_| RecipeProtoError::DiskOutOfRange {
                     value: config.disk_bytes.unwrap_or_default(),
+                })?,
+            scratch_disk_size_mb: config
+                .scratch_disk_bytes
+                .map(bytes_to_mib_u32)
+                .transpose()
+                .map_err(|_| RecipeProtoError::DiskOutOfRange {
+                    value: config.scratch_disk_bytes.unwrap_or_default(),
                 })?,
             balloon: config.balloon.map(balloon_from_proto).transpose()?,
         })

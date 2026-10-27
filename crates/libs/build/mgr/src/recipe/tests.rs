@@ -1243,3 +1243,27 @@ fn proto_steps_validate_environment_names_before_execution() {
         assert!(!format!("{error:?}").contains("TOKEN"));
     }
 }
+
+#[test]
+fn scratch_capacity_round_trips_without_replacing_runtime_capacity() {
+    for scratch in ["", "scratch_disk_size_mb = 8192"] {
+        let toml: TomlRecipe = toml::from_str(&format!(
+            "[metadata]\nname = \"scratch-example\"\nbase = \"seed\"\ndisk_size_mb = 4096\n{scratch}"
+        )).unwrap();
+        let proto = toml
+            .try_into_proto(None, &mut |_index, _source| unreachable!("no copy steps"))
+            .unwrap();
+        let mut proto = ProtoRecipe::decode(proto.encode_to_vec().as_slice()).unwrap();
+        let recipe = Recipe::try_from(proto.clone()).unwrap();
+        assert_eq!(recipe.build_config.disk_size_mb, Some(4096));
+        assert_eq!(
+            recipe.build_config.scratch_disk_size_mb,
+            if scratch.is_empty() { None } else { Some(8192) }
+        );
+        proto.build_config.as_mut().unwrap().scratch_disk_bytes = Some(u64::MAX);
+        assert!(matches!(
+            Recipe::try_from(proto),
+            Err(RecipeProtoError::DiskOutOfRange { .. })
+        ));
+    }
+}

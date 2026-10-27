@@ -83,10 +83,12 @@ fn base_template_defaults(base: &str) -> (String, Option<String>) {
         .unwrap_or_else(|| (String::from("root"), None))
 }
 
-/// Disk sizes affect both the build VM and the template's runtime metadata.
+/// Runtime disk sizes also supply the build VM default; scratch rules may raise
+/// build capacity without changing the template's runtime metadata.
 /// The SDK has no disk-size field, so deployments supply exact-name or trailing-`*`
 /// prefix rules as a JSON object. Unconfigured templates use build-manager defaults.
 const TEMPLATE_BUILD_DISK_MIB_ENV: &str = "SPACE_TEMPLATE_BUILD_DISK_MIB";
+const TEMPLATE_BUILD_SCRATCH_DISK_MIB_ENV: &str = "SPACE_TEMPLATE_BUILD_SCRATCH_DISK_MIB";
 const MIB: u64 = 1024 * 1024;
 
 pub(super) async fn build_recipe(
@@ -164,6 +166,14 @@ pub(super) async fn build_recipe(
             vcpu: cpu_count,
             memory_bytes: memory_mb.map(|mb| u64::from(mb) * MIB),
             disk_bytes: default_disk_mib(template_name.as_str())?.map(|disk_mib| disk_mib * MIB),
+            scratch_disk_bytes: disk_mib_with_override(
+                template_name.as_str(),
+                None,
+                std::env::var(TEMPLATE_BUILD_SCRATCH_DISK_MIB_ENV)
+                    .ok()
+                    .as_deref(),
+            )?
+            .map(|disk_mib| disk_mib * MIB),
             balloon: None,
         }),
         origin: Some(build_proto::recipe::Origin { kind: Some(origin) }),
@@ -233,14 +243,11 @@ fn disk_mib_with_override(
 
     let rules: BTreeMap<String, Option<u64>> =
         serde_json::from_str(template_disks.unwrap_or("{}")).map_err(|_| {
-            E2bApiError::internal(format!("{TEMPLATE_BUILD_DISK_MIB_ENV} must be a JSON object of template names or prefixes ending in * to MiB sizes or null"))
+            E2bApiError::internal("template disk rules must be a JSON object of template names or prefixes ending in * to MiB sizes or null")
         })?;
     for (pattern, disk_mib) in &rules {
-        TemplateName::parse(pattern.strip_suffix('*').unwrap_or(pattern)).map_err(|_| {
-            E2bApiError::internal(format!(
-                "invalid template pattern in {TEMPLATE_BUILD_DISK_MIB_ENV}"
-            ))
-        })?;
+        TemplateName::parse(pattern.strip_suffix('*').unwrap_or(pattern))
+            .map_err(|_| E2bApiError::internal("invalid template pattern in disk rules"))?;
         if let Some(disk_mib) = disk_mib {
             validate_disk_mib(*disk_mib)?;
         }
