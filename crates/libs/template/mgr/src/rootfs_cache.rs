@@ -70,23 +70,38 @@ pub(crate) fn expand_rootfs_from_metadata(
         .map(|path| Some((path, size_bytes)))
 }
 
-/// Verify that a published template build_dir contains a runtime-sized
-/// rootfs.ext4. When metadata declares `disk_size_mb`, that expanded size is
-/// the local-cache invariant on both builders and workers. Builds without a
-/// disk size fall back to the manifest rootfs size for older or non-Firecracker
-/// artifacts.
+/// Reject a runtime capacity that cannot contain the artifact without shrinking it.
+pub(crate) fn validate_runtime_capacity(build_dir: &Path) -> Result<(), ExpandedRootfsError> {
+    let Some(rootfs_size_mb) = rootfs_size_mb_from_metadata(build_dir)? else {
+        return Ok(());
+    };
+    let path = build_dir.join(TEMPLATE_ROOTFS_FILE);
+    let current_bytes = std::fs::metadata(&path)
+        .map_err(|source| ExpandedRootfsError::Io {
+            operation: "stat template rootfs",
+            path: path.display().to_string(),
+            source,
+        })?
+        .len();
+    if current_bytes > u64::from(rootfs_size_mb) * 1024 * 1024 {
+        return Err(ExpandedRootfsError::TooSmall {
+            rootfs_size_mb,
+            current_mb: current_bytes.div_ceil(1024 * 1024),
+        });
+    }
+    Ok(())
+}
+
+/// Verify compact artifact size, also accepting legacy caches expanded to the
+/// runtime capacity. Digest verification remains the import/registration boundary.
 pub(crate) fn verify_rootfs_from_metadata(
     build_dir: impl AsRef<Path>,
 ) -> Result<(), ExpandedRootfsError> {
     let build_dir = build_dir.as_ref();
-    let expanded_bytes =
+    let runtime_bytes =
         rootfs_size_mb_from_metadata(build_dir)?.map(|mb| u64::from(mb) * 1024 * 1024);
-    let manifest_bytes = if expanded_bytes.is_none() {
-        manifest_rootfs_size_bytes(build_dir)?
-    } else {
-        None
-    };
-    let expected_bytes = expanded_bytes.or(manifest_bytes);
+    // Artifact bytes take precedence over writable sandbox capacity.
+    let expected_bytes = manifest_rootfs_size_bytes(build_dir)?.or(runtime_bytes);
 
     if expected_bytes.is_none() {
         // Nothing to verify against; treat as available.
@@ -110,7 +125,7 @@ pub(crate) fn verify_rootfs_from_metadata(
         }
     };
 
-    if expected_bytes == Some(actual_bytes) {
+    if expected_bytes == Some(actual_bytes) || runtime_bytes == Some(actual_bytes) {
         return Ok(());
     }
     Err(ExpandedRootfsError::WrongSize {

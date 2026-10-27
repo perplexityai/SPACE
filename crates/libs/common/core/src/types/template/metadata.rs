@@ -213,9 +213,9 @@ pub struct TemplateMetadata {
     )]
     pub memory_mib: Option<u32>,
 
-    /// Sized rootfs disk capacity (MiB). Recipe builds use this to
-    /// expand the rootfs to a sandbox-runtime size; seed templates
-    /// may omit it. `None` / `Some(0)` is treated as "no default".
+    /// Writable sandbox disk capacity (MiB), applied after cloning the immutable
+    /// template artifact. Seed templates may omit it. `None` / `Some(0)` is
+    /// treated as "no default".
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")

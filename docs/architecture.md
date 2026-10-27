@@ -16,6 +16,24 @@ A sandbox, a lifecycle operation, and a command stream have separate lifetimes. 
 
 A template reference such as `seed:latest` selects a published release; a digest reference selects specific content. A sandbox response reports the resolved template digest so callers can record what they ran.
 
+Template registration hashes and compresses the immutable rootfs at its build
+size. `metadata.json`'s `disk_size_mb` declares writable sandbox capacity; it is
+not the artifact length. Node-manager clones the rootfs and grows the clone to
+an explicit sandbox disk override, or otherwise the template default, before
+boot. The manifest records the artifact's actual size and digest. Existing
+expanded artifacts remain readable, and a capacity smaller than the filesystem
+is rejected rather than shrinking it.
+
+When upgrading from versions that expand templates during registration, update
+worker template-managers and node-managers before builders publish compact
+artifacts. Older template-managers reject compact artifacts whose size differs
+from the runtime capacity. Once compact releases exist, keep compatible readers
+on every node that can receive them; rolling back requires selecting retained
+expanded releases first. Rebuilding a compact release produces a new content
+identity relative to its expanded predecessor, so its base snapshots must be
+rebuilt. A registration refresh cannot change the disk default of an existing
+digest because base snapshots do not include disk capacity in their key.
+
 Operators can restrict newly registered template artifacts with
 `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` on the internal API: a comma-separated
 list of exact S3 bucket names. A configured policy rejects other buckets and

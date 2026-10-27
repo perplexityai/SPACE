@@ -11,6 +11,11 @@ fn rejects_size_smaller_than_current_rootfs() {
         .set_len(2 * MIB)
         .unwrap();
 
+    std::fs::write(temp.path().join("metadata.json"), br#"{"disk_size_mb":1}"#).unwrap();
+    assert!(matches!(
+        validate_runtime_capacity(temp.path()),
+        Err(ExpandedRootfsError::TooSmall { .. })
+    ));
     let error = expand_rootfs(&rootfs, 1).unwrap_err();
 
     assert!(matches!(
@@ -62,7 +67,7 @@ fn invalid_metadata_is_an_expansion_error() {
 }
 
 #[test]
-fn verify_rejects_unexpanded_rootfs_when_disk_size_is_set() {
+fn verify_accepts_compact_rootfs_matching_manifest() {
     let temp = tempfile::tempdir().unwrap();
     let rootfs = temp.path().join("rootfs.ext4");
     std::fs::File::create(&rootfs)
@@ -77,15 +82,7 @@ fn verify_rejects_unexpanded_rootfs_when_disk_size_is_set() {
     )
     .unwrap();
 
-    let error = verify_rootfs_from_metadata(temp.path()).unwrap_err();
-    assert!(matches!(
-        error,
-        ExpandedRootfsError::WrongSize {
-            expected_bytes: 4194304,
-            actual_bytes: 1048576,
-            ..
-        }
-    ));
+    verify_rootfs_from_metadata(temp.path()).unwrap();
 }
 
 #[test]

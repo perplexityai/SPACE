@@ -445,3 +445,63 @@ async fn rejected_snapshot_stream_discards_prepared_refresh(#[case] valid_dimens
                 .contains(".republishing."))
     );
 }
+
+#[rstest]
+#[case::raw(false)]
+#[case::compressed(true)]
+#[tokio::test]
+async fn compact_import_preserves_artifact_and_runtime_capacity(#[case] compressed: bool) {
+    let mut fixture = ImportFixture::new().await;
+    let mut header = fixture.changed_header(Change::Unchanged);
+    let name = "compact-import-test";
+    header.template.as_mut().unwrap().name = name.into();
+    header.metadata_json = br#"{"disk_size_mb":32}"#.to_vec();
+    let mut manifest: Value = serde_json::from_slice(&header.manifest_json).unwrap();
+    manifest["name"] = json!(name);
+    header.manifest_json = serde_json::to_vec(&manifest).unwrap();
+    let original = std::fs::read(fixture.directory.join(TEMPLATE_ROOTFS_FILE)).unwrap();
+    // The optional stream checksum may use a different algorithm from the identity.
+    header.rootfs_hash = Some(format!("blake3:{}", blake3::hash(&original)));
+    let (file_name, payload) = if compressed {
+        (
+            TEMPLATE_ROOTFS_ZSTD_FILE,
+            zstd::stream::encode_all(original.as_slice(), 1).unwrap(),
+        )
+    } else {
+        (TEMPLATE_ROOTFS_FILE, original.clone())
+    };
+    let mut requests = vec![ImportTemplateRequest {
+        payload: Some(Payload::Header(header)),
+    }];
+    for (index, chunk) in payload.chunks(128 * 1024).enumerate() {
+        requests.push(ImportTemplateRequest {
+            payload: Some(Payload::Chunk(crate::proto::FileChunk {
+                file_name: file_name.into(),
+                offset: (index * 128 * 1024) as u64,
+                data: chunk.to_vec(),
+                ..Default::default()
+            })),
+        });
+    }
+    let response = fixture
+        .client
+        .import_template(tokio_stream::iter(requests))
+        .await
+        .unwrap()
+        .into_inner();
+    let hash = response.template.unwrap().content_hash.unwrap();
+    assert_eq!(Some(&hash), fixture.template.content_hash.as_ref());
+    let imported = build_artifacts_dir(
+        &fixture.service.artifact_store.root,
+        name,
+        &hash,
+        crate::db::TemplateCachePartition::Legacy,
+    );
+    assert_eq!(
+        std::fs::read(imported.join(TEMPLATE_ROOTFS_FILE)).unwrap(),
+        original
+    );
+    let metadata: Value =
+        serde_json::from_slice(&std::fs::read(imported.join("metadata.json")).unwrap()).unwrap();
+    assert_eq!(metadata["disk_size_mb"], 32);
+}

@@ -23,7 +23,7 @@
 //!    `.partial → rename` provides per-file atomicity, and vol-mgr's
 //!    skip-if-present elides any re-download of files already on disk
 //!    from a prior partial attempt.
-//! 4. Materializing local `rootfs.ext4` in expanded runtime shape via
+//! 4. Materializing immutable `rootfs.ext4` artifact bytes via
 //!    [`crate::rootfs_zstd::decompress_rootfs`] (process-unique tmp
 //!    filename + atomic rename, so two overlapping decompresses from a
 //!    cancellation race can't corrupt each other) and verifying its
