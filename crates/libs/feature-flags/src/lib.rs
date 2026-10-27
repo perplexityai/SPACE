@@ -190,6 +190,12 @@ pub const SPACE_CLUSTER_RATE_LIMITER_FLAG: BoolFlag =
 pub const SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG: BoolFlag =
     BoolFlag::new("space-api-client-concurrency-limiter", true);
 
+/// Skip sandbox row locking for unchanged timeout policies with known runtime
+/// presence. Evaluated per timeout call using the sandbox ID as the subject.
+/// Falls back off, preserving the locked path until explicitly enabled.
+pub const SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG: BoolFlag =
+    BoolFlag::new("space-api-timeout-lock-bypass", false);
+
 /// JSON-typed flag carrying runtime overrides for the space-api per-client
 /// concurrency limiter (caps on concurrent create/reconnect operations per
 /// `X-Client-ID`). Shape:

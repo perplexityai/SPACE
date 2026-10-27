@@ -16,6 +16,7 @@ use pplx_space_common_core::types::{OrgId, UserId};
 use super::*;
 use crate::models::{SandboxMetadata, SandboxMetadataValue, User};
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_feature_flags::{FeatureFlagClient, SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG};
 use pplx_space_test_env::TestResult;
 
 async fn insert_actor(pool: &PgPool) -> TestResult<User> {
@@ -89,7 +90,12 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
     }
     let db = pg_test_db().await?;
     let actor = insert_actor(&db.pool).await?;
-    let controller = direct_sandbox_controller(&db.pool);
+    let enabled =
+        FeatureFlagClient::fixed_bools([(SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG.key(), true)]);
+    let disabled =
+        FeatureFlagClient::fixed_bools([(SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG.key(), false)]);
+    let absent = FeatureFlagClient::disabled();
+    let controller = direct_sandbox_controller(&db.pool).with_feature_flags(enabled.clone());
     let policy = crate::e2b::auto_lifecycle_policy(90, true, false);
     let node = pplx_space_common_core::types::NodeId::new();
     let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(node.to_string())
@@ -209,10 +215,30 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
             );
         }
     }
-    // Unknown runtime presence must serialize with activation acquisition,
-    // even when the policy is already unchanged: a Kubernetes sandbox whose
-    // record proves no execution, and one mid-transition.
-    for lifecycle in ["started", "starting"] {
+    // Ineligible requests retain locking even with unchanged intent. Gate
+    // rollback and missing configuration must also restore that behavior.
+    let conflicting = crate::e2b::auto_lifecycle_policy(120, true, false);
+    for (lifecycle, flags, timeout, expected) in [
+        ("created", &disabled, 90, &policy),
+        ("created", &absent, 90, &policy),
+        ("created", &enabled, 120, &policy),
+        ("created", &enabled, 90, &conflicting),
+        ("started", &enabled, 90, &policy),
+        ("creating", &enabled, 90, &policy),
+        ("starting", &enabled, 90, &policy),
+        ("restoring", &enabled, 90, &policy),
+        ("resuming", &enabled, 90, &policy),
+        ("pausing", &enabled, 90, &policy),
+        ("suspending", &enabled, 90, &policy),
+        ("checkpointing", &enabled, 90, &policy),
+        ("stopping", &enabled, 90, &policy),
+        ("stopped", &enabled, 90, &policy),
+        ("deleting", &enabled, 90, &policy),
+        ("quarantined", &enabled, 90, &policy),
+        ("failed", &enabled, 90, &policy),
+        ("deleted", &enabled, 90, &policy),
+    ] {
+        let controller = controller.clone().with_feature_flags(flags.clone());
         let sandbox = seed_sandbox(&db.pool, &actor).await?;
         sqlx::query(sql!(
             "UPDATE sandboxes SET lifecycle = $2, auto_lifecycle_json = $3 WHERE id = $1"
@@ -235,20 +261,20 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
             .set_access_idle_timeout(
                 &db.pool,
                 &sandbox,
-                90,
+                timeout,
                 prost_types::Timestamp {
                     seconds: 1_800_000_000,
                     nanos: 0,
                 },
-                tokio::time::Instant::now() + Duration::from_millis(500),
-                Some(&policy),
+                tokio::time::Instant::now() + Duration::from_millis(200),
+                Some(expected),
             )
             .await;
         holder.rollback().await?;
         let error = match result {
             Ok(outcome) => {
                 return Err(format!(
-                    "{lifecycle}: unknown runtime presence must still wait for the row lock, \
+                    "{lifecycle}: ineligible timeout must still wait for the row lock, \
                      got {outcome:?}"
                 )
                 .into());

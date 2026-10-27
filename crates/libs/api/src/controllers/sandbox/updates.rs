@@ -684,27 +684,36 @@ impl SandboxController {
         expected_policy: Option<&AutoLifecyclePolicy>,
     ) -> Result<AccessIdleTimeoutOutcome, ControllerError> {
         tokio::time::timeout_at(deadline, async {
-            let execution = sandbox_store::auto_lifecycle_execution(pool, sandbox.id)
-                .await
-                .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
-                .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
-            let current_policy = execution.policy.0.clone().normalized();
-            // An unchanged policy needs no persistence. Only bypass the lock
-            // when runtime presence is already known: an `Unknown` answer must
-            // serialize with activation acquisition and read its claim after
-            // taking the lock.
-            let unchanged = crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs)
-                .normalized()
-                == current_policy
-                && expected_policy
-                    .is_none_or(|expected| expected.clone().normalized() == current_policy);
-            let presence = RuntimePresence::unlocked(&execution);
-            let (execution, presence, tx) = if unchanged
-                && matches!(
-                    presence,
-                    Ok(RuntimePresence::Absent | RuntimePresence::Present)
-                ) {
-                (execution, presence?, None)
+            let unlocked = if self.feature_flags.bool_value(
+                pplx_space_feature_flags::SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG,
+                &sandbox.id.to_string(),
+            ) {
+                let execution = sandbox_store::auto_lifecycle_execution(pool, sandbox.id)
+                    .await
+                    .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
+                    .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
+                let current_policy = execution.policy.0.clone().normalized();
+                // Only unchanged intent with known runtime presence can skip
+                // serialization with activation acquisition.
+                let unchanged =
+                    crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs)
+                        .normalized()
+                        == current_policy
+                        && expected_policy
+                            .is_none_or(|expected| expected.clone().normalized() == current_policy);
+                match RuntimePresence::unlocked(&execution) {
+                    Ok(presence @ (RuntimePresence::Absent | RuntimePresence::Present))
+                        if unchanged =>
+                    {
+                        Some((execution, presence))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let (execution, presence, tx) = if let Some((execution, presence)) = unlocked {
+                (execution, presence, None)
             } else {
                 let mut tx = pool
                     .begin()

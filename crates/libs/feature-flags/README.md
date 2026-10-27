@@ -131,7 +131,7 @@ their last known values across a daemon restart.
 
 ## The flags SPACE reads
 
-Eight keys. The **subject** is what a percentage rollout hashes, so it decides
+The **subject** is what a percentage rollout hashes, so it decides
 what a fractional rule splits on; the **attributes** are what a targeting rule
 can match on beyond the subject.
 
@@ -140,6 +140,7 @@ can match on beyond the subject.
 | `space-cluster-rate-limiter` | boolean | constant `space-cluster` | none | on |
 | `space-api-client-concurrency-limiter` | boolean | constant `space-cluster` | none | on |
 | `space-api-client-concurrency-quotas` | JSON object | constant `space-cluster` | none | env-configured caps |
+| `space-api-timeout-lock-bypass` | boolean | canonical sandbox UUID string | none | off |
 | `space-net-gateway-known-egress-domains` | JSON object | sandbox id | none | the deployment's local list |
 | `space-cluster-api-client-side-balancing` | boolean | `sandbox:`/`session:`/`org:` prefixed id | `cluster_id` | off |
 | `space-native-create-pool-claim` | boolean | constant `space-cluster` | none | off |
@@ -152,6 +153,16 @@ that would enable new behavior fall back **off**. All three JSON keys fall back
 to whatever their deployment configured locally rather than to a value chosen
 here, because an override that resolves nothing should leave local
 configuration standing — see `policy::override_allowed`.
+
+`space-api-timeout-lock-bypass` lets unchanged timeout updates skip the sandbox
+row lock when runtime presence is known. Policy changes and uncertain execution
+ownership still take the lock. Create this boolean flag in Eppo with a default
+of `false`, deploy the API with its existing `EPPO_SDK_KEY`, then enable it for
+selected sandbox UUIDs before increasing the percentage. The API evaluates it on
+each timeout call. Setting it to `false` restores locking after the provider
+refreshes; requests already admitted keep their decision. Missing assignments
+or an unready provider use `false`; a disconnected provider may retain its last
+configuration. No worker rollout or migration is needed.
 
 `space-native-hidden-operations` opens hidden native operations to an org, so
 its env master, `SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED` (on by default),

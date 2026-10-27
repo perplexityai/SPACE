@@ -20,6 +20,15 @@
       },
       "targeting": {}
     },
+    "space-api-timeout-lock-bypass": {
+      "state": "ENABLED",
+      "defaultVariant": "off",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "targeting": {}
+    },
     "space-api-client-concurrency-quotas": {
       "state": "ENABLED",
       "defaultVariant": "env",
