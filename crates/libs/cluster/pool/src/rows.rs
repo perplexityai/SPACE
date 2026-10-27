@@ -4,7 +4,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    ClaimedPoolSlot, PoolConfig, PoolError, PoolSlot, PoolSlotCounts, ReservedPoolSlot, Result,
+    ClaimedPoolSlot, DecodedPoolConfigs, PoolConfig, PoolError, PoolSlot, PoolSlotCounts,
+    ReservedPoolSlot, Result, UndecodablePoolConfig,
     models::{
         PoolObservedDemand, PoolPolicyRelease, parse_disk_io_limits, parse_disk_mib,
         parse_memory_mib, parse_vcpu,
@@ -60,6 +61,29 @@ impl TryFrom<PoolConfigRow> for PoolConfig {
             updated_at: row.updated_at,
         })
     }
+}
+
+/// Decode each config row on its own. A row that fails is reported in
+/// [`DecodedPoolConfigs::undecodable`] and the other rows still decode.
+pub(crate) fn decode_config_rows(rows: Vec<PoolConfigRow>) -> DecodedPoolConfigs {
+    let mut decoded = DecodedPoolConfigs::default();
+    for row in rows {
+        let id = row.id;
+        let template_release_id = row.template_release_id;
+        let template_name = row.template_name.clone();
+        let content_hash = row.content_hash.clone();
+        match PoolConfig::try_from(row) {
+            Ok(config) => decoded.configs.push(config),
+            Err(error) => decoded.undecodable.push(UndecodablePoolConfig {
+                id,
+                template_release_id,
+                template_name,
+                content_hash,
+                error,
+            }),
+        }
+    }
+    decoded
 }
 
 #[derive(sqlx::FromRow)]

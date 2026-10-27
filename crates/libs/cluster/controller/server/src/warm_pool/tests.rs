@@ -235,6 +235,7 @@ async fn seeded_pool_config(store: &WarmPoolStore, config_id: Uuid) -> PoolConfi
         .reconcilable_configs()
         .await
         .expect("pool config query should succeed")
+        .configs
         .into_iter()
         .find(|config| config.id == config_id)
         .expect("seeded pool config is reconcilable")
@@ -912,6 +913,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
     let config = store
         .reconcilable_configs()
         .await?
+        .configs
         .into_iter()
         .find(|config| config.id == config_id)
         .expect("seeded pool config is reconcilable");
@@ -1003,6 +1005,7 @@ async fn observe_warming_slots_keeps_young_slot_missing_from_cache() -> TestResu
     let config = store
         .reconcilable_configs()
         .await?
+        .configs
         .into_iter()
         .find(|config| config.id == config_id)
         .expect("seeded pool config is reconcilable");

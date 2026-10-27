@@ -39,6 +39,26 @@ pub struct PoolConfig {
     pub updated_at: OffsetDateTime,
 }
 
+/// A `kubernetes_pool_configs` row that a config read could not decode into a
+/// [`PoolConfig`]. The read skips the row and reports it here, so one bad
+/// release or shape cannot stop the reconciler for every other template. The
+/// identity fields stay raw strings: they are the values that failed to parse.
+#[derive(Debug)]
+pub struct UndecodablePoolConfig {
+    pub id: Uuid,
+    pub template_release_id: Uuid,
+    pub template_name: String,
+    pub content_hash: String,
+    pub error: PoolError,
+}
+
+/// The result of a config read: the rows that decoded, and the rows it skipped.
+#[derive(Debug, Default)]
+pub struct DecodedPoolConfigs {
+    pub configs: Vec<PoolConfig>,
+    pub undecodable: Vec<UndecodablePoolConfig>,
+}
+
 /// A pool config joined with its live slot counts, as served by the
 /// cluster-pool admin API. Numeric fields keep their storage types and
 /// `template_name`/`content_hash` stay raw strings: this is a read model for

@@ -12,8 +12,8 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    ClaimedPoolSlot, ClaimedSlotBindSource, ManualPoolConfigSpec, NewPoolSlot,
-    OpenPoolSlotDeleteLock, PoolConfig, PoolConfigOwner, PoolConfigWithCounts, PoolError, PoolSlot,
+    ClaimedPoolSlot, ClaimedSlotBindSource, DecodedPoolConfigs, ManualPoolConfigSpec, NewPoolSlot,
+    OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigWithCounts, PoolError, PoolSlot,
     PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
     ReservedPoolSlot, Result,
     models::{
@@ -22,7 +22,7 @@ use crate::{
     },
     rows::{
         ClaimedPoolSlotRow, PoolConfigRow, PoolObservedDemandRow, PoolPolicyReleaseRow,
-        PoolSlotCountsRow, PoolSlotRow, ReservedPoolSlotRow,
+        PoolSlotCountsRow, PoolSlotRow, ReservedPoolSlotRow, decode_config_rows,
     },
 };
 
@@ -136,7 +136,7 @@ impl WarmPoolStore {
         &self.pool
     }
 
-    pub async fn enabled_configs(&self) -> Result<Vec<PoolConfig>> {
+    pub async fn enabled_configs(&self) -> Result<DecodedPoolConfigs> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
@@ -151,10 +151,10 @@ impl WarmPoolStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(TryInto::try_into).collect()
+        Ok(decode_config_rows(rows))
     }
 
-    pub async fn reconcilable_configs(&self) -> Result<Vec<PoolConfig>> {
+    pub async fn reconcilable_configs(&self) -> Result<DecodedPoolConfigs> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
@@ -175,7 +175,7 @@ impl WarmPoolStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(TryInto::try_into).collect()
+        Ok(decode_config_rows(rows))
     }
 
     /// Disabled configs whose retirement state still needs publication.
@@ -184,7 +184,7 @@ impl WarmPoolStore {
     /// this grace period. That bounded tombstone prevents a stale per-config
     /// metric group from looking active after a manual disable, including when
     /// an already-empty config no longer qualifies for normal reconciliation.
-    pub async fn recently_disabled_configs(&self, grace: Duration) -> Result<Vec<PoolConfig>> {
+    pub async fn recently_disabled_configs(&self, grace: Duration) -> Result<DecodedPoolConfigs> {
         let grace_secs = i64::try_from(grace.as_secs()).unwrap_or(i64::MAX);
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
@@ -202,7 +202,7 @@ impl WarmPoolStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(TryInto::try_into).collect()
+        Ok(decode_config_rows(rows))
     }
 
     pub async fn list_configs_with_counts(&self) -> Result<Vec<PoolConfigWithCounts>> {
@@ -398,7 +398,7 @@ impl WarmPoolStore {
     /// This sequence intentionally is not transactional: it relies on
     /// `space-cluster-controller` running as a singleton `Recreate` deployment.
     /// Add serialization or a transaction before calling it concurrently.
-    pub async fn autoscale_configs(&self, namespace: &str) -> Result<Vec<PoolConfig>> {
+    pub async fn autoscale_configs(&self, namespace: &str) -> Result<DecodedPoolConfigs> {
         let candidates = self.autoscale_candidates().await?;
 
         for candidate in &candidates {
@@ -763,7 +763,11 @@ impl WarmPoolStore {
         Ok(())
     }
 
-    async fn delete_empty_disabled_autoscale_configs(&self) -> Result<Vec<PoolConfig>> {
+    /// Rows that do not decode are deleted too: the decode only builds the
+    /// identity for the final inactive state, and an empty, disabled
+    /// autoscaler row has no other use. They are returned in
+    /// [`DecodedPoolConfigs::undecodable`] so the caller can report them.
+    async fn delete_empty_disabled_autoscale_configs(&self) -> Result<DecodedPoolConfigs> {
         let mut tx = self.pool.begin().await?;
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
@@ -784,11 +788,13 @@ impl WarmPoolStore {
         ))
         .fetch_all(&mut *tx)
         .await?;
-        let configs = rows
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<PoolConfig>>>()?;
-        let config_ids = configs.iter().map(|config| config.id).collect::<Vec<_>>();
+        let configs = decode_config_rows(rows);
+        let config_ids = configs
+            .configs
+            .iter()
+            .map(|config| config.id)
+            .chain(configs.undecodable.iter().map(|config| config.id))
+            .collect::<Vec<_>>();
         sqlx::query(sql!(
             "DELETE FROM kubernetes_pool_configs
              WHERE id = ANY($1::UUID[])"

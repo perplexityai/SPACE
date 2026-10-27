@@ -1154,7 +1154,7 @@ async fn autoscale_matches_prefixed_sandbox_demand_to_bare_release_hash() -> Tes
     .bind(old_release_id)
     .fetch_optional(&fixture.pool)
     .await?;
-    let configs = fixture.store.reconcilable_configs().await?;
+    let configs = fixture.store.reconcilable_configs().await?.configs;
     let old_config = configs
         .iter()
         .find(|config| config.template_release_id == old_release_id)
@@ -1189,7 +1189,7 @@ async fn autoscale_deletes_empty_policy_owned_pool_when_policy_is_removed() -> T
     )
     .await?;
 
-    let retired_configs = fixture.store.autoscale_configs("sandboxes").await?;
+    let retired_configs = fixture.store.autoscale_configs("sandboxes").await?.configs;
 
     let config_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
@@ -1244,7 +1244,8 @@ async fn recently_disabled_configs_only_returns_configs_within_grace_period() ->
     let configs = fixture
         .store
         .recently_disabled_configs(Duration::from_secs(10 * 60))
-        .await?;
+        .await?
+        .configs;
 
     assert_eq!(configs.len(), 1);
     assert_eq!(configs[0].id, recent_id);
@@ -4226,11 +4227,11 @@ async fn config_reads_decode_blake3_release_hashes() -> TestResult {
     let content_hash = ContentHash::new(Digest::blake3([0x3b; 32]));
     insert_pool_config(&fixture.pool, release_id, config_id, content_hash).await?;
 
-    let enabled = fixture.store.enabled_configs().await?;
+    let enabled = fixture.store.enabled_configs().await?.configs;
     assert_eq!(enabled.len(), 1);
     assert_eq!(enabled[0].content_hash, content_hash);
 
-    let reconcilable = fixture.store.reconcilable_configs().await?;
+    let reconcilable = fixture.store.reconcilable_configs().await?.configs;
     assert_eq!(reconcilable.len(), 1);
     assert_eq!(reconcilable[0].content_hash, content_hash);
 
@@ -4246,14 +4247,89 @@ async fn config_reads_decode_blake3_release_hashes() -> TestResult {
     let recently_disabled = fixture
         .store
         .recently_disabled_configs(Duration::from_secs(10 * 60))
-        .await?;
+        .await?
+        .configs;
     assert_eq!(recently_disabled.len(), 1);
     assert_eq!(recently_disabled[0].content_hash, content_hash);
 
-    let retired = fixture.store.autoscale_configs("space").await?;
+    let retired = fixture.store.autoscale_configs("space").await?.configs;
     assert_eq!(retired.len(), 1);
     assert_eq!(retired[0].id, config_id);
     assert_eq!(retired[0].content_hash, content_hash);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn config_reads_skip_an_undecodable_row_and_keep_the_others() -> TestResult {
+    // One release carries a hash the decoder cannot parse (here `sha256:`
+    // prepended to a `blake3:` value, the shape the store SQL produced before
+    // it read hashes as stored). Before this change that one row failed every
+    // config read, so no template got a warm pool. Each read must skip the
+    // bad row, report it, and still return the good rows.
+    let fixture = postgres_fixture().await?;
+    let good_release_id = Uuid::now_v7();
+    let good_config_id = Uuid::now_v7();
+    let good_hash = ContentHash::new(Digest::sha256([0x4c; 32]));
+    insert_pool_config(&fixture.pool, good_release_id, good_config_id, good_hash).await?;
+
+    let bad_release_id = Uuid::now_v7();
+    let bad_config_id = Uuid::now_v7();
+    let bad_hash = format!("sha256:blake3:{}", "3b".repeat(32));
+    insert_template_release_with_hash(&fixture.pool, "broken", bad_release_id, &bad_hash).await?;
+    sqlx::query(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, $2, 2, 1024, 2, 1, 2, 'space', true, 'autoscaler')",
+    )
+    .bind(bad_config_id)
+    .bind(bad_release_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    for read in [
+        fixture.store.enabled_configs().await?,
+        fixture.store.reconcilable_configs().await?,
+    ] {
+        assert_eq!(read.configs.len(), 1);
+        assert_eq!(read.configs[0].id, good_config_id);
+        assert_eq!(read.undecodable.len(), 1);
+        let skipped = &read.undecodable[0];
+        assert_eq!(skipped.id, bad_config_id);
+        assert_eq!(skipped.template_release_id, bad_release_id);
+        assert_eq!(skipped.template_name, "broken");
+        assert_eq!(skipped.content_hash, bad_hash);
+        assert!(matches!(skipped.error, PoolError::ContentHash(_)));
+    }
+
+    sqlx::query(
+        "UPDATE kubernetes_pool_configs
+         SET enabled = false, updated_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(bad_config_id)
+    .execute(&fixture.pool)
+    .await?;
+    let recently_disabled = fixture
+        .store
+        .recently_disabled_configs(Duration::from_secs(10 * 60))
+        .await?;
+    assert!(recently_disabled.configs.is_empty());
+    assert_eq!(recently_disabled.undecodable.len(), 1);
+    assert_eq!(recently_disabled.undecodable[0].id, bad_config_id);
+
+    // The autoscaler deletes the empty, disabled row even though it does not
+    // decode, and reports it; the good manual config is not touched.
+    let retired = fixture.store.autoscale_configs("space").await?;
+    assert!(retired.configs.is_empty());
+    assert_eq!(retired.undecodable.len(), 1);
+    assert_eq!(retired.undecodable[0].id, bad_config_id);
+    let remaining = fixture.store.reconcilable_configs().await?;
+    assert_eq!(remaining.configs.len(), 1);
+    assert_eq!(remaining.configs[0].id, good_config_id);
+    assert!(remaining.undecodable.is_empty());
 
     Ok(())
 }

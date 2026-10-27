@@ -26,7 +26,8 @@ use pplx_space_api::node_group_placement::{
     ResolvePath as NodeGroupResolvePath, ResolvedPlacement,
 };
 use pplx_space_cluster_pool::{
-    NewPoolSlot, PoolConfig, PoolSlot, PoolSlotCounts, PoolSlotState, WarmPoolStore,
+    NewPoolSlot, PoolConfig, PoolSlot, PoolSlotCounts, PoolSlotState, UndecodablePoolConfig,
+    WarmPoolStore,
 };
 use pplx_space_common_core::kubernetes::NodeGroupPlacement;
 use pplx_space_common_core::{
@@ -940,16 +941,25 @@ impl Reconciler {
                 self.store.autoscale_configs(&self.namespace),
             )
             .await?;
-        let mut configs = self
+        let reconcilable = self
             .timed_postgres("reconcilable-configs", self.store.reconcilable_configs())
             .await?;
-        let recently_disabled_configs = self
+        let recently_disabled = self
             .timed_postgres(
                 "recently-disabled-configs",
                 self.store
                     .recently_disabled_configs(RECONCILE_CONFIG_RETIREMENT_GRACE),
             )
             .await?;
+        // A config row that does not decode is skipped, not fatal: it must not
+        // stop the pass for every other template.
+        report_undecodable_configs("autoscale-configs", &deleted_configs.undecodable);
+        report_undecodable_configs("reconcilable-configs", &reconcilable.undecodable);
+        report_undecodable_configs("recently-disabled-configs", &recently_disabled.undecodable);
+        let undecodable_reconcilable_configs = reconcilable.undecodable.len();
+        let deleted_configs = deleted_configs.configs;
+        let mut configs = reconcilable.configs;
+        let recently_disabled_configs = recently_disabled.configs;
         let inventory_config_ids = configs
             .iter()
             .chain(&recently_disabled_configs)
@@ -996,11 +1006,12 @@ impl Reconciler {
         .await;
         {
             let mut report = self.pass_report();
-            report.configs = config_results.len();
+            report.configs = config_results.len() + undecodable_reconcilable_configs;
             report.failed_configs = config_results
                 .iter()
                 .filter(|result| !result.succeeded())
-                .count();
+                .count()
+                + undecodable_reconcilable_configs;
         }
         for config_result in config_results {
             self.emit_config_result(&config_result, Instant::now());
@@ -2705,6 +2716,22 @@ fn emit_reconcile_config_states(config: &PoolConfig, succeeded: bool) {
         "succeeded",
         state.succeeded,
     );
+}
+
+/// Log and count each config row a read skipped because it did not decode.
+fn report_undecodable_configs(read: &'static str, configs: &[UndecodablePoolConfig]) {
+    for config in configs {
+        tracing::error!(
+            read,
+            config_id = %config.id,
+            template_release_id = %config.template_release_id,
+            template = %config.template_name,
+            content_hash = %config.content_hash,
+            error = %config.error,
+            "warm pool: config row did not decode; skipping it and continuing with remaining configs"
+        );
+        pplx_space_metrics::warm_pool::config_decode_failed(read, &config.template_name);
+    }
 }
 
 fn retired_configs_to_emit(
