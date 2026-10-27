@@ -341,6 +341,18 @@ pub fn recover_interrupted_startup_states(
                 .pid
                 .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
         {
+            if row.pid.is_some() && row.node_execution_id.is_some() {
+                // The service's periodic process-exit reconciler rechecks this
+                // execution under the cleanup fence and persists stop intent.
+                // Quarantining here would remove the row from its inventory,
+                // making a VMM crash recoverable only without a manager restart.
+                recovered.push(StartupRecoveryRecord {
+                    id: row.id,
+                    previous_state: row.state,
+                    outcome: StartupRecoveryOutcome::Deferred,
+                });
+                continue;
+            }
             // The state-only Firecracker probe cannot reconstruct trusted
             // process credentials. Preserve all resources until the missing
             // runtime identity can be explained; an older artifact is not

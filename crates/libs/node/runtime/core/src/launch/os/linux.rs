@@ -139,6 +139,11 @@ impl ProcessHandle {
     }
 }
 
+pub(super) fn pin_current_process() -> Result<ProcessHandle, ProcessHandleError> {
+    let pid = nix::unistd::getpid().as_raw();
+    open_process_handle(pid.cast_unsigned(), pid)
+}
+
 fn open_process_handle(
     pid: u32,
     raw_pid: libc::pid_t,

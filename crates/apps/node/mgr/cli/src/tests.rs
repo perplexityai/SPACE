@@ -30,3 +30,32 @@ fn command_errors_are_fallible_and_preserve_operator_guidance() {
     assert!(denied.contains("sudo space-nodemgr cleanup"));
     assert!(!cleanup_error("cleanup", tonic::Status::unavailable("retry")).contains("hint:"));
 }
+
+#[test]
+fn selectors_count_sandboxes_not_retiring_execution_leases() {
+    let sandbox = "019d84bd-280d-7331-99c6-b63312345678";
+    let other = "019d84bd-280d-7331-99c6-b63412345678";
+    let lease = |id: &str| NetworkLease {
+        sandbox_id: id.into(),
+        ..Default::default()
+    };
+    for selector in [sandbox, "12345678"] {
+        assert_eq!(
+            resolve_lease_selector(
+                vec![lease(sandbox), lease(sandbox)],
+                &selector.parse().unwrap()
+            )
+            .unwrap(),
+            sandbox
+        );
+    }
+    resolve_lease_selector(
+        vec![lease(sandbox), lease(other)],
+        &"12345678".parse().unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        resolve_lease_selector(vec![], &sandbox.parse().unwrap()).unwrap(),
+        sandbox
+    );
+}

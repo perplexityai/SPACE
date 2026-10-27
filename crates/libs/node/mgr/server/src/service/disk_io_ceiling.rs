@@ -497,6 +497,15 @@ impl NodeManagerService {
         if !current {
             return Ok(Enforcement::Superseded);
         }
+        let runtime = self.recorded_execution(id.to_owned()).await?.map_or(
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            |execution| execution.runtime().kind,
+        );
+        if runtime != pplx_space_common_core::types::RuntimeKind::Firecracker {
+            return Err(Status::failed_precondition(
+                "live disk-I/O ceiling is unsupported by this runtime; drain before enabling the ceiling",
+            ));
+        }
         let client = crate::fc_api::FcApiClient::new(format!(
             "{JAIL_DIR}/firecracker/{id}/root/firecracker.sock"
         ));
