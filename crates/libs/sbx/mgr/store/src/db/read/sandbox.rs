@@ -27,6 +27,14 @@ pub fn sandbox_within_budget(
     crate::db::inventory_read::get(conn, id, budget)
 }
 
+/// Which of `ids` have a row, whatever it holds.
+pub fn existing_ids(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    crate::db::existing_sandbox_ids(conn, ids)
+}
+
 /// The row's `state_changed_at` exactly as stored, `None` without a row.
 ///
 /// [`SandboxRow`] does not carry this column: the value is a CAS witness, so

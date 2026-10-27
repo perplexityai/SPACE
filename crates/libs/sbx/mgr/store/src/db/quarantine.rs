@@ -734,40 +734,34 @@ db_private_outside_tests! {
                 s.transition_receipt_activation_attempt_id
            FROM sandboxes s
            LEFT JOIN sandbox_quarantine_state qs ON qs.sandbox_id = s.id
-          WHERE s.id = ?1
+          WHERE s.id IN (SELECT value FROM json_each(?1))
             AND (s.state = 'quarantined'
                  OR s.transition_receipt_id IS NOT NULL)",
         )?;
+        let mut rows = statement.query(params![
+            crate::db::inventory_read::json_id_array(sandbox_ids)?
+        ])?;
         let mut publications = BTreeMap::new();
-        for sandbox_id in sandbox_ids {
-            let publication = statement
-                .query_row(params![sandbox_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        RawSandboxStatePublicationMetadata {
-                            quarantine_reason_code: row.get(2)?,
-                            transition_receipt_id: row.get(3)?,
-                            transition_receipt_kind: row.get(4)?,
-                            transition_receipt_target_state: row.get(5)?,
-                            transition_receipt_execution_generation: row.get(6)?,
-                            transition_receipt_reason_code: row.get(7)?,
-                            transition_receipt_activation_attempt_id: row.get(8)?,
-                        },
-                    ))
-                })
-                .optional();
-            match publication {
-                Ok(Some((id, publication))) => {
-                    publications.insert(id, Ok(publication));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    publications.insert(sandbox_id.clone(), Err(error.into()));
-                }
-            }
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, String>(0)?;
+            publications.insert(id, publication_metadata(row).map_err(Error::from));
         }
         Ok(publications)
     }
+}
+
+fn publication_metadata(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawSandboxStatePublicationMetadata> {
+    Ok(RawSandboxStatePublicationMetadata {
+        quarantine_reason_code: row.get(2)?,
+        transition_receipt_id: row.get(3)?,
+        transition_receipt_kind: row.get(4)?,
+        transition_receipt_target_state: row.get(5)?,
+        transition_receipt_execution_generation: row.get(6)?,
+        transition_receipt_reason_code: row.get(7)?,
+        transition_receipt_activation_attempt_id: row.get(8)?,
+    })
 }
 
 pub fn mark_quarantined_from_state(

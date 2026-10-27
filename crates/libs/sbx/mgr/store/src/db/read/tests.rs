@@ -1059,3 +1059,85 @@ fn state_page_charges_both_budgets_exactly_as_the_state_rpc_did() {
         Err(StatePageError::Metadata(InventoryReadError::Limit(_)))
     ));
 }
+
+thread_local! {
+    static STATEMENTS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many statements `read` runs on `conn`.
+fn statements_run<T>(conn: &Connection, read: impl FnOnce() -> T) -> (T, usize) {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    fn count(event: TraceEvent<'_>) {
+        if let TraceEvent::Profile(..) = event {
+            STATEMENTS_RUN.with(|run| run.set(run.get() + 1));
+        }
+    }
+    STATEMENTS_RUN.with(|run| run.set(0));
+    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(count));
+    let result = read();
+    conn.trace_v2(TraceEventCodes::empty(), None);
+    (result, STATEMENTS_RUN.with(std::cell::Cell::get))
+}
+
+/// Node-ctl reads every row on the node each inventory pass, so a batch's
+/// statements must not grow with the rows it reads.
+#[test]
+fn a_state_page_runs_as_many_statements_for_many_rows_as_for_one() {
+    let conn = test_conn();
+    let mut ids = Vec::new();
+    for index in 0..24 {
+        let id = insert_row(&conn, SandboxState::Stopped);
+        if index % 3 == 0 {
+            crate::db::mark_quarantined(
+                &conn,
+                &id,
+                crate::db::SandboxQuarantineSource::SbxManager,
+                SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
+                "seeded",
+                crate::db::SandboxQuarantineNextAction::RequiresOperatorAttention,
+            )
+            .unwrap();
+        }
+        ids.push(id);
+    }
+    ids.push(SandboxId::new().to_string());
+
+    let page_statements = |ids: &[String]| {
+        let mut budgets = StateBudgets {
+            raw: unlimited(),
+            metadata: unlimited(),
+        };
+        let (page, statements) = statements_run(&conn, || state_page(&conn, ids, &mut budgets));
+        (page.unwrap(), statements)
+    };
+    let (one, one_statements) = page_statements(&ids[..1]);
+    let (all, all_statements) = page_statements(&ids);
+
+    assert!(matches!(one.as_slice(), [StatePageRow::Decoded(_)]));
+    assert_eq!(all.len(), ids.len());
+    assert_eq!(
+        all.iter()
+            .filter(|row| matches!(row, StatePageRow::Decoded(row) if row.publication.is_some()))
+            .count(),
+        8
+    );
+    assert!(matches!(all.last(), Some(StatePageRow::Missing(_))));
+    assert_eq!(all_statements, one_statements);
+}
+
+#[test]
+fn existing_ids_reads_a_batch_with_one_statement() {
+    let conn = test_conn();
+    let present = (0..24)
+        .map(|_| insert_row(&conn, SandboxState::Stopped))
+        .collect::<Vec<_>>();
+    let absent = SandboxId::new().to_string();
+    let mut ids = present.clone();
+    ids.push(absent.clone());
+
+    let (existing, statements) = statements_run(&conn, || existing_ids(&conn, &ids).unwrap());
+
+    assert_eq!(existing, present.into_iter().collect());
+    assert!(!existing.contains(&absent));
+    assert_eq!(statements, 1);
+}

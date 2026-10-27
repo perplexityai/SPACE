@@ -193,7 +193,7 @@ db_private_outside_tests! {
         id: &str,
         budget: &mut InventoryBudget,
     ) -> Result<Option<super::SandboxRow>, InventoryReadError> {
-        let mut stmt = conn.prepare_cached(super::GET_SANDBOX_SQL)?;
+        let mut stmt = conn.prepare_cached(&super::GET_SANDBOX_SQL)?;
         let mut rows = stmt.query([id])?;
         rows.next()?
             .map(|row| {
@@ -201,6 +201,27 @@ db_private_outside_tests! {
                 Ok(super::row_to_sandbox(row)?)
             })
             .transpose()
+    }
+}
+
+db_private_outside_tests! {
+    /// Read the rows of `ids`, charging `budget` with each row found. Each
+    /// decoded row, or the error that kept it from decoding, is keyed by id;
+    /// an id with no row is absent.
+    fn get_many(
+        conn: &Connection,
+        ids: &[String],
+        budget: &mut InventoryBudget,
+    ) -> Result<std::collections::HashMap<String, Result<super::SandboxRow, Error>>, InventoryReadError> {
+        let mut stmt = conn.prepare_cached(&super::GET_SANDBOXES_SQL)?;
+        let mut rows = stmt.query([json_id_array(ids)?])?;
+        let mut found = std::collections::HashMap::with_capacity(ids.len());
+        while let Some(row) = rows.next()? {
+            check_row(row, budget)?;
+            let id: String = row.get("id")?;
+            found.insert(id, super::row_to_sandbox(row).map_err(Error::from));
+        }
+        Ok(found)
     }
 }
 
@@ -257,16 +278,24 @@ db_private_outside_tests! {
                 s.last_observed_route_generation_substrate_kind, s.last_observed_route_substrate_kind,
                 q.reason_code, q.quarantine_id, q.next_action_owner, q.attempt_count, q.next_action_after
            FROM sandboxes s LEFT JOIN sandbox_quarantine_state q ON q.sandbox_id = s.id
-          WHERE s.id = ?1"
+          WHERE s.id IN (SELECT value FROM json_each(?1))"
         )?;
-        for id in ids {
-            let mut rows = stmt.query([id])?;
-            if let Some(row) = rows.next()? {
-                check_row(row, budget)?;
-            }
+        let mut rows = stmt.query([json_id_array(ids)?])?;
+        while let Some(row) = rows.next()? {
+            check_row(row, budget)?;
         }
         Ok(())
     }
+}
+
+/// `ids` as the JSON array a batch read binds for `json_each`.
+///
+/// A batch reads its ids with one statement rather than one per id: the
+/// State RPC reads every row on the node each inventory pass, so per-id
+/// statements cost a node with many retained rows several statements per row.
+pub(in crate::db) fn json_id_array(ids: &[String]) -> rusqlite::Result<String> {
+    serde_json::to_string(ids)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 #[cfg(test)]

@@ -1065,15 +1065,12 @@ impl SandboxManagerService {
     ) -> Result<GetDiskUsageResponse, Status> {
         let (resolved_ids, mut missing_ids) = self
             .storage(move |db| {
+                let existing = crate::db::read::existing_ids(db, &sandbox_ids)
+                    .map_err(|error| Status::internal(format!("read sandbox identity: {error}")))?;
                 let mut resolved_ids = Vec::with_capacity(sandbox_ids.len());
                 let mut missing_ids = Vec::new();
                 for id in sandbox_ids {
-                    if crate::db::read::sandbox_view(db, &id)
-                        .exists()
-                        .map_err(|error| {
-                            Status::internal(format!("read sandbox identity: {error}"))
-                        })?
-                    {
+                    if existing.contains(&id) {
                         resolved_ids.push(id);
                     } else {
                         missing_ids.push(SbxMissingDiskUsageId {

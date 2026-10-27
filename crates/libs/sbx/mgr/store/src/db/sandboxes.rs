@@ -1171,6 +1171,22 @@ pub fn clear_runtime_fields(conn: &Connection, id: &str) -> Result<()> {
 }
 
 db_private_outside_tests! {
+    fn existing_sandbox_ids(
+        conn: &Connection,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = conn.prepare_cached(sql!(
+            "SELECT id FROM sandboxes WHERE id IN (SELECT value FROM json_each(?1))"
+        ))?;
+        let rows = stmt.query_map(
+            [crate::db::inventory_read::json_id_array(ids)?],
+            |row| row.get(0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+db_private_outside_tests! {
     fn sandbox_exists(conn: &Connection, id: &str) -> Result<bool> {
         conn.query_row(
             sql!("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ?1)"),
@@ -1180,17 +1196,30 @@ db_private_outside_tests! {
     }
 }
 
-pub(super) const GET_SANDBOX_SQL: &str =
-        "SELECT id, uuid8, state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
-         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id
-         FROM sandboxes WHERE id = ?1";
+/// The columns [`row_to_sandbox`] decodes, as the whole `SELECT` list of each
+/// statement below that reads `sandboxes` rows into a [`SandboxRow`].
+const SANDBOX_ROW_COLUMNS: &str =
+    "id, uuid8, state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
+         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id";
+
+pub(super) static GET_SANDBOX_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("SELECT {SANDBOX_ROW_COLUMNS} FROM sandboxes WHERE id = ?1")
+});
+
+/// The rows whose ids are in the JSON array bound to `?1`, in no particular order.
+pub(super) static GET_SANDBOXES_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT {SANDBOX_ROW_COLUMNS} FROM sandboxes
+          WHERE id IN (SELECT value FROM json_each(?1))"
+    )
+});
 
 db_private_outside_tests! {
     fn get_sandbox(conn: &Connection, id: &str) -> Result<Option<SandboxRow>> {
         // Every guest file operation and process start looks its sandbox up
         // several times under the one database connection; parsing this wide
         // SELECT each time dominated that work.
-        let mut stmt = conn.prepare_cached(GET_SANDBOX_SQL)?;
+        let mut stmt = conn.prepare_cached(&GET_SANDBOX_SQL)?;
         let mut rows = stmt.query_map(params![id], row_to_sandbox)?;
         rows.next().transpose().map_err(Error::from)
     }

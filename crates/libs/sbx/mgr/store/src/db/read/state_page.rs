@@ -79,7 +79,8 @@ pub enum StatePageError {
 
 /// Read one batch of `ids` for the State RPC, charging `budgets`.
 ///
-/// Rows come back in request order, one per id. The State RPC publishes the
+/// Rows come back in request order, one per id; `ids` are distinct, as the
+/// State RPC canonicalizes them. The State RPC publishes the
 /// state-only rows before the decoded ones, so a caller reproducing its
 /// response partitions them rather than publishing in this order.
 ///
@@ -96,15 +97,14 @@ pub fn state_page(
         .map_err(StatePageError::Metadata)?;
     let mut route_provenance = crate::db::activation_route_provenance_for_sandboxes(conn, ids)
         .map_err(StatePageError::RouteProvenance)?;
+    let mut rows = crate::db::inventory_read::get_many(conn, ids, &mut budgets.raw)
+        .map_err(StatePageError::Row)?;
     let mut page = Vec::with_capacity(ids.len());
     for sandbox_id in ids {
-        match crate::db::inventory_read::get(conn, sandbox_id, &mut budgets.raw) {
-            Ok(Some(row)) => page.push(PageEntry::Row(Box::new(row))),
-            Ok(None) => page.push(PageEntry::Done(StatePageRow::Missing(sandbox_id.clone()))),
-            Err(error @ (InventoryReadError::Limit(_) | InventoryReadError::Ambiguous)) => {
-                return Err(StatePageError::Row(error));
-            }
-            Err(InventoryReadError::Database(error)) => {
+        match rows.remove(sandbox_id) {
+            Some(Ok(row)) => page.push(PageEntry::Row(Box::new(row))),
+            None => page.push(PageEntry::Done(StatePageRow::Missing(sandbox_id.clone()))),
+            Some(Err(error)) => {
                 let lifecycle = match crate::db::raw_sandbox_lifecycle(conn, sandbox_id) {
                     Ok(Some(lifecycle)) => lifecycle,
                     Ok(None) => {

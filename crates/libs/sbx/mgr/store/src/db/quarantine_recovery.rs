@@ -270,64 +270,58 @@ db_private_outside_tests! {
            FROM sandbox_quarantine_state qs
            JOIN sandboxes s ON s.id = qs.sandbox_id
            LEFT JOIN sandbox_cleanup_episodes cleanup ON cleanup.sandbox_id = s.id
-          WHERE qs.sandbox_id = ?1
+          WHERE qs.sandbox_id IN (SELECT value FROM json_each(?1))
             AND qs.source = ?2
             AND s.state IN ('quarantined', 'restoring')
             AND cleanup.sandbox_id IS NULL",
         )?;
+        let mut rows = statement.query(params![
+            crate::db::inventory_read::json_id_array(sandbox_ids)?,
+            SandboxQuarantineSource::SbxManager.as_str()
+        ])?;
         let mut observations = BTreeMap::new();
-        for sandbox_id in sandbox_ids {
-            let observation = statement
-                .query_row(
-                    params![sandbox_id, SandboxQuarantineSource::SbxManager.as_str()],
-                    |row| {
-                        let reason_raw = row.get::<_, String>(5)?;
-                        let reason =
-                            reason_raw
-                                .parse::<SandboxQuarantineReasonCode>()
-                                .map_err(|error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        5,
-                                        Type::Text,
-                                        Box::new(error),
-                                    )
-                                })?;
-                        let observation = if reason.automatic_recovery_policy().is_some() {
-                            Some(RawQuarantineRecoveryObservation {
-                                local_quarantine_id: row.get(1)?,
-                                owner: row.get(2)?,
-                                attempt_count: row.get(3)?,
-                                next_attempt_at: {
-                                    let value = row.get::<_, rusqlite::types::Value>(4)?;
-                                    let stored_type = value.data_type();
-                                    nullable_stored_timestamp_text(value).ok_or_else(|| {
-                                        rusqlite::Error::InvalidColumnType(
-                                            4,
-                                            "next_action_after".into(),
-                                            stored_type,
-                                        )
-                                    })?
-                                },
-                            })
-                        } else {
-                            None
-                        };
-                        Ok((row.get::<_, String>(0)?, observation))
-                    },
-                )
-                .optional();
-            match observation {
-                Ok(Some((id, Some(observation)))) => {
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, String>(0)?;
+            match recovery_observation(row) {
+                Ok(Some(observation)) => {
                     observations.insert(id, Ok(observation));
                 }
-                Ok(Some((_, None)) | None) => {}
+                Ok(None) => {}
                 Err(error) => {
-                    observations.insert(sandbox_id.clone(), Err(error.into()));
+                    observations.insert(id, Err(error.into()));
                 }
             }
         }
         Ok(observations)
     }
+}
+
+/// One `quarantine_recovery_observations` row's observation; `None` when its
+/// reason has no automatic-recovery policy.
+fn recovery_observation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<RawQuarantineRecoveryObservation>> {
+    let reason_raw = row.get::<_, String>(5)?;
+    let reason = reason_raw
+        .parse::<SandboxQuarantineReasonCode>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(error))
+        })?;
+    if reason.automatic_recovery_policy().is_none() {
+        return Ok(None);
+    }
+    Ok(Some(RawQuarantineRecoveryObservation {
+        local_quarantine_id: row.get(1)?,
+        owner: row.get(2)?,
+        attempt_count: row.get(3)?,
+        next_attempt_at: {
+            let value = row.get::<_, rusqlite::types::Value>(4)?;
+            let stored_type = value.data_type();
+            nullable_stored_timestamp_text(value).ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(4, "next_action_after".into(), stored_type)
+            })?
+        },
+    }))
 }
 
 /// One scanned row of the legacy-recovery quarantine cohort.
