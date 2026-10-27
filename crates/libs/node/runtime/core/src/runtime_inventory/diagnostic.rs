@@ -1328,8 +1328,8 @@ pub const FIRECRACKER_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
 const CLOUD_HYPERVISOR_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
     binaries: &["bin/cloud-hypervisor"],
     state_format: None,
-    // Discovery recognizes installed bytes without approving new installs.
-    known_releases: Vec::new,
+    // Install pins do not qualify this runtime for sandbox execution.
+    known_releases: || vec![crate::catalog::CLOUD_HYPERVISOR_INSTALL_VERSION],
 };
 
 fn firecracker_known_releases() -> Vec<&'static str> {

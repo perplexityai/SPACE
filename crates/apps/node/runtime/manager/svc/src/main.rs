@@ -105,8 +105,12 @@ struct Cli {
     /// Where Firecracker release archives are downloaded from: an
     /// `https://` base laid out as Firecracker's GitHub release downloads,
     /// `<base>/v<version>/firecracker-v<version>-<arch>.tgz`.
-    #[arg(long, default_value = FIRECRACKER_RELEASE_SOURCE)]
+    #[arg(long, default_value = FIRECRACKER_RELEASE_SOURCE, value_parser = ReleaseSourceParser)]
     release_source: ReleaseUrl,
+
+    /// Where Cloud Hypervisor static executables are downloaded from.
+    #[arg(long, default_value = pplx_space_node_runtime_manager::CLOUD_HYPERVISOR_RELEASE_SOURCE, value_parser = ReleaseSourceParser)]
+    cloud_hypervisor_release_source: ReleaseUrl,
 
     /// Largest kernel or release archive one install downloads, in bytes.
     #[arg(long, default_value_t = DEFAULT_INSTALL_LIMITS.max_bytes)]
@@ -194,12 +198,53 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
             list_admission_timeout: Duration::from_secs(cli.list_admission_timeout_secs),
             kernel_source: Some(KernelSourceConfig::S3(cli.kernel_source)),
             catalog_dir: cli.catalog_dir,
-            releases: vec![RuntimeManagerReleaseConfig {
-                root: cli.node_releases_dir,
-                source: ReleaseSourceConfig::GitHub(cli.release_source),
-            }],
+            releases: vec![
+                RuntimeManagerReleaseConfig {
+                    root: cli.node_releases_dir,
+                    source: ReleaseSourceConfig::GitHub(cli.release_source),
+                },
+                RuntimeManagerReleaseConfig {
+                    root: paths::NODE_CLOUD_HYPERVISOR_DIR.into(),
+                    source: ReleaseSourceConfig::CloudHypervisorGitHub(
+                        cli.cloud_hypervisor_release_source,
+                    ),
+                },
+            ],
             install,
         })
+    }
+}
+
+/// Clap's inferred parser repeats invalid inputs in diagnostics. Release-source
+/// URLs must be refused without echoing credentials or signed query parameters.
+#[derive(Clone)]
+struct ReleaseSourceParser;
+
+impl clap::builder::TypedValueParser for ReleaseSourceParser {
+    type Value = ReleaseUrl;
+
+    fn parse_ref(
+        &self,
+        command: &clap::Command,
+        argument: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let invalid = || {
+            let option = argument.map_or("release source", |arg| arg.get_id().as_str());
+            clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!(
+                    "{option}: {}",
+                    pplx_space_node_runtime_manager::ReleaseUrlParseError
+                ),
+            )
+            .with_cmd(command)
+        };
+        value
+            .to_str()
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())
     }
 }
 
@@ -215,3 +260,6 @@ fn main() -> anyhow::Result<()> {
             Ok(result?)
         })
 }
+
+#[cfg(test)]
+mod tests;

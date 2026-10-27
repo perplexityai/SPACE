@@ -18,16 +18,22 @@ use super::source::BoxError;
 pub const FIRECRACKER_RELEASE_SOURCE: &str =
     "https://github.com/firecracker-microvm/firecracker/releases/download";
 
-/// An `https://` URL with a host and no query: a release source's download
-/// base or an archive under it. The path can be extended with
+/// Cloud Hypervisor's static executable release downloads.
+pub const CLOUD_HYPERVISOR_RELEASE_SOURCE: &str =
+    "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download";
+
+/// An `https://` URL with a host and no userinfo, query or fragment: a release
+/// source's download base or an archive under it. The path can be extended with
 /// [`ReleaseUrl::join`] without re-parsing.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ReleaseUrl(String);
 
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-#[error("invalid release location '{0}'; expected an https:// URL with a host and no query")]
-pub struct ReleaseUrlParseError(String);
+#[error(
+    "invalid release location; expected an https:// URL with a host and no userinfo, query or fragment"
+)]
+pub struct ReleaseUrlParseError;
 
 impl ReleaseUrl {
     pub fn as_str(&self) -> &str {
@@ -46,11 +52,15 @@ impl FromStr for ReleaseUrl {
     type Err = ReleaseUrlParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let invalid = || ReleaseUrlParseError(value.to_string());
+        let invalid = || ReleaseUrlParseError;
         let uri: http::Uri = value.parse().map_err(|_| invalid())?;
         if uri.scheme_str() != Some("https")
             || uri.host().is_none_or(str::is_empty)
             || uri.query().is_some()
+            || uri
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'))
+            || value.contains('#')
         {
             return Err(invalid());
         }
