@@ -31,7 +31,7 @@ impl Side {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Operation {
+pub(crate) enum Operation {
     Read,
     Write,
     Flush,
@@ -46,6 +46,10 @@ pub(crate) struct RelayFault {
 }
 
 impl RelayFault {
+    pub(crate) const fn new(side: Side, operation: Operation) -> Self {
+        Self { side, operation }
+    }
+
     pub(crate) const fn side(self) -> Side {
         self.side
     }
@@ -140,10 +144,10 @@ pub(in crate::tcp_proxy) struct RelayLeg<'a, T> {
 impl<T> RelayLeg<'_, T> {
     fn note(&self, operation: Operation, result: &Poll<io::Result<impl Sized>>) {
         if let Poll::Ready(Err(_)) = result {
-            let _ = self.witness.fault.set(RelayFault {
-                side: self.side,
-                operation,
-            });
+            let _ = self
+                .witness
+                .fault
+                .set(RelayFault::new(self.side, operation));
         }
     }
 }

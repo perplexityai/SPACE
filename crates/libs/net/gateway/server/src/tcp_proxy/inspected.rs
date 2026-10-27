@@ -2,7 +2,7 @@
 use super::http_host::{HostBinding, MeteredIo};
 use super::tls::TlsTransportError;
 use super::tls_http::{HttpError, HttpProtocol};
-use super::{TcpProxy, tls, tls_http, transport};
+use super::{Severity, TcpProxy, tls, tls_http, transport};
 use crate::{
     certificates::CertificateLease,
     egress::AdmittedTcp,
@@ -36,6 +36,7 @@ impl TcpProxy {
             protocol = tracing::field::Empty,
             policy_ref = tracing::field::Empty,
             handshake_queue_ms = tracing::field::Empty,
+            fault = tracing::field::Empty,
             otel.status_code = "ERROR",
         );
         async {
@@ -62,6 +63,8 @@ impl TcpProxy {
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();
                 let wire_written = accounting.written.clone();
+                let known_egress = self.known_egress_state.clone();
+                let sandbox_id = self.sandbox_id;
                 let connect = move |guest_protocol| async move {
                     let origin = async {
                         Ok(MeteredIo {
@@ -74,7 +77,26 @@ impl TcpProxy {
                     tls::connect(origin, &upstream_lease, &interception, offer)
                         .await
                         .map(|(io, alpn)| (io, alpn.into()))
-                        .map_err(Into::into)
+                        .map_err(|error| {
+                            // The origin is dialed for the guest's first
+                            // request, so a failed setup is answered with a
+                            // 502 inside the session and never reaches the
+                            // flow outcome that known-egress otherwise reads.
+                            let reason = match &error {
+                                TlsTransportError::Connect(error) => {
+                                    format!("upstream_connect: {error}")
+                                }
+                                error => format!("upstream_setup: {}", error.as_str()),
+                            };
+                            known_egress.report_tcp_relay_failure(
+                                sandbox_id,
+                                destination,
+                                upstream_lease.host(),
+                                Some(error.fault()),
+                                &reason,
+                            );
+                            error.into()
+                        })
                 };
                 tls_http::serve(downstream, binding, lease.clone(), connect).await
             };
@@ -88,10 +110,20 @@ impl TcpProxy {
                 () = lease.invalidated() => Err(TlsTransportError::Invalidated.into()),
                 result = operation => result,
             };
-            if result.is_ok() {
-                tracing::Span::current().record("otel.status_code", "OK");
-            } else if let Err(error) = &result {
-                error.record("tls_session");
+            match &result {
+                Ok(()) => {
+                    tracing::Span::current().record("otel.status_code", "OK");
+                }
+                Err(error) => {
+                    let fault = error.fault();
+                    let span = tracing::Span::current();
+                    span.record("fault", fault.as_str());
+                    // A session the guest ended is not a gateway failure.
+                    if fault.severity() == Severity::Debug {
+                        span.record("otel.status_code", "OK");
+                    }
+                    error.record("tls_session");
+                }
             }
             result
         }

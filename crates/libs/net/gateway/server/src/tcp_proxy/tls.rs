@@ -13,7 +13,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
-use super::transport;
+use super::relay::{Operation, RelayFault, Side};
+use super::{Fault, Severity, event_at, transport};
 use crate::certificates::{CertificateError, CertificateLease};
 use crate::tls_interception::{
     Admission, HandshakePermit, Refused, TlsHandshakeLeg, TlsInterception,
@@ -28,7 +29,7 @@ pub(super) enum TlsTransportError {
     #[error("TLS handshake capacity exhausted")]
     Capacity,
     #[error("TLS connection setup exceeded its ten-second deadline")]
-    Timeout,
+    Timeout(SetupPhase),
     #[error("certificate lease expired or its binding changed")]
     Invalidated,
     /// The gateway itself is shutting down. Distinct from
@@ -54,14 +55,27 @@ pub(super) enum TlsTransportError {
     Connect(#[from] transport::Error),
 }
 
+/// The part of connection setup that a [`TlsTransportError::Timeout`] cut
+/// short. All three share one deadline and one `tls_timeout` outcome, but
+/// only the dial is a failed connect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SetupPhase {
+    GuestHandshake,
+    OriginConnect,
+    OriginHandshake,
+}
+
 impl TlsTransportError {
     pub(super) fn record(&self, stage: &'static str) {
         let failure = self.failure();
+        let fault = self.fault();
         let io_kind = self.io_error().map(io::Error::kind);
-        tracing::error!(
+        event_at!(
+            fault.severity(),
             telemetry_type = "gateway_boundary_failure",
             stage,
             outcome = self.as_str(),
+            fault = fault.as_str(),
             reason = failure.reason,
             io_kind = ?io_kind,
             tls_alert = failure.alert_code(),
@@ -73,7 +87,7 @@ impl TlsTransportError {
     pub(super) const fn as_str(&self) -> &'static str {
         match self {
             Self::Capacity => "tls_capacity",
-            Self::Timeout => "tls_timeout",
+            Self::Timeout(_) => "tls_timeout",
             Self::Invalidated => "tls_invalidated",
             Self::Withdrawn => "tls_withdrawn",
             Self::Target => "tls_target_error",
@@ -82,6 +96,25 @@ impl TlsTransportError {
             Self::Downstream(_) => "tls_downstream_error",
             Self::Upstream(_) => "tls_upstream_error",
             Self::Connect(_) => "upstream_connect_error",
+        }
+    }
+
+    pub(super) fn fault(&self) -> Fault {
+        match self {
+            Self::Downstream(error) => Fault::GuestHandshake {
+                alert: received_alert(error).is_some(),
+            },
+            Self::Timeout(SetupPhase::GuestHandshake) => Fault::GuestHandshake { alert: false },
+            Self::Upstream(_) | Self::Timeout(SetupPhase::OriginHandshake) => {
+                Fault::OriginHandshake
+            }
+            Self::Connect(_) | Self::Timeout(SetupPhase::OriginConnect) => Fault::OriginConnect,
+            Self::Invalidated | Self::Withdrawn => Fault::Cancelled,
+            Self::Capacity
+            | Self::Target
+            | Self::Protocol
+            | Self::Certificate(_)
+            | Self::Configuration(_) => Fault::Gateway,
         }
     }
 
@@ -97,7 +130,7 @@ impl TlsTransportError {
     fn failure(&self) -> TlsFailure {
         match self {
             Self::Capacity => TlsFailure::new("capacity"),
-            Self::Timeout => TlsFailure::new("timeout"),
+            Self::Timeout(_) => TlsFailure::new("timeout"),
             Self::Invalidated => TlsFailure::new("invalidated"),
             Self::Withdrawn => TlsFailure::new("gateway_shutdown"),
             Self::Target => TlsFailure::new("target_mismatch"),
@@ -216,7 +249,7 @@ where
         let downstream =
             tokio::time::timeout_at(deadline, TlsAcceptor::from(Arc::new(config)).accept(stream))
                 .await
-                .map_err(|_| TlsTransportError::Timeout)?
+                .map_err(|_| TlsTransportError::Timeout(SetupPhase::GuestHandshake))?
                 .map_err(TlsTransportError::Downstream)?;
         let actual_name = downstream
             .get_ref()
@@ -270,7 +303,7 @@ where
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(TlsTransportError::Timeout),
+            Err(_) => Err(TlsTransportError::Timeout(SetupPhase::OriginConnect)),
         };
         // The dial and the handshake share one deadline, so without separate
         // timers a `timeout` cannot be attributed to either phase.
@@ -313,7 +346,7 @@ where
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(TlsTransportError::Timeout),
+            Err(_) => Err(TlsTransportError::Timeout(SetupPhase::OriginHandshake)),
         };
         attempt.finish(&result);
         result
@@ -448,6 +481,7 @@ impl HandshakeAttempt {
 
     fn record_failure(leg: TlsHandshakeLeg, error: &TlsTransportError) -> &'static str {
         let failure = error.failure();
+        let fault = error.fault();
         let boundary = match leg {
             TlsHandshakeLeg::ClientToNetgw => "guest_tls",
             TlsHandshakeLeg::NetgwToOrigin => "origin_tls",
@@ -466,11 +500,15 @@ impl HandshakeAttempt {
             failure.reason,
             &failure.alert_tag(),
         );
-        tracing::warn!(
+        // Never louder than WARN: the boundary event for the same failure
+        // carries ERROR where one is due.
+        event_at!(
+            fault.severity().min(Severity::Warn),
             telemetry_type = "tls_handshake_error",
             boundary,
             leg = leg.as_str(),
             outcome,
+            fault = fault.as_str(),
             reason = failure.reason,
             io_kind = ?error.io_error().map(io::Error::kind),
             tls_alert = failure.alert_code(),
@@ -496,6 +534,13 @@ impl Drop for HandshakeAttempt {
     }
 }
 
+const fn side(leg: TlsHandshakeLeg) -> Side {
+    match leg {
+        TlsHandshakeLeg::ClientToNetgw => Side::Guest,
+        TlsHandshakeLeg::NetgwToOrigin => Side::Origin,
+    }
+}
+
 /// Reports native I/O failures from an established TLS connection regardless
 /// of whether Hyper or an upgraded tunnel currently owns the stream.
 pub(super) struct TlsIo<T> {
@@ -513,18 +558,23 @@ impl<T> TlsIo<T> {
         }
     }
 
-    fn record_error(&mut self, operation: &'static str, error: &io::Error) {
+    /// `kind` is the relay operation `operation` counts as, so the `fault`
+    /// field matches the pass-through relay's labels.
+    fn record_error(&mut self, operation: &'static str, kind: Operation, error: &io::Error) {
         if self.error_reported {
             return;
         }
         let failure = TlsFailure::io(error);
+        let fault = Fault::Relay(RelayFault::new(side(self.leg), kind));
         self.error_reported = true;
         pplx_space_metrics::gateway::tls_connection_error(self.leg.as_str(), failure.reason);
-        tracing::warn!(
+        event_at!(
+            fault.severity(),
             telemetry_type = "tls_connection_error",
             boundary = "forwarding",
             leg = self.leg.as_str(),
             operation,
+            fault = fault.as_str(),
             reason = failure.reason,
             io_kind = ?error.kind(),
             tls_alert = failure.alert_code(),
@@ -542,7 +592,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for TlsIo<T> {
     ) -> Poll<io::Result<()>> {
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Err(error)) = &result {
-            self.record_error("read", error);
+            self.record_error("read", Operation::Read, error);
         }
         result
     }
@@ -556,7 +606,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TlsIo<T> {
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Err(error)) = &result {
-            self.record_error("write", error);
+            self.record_error("write", Operation::Write, error);
         }
         result
     }
@@ -564,7 +614,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TlsIo<T> {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let result = Pin::new(&mut self.inner).poll_flush(cx);
         if let Poll::Ready(Err(error)) = &result {
-            self.record_error("flush", error);
+            self.record_error("flush", Operation::Flush, error);
         }
         result
     }
@@ -572,7 +622,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TlsIo<T> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let result = Pin::new(&mut self.inner).poll_shutdown(cx);
         if let Poll::Ready(Err(error)) = &result {
-            self.record_error("shutdown", error);
+            self.record_error("shutdown", Operation::Shutdown, error);
         }
         result
     }
@@ -588,7 +638,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TlsIo<T> {
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
         if let Poll::Ready(Err(error)) = &result {
-            self.record_error("write_vectored", error);
+            self.record_error("write_vectored", Operation::Write, error);
         }
         result
     }

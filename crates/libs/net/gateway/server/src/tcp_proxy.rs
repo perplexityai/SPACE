@@ -33,6 +33,7 @@ use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
 mod accounting;
 mod admission;
+mod fault;
 mod http_host;
 mod inspected;
 mod relay;
@@ -44,6 +45,7 @@ mod transport;
 mod upstream;
 
 use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
+pub(crate) use fault::{Fault, Severity, event_at};
 pub use pplx_space_net_gateway_client::TcpDomainAuthorizationMode;
 pub(crate) use relay::{RelayFault, Side as RelaySide};
 
@@ -812,19 +814,25 @@ impl TcpProxy {
         let Some(reason) = outcome.failure_reason() else {
             return false;
         };
-        let FlowOutcome::RelayFailed(RelayFailure::Transfer { fault, .. }) = outcome else {
-            return self.known_egress_state.report_tcp_failure(
-                self.sandbox_id,
-                dst,
-                host,
-                reason.as_ref(),
-            );
+        let fault = match outcome {
+            FlowOutcome::RelayFailed(RelayFailure::Transfer { fault, .. }) => {
+                fault.map(Fault::Relay)
+            }
+            FlowOutcome::RelayFailed(RelayFailure::Inspected(error)) => Some(error.fault()),
+            _ => {
+                return self.known_egress_state.report_tcp_failure(
+                    self.sandbox_id,
+                    dst,
+                    host,
+                    reason.as_ref(),
+                );
+            }
         };
-        self.known_egress_state.report_tcp_transfer_failure(
+        self.known_egress_state.report_tcp_relay_failure(
             self.sandbox_id,
             dst,
             host,
-            *fault,
+            fault,
             reason.as_ref(),
         )
     }

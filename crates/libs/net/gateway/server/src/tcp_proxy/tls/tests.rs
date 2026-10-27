@@ -72,6 +72,67 @@ fn upstream_protocol_requires_guest_compatibility() {
     }
 }
 
+/// A guest that abandons its handshake is not a failed connect, and a dial
+/// that runs out of time is not a destination's stalled TLS handshake.
+#[test]
+fn setup_failures_name_the_failing_peer_and_phase() {
+    use super::super::{Fault, transport};
+    use super::SetupPhase;
+    use std::io::{Error, ErrorKind};
+
+    let eof = || Error::from(ErrorKind::UnexpectedEof);
+    let alert = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::UnknownCA),
+        )
+    };
+    let rustls = || rustls::Error::General("test".to_owned());
+    for (error, expected) in [
+        (
+            TlsTransportError::Downstream(eof()),
+            Fault::GuestHandshake { alert: false },
+        ),
+        (
+            TlsTransportError::Downstream(alert()),
+            Fault::GuestHandshake { alert: true },
+        ),
+        (
+            TlsTransportError::Timeout(SetupPhase::GuestHandshake),
+            Fault::GuestHandshake { alert: false },
+        ),
+        (TlsTransportError::Upstream(alert()), Fault::OriginHandshake),
+        (
+            TlsTransportError::Timeout(SetupPhase::OriginHandshake),
+            Fault::OriginHandshake,
+        ),
+        (
+            TlsTransportError::Connect(transport::Error::Io(eof())),
+            Fault::OriginConnect,
+        ),
+        (
+            TlsTransportError::Connect(transport::Error::Timeout),
+            Fault::OriginConnect,
+        ),
+        (
+            TlsTransportError::Timeout(SetupPhase::OriginConnect),
+            Fault::OriginConnect,
+        ),
+        (TlsTransportError::Invalidated, Fault::Cancelled),
+        (TlsTransportError::Withdrawn, Fault::Cancelled),
+        (TlsTransportError::Capacity, Fault::Gateway),
+        (TlsTransportError::Target, Fault::Gateway),
+        (TlsTransportError::Protocol, Fault::Gateway),
+        (TlsTransportError::Configuration(rustls()), Fault::Gateway),
+        (
+            TlsTransportError::Certificate(crate::certificates::CertificateError::Tls(rustls())),
+            Fault::Gateway,
+        ),
+    ] {
+        assert_eq!(error.fault(), expected, "{error:?}");
+    }
+}
+
 #[test]
 fn tls_diagnostics_do_not_export_the_guest_hostname() {
     #[derive(Clone, Default)]
@@ -142,7 +203,8 @@ mod http_failure {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-    use super::super::super::tls_http::http_reason;
+    use super::super::super::Fault;
+    use super::super::super::tls_http::{HttpError, http_reason};
 
     /// Delivers one request, then fails every write the way a guest reset does.
     struct ResetAfterRequest(&'static [u8]);
@@ -216,6 +278,64 @@ mod http_failure {
         let error = serve.await.expect_err("body stream fails");
         let failure = http_reason(&error);
         assert_eq!(failure, "user");
+    }
+
+    /// The guest-facing server fails through the guest, except when the
+    /// destination's response body fails underneath it.
+    #[tokio::test]
+    async fn session_failures_name_the_peer_that_ended_them() {
+        use tokio::io::AsyncReadExt;
+
+        // The guest hangs up while a response is still streaming.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let serve = tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(
+            TokioIo::new(server),
+            service_fn(|_| async {
+                let body = StreamBody::new(futures_util::stream::pending::<
+                    Result<Frame<Bytes>, io::Error>,
+                >());
+                Ok::<_, Infallible>(hyper::Response::new(body))
+            }),
+        ));
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: a\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0; 64];
+        assert!(client.read(&mut head).await.unwrap() > 0);
+        drop(client);
+        let guest_left = serve.await.unwrap().expect_err("guest left mid-response");
+
+        // The destination's response body fails mid-stream.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let serve = hyper::server::conn::http1::Builder::new().serve_connection(
+            TokioIo::new(server),
+            service_fn(|_| async {
+                let body = StreamBody::new(futures_util::stream::iter([Err::<Frame<Bytes>, _>(
+                    io::Error::from(io::ErrorKind::ConnectionReset),
+                )]));
+                Ok::<_, Infallible>(hyper::Response::new(body))
+            }),
+        );
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: a\r\n\r\n")
+            .await
+            .unwrap();
+        let origin_failed = serve.await.expect_err("response body failed");
+
+        type Source = Box<dyn std::error::Error + Send + Sync>;
+        for (error, expected) in [
+            (Source::from(guest_left), Fault::GuestHttp),
+            (Source::from(origin_failed), Fault::OriginHttp),
+            // TLS EOF before the guest's first byte surfaces unwrapped from
+            // HTTP version detection.
+            (
+                Source::from(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Fault::GuestHttp,
+            ),
+        ] {
+            assert_eq!(HttpError::Server(error).fault(), expected);
+        }
     }
 
     #[tokio::test]

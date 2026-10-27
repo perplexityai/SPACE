@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 mod leg;
 use leg::RelayWitness;
-pub(crate) use leg::{RelayFault, Side};
+pub(crate) use leg::{Operation, RelayFault, Side};
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Error {

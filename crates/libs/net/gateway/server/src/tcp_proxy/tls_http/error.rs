@@ -1,5 +1,6 @@
 //! Preserve the error returned by HTTP setup or serving without interpreting opaque sources.
 use super::super::tls::TlsTransportError;
+use super::super::{Fault, event_at};
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::tcp_proxy) enum HttpError {
@@ -18,6 +19,28 @@ impl HttpError {
             Self::Protocol(_) | Self::Server(_) => "http_connection_error",
         }
     }
+    /// The guest-facing HTTP server fails only through the guest, except
+    /// when a response body streamed from the destination fails: Hyper calls
+    /// that a user error, and this server's only other user code, its
+    /// service, cannot fail.
+    pub(in crate::tcp_proxy) fn fault(&self) -> Fault {
+        match self {
+            Self::Transport(error) => error.fault(),
+            // Only origin requests and their senders return a bare Hyper error.
+            Self::Protocol(_) => Fault::OriginHttp,
+            Self::Server(error) => {
+                if error
+                    .downcast_ref::<hyper::Error>()
+                    .is_some_and(hyper::Error::is_user)
+                {
+                    Fault::OriginHttp
+                } else {
+                    Fault::GuestHttp
+                }
+            }
+        }
+    }
+
     pub(in crate::tcp_proxy) fn record(&self, stage: &'static str) {
         match self {
             Self::Transport(error) => error.record(stage),
@@ -26,8 +49,16 @@ impl HttpError {
                 http_reason = http_reason(error),
                 "HTTP operation failed"
             ),
-            Self::Server(_) => {
-                tracing::info!(stage, reason = self.as_str(), "HTTP connection ended")
+            Self::Server(error) => {
+                let fault = self.fault();
+                event_at!(
+                    fault.severity(),
+                    stage,
+                    reason = self.as_str(),
+                    fault = fault.as_str(),
+                    http_reason = error.downcast_ref::<hyper::Error>().map(http_reason),
+                    "HTTP connection ended"
+                );
             }
         }
     }

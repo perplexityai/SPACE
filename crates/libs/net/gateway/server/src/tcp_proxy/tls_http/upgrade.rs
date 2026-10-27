@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::accounting::{Attempt, Outcome};
 use super::super::relay::{self, RelayFault};
+use super::super::{Fault, Severity, event_at};
 use super::SanitizedRequest;
 
 pub(super) enum Handshake {
@@ -182,7 +183,14 @@ pub(super) fn relay(
                     Err(relay::Error::Cancelled) => (Outcome::Cancelled, "session_ended"),
                     Err(relay::Error::Idle) => (Outcome::Success, "upgrade_idle_timeout"),
                     Err(relay::Error::Io(error)) => {
-                        tracing::info!(io_kind = ?error.kind(), raw_os_error = error.raw_os_error(), "HTTP upgrade relay failed");
+                        let fault = report.fault.map(Fault::Relay);
+                        event_at!(
+                            fault.map_or(Severity::Info, Fault::severity),
+                            io_kind = ?error.kind(),
+                            raw_os_error = error.raw_os_error(),
+                            fault = fault.map(Fault::as_str),
+                            "HTTP upgrade relay failed"
+                        );
                         (
                             Outcome::Error,
                             report.fault.map_or("relay_io", RelayFault::as_str),

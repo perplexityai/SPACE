@@ -651,22 +651,65 @@ events use the log target
 `pplx_space_net_gateway::known_egress` and carry `sandbox_id`,
 `original_dst_port`, `destination`, `protocol` and `reason`.
 
-- ERROR `failed to connect to known egress destination`: every failed matched
-  DNS query or TCP flow except a pass-through transfer failure. That covers
-  rejections and failed connects. It also covers inspected TLS/HTTP failures,
-  including those after the upstream connected.
+- ERROR `failed to connect to known egress destination`: a matched DNS query
+  or TCP flow that was rejected, or whose connect failed. Under TLS
+  interception the destination is dialed for the guest's first request, so a
+  failed or timed-out dial logs here with an `upstream_connect: ...` or
+  `upstream_setup: tls_timeout` reason. The gateway's own inspection failures
+  (handshake capacity, certificate material, configuration, target or ALPN
+  checks) also log here.
 - INFO `known egress destination failed an established connection`: a
-  pass-through relay that connected and then failed first on the destination
-  leg, or without a recorded leg (`fault:relay_io`).
+  pass-through relay or inspected session whose destination failed after the
+  TCP connect: a destination-leg relay failure, a relay failure without a
+  recorded leg (`fault:relay_io`), the destination's TLS handshake or
+  certificate (`fault:origin_handshake`), or its HTTP response
+  (`fault:origin_http`).
 - DEBUG `guest side failed an established known egress connection`: a
-  pass-through relay that connected and then failed first on the guest leg.
-  These events are visible only when the gateway's log filter enables DEBUG
-  for that target.
+  pass-through relay or inspected session that the guest ended: a guest-leg
+  relay failure, a failed or abandoned guest TLS handshake
+  (`fault:guest_handshake`), or a guest HTTP connection that ended
+  mid-message or before a request (`fault:guest_http`). These events are
+  visible only when the gateway's log filter enables DEBUG for that target.
 
-The INFO and DEBUG events add `fault`, with the same pass-through values as
-the metric tag above. Each of these failures is also counted by
-`gateway.tcp.connection{status:relay_failed,detail:transfer}`, with the same
-`fault`, so no log level is needed to count transfer failures.
+An inspected session that gateway shutdown or a certificate lease change
+cancelled is not logged here. The INFO and DEBUG events add `fault`; a
+pass-through failure has the same values as the metric tag above and is also
+counted by `gateway.tcp.connection{status:relay_failed,detail:transfer}` with
+that `fault`, so no log level is needed to count transfer failures. Inspected
+sessions are counted by `gateway.tcp.connection{status:relay_failed,detail:inspected_http}`
+without a `fault`.
+
+### Inspected TLS failure logs
+
+Inspected TLS and HTTP classify a failure by what failed first, the same way
+the pass-through relay does. The `fault` field on `TLS handshake failed`,
+`inspected connection failed`, `established TLS connection failed`, `HTTP
+connection ended` and `HTTP upgrade relay failed` decides the level:
+
+| `fault` | Level | Meaning |
+| --- | --- | --- |
+| `guest_read`, `guest_write`, `guest_flush`, `guest_shutdown` | DEBUG | An established guest TLS stream failed, usually a guest closing without TLS `close_notify` or resetting. |
+| `guest_handshake` | DEBUG, or WARN with `tls_alert` | The guest's TLS handshake failed or timed out. A guest that rejects the interception chain sends a fatal alert; one that disconnects or resets does not. |
+| `guest_http` | DEBUG | The guest's HTTP connection ended mid-message, idled out before a request, or broke HTTP framing. |
+| `origin_read`, `origin_write`, `origin_flush`, `origin_shutdown` | INFO | An established destination TLS stream failed. |
+| `origin_handshake` | INFO | The destination's TLS handshake or certificate failed, or stalled, after its TCP connect. |
+| `origin_http` | INFO | The destination's response failed after it began. |
+| `origin_connect` | ERROR | The TCP connect to the destination failed or timed out. |
+| `gateway` | ERROR | The gateway's handshake capacity, certificate material, configuration, or target or ALPN check failed. |
+| `cancelled` | INFO | Gateway shutdown or a certificate lease change ended the session. |
+
+`TLS handshake failed` is never louder than WARN; `inspected connection failed`
+carries the ERROR for the same failure. A guest-attributed fault is relative to
+what the gateway observed first: a destination that stalls can make the guest
+give up, which reads as a guest fault. `gateway.tls.handshake` and
+`gateway.tls.connection_error` still count every failure with its `leg` and
+`reason`, whatever its level.
+
+The `tls.server` span records `fault` when its session fails. Its
+`otel.status_code` is `ERROR` unless the session succeeded or a DEBUG fault
+ended it. The span describes the guest connection: a failed destination setup
+that the guest receives as a 502 shows on the `tls.client` span for that setup
+instead.
 
 ## Firecracker and guest diagnostics
 
