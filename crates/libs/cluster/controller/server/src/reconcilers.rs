@@ -28,6 +28,7 @@ use crate::drained_node_terminator;
 use crate::execution_materialization_backfill;
 use crate::failed_restorable_repair;
 use crate::kube_node_sync;
+use crate::lost_started_sandboxes;
 use crate::node_drain;
 use crate::node_group_labeler;
 use crate::node_group_mirror;
@@ -774,6 +775,33 @@ pub async fn run_reconcilers(
                 tracing::info!(
                     "orphaned-nodes reconciler is disabled \
                      (SPACE_ORPHANED_NODES_ENABLED unset); skipping AWS SDK init"
+                );
+            }
+
+            // Lost-started-sandbox give-up: flips `started` sandboxes whose
+            // started recovery failed with no restore source to `failed` once
+            // their source node is gone (row deleted, or absent from
+            // Kubernetes with no live EC2 instance). Opt-in; the AWS SDK is
+            // only initialized when it's enabled, like `orphaned_nodes`.
+            let lost_started_config = lost_started_sandboxes::ReconcilerConfig::from_env();
+            if lost_started_config.enabled {
+                let aws_config =
+                    aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
+                let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
+                let sink = lost_started_sandboxes::LostStartedDbStore::new(pool.clone());
+                let presence = reconcile_queue_gc::SubstrateKubeNodePresence::new(kube.clone());
+                handles.push(tokio::spawn(lost_started_sandboxes::run(
+                    lost_started_config,
+                    sink,
+                    lookup,
+                    presence,
+                    shutdown_token.child_token(),
+                )));
+            } else {
+                tracing::info!(
+                    "lost_started_sandboxes is disabled \
+                     (SPACE_LOST_STARTED_SANDBOXES_ENABLED unset); skipping AWS SDK init"
                 );
             }
 

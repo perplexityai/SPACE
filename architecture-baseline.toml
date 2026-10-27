@@ -161,7 +161,7 @@
 "crates/libs/api/src/controllers/substrate/kubernetes/store/restore_lease.rs" = 8
 "crates/libs/api/src/controllers/substrate/kubernetes/store/suspend.rs" = 8
 "crates/libs/api/src/controllers/substrate/mod.rs" = 1
-"crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 2
+"crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 1
 "crates/libs/cluster/controller/server/src/failed_restorable_repair/store.rs" = 3
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 5

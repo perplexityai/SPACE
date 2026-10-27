@@ -1,11 +1,12 @@
 //! Unified metric + structured-log emission for the cluster-controller's
 //! sandbox repair/sweep loops.
 //!
-//! Names live in the `cluster_reconciler.*` namespace. Eight loops share the family, distinguished by the
+//! Names live in the `cluster_reconciler.*` namespace. Nine loops share the family, distinguished by the
 //! `loop` tag: `started_sandbox_repair`, `failed_restorable_repair`,
 //! `transient_lifecycle_sweeper`, `suspended_execution_reaper`,
 //! `stuck_snapshot_reaper`, `stuck_container_creating_gc`,
-//! `warm_pool_orphan_gc`, and `orphaned_restore_pod_gc`. Loops with
+//! `warm_pool_orphan_gc`, `orphaned_restore_pod_gc`, and
+//! `lost_started_sandboxes`. Loops with
 //! multiple sub-sweeps further split on the `sweep` tag; single-sweep
 //! loops carry `sweep:main`.
 //!
@@ -59,6 +60,7 @@ pub enum Loop {
     StuckContainerCreatingGc,
     WarmPoolOrphanGc,
     OrphanedRestorePodGc,
+    LostStartedSandboxes,
 }
 
 impl Loop {
@@ -72,6 +74,7 @@ impl Loop {
             Self::StuckContainerCreatingGc => "stuck_container_creating_gc",
             Self::WarmPoolOrphanGc => "warm_pool_orphan_gc",
             Self::OrphanedRestorePodGc => "orphaned_restore_pod_gc",
+            Self::LostStartedSandboxes => "lost_started_sandboxes",
         }
     }
 }
@@ -396,6 +399,46 @@ impl UnrestorableOutcome {
         match self {
             Self::GaveUpNoRestoreSource => Some(LIFECYCLE_FAILED),
             Self::CasLost => None,
+        }
+    }
+}
+
+/// Per-candidate result of the lost-started-sandbox give-up
+/// (`loop:lost_started_sandboxes, sweep:main`). `from_lifecycle` is always
+/// `started`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostStartedOutcome {
+    /// The source node is confirmed gone and no snapshot can restore the
+    /// sandbox without rolling it back: CAS'd to `failed`.
+    GaveUpSourceNodeGone,
+    /// Left alone: the source node's instance is still live
+    /// (`reason:source_node_live`).
+    Skipped,
+    /// Left alone this tick: the source node can't be checked
+    /// (`reason:source_node_unverifiable`, `reason:kube_membership_unknown`,
+    /// `reason:kube_absence_settling`)
+    /// or a lookup failed (`reason:instance_lookup_failed`,
+    /// `reason:kube_node_lookup_failed`).
+    Deferred,
+    CasLost,
+    Error,
+}
+
+impl LostStartedOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GaveUpSourceNodeGone => "gave_up_source_node_gone",
+            Self::Skipped => OUTCOME_SKIPPED,
+            Self::Deferred => OUTCOME_DEFERRED,
+            Self::CasLost => OUTCOME_CAS_LOST,
+            Self::Error => OUTCOME_ERROR,
+        }
+    }
+
+    fn to_lifecycle(self) -> Option<&'static str> {
+        match self {
+            Self::GaveUpSourceNodeGone => Some(LIFECYCLE_FAILED),
+            Self::Skipped | Self::Deferred | Self::CasLost | Self::Error => None,
         }
     }
 }
@@ -842,6 +885,14 @@ impl OutcomeEvent {
             outcome.as_str(),
         );
         event.from_lifecycle = Some("restoring".to_string());
+        event.to_lifecycle = outcome.to_lifecycle();
+        event
+    }
+
+    pub fn lost_started_sandbox(outcome: LostStartedOutcome) -> Self {
+        let mut event = Self::new(Loop::LostStartedSandboxes, Sweep::Main, outcome.as_str());
+        event.mode = Some(Mode::Live);
+        event.from_lifecycle = Some(LIFECYCLE_STARTED.to_string());
         event.to_lifecycle = outcome.to_lifecycle();
         event
     }

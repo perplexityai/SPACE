@@ -19,10 +19,12 @@ mod drained_node_terminator;
 mod env_config;
 mod execution_materialization_backfill;
 mod failed_restorable_repair;
+mod gone_node_write_off;
 mod kube_node_sync;
 mod leader_election;
 #[cfg(test)]
 mod lifecycle_writer_test_support;
+mod lost_started_sandboxes;
 mod node_drain;
 mod node_group_labeler;
 mod node_group_mirror;

@@ -1364,6 +1364,7 @@ async fn k8s_store_postgres_behaviors() -> TestResult {
     failed_started_recovery_converges_unplaced_sandbox_with_current_snapshot(&fixture).await?;
     failed_started_recovery_converges_after_authoritative_pod_absence(&fixture).await?;
     failed_started_recovery_after_pod_absence_refuses_stale_snapshot(&fixture).await?;
+    started_recovery_claim_on_lost_sandbox_mints_no_execution(&fixture).await?;
     failed_started_recovery_pod_absence_is_fenced_against_late_materialization(&fixture).await?;
     failed_started_recovery_without_current_snapshot_stays_started(&fixture).await?;
     failed_started_recovery_with_orphaned_snapshot_stays_started(&fixture).await?;
@@ -2614,6 +2615,41 @@ async fn failed_started_recovery_converges_after_authoritative_pod_absence(
         execution_by_generation_row(&fixture.pool, sandbox_id, generation).await?
     );
 
+    Ok(())
+}
+
+/// A sandbox given up as lost is `failed` with its execution retired. A wake
+/// that still reaches started recovery must be refused without allocating a
+/// generation, so a retrying client stops minting executions.
+async fn started_recovery_claim_on_lost_sandbox_mints_no_execution(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "failed").await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+            (sandbox_id, generation, pod_name, pod_namespace, state, active)
+         VALUES ($1, 7, $2, 'sandboxes', 'forgotten', FALSE)"
+    ))
+    .bind(sandbox_id)
+    .bind(format!("space-sbx-{}-g7", sandbox_id.as_uuid().simple()))
+    .execute(&fixture.pool)
+    .await?;
+
+    let claim = fixture.store.claim_started_recovery(sandbox_id).await;
+    assert!(
+        matches!(claim, Err(SubstrateError::Conflict { .. })),
+        "a lost sandbox must not be recovered, got {claim:?}"
+    );
+    let (executions, newest): (i64, i64) = sqlx::query_as(sql!(
+        "SELECT COUNT(*), MAX(generation)
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!((executions, newest), (1, 7));
     Ok(())
 }
 

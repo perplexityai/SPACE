@@ -36,7 +36,7 @@ use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
 /// snapshot. Well above the reflector's resync latency; slower reaping is fine
 /// for a retention-cleanup path.
 pub const DEFAULT_ABSENCE_GRACE: Duration = Duration::from_secs(600);
-const DIRECT_NODE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DIRECT_NODE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A detector's verdict for one candidate node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

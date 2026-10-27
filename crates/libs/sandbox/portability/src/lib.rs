@@ -2176,6 +2176,64 @@ pub fn inflight_suspend_upload_from_other_node_exists(
     )
 }
 
+/// Returns a self-contained SQL fragment that is TRUE when a `started`
+/// sandbox aliased `sandbox_alias`, whose started recovery failed, has no
+/// snapshot that could restore it without a rollback and none that might
+/// become one. It gates the give-up that marks such a sandbox lost once the
+/// node in `{sandbox_alias}.active_node_id` is gone. `settle_param` is the
+/// bind placeholder for the dead-upload settle window in seconds.
+///
+/// Deliberately stricter than started recovery's own source lookup, so the
+/// give-up can never fail a sandbox that recovery, or the failed-recovery
+/// convergence to `suspended`, could still bring back. Either of these keeps
+/// the sandbox:
+///
+/// - **Any ready full snapshot that covers the activity clocks**, whatever
+///   its origin or artifact identity, with a live storage location. Started
+///   recovery accepts only the current suspend snapshot.
+/// - **Any `creating` full snapshot that may still finalize.** One from
+///   another node, or from no recorded node, can still become `ready`. One
+///   from the gone node can't, since its upload worker died with the
+///   instance, but a finalize RPC that left the node first may still be in
+///   flight, so it counts until it has been quiet for the settle window, the
+///   rule the drained-node give-up applies to the same rows.
+///
+/// A ready snapshot older than the last command or access doesn't count:
+/// restoring it would silently roll the user back, which is why started
+/// recovery refuses it.
+///
+/// Two `NOT EXISTS` conjuncts rather than `NOT (A OR B)`, so a caller that
+/// scans many rows can plan each as an anti-join.
+pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) -> String {
+    format!(
+        "NOT EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots sn\n\
+               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
+              WHERE sn.sandbox_id = {sandbox_alias}.id\n\
+                AND sn.type = 'full'\n\
+                AND sn.state = 'ready'\n\
+                AND ssl.orphaned_at IS NULL\n\
+                AND ({sandbox_alias}.last_command_at IS NULL\n\
+                     OR sn.timestamp >= {sandbox_alias}.last_command_at)\n\
+                AND ({sandbox_alias}.last_access_at IS NULL\n\
+                     OR sn.timestamp >= {sandbox_alias}.last_access_at)\n\
+         )\n\
+         AND NOT EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots sn\n\
+              WHERE sn.sandbox_id = {sandbox_alias}.id\n\
+                AND sn.type = 'full'\n\
+                AND sn.state = 'creating'\n\
+                AND (\n\
+                    sn.source_node_id IS DISTINCT FROM {sandbox_alias}.active_node_id\n\
+                    OR COALESCE(sn.last_attempt_at, sn.timestamp)\n\
+                       >= NOW() - make_interval(secs => {settle_param}::BIGINT)\n\
+                )\n\
+         )"
+    )
+}
+
 /// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
 /// is **portable for drain-completion**:
 ///

@@ -7,14 +7,16 @@ use std::time::Duration;
 
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_svc::sql::sandbox_residency::{self, ResidencyEvidence};
-use pplx_space_events::{
-    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
-};
+use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_from_other_node_exists,
     snapshot_durable_for_source_release,
 };
 use sqlx::PgPool;
+
+use crate::gone_node_write_off::{
+    emit_lost_and_failed, node_identity_holds, write_off_lost_sandboxes,
+};
 
 use super::{
     DRAIN_KEEP_ANNOTATION, DrainKeepAnnotationLookup, DrainKeepStatus, DrainedNodeTerminatorSink,
@@ -565,25 +567,14 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // the undrain/reflector UPDATE until this transaction commits (or
         // waits for theirs and then re-reads the latest committed version,
         // refusing on drift).
-        let node_still_eligible: Option<i32> = sqlx::query_scalar(sql!(
-            "SELECT 1 FROM nodes
-              WHERE id = $1 AND drain_phase = 'drained' AND managed_by = $2
-              FOR SHARE"
-        ))
-        .bind(node_id)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let uid_still_matches: Option<i32> = sqlx::query_scalar(sql!(
-            "SELECT 1 FROM node_k8s
-              WHERE node_id = $1 AND k8s_node_uid IS NOT DISTINCT FROM $2
-              FOR SHARE"
-        ))
-        .bind(node_id)
-        .bind(expected_uid.clone())
-        .fetch_optional(&mut *tx)
-        .await?;
-        if node_still_eligible.is_none() || uid_still_matches.is_none() {
+        if !node_identity_holds(
+            &mut tx,
+            node_id,
+            Some(PHASE_DRAINED),
+            expected_uid.as_deref(),
+        )
+        .await?
+        {
             tx.rollback().await?;
             return Ok(Vec::new());
         }
@@ -657,83 +648,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
             .fetch_all(&mut *tx)
             .await?;
         if !ids.is_empty() {
-            // Finalize the flipped sandboxes' dead `creating` uploads from
-            // this node — the upload worker died with the instance, so no
-            // `FinalizeArtifactBackup` will ever terminalize them. Without
-            // this, the snapshot guard's lifecycle-agnostic in-flight arm
-            // (`inflight_suspend_upload_from_node_exists`) keeps treating the
-            // row as a live upload and refuses the reap forever — on a
-            // sandbox that is now `failed` and therefore outside this
-            // give-up's own candidate set. Scoped to `source_node_id = $2`
-            // (uploads from other nodes vetoed the flip entirely, so none of
-            // the flipped ids have one) and mirroring the worker's own
-            // failure terminalization (`state = 'failed'`).
-            sqlx::query(sql!(
-                "UPDATE snapshots
-                    SET state = 'failed'
-                  WHERE sandbox_id = ANY($1)
-                    AND source_node_id = $2
-                    AND type = 'full'
-                    AND state = 'creating'
-                    AND COALESCE(last_attempt_at, timestamp)
-                        < NOW() - make_interval(secs => $3::BIGINT)"
-            ))
-            .bind(&ids)
-            .bind(node_id)
-            .bind(DEAD_UPLOAD_SETTLE.as_secs().cast_signed())
-            .execute(&mut *tx)
-            .await?;
-            // Drop the given-up sandboxes' queue rows on this node. Once the
-            // sandbox is `failed`, a queued row describes an artifact nobody
-            // will back up, and nothing else removes it: a gone node sends no
-            // census for the mirror to replace its set from, and the table's
-            // only foreign key is on `sandbox_id`, so the row would stay until
-            // the sandbox row is deleted, reading as pending work the node no
-            // longer has.
-            //
-            // Scoped to `node_id`, not just `sandbox_id`: a sandbox can hold
-            // a queue row on another node — the queue is keyed
-            // `(node_id, sandbox_id)` — and that row belongs to that node's
-            // inventory, not to this reap. Deleting by sandbox alone would
-            // silently drop a live node's pending work.
-            //
-            // Lock order is sandboxes-then-queue. The census publish that
-            // writes these rows takes the queue row first (its foreign-key
-            // check on `sandboxes` runs after the insert, and its upsert arm
-            // locks the existing queue row with no check at all), so the two
-            // can deadlock. That needs a census for this same node while its
-            // give-up runs, which a gone node does not send, and the cost would
-            // be a deadlock error retried on the next tick, not lost data.
-            sqlx::query(sql!(
-                "DELETE FROM node_local_backup_pending
-                  WHERE node_id = $1 AND sandbox_id = ANY($2)"
-            ))
-            .bind(node_id)
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(sql!(
-                "UPDATE sandbox_k8s_executions
-                    SET active = FALSE,
-                        state = 'forgotten',
-                        pod_ip = NULL,
-                        terminated_at = COALESCE(terminated_at, NOW()),
-                        updated_at = NOW()
-                  WHERE sandbox_id = ANY($1)
-                    AND active"
-            ))
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(sql!(
-                "UPDATE sandboxes
-                    SET placement = 'unplaced',
-                        active_node_id = NULL
-                  WHERE id = ANY($1)"
-            ))
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await?;
+            write_off_lost_sandboxes(&mut tx, node_id, &ids, DEAD_UPLOAD_SETTLE).await?;
         }
         tx.commit().await?;
         let node_label = node_id.to_string();
@@ -744,18 +659,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
                 .source_node_id(node_label.clone())
                 .reason("gone_node_unrecoverable")
                 .trigger(SandboxEventTrigger::System);
-            SandboxEvent::new(
-                *sandbox_id,
-                SandboxEventType::SandboxLost,
-                SandboxEventSource::ClusterController,
-            )
-            .emit_with(details.clone());
-            SandboxEvent::new(
-                *sandbox_id,
-                SandboxEventType::SandboxFailed,
-                SandboxEventSource::ClusterController,
-            )
-            .emit_with(details.operation("drained_node_terminator"));
+            emit_lost_and_failed(*sandbox_id, details, "drained_node_terminator");
         }
         Ok(ids)
     }
