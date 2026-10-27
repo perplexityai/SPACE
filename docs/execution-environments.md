@@ -878,6 +878,45 @@ Kind and development nodes. Before upgrading a deployment that needs those exist
 bindings, configure its explicit allowlist while keeping the default at E0. Do not
 expand every development deployment's policy merely because of its name.
 
+### Environment observations
+
+`GetExecutionInventory` also returns `environments`, which says what the node's
+build certifies and which environments the node can cold boot:
+
+- `known` lists every environment in the build's compiled catalog for the host
+  architecture, whatever its policy. Each entry carries its full generic
+  (schema 2) definition, so a reader can check the reference against the
+  descriptor. It also carries the runtime release's sort key and the
+  environment's certified upgrade and memory edges, from
+  `CompiledEnvironment::upgrade_targets` and `memory_targets`. "Selecting a
+  restore consumer" below describes which upgrade edges are certified. No
+  memory edge is certified yet, so none is published.
+- `usable_environments` lists the known environments this node can cold boot:
+  node-manager's startup policy allows the environment, and a new cold boot
+  resolves to it from verified artifacts under its own reference. Cluster
+  policy only narrows the startup policy, so applying it, and judging freshness,
+  is the reader's job. Unverified external copies with matching versions don't
+  count, and a node on the prototype overlapping layout reports nothing usable.
+  The field is evidence, not a reservation, and it doesn't cover restore
+  readiness.
+
+A sort key is the runtime driver's ordering in portable form, compared
+element-wise within one runtime kind. Firecracker and Cloud Hypervisor use
+`[major, minor, patch]` for plain releases, reading Cloud Hypervisor's
+`major.minor` labels as patch zero. Neither publishes a key for a pre-release or
+build suffix, or for a part that doesn't fit a Postgres `INT`. `RuntimeInstallation.version_sort_key`
+carries the same key for each runtime the inventory publishes.
+
+A node built before these fields omits `environments`, which means unknown,
+never an empty catalog. An empty observation is a node whose build certifies
+nothing for its architecture. Cluster readers built before the fields drop them
+from the legacy and complete inventories alike, so their agreement check still
+holds. `EnvironmentObservation::try_from` rejects the whole observation for an
+unknown schema, a schema-1 definition, a reference that doesn't match its
+descriptor, a repeated known or usable entry, a repeated or self edge, a usable
+or edge reference outside `known`, a memory edge without an upgrade edge, or an
+out-of-range sort key.
+
 ### Cluster desired policy
 
 Cluster policy lives in the control-plane tables `runtime_environment_policy`
@@ -1121,6 +1160,15 @@ cold-boot selection for a new sandbox or build, described above, uses the same
 check and doesn't consult edges. An edge doesn't replace the consent, fencing and preserved pair above,
 doesn't move work, and doesn't permit a restore: it carries no memory and
 doesn't qualify a loader.
+
+Memory compatibility has no single authority yet. Restore fallback admits a
+candidate that supports memory state and has an equal compatibility profile
+(`selection.rs`), while published memory edges come from
+`CompiledEnvironment::memory_targets`, which certifies none. Equal profiles are
+a prerequisite, not qualification. Cross-environment restore planning needs one
+directed rule that both admission and publication use, covering adapter
+qualification and the platform and boot constraints, with same-environment
+restore still allowed.
 
 ### Upgrading a sandbox's runtime
 

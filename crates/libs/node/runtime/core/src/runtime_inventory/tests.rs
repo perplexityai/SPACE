@@ -1538,3 +1538,77 @@ fn cold_only_runtime_has_no_launcher_or_snapshot_claims() {
     let reported = inventory(vec![installation]).to_proto();
     assert!(reported.runtimes[0].state_formats.is_empty());
 }
+
+#[test]
+fn firecracker_sort_keys_order_as_the_driver_compares() {
+    let versions = ["1.9.0", "v1.15.1", "1.15.10", "1.17.0", "1.17.1", "2.0.0"];
+    let identity = |version: &str| RuntimeIdentity {
+        kind: RuntimeKind::Firecracker,
+        version: RuntimeVersion::parse(version).unwrap(),
+    };
+    for left in versions {
+        for right in versions {
+            let compared = FirecrackerDriver
+                .compare_versions(&identity(left).version, &identity(right).version)
+                .unwrap();
+            let keyed = version_sort_key(&identity(left))
+                .unwrap()
+                .cmp(&version_sort_key(&identity(right)).unwrap());
+            assert_eq!(keyed, compared, "{left} vs {right}");
+        }
+    }
+    assert_eq!(
+        version_sort_key(&identity("v1.15.1")).unwrap().components(),
+        [1, 15, 1]
+    );
+    // Suffixes order by strings, and oversized parts do not fit INT[].
+    for unordered in [
+        "1.17.0-rc.1",
+        "1.17.0+build.5",
+        "3000000000.0.0",
+        "not-semver",
+    ] {
+        assert_eq!(version_sort_key(&identity(unordered)), None, "{unordered}");
+    }
+    assert_eq!(
+        version_sort_key(&RuntimeIdentity {
+            kind: RuntimeKind::Gvisor,
+            version: RuntimeVersion::parse("40.0").unwrap(),
+        }),
+        None,
+        "a runtime without a driver publishes no order"
+    );
+}
+
+#[test]
+fn cloud_hypervisor_sort_keys_order_as_the_driver_compares() {
+    let driver = cloud_hypervisor::CloudHypervisorDriver;
+    let versions = ["40.0", "54.0", "54.0.1", "54.1", "100.0"];
+    let version = |text: &str| RuntimeVersion::parse(text).unwrap();
+    for left in versions {
+        for right in versions {
+            let compared = driver
+                .compare_versions(&version(left), &version(right))
+                .unwrap();
+            let keyed = driver
+                .version_sort_key(&version(left))
+                .unwrap()
+                .cmp(&driver.version_sort_key(&version(right)).unwrap());
+            assert_eq!(keyed, compared, "{left} vs {right}");
+        }
+    }
+    assert_eq!(
+        driver
+            .version_sort_key(&version("54.0"))
+            .unwrap()
+            .components(),
+        [54, 0, 0]
+    );
+    for unordered in ["54.0-rc.1", "3000000000.0", "not-semver"] {
+        assert_eq!(
+            driver.version_sort_key(&version(unordered)),
+            None,
+            "{unordered}"
+        );
+    }
+}

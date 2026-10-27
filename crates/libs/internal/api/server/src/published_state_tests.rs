@@ -126,6 +126,7 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
                     can_load: true,
                 })
                 .collect(),
+            version_sort_key: Vec::new(),
         }],
         components: execution
             .components()
@@ -136,6 +137,7 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
                 legacy_default: true,
             })
             .collect(),
+        environments: None,
     };
     let mut template = template_state();
     template.execution = Some((&execution).into());

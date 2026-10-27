@@ -14,6 +14,9 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use super::size::MemorySize;
 use super::{Arch, Digest, HostCpu, RuntimeKind, VcpuCount};
 
+mod sort_key;
+pub use sort_key::{VersionSortKey, VersionSortKeyError};
+
 /// Firecracker release assigned to durable artifacts written before execution metadata existed.
 pub const INITIAL_FIRECRACKER_RUNTIME_VERSION: &str = "1.15.1";
 /// Guest kernel node images ship as their default and legacy default, which

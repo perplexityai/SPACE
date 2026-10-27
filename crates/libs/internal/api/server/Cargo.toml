@@ -67,6 +67,7 @@ pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx", "test-hooks"] }
+pplx-space-execution-common = { workspace = true, features = ["serde"] }
 hex = { workspace = true }
 insta = { workspace = true, features = ["yaml", "redactions"] }
 prost = { workspace = true }

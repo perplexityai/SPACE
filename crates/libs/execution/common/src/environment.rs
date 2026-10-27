@@ -7,9 +7,14 @@ use pplx_space_common_core::types::*;
 use crate::{ExecutionProtoError, proto};
 
 mod binding;
+mod observation;
 mod profiles;
 mod transport;
 pub use binding::{EnvironmentBindingError, EnvironmentRequirementsError};
+pub use observation::{
+    ENVIRONMENT_OBSERVATION_SCHEMA_VERSION, EnvironmentObservation, EnvironmentObservationError,
+    KnownEnvironment,
+};
 pub use transport::{FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT};
 pub const CLOUD_HYPERVISOR_BOOT_CONTRACT: &str = "cloud-hypervisor-linux-direct-v1";
 pub const CLOUD_HYPERVISOR_MACHINE_CONTRACT: &str = "cloud-hypervisor-pci-v1";

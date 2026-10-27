@@ -9,7 +9,7 @@ use pplx_space_common_core::types::{
     Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
     ArtifactVersion, Digest, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
     FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
-    RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion,
+    RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion, VersionSortKey,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -18,6 +18,7 @@ pub mod diagnostic;
 pub mod kernel_release;
 #[cfg(feature = "artifact-store")]
 mod managed;
+mod observation;
 
 const BOOT_COMPONENT_ROLE: &str = "boot";
 const VMLINUX_COMPONENT_FORMAT: &str = "vmlinux";
@@ -591,6 +592,9 @@ trait RuntimeDriver: Send + Sync {
         left: &RuntimeVersion,
         right: &RuntimeVersion,
     ) -> Result<Ordering, RuntimeInventoryError>;
+    /// A portable key that orders as `compare_versions` does, for versions
+    /// whose order fits integer components. `None` publishes no order.
+    fn version_sort_key(&self, version: &RuntimeVersion) -> Option<VersionSortKey>;
     fn can_execute(
         &self,
         installed: &RuntimeInstallation,
@@ -813,6 +817,10 @@ impl RuntimeDriver for FirecrackerDriver {
         Ok(self.parse_version(left)?.cmp(&self.parse_version(right)?))
     }
 
+    fn version_sort_key(&self, version: &RuntimeVersion) -> Option<VersionSortKey> {
+        semver_sort_key(&self.parse_version(version).ok()?)
+    }
+
     fn can_execute(
         &self,
         installed: &RuntimeInstallation,
@@ -870,6 +878,29 @@ impl RuntimeDriverRegistry {
 }
 
 static DRIVERS: RuntimeDriverRegistry = RuntimeDriverRegistry::new();
+
+/// The runtime driver's ordering key for a release, when it defines one.
+fn semver_sort_key(version: &semver::Version) -> Option<VersionSortKey> {
+    // A pre-release sorts before its release, which [major, minor, patch]
+    // can't express; build metadata has no defined order.
+    if !version.pre.is_empty() || !version.build.is_empty() {
+        return None;
+    }
+    let component = |value: u64| u32::try_from(value).ok();
+    VersionSortKey::new(vec![
+        component(version.major)?,
+        component(version.minor)?,
+        component(version.patch)?,
+    ])
+    .ok()
+}
+
+pub(crate) fn version_sort_key(runtime: &RuntimeIdentity) -> Option<VersionSortKey> {
+    DRIVERS
+        .get(runtime.kind)
+        .ok()?
+        .version_sort_key(&runtime.version)
+}
 
 impl RuntimeInventory {
     /// Root-owned artifacts are immutable; missing/replaced files invalidate a
@@ -1330,6 +1361,9 @@ impl RuntimeInventory {
                     })
                     .into_iter()
                     .collect(),
+                version_sort_key: VersionSortKey::to_wire(
+                    version_sort_key(&installation.runtime).as_ref(),
+                ),
             })
             .collect();
         let components = self
@@ -1343,6 +1377,7 @@ impl RuntimeInventory {
             .collect();
         proto::NodeExecutionInventory {
             policy: None,
+            environments: None,
             runtimes,
             components,
         }

@@ -26,6 +26,7 @@ async fn collection_outcomes_keep_failure_distinct_from_empty_success() {
             ..Default::default()
         }],
         components: vec![],
+        environments: None,
     };
     for (result, expected) in [
         (

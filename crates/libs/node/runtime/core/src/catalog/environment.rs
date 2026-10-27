@@ -412,6 +412,12 @@ impl CompiledEnvironment {
                 })
             })
     }
+    /// Upgrade targets also certified to restore this one's checkpoints. None
+    /// is certified yet: keeping memory across a runtime change needs a
+    /// qualified loader pair first.
+    pub fn memory_targets(&self) -> &[EnvironmentReference] {
+        &[]
+    }
 }
 
 /// Edges are optional metadata, so an invalid table withdraws every edge and

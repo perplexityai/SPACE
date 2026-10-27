@@ -334,3 +334,27 @@ fn an_execution_is_attributed_to_the_environment_it_ran_under() {
     .unwrap();
     assert_eq!(attributed(&custom), None);
 }
+
+#[test]
+fn published_sort_keys_match_the_selection_ordering() {
+    // Restore selection ranks by `runtime_ordering_key`; the observation
+    // publishes the driver's key. A release bump must move both.
+    let mut checked = 0;
+    for architecture in [Arch::X86_64, Arch::Aarch64] {
+        for entry in CompiledEnvironment::for_architecture(architecture).unwrap() {
+            let published = crate::runtime_inventory::version_sort_key(&entry.release().release)
+                .unwrap_or_else(|| panic!("{} has no runtime ordering key", entry.name()));
+            let selection = entry.runtime_ordering_key();
+            assert!(
+                selection.pre.is_empty() && selection.build.is_empty(),
+                "{} ranks by a key the observation can't publish",
+                entry.name()
+            );
+            let expected = [selection.major, selection.minor, selection.patch]
+                .map(|part| u32::try_from(part).unwrap());
+            assert_eq!(published.components(), expected, "{}", entry.name());
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "the compiled catalog has entries to compare");
+}

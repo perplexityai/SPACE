@@ -62,21 +62,11 @@ impl RuntimeDriver for CloudHypervisorDriver {
         // Installed releases are exact inputs here; replacement preference is
         // owned by the qualification catalog, never inferred from directory names.
         // This ordering is only for diagnostic listing, not replacement selection.
-        let parse = |version: &RuntimeVersion| {
-            let text = version.as_str();
-            let normalized = if text.split('.').count() == 2 {
-                format!("{text}.0")
-            } else {
-                text.to_owned()
-            };
-            semver::Version::parse(&normalized).map_err(|source| {
-                RuntimeInventoryError::InvalidVersionOutput {
-                    path: PathBuf::from("cloud-hypervisor"),
-                    output: format!("{version}: {source}"),
-                }
-            })
-        };
-        Ok(parse(left)?.cmp(&parse(right)?))
+        Ok(parse_version(left)?.cmp(&parse_version(right)?))
+    }
+
+    fn version_sort_key(&self, version: &RuntimeVersion) -> Option<VersionSortKey> {
+        semver_sort_key(&parse_version(version).ok()?)
     }
 
     fn can_execute(
@@ -93,4 +83,20 @@ impl RuntimeDriver for CloudHypervisorDriver {
             && installed.guest == requested.guest()
             && installed.state_format.as_ref() == requested.state_format())
     }
+}
+
+/// CH labels releases `major.minor`; read a missing patch as zero.
+fn parse_version(version: &RuntimeVersion) -> Result<semver::Version, RuntimeInventoryError> {
+    let text = version.as_str();
+    let normalized = if text.split('.').count() == 2 {
+        format!("{text}.0")
+    } else {
+        text.to_owned()
+    };
+    semver::Version::parse(&normalized).map_err(|source| {
+        RuntimeInventoryError::InvalidVersionOutput {
+            path: PathBuf::from("cloud-hypervisor"),
+            output: format!("{version}: {source}"),
+        }
+    })
 }

@@ -322,6 +322,26 @@ impl NodeManagerService {
         let policy = execution_policy::observation(&self.execution_policy())
             .map_err(|error| Status::internal(error.to_string()))?;
         report.policy = Some((&policy).into());
+        // Known is the whole compiled catalog, never the policy's E0-only
+        // fallback; usable is judged against the startup ceiling discovery
+        // used. When the catalog can't load, or the observation can't be
+        // built from it, omit the observation (unknown) rather than the
+        // inventory.
+        report.environments = match node_artifacts::compiled_environments() {
+            Ok(catalog) => {
+                match inventory.environment_observation(catalog, self.execution_policy.startup()) {
+                    Ok(observation) => Some((&observation).into()),
+                    Err(error) => {
+                        tracing::error!(%error, "compiled environment observation is invalid; omitting it");
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "compiled catalog unavailable; omitting environment observation");
+                None
+            }
+        };
         Ok(Response::new(report))
     }
 
