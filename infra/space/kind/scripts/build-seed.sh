@@ -26,6 +26,7 @@
 #
 # Idempotent: skips the (slow, privileged) rootfs build when the inputs
 # (guest binaries, builder script, seed recipe source, pubkey) are unchanged.
+# Concurrent runs on one output directory are serialized by a file lock.
 #
 # The builder image's layers and the recipe's Ubuntu cloud image (its signed
 # checksums and the squashfs) come from the Kind registry layer cache
@@ -129,6 +130,20 @@ if [[ "${1:-}" == "--cache-only" ]]; then
   exit 0
 fi
 (( $# == 0 )) || die "usage: $0 [--cache-only]"
+
+# Tilt runs this from its seed-artifacts resource and from the seed-publish
+# image build, which can overlap. A file lock in $OUT_DIR serializes the
+# writers, so a later caller finds the seed up to date instead of rebuilding
+# it under the first. Off Linux there may be no flock; callers then run
+# unguarded.
+mkdir -p "$OUT_DIR"
+if command -v flock >/dev/null 2>&1; then
+  exec 7>"$OUT_DIR/.build.lock"
+  if ! flock -n 7; then
+    log "another seed build holds $OUT_DIR/.build.lock; waiting for it"
+    flock 7
+  fi
+fi
 
 # $OUT_DIR is shared by every checkout on the host; see the library for who
 # reads this mark.
