@@ -18,3 +18,18 @@ sandbox, then rechecks its current lease/runtime evidence and persisted authorit
 Contention does not restart the daemon or bypass the gate. Shutdown cancels the
 ownership wait; a stuck recovery operation keeps admission unready. Qualify
 restarts with dirty/resetting slots as well as clean startup.
+
+## Snapshot receive
+
+Snapshot restore validates a private anonymous reflink before invoking `btrfs
+receive`. Upload and restore accept protocol v1 commands only, check command
+CRCs, and require END followed by EOF. Validation and receive share the host
+mutation time budget. A framing or protocol rejection leaves the old instance
+untouched; the private input disappears when its last descriptor closes.
+
+This is a framing and decompression guard, not artifact authentication or a
+validator for paths, parents and clone sources. Continue treating stored streams
+as untrusted. The worker image supplies btrfs-progs 7.3. Direct-node installations
+must supply the binary themselves;
+verify the executable resolved in node-manager's runtime environment, its
+version and hash, and the deployed image digest when rolling out or rolling back.
