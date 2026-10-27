@@ -1509,3 +1509,61 @@ fn the_budget_outlasts_several_connect_retry_attempts() {
          before a fourth dial attempt"
     );
 }
+
+#[test]
+fn unanswered_templates_wait_out_the_grace_before_eviction() {
+    let after = UNANSWERED_TEMPLATE_EVICT_AFTER;
+    let start = std::time::Instant::now();
+    let at = |offset: Duration| start + offset;
+    let names = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let set = |names: &[&str]| {
+        names
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+    };
+    let local = names(&["generic", "left-a", "left-b"]);
+    let mut unanswered = UnansweredTemplates::default();
+
+    // `generic` is always answered. `left-a` is left out from the start;
+    // `left-b` is answered once at half the wait, then left out again.
+    unanswered.observe(&local, &set(&["generic"]), true, at(Duration::ZERO));
+    unanswered.observe(&local, &set(&["generic", "left-b"]), true, at(after / 2));
+    unanswered.observe(&local, &set(&["generic"]), true, at(after / 2 + after / 4));
+    assert!(
+        unanswered
+            .due(at(after - Duration::from_secs(1)), after, 10)
+            .is_empty(),
+        "nothing is evicted inside the wait"
+    );
+    assert_eq!(
+        unanswered.due(at(after), after, 10),
+        ["left-a"],
+        "an answer restarts the wait"
+    );
+    let both = at(after / 2 + after / 4 + after);
+    assert_eq!(
+        unanswered.due(both, after, 10),
+        ["left-a", "left-b"],
+        "longest-unanswered first"
+    );
+    assert_eq!(
+        unanswered.due(both, after, 1),
+        ["left-a"],
+        "capped per sync"
+    );
+
+    // A one-template request leaves the others alone; a full one drops
+    // templates that are no longer local.
+    unanswered.observe(&names(&["left-b"]), &set(&[]), false, both);
+    assert_eq!(unanswered.due(both, after, 10), ["left-a", "left-b"]);
+    unanswered.observe(&names(&["left-b"]), &set(&[]), true, both);
+    assert_eq!(unanswered.due(both, after, 10), ["left-b"]);
+
+    // A refused delete waits the whole period again; a done one is forgotten.
+    unanswered.restart("left-b", both);
+    assert!(unanswered.due(both, after, 10).is_empty());
+    assert_eq!(unanswered.due(both + after, after, 10), ["left-b"]);
+    unanswered.forget("left-b");
+    assert!(unanswered.due(both + 2 * after, after, 10).is_empty());
+}
