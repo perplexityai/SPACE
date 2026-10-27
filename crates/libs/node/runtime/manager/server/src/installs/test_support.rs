@@ -27,7 +27,8 @@ use super::publisher::{ArtifactPublisher, NodeArtifactRef, PinSource, Published,
 use super::release_source::{ReleaseChunks, ReleaseSource, ReleaseSourceError, ReleaseUrl};
 
 use super::source::{
-    ByteChunks, ContentMd5, KernelSource, RuntimeLine, SourceError, SourceKernel, VerifiableKernel,
+    ByteChunks, ContentMd5, KernelLocation, KernelSource, KernelSources, RuntimeLine, SourceError,
+    SourceKernel, VerifiableKernel,
 };
 
 /// How the fake source serves a kernel's bytes.
@@ -101,7 +102,8 @@ impl FakeSource {
                     line.release
                 ),
                 ..self.root.clone()
-            },
+            }
+            .into(),
             size,
             md5,
         };
@@ -163,8 +165,8 @@ impl FakeSource {
 
 #[async_trait::async_trait]
 impl KernelSource for FakeSource {
-    fn root(&self) -> &StorageUri {
-        &self.root
+    fn root(&self) -> KernelLocation {
+        self.root.clone().into()
     }
 
     fn runtime(&self) -> RuntimeKind {
@@ -636,4 +638,10 @@ impl ReleaseSource for FakeExecutableSource {
             bytes::Bytes::copy_from_slice(&self.bytes),
         )])))
     }
+}
+
+pub(crate) fn kernel_sources(source: Arc<dyn KernelSource>) -> KernelSources {
+    let mut sources = KernelSources::default();
+    sources.insert(source).unwrap();
+    sources
 }
