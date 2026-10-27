@@ -372,6 +372,67 @@ async fn install_test_policy(state: &GatewayNetworkState, policy: NetworkPolicyV
     assert_eq!(snapshot.mode, crate::proto::NetworkState::Ready);
 }
 
+/// A guest's first DNS query after a start or restore can precede the gateway
+/// CA; it must be answered once the CA arrives, not dropped.
+#[tokio::test]
+async fn datagram_sent_before_the_ca_arrives_is_delivered_once_it_does() {
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = open.clone();
+    let state = GatewayNetworkState::pending_policy()
+        .with_traffic_gate(Arc::new(move || gate.load(Ordering::SeqCst)));
+    let mut policy = NetworkPolicyV1::allow_all();
+    policy.tls_interception = pplx_space_net_common::TlsInterception::On;
+    install_test_policy(&state, policy).await;
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut proxy = UdpProxy::new(
+        UdpProxyConfig {
+            sandbox_id: "test",
+            listener,
+            stats: Arc::new(ProxyStats::new()),
+            network_state: state.clone(),
+            known_egress_state: KnownEgressState::default(),
+            reserved_dns: crate::reserved_dns::test_support::test_core(),
+            shutdown_token: CancellationToken::new(),
+        },
+        TaskTracker::new(),
+    )
+    .unwrap();
+    let destination: SocketAddrV4 = "198.18.1.2:9000".parse().unwrap();
+    let flow = FlowKey {
+        guest_src: "127.0.0.1:10000".parse().unwrap(),
+        orig_dst: SocketAddr::V4(destination),
+    };
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let session = test_session(1).await;
+    session
+        .upstream_socket
+        .connect(receiver.local_addr().unwrap())
+        .await
+        .unwrap();
+    proxy.sessions.put(flow, session);
+
+    proxy
+        .handle_guest_datagram(flow.guest_src, destination, b"early")
+        .await;
+    proxy.replay_pending_udp().await;
+    assert_eq!(
+        proxy.pending_udp.datagrams.len(),
+        1,
+        "a datagram sent before the CA must wait for it"
+    );
+
+    open.store(true, Ordering::SeqCst);
+    proxy.replay_pending_udp().await;
+    assert!(proxy.pending_udp.is_empty());
+    let mut received = [0; 16];
+    let length = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut received))
+        .await
+        .expect("the held datagram did not reach the receiver once the CA arrived")
+        .unwrap();
+    assert_eq!(&received[..length], b"early");
+}
+
 #[tokio::test]
 async fn pending_replay_rechecks_ca_readiness_before_each_datagram() {
     use std::sync::atomic::AtomicUsize;
@@ -427,7 +488,8 @@ async fn pending_replay_rechecks_ca_readiness_before_each_datagram() {
         // replay must independently recheck the gate for each datagram.
         remaining.store(permitted_replays, Ordering::SeqCst);
         proxy.replay_pending_udp().await;
-        assert!(proxy.pending_udp.is_empty());
+        // Datagrams the closed gate refused stay queued for a later replay.
+        assert_eq!(proxy.pending_udp.datagrams.len(), 2 - permitted_replays);
         // A marker on the same local socket bounds the observation: any
         // unadmitted replay must be seen before the marker, even when delivery
         // has not completed when send returns.

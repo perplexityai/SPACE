@@ -61,7 +61,7 @@ ADDRESSES = [
 STATES = {"ready": 3, "no-identity": 1, "policy-error": 4}
 # NetworkState READY covers policy hydration only. With TLS
 # interception on, the gateway CA and credential store are reported separately
-# and guest egress fails closed per connection until they are usable.
+# and guest egress is held, then fails closed, until they are usable.
 INTERCEPTION_READINESS_READY = 2
 TLS_TEST_ALPNS = {"h2", "http/1.1", "space-unsupported"}
 # Per startup stage, sized for a runner still loaded by the harness's builds.

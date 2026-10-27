@@ -542,8 +542,9 @@ pub fn network_policy_push(result: &str) {
 
 /// A network policy refresh converged (Ready + matching ref) while the
 /// gateway reported its TLS-interception dependencies as not ready. The
-/// sandbox starts anyway; guest egress fails closed per connection until the
-/// CA arrives. `reason` is the refresh trigger (`start`, `reconcile`, ...).
+/// sandbox starts anyway; the gateway holds guest egress until the CA arrives
+/// and fails closed if it does not. Routine on the refresh that installs a
+/// TLS-on policy. `reason` is the refresh trigger (`start`, `reconcile`, ...).
 pub fn network_policy_interception_not_ready(reason: &str) {
     counter(
         "reconcile.network_policy.interception_not_ready",

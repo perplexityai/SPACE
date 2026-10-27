@@ -126,9 +126,11 @@ context. Keep event names domain-level: prefer `pause_requested` or
   or `unspecified` for an old gateway binary): the gateway's TLS-interception
   dependencies (CA, credential store) are reported separately from
   `network_state` and never gate sandbox start. `dependencies_not_ready` means
-  the sandbox reached Started while guest egress under a TLS-on policy fails
-  closed per connection until the CA arrives; investigate the node CA path,
-  not the sandbox lifecycle.
+  the gateway CA had not arrived yet. It is routine on the refresh that installs
+  a TLS-on policy, because the gateway requests its CA only after that install;
+  the gateway holds guest egress until the CA arrives and fails closed only if
+  the hold expires. When it persists, investigate the node CA path, not the
+  sandbox lifecycle.
 - For network policy enforcement events, include `operation` to distinguish
   `tproxy_setup` from `initial_policy_hydration`, plus `netns`,
   `installed_network_policy_ref`, `network_state`, and errors when available.

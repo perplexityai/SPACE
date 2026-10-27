@@ -39,6 +39,9 @@ pub type ReadinessObserver = Arc<dyn Fn(bool) + Send + Sync>;
 pub const HYDRATION_DEADLINE: Duration = Duration::from_secs(30);
 pub const TCP_PENDING_TIMEOUT: Duration = HYDRATION_DEADLINE.saturating_add(Duration::from_secs(1));
 pub const TCP_PENDING_WARN_AFTER: Duration = Duration::from_millis(500);
+// The CA gate is a live callback outside the watch channel, so a held TCP
+// connection re-reads it on this cadence, the same as buffered UDP replay.
+const INTERCEPTION_RECHECK_INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) const INITIAL_HYDRATION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const READY_HYDRATION_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 const POLICY_REF_MISMATCH_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -68,7 +71,7 @@ pub struct NetworkStateSnapshot {
 }
 
 /// Readiness of the gateway CA relative to the installed policy. Orthogonal to [`NetworkState`]:
-/// a gateway is `Ready` with `DependenciesNotReady` while it denies traffic
+/// a gateway is `Ready` with `DependenciesNotReady` while it holds traffic
 /// until the CA is available.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InterceptionReadiness {
@@ -79,7 +82,8 @@ pub enum InterceptionReadiness {
     /// behind the traffic gate is usable.
     Ready,
     /// The installed policy has TLS interception on and the gateway CA is not
-    /// usable yet. New TCP and UDP traffic is denied.
+    /// usable yet. New TCP connections and UDP datagrams are held, as for a
+    /// pending policy, and are denied only once that hold expires.
     DependenciesNotReady,
 }
 
@@ -886,8 +890,25 @@ impl GatewayNetworkState {
                     }
                     if let Some(policy) = snapshot.policy {
                         if snapshot.interception_readiness.blocks_admission() {
-                            record_not_ready_denial("tcp", PolicyNotReady::InterceptionNotReady);
-                            return TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady);
+                            // The CA owner starts only once this policy is
+                            // installed, so every start and restore spends a
+                            // moment Ready without a CA. Hold the connection
+                            // within the pending budget instead of resetting
+                            // it; nothing is forwarded until the gate opens.
+                            let now = Instant::now();
+                            if now >= deadline {
+                                record_not_ready_denial(
+                                    "tcp",
+                                    PolicyNotReady::InterceptionNotReady,
+                                );
+                                return TrafficPolicy::NotReady(
+                                    PolicyNotReady::InterceptionNotReady,
+                                );
+                            }
+                            let recheck = INTERCEPTION_RECHECK_INTERVAL
+                                .min(deadline.saturating_duration_since(now));
+                            let _ = tokio::time::timeout(recheck, state_rx.changed()).await;
+                            continue;
                         }
                         return TrafficPolicy::Ready(policy);
                     }
@@ -977,8 +998,8 @@ impl GatewayNetworkState {
         {
             // One live gate read per datagram, taken by the snapshot.
             if snapshot.interception_readiness.blocks_admission() {
-                // UDP has no connection to hold: a datagram either goes out
-                // inspected or not at all. Deny per datagram.
+                // The UDP proxy buffers this like a pending policy and replays
+                // it once the gate opens; nothing leaves uninspected meanwhile.
                 record_not_ready_denial("udp", PolicyNotReady::InterceptionNotReady);
                 return TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady);
             }
@@ -1054,8 +1075,9 @@ impl GatewayNetworkState {
         // Ready always means an installed policy. TLS-interception
         // dependencies do not demote the state:
         // sandbox-manager keys sandbox start on Ready + matching ref, and a
-        // CA the node cannot issue must fail closed per connection, never
-        // fail the boot. Peers read `interception_readiness` for that.
+        // CA the node cannot issue must hold and then fail closed per
+        // connection, never fail the boot. Peers read
+        // `interception_readiness` for that.
         if snapshot.mode == NetworkState::Ready && snapshot.policy.is_none() {
             snapshot.mode = NetworkState::PendingPolicy;
             snapshot.last_error = "network policy is not installed".to_owned();
@@ -1172,10 +1194,10 @@ fn record_pending_tcp_slow_wait(snapshot: &NetworkStateSnapshot, started_at: Ins
         effective_network_policy_ref_authority_label(&snapshot.installed_policy_ref),
     );
     let wait_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    // Only the hydration wait reaches here; unavailable interception
-    // dependencies deny the connection instead of holding it. Carry the
-    // readiness anyway so a responder is not sent hunting for a CA problem
-    // that this wait is not evidence of.
+    // Only the hydration wait reaches here; a hold on unavailable
+    // interception dependencies is not reported as one. Carry the readiness
+    // anyway so a responder is not sent hunting for a CA problem that this
+    // wait is not evidence of.
     warn!(
         wait_ms,
         state = snapshot.mode.as_str(),

@@ -612,10 +612,11 @@ where
                     pplx_space_metrics::reconcile::network_policy_push("ok");
                     // Ready + matching ref is the whole start gate. The
                     // gateway reports TLS-interception dependency readiness
-                    // separately; when it is not ready the sandbox still
-                    // starts and guest egress fails closed per connection
-                    // until the CA arrives. Surface it, never
-                    // fail on it.
+                    // separately and never fails on it. Its CA owner starts
+                    // only once a TLS-on policy is installed, so the refresh
+                    // that installs one routinely sees the CA still pending;
+                    // the gateway holds guest egress until it arrives and
+                    // reports a CA that does not arrive itself.
                     let interception_readiness =
                         pplx_space_net_gateway_client::proto::InterceptionReadiness::try_from(
                             response.interception_readiness,
@@ -627,20 +628,13 @@ where
                         pplx_space_metrics::reconcile::network_policy_interception_not_ready(
                             reason,
                         );
-                        tracing::warn!(
-                            sandbox_id,
-                            expected_policy_ref = %request.expected_policy_ref,
-                            interception_readiness = interception_readiness.as_str(),
-                            "network policy refreshed in net-gateway; TLS interception dependencies not ready, guest egress fails closed until they are"
-                        );
-                    } else {
-                        tracing::info!(
-                            sandbox_id,
-                            expected_policy_ref = %request.expected_policy_ref,
-                            interception_readiness = interception_readiness.as_str(),
-                            "network policy refreshed in net-gateway"
-                        );
                     }
+                    tracing::info!(
+                        sandbox_id,
+                        expected_policy_ref = %request.expected_policy_ref,
+                        interception_readiness = interception_readiness.as_str(),
+                        "network policy refreshed in net-gateway"
+                    );
                     emit_sandbox_event(
                         sandbox_id,
                         SandboxEventType::NetworkPolicyRefreshCompleted,

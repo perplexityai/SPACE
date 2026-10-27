@@ -83,6 +83,17 @@ const UDP_PENDING_MAX_BYTES: usize = 1024 * 1024;
 /// whereas a shorter grace dropped it silently mid-refresh and surfaced as a
 /// resolver timeout (gaierror) in the guest.
 const UDP_PENDING_MAX_AGE: Duration = crate::state::TCP_PENDING_TIMEOUT;
+
+/// Not-ready states whose datagrams wait in the pending queue rather than
+/// being dropped: both end on their own, a policy install or the gateway CA
+/// arriving, and both are routinely crossed by every start and restore.
+fn holds_pending_udp(reason: PolicyNotReady) -> bool {
+    matches!(
+        reason,
+        PolicyNotReady::PendingPolicy | PolicyNotReady::InterceptionNotReady
+    )
+}
+
 const UDP_PENDING_REPLAY_INTERVAL: Duration = Duration::from_millis(25);
 const UDP_PENDING_REPLAY_BATCH_DATAGRAMS: usize = 16;
 /// A response task emits at most one terminal event, so a queue sized to the
@@ -555,7 +566,7 @@ impl UdpProxy {
         let policy = match self.network_state.udp_policy().await {
             TrafficPolicy::Ready(policy) => policy,
             TrafficPolicy::NotReady(reason) => {
-                if reason == PolicyNotReady::PendingPolicy {
+                if holds_pending_udp(reason) {
                     self.pending_udp.push(
                         flow,
                         bytes,
@@ -621,7 +632,7 @@ impl UdpProxy {
                 .operation_token();
             let policy = match self.network_state.udp_policy().await {
                 TrafficPolicy::Ready(policy) => policy,
-                TrafficPolicy::NotReady(PolicyNotReady::PendingPolicy) => break,
+                TrafficPolicy::NotReady(reason) if holds_pending_udp(reason) => break,
                 TrafficPolicy::NotReady(_) => {
                     self.pending_udp.clear_dropped(
                         PendingUdpClearReason::NonReadyPolicy,

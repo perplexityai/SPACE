@@ -53,18 +53,21 @@ async fn interception_dependency_gate_blocks_traffic_without_blocking_policy_hyd
     );
     assert!(snapshot.interception_readiness.blocks_admission());
     assert!(snapshot.policy.is_some());
-    // UDP has no connection to hold: it fails closed immediately.
+    // The UDP proxy buffers on this answer; it never admits the datagram.
     assert!(matches!(
         state.udp_policy().await,
         TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady)
     ));
-    let denied = tokio::time::timeout(Duration::from_millis(1), state.wait_for_tcp_policy())
-        .await
-        .expect("missing interception dependencies must deny TCP immediately");
+    let started = tokio::time::Instant::now();
+    let denied = state.wait_for_tcp_policy().await;
     assert!(matches!(
         denied,
         TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady)
     ));
+    assert!(
+        started.elapsed() >= TCP_PENDING_TIMEOUT,
+        "a CA that never arrives must hold TCP for the pending budget, then fail closed"
+    );
     assert_eq!(state.snapshot().await.pending_tcp_connections, 0);
     // Interception dependency availability is not a policy-loader failure:
     // waiting must neither exhaust the hydration budget nor re-install an
@@ -122,6 +125,38 @@ async fn interception_dependency_gate_blocks_traffic_without_blocking_policy_hyd
     );
     shutdown.cancel();
     hydration.await.unwrap();
+}
+
+/// The CA owner starts only after a TLS-On policy installs, so a connection
+/// opened in that gap must wait for the CA rather than be refused.
+#[tokio::test(start_paused = true)]
+async fn tcp_admission_held_until_interception_dependencies_arrive() {
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = open.clone();
+    let state = GatewayNetworkState::pending_policy()
+        .with_traffic_gate(Arc::new(move || gate.load(Ordering::SeqCst)));
+    state
+        .refresh(
+            tls_on_loader(Arc::new(AtomicU64::new(0))),
+            None,
+            NetworkStateReason::Startup,
+        )
+        .await;
+    let held = tokio::spawn({
+        let state = state.clone();
+        async move { state.wait_for_tcp_policy().await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !held.is_finished(),
+        "a connection opened before the CA arrives must be held, not refused"
+    );
+    open.store(true, Ordering::SeqCst);
+    let admitted = tokio::time::timeout(Duration::from_millis(100), held)
+        .await
+        .expect("the held connection must be admitted once the CA arrives")
+        .unwrap();
+    assert!(matches!(admitted, TrafficPolicy::Ready(_)));
 }
 
 /// TLS-Off sandboxes never consult the interception gate: a closed gate does

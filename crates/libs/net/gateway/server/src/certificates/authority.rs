@@ -635,7 +635,7 @@ impl GatewayAuthority {
                     // backoff below rather than blocking the epoch: a CA the
                     // node cannot issue today may be issued after the next
                     // deploy without restarting this gateway. Guest egress
-                    // fails closed per connection in the meantime.
+                    // is held, then fails closed, in the meantime.
                     //
                     // Whether to keep the CA already held and whether to keep
                     // asking are separate questions. Only a transient failure
