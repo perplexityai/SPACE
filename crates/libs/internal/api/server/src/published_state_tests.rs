@@ -149,6 +149,63 @@ async fn steady_publish_skips_inapplicable_quarantine_queries_but_consumes_recei
         [0, 0, 1, 0, 0, 1],
         "completion, rollback, pause recovery, suspended projection, record, clear"
     );
+
+    // Positive controls: one applicable row runs each skipped statement once,
+    // so a signature that stops matching cannot pass as a skip.
+    let rollback_id = SandboxId::new();
+    let suspended_id = SandboxId::new();
+    let recovery_id = SandboxId::new();
+    for (sandbox_id, lifecycle) in [
+        (rollback_id, "stopped"),
+        (suspended_id, "suspended"),
+        (recovery_id, "started"),
+    ] {
+        insert_active_sandbox(&db.pool, sandbox_id, node_id, lifecycle).await?;
+    }
+    inventory.extend([
+        PublishedSandboxState {
+            sandbox_id: rollback_id.to_string(),
+            present: true,
+            status: Some("stopped".to_string()),
+            transition_receipt: Some(pplx_space_sbx_mgr_client::proto::TransitionReceipt {
+                id: Uuid::now_v7().to_string(),
+                kind: "activation_rollback".to_string(),
+                target_state: "stopped".to_string(),
+                execution_generation: 7,
+                reason_code: SandboxQuarantineReasonCode::ColdActivationInterrupted.to_string(),
+                activation_attempt_id: Some(Uuid::now_v7().to_string()),
+            }),
+            ..PublishedSandboxState::default()
+        },
+        PublishedSandboxState {
+            sandbox_id: suspended_id.to_string(),
+            present: true,
+            status: Some("suspended".to_string()),
+            ..PublishedSandboxState::default()
+        },
+        PublishedSandboxState {
+            sandbox_id: recovery_id.to_string(),
+            present: true,
+            status: Some("started".to_string()),
+            quarantine_recovery: Some(
+                pplx_space_sbx_mgr_client::proto::QuarantineRecoveryObservation {
+                    schema_version: 1,
+                    local_quarantine_id: Uuid::now_v7().to_string(),
+                    ..Default::default()
+                },
+            ),
+            ..PublishedSandboxState::default()
+        },
+    ]);
+    publish_sandbox_states(&mut conn, node_id, &inventory).await?;
+    let control_calls = calls(&db.pool).await?;
+    for (index, statement) in [(1, "rollback"), (3, "suspended projection"), (4, "record")] {
+        assert_eq!(
+            control_calls[index] - receipt_calls[index],
+            1,
+            "{statement} query really executes"
+        );
+    }
     Ok(())
 }
 

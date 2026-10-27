@@ -690,6 +690,8 @@ impl SharedPostgres {
             .with_host_auth()
             .with_name(image_name)
             .with_tag(image_tag)
+            // `with_cmd` replaces the module's default `-c fsync=off`, so keep
+            // it explicitly while preloading `pg_stat_statements`.
             .with_cmd([
                 "-c",
                 "fsync=off",
