@@ -1505,6 +1505,36 @@ fn cold_only_runtime_has_no_launcher_or_snapshot_claims() {
             allowed
         );
     }
+    let mut snapshot_installation = installation.clone();
+    snapshot_installation.state_format = Some(StateFormatIdentity {
+        format: "cloud-hypervisor-snapshot".parse().unwrap(),
+        version: "54.0.1".parse().unwrap(),
+    });
+    let snapshot = ExecutionMetadata::new(
+        snapshot_installation.runtime.clone(),
+        snapshot_installation.guest,
+        snapshot_installation.state_format.clone(),
+        vec![],
+    )
+    .unwrap()
+    .with_environment(EnvironmentReference::new(Digest::sha256([32; 32])));
+    for mode in [
+        ExecutionSelectionMode::NewColdBoot,
+        ExecutionSelectionMode::ExistingColdBoot,
+        ExecutionSelectionMode::PersistedStateRestore,
+    ] {
+        assert!(
+            driver
+                .can_execute(&snapshot_installation, &snapshot, mode)
+                .unwrap()
+        );
+        assert!(!driver.can_execute(&installation, &snapshot, mode).unwrap());
+        assert!(
+            !driver
+                .can_execute(&snapshot_installation, &bound, mode)
+                .unwrap()
+        );
+    }
     let reported = inventory(vec![installation]).to_proto();
     assert!(reported.runtimes[0].state_formats.is_empty());
 }

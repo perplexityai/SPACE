@@ -301,8 +301,8 @@ impl NodeManager for NodeManagerService {
         observe_rpc("CaptureVmState", sandbox_id, async {
             self.authorize_peer(&request, "CaptureVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
             let (metadata, extensions, input) = request.into_parts();
-            let input = crate::snapshot_request::FirecrackerCapture::try_from(input)?;
-            NodeManagerService::capture_firecracker_state(
+            let input = crate::snapshot_request::StateCapture::try_from(input)?;
+            NodeManagerService::capture_runtime_state(
                 self,
                 Request::from_parts(metadata, extensions, input),
             )
@@ -321,8 +321,8 @@ impl NodeManager for NodeManagerService {
         observe_rpc("RestoreVmState", sandbox_id, async {
             self.authorize_peer(&request, "RestoreVmState", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
             let (metadata, extensions, input) = request.into_parts();
-            let input = crate::snapshot_request::FirecrackerRestore::try_from(input)?;
-            NodeManagerService::restore_firecracker_state(
+            let input = crate::snapshot_request::StateRestore::try_from(input)?;
+            NodeManagerService::restore_runtime_state(
                 self,
                 Request::from_parts(metadata, extensions, input),
             )

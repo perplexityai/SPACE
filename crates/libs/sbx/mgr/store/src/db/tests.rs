@@ -175,7 +175,7 @@ fn periodic_recovery_bounds_discovery_and_advances_past_retained_or_malformed_ro
         let id = SandboxId::new().to_string();
         insert_test_sandbox(
             &conn,
-            TestSandboxInsert::new(&id, "sandbox1", SandboxState::Started),
+            TestSandboxInsert::new(&id, "sandbox1", SandboxState::Stopped),
         );
     }
     let corrupt = SandboxId::new().to_string();
@@ -190,6 +190,7 @@ fn periodic_recovery_bounds_discovery_and_advances_past_retained_or_malformed_ro
     .unwrap();
     let mut expected = Vec::new();
     for state in [
+        SandboxState::Started,
         SandboxState::Paused,
         SandboxState::Resuming,
         SandboxState::Checkpointing,
@@ -7474,12 +7475,9 @@ fn startup_recovery_reconciles_interrupted_states_without_runtime_fields() {
         } else {
             match state {
                 SandboxState::Started if !current_pid_has_proc => {
-                    assert_eq!(row.state, SandboxState::Quarantined);
+                    assert_eq!(row.state, SandboxState::Started);
                     assert!(row.cleanup_completion.is_none());
-                    assert_eq!(
-                        record.unwrap().outcome,
-                        StartupRecoveryOutcome::State(SandboxState::Quarantined)
-                    );
+                    assert_eq!(record.unwrap().outcome, StartupRecoveryOutcome::Deferred);
                 }
                 SandboxState::Creating
                 | SandboxState::Starting
@@ -7511,7 +7509,7 @@ fn startup_recovery_reconciles_interrupted_states_without_runtime_fields() {
 }
 
 #[test]
-fn startup_missing_runtime_identity_quarantines_without_cleanup() {
+fn startup_missing_runtime_defers_fenced_rows_and_quarantines_missing_identity() {
     for runtime_fields in [false, true] {
         let conn = test_conn();
         let id = SandboxId::new().to_string();
@@ -7526,9 +7524,24 @@ fn startup_missing_runtime_identity_quarantines_without_cleanup() {
             )
             .unwrap();
         }
-        recover_interrupted_startup_states(&conn).unwrap();
+        let recovered = recover_interrupted_startup_states(&conn).unwrap();
         let row = get_sandbox(&conn, &id).unwrap().unwrap();
-        assert_eq!(row.state, SandboxState::Quarantined);
+        // A recorded PID plus the persisted execution fence belongs to the
+        // service's process-exit reconciler, including after a manager restart.
+        let expected = if runtime_fields {
+            SandboxState::Started
+        } else {
+            SandboxState::Quarantined
+        };
+        assert_eq!(row.state, expected);
+        assert_eq!(
+            recovered[0].outcome,
+            if runtime_fields {
+                StartupRecoveryOutcome::Deferred
+            } else {
+                StartupRecoveryOutcome::State(SandboxState::Quarantined)
+            }
+        );
         assert_eq!(row.pid, runtime_fields.then_some(u32::MAX));
         assert_eq!(row.uid, runtime_fields.then_some(10000));
         assert!(row.cleanup_completion.is_none());
@@ -7536,13 +7549,15 @@ fn startup_missing_runtime_identity_quarantines_without_cleanup() {
             current_quarantine_reason_wire_value(&conn, &id)
                 .unwrap()
                 .as_deref(),
-            Some(SandboxQuarantineReasonCode::RuntimeProbeInconsistent.as_str())
+            (!runtime_fields)
+                .then_some(SandboxQuarantineReasonCode::RuntimeProbeInconsistent.as_str())
         );
-        assert!(
-            recover_interrupted_startup_states(&conn)
-                .unwrap()
-                .is_empty()
-        );
+        let again = recover_interrupted_startup_states(&conn).unwrap();
+        if runtime_fields {
+            assert_eq!(again, recovered);
+        } else {
+            assert!(again.is_empty());
+        }
     }
 }
 

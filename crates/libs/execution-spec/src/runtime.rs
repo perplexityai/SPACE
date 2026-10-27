@@ -124,8 +124,8 @@ impl RuntimeKind {
             // Upstream VMM features are not SPACE lifecycle capabilities.
             // Advertise each capability only when its adapter is qualified.
             Self::CloudHypervisor => RuntimeCapabilities {
-                pause_resume: false,
-                snapshot: false,
+                pause_resume: true,
+                snapshot: true,
                 fork: false,
                 prewarmed_pool: false,
                 network_gateway: false,

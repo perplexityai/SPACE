@@ -141,6 +141,34 @@ pub(crate) fn open(path: &Path, expected: VerityDigest) -> Result<SealedFile, St
     Ok(file)
 }
 
+/// Repeated in the single-threaded launcher on the descriptor passed to exec.
+pub(crate) fn open_catalog_executable(
+    path: &Path,
+    pins: pplx_space_node_runtime_core::authenticated_source::SourcePins,
+) -> Result<pplx_space_node_runtime_core::authenticated_source::AuthenticatedFile, Status> {
+    use pplx_space_node_runtime_core::authenticated_source::AuthenticatedFile;
+    use std::os::unix::fs::MetadataExt;
+    let file = AuthenticatedFile::open_catalog(path, pins).map_err(|error| {
+        if error.is_transient() {
+            Status::internal(error.to_string())
+        } else {
+            Status::failed_precondition(error.to_string())
+        }
+    })?;
+    let metadata = file.file().metadata().map_err(|source| {
+        source_status(SourceError::Metadata {
+            path: path.to_owned(),
+            source,
+        })
+    })?;
+    if metadata.mode() & 0o111 == 0 {
+        return Err(Status::failed_precondition(
+            "authenticated runtime file is not executable",
+        ));
+    }
+    Ok(file)
+}
+
 #[derive(Debug, thiserror::Error)]
 enum SourceError {
     #[error(transparent)]

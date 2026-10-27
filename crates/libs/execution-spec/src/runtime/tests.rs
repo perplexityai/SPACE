@@ -41,8 +41,8 @@ fn runtime_kind_exposes_baseline_capabilities() {
     assert_eq!(
         RuntimeKind::CloudHypervisor.baseline_capabilities(),
         RuntimeCapabilities {
-            pause_resume: false,
-            snapshot: false,
+            pause_resume: true,
+            snapshot: true,
             fork: false,
             prewarmed_pool: false,
             network_gateway: false,
@@ -51,8 +51,6 @@ fn runtime_kind_exposes_baseline_capabilities() {
     );
     assert!(RuntimeKind::CloudHypervisor.supports_startup(StartupPolicy::ColdOnly));
     for policy in [
-        StartupPolicy::PreferBaseSnapshot,
-        StartupPolicy::RequireBaseSnapshot,
         StartupPolicy::PreferWarmPool,
         StartupPolicy::RequireWarmPool,
     ] {

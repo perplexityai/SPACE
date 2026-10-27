@@ -63,12 +63,12 @@ fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
     qualified.runtimes[0].guest.architecture = Arch::X86_64;
     for (runtime_integrity, kernel_integrity) in [
         (
-            ExecutionSourceIntegrity::Legacy,
-            ExecutionSourceIntegrity::Legacy,
+            ExecutionSourceIntegrity::CatalogSha256,
+            ExecutionSourceIntegrity::CatalogSha256,
         ),
         (
             ExecutionSourceIntegrity::FsVerity,
-            ExecutionSourceIntegrity::Legacy,
+            ExecutionSourceIntegrity::CatalogSha256,
         ),
         (
             ExecutionSourceIntegrity::FsVerity,
@@ -994,7 +994,7 @@ fn legacy_cached_kernel_is_verified_without_a_store_source() {
         assert_eq!(kernel.is_some(), accepted);
         if let Some(kernel) = kernel {
             assert_eq!(kernel.path, image);
-            assert_eq!(kernel.integrity, ExecutionSourceIntegrity::Legacy);
+            assert_eq!(kernel.integrity, ExecutionSourceIntegrity::CatalogSha256);
         }
     }
 }
