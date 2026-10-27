@@ -53,7 +53,7 @@ impl CloudHypervisorKernels {
 #[async_trait::async_trait]
 impl KernelSource for CloudHypervisorKernels {
     fn root(&self) -> KernelLocation {
-        KernelLocation::Https(self.transport.root().clone())
+        KernelLocation::Https(self.transport.base().clone())
     }
     fn runtime(&self) -> RuntimeKind {
         RuntimeKind::CloudHypervisor
@@ -91,7 +91,7 @@ impl KernelSource for CloudHypervisorKernels {
         };
         Ok(Box::pin(
             self.transport
-                .open(location)
+                .open(&location.clone().into())
                 .await?
                 .map_err(SourceError::Https),
         ))
