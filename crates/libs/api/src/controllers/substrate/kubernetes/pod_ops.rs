@@ -5,7 +5,8 @@ use super::*;
 use crate::controllers::substrate::kubernetes::store::{
     ActiveExecutionState, ActiveExecutionStatusRow, FailedRecoveryPodAbsenceOutcome,
     PlacementRetryDisposition, PodNodePlacement, PodTrackingCleanupCause, SandboxExecutionClaim,
-    StartedRecoveryReplacement, StartedRecoveryRestoreContext, StartedRecoveryRestoreSource,
+    SnapshotCaptureHost, StartedRecoveryReplacement, StartedRecoveryRestoreContext,
+    StartedRecoveryRestoreSource,
 };
 use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,
@@ -13,7 +14,7 @@ use crate::node_group_placement::{
 };
 use pplx_space_common_core::kubernetes::{EvacuationPlacement, NodeGroupPlacement, PodToleration};
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, PolicyAuthority,
+    ExecutionGeneration, HostCpu, NodeRole as SpaceNodeRole, PodUid, PolicyAuthority,
     SandboxActivationAttemptId, SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
 };
 use pplx_space_events::{
@@ -25,6 +26,7 @@ use rand::RngExt;
 mod create_request;
 mod delete;
 mod ensure_pod;
+mod host_cpu;
 mod read;
 mod redrive;
 mod restore;
@@ -132,6 +134,44 @@ pub(super) struct SandboxPodRequestInputs<'a> {
     /// `None` renders no node-group constraints: the gate is off, or the
     /// cluster has no generic node group.
     pub(super) node_group_placement: Option<&'a NodeGroupPlacement>,
+    /// CPU identities the restore pod must stay off, from
+    /// [`KubernetesSubstrate::host_cpu_exclusions`]. Empty renders no CPU
+    /// constraint; it's ignored for non-restore builds.
+    pub(super) excluded_host_cpus: &'a [HostCpu],
+}
+
+/// The required node-selector terms and tolerations a restore pod renders
+/// besides its CPU term, as far as they decide which nodes could host it. See
+/// [`KubernetesSubstrate::restore_schedulable_node_exists`].
+#[derive(Clone, Copy, Default)]
+pub(super) struct RestorePlacementBounds<'a> {
+    /// The node-group candidate set, when the placement gate resolves one.
+    pub(super) node_group_placement: Option<&'a NodeGroupPlacement>,
+    /// An evacuation's cohort pin.
+    pub(super) extra_required_label: Option<(&'a str, &'a str)>,
+    /// An evacuation's cohort tolerations.
+    pub(super) extra_tolerations: &'a [PodToleration],
+}
+
+impl<'a> RestorePlacementBounds<'a> {
+    fn for_context(
+        context: &'a PodCreateContext<'a>,
+        node_group_placement: Option<&'a NodeGroupPlacement>,
+    ) -> Self {
+        let (extra_required_label, extra_tolerations) = match context {
+            PodCreateContext::Restore(RestoreContext::Evacuation {
+                extra_required_affinity,
+                extra_tolerations,
+                ..
+            }) => (*extra_required_affinity, *extra_tolerations),
+            _ => (None, &[][..]),
+        };
+        Self {
+            node_group_placement,
+            extra_required_label,
+            extra_tolerations,
+        }
+    }
 }
 
 impl PodCreateContext<'_> {
@@ -156,6 +196,23 @@ impl PodCreateContext<'_> {
             Self::Restore(RestoreContext::UserRestore {
                 direct_node_name, ..
             }) => *direct_node_name,
+        }
+    }
+
+    /// The remote snapshot this build restores from, if it has one.
+    fn suspend_restore_storage_uri(&self) -> Option<&str> {
+        match self {
+            Self::OnDemand => None,
+            Self::Restore(
+                RestoreContext::UserRestore {
+                    suspend_restore_storage_uri,
+                    ..
+                }
+                | RestoreContext::Evacuation {
+                    suspend_restore_storage_uri,
+                    ..
+                },
+            ) => *suspend_restore_storage_uri,
         }
     }
 }

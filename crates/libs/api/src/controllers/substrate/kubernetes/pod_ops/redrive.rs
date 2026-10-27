@@ -642,6 +642,15 @@ impl KubernetesSubstrate {
             let node_group_placement = self
                 .resolve_node_group_placement(sandbox, &cross_node_context)
                 .await?;
+            // The successor drops the source pin, not the capture CPU: landing
+            // "anywhere" must still mean on a host that can load the snapshot.
+            let excluded_host_cpus = self
+                .restore_excluded_host_cpus(
+                    sandbox,
+                    &cross_node_context,
+                    node_group_placement.placement(),
+                )
+                .await?;
 
             let cross_node_pod = match create_sandbox_pod(
                 &self.k8s,
@@ -653,6 +662,7 @@ impl KubernetesSubstrate {
                         auto_lifecycle_json: &auto_lifecycle_json,
                         network_policy_json: &network_policy_json,
                         node_group_placement: node_group_placement.placement(),
+                        excluded_host_cpus: &excluded_host_cpus,
                     },
                     cross_node_context,
                 ),

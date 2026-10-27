@@ -253,6 +253,7 @@ fn cluster_controller_built_restore_drops_source_node_pin_and_omits_tolerations(
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -317,6 +318,7 @@ fn cluster_controller_built_restore_renders_configured_placement() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: std::slice::from_ref(&toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
+            excluded_host_cpus: &[],
             node_group_placement: None,
         },
     );
@@ -559,6 +561,7 @@ fn node_group_labeler_selector_matches_the_rendered_pod_node_selector() {
             restore_node_shortlist: Vec::new(),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            excluded_host_cpus: &[],
             // No placement: the labeler tracks the *unpinned* selector, and a
             // placement adds required nodeAffinity rather than nodeSelector
             // entries, so it would not change what this compares.

@@ -49,8 +49,11 @@ mod pod_placement;
 mod pod_tracking;
 mod restore_lease;
 mod restore_source;
+mod snapshot_capture;
 mod started_recovery;
 mod suspend;
+
+pub(in crate::controllers::substrate::kubernetes) use snapshot_capture::SnapshotCaptureHost;
 
 #[derive(Clone)]
 pub(super) struct K8sStore {

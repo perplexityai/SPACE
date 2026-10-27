@@ -920,6 +920,48 @@ impl KubernetesSubstrate {
         let node_group_placement = self
             .resolve_node_group_placement_for_claim(&sandbox, &claim, &pod_create_context)
             .await?;
+        // Resolved here for the same reason: before any pod exists, while the
+        // context is still in hand. A failure retires the claim the way
+        // `resolve_node_group_placement_for_claim` does, returning the error
+        // that explains why the build failed even when retiring fails too.
+        let excluded_host_cpus = match self
+            .restore_excluded_host_cpus(
+                &sandbox,
+                &pod_create_context,
+                node_group_placement.placement(),
+            )
+            .await
+        {
+            Ok(excluded_host_cpus) => excluded_host_cpus,
+            Err(error) => {
+                if execution_pod_create_in_flight(claim.row.state) {
+                    match self
+                        .store
+                        .abandon_created_unmaterialized_create_claim(sandbox.id, &claim)
+                        .await
+                    {
+                        Ok(true) => tracing::warn!(
+                            sandbox_id = %sandbox.id,
+                            generation = claim.row.generation,
+                            %error,
+                            "retired unmaterialized Kubernetes pod create claim after the \
+                             restore's host CPU constraint could not be resolved"
+                        ),
+                        Ok(false) => {}
+                        Err(retire_error) => tracing::warn!(
+                            sandbox_id = %sandbox.id,
+                            generation = claim.row.generation,
+                            %error,
+                            %retire_error,
+                            "could not retire the unmaterialized create claim after the \
+                             restore's host CPU constraint failed to resolve; the claim clears \
+                             at the stale-create age"
+                        ),
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         let auto_lifecycle = match self
             .store
@@ -1013,6 +1055,7 @@ impl KubernetesSubstrate {
                     auto_lifecycle_json: &auto_lifecycle_json,
                     network_policy_json: &network_policy_json,
                     node_group_placement: node_group_placement.placement(),
+                    excluded_host_cpus: &excluded_host_cpus,
                 },
                 pod_create_context,
             ),

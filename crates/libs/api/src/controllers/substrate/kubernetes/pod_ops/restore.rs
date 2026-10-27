@@ -221,6 +221,10 @@ impl KubernetesSubstrate {
         let existing = self
             .existing_suspend_restore_annotations(sandbox.id)
             .await?;
+        // A plan read back from the restore annotations on the active
+        // execution's pod, in any phase, belongs to a restore already
+        // materialized for that execution; it is never redirected.
+        let from_live_pod = existing.is_some();
         let storage_uri = match existing.as_ref().and_then(|plan| plan.storage_uri.clone()) {
             Some(storage_uri) => Some(storage_uri),
             None => {
@@ -255,6 +259,14 @@ impl KubernetesSubstrate {
                     .to_string(),
                 phase: None,
             });
+        }
+        if !from_live_pod
+            && let (Some(source_node), None) = (source_node_name.as_deref(), storage_uri.as_ref())
+            && let Some(redirect) = self
+                .cpu_incompatible_local_source_redirect(sandbox, source_node)
+                .await?
+        {
+            return Ok(redirect);
         }
         Ok(SuspendRestorePlan {
             source_node_name,
