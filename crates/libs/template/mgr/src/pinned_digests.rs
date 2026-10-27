@@ -4,9 +4,12 @@
 //! Two pin tables back the same conceptual relation "this digest is
 //! still wanted on this node":
 //!
-//! - `template_pinned_tags` — keyed on `(name, tag)`. The prefetch
-//!   tag pass writes the current resolution; the (future) GC unions
-//!   it with the release pins to decide what not to evict.
+//! - `template_pinned_tags` — keyed on `(name, tag, cache_partition)`,
+//!   so one tag can pin a different build per environment. The prefetch
+//!   tag pass writes the current resolution; the GC unions it with the
+//!   release pins to decide what not to evict. Pins protect a digest in
+//!   every cache partition. Cluster tag resolution names no environment
+//!   yet, so the prefetcher pins the legacy partition.
 //! - `template_pinned_releases` — keyed on `(name, content_hash)`.
 //!   The latest-N release pass writes one row per recent release.
 //!
@@ -56,17 +59,24 @@ impl PinnedDigestsStore {
     }
 
     /// Record (or refresh) a tag pin: "for template `name`, tag
-    /// `tag` currently resolves to `content_hash`". The previous
-    /// hash for the same `(name, tag)` loses its pin — that's
-    /// correct, because the tag no longer protects it.
-    pub fn upsert_tag(&self, name: &str, tag: &str, content_hash: &str) -> Result<()> {
+    /// `tag` currently resolves to `content_hash` in
+    /// `cache_partition`". The previous hash for the same
+    /// `(name, tag, cache_partition)` loses its pin — that's correct,
+    /// because the tag no longer protects it there.
+    pub fn upsert_tag(
+        &self,
+        name: &str,
+        tag: &str,
+        cache_partition: crate::db::TemplateCachePartition,
+        content_hash: &str,
+    ) -> Result<()> {
         let conn = self.lock_conn()?;
         let ts = crate::db::now();
         conn.execute(
-            "INSERT INTO template_pinned_tags (name, tag, content_hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(name, tag) DO UPDATE SET content_hash = ?3, updated_at = ?4",
-            params![name, tag, content_hash, ts],
+            "INSERT INTO template_pinned_tags (name, tag, cache_partition, content_hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(name, tag, cache_partition) DO UPDATE SET content_hash = ?4, updated_at = ?5",
+            params![name, tag, cache_partition.key(), content_hash, ts],
         )?;
         Ok(())
     }

@@ -129,6 +129,18 @@ message TemplateRef {
   string name = 1;
   optional string content_hash = 2;     // exact build hash
   optional string tag = 3;              // build alias
+  // One rootfs can be cached once per environment it's bound to. In requests,
+  // an environment reference prefers the build bound to that environment,
+  // then the build unbound and initial-environment builds share, then any
+  // other; absent prefers the shared one. A latest-build lookup returns the
+  // newest build, same-date builds going to the larger content hash and
+  // builds of one digest to that order. A cache miss pulls the release, whose
+  // manifest, or failing that its metadata, decides where it's cached. Callers
+  // check that the build they get is a compatible cold-boot source for the
+  // environment they run it under. In responses: the resolved build's
+  // environment binding, absent for unbound builds. DeleteTemplateBuild
+  // rejects it and removes every cached build of the hash.
+  optional string environment = 4;
 }
 
 message SnapshotInfo {

@@ -224,6 +224,7 @@ fn upsert_test_build_with_execution(conn: &Connection, name: &str, content_hash:
         &BuildUpsert {
             name,
             content_hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-06-12T00:00:00Z",
             manifest_json: &manifest_json,
             runtime: "fc",
@@ -273,6 +274,9 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
             &BuildUpsert {
                 name: "seed",
                 content_hash: "sha256:build",
+                cache_partition: pplx_space_node_runtime_core::catalog::template_cache_partition(
+                    execution.environment(),
+                ),
                 build_date: "2026-06-12T00:00:00Z",
                 manifest_json: &manifest_json,
                 runtime: "fc",
@@ -357,7 +361,13 @@ fn delete_build_removes_execution_component_rows() {
     conn.pragma_update(None, "foreign_keys", false).unwrap();
     upsert_test_build_with_execution(&conn, "base", "sha256:build");
 
-    delete_build(&conn, "base", "sha256:build").unwrap();
+    delete_build(
+        &conn,
+        "base",
+        "sha256:build",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
 
     let component_count: u32 = conn
         .query_row(
@@ -726,6 +736,7 @@ fn ready_build(name: &str, content_hash: &str, size: u64) -> BuildUpsert<'static
     BuildUpsert {
         name: n,
         content_hash: h,
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         build_date: "2026-01-01T00:00:00Z",
         manifest_json: "{}",
         runtime: "fc",
@@ -738,14 +749,14 @@ fn ready_build(name: &str, content_hash: &str, size: u64) -> BuildUpsert<'static
 /// Regression test: `upsert_build`'s ON CONFLICT path must NOT clobber
 /// a `state='deleting'` row back to `'ready'`. That window
 /// opens when eviction Phase 1 marks deleting, a concurrent
-/// on-demand pull races in (since `resolve_template` now
+/// on-demand pull races in (since `resolve_template_build` now
 /// returns NotFound and the `GetTemplate` handler falls
 /// through to a fresh pull), and the pull's final upsert
 /// would resurrect the doomed row. Eviction's Phase 3 then
 /// DELETEs it, and the on-disk state is indeterminate.
 ///
 /// With the WHERE guard, the upsert is a no-op when state is
-/// 'deleting'. The caller's `resolve_template` then still
+/// 'deleting'. The caller's `resolve_template_build` then still
 /// sees `state='deleting'` → NotFound, no resurrection.
 #[test]
 fn upsert_build_refuses_to_clobber_deleting_state() {
@@ -793,17 +804,17 @@ fn is_build_marked_deleting_matches_state() {
     let conn = test_conn();
     upsert_build(&conn, &ready_build("seed", "sha256:aa", 100)).unwrap();
 
-    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:aa").unwrap());
+    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:aa",).unwrap());
 
     conn.execute(
         "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
         params!["seed", "sha256:aa"],
     )
     .unwrap();
-    assert!(is_build_marked_deleting(&conn, "seed", "sha256:aa").unwrap());
+    assert!(is_build_marked_deleting(&conn, "seed", "sha256:aa",).unwrap());
 
     // Missing row → false (not an error).
-    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:does-not-exist").unwrap());
+    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:does-not-exist",).unwrap());
 }
 
 /// `upsert_build` must seed `last_used_at = created_at` so a
@@ -848,7 +859,13 @@ fn touch_build_updates_last_used_at() {
         .unwrap();
     assert_eq!(before, "1000");
 
-    touch_build(&conn, "seed", "sha256:aa").unwrap();
+    touch_build(
+        &conn,
+        "seed",
+        "sha256:aa",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
 
     let after: String = conn
         .query_row(
@@ -872,7 +889,13 @@ fn touch_build_updates_last_used_at() {
 fn touch_build_is_no_op_for_missing_row() {
     let conn = test_conn();
 
-    touch_build(&conn, "seed", "sha256:does-not-exist").unwrap();
+    touch_build(
+        &conn,
+        "seed",
+        "sha256:does-not-exist",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
 }
 
 /// `list_eviction_candidates` returns timestamps as parsed u64

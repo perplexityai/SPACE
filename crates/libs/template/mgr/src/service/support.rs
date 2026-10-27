@@ -96,6 +96,16 @@ pub(super) fn compute_snapshot_hash(snap_dir: &str) -> std::io::Result<String> {
     Ok(result.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The build a `GetTemplate` request selects: a name plus an optional exact
+/// hash, preferring one environment's cache partition when `partition` is
+/// set.
+#[derive(Clone)]
+pub(super) struct TemplateSelection {
+    pub(super) name: String,
+    pub(super) content_hash: String,
+    pub(super) partition: Option<crate::db::TemplateCachePartition>,
+}
+
 /// Builds a `GetTemplateResponse` from a local SQLite lookup. Returns
 /// `Status::not_found` when the build row isn't there. Used both for
 /// the initial lookup in [`TemplateManagerService::get_template`] and
@@ -103,9 +113,7 @@ pub(super) fn compute_snapshot_hash(snap_dir: &str) -> std::io::Result<String> {
 pub(super) async fn build_get_template_response(
     template_root: PathBuf,
     db: Arc<Mutex<rusqlite::Connection>>,
-    template_id: String,
-    req_hash: String,
-    req_tag: String,
+    selection: TemplateSelection,
     snapshot_selector: Option<(u32, u32)>,
     policy_snapshot_memory_mib: Option<u32>,
 ) -> Result<crate::proto::GetTemplateResponse, Status> {
@@ -114,20 +122,30 @@ pub(super) async fn build_get_template_response(
             .lock()
             .map_err(|e| Status::internal(format!("db mutex poisoned: {e}")))?;
 
-        let (name, content_hash) =
-            TemplateManagerService::resolve_template(&conn, &template_id, &req_hash, &req_tag)?;
+        let build = TemplateManagerService::resolve_template_build(
+            &conn,
+            &selection.name,
+            &selection.content_hash,
+            selection.partition,
+        )?;
+        let name = build.name.clone();
+        let content_hash = build.content_hash.clone();
+        let partition = build.cache_partition;
 
-        let build = crate::db::get_build(&conn, &name, &content_hash)
-            .map_err(|e| Status::internal(format!("db get_build: {e}")))?
-            .ok_or_else(|| Status::not_found(format!("build not found: {name}@{content_hash}")))?;
-
-        let snapshots = crate::db::list_snapshots(&conn, &name, &content_hash)
+        let snapshots = crate::db::list_snapshots(&conn, &name, &content_hash, partition)
             .map_err(|e| Status::internal(format!("db list_snapshots: {e}")))?;
 
         let settings = crate::db::get_template_settings(&conn, &name)
             .map_err(|e| Status::internal(format!("db get_template_settings: {e}")))?;
+        let snapshot_key = |vcpu, memory_mib| crate::db::SnapshotKey {
+            name: &name,
+            content_hash: &content_hash,
+            cache_partition: partition,
+            vcpu,
+            memory_mib,
+        };
         let matched_snapshot = if let Some((vcpu, memory_mib)) = snapshot_selector {
-            crate::db::get_snapshot(&conn, &name, &content_hash, vcpu, memory_mib)
+            crate::db::get_snapshot(&conn, snapshot_key(vcpu, memory_mib))
                 .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))?
         } else if let Some(settings) = settings
             .as_ref()
@@ -135,12 +153,13 @@ pub(super) async fn build_get_template_response(
         {
             let vcpu = settings.snapshot_vcpu;
             let memory_mib = policy_snapshot_memory_mib.unwrap_or(settings.snapshot_memory_mib);
-            crate::db::get_snapshot(&conn, &name, &content_hash, vcpu, memory_mib)
+            crate::db::get_snapshot(&conn, snapshot_key(vcpu, memory_mib))
                 .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))?
         } else {
             snapshots.first().map(|s| crate::db::SnapshotRow {
                 name: s.name.clone(),
                 content_hash: s.content_hash.clone(),
+                cache_partition: s.cache_partition,
                 vcpu: s.vcpu,
                 memory_mib: s.memory_mib,
                 snapshot_hash: s.snapshot_hash.clone(),
@@ -148,15 +167,17 @@ pub(super) async fn build_get_template_response(
             })
         };
 
-        let template_dir_path = build_artifacts_dir(&template_root, &name, &content_hash)
-            .to_string_lossy()
-            .into_owned();
+        let template_dir_path =
+            build_artifacts_dir(&template_root, &name, &content_hash, partition)
+                .to_string_lossy()
+                .into_owned();
         let snapshot_result = matched_snapshot.as_ref().map(|snap| {
             (
                 snapshot_artifacts_dir(
                     &template_root,
                     &name,
                     &content_hash,
+                    partition,
                     snap.vcpu,
                     snap.memory_mib,
                 )
@@ -193,6 +214,7 @@ pub(super) async fn build_get_template_response(
             .map(|settings| settings.default_auto_lifecycle_authority)
             .unwrap_or(crate::db::PolicyAuthority::Cluster);
         drop(conn);
+        let environment = build.environment();
 
         crate::rootfs_cache::verify_rootfs_from_metadata(&template_dir_path).map_err(|error| {
             Status::failed_precondition(format!(
@@ -206,6 +228,7 @@ pub(super) async fn build_get_template_response(
                 name: build.name,
                 content_hash: Some(build.content_hash),
                 tag: None,
+                environment: environment.map(|environment| environment.to_string()),
             }),
             build_date: build.build_date,
             artifact_size_bytes: build.artifact_size_bytes,

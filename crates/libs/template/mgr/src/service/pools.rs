@@ -20,9 +20,14 @@ impl TemplateManagerService {
                     .map_err(|_| crate::db::mutex_poison_error("create pool template lookup"))?;
                 let existing_pool = crate::db::get_pool(&conn, &template)?;
                 let settings = crate::db::get_template_settings(&conn, &template)?;
-                let runtime_defaults = Self::resolve_template(&conn, &template, "", "latest")
-                    .ok()
-                    .map(|(_, content_hash)| template_runtime_defaults(&template, &content_hash))
+                let runtime_defaults = crate::pool_manager::pool_base_build(&conn, &template)?
+                    .map(|build| {
+                        template_runtime_defaults(
+                            &template,
+                            &build.content_hash,
+                            build.cache_partition,
+                        )
+                    })
                     .unwrap_or_default();
                 Ok::<_, rusqlite::Error>((existing_pool, settings, runtime_defaults))
             })
@@ -80,12 +85,22 @@ impl TemplateManagerService {
                 let conn = db.lock().map_err(|_| {
                     Status::internal("db mutex poisoned while checking pool snapshot")
                 })?;
-                let Some((_, content_hash)) = Self::resolve_template(&conn, &t, "", "latest").ok()
+                let Some(build) = crate::pool_manager::pool_base_build(&conn, &t)
+                    .map_err(|e| Status::internal(format!("db get_latest_build: {e}")))?
                 else {
                     return Ok::<_, Status>(None);
                 };
-                crate::db::get_snapshot(&conn, &t, &content_hash, vcpu, memory_mib)
-                    .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))
+                crate::db::get_snapshot(
+                    &conn,
+                    crate::db::SnapshotKey {
+                        name: &t,
+                        content_hash: &build.content_hash,
+                        cache_partition: build.cache_partition,
+                        vcpu,
+                        memory_mib,
+                    },
+                )
+                .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))
             })
             .await
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;

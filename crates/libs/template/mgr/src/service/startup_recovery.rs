@@ -47,6 +47,10 @@ enum DigestDirRejection {
     },
     #[error("manifest content_hash {found:?} does not match digest dir name {expected:?}")]
     ContentHashDisagreesWithDirName { found: String, expected: String },
+    #[error("manifest binds the {found} cache partition but the digest dir holds {expected}")]
+    PartitionDisagreesWithDirName { found: String, expected: String },
+    #[error("manifest execution metadata is invalid: {0}")]
+    ExecutionMetadataInvalid(String),
     #[error("manifest does not declare a bootable_artifact")]
     BootableArtifactNotDeclared,
     #[error("manifest.files map has no entry for bootable artifact {0:?}")]
@@ -103,12 +107,42 @@ fn parse_metadata_from_digest_dir(digest_dir: &Path) -> TemplateMetadata {
 }
 
 /// Confirm manifest invariants that don't require I/O: content_hash
-/// matches the dir name and the bootable artifact entry is present and
-/// pinned to the dir name.
+/// matches the dir name, the manifest binds the dir's partition, and the
+/// bootable artifact entry is present and pinned to the dir name.
+///
+/// A node that predates partitions can hold a build bound to another
+/// environment in the legacy layout. It's dropped like any other mismatch and
+/// re-pulled into its own partition on demand, since every reader derives a
+/// build's partition from its binding. Its sandboxes keep running; suspend
+/// falls back to the Full codec, as when eviction removes a parent build.
 fn validate_manifest_self_consistency(
     hash_name: &str,
+    partition: crate::db::TemplateCachePartition,
     manifest: &TemplateManifest,
+    metadata: &TemplateMetadata,
 ) -> Result<(), DigestDirRejection> {
+    let bound = match crate::service::effective_environment(manifest, metadata) {
+        // Without the initial environment's reference, an E0 build can't be
+        // told from another environment's, so no dir is dropped for it.
+        _ if pplx_space_node_runtime_core::catalog::initial_environment_reference().is_none() => {
+            None
+        }
+        Ok(environment) => {
+            Some(pplx_space_node_runtime_core::catalog::template_cache_partition(environment))
+        }
+        // Unreadable metadata in a legacy dir keeps its pre-partition handling:
+        // the row upsert refuses it and the dir stays.
+        Err(_) if partition == crate::db::TemplateCachePartition::Legacy => None,
+        Err(error) => return Err(DigestDirRejection::ExecutionMetadataInvalid(error)),
+    };
+    if let Some(bound) = bound
+        && bound != partition
+    {
+        return Err(DigestDirRejection::PartitionDisagreesWithDirName {
+            found: bound.to_string(),
+            expected: partition.to_string(),
+        });
+    }
     if manifest.content_hash != hash_name {
         return Err(DigestDirRejection::ContentHashDisagreesWithDirName {
             found: manifest.content_hash.clone(),
@@ -210,13 +244,14 @@ async fn lookup_build_row(
     db: &Arc<Mutex<rusqlite::Connection>>,
     name: &str,
     content_hash: &str,
+    partition: crate::db::TemplateCachePartition,
 ) -> Result<Option<crate::db::BuildRow>, String> {
     let db = Arc::clone(db);
     let n = name.to_string();
     let h = content_hash.to_string();
     tokio::task::spawn_blocking(move || {
         let conn = lock_recovery_db(&db)?;
-        crate::db::get_build(&conn, &n, &h).map_err(|error| error.to_string())
+        crate::db::get_build(&conn, &n, &h, partition).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("spawn_blocking: {error}"))?
@@ -226,6 +261,7 @@ async fn lookup_build_row(
 struct ValidatedBuildRow {
     name: String,
     content_hash: String,
+    partition: crate::db::TemplateCachePartition,
     manifest_json: String,
     build_date: String,
     runtime: String,
@@ -245,6 +281,7 @@ async fn insert_validated_build_row(
             &crate::db::BuildUpsert {
                 name: &row.name,
                 content_hash: &row.content_hash,
+                cache_partition: row.partition,
                 build_date: &row.build_date,
                 manifest_json: &row.manifest_json,
                 runtime: &row.runtime,
@@ -264,49 +301,122 @@ async fn delete_stale_build_row(
     db: &Arc<Mutex<rusqlite::Connection>>,
     name: &str,
     content_hash: &str,
+    partition: crate::db::TemplateCachePartition,
 ) -> Result<(), String> {
     let db = Arc::clone(db);
     let n = name.to_string();
     let h = content_hash.to_string();
     tokio::task::spawn_blocking(move || {
         let conn = lock_recovery_db(&db)?;
-        crate::db::delete_build(&conn, &n, &h).map_err(|error| error.to_string())
+        crate::db::delete_build(&conn, &n, &h, partition).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("spawn_blocking: {error}"))?
     .map_err(|error| format!("db::delete_build: {error}"))
 }
 
-async fn remove_digest_dir_from_disk(digest_dir: &Path) {
-    match tokio::fs::remove_dir_all(digest_dir).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+/// Remove an invalid build dir, reporting whether it's gone. Installed
+/// builds are read-only btrfs subvolumes that only node-manager can delete;
+/// the local subvolume-aware cleanup is the fallback, as on the pull path.
+async fn remove_digest_dir_from_disk(build: DigestDirBuild<'_>) -> bool {
+    let digest_dir = build.digest_dir;
+    let dir = digest_dir.to_path_buf();
+    let is_subvolume = tokio::task::spawn_blocking(move || {
+        pplx_space_common_core::host::btrfs::is_subvolume(&dir)
+    })
+    .await
+    .unwrap_or(false);
+    if is_subvolume {
+        match crate::btrfs_via_nodemgr::delete_template_subvolume(
+            build.name,
+            build.hash_name,
+            build.partition,
+        )
+        .await
+        {
+            Ok(()) => return true,
+            Err(error) => tracing::warn!(
+                dir = %digest_dir.display(),
+                %error,
+                "node-manager could not delete digest dir during startup recovery; trying local cleanup"
+            ),
+        }
+    }
+    let dir = digest_dir.to_path_buf();
+    let removed = tokio::task::spawn_blocking(move || crate::volume::cleanup_digest_dir_sync(&dir))
+        .await
+        .map_err(std::io::Error::other)
+        .flatten();
+    match removed {
+        Ok(()) => true,
         Err(error) => {
             tracing::warn!(
                 dir = %digest_dir.display(),
                 %error,
                 "failed to remove digest dir during startup recovery"
             );
+            false
         }
     }
 }
 
+/// One build dir recovery is reconciling.
+#[derive(Clone, Copy)]
+struct DigestDirBuild<'a> {
+    name: &'a str,
+    hash_name: &'a str,
+    partition: crate::db::TemplateCachePartition,
+    digest_dir: &'a Path,
+}
+
 async fn drop_invalid_digest_dir(
-    db: &Arc<Mutex<rusqlite::Connection>>,
-    name: &str,
-    hash_name: &str,
-    digest_dir: &Path,
+    service: &TemplateManagerService,
+    build: DigestDirBuild<'_>,
     rejection: &DigestDirRejection,
 ) {
+    let DigestDirBuild {
+        name,
+        hash_name,
+        partition,
+        digest_dir,
+    } = build;
     tracing::warn!(
         template = %name,
         content_hash = %hash_name,
+        cache_partition = %partition,
         dir = %digest_dir.display(),
         reason = %rejection,
         "dropping invalid digest dir during startup recovery"
     );
-    remove_digest_dir_from_disk(digest_dir).await;
-    if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
+    // A build in the wrong partition never becomes valid there, so its base
+    // snapshots go too, first: startup re-registers any snapshot dir it finds
+    // under the dir's partition. Until both are gone its rootfs is intact, so
+    // it keeps serving cold boots and a later startup retries.
+    // Other rejections can be transient and keep their snapshots.
+    if matches!(
+        rejection,
+        DigestDirRejection::PartitionDisagreesWithDirName { .. }
+    ) {
+        let store = service.artifact_store.clone();
+        let (n, h) = (name.to_string(), hash_name.to_string());
+        let snapshots_removed =
+            tokio::task::spawn_blocking(move || store.remove_snapshot_artifacts(&n, &h, partition))
+                .await;
+        if !matches!(snapshots_removed, Ok(Ok(()))) {
+            tracing::warn!(
+                template = %name,
+                content_hash = %hash_name,
+                "could not remove base snapshots of a build in the wrong cache partition; keeping it"
+            );
+            return;
+        }
+        if !remove_digest_dir_from_disk(build).await {
+            return;
+        }
+    } else {
+        remove_digest_dir_from_disk(build).await;
+    }
+    if let Err(error) = delete_stale_build_row(&service.db, name, hash_name, partition).await {
         tracing::warn!(
             template = %name,
             content_hash = %hash_name,
@@ -327,29 +437,36 @@ async fn drop_invalid_digest_dir(
 ///   removed and no row to be written.
 async fn reconcile_digest_dir_against_db(
     service: &TemplateManagerService,
-    name: &str,
-    hash_name: &str,
-    digest_dir: &Path,
+    build: DigestDirBuild<'_>,
 ) {
+    let DigestDirBuild {
+        name,
+        hash_name,
+        partition,
+        digest_dir,
+    } = build;
     let (manifest, manifest_json) = match parse_manifest_from_digest_dir(digest_dir) {
         Ok(parsed) => parsed,
         Err(rejection) => {
-            drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+            drop_invalid_digest_dir(service, build, &rejection).await;
             return;
         }
     };
 
-    if let Err(rejection) = validate_manifest_self_consistency(hash_name, &manifest) {
-        drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+    let metadata = parse_metadata_from_digest_dir(digest_dir);
+    if let Err(rejection) =
+        validate_manifest_self_consistency(hash_name, partition, &manifest, &metadata)
+    {
+        drop_invalid_digest_dir(service, build, &rejection).await;
         return;
     }
 
     if let Err(rejection) = verify_local_files_against_manifest(digest_dir, &manifest) {
-        drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, build, &rejection).await;
         return;
     }
 
-    let existing_row = match lookup_build_row(&service.db, name, hash_name).await {
+    let existing_row = match lookup_build_row(&service.db, name, hash_name, partition).await {
         Ok(row) => row,
         Err(error) => {
             tracing::warn!(
@@ -374,7 +491,7 @@ async fn reconcile_digest_dir_against_db(
     if let Err(rejection) =
         verify_bootable_artifact_hash(digest_dir, &manifest.bootable_artifact, hash_name).await
     {
-        drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, build, &rejection).await;
         return;
     }
 
@@ -388,7 +505,6 @@ async fn reconcile_digest_dir_against_db(
         return;
     }
 
-    let metadata = parse_metadata_from_digest_dir(digest_dir);
     let build_date = manifest.build_date.clone();
     let runtime = if manifest.runtime.is_empty() {
         RUNTIME_FIRECRACKER_ALIAS.to_string()
@@ -406,13 +522,25 @@ async fn reconcile_digest_dir_against_db(
         let rejection = DigestDirRejection::FileSizeNotDeclared {
             filename: manifest.bootable_artifact.clone(),
         };
-        drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, build, &rejection).await;
         return;
     };
 
+    // A pull interrupted before normalizing leaves a manifest without the
+    // binding its metadata carries; the row stores it the way registration
+    // would, so the store files it under the partition validated above.
+    let manifest_json = match metadata.execution_metadata() {
+        Ok(Some(execution)) if manifest.execution.is_none() => {
+            let mut bound = manifest.clone();
+            bound.set_execution_metadata(execution.clone());
+            serde_json::to_string(&bound).unwrap_or(manifest_json)
+        }
+        _ => manifest_json,
+    };
     let row = ValidatedBuildRow {
         name: name.to_string(),
         content_hash: hash_name.to_string(),
+        partition,
         manifest_json,
         build_date,
         runtime,
@@ -557,7 +685,13 @@ async fn reconcile_base_snapshots_for_template(
         return;
     };
     for snap_hash_entry in snap_hash_entries.flatten() {
-        let snap_hash = snap_hash_entry.file_name().to_string_lossy().to_string();
+        let build_dir_name = snap_hash_entry.file_name().to_string_lossy().to_string();
+        let Some((snap_hash, partition)) =
+            crate::db::TemplateCachePartition::parse_build_dir_name(&build_dir_name)
+        else {
+            continue;
+        };
+        let snap_hash = snap_hash.to_string();
         if !snap_hash.starts_with("sha256:") || !snap_hash_entry.path().is_dir() {
             continue;
         }
@@ -583,8 +717,18 @@ async fn reconcile_base_snapshots_for_template(
             let h = snap_hash.clone();
             match tokio::task::spawn_blocking(move || {
                 let conn = lock_recovery_db(&db)?;
-                crate::db::upsert_snapshot(&conn, &n, &h, vcpu, memory_mib, &snap_hash_val)
-                    .map_err(|error| error.to_string())
+                crate::db::upsert_snapshot(
+                    &conn,
+                    crate::db::SnapshotKey {
+                        name: &n,
+                        content_hash: &h,
+                        cache_partition: partition,
+                        vcpu,
+                        memory_mib,
+                    },
+                    &snap_hash_val,
+                )
+                .map_err(|error| error.to_string())
             })
             .await
             {
@@ -618,9 +762,7 @@ async fn prune_catalog_rows_missing_on_disk(
     let artifact_store = artifact_store.clone();
     match tokio::task::spawn_blocking(move || {
         let Ok(conn) = db.lock() else {
-            tracing::warn!(
-                "template DB mutex poisoned while pruning stale startup recovery rows"
-            );
+            tracing::warn!("template DB mutex poisoned while pruning stale startup recovery rows");
             return;
         };
 
@@ -637,31 +779,18 @@ async fn prune_catalog_rows_missing_on_disk(
         //   - artifacts missing → delete the row outright; any
         //     partial subvolume on disk is a small leak handled by
         //     the next eviction's nodemgr-delete path.
-        let stuck: Vec<(String, String)> = match conn.prepare(
-            "SELECT name, content_hash FROM template_builds WHERE state = 'deleting'",
-        ) {
-            Ok(mut stmt) => match stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }) {
-                Ok(rows) => rows.filter_map(Result::ok).collect(),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to enumerate stuck 'deleting' template builds");
-                    Vec::new()
-                }
-            },
-            Err(error) => {
-                tracing::warn!(%error, "failed to prepare query for stuck 'deleting' template builds");
-                Vec::new()
-            }
-        };
-        for (name, content_hash) in &stuck {
-            if artifact_store.build_artifacts_missing(name, content_hash) {
+        let stuck = crate::db::list_deleting_builds(&conn).unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to enumerate stuck 'deleting' template builds");
+            Vec::new()
+        });
+        for (name, content_hash, partition) in &stuck {
+            if artifact_store.build_artifacts_missing(name, content_hash, *partition) {
                 tracing::info!(
                     template = %name,
                     content_hash = %content_hash,
                     "stuck 'deleting' template build: artifacts missing, dropping row"
                 );
-                let _ = crate::db::delete_build(&conn, name, content_hash);
+                let _ = crate::db::delete_build(&conn, name, content_hash, *partition);
             } else {
                 tracing::info!(
                     template = %name,
@@ -670,32 +799,49 @@ async fn prune_catalog_rows_missing_on_disk(
                 );
                 let _ = conn.execute(
                     "UPDATE template_builds SET state = 'ready'
-                     WHERE name = ?1 AND content_hash = ?2 AND state = 'deleting'",
-                    rusqlite::params![name, content_hash],
+                     WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
+                       AND state = 'deleting'",
+                    rusqlite::params![name, content_hash, partition.key()],
                 );
             }
         }
 
         let builds = crate::db::list_builds(&conn).unwrap_or_default();
         for build in &builds {
-            if artifact_store.build_artifacts_missing(&build.name, &build.content_hash) {
+            if artifact_store.build_artifacts_missing(
+                &build.name,
+                &build.content_hash,
+                build.cache_partition,
+            ) {
                 tracing::warn!(
                     template = %build.name,
                     content_hash = %build.content_hash,
+                    cache_partition = %build.cache_partition,
                     "pruning catalog build row whose artifacts are missing on disk"
                 );
-                let _ = crate::db::delete_build(&conn, &build.name, &build.content_hash);
+                let _ = crate::db::delete_build(
+                    &conn,
+                    &build.name,
+                    &build.content_hash,
+                    build.cache_partition,
+                );
             }
         }
 
         let remaining_builds = crate::db::list_builds(&conn).unwrap_or_default();
         for build in &remaining_builds {
-            let snaps = crate::db::list_snapshots(&conn, &build.name, &build.content_hash)
-                .unwrap_or_default();
+            let snaps = crate::db::list_snapshots(
+                &conn,
+                &build.name,
+                &build.content_hash,
+                build.cache_partition,
+            )
+            .unwrap_or_default();
             for snap in &snaps {
                 if artifact_store.snapshot_artifacts_missing(
                     &snap.name,
                     &snap.content_hash,
+                    snap.cache_partition,
                     snap.vcpu,
                     snap.memory_mib,
                 ) {
@@ -706,9 +852,15 @@ async fn prune_catalog_rows_missing_on_disk(
                         memory_mib = snap.memory_mib,
                         "pruning catalog snapshot row whose artifacts are missing on disk"
                     );
-                    let _ = conn.execute(
-                        "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 AND vcpu = ?3 AND memory_mib = ?4",
-                        rusqlite::params![snap.name, snap.content_hash, snap.vcpu, snap.memory_mib],
+                    let _ = crate::db::delete_snapshot(
+                        &conn,
+                        crate::db::SnapshotKey {
+                            name: &snap.name,
+                            content_hash: &snap.content_hash,
+                            cache_partition: snap.cache_partition,
+                            vcpu: snap.vcpu,
+                            memory_mib: snap.memory_mib,
+                        },
                     );
                 }
             }
@@ -720,10 +872,7 @@ async fn prune_catalog_rows_missing_on_disk(
         {
             Ok(pruned) if pruned > 0 => {
                 pplx_space_metrics::template::digest_pins_pruned(pruned as u64);
-                tracing::info!(
-                    pruned,
-                    "pruned template digest pins without local builds"
-                );
+                tracing::info!(pruned, "pruned template digest pins without local builds");
             }
             Ok(_) => {}
             Err(error) => {
@@ -818,13 +967,26 @@ impl TemplateManagerService {
                         if is_import_staging_dir(&hash_name)
                             || is_republish_staging_dir(&hash_name)
                             || replaced_digest_base(&hash_name).is_some()
-                            || hash_name.parse::<Digest>().is_err()
                             || !digest_entry.path().is_dir()
                         {
                             continue;
                         }
+                        let Some((content_hash, partition)) =
+                            crate::db::TemplateCachePartition::parse_build_dir_name(&hash_name)
+                        else {
+                            continue;
+                        };
                         let digest_dir = digest_entry.path();
-                        reconcile_digest_dir_against_db(self, &name, &hash_name, &digest_dir).await;
+                        reconcile_digest_dir_against_db(
+                            self,
+                            DigestDirBuild {
+                                name: &name,
+                                hash_name: content_hash,
+                                partition,
+                                digest_dir: &digest_dir,
+                            },
+                        )
+                        .await;
                     }
                 }
 

@@ -15,7 +15,7 @@ use pplx_space_common_core::types::{
     AutoLifecyclePolicy, DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU, Digest,
     HashAlg, MIN_BASE_SNAPSHOT_MEMORY_MIB, MIN_BASE_SNAPSHOT_VCPU, RUNTIME_FIRECRACKER_ALIAS,
     TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
-    TEMPLATE_ROOTFS_ZSTD_LEVEL,
+    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateCachePartition,
 };
 use pplx_space_common_svc::{
     AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
@@ -92,8 +92,13 @@ impl TemplateArtifactStore {
         template_artifacts_dir(&self.root, name).exists()
     }
 
-    fn build_artifacts_missing(&self, name: &str, content_hash: &str) -> bool {
-        let build_dir = build_artifacts_dir(&self.root, name, content_hash);
+    fn build_artifacts_missing(
+        &self,
+        name: &str,
+        content_hash: &str,
+        partition: TemplateCachePartition,
+    ) -> bool {
+        let build_dir = build_artifacts_dir(&self.root, name, content_hash, partition);
         !build_dir.exists() || !build_dir.join(TEMPLATE_ROOTFS_FILE).exists()
     }
 
@@ -101,10 +106,12 @@ impl TemplateArtifactStore {
         &self,
         name: &str,
         content_hash: &str,
+        partition: TemplateCachePartition,
         vcpu: u32,
         memory_mib: u32,
     ) -> bool {
-        let snapshot_dir = snapshot_artifacts_dir(&self.root, name, content_hash, vcpu, memory_mib);
+        let snapshot_dir =
+            snapshot_artifacts_dir(&self.root, name, content_hash, partition, vcpu, memory_mib);
         !snapshot_dir.join("snapshot.base").exists() || !snapshot_dir.join("vmstate.base").exists()
     }
 
@@ -112,10 +119,11 @@ impl TemplateArtifactStore {
         &self,
         name: &str,
         content_hash: &str,
+        partition: TemplateCachePartition,
     ) -> Result<(), TemplateArtifactDeleteError> {
-        self.remove_snapshot_artifacts(name, content_hash)?;
+        self.remove_snapshot_artifacts(name, content_hash, partition)?;
 
-        let build_dir = build_artifacts_dir(&self.root, name, content_hash);
+        let build_dir = build_artifacts_dir(&self.root, name, content_hash, partition);
         remove_dir_all_if_exists(&build_dir).map_err(|source| {
             TemplateArtifactDeleteError::BuildDir {
                 path: build_dir,
@@ -135,8 +143,10 @@ impl TemplateArtifactStore {
         &self,
         name: &str,
         content_hash: &str,
+        partition: TemplateCachePartition,
     ) -> Result<(), TemplateArtifactDeleteError> {
-        let snapshots_dir = build_snapshots_artifacts_dir(&self.root, name, content_hash);
+        let snapshots_dir =
+            build_snapshots_artifacts_dir(&self.root, name, content_hash, partition);
         remove_dir_all_if_exists(&snapshots_dir).map_err(|source| {
             TemplateArtifactDeleteError::BuildSnapshots {
                 path: snapshots_dir,
@@ -166,24 +176,35 @@ fn template_artifacts_dir(root: &Path, name: &str) -> PathBuf {
     root.join(name)
 }
 
-fn build_artifacts_dir(root: &Path, name: &str, content_hash: &str) -> PathBuf {
-    template_artifacts_dir(root, name).join(content_hash)
+fn build_artifacts_dir(
+    root: &Path,
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> PathBuf {
+    template_artifacts_dir(root, name).join(partition.build_dir_name(content_hash))
 }
 
-fn build_snapshots_artifacts_dir(root: &Path, name: &str, content_hash: &str) -> PathBuf {
+fn build_snapshots_artifacts_dir(
+    root: &Path,
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> PathBuf {
     template_artifacts_dir(root, name)
         .join("snapshots")
-        .join(content_hash)
+        .join(partition.build_dir_name(content_hash))
 }
 
 fn snapshot_artifacts_dir(
     root: &Path,
     name: &str,
     content_hash: &str,
+    partition: TemplateCachePartition,
     vcpu: u32,
     memory_mib: u32,
 ) -> PathBuf {
-    build_snapshots_artifacts_dir(root, name, content_hash)
+    build_snapshots_artifacts_dir(root, name, content_hash, partition)
         .join(format!("{vcpu}vcpu-{memory_mib}mib"))
 }
 
@@ -201,7 +222,7 @@ fn lock_status<'a, T>(mutex: &'a Mutex<T>, context: &str) -> Result<MutexGuard<'
         .map_err(|_| Status::internal(format!("{context} mutex poisoned")))
 }
 
-fn is_import_staging_dir(name: &str) -> bool {
+pub(crate) fn is_import_staging_dir(name: &str) -> bool {
     name.split_once(':')
         .is_some_and(|(algorithm, _)| algorithm.parse::<HashAlg>().is_ok())
         && name.contains(IMPORTING_MARKER)
@@ -220,9 +241,11 @@ fn replaced_digest_base(name: &str) -> Option<&str> {
     transient_digest_base(name, REPLACED_MARKER)
 }
 
+/// The build dir name (`{content_hash}`, or `{content_hash}@{environment}`
+/// for an environment's cache partition) a transient sibling belongs to.
 fn transient_digest_base<'a>(name: &'a str, marker: &str) -> Option<&'a str> {
     let (base, suffix) = name.split_once(marker)?;
-    base.parse::<Digest>().ok()?;
+    TemplateCachePartition::parse_build_dir_name(base)?;
     if base.is_empty() || suffix.is_empty() {
         return None;
     }
@@ -377,16 +400,25 @@ pub struct TemplateManagerService {
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
-/// Path to a build's digest directory: `{TEMPLATE_DIR}/{name}/{content_hash}/`
-fn build_dir(name: &str, content_hash: &str) -> String {
-    format!("{TEMPLATE_DIR}/{name}/{content_hash}")
+/// Path to a build's digest directory: `{TEMPLATE_DIR}/{name}/{build_dir}/`,
+/// where `build_dir` is the content hash plus `@{environment}` outside the
+/// legacy cache partition.
+fn build_dir(name: &str, content_hash: &str, partition: TemplateCachePartition) -> String {
+    pplx_space_common_core::host::linux::paths::template_build_dir(name, content_hash, partition)
 }
 
-/// Path to the snapshots directory for a build: `{TEMPLATE_DIR}/{name}/snapshots/{content_hash}/{vcpu}vcpu-{memory_mib}mib/`
-fn snapshot_dir(name: &str, content_hash: &str, vcpu: u32, memory_mib: u32) -> String {
+/// Path to the snapshots directory for a build: `{TEMPLATE_DIR}/{name}/snapshots/{build_dir}/{vcpu}vcpu-{memory_mib}mib/`
+fn snapshot_dir(
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+    vcpu: u32,
+    memory_mib: u32,
+) -> String {
     pplx_space_common_core::host::linux::paths::template_snapshot_dir(
         name,
         content_hash,
+        partition,
         vcpu,
         memory_mib,
     )
@@ -399,8 +431,12 @@ struct TemplateRuntimeDefaults {
     disk_size_mb: Option<u32>,
 }
 
-fn template_runtime_defaults(name: &str, content_hash: &str) -> TemplateRuntimeDefaults {
-    let metadata_path = Path::new(&build_dir(name, content_hash)).join("metadata.json");
+fn template_runtime_defaults(
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> TemplateRuntimeDefaults {
+    let metadata_path = Path::new(&build_dir(name, content_hash, partition)).join("metadata.json");
     let Ok(metadata_json) = std::fs::read_to_string(metadata_path) else {
         return TemplateRuntimeDefaults::default();
     };
@@ -612,17 +648,28 @@ fn allocated_file_size(path: impl AsRef<Path>) -> Option<u64> {
         .map(|metadata| metadata.blocks().saturating_mul(512))
 }
 
-fn template_cache_size_bytes(name: &str, content_hash: &str) -> Option<u64> {
-    allocated_file_size(Path::new(&build_dir(name, content_hash)).join("rootfs.ext4"))
+fn template_cache_size_bytes(
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> Option<u64> {
+    allocated_file_size(Path::new(&build_dir(name, content_hash, partition)).join("rootfs.ext4"))
 }
 
 fn snapshot_cache_size_bytes(
     name: &str,
     content_hash: &str,
+    partition: TemplateCachePartition,
     vcpu: u32,
     memory_mib: u32,
 ) -> Option<u64> {
-    let dir = PathBuf::from(snapshot_dir(name, content_hash, vcpu, memory_mib));
+    let dir = PathBuf::from(snapshot_dir(
+        name,
+        content_hash,
+        partition,
+        vcpu,
+        memory_mib,
+    ));
     let snapshot = allocated_file_size(dir.join("snapshot.base"))?;
     let vmstate = allocated_file_size(dir.join("vmstate.base")).unwrap_or(0);
     Some(snapshot.saturating_add(vmstate))
@@ -713,6 +760,43 @@ fn validate_retained_environment_binding(
         ));
     }
     Ok(())
+}
+
+/// Cache partition of the environment a build's manifest binds.
+pub(crate) fn manifest_cache_partition(
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+    metadata: &pplx_space_common_core::types::TemplateMetadata,
+) -> Result<TemplateCachePartition, Status> {
+    let environment = effective_environment(manifest, metadata).map_err(Status::data_loss)?;
+    Ok(pplx_space_node_runtime_core::catalog::template_cache_partition(environment))
+}
+
+/// The environment a build is bound to once registered: its manifest's
+/// execution metadata, else its metadata's, which
+/// [`normalize_template_manifest`] copies into a manifest that has none.
+/// Every reader that picks a build's partition goes through this, so it
+/// agrees with the binding `db::upsert_build` checks.
+pub(crate) fn effective_environment(
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+    metadata: &pplx_space_common_core::types::TemplateMetadata,
+) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, String> {
+    match manifest
+        .execution_metadata()
+        .map_err(|error| error.to_string())?
+    {
+        Some(execution) => Ok(execution.environment()),
+        None => metadata.environment().map_err(|error| error.to_string()),
+    }
+}
+
+/// Cache partition of the environment registration metadata binds.
+pub(crate) fn metadata_cache_partition(
+    metadata: &pplx_space_common_core::types::TemplateMetadata,
+) -> Result<TemplateCachePartition, Status> {
+    let environment = metadata
+        .environment()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(pplx_space_node_runtime_core::catalog::template_cache_partition(environment))
 }
 
 pub(crate) fn normalize_template_manifest(
@@ -1230,16 +1314,18 @@ async fn fetch_warm_pool_protected_keys() -> Result<HashSet<(String, String)>, S
 fn build_disk_usage_with_snapshots(
     name: &str,
     content_hash: &str,
+    partition: TemplateCachePartition,
     fallback_artifact_size: u64,
     snapshot_dims: &[(u32, u32)],
 ) -> u64 {
-    let digest_dir = build_dir(name, content_hash);
+    let digest_dir = build_dir(name, content_hash, partition);
     let build_bytes =
         digest_dir_allocated_bytes(Path::new(&digest_dir)).unwrap_or(fallback_artifact_size);
     let snapshot_bytes: u64 = snapshot_dims
         .iter()
         .map(|(vcpu, memory_mib)| {
-            snapshot_cache_size_bytes(name, content_hash, *vcpu, *memory_mib).unwrap_or(0)
+            snapshot_cache_size_bytes(name, content_hash, partition, *vcpu, *memory_mib)
+                .unwrap_or(0)
         })
         .sum();
     build_bytes.saturating_add(snapshot_bytes)
@@ -1284,16 +1370,17 @@ fn fallback_delete_build_artifacts(
     store: &TemplateArtifactStore,
     name: &str,
     content_hash: &str,
+    partition: TemplateCachePartition,
 ) -> Result<(), io::Error> {
     store
-        .remove_snapshot_artifacts(name, content_hash)
+        .remove_snapshot_artifacts(name, content_hash, partition)
         .map_err(|err| match err {
             TemplateArtifactDeleteError::BuildSnapshots { source, .. } => source,
             // remove_snapshot_artifacts only produces BuildSnapshots
             // errors; the other variants are unreachable here.
             other => io::Error::other(format!("unexpected delete error: {other}")),
         })?;
-    let build_dir = build_artifacts_dir(&store.root, name, content_hash);
+    let build_dir = build_artifacts_dir(&store.root, name, content_hash, partition);
     match crate::volume::cleanup_digest_dir_sync(&build_dir) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -1611,8 +1698,18 @@ impl TemplateManagerService {
             Arc::new(|| Box::pin(fetch_warm_pool_protected_keys()));
 
         let disk_size_for: crate::eviction::DiskSizeFn = Arc::new(
-            move |name: &str, content_hash: &str, fallback: u64, snapshot_dims: &[(u32, u32)]| {
-                build_disk_usage_with_snapshots(name, content_hash, fallback, snapshot_dims)
+            move |name: &str,
+                  content_hash: &str,
+                  partition: TemplateCachePartition,
+                  fallback: u64,
+                  snapshot_dims: &[(u32, u32)]| {
+                build_disk_usage_with_snapshots(
+                    name,
+                    content_hash,
+                    partition,
+                    fallback,
+                    snapshot_dims,
+                )
             },
         );
 
@@ -1636,60 +1733,67 @@ impl TemplateManagerService {
         // `spawn_blocking` thread.
         let delete_disk_for: crate::eviction::DeleteDiskFn = {
             let store = artifact_store.clone();
-            Arc::new(move |name: &str, content_hash: &str| {
-                let n = name.to_string();
-                let h = content_hash.to_string();
-                let store = store.clone();
-                Box::pin(async move {
-                    let outcome: Result<(), String> =
-                        match crate::btrfs_via_nodemgr::delete_template_subvolume(&n, &h).await {
-                            Ok(()) => {
-                                // Snapshot dirs are plain dirs under
-                                // `<root>/<name>/snapshots/<hash>/`,
-                                // separate from the digest subvol nodemgr
-                                // just deleted. Run only the snapshot
-                                // half locally — the combined helper
-                                // would re-try a now-gone build dir.
-                                store
-                                    .remove_snapshot_artifacts(&n, &h)
-                                    .map_err(|err| format!("snapshot cleanup: {err}"))
-                            }
-                            Err(rpc_err) => {
-                                tracing::warn!(
-                                    template = %n,
-                                    content_hash = %h,
-                                    err = %rpc_err,
-                                    "btrfs_via_nodemgr::delete_template_subvolume failed; falling back to subvolume-aware local cleanup"
-                                );
-                                // Subvolume-aware local fallback. Plain
-                                // `remove_dir_all` EROFSes on the first
-                                // unlink inside a read-only digest
-                                // subvolume, surfacing Err to the caller
-                                // and leaving the row stuck in
-                                // `state='deleting'`. The shared
-                                // `cleanup_digest_dir_sync` helper from
-                                // volume.rs clears the RO flag first and
-                                // handles the subvol-vs-plain-dir
-                                // disambiguation the same way
-                                // `cleanup_digest_dir_after_hash_mismatch`
-                                // does on the pull-failure path.
-                                fallback_delete_build_artifacts(&store, &n, &h)
-                                    .map_err(|err| err.to_string())
-                            }
-                        };
-                    outcome.map_err(|err| {
-                        // Surface the disk error as a SQLite error
-                        // so it bubbles out of `execute_one_async`.
-                        // The wrapping `Code::SQLITE_IOERR` is a
-                        // synthetic carrier; the underlying error
-                        // is logged by `run_loop`.
-                        rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                            Some(err),
-                        )
+            Arc::new(
+                move |name: &str, content_hash: &str, partition: TemplateCachePartition| {
+                    let n = name.to_string();
+                    let h = content_hash.to_string();
+                    let store = store.clone();
+                    Box::pin(async move {
+                        let outcome: Result<(), String> =
+                            match crate::btrfs_via_nodemgr::delete_template_subvolume(
+                                &n, &h, partition,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    // Snapshot dirs are plain dirs under
+                                    // `<root>/<name>/snapshots/<hash>/`,
+                                    // separate from the digest subvol nodemgr
+                                    // just deleted. Run only the snapshot
+                                    // half locally — the combined helper
+                                    // would re-try a now-gone build dir.
+                                    store
+                                        .remove_snapshot_artifacts(&n, &h, partition)
+                                        .map_err(|err| format!("snapshot cleanup: {err}"))
+                                }
+                                Err(rpc_err) => {
+                                    tracing::warn!(
+                                        template = %n,
+                                        content_hash = %h,
+                                        cache_partition = %partition,
+                                        err = %rpc_err,
+                                        "btrfs_via_nodemgr::delete_template_subvolume failed; falling back to subvolume-aware local cleanup"
+                                    );
+                                    // Subvolume-aware local fallback. Plain
+                                    // `remove_dir_all` EROFSes on the first
+                                    // unlink inside a read-only digest
+                                    // subvolume, surfacing Err to the caller
+                                    // and leaving the row stuck in
+                                    // `state='deleting'`. The shared
+                                    // `cleanup_digest_dir_sync` helper from
+                                    // volume.rs clears the RO flag first and
+                                    // handles the subvol-vs-plain-dir
+                                    // disambiguation the same way
+                                    // `cleanup_digest_dir_after_hash_mismatch`
+                                    // does on the pull-failure path.
+                                    fallback_delete_build_artifacts(&store, &n, &h, partition)
+                                        .map_err(|err| err.to_string())
+                                }
+                            };
+                        outcome.map_err(|err| {
+                            // Surface the disk error as a SQLite error
+                            // so it bubbles out of `execute_one_async`.
+                            // The wrapping `Code::SQLITE_IOERR` is a
+                            // synthetic carrier; the underlying error
+                            // is logged by `run_loop`.
+                            rusqlite::Error::SqliteFailure(
+                                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                                Some(err),
+                            )
+                        })
                     })
-                })
-            })
+                },
+            )
         };
 
         // Stuck-deleting reaper probe: queried by `gc_tick`'s
@@ -1701,18 +1805,20 @@ impl TemplateManagerService {
         // let the planner replan it.
         let reaper_probe: crate::eviction::ReaperDiskProbeFn = {
             let store = artifact_store.clone();
-            Arc::new(move |name: &str, content_hash: &str| {
-                let store = store.clone();
-                let n = name.to_string();
-                let h = content_hash.to_string();
-                Box::pin(async move {
-                    if store.build_artifacts_missing(&n, &h) {
-                        crate::eviction::ReaperDiskState::Missing
-                    } else {
-                        crate::eviction::ReaperDiskState::Intact
-                    }
-                })
-            })
+            Arc::new(
+                move |name: &str, content_hash: &str, partition: TemplateCachePartition| {
+                    let store = store.clone();
+                    let n = name.to_string();
+                    let h = content_hash.to_string();
+                    Box::pin(async move {
+                        if store.build_artifacts_missing(&n, &h, partition) {
+                            crate::eviction::ReaperDiskState::Missing
+                        } else {
+                            crate::eviction::ReaperDiskState::Intact
+                        }
+                    })
+                },
+            )
         };
 
         spawn_observed_background_loop(
@@ -2037,6 +2143,10 @@ impl TemplateManagerService {
             manifest.runtime.clone()
         };
         let arch = template_arch(&metadata, &manifest);
+        // The row's partition comes from the manifest's binding. Nothing here
+        // checks that `digest_dir` is that partition's directory: callers
+        // derive both from the same manifest.
+        let partition = manifest_cache_partition(&manifest, &metadata)?;
         crate::rootfs_cache::verify_rootfs_from_metadata(digest_dir).map_err(|error| {
             Status::failed_precondition(format!(
                 "template rootfs is unavailable for {template_id}@{content_hash}: {error}"
@@ -2075,6 +2185,7 @@ impl TemplateManagerService {
                 &crate::db::BuildUpsert {
                     name: &n,
                     content_hash: &h,
+                    cache_partition: partition,
                     build_date: &build_date,
                     manifest_json: &manifest_json,
                     runtime: &runtime,

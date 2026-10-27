@@ -99,10 +99,20 @@ fn parse_policy_authority(value: &str, column: usize) -> Result<PolicyAuthority>
 }
 
 // ── Template builds ────────────────────────────────────────────────────────
+//
+// A build is keyed by `(name, content_hash, cache_partition)`. The content
+// hash names rootfs bytes; the partition separates builds of one rootfs bound
+// to different environments (see `TemplateCachePartition`). Readers that pass
+// no partition get every partition of a hash and prefer the legacy one, which
+// sorts first because its key is the empty string.
 
+pub use pplx_space_common_core::types::TemplateCachePartition;
+
+#[derive(Debug)]
 pub struct BuildRow {
     pub name: String,
     pub content_hash: String,
+    pub cache_partition: TemplateCachePartition,
     pub build_date: String,
     pub manifest_json: String,
     pub runtime: String,
@@ -117,6 +127,7 @@ pub struct BuildRow {
 pub struct BuildUpsert<'a> {
     pub name: &'a str,
     pub content_hash: &'a str,
+    pub cache_partition: TemplateCachePartition,
     pub build_date: &'a str,
     pub manifest_json: &'a str,
     pub runtime: &'a str,
@@ -125,27 +136,135 @@ pub struct BuildUpsert<'a> {
     pub state: &'a str,
 }
 
-pub fn get_build(conn: &Connection, name: &str, content_hash: &str) -> Result<Option<BuildRow>> {
+impl BuildRow {
+    /// The stored execution metadata; `None` when absent or unreadable,
+    /// which is logged.
+    pub fn execution_metadata(&self) -> Option<pplx_space_common_core::types::ExecutionMetadata> {
+        let raw = self.execution_metadata_json.as_deref()?;
+        serde_json::from_str(raw)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    template = %self.name,
+                    content_hash = %self.content_hash,
+                    %error,
+                    "stored template execution metadata is invalid"
+                );
+            })
+            .ok()
+    }
+
+    /// The environment the build is bound to.
+    pub fn environment(&self) -> Option<pplx_space_common_core::types::EnvironmentReference> {
+        self.execution_metadata()?.environment()
+    }
+}
+
+fn parse_cache_partition(value: &str, column: usize) -> Result<TemplateCachePartition> {
+    TemplateCachePartition::from_key(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
+/// Maps the column list shared by every `template_builds` read below.
+fn build_row(row: &rusqlite::Row<'_>) -> Result<BuildRow> {
+    Ok(BuildRow {
+        name: row.get(0)?,
+        content_hash: row.get(1)?,
+        cache_partition: parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
+        build_date: row.get(3)?,
+        manifest_json: row.get(4)?,
+        runtime: row.get(5)?,
+        arch: row.get(6)?,
+        artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(7)?, 7)?,
+        state: row.get(8)?,
+        owner_type: row.get(9)?,
+        owner_id: row.get(10)?,
+        execution_metadata_json: row.get(11)?,
+    })
+}
+
+pub fn get_build(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+    cache_partition: TemplateCachePartition,
+) -> Result<Option<BuildRow>> {
     let mut stmt = conn.prepare(
-        "SELECT name, content_hash, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds WHERE name = ?1 AND content_hash = ?2",
+        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
+         FROM template_builds WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
     )?;
-    let mut rows = stmt.query_map(params![name, content_hash], |row| {
-        Ok(BuildRow {
-            name: row.get(0)?,
-            content_hash: row.get(1)?,
-            build_date: row.get(2)?,
-            manifest_json: row.get(3)?,
-            runtime: row.get(4)?,
-            arch: row.get(5)?,
-            artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(6)?, 6)?,
-            state: row.get(7)?,
-            owner_type: row.get(8)?,
-            owner_id: row.get(9)?,
-            execution_metadata_json: row.get(10)?,
-        })
-    })?;
+    let mut rows = stmt.query_map(
+        params![name, content_hash, cache_partition.key()],
+        build_row,
+    )?;
     rows.next().transpose()
+}
+
+/// The ready build of a digest, preferring `preferred`'s partition, then
+/// the legacy partition, then any other.
+pub fn find_ready_build(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+    preferred: Option<TemplateCachePartition>,
+) -> Result<Option<BuildRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
+         FROM template_builds
+         WHERE name = ?1 AND content_hash = ?2 AND state = 'ready'
+         ORDER BY cache_partition = ?3 DESC, cache_partition ASC LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(
+        params![
+            name,
+            content_hash,
+            preferred.map(TemplateCachePartition::key)
+        ],
+        build_row,
+    )?;
+    rows.next().transpose()
+}
+
+/// Whether a row exists for the digest in any partition, in any state.
+pub fn build_exists(conn: &Connection, name: &str, content_hash: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM template_builds WHERE name = ?1 AND content_hash = ?2)",
+        params![name, content_hash],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+}
+
+/// Builds left in `state='deleting'` by an interrupted eviction.
+pub fn list_deleting_builds(
+    conn: &Connection,
+) -> Result<Vec<(String, String, TemplateCachePartition)>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, content_hash, cache_partition FROM template_builds WHERE state = 'deleting'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// Every cached build of one rootfs digest, legacy partition first.
+pub fn list_builds_for_hash(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+) -> Result<Vec<BuildRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
+         FROM template_builds WHERE name = ?1 AND content_hash = ?2
+         ORDER BY cache_partition ASC",
+    )?;
+    let rows = stmt.query_map(params![name, content_hash], build_row)?;
+    rows.collect()
 }
 
 /// Normalize an ISO 8601 build_date to UTC so lexicographic sort = chronological sort.
@@ -165,6 +284,13 @@ fn normalize_build_date(s: &str) -> String {
     s.to_string()
 }
 
+fn invalid_build_upsert(message: &'static str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    )))
+}
+
 pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     let manifest: pplx_space_common_core::types::TemplateManifest =
         serde_json::from_str(b.manifest_json)
@@ -180,13 +306,21 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
             .parse::<pplx_space_common_core::types::Arch>()
             .is_ok_and(|arch| arch == execution.guest().architecture);
         if !runtime_matches || !arch_matches {
-            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "template build runtime/arch columns disagree with execution metadata",
-                ),
-            )));
+            return Err(invalid_build_upsert(
+                "template build runtime/arch columns disagree with execution metadata",
+            ));
         }
+    }
+    // A build lives in the partition of the environment it's bound to. A
+    // mismatch would let a lookup for one environment return a build bound to
+    // another, so the store refuses it rather than trusting the caller.
+    let bound_partition = pplx_space_node_runtime_core::catalog::template_cache_partition(
+        execution.and_then(|execution| execution.environment()),
+    );
+    if bound_partition != b.cache_partition {
+        return Err(invalid_build_upsert(
+            "template build cache partition disagrees with its environment binding",
+        ));
     }
     let execution_json = execution
         .map(serde_json::to_string)
@@ -202,6 +336,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
         .map(|value| value.version.as_str());
     let ts = now();
     let build_date_utc = normalize_build_date(b.build_date);
+    let partition = b.cache_partition.key();
     // Insert seeds `last_used_at` to `created_at` so a build that has
     // never been resolved sits at the correct LRU position. The
     // ON CONFLICT path intentionally leaves `last_used_at` alone: a
@@ -222,33 +357,36 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     // surfaces NotFound to its caller cleanly.
     let tx = immediate_transaction(conn)?;
     let rows = tx.execute(
-        "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, created_at, last_used_at, runtime_version, guest_os, state_format_name, state_format_version, execution_metadata_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14)
-         ON CONFLICT(name, content_hash) DO UPDATE SET build_date = ?3, manifest_json = ?4, runtime = ?5, arch = ?6, artifact_size_bytes = ?7, state = ?8, runtime_version = ?10, guest_os = ?11, state_format_name = ?12, state_format_version = ?13, execution_metadata_json = ?14
+        "INSERT INTO template_builds (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, created_at, last_used_at, runtime_version, guest_os, state_format_name, state_format_version, execution_metadata_json)
+         VALUES (?1, ?2, ?15, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(name, content_hash, cache_partition) DO UPDATE SET build_date = ?3, manifest_json = ?4, runtime = ?5, arch = ?6, artifact_size_bytes = ?7, state = ?8, runtime_version = ?10, guest_os = ?11, state_format_name = ?12, state_format_version = ?13, execution_metadata_json = ?14
          WHERE template_builds.state != 'deleting'",
-        params![b.name, b.content_hash, build_date_utc, b.manifest_json, b.runtime, b.arch, saturating_u64_to_i64(b.artifact_size_bytes), b.state, ts, runtime_version, guest_os, state_format_name, state_format_version, execution_json],
+        params![b.name, b.content_hash, build_date_utc, b.manifest_json, b.runtime, b.arch, saturating_u64_to_i64(b.artifact_size_bytes), b.state, ts, runtime_version, guest_os, state_format_name, state_format_version, execution_json, partition],
     )?;
     if rows == 0 {
         tracing::warn!(
             template = b.name,
             content_hash = b.content_hash,
+            cache_partition = %b.cache_partition,
             "upsert_build no-op: row is in state='deleting'; concurrent eviction won the race"
         );
         tx.commit()?;
         return Ok(());
     }
     tx.execute(
-        "DELETE FROM template_build_components WHERE name = ?1 AND content_hash = ?2",
-        params![b.name, b.content_hash],
+        "DELETE FROM template_build_components
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![b.name, b.content_hash, partition],
     )?;
     if let Some(execution) = execution {
         for component in execution.components() {
             tx.execute(
-                "INSERT INTO template_build_components (name, content_hash, kind, role_key, version, digest, format)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO template_build_components (name, content_hash, cache_partition, kind, role_key, version, digest, format)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     b.name,
                     b.content_hash,
+                    partition,
                     component.kind.as_str(),
                     component.role.as_ref().map_or("", |role| role.as_str()),
                     component.version.as_ref().map(|value| value.as_str()),
@@ -262,12 +400,13 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Whether the build for `(name, content_hash)` exists locally and
-/// is currently in `state='deleting'` (i.e. the eviction loop has
-/// flipped it via Phase 1 but Phase 3 hasn't deleted the row yet).
-/// Callers use this as a pre-flight check before starting a fresh
-/// pull — a pull during this window writes bytes the eviction is
-/// about to delete.
+/// Whether a build of the digest, in any cache partition, exists locally
+/// and is currently in `state='deleting'` (i.e. the eviction loop has
+/// flipped it via Phase 1 but Phase 3 hasn't deleted the row yet). Callers
+/// use this as a pre-flight check before starting a fresh pull — a pull
+/// during this window writes bytes the eviction is about to delete. A pull
+/// learns its partition only from the release manifest, so the check
+/// covers every partition.
 pub fn is_build_marked_deleting(conn: &Connection, name: &str, content_hash: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM template_builds
@@ -286,12 +425,17 @@ pub fn is_build_marked_deleting(conn: &Connection, name: &str, content_hash: &st
 /// longer exists is not an error, and the eviction planner reads from
 /// the same rows so a stale touch would have nothing to update
 /// anyway.
-pub fn touch_build(conn: &Connection, name: &str, content_hash: &str) -> Result<()> {
+pub fn touch_build(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+    cache_partition: TemplateCachePartition,
+) -> Result<()> {
     let ts = now();
     conn.execute(
-        "UPDATE template_builds SET last_used_at = ?3
-         WHERE name = ?1 AND content_hash = ?2",
-        params![name, content_hash, ts],
+        "UPDATE template_builds SET last_used_at = ?4
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![name, content_hash, cache_partition.key(), ts],
     )?;
     Ok(())
 }
@@ -303,6 +447,7 @@ pub fn touch_build(conn: &Connection, name: &str, content_hash: &str) -> Result<
 pub struct BuildEvictionRow {
     pub name: String,
     pub content_hash: String,
+    pub cache_partition: TemplateCachePartition,
     pub artifact_size_bytes: u64,
     pub created_at_secs: u64,
     pub last_used_at_secs: u64,
@@ -313,16 +458,17 @@ pub struct BuildEvictionRow {
 /// only DB read the GC loop performs against `template_builds`.
 pub fn list_eviction_candidates(conn: &Connection) -> Result<Vec<BuildEvictionRow>> {
     let mut stmt = conn.prepare(
-        "SELECT name, content_hash, artifact_size_bytes, created_at, last_used_at
+        "SELECT name, content_hash, cache_partition, artifact_size_bytes, created_at, last_used_at
          FROM template_builds WHERE state = 'ready'",
     )?;
     let rows = stmt.query_map([], |row| {
-        let created_str: String = row.get(3)?;
-        let last_used_str: String = row.get(4)?;
+        let created_str: String = row.get(4)?;
+        let last_used_str: String = row.get(5)?;
         Ok(BuildEvictionRow {
             name: row.get(0)?,
             content_hash: row.get(1)?,
-            artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(2)?, 2)?,
+            cache_partition: parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
+            artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(3)?, 3)?,
             created_at_secs: created_str.parse::<u64>().unwrap_or(0),
             last_used_at_secs: last_used_str.parse::<u64>().unwrap_or(0),
         })
@@ -332,7 +478,8 @@ pub fn list_eviction_candidates(conn: &Connection) -> Result<Vec<BuildEvictionRo
 
 /// Distinct `(name, content_hash)` pairs pinned by *any* prefetch
 /// source — tag or release. UNION'd at the SQL layer so the GC
-/// loop's pinned-set check is one query, not two.
+/// loop's pinned-set check is one query, not two. A pin names rootfs
+/// bytes, so it protects every cache partition of the digest.
 pub fn list_pinned_build_keys(conn: &Connection) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT name, content_hash FROM template_pinned_tags
@@ -365,62 +512,44 @@ pub(crate) fn set_last_used_at_for_test(
 
 pub fn list_builds(conn: &Connection) -> Result<Vec<BuildRow>> {
     let mut stmt = conn.prepare(
-        "SELECT name, content_hash, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds WHERE state = 'ready'",
+        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
+         FROM template_builds WHERE state = 'ready'
+         ORDER BY name ASC, build_date ASC, content_hash ASC, cache_partition ASC",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(BuildRow {
-            name: row.get(0)?,
-            content_hash: row.get(1)?,
-            build_date: row.get(2)?,
-            manifest_json: row.get(3)?,
-            runtime: row.get(4)?,
-            arch: row.get(5)?,
-            artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(6)?, 6)?,
-            state: row.get(7)?,
-            owner_type: row.get(8)?,
-            owner_id: row.get(9)?,
-            execution_metadata_json: row.get(10)?,
-        })
-    })?;
+    let rows = stmt.query_map([], build_row)?;
     rows.collect()
 }
 
 pub fn list_builds_by_name(conn: &Connection, name: &str) -> Result<Vec<BuildRow>> {
     let mut stmt = conn.prepare(
-        "SELECT name, content_hash, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
+        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds WHERE name = ?1 AND state = 'ready'",
     )?;
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(BuildRow {
-            name: row.get(0)?,
-            content_hash: row.get(1)?,
-            build_date: row.get(2)?,
-            manifest_json: row.get(3)?,
-            runtime: row.get(4)?,
-            arch: row.get(5)?,
-            artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(6)?, 6)?,
-            state: row.get(7)?,
-            owner_type: row.get(8)?,
-            owner_id: row.get(9)?,
-            execution_metadata_json: row.get(10)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name], build_row)?;
     rows.collect()
 }
 
-pub fn delete_build(conn: &Connection, name: &str, content_hash: &str) -> Result<()> {
+pub fn delete_build(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+    cache_partition: TemplateCachePartition,
+) -> Result<()> {
+    let partition = cache_partition.key();
     conn.execute(
-        "DELETE FROM template_build_components WHERE name = ?1 AND content_hash = ?2",
-        params![name, content_hash],
+        "DELETE FROM template_build_components
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![name, content_hash, partition],
     )?;
     conn.execute(
-        "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2",
-        params![name, content_hash],
+        "DELETE FROM template_snapshots
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![name, content_hash, partition],
     )?;
     conn.execute(
-        "DELETE FROM template_builds WHERE name = ?1 AND content_hash = ?2",
-        params![name, content_hash],
+        "DELETE FROM template_builds
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![name, content_hash, partition],
     )?;
     Ok(())
 }
@@ -464,30 +593,70 @@ pub fn template_local_state_exists(conn: &Connection, name: &str) -> Result<bool
 
 // ── Latest build (replaces tag-based resolution) ──────────────────────────
 
-pub fn get_latest_build(conn: &Connection, name: &str) -> Result<Option<BuildRow>> {
+/// Newest ready build of `name` in any partition, as before partitions
+/// existed; callers check it as a compatible cold-boot source. Same-date
+/// builds go to the larger content hash, as sandbox-manager's catalog and
+/// node-ctl pick, and a release and its twin go to `preferred`'s partition
+/// and then the legacy one.
+pub fn get_latest_build(
+    conn: &Connection,
+    name: &str,
+    preferred: Option<TemplateCachePartition>,
+) -> Result<Option<BuildRow>> {
     let mut stmt = conn.prepare(
-        "SELECT name, content_hash, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds WHERE name = ?1 AND state = 'ready' ORDER BY build_date DESC LIMIT 1",
+        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
+         FROM template_builds
+         WHERE name = ?1 AND state = 'ready'
+         ORDER BY build_date DESC, content_hash DESC, cache_partition = ?2 DESC,
+                  cache_partition = '' DESC,
+                  cache_partition ASC
+         LIMIT 1",
     )?;
-    let mut rows = stmt.query_map(params![name], |row| {
-        Ok(BuildRow {
-            name: row.get(0)?,
-            content_hash: row.get(1)?,
-            build_date: row.get(2)?,
-            manifest_json: row.get(3)?,
-            runtime: row.get(4)?,
-            arch: row.get(5)?,
-            artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(6)?, 6)?,
-            state: row.get(7)?,
-            owner_type: row.get(8)?,
-            owner_id: row.get(9)?,
-            execution_metadata_json: row.get(10)?,
-        })
-    })?;
-    match rows.next() {
-        Some(Ok(row)) => Ok(Some(row)),
-        _ => Ok(None),
+    let mut rows = stmt.query_map(
+        params![name, preferred.map(TemplateCachePartition::key)],
+        build_row,
+    )?;
+    rows.next().transpose()
+}
+
+/// Newest ready build of `name` in exactly one partition that belongs there:
+/// its binding maps to that partition.
+pub fn get_latest_build_in_partition(
+    conn: &Connection,
+    name: &str,
+    cache_partition: TemplateCachePartition,
+) -> Result<Option<BuildRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
+         FROM template_builds
+         WHERE name = ?1 AND cache_partition = ?2 AND state = 'ready'
+         ORDER BY build_date DESC, content_hash DESC",
+    )?;
+    // The migration files every pre-partition row as legacy, including a
+    // build bound to another environment that startup recovery has yet to
+    // drop. It isn't this partition's build, so an older one that is wins.
+    for row in stmt.query_map(params![name, cache_partition.key()], build_row)? {
+        let row = row?;
+        if pplx_space_node_runtime_core::catalog::template_cache_partition(row.environment())
+            == cache_partition
+        {
+            return Ok(Some(row));
+        }
     }
+    Ok(None)
+}
+
+/// Partitions that hold at least one ready build of `name`, legacy first.
+pub fn list_build_partitions(conn: &Connection, name: &str) -> Result<Vec<TemplateCachePartition>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT cache_partition FROM template_builds
+         WHERE name = ?1 AND state = 'ready'
+         ORDER BY cache_partition ASC",
+    )?;
+    let rows = stmt.query_map(params![name], |row| {
+        parse_cache_partition(&row.get::<_, String>(0)?, 0)
+    })?;
+    rows.collect()
 }
 
 // ── Snapshots ──────────────────────────────────────────────────────────────
@@ -495,53 +664,72 @@ pub fn get_latest_build(conn: &Connection, name: &str) -> Result<Option<BuildRow
 pub struct SnapshotRow {
     pub name: String,
     pub content_hash: String,
+    pub cache_partition: TemplateCachePartition,
     pub vcpu: u32,
     pub memory_mib: u32,
     pub snapshot_hash: String,
     pub built_at: String,
 }
 
-pub fn get_snapshot(
-    conn: &Connection,
-    name: &str,
-    content_hash: &str,
-    vcpu: u32,
-    memory_mib: u32,
-) -> Result<Option<SnapshotRow>> {
+fn snapshot_row(row: &rusqlite::Row<'_>) -> Result<SnapshotRow> {
+    Ok(SnapshotRow {
+        name: row.get(0)?,
+        content_hash: row.get(1)?,
+        cache_partition: parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
+        vcpu: row.get(3)?,
+        memory_mib: row.get(4)?,
+        snapshot_hash: row.get(5)?,
+        built_at: row.get(6)?,
+    })
+}
+
+/// One base snapshot: a build and the compute shape it was captured at.
+#[derive(Clone, Copy)]
+pub struct SnapshotKey<'a> {
+    pub name: &'a str,
+    pub content_hash: &'a str,
+    pub cache_partition: TemplateCachePartition,
+    pub vcpu: u32,
+    pub memory_mib: u32,
+}
+
+pub fn get_snapshot(conn: &Connection, key: SnapshotKey<'_>) -> Result<Option<SnapshotRow>> {
     let mut stmt = conn.prepare(
-        "SELECT name, content_hash, vcpu, memory_mib, snapshot_hash, built_at
-         FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 AND vcpu = ?3 AND memory_mib = ?4",
+        "SELECT name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at
+         FROM template_snapshots
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND vcpu = ?4 AND memory_mib = ?5",
     )?;
-    let mut rows = stmt.query_map(params![name, content_hash, vcpu, memory_mib], |row| {
-        Ok(SnapshotRow {
-            name: row.get(0)?,
-            content_hash: row.get(1)?,
-            vcpu: row.get(2)?,
-            memory_mib: row.get(3)?,
-            snapshot_hash: row.get(4)?,
-            built_at: row.get(5)?,
-        })
-    })?;
+    let mut rows = stmt.query_map(
+        params![
+            key.name,
+            key.content_hash,
+            key.cache_partition.key(),
+            key.vcpu,
+            key.memory_mib
+        ],
+        snapshot_row,
+    )?;
     match rows.next() {
         Some(Ok(row)) => Ok(Some(row)),
         _ => Ok(None),
     }
 }
 
-pub fn upsert_snapshot(
-    conn: &Connection,
-    name: &str,
-    content_hash: &str,
-    vcpu: u32,
-    memory_mib: u32,
-    snapshot_hash: &str,
-) -> Result<()> {
+pub fn upsert_snapshot(conn: &Connection, key: SnapshotKey<'_>, snapshot_hash: &str) -> Result<()> {
     let ts = now();
     conn.execute(
-        "INSERT INTO template_snapshots (name, content_hash, vcpu, memory_mib, snapshot_hash, built_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(name, content_hash, vcpu, memory_mib) DO UPDATE SET snapshot_hash = ?5, built_at = ?6",
-        params![name, content_hash, vcpu, memory_mib, snapshot_hash, ts],
+        "INSERT INTO template_snapshots (name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(name, content_hash, cache_partition, vcpu, memory_mib) DO UPDATE SET snapshot_hash = ?6, built_at = ?7",
+        params![
+            key.name,
+            key.content_hash,
+            key.cache_partition.key(),
+            key.vcpu,
+            key.memory_mib,
+            snapshot_hash,
+            ts
+        ],
     )?;
     Ok(())
 }
@@ -550,42 +738,45 @@ pub fn list_snapshots(
     conn: &Connection,
     name: &str,
     content_hash: &str,
+    cache_partition: TemplateCachePartition,
 ) -> Result<Vec<SnapshotRow>> {
     let mut stmt = conn.prepare(
-        "SELECT name, content_hash, vcpu, memory_mib, snapshot_hash, built_at
-         FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 ORDER BY vcpu ASC, memory_mib ASC",
+        "SELECT name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at
+         FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
+         ORDER BY vcpu ASC, memory_mib ASC",
     )?;
-    let rows = stmt.query_map(params![name, content_hash], |row| {
-        Ok(SnapshotRow {
-            name: row.get(0)?,
-            content_hash: row.get(1)?,
-            vcpu: row.get(2)?,
-            memory_mib: row.get(3)?,
-            snapshot_hash: row.get(4)?,
-            built_at: row.get(5)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![name, content_hash, cache_partition.key()],
+        snapshot_row,
+    )?;
     rows.collect()
 }
 
-pub fn delete_snapshots_for_build(conn: &Connection, name: &str, content_hash: &str) -> Result<()> {
+pub fn delete_snapshots_for_build(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+    cache_partition: TemplateCachePartition,
+) -> Result<()> {
     conn.execute(
-        "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2",
-        params![name, content_hash],
+        "DELETE FROM template_snapshots
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![name, content_hash, cache_partition.key()],
     )?;
     Ok(())
 }
 
-pub fn delete_snapshot(
-    conn: &Connection,
-    name: &str,
-    content_hash: &str,
-    vcpu: u32,
-    memory_mib: u32,
-) -> Result<()> {
+pub fn delete_snapshot(conn: &Connection, key: SnapshotKey<'_>) -> Result<()> {
     conn.execute(
-        "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 AND vcpu = ?3 AND memory_mib = ?4",
-        params![name, content_hash, vcpu, memory_mib],
+        "DELETE FROM template_snapshots
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND vcpu = ?4 AND memory_mib = ?5",
+        params![
+            key.name,
+            key.content_hash,
+            key.cache_partition.key(),
+            key.vcpu,
+            key.memory_mib
+        ],
     )?;
     Ok(())
 }
@@ -1423,5 +1614,7 @@ pub fn ensure_template_settings_for_builds(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod partition_tests;
 #[cfg(test)]
 mod tests;

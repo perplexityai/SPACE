@@ -489,6 +489,44 @@ pub(super) fn absent_sandbox_state(sandbox_id: String) -> PublishedSandboxState 
     }
 }
 
+/// The build node-ctl publishes for each template name. The cluster's
+/// template inventory is keyed by (node, name, digest), so a build
+/// template-manager caches for another environment would overwrite its legacy
+/// sibling's row. A name's legacy-partition builds win until the inventory
+/// carries the partition; a name with none publishes its other builds, as it
+/// did before partitions existed. Otherwise the last listed build wins:
+/// `ListTemplates` orders a name's builds by build date, so that's the newest,
+/// where before partitions it was the most recently inserted.
+pub(super) fn published_template_builds(
+    templates: Vec<pplx_space_template_mgr_client::proto::TemplateFullInfo>,
+) -> BTreeMap<String, pplx_space_template_mgr_client::proto::TemplateFullInfo> {
+    let mut by_name = BTreeMap::new();
+    let mut legacy_names = BTreeSet::new();
+    for template in templates {
+        let legacy = is_legacy_template_build(&template);
+        if legacy {
+            legacy_names.insert(template.name.clone());
+        } else if legacy_names.contains(&template.name) {
+            continue;
+        }
+        by_name.insert(template.name.clone(), template);
+    }
+    by_name
+}
+
+fn is_legacy_template_build(
+    template: &pplx_space_template_mgr_client::proto::TemplateFullInfo,
+) -> bool {
+    match template.environment() {
+        Ok(environment) => {
+            pplx_space_node_runtime_core::catalog::template_cache_partition(environment)
+                == pplx_space_common_core::types::TemplateCachePartition::Legacy
+        }
+        // An unreadable binding keeps the pre-partition behavior: publish.
+        Err(_) => true,
+    }
+}
+
 pub(super) async fn collect_template_states(
     scope: FacetScope,
 ) -> Result<(Vec<PublishedTemplateState>, u64), String> {
@@ -510,10 +548,7 @@ pub(super) async fn collect_template_states(
         .into_iter()
         .map(|pool| (pool.template.clone(), pool))
         .collect::<BTreeMap<_, _>>();
-    let mut by_name = BTreeMap::new();
-    for template in templates {
-        by_name.insert(template.name.clone(), template);
-    }
+    let by_name = published_template_builds(templates);
 
     let names: BTreeSet<String> = match scope {
         FacetScope::Items(items) => util::dedupe_non_empty(items).into_iter().collect(),

@@ -3,6 +3,27 @@ use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 
 use super::*;
 
+/// Cache partition a request's `TemplateRef.environment` selects; `None`
+/// when the request names no environment.
+pub(super) fn requested_cache_partition(
+    environment: Option<&str>,
+) -> Result<Option<crate::db::TemplateCachePartition>, Status> {
+    environment
+        .map(|environment| {
+            environment
+                .parse::<pplx_space_common_core::types::EnvironmentReference>()
+                .map(|environment| {
+                    pplx_space_node_runtime_core::catalog::template_cache_partition(Some(
+                        environment,
+                    ))
+                })
+                .map_err(|error| {
+                    Status::invalid_argument(format!("invalid template environment: {error}"))
+                })
+        })
+        .transpose()
+}
+
 pub(super) const fn pull_failure_code(failure: crate::volume::PullFailure) -> tonic::Code {
     match failure.class() {
         crate::volume::PullFailureClass::Missing => tonic::Code::NotFound,
@@ -76,6 +97,7 @@ impl TemplateManagerService {
             validate_content_hash(&req_hash)?;
         }
         let req_tag = tmpl_ref.tag.clone().unwrap_or_default();
+        let requested_partition = requested_cache_partition(tmpl_ref.environment.as_deref())?;
         let caller_org = req
             .caller_org_id
             .as_deref()
@@ -122,17 +144,20 @@ impl TemplateManagerService {
                 let db = Arc::clone(&self.db);
                 let template_id = template_id.clone();
                 let req_hash = req_hash.clone();
-                let req_tag = req_tag.clone();
+                let preferred = requested_partition;
                 tokio::task::spawn_blocking(move || {
                     let conn = db
                         .lock()
                         .map_err(|_| Status::internal("template DB mutex poisoned"))?;
-                    let (name, _) = TemplateManagerService::resolve_template(
+                    // Resolve with the request's preference, so the build
+                    // whose LRU this touches is the one the request serves.
+                    let name = TemplateManagerService::resolve_template_build(
                         &conn,
                         &template_id,
                         &req_hash,
-                        &req_tag,
-                    )?;
+                        preferred,
+                    )?
+                    .name;
                     let settings = crate::db::get_template_settings(&conn, &name)
                         .map_err(|e| Status::internal(format!("db get_template_settings: {e}")))?;
                     Ok::<_, Status>(
@@ -187,13 +212,17 @@ impl TemplateManagerService {
         };
         let cache_tags = get_template_metric_tags(template_id, &requested_hash, &req_tag);
 
+        let selection = |content_hash: String| TemplateSelection {
+            name: template_id.clone(),
+            content_hash,
+            partition: requested_partition,
+        };
+
         // First attempt: local-only lookup.
         match build_get_template_response(
             self.artifact_store.root.clone(),
             Arc::clone(&self.db),
-            template_id.clone(),
-            req_hash.clone(),
-            req_tag.clone(),
+            selection(req_hash.clone()),
             snapshot_selector,
             policy_snapshot_memory_mib,
         )
@@ -238,10 +267,12 @@ impl TemplateManagerService {
                 self.volume_puller
                     .pull_in_scope(
                         Arc::clone(&self.db),
-                        template_id,
-                        &req_hash,
-                        &req_tag,
-                        crate::volume::PullTrigger::OnDemand,
+                        crate::volume::PullSpec {
+                            name: template_id,
+                            req_hash: &req_hash,
+                            req_tag: &req_tag,
+                            trigger: crate::volume::PullTrigger::OnDemand,
+                        },
                         scope,
                     )
                     .await
@@ -255,9 +286,7 @@ impl TemplateManagerService {
                 build_get_template_response(
                     self.artifact_store.root.clone(),
                     Arc::clone(&self.db),
-                    template_id.clone(),
-                    req_hash,
-                    req_tag,
+                    selection(req_hash),
                     snapshot_selector,
                     policy_snapshot_memory_mib,
                 )
@@ -496,6 +525,11 @@ impl TemplateManagerService {
                 "name and content_hash are required",
             ));
         }
+        if tmpl_ref.environment.is_some() {
+            return Err(Status::invalid_argument(
+                "DeleteTemplateBuild removes every cached build of the hash; environment is not accepted",
+            ));
+        }
         validate_template_name(&name)?;
         validate_content_hash(&content_hash)?;
 
@@ -504,15 +538,17 @@ impl TemplateManagerService {
         let db = Arc::clone(&self.db);
         let n = name.clone();
         let h = content_hash.clone();
-        let build = tokio::task::spawn_blocking(move || {
+        let builds = tokio::task::spawn_blocking(move || {
             let conn = db
                 .lock()
                 .map_err(|_| Status::internal("template DB mutex poisoned"))?;
 
-            // Verify build exists
-            let build = crate::db::get_build(&conn, &n, &h)
-                .map_err(|e| Status::internal(format!("db: {e}")))?
-                .ok_or_else(|| Status::not_found(format!("build not found: {n}@{h}")))?;
+            // Verify the digest is cached, in any partition.
+            let builds = crate::db::list_builds_for_hash(&conn, &n, &h)
+                .map_err(|e| Status::internal(format!("db: {e}")))?;
+            if builds.is_empty() {
+                return Err(Status::not_found(format!("build not found: {n}@{h}")));
+            }
 
             // Check pools by template name
             let pools = crate::db::get_all_pools(&conn)
@@ -524,16 +560,18 @@ impl TemplateManagerService {
                 )));
             }
 
-            Ok::<_, Status>(build)
+            Ok::<_, Status>(builds)
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
         .map_err(|e: Status| e)?;
 
+        // Sandboxes report the digest they were created from, not its
+        // partition, so one dependent sandbox blocks the whole digest.
         ensure_no_dependent_sandboxes_for_template_builds(
             TemplateBuildDeleteOperation::Build,
             DependentSandboxScope::All,
-            TemplateBuildDeleteTarget::Builds(std::slice::from_ref(&build)),
+            TemplateBuildDeleteTarget::Builds(builds.get(..1).unwrap_or_default()),
         )
         .await?;
 
@@ -545,34 +583,78 @@ impl TemplateManagerService {
         Ok(Response::new(crate::proto::DeleteTemplateBuildResponse {}))
     }
 
+    /// Delete every cached partition of a digest: artifacts first, then rows.
+    /// A partition counts when it has a row, a build dir or a base-snapshot
+    /// dir, so neither a complete dir whose row an interrupted pull never
+    /// wrote nor a leftover snapshot dir outlives the delete.
     pub(super) async fn delete_template_build_after_dependency_checks(
         &self,
         name: &str,
         content_hash: &str,
     ) -> Result<(), Status> {
-        self.remove_build_artifacts_subvolume_aware(
-            name,
-            content_hash,
-            tokio::time::Instant::now() + NODEMGR_SUBVOLUME_DELETE_TIMEOUT,
-        )
-        .await?;
-
         let db = Arc::clone(&self.db);
+        let root = self.artifact_store.root.clone();
         let n = name.to_string();
         let h = content_hash.to_string();
-        tokio::task::spawn_blocking(move || {
+        let partitions = tokio::task::spawn_blocking(move || {
             let conn = db
                 .lock()
                 .map_err(|_| Status::internal("template DB mutex poisoned"))?;
-            // Delete build and its snapshot rows from DB.
-            crate::db::delete_build(&conn, &n, &h)
-                .map_err(|e| Status::internal(format!("db delete_build: {e}")))?;
-
-            Ok::<_, Status>(())
+            let builds = crate::db::list_builds_for_hash(&conn, &n, &h)
+                .map_err(|e| Status::internal(format!("db list_builds_for_hash: {e}")))?;
+            let mut partitions: std::collections::BTreeSet<_> = builds
+                .into_iter()
+                .map(|build| build.cache_partition)
+                .collect();
+            partitions.extend(
+                pplx_space_common_core::host::linux::paths::cached_template_partitions_in(
+                    &root, &n, &h,
+                ),
+            );
+            // Base-snapshot dirs under `{name}/snapshots/` carry the same
+            // build dir names.
+            partitions.extend(
+                pplx_space_common_core::host::linux::paths::cached_template_partitions_in(
+                    &root.join(&n),
+                    "snapshots",
+                    &h,
+                ),
+            );
+            // A digest with neither still has its legacy dir cleaned, as before.
+            if partitions.is_empty() {
+                partitions.insert(crate::db::TemplateCachePartition::Legacy);
+            }
+            Ok::<_, Status>(partitions)
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
-        .map_err(|e: Status| e)?;
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
+
+        let nodemgr_deadline = tokio::time::Instant::now() + NODEMGR_SUBVOLUME_DELETE_TIMEOUT;
+        for partition in partitions {
+            self.remove_build_artifacts_subvolume_aware(
+                name,
+                &partition.build_dir_name(content_hash),
+                nodemgr_deadline,
+            )
+            .await?;
+
+            let db = Arc::clone(&self.db);
+            let n = name.to_string();
+            let h = content_hash.to_string();
+            tokio::task::spawn_blocking(move || {
+                let conn = db
+                    .lock()
+                    .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+                // Delete build and its snapshot rows from DB.
+                crate::db::delete_build(&conn, &n, &h, partition)
+                    .map_err(|e| Status::internal(format!("db delete_build: {e}")))?;
+
+                Ok::<_, Status>(())
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+            .map_err(|e: Status| e)?;
+        }
 
         Ok(())
     }
@@ -623,44 +705,58 @@ impl TemplateManagerService {
     /// Abandoning the RPC at the deadline is safe: the delete is
     /// idempotent, so a server-side completion racing the local
     /// fallback is benign.
+    ///
+    /// `build_dir_name` is a directory under the template: a build dir
+    /// (`{content_hash}` or `{content_hash}@{environment}`) or a transient
+    /// sibling, whose name is used verbatim and which skips the RPC leg.
     pub(super) async fn remove_build_artifacts_subvolume_aware(
         &self,
         name: &str,
-        content_hash: &str,
+        build_dir_name: &str,
         nodemgr_deadline: tokio::time::Instant,
     ) -> Result<(), Status> {
-        let build_dir = build_artifacts_dir(&self.artifact_store.root, name, content_hash);
+        let parsed_build = TemplateCachePartition::parse_build_dir_name(build_dir_name);
+        let (content_hash, partition) = parsed_build.unwrap_or((
+            build_dir_name,
+            // Legacy dir names are the bare name, so a transient sibling's
+            // paths compose unchanged.
+            TemplateCachePartition::Legacy,
+        ));
+        let build_dir =
+            build_artifacts_dir(&self.artifact_store.root, name, content_hash, partition);
         let is_subvol = tokio::task::spawn_blocking({
             let build_dir = build_dir.clone();
             move || pplx_space_common_core::host::btrfs::is_subvolume(&build_dir)
         })
         .await
         .map_err(|e| {
-            blocking_join_status("probe digest dir", &format!("{name}@{content_hash}"), e)
+            blocking_join_status("probe digest dir", &format!("{name}@{build_dir_name}"), e)
         })?;
 
         if !is_subvol {
             let store = self.artifact_store.clone();
             let n = name.to_string();
             let h = content_hash.to_string();
-            return tokio::task::spawn_blocking(move || store.remove_build_artifacts(&n, &h))
-                .await
-                .map_err(|e| {
-                    blocking_join_status(
-                        "remove build artifacts",
-                        &format!("{name}@{content_hash}"),
-                        e,
-                    )
-                })?
-                .map_err(|error| {
-                    tracing::error!(
-                        template = name,
-                        content_hash,
-                        %error,
-                        "failed to remove template build artifacts before DB cleanup"
-                    );
-                    Status::internal(error.to_string())
-                });
+            return tokio::task::spawn_blocking(move || {
+                store.remove_build_artifacts(&n, &h, partition)
+            })
+            .await
+            .map_err(|e| {
+                blocking_join_status(
+                    "remove build artifacts",
+                    &format!("{name}@{build_dir_name}"),
+                    e,
+                )
+            })?
+            .map_err(|error| {
+                tracing::error!(
+                    template = name,
+                    content_hash,
+                    %error,
+                    "failed to remove template build artifacts before DB cleanup"
+                );
+                Status::internal(error.to_string())
+            });
         }
 
         // Snapshot dirs are plain dirs under
@@ -670,13 +766,13 @@ impl TemplateManagerService {
             let store = self.artifact_store.clone();
             let n = name.to_string();
             let h = content_hash.to_string();
-            move || store.remove_snapshot_artifacts(&n, &h)
+            move || store.remove_snapshot_artifacts(&n, &h, partition)
         })
         .await
         .map_err(|e| {
             blocking_join_status(
                 "remove snapshot artifacts",
-                &format!("{name}@{content_hash}"),
+                &format!("{name}@{build_dir_name}"),
                 e,
             )
         })?;
@@ -698,8 +794,8 @@ impl TemplateManagerService {
         // straight to the local cleanup, which operates on the real
         // `build_dir`.
         //
-        // The RPC leg is also skipped when `content_hash` is not a
-        // valid content hash: the template-level delete routes
+        // The RPC leg is also skipped when the dir is not a build dir:
+        // the template-level delete routes
         // transient digest-sibling subvolumes (`….importing`,
         // `….replaced.<uuid>`, `build.importing.<job>`) through here,
         // and node-mgr rejects those names at its validation boundary,
@@ -707,11 +803,12 @@ impl TemplateManagerService {
         // transient dir to the gRPC error stream this path exists to
         // quiet. The local cleanup deletes them fine.
         let take_rpc_leg = self.artifact_store.root == Path::new(TEMPLATE_DIR)
+            && parsed_build.is_some()
             && validate_content_hash(content_hash).is_ok();
         if take_rpc_leg && nodemgr_deadline > tokio::time::Instant::now() {
             match tokio::time::timeout_at(
                 nodemgr_deadline,
-                crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash),
+                crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash, partition),
             )
             .await
             {
@@ -752,7 +849,7 @@ impl TemplateManagerService {
         })
         .await
         .map_err(|e| {
-            blocking_join_status("clean digest dir", &format!("{name}@{content_hash}"), e)
+            blocking_join_status("clean digest dir", &format!("{name}@{build_dir_name}"), e)
         })?;
         if let Err(error) = cleanup_result {
             tracing::error!(

@@ -221,20 +221,22 @@ pub const SPACE_TEMPLATE_RECEIVED_UUID_NS: Uuid =
     Uuid::from_u128(0x1f3a_9c44_5e6b_47d8_b9c1_2a0f_8e51_7d36);
 
 /// Compute the deterministic `received_uuid` to stamp on a template
-/// subvolume installed from `(name, content_hash)`.
+/// subvolume installed as `{name}/{build_dir}`.
 ///
-/// Two nodes that independently install the same `(name, content_hash)`
-/// build arrive at the exact same 16-byte UUID via UUIDv5 (SHA-1 of
-/// `namespace || name`), enabling `btrfs send -p` streams produced on one
-/// node to be received on the other without distributing template send
-/// streams.
+/// Two nodes that independently install the same build arrive at the
+/// exact same 16-byte UUID via UUIDv5 (SHA-1 of `namespace || name`),
+/// enabling `btrfs send -p` streams produced on one node to be received on
+/// the other without distributing template send streams.
 ///
-/// `content_hash` is the template build's content-addressed digest
-/// (typically `"sha256:..."`); it's included in the v5 name so two
-/// distinct builds of the same template name produce distinct UUIDs and
-/// cannot be confused for each other.
-pub fn deterministic_template_received_uuid(name: &str, content_hash: &str) -> Uuid {
-    let name = format!("{name}@{content_hash}");
+/// `build_dir` is the build's directory name: its content-addressed digest
+/// (typically `"sha256:..."`), followed by `@{environment}` for builds in
+/// an environment's cache partition. It's included in the v5 name so
+/// distinct builds of the same template name, including one rootfs bound
+/// to two environments, produce distinct UUIDs and cannot be confused for
+/// each other. Legacy builds' directory name is the bare digest, so their
+/// UUIDs are unchanged.
+pub fn deterministic_template_received_uuid(name: &str, build_dir: &str) -> Uuid {
+    let name = format!("{name}@{build_dir}");
     Uuid::new_v5(&SPACE_TEMPLATE_RECEIVED_UUID_NS, name.as_bytes())
 }
 

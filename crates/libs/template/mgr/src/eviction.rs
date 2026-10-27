@@ -11,8 +11,9 @@
 //!
 //! ## Protected sets for templates
 //!
-//! A build `(name, content_hash)` is **not** evictable when any of
-//! these hold:
+//! A build `(name, content_hash, cache_partition)` is **not** evictable
+//! when any of these hold for its `(name, content_hash)` — the protected
+//! sets name rootfs digests, so they cover every cache partition of one:
 //!
 //! - It is in the `pinned` set (UNION of `template_pinned_tags` and
 //!   `template_pinned_releases` — the same source-of-truth tables the
@@ -57,12 +58,18 @@ use tracing::{info, warn};
 
 pub(crate) use pplx_space_common_lru_reaper::EvictionConfig;
 
+use crate::db::TemplateCachePartition;
+
+/// Planner key: one cached build.
+type BuildKey = (String, String, TemplateCachePartition);
+
 /// Snapshot of one `template_builds` row plus its on-disk size,
 /// supplied to the planner. The planner does not read the DB itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BuildSnapshot {
     pub(crate) name: String,
     pub(crate) content_hash: String,
+    pub(crate) cache_partition: TemplateCachePartition,
     /// Sum of the on-disk artifacts for this build (rootfs + zstd +
     /// metadata + manifest + any per-`(vcpu, memory_mib)` snapshot
     /// pairs). Computed by the caller before invoking the planner.
@@ -81,6 +88,7 @@ pub(crate) struct BuildSnapshot {
 pub(crate) struct EvictionCandidate {
     pub(crate) name: String,
     pub(crate) content_hash: String,
+    pub(crate) cache_partition: TemplateCachePartition,
     pub(crate) size_bytes: u64,
 }
 
@@ -101,21 +109,35 @@ pub(crate) fn plan_evictions(
     warm_pool: &HashSet<(String, String)>,
     cfg: &EvictionConfig,
 ) -> Vec<EvictionCandidate> {
-    let inputs: Vec<EvictionInput<(String, String)>> = builds
+    let inputs: Vec<EvictionInput<BuildKey>> = builds
         .into_iter()
         .map(|b| EvictionInput {
-            key: (b.name, b.content_hash),
+            key: (b.name, b.content_hash, b.cache_partition),
             size_bytes: b.size_bytes,
             created_at_secs: b.created_at_secs,
             last_used_at_secs: b.last_used_at_secs,
         })
         .collect();
-    let pinned_union: HashSet<(String, String)> = pinned.union(warm_pool).cloned().collect();
-    lru_reaper::plan_evictions(inputs, &pinned_union, active, cfg)
+    // Protected sets name digests; lift them onto every cached partition of
+    // each protected digest.
+    let lift = |sets: &[&HashSet<(String, String)>]| -> HashSet<BuildKey> {
+        inputs
+            .iter()
+            .filter(|input| {
+                let digest = (input.key.0.clone(), input.key.1.clone());
+                sets.iter().any(|set| set.contains(&digest))
+            })
+            .map(|input| input.key.clone())
+            .collect()
+    };
+    let pinned_union = lift(&[pinned, warm_pool]);
+    let active = lift(&[active]);
+    lru_reaper::plan_evictions(inputs, &pinned_union, &active, cfg)
         .into_iter()
         .map(|c| EvictionCandidate {
             name: c.key.0,
             content_hash: c.key.1,
+            cache_partition: c.key.2,
             size_bytes: c.size_bytes,
         })
         .collect()
@@ -147,7 +169,7 @@ pub(crate) struct EvictionPlan {
 /// step. The lock is released before `disk_size_for` is called.
 struct PlanDbSnapshot {
     builds: Vec<crate::db::BuildEvictionRow>,
-    snapshot_dims: std::collections::HashMap<(String, String), Vec<(u32, u32)>>,
+    snapshot_dims: std::collections::HashMap<BuildKey, Vec<(u32, u32)>>,
     pinned: HashSet<(String, String)>,
 }
 
@@ -159,14 +181,18 @@ struct PlanDbSnapshot {
 /// caller's stackframe, NOT under the lock.
 fn read_plan_db_snapshot(conn: &Connection) -> rusqlite::Result<PlanDbSnapshot> {
     let builds = crate::db::list_eviction_candidates(conn)?;
-    let mut snapshot_dims: std::collections::HashMap<(String, String), Vec<(u32, u32)>> =
+    let mut snapshot_dims: std::collections::HashMap<BuildKey, Vec<(u32, u32)>> =
         std::collections::HashMap::with_capacity(builds.len());
     for b in &builds {
-        let dims: Vec<(u32, u32)> = crate::db::list_snapshots(conn, &b.name, &b.content_hash)?
-            .into_iter()
-            .map(|s| (s.vcpu, s.memory_mib))
-            .collect();
-        snapshot_dims.insert((b.name.clone(), b.content_hash.clone()), dims);
+        let dims: Vec<(u32, u32)> =
+            crate::db::list_snapshots(conn, &b.name, &b.content_hash, b.cache_partition)?
+                .into_iter()
+                .map(|s| (s.vcpu, s.memory_mib))
+                .collect();
+        snapshot_dims.insert(
+            (b.name.clone(), b.content_hash.clone(), b.cache_partition),
+            dims,
+        );
     }
     let pinned: HashSet<(String, String)> = crate::db::list_pinned_build_keys(conn)?
         .into_iter()
@@ -191,7 +217,7 @@ pub(crate) fn plan_from_db(
     active: &HashSet<(String, String)>,
     warm_pool: &HashSet<(String, String)>,
     cfg: &EvictionConfig,
-    disk_size_for: impl Fn(&str, &str, u64, &[(u32, u32)]) -> u64,
+    disk_size_for: impl Fn(&str, &str, TemplateCachePartition, u64, &[(u32, u32)]) -> u64,
 ) -> rusqlite::Result<EvictionPlan> {
     let db_snapshot = read_plan_db_snapshot(conn)?;
     plan_from_snapshot(db_snapshot, active, warm_pool, cfg, disk_size_for)
@@ -207,7 +233,7 @@ fn plan_from_snapshot(
     active: &HashSet<(String, String)>,
     warm_pool: &HashSet<(String, String)>,
     cfg: &EvictionConfig,
-    disk_size_for: impl Fn(&str, &str, u64, &[(u32, u32)]) -> u64,
+    disk_size_for: impl Fn(&str, &str, TemplateCachePartition, u64, &[(u32, u32)]) -> u64,
 ) -> rusqlite::Result<EvictionPlan> {
     let PlanDbSnapshot {
         builds: builds_rows,
@@ -218,12 +244,19 @@ fn plan_from_snapshot(
     let builds: Vec<BuildSnapshot> = builds_rows
         .into_iter()
         .map(|r| {
-            let key = (r.name.clone(), r.content_hash.clone());
+            let key = (r.name.clone(), r.content_hash.clone(), r.cache_partition);
             let dims = snapshot_dims.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-            let size = disk_size_for(&r.name, &r.content_hash, r.artifact_size_bytes, dims);
+            let size = disk_size_for(
+                &r.name,
+                &r.content_hash,
+                r.cache_partition,
+                r.artifact_size_bytes,
+                dims,
+            );
             BuildSnapshot {
                 name: r.name,
                 content_hash: r.content_hash,
+                cache_partition: r.cache_partition,
                 size_bytes: size,
                 created_at_secs: r.created_at_secs,
                 last_used_at_secs: r.last_used_at_secs,
@@ -286,7 +319,7 @@ enum PrecheckOutcome {
 ///      already deleted (concurrent manual `DeleteTemplateBuild`) or
 ///      already marked deleting (concurrent eviction tick we lost
 ///      a race to), the UPDATE affects 0 rows and we skip.
-///   3. After this txn commits, any concurrent `resolve_template`
+///   3. After this txn commits, any concurrent `resolve_template_build`
 ///      reader sees `state='deleting'` and treats the build as
 ///      not-resolvable — closing the GC-vs-sandbox-create race
 ///      where a sandbox could be issued against a build that was
@@ -324,8 +357,12 @@ fn execute_precheck(
     // eviction) already grabbed it.
     let updated = tx.execute(
         "UPDATE template_builds SET state = 'deleting'
-         WHERE name = ?1 AND content_hash = ?2 AND state = 'ready'",
-        params![candidate.name, candidate.content_hash],
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND state = 'ready'",
+        params![
+            candidate.name,
+            candidate.content_hash,
+            candidate.cache_partition.key()
+        ],
     )?;
     if updated == 0 {
         return Ok(PrecheckOutcome::SkipRowMissing);
@@ -340,16 +377,25 @@ fn execute_precheck(
 /// pin landed between phases the disk is gone and the next pull
 /// will re-materialize (pin's job is to keep the digest available,
 /// not to keep this exact row). Mirror the existing `delete_build`
-/// ordering: snapshots first (FK-bound) then the build row.
+/// ordering: child rows first (FK-bound) then the build row. The runtime
+/// connection doesn't enforce foreign keys, so nothing cascades.
 fn execute_finalize(conn: &Connection, candidate: &EvictionCandidate) -> rusqlite::Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let partition = candidate.cache_partition.key();
     tx.execute(
-        "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2",
-        params![candidate.name, candidate.content_hash],
+        "DELETE FROM template_build_components
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![candidate.name, candidate.content_hash, partition],
     )?;
     tx.execute(
-        "DELETE FROM template_builds WHERE name = ?1 AND content_hash = ?2",
-        params![candidate.name, candidate.content_hash],
+        "DELETE FROM template_snapshots
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![candidate.name, candidate.content_hash, partition],
+    )?;
+    tx.execute(
+        "DELETE FROM template_builds
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+        params![candidate.name, candidate.content_hash, partition],
     )?;
     tx.commit()
 }
@@ -367,7 +413,7 @@ pub(crate) fn execute_one(
     active: &HashSet<(String, String)>,
     warm_pool: &HashSet<(String, String)>,
     candidate: &EvictionCandidate,
-    delete_disk: impl FnOnce(&str, &str) -> rusqlite::Result<()>,
+    delete_disk: impl FnOnce(&str, &str, TemplateCachePartition) -> rusqlite::Result<()>,
 ) -> rusqlite::Result<EvictionOutcome> {
     match execute_precheck(conn, active, warm_pool, candidate)? {
         PrecheckOutcome::SkipPinned => return Ok(EvictionOutcome::SkippedPinnedAtExecute),
@@ -376,7 +422,11 @@ pub(crate) fn execute_one(
         PrecheckOutcome::SkipRowMissing => return Ok(EvictionOutcome::SkippedRowMissing),
         PrecheckOutcome::Proceed => {}
     }
-    delete_disk(&candidate.name, &candidate.content_hash)?;
+    delete_disk(
+        &candidate.name,
+        &candidate.content_hash,
+        candidate.cache_partition,
+    )?;
     execute_finalize(conn, candidate)?;
     Ok(EvictionOutcome::Deleted)
 }
@@ -384,7 +434,7 @@ pub(crate) fn execute_one(
 /// Production execution path: pre-check txn → async disk delete
 /// (DB lock released) → finalize txn. The disk delete may take
 /// seconds on multi-GB rootfs+zstd; releasing the lock around it
-/// means other tokio tasks (prefetch writes, `resolve_template` on
+/// means other tokio tasks (prefetch writes, `resolve_template_build` on
 /// the sandbox-create hot path) keep making progress while we
 /// delete.
 ///
@@ -436,7 +486,12 @@ pub(crate) async fn execute_one_async(
     // potentially-slow step (multi-GB delete on EBS-backed storage)
     // — keeping the lock around it would block prefetch, sandbox-
     // create, and every other DB consumer for the duration.
-    delete_disk(&candidate.name, &candidate.content_hash).await?;
+    delete_disk(
+        &candidate.name,
+        &candidate.content_hash,
+        candidate.cache_partition,
+    )
+    .await?;
 
     // Phase 3: finalize in a short locked region.
     let cand_for_finalize = candidate.clone();
@@ -465,7 +520,8 @@ pub(crate) async fn execute_one_async(
 /// hit the DB itself. Hitting the DB here would deadlock the
 /// non-reentrant `Arc<Mutex<Connection>>` the surrounding
 /// `spawn_blocking` already holds.
-pub(crate) type DiskSizeFn = Arc<dyn Fn(&str, &str, u64, &[(u32, u32)]) -> u64 + Send + Sync>;
+pub(crate) type DiskSizeFn =
+    Arc<dyn Fn(&str, &str, TemplateCachePartition, u64, &[(u32, u32)]) -> u64 + Send + Sync>;
 
 /// Remove a build's on-disk artifacts. Returns a `Future` so the
 /// production closure (which RPCs to node-mgr for the btrfs subvol
@@ -479,6 +535,7 @@ pub(crate) type DeleteDiskFn = Arc<
     dyn Fn(
             &str,
             &str,
+            TemplateCachePartition,
         )
             -> std::pin::Pin<Box<dyn std::future::Future<Output = rusqlite::Result<()>> + Send>>
         + Send
@@ -533,6 +590,7 @@ pub(crate) type ReaperDiskProbeFn = Arc<
     dyn Fn(
             &str,
             &str,
+            TemplateCachePartition,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ReaperDiskState> + Send>>
         + Send
         + Sync,
@@ -550,7 +608,7 @@ pub(crate) type ReaperDiskProbeFn = Arc<
 /// - **Disk intact** ⇒ reset row to `'ready'`. The next planner pass
 ///   replans the build for eviction; if pins or sandboxes attached
 ///   while it was stuck, the planner's filters keep it alive.
-/// - **Disk missing** ⇒ drop the row. `resolve_template` reports
+/// - **Disk missing** ⇒ drop the row. `resolve_template_build` reports
 ///   NotFound; `do_pull` on the next access writes fresh bytes into
 ///   the leftover btrfs subvol root via its existing
 ///   `digest_dir_existed` adoption path.
@@ -567,35 +625,29 @@ pub(crate) async fn reap_stuck_deleting(
     reaper_probe: &ReaperDiskProbeFn,
 ) -> usize {
     let db_for_query = Arc::clone(&db);
-    let stuck =
-        match tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<(String, String)>> {
-            let conn = db_for_query
-                .lock()
-                .map_err(|_| crate::db::mutex_poison_error("template GC reaper query"))?;
-            let mut stmt = conn.prepare(
-                "SELECT name, content_hash FROM template_builds WHERE state = 'deleting'",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.collect()
-        })
-        .await
-        {
-            Ok(Ok(rows)) => rows,
-            Ok(Err(err)) => {
-                warn!(error = %err, "template GC reaper: select stuck rows failed");
-                return 0;
-            }
-            Err(join_err) => {
-                warn!(error = %join_err, "template GC reaper: select task panicked");
-                return 0;
-            }
-        };
+    let stuck = match tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<BuildKey>> {
+        let conn = db_for_query
+            .lock()
+            .map_err(|_| crate::db::mutex_poison_error("template GC reaper query"))?;
+        crate::db::list_deleting_builds(&conn)
+    })
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            warn!(error = %err, "template GC reaper: select stuck rows failed");
+            return 0;
+        }
+        Err(join_err) => {
+            warn!(error = %join_err, "template GC reaper: select task panicked");
+            return 0;
+        }
+    };
 
     let mut handled = 0usize;
-    for (name, content_hash) in stuck {
-        let state = reaper_probe(&name, &content_hash).await;
+    for (name, content_hash, partition) in stuck {
+        let state = reaper_probe(&name, &content_hash, partition).await;
+        let partition_key = partition.key();
         let db_for_update = Arc::clone(&db);
         let n = name.clone();
         let h = content_hash.clone();
@@ -607,8 +659,9 @@ pub(crate) async fn reap_stuck_deleting(
                 ReaperDiskState::Intact => {
                     conn.execute(
                         "UPDATE template_builds SET state = 'ready'
-                         WHERE name = ?1 AND content_hash = ?2 AND state = 'deleting'",
-                        params![n, h],
+                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
+                           AND state = 'deleting'",
+                        params![n, h, partition_key],
                     )?;
                 }
                 ReaperDiskState::Missing => {
@@ -617,13 +670,26 @@ pub(crate) async fn reap_stuck_deleting(
                         rusqlite::TransactionBehavior::Immediate,
                     )?;
                     tx.execute(
-                        "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2",
-                        params![n, h],
+                        "DELETE FROM template_snapshots
+                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
+                        params![n, h, partition_key],
                     )?;
                     tx.execute(
                         "DELETE FROM template_builds
-                         WHERE name = ?1 AND content_hash = ?2 AND state = 'deleting'",
-                        params![n, h],
+                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
+                           AND state = 'deleting'",
+                        params![n, h, partition_key],
+                    )?;
+                    // Nothing cascades on the runtime connection; drop the
+                    // components only if the build row went.
+                    tx.execute(
+                        "DELETE FROM template_build_components
+                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
+                           AND NOT EXISTS (
+                               SELECT 1 FROM template_builds
+                               WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
+                           )",
+                        params![n, h, partition_key],
                     )?;
                     tx.commit()?;
                 }
@@ -638,6 +704,7 @@ pub(crate) async fn reap_stuck_deleting(
                 info!(
                     template = %name,
                     content_hash = %content_hash,
+                    cache_partition = %partition,
                     resolution = match state {
                         ReaperDiskState::Intact => "reset_to_ready",
                         ReaperDiskState::Missing => "drop_row",
@@ -678,7 +745,7 @@ pub(crate) async fn reap_stuck_deleting(
 /// touch `state='deleting'` row recovery.
 #[cfg(test)]
 pub(crate) fn noop_reaper_probe() -> ReaperDiskProbeFn {
-    Arc::new(|_, _| Box::pin(async { ReaperDiskState::Intact }))
+    Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Intact }))
 }
 
 /// Test stand-in for the warm-pool protected-set fetcher: no warm
@@ -865,7 +932,7 @@ pub(crate) async fn gc_tick(
     // Step 0: resolve any rows stuck in `state='deleting'` from a
     // prior tick whose Phase 2 errored. Bytes-intact rows go back to
     // `'ready'` so the planner can replan them this tick; bytes-missing
-    // rows are dropped so `resolve_template` stops 404'ing and
+    // rows are dropped so `resolve_template_build` stops 404'ing and
     // `do_pull` re-materializes on next access. Race-free: no Phase 1
     // CAS has run yet in this tick, so any `'deleting'` row here is
     // necessarily a leftover, not in-flight.
@@ -904,7 +971,7 @@ pub(crate) async fn gc_tick(
             &active_for_plan,
             &warm_pool_for_plan,
             &evict_cfg_for_plan,
-            |n, h, fallback, dims| disk_size_clone(n, h, fallback, dims),
+            |n, h, partition, fallback, dims| disk_size_clone(n, h, partition, fallback, dims),
         )
     })
     .await
@@ -960,6 +1027,7 @@ pub(crate) async fn gc_tick(
                 warn!(
                     template = %candidate.name,
                     content_hash = %candidate.content_hash,
+                    cache_partition = %candidate.cache_partition,
                     error = %err,
                     "template GC: candidate delete failed"
                 );
@@ -970,6 +1038,7 @@ pub(crate) async fn gc_tick(
                 warn!(
                     template = %candidate.name,
                     content_hash = %candidate.content_hash,
+                    cache_partition = %candidate.cache_partition,
                     error = %err,
                     "template GC: candidate delete task panicked"
                 );

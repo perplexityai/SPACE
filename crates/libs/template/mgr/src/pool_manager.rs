@@ -15,7 +15,7 @@ const BASE_TICK: u64 = 5;
 const MAX_TICK: u64 = 160;
 
 #[derive(Debug, thiserror::Error)]
-enum PoolError {
+pub(crate) enum PoolError {
     #[error("sandbox-manager client: {0}")]
     SandboxClient(String),
     #[error("pool sandbox {sandbox_id} is failed")]
@@ -26,9 +26,54 @@ enum PoolError {
     Db(#[from] rusqlite::Error),
     #[error("pool clone task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("template has no legacy-partition build for a pool to boot")]
+    NoPoolBuild,
 }
 
 type PoolResult<T> = Result<T, PoolError>;
+
+/// The content hash a pool refill names, so sandbox-manager doesn't resolve
+/// the template's latest, which can be another environment's. `None` when no
+/// build is cached at all: sandbox-manager's lookup then pulls the latest
+/// release. A refill uses the build, as the lookup it replaces recorded, so
+/// it advances the build's LRU; a failed touch only costs LRU accuracy.
+pub(crate) fn pool_refill_hash(
+    conn: &rusqlite::Connection,
+    template: &str,
+) -> PoolResult<Option<String>> {
+    if let Some(build) = pool_base_build(conn, template)? {
+        if let Err(error) = crate::db::touch_build(
+            conn,
+            &build.name,
+            &build.content_hash,
+            build.cache_partition,
+        ) {
+            eprintln!("[pool-manager] {template}: could not touch pool build LRU: {error}");
+        }
+        return Ok(Some(build.content_hash));
+    }
+    if crate::db::list_build_partitions(conn, template)?.is_empty() {
+        return Ok(None);
+    }
+    // Only other environments' builds are cached. Pools don't yet pick a
+    // build per environment, so the pool stays empty rather than boot one.
+    Err(PoolError::NoPoolBuild)
+}
+
+/// The build a template's pool boots: the newest of the legacy partition.
+/// Pool fill, refill and invalidation don't yet track a build per
+/// environment, so a newer build bound to another one must not win the
+/// pool's lookups.
+pub(crate) fn pool_base_build(
+    conn: &rusqlite::Connection,
+    template: &str,
+) -> rusqlite::Result<Option<crate::db::BuildRow>> {
+    crate::db::get_latest_build_in_partition(
+        conn,
+        template,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+}
 
 #[derive(Default)]
 struct PoolTickOutcome {
@@ -267,14 +312,25 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
 }
 
 /// Create a pool sandbox from base snapshot (slow path). Returns sandbox_id on success.
-async fn create_from_base(
+pub(crate) async fn create_from_base(
     db: Arc<Mutex<rusqlite::Connection>>,
     template: String,
     from_snapshot: bool,
     vcpu: u32,
     memory_mib: u32,
 ) -> PoolResult<String> {
-    match do_create_from_base(&template, from_snapshot, vcpu, memory_mib).await {
+    let content_hash = {
+        let db = Arc::clone(&db);
+        let template = template.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| crate::db::mutex_poison_error("pool base build lookup"))?;
+            pool_refill_hash(&conn, &template)
+        })
+        .await??
+    };
+    match do_create_from_base(&template, content_hash, from_snapshot, vcpu, memory_mib).await {
         Ok(id) => {
             crate::node_state_sync::mark_template_dirty(&db, &template);
             Ok(id)
@@ -288,6 +344,7 @@ async fn create_from_base(
 
 async fn do_create_from_base(
     template: &str,
+    content_hash: Option<String>,
     from_snapshot: bool,
     vcpu: u32,
     memory_mib: u32,
@@ -315,7 +372,7 @@ async fn do_create_from_base(
             },
             blocking: false,
             sandbox_id: None,
-            content_hash: None,
+            content_hash,
             env: Default::default(),
             auto_lifecycle: None,
             rootfs_size_mb: None,

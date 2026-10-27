@@ -395,6 +395,8 @@ sandbox metadata. No table migration or backfill is required. The reference is
 not a substitute for binary verification or an arbitrary execution permission.
 A same-rootfs registration cannot add, remove or replace the retained manifest's
 binding by refreshing metadata; it fails before changing the existing release.
+A template-manager registration bound to another environment's cache partition
+is a separate node-local build instead (see "Template caches per environment").
 Control-plane registration likewise rejects contradictory execution metadata
 before changing tags or storage locations. Identical retries and metadata-free
 tag updates preserve the original evidence; a NULL record may be filled once.
@@ -1241,6 +1243,127 @@ policy and retain compatibility checks at node admission. Retirement and garbage
 collection require a separate reference-aware operation; recipe omission alone
 never grants deletion authority.
 
+
+### Template caches per environment
+
+A content hash names rootfs bytes, not an environment, so template-manager
+caches one rootfs once per environment it's bound to. Each such build has its
+own manifest, base snapshots, btrfs subvolume and `received_uuid`, and its own
+rows in the build, component, base-snapshot and tag-pin tables, keyed by a
+cache partition:
+
+| Build | Partition key | Build directory |
+|---|---|---|
+| Unbound, or bound to the Linux/x86_64 initial environment (E0) | empty | `{name}/{content_hash}` |
+| Bound to any other environment | its reference | `{name}/{content_hash}@{environment}` |
+
+Base snapshots live under `{name}/snapshots/<build directory>/`. E0 shares the
+legacy partition because it was the only environment nodes executed before
+partitions existed: existing rows, directories and stamped `received_uuid`
+values keep their identity, and the migration rebuilds the tables without moving
+data. A build's binding is its manifest's execution metadata, else its
+metadata's, which registration copies into the manifest. Registration, import
+and pull file a build under the partition of that binding, `upsert_build` refuses a row whose partition disagrees with
+its binding, and startup recovery drops a directory whose manifest binds
+another partition. If such a build's base snapshots or directory can't be
+removed, the build and its row stay, and the next startup tries again. That includes a legacy-layout directory bound to a non-E0
+environment, which only a node that admitted such an environment before
+partitions existed can hold: it's dropped with its base snapshots and pulled
+into its own partition on demand. Sandboxes booted from it keep running;
+suspend uses the Full codec, as after an eviction of their parent build.
+
+`TemplateRef.environment` is a preference: a lookup returns the build in
+the selected environment's partition, else the legacy build, else any other
+build of the digest. Absent, it prefers the legacy build, so
+environment-unaware callers keep their behavior; E0 selects the legacy
+partition. A lookup of a template's latest build returns the newest build of
+any partition, as before partitions existed. New tie-breaks send same-date
+builds to the larger content hash, and builds of one digest to the preferred
+partition, then the legacy one. The caller checks the build it gets as a
+compatible cold-boot source for the environment it runs under, which keeps
+compatible selection working when the selected environment has no build of
+its own. Sandbox-manager starts a sandbox preferring the build of its saved
+binding's environment, and checks the disk and boot inputs against that
+binding. A cache miss pulls the
+release without a selector: the pull reads the release manifest and metadata
+before choosing a directory and reuses those bytes. Responses echo the resolved
+build's environment.
+Node-manager's template subvolume RPCs carry a partitioned build in
+`EnvironmentTemplateBuild` and leave the legacy `content_hash` empty, so an
+older node-manager rejects them rather than acting on the legacy build.
+`DeleteTemplateBuild` removes every partition of a cached hash that has a row,
+a build directory or a base-snapshot directory, and rejects a selector. Tag and release pins protect a digest in every partition, and a pull
+is refused with a retryable error while any partition of its digest is being
+evicted.
+
+Base-snapshot reconciliation runs per partition: each partition's newest build
+of a template gets its own snapshot. A build outside the legacy partition is
+captured through sandbox-manager's environment create path, so it cold-boots
+under its own environment, and a node that doesn't admit that environment
+refuses the capture. Rebuilding such a snapshot leaves pools alone: template
+pools boot only legacy builds, so a pool's defaults, snapshot check and refills
+use its template's newest legacy-partition build. A template with no legacy
+build gets no pool members, even though sandbox-manager admits non-default
+bindings into pools: its pool stays empty and creates boot without it.
+
+Deploy sandbox-manager, build-manager and node-ctl no later than
+template-manager. A sandbox-manager that predates partitions reads and writes
+only legacy directories: it publishes the base snapshot of any build bound to
+another environment into the legacy snapshot directory, which for a twin
+overwrites the legacy build's snapshot and otherwise leaves the capture
+unrecorded, and its rootfs deltas and transfers miss builds outside the legacy
+partition. The other way round, a new sandbox-manager publishes a legacy-layout
+build bound to another environment under that environment's partition, so an
+older template-manager doesn't record its capture until it upgrades.
+Node-manager can deploy in either order: an older one refuses partitioned
+subvolume requests, and a pull into another environment's partition lands in a
+plain directory, as on a host without btrfs. An older build-manager publishes
+a build bound to another environment from the legacy directory, which no longer
+holds it. An older node-ctl publishes a template's last listed build, which can
+be a twin.
+
+Roll back in the reverse order, template-manager before or together with the
+others. An older template-manager refuses the migrated database, and an older
+migrator doesn't bundle the migration, so:
+
+1. Stop template-manager on the node and keep the new version from restarting:
+   at startup it re-applies the migration.
+2. While it's stopped, copy the template-manager database with its `-wal` and
+   `-shm` files. If the rollback fails, restore all three together and
+   redeploy the new template-manager. The directories removed in step 3 aren't
+   restored; their builds re-pull on demand, and twins of published releases
+   must be rebuilt.
+3. Under the template cache root (`TEMPLATE_DIR`), remove each
+   `{name}/snapshots/{hash}@{environment}` directory, which the older
+   template-manager would register as snapshot rows of an invalid hash, and
+   delete each `{name}/{hash}@{environment}` build directory, a read-only
+   subvolume on btrfs hosts, with `btrfs subvolume delete`; the older
+   template-manager never sees or evicts them.
+4. Run a migrator that bundles this migration, last: once it commits, an older
+   template-manager can open the database. First check that
+   `space-db-migrator template-manager --database-path <db> status` shows
+   `20261026220935` as the newest applied migration in both the `service` and
+   `common` scopes, then run `space-db-migrator template-manager
+   --database-path <db> down` once. It drops the rows of every environment
+   partition and removes the migration's history row; a second run would undo
+   the baseline and drop the schema.
+5. Start the older template-manager. If sandbox-manager rolls back after
+   template-manager, a new sandbox-manager can still publish a
+   `snapshots/{hash}@{environment}` directory meanwhile; repeat step 3 once it
+   has rolled back, before the older template-manager next restarts, or roll
+   sandbox-manager back together with template-manager.
+
+Known limits until the cluster side carries partitions:
+
+- Release identity is `(template_name, hash)` in the control plane, its object
+  store layout and its node inventory, so a twin of a published release can't
+  be registered or published yet. Node-ctl publishes a template's
+  legacy-partition build, and another partition's only when it has none.
+- The sandbox btrfs-send codec names legacy builds only. A sandbox booted from
+  another partition fails the codec's lineage check and uses the Full codec.
+- Prefetch names no environment: it pulls without a selector, counts a build
+  in any partition of a digest as cached, and its tag pins use the legacy
+  partition key.
 
 ## Runtime control transport
 

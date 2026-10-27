@@ -214,6 +214,7 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
         &crate::db::BuildUpsert {
             name: "seed",
             content_hash: hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: "{}",
             runtime: "fc",
@@ -242,8 +243,10 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
         hash,
         &[],
         &[],
-        None,
-        RootfsBackingPolicy::Inherit,
+        PullContext {
+            background_worker: None,
+            backing_policy: RootfsBackingPolicy::Inherit,
+        },
     )
     .await;
     match outcome {
@@ -252,6 +255,58 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
         }
         other => panic!("expected eviction-in-progress failure, got {other:?}"),
     }
+}
+
+/// A digest mid-eviction refuses the pull before the DB fast path, which
+/// would otherwise count the doomed row as present and report a pull that
+/// left nothing to serve.
+#[tokio::test]
+async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
+    use std::sync::Mutex;
+
+    let conn = crate::db::test_conn();
+    let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    crate::db::upsert_build(
+        &conn,
+        &crate::db::BuildUpsert {
+            name: "seed",
+            content_hash: hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
+            build_date: "2026-01-01T00:00:00Z",
+            manifest_json: "{}",
+            runtime: "fc",
+            arch: "aarch64",
+            artifact_size_bytes: 100,
+            state: "ready",
+        },
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+        rusqlite::params!["seed", hash],
+    )
+    .unwrap();
+
+    let (outcome, _) = pull_resolved_owner(
+        Arc::new(Mutex::new(conn)),
+        "seed",
+        hash,
+        &[],
+        &[],
+        PullContext {
+            background_worker: None,
+            backing_policy: RootfsBackingPolicy::Inherit,
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(
+            outcome,
+            PullOutcome::ClassifiedFailure(PullFailure::EvictionInProgress)
+        ),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -268,8 +323,10 @@ async fn do_pull_treats_empty_storage_locations_as_local_only_uncached() {
         hash,
         &[],
         &[],
-        None,
-        RootfsBackingPolicy::Inherit,
+        PullContext {
+            background_worker: None,
+            backing_policy: RootfsBackingPolicy::Inherit,
+        },
     )
     .await;
 
@@ -548,16 +605,27 @@ async fn cancelled_request_leaves_recoverable_state_for_next_caller() {
 
     // Sanity: nothing in the DB yet.
     assert!(
-        crate::db::get_build(&db.lock().unwrap(), name, content_hash)
-            .unwrap()
-            .is_none(),
+        crate::db::get_build(
+            &db.lock().unwrap(),
+            name,
+            content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none(),
         "precondition: cancelled caller never wrote the row"
     );
 
     // The "next GetTemplate" calls recovery.
-    let rootfs_size = recover_from_digest_dir(&db, name, content_hash, digest_dir)
-        .await
-        .expect("orphaned digest dir must recover");
+    let rootfs_size = recover_from_digest_dir(
+        &db,
+        name,
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        digest_dir,
+    )
+    .await
+    .expect("orphaned digest dir must recover");
     assert_eq!(
         rootfs_size,
         b"decompressed rootfs bytes (test fixture)".len() as u64
@@ -566,9 +634,14 @@ async fn cancelled_request_leaves_recoverable_state_for_next_caller() {
     // The DB row is now present and the manifest is normalized — even
     // though the on-disk manifest the cancelled caller left behind was
     // the raw vol-mgr-pulled object.
-    let row = crate::db::get_build(&db.lock().unwrap(), name, content_hash)
-        .unwrap()
-        .expect("recovery must commit the row");
+    let row = crate::db::get_build(
+        &db.lock().unwrap(),
+        name,
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap()
+    .expect("recovery must commit the row");
     assert_eq!(row.state, "ready");
     assert_eq!(row.artifact_size_bytes, rootfs_size);
     let stored: serde_json::Value = serde_json::from_str(&row.manifest_json).unwrap();
@@ -617,15 +690,27 @@ async fn partial_disk_state_does_not_recover() {
         .await
         .unwrap();
 
-    let outcome = recover_from_digest_dir(&db, "seed", "sha256:partial", digest_dir).await;
+    let outcome = recover_from_digest_dir(
+        &db,
+        "seed",
+        "sha256:partial",
+        crate::db::TemplateCachePartition::Legacy,
+        digest_dir,
+    )
+    .await;
     assert!(
         outcome.is_err(),
         "recovery must decline when rootfs.ext4 is absent"
     );
     assert!(
-        crate::db::get_build(&db.lock().unwrap(), "seed", "sha256:partial")
-            .unwrap()
-            .is_none(),
+        crate::db::get_build(
+            &db.lock().unwrap(),
+            "seed",
+            "sha256:partial",
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none(),
         "DB row must not be created on partial-state recovery"
     );
 }
@@ -675,17 +760,28 @@ async fn recovery_accepts_legacy_manifest_without_zst_on_disk() {
     .unwrap();
     // Deliberately no rootfs.ext4.zst.
 
-    let rootfs_size = recover_from_digest_dir(&db, "seed", content_hash, digest_dir)
-        .await
-        .expect("legacy on-disk shape must recover without a .zst sibling");
+    let rootfs_size = recover_from_digest_dir(
+        &db,
+        "seed",
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        digest_dir,
+    )
+    .await
+    .expect("legacy on-disk shape must recover without a .zst sibling");
     assert_eq!(
         rootfs_size,
         b"legacy rootfs bytes (test fixture)".len() as u64
     );
 
-    let row = crate::db::get_build(&db.lock().unwrap(), "seed", content_hash)
-        .unwrap()
-        .expect("legacy recovery must commit the row");
+    let row = crate::db::get_build(
+        &db.lock().unwrap(),
+        "seed",
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap()
+    .expect("legacy recovery must commit the row");
     assert_eq!(row.state, "ready");
     let stored: serde_json::Value = serde_json::from_str(&row.manifest_json).unwrap();
     assert!(
@@ -743,15 +839,27 @@ async fn recovery_declines_when_manifest_requires_zst_but_disk_lacks_it() {
         .unwrap();
     // No rootfs.ext4.zst — the manifest demands it, recovery must decline.
 
-    let outcome = recover_from_digest_dir(&db, "seed", content_hash, digest_dir).await;
+    let outcome = recover_from_digest_dir(
+        &db,
+        "seed",
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        digest_dir,
+    )
+    .await;
     assert!(
         outcome.is_err(),
         "manifest-listed file missing on disk must abort recovery"
     );
     assert!(
-        crate::db::get_build(&db.lock().unwrap(), "seed", content_hash)
-            .unwrap()
-            .is_none(),
+        crate::db::get_build(
+            &db.lock().unwrap(),
+            "seed",
+            content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none(),
         "DB row must not be created when a manifest-listed file is missing"
     );
 }
@@ -1255,15 +1363,27 @@ async fn hash_mismatch_cleanup_removes_digest_dir_so_recovery_declines() {
     cleanup_digest_dir_sync(digest_dir).unwrap();
 
     // Recovery MUST decline now — the bad rootfs.ext4 is gone.
-    let outcome = recover_from_digest_dir(&db, "seed", "sha256:mismatched", digest_dir).await;
+    let outcome = recover_from_digest_dir(
+        &db,
+        "seed",
+        "sha256:mismatched",
+        crate::db::TemplateCachePartition::Legacy,
+        digest_dir,
+    )
+    .await;
     assert!(
         outcome.is_err(),
         "post-mismatch recovery must decline; otherwise bad bytes get committed to DB"
     );
     assert!(
-        crate::db::get_build(&db.lock().unwrap(), "seed", "sha256:mismatched")
-            .unwrap()
-            .is_none(),
+        crate::db::get_build(
+            &db.lock().unwrap(),
+            "seed",
+            "sha256:mismatched",
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none(),
         "no DB row may be created from a hash-mismatched pull"
     );
 }
@@ -1409,5 +1529,290 @@ async fn materialize_blake3_release(#[case] compressed: bool) {
             size: Some(3),
             compression: None,
         }
+    );
+}
+
+#[test]
+fn digest_dir_partition_reads_build_dirs_only() {
+    let hash = format!("sha256:{}", "7".repeat(64));
+    let twin = TemplateCachePartition::Environment(
+        pplx_space_common_core::types::EnvironmentReference::new(
+            pplx_space_common_core::types::Digest::sha256([2; 32]),
+        ),
+    );
+    assert_eq!(
+        digest_dir_partition(&Path::new("/t/seed").join(&hash)),
+        Some(TemplateCachePartition::Legacy)
+    );
+    assert_eq!(
+        digest_dir_partition(&Path::new("/t/seed").join(twin.build_dir_name(&hash))),
+        Some(twin)
+    );
+    // Transient siblings aren't builds; their delete must not target one.
+    assert_eq!(
+        digest_dir_partition(&Path::new("/t/seed").join(format!("{hash}.importing.x"))),
+        None
+    );
+}
+
+/// A node that predates partitions can hold a build bound to another
+/// environment in the legacy layout. Recovery leaves it unregistered, so the
+/// pull fetches the release into its own partition. The binding counts
+/// whether the manifest carries it or only metadata.json does, since
+/// registration copies the latter into the manifest.
+#[rstest::rstest]
+#[case::in_manifest(false)]
+#[case::in_metadata(true)]
+#[tokio::test]
+async fn recovery_declines_a_legacy_dir_bound_to_another_environment(#[case] in_metadata: bool) {
+    use pplx_space_common_core::types::{
+        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest, TemplateMetadata,
+    };
+    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let tmp = tempfile::tempdir().unwrap();
+    let digest_dir = tmp.path();
+    let content_hash = "sha256:legacy-recovery";
+    let environment = EnvironmentReference::new(Digest::sha256([2; 32]));
+    let execution =
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).with_environment(environment);
+    let mut metadata: TemplateMetadata = serde_json::from_str(r#"{"arch":"x86_64"}"#).unwrap();
+    if in_metadata {
+        metadata.set_execution_metadata(execution.clone());
+    }
+    tokio::fs::write(
+        digest_dir.join("metadata.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut manifest: TemplateManifest = serde_json::from_str(&format!(
+        r#"{{
+            "name": "seed",
+            "content_hash": "{content_hash}",
+            "runtime": "fc",
+            "arch": "x86_64",
+            "bootable_artifact": "rootfs.ext4",
+            "files": {{ "rootfs.ext4": {{ "digest": "{content_hash}", "size": 4 }} }}
+        }}"#
+    ))
+    .unwrap();
+    if !in_metadata {
+        manifest.set_execution_metadata(execution);
+    }
+    tokio::fs::write(
+        digest_dir.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(digest_dir.join(TEMPLATE_ROOTFS_FILE), b"root")
+        .await
+        .unwrap();
+
+    let outcome = recover_from_digest_dir(
+        &db,
+        "seed",
+        content_hash,
+        TemplateCachePartition::Legacy,
+        digest_dir,
+    )
+    .await;
+
+    assert_eq!(outcome, Err("manifest_partition_mismatch"));
+    assert!(
+        crate::db::list_builds_for_hash(&db.lock().unwrap(), "seed", content_hash)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A partition probe dir is a transient sibling startup recovery reaps, never
+/// a build dir a lookup or recovery could adopt.
+#[test]
+fn partition_probe_dirs_are_reaped_staging_dirs_not_builds() {
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let probe = partition_probe_dir_name(&hash, uuid::Uuid::now_v7());
+    assert!(crate::service::is_import_staging_dir(&probe), "{probe}");
+    assert!(
+        TemplateCachePartition::parse_build_dir_name(&probe).is_none(),
+        "{probe}"
+    );
+}
+
+/// Recovery registers every complete partition of a digest an interrupted
+/// pull left behind: once one row exists, lookups stop reaching recovery.
+#[tokio::test]
+async fn recovery_registers_every_complete_partition_of_a_digest() {
+    use pplx_space_common_core::types::{
+        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest,
+    };
+    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let root = tempfile::tempdir().unwrap();
+    let content_hash = format!("sha256:{}", "b".repeat(64));
+    let twin =
+        TemplateCachePartition::Environment(EnvironmentReference::new(Digest::sha256([2; 32])));
+    for partition in [TemplateCachePartition::Legacy, twin] {
+        let dir = root
+            .path()
+            .join("seed")
+            .join(partition.build_dir_name(&content_hash));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("metadata.json"), br#"{"arch":"x86_64"}"#)
+            .await
+            .unwrap();
+        let mut manifest: TemplateManifest = serde_json::from_str(&format!(
+            r#"{{
+                "name": "seed",
+                "content_hash": "{content_hash}",
+                "runtime": "fc",
+                "arch": "x86_64",
+                "bootable_artifact": "rootfs.ext4",
+                "files": {{ "rootfs.ext4": {{ "digest": "{content_hash}", "size": 4 }} }}
+            }}"#
+        ))
+        .unwrap();
+        if let Some(environment) = partition.environment() {
+            manifest.set_execution_metadata(
+                ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![])
+                    .with_environment(environment),
+            );
+        }
+        tokio::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(dir.join(TEMPLATE_ROOTFS_FILE), b"root")
+            .await
+            .unwrap();
+    }
+
+    assert!(try_recover_from_disk_in(&db, root.path(), "seed", &content_hash).await);
+
+    let mut partitions: Vec<_> =
+        crate::db::list_builds_for_hash(&db.lock().unwrap(), "seed", &content_hash)
+            .unwrap()
+            .into_iter()
+            .map(|build| build.cache_partition)
+            .collect();
+    partitions.sort();
+    assert_eq!(partitions, [TemplateCachePartition::Legacy, twin]);
+}
+
+/// A pull files a release under the binding its manifest carries, else the
+/// one its metadata carries, as registration does.
+#[test]
+fn release_partition_reads_the_manifest_then_the_metadata_binding() {
+    use pplx_space_common_core::types::{
+        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest, TemplateMetadata,
+    };
+    let environment = EnvironmentReference::new(Digest::sha256([2; 32]));
+    let twin = TemplateCachePartition::Environment(environment);
+    let bound =
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).with_environment(environment);
+    let mut bound_manifest = TemplateManifest::default();
+    bound_manifest.set_execution_metadata(bound.clone());
+    let mut bound_metadata = TemplateMetadata::default();
+    bound_metadata.set_execution_metadata(bound);
+
+    let unbound_manifest = serde_json::to_vec(&TemplateManifest::default()).unwrap();
+    let bound_manifest = serde_json::to_vec(&bound_manifest).unwrap();
+    let bound_metadata = serde_json::to_vec(&bound_metadata).unwrap();
+    assert_eq!(release_partition(&bound_manifest, b"{}"), Ok(twin));
+    assert_eq!(
+        release_partition(&unbound_manifest, &bound_metadata),
+        Ok(twin)
+    );
+    assert_eq!(
+        release_partition(&unbound_manifest, b"not json"),
+        Ok(TemplateCachePartition::Legacy)
+    );
+    assert_eq!(
+        release_partition(b"not json", &bound_metadata),
+        Err(PullFailure::ManifestMalformed)
+    );
+}
+
+/// A dir whose execution metadata can't be read isn't recovered, and says so.
+#[tokio::test]
+async fn recovery_declines_unreadable_execution_metadata() {
+    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let tmp = tempfile::tempdir().unwrap();
+    let digest_dir = tmp.path();
+    let content_hash = "sha256:unreadable-recovery";
+    tokio::fs::write(digest_dir.join("metadata.json"), br#"{"arch":"x86_64"}"#)
+        .await
+        .unwrap();
+    let manifest = format!(
+        r#"{{
+            "name": "seed",
+            "content_hash": "{content_hash}",
+            "runtime": "fc",
+            "arch": "x86_64",
+            "schema_version": 4294967295,
+            "bootable_artifact": "rootfs.ext4",
+            "files": {{ "rootfs.ext4": {{ "digest": "{content_hash}", "size": 4 }} }}
+        }}"#
+    );
+    tokio::fs::write(digest_dir.join("manifest.json"), manifest.as_bytes())
+        .await
+        .unwrap();
+    tokio::fs::write(digest_dir.join(TEMPLATE_ROOTFS_FILE), b"root")
+        .await
+        .unwrap();
+
+    let outcome = recover_from_digest_dir(
+        &db,
+        "seed",
+        content_hash,
+        TemplateCachePartition::Legacy,
+        digest_dir,
+    )
+    .await;
+
+    assert_eq!(outcome, Err("execution_metadata_invalid"));
+}
+
+/// Recovery files a dir's build only under the partition its manifest binds:
+/// an unbound manifest found in a twin's dir doesn't become the twin.
+#[tokio::test]
+async fn recovery_declines_a_manifest_bound_outside_the_dir_partition() {
+    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let tmp = tempfile::tempdir().unwrap();
+    let digest_dir = tmp.path();
+    let content_hash = "sha256:partition-recovery";
+    tokio::fs::write(digest_dir.join("metadata.json"), br#"{"arch":"x86_64"}"#)
+        .await
+        .unwrap();
+    let manifest = format!(
+        r#"{{
+            "name": "seed",
+            "content_hash": "{content_hash}",
+            "runtime": "fc",
+            "arch": "x86_64",
+            "bootable_artifact": "rootfs.ext4",
+            "files": {{ "rootfs.ext4": {{ "digest": "{content_hash}", "size": 4 }} }}
+        }}"#
+    );
+    tokio::fs::write(digest_dir.join("manifest.json"), manifest.as_bytes())
+        .await
+        .unwrap();
+    tokio::fs::write(digest_dir.join(TEMPLATE_ROOTFS_FILE), b"root")
+        .await
+        .unwrap();
+    let twin = TemplateCachePartition::Environment(
+        pplx_space_common_core::types::EnvironmentReference::new(
+            pplx_space_common_core::types::Digest::sha256([2; 32]),
+        ),
+    );
+
+    let outcome = recover_from_digest_dir(&db, "seed", content_hash, twin, digest_dir).await;
+
+    assert_eq!(outcome, Err("manifest_partition_mismatch"));
+    assert!(
+        crate::db::list_builds_for_hash(&db.lock().unwrap(), "seed", content_hash)
+            .unwrap()
+            .is_empty()
     );
 }

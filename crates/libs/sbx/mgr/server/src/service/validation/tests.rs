@@ -1,5 +1,6 @@
 use super::normalize_environment_input;
 use super::require_environment_acknowledgement;
+use super::template_base_snapshot_dir;
 use pplx_space_common_core::types::{Arch, EnvironmentReference, ExecutionMetadata};
 
 #[test]
@@ -425,4 +426,28 @@ fn memory_state_support_follows_complete_environment_identity() {
     ] {
         assert_eq!(super::requires_cold_creation(&execution), cold_only);
     }
+}
+
+#[test]
+fn a_capture_publishes_under_its_own_environment_s_cache_partition() {
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let initial = pplx_space_node_runtime_core::catalog::initial_environment_reference().unwrap();
+    let twin = EnvironmentReference::new(pplx_space_common_core::types::Digest::sha256([2; 32]));
+    let bound = |environment| {
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).with_environment(environment)
+    };
+    let dir = |execution: Option<&ExecutionMetadata>| {
+        template_base_snapshot_dir("seed", &hash, execution, 2, 1024)
+    };
+    let legacy = dir(None);
+    assert!(
+        legacy.contains(&format!("/seed/snapshots/{hash}/")),
+        "{legacy}"
+    );
+    assert_eq!(dir(Some(&bound(initial))), legacy);
+    let twin_dir = dir(Some(&bound(twin)));
+    assert!(
+        twin_dir.contains(&format!("/seed/snapshots/{hash}@{twin}/")),
+        "{twin_dir}"
+    );
 }

@@ -1509,3 +1509,79 @@ fn the_budget_outlasts_several_connect_retry_attempts() {
          before a fourth dial attempt"
     );
 }
+
+#[test]
+fn template_publication_prefers_each_name_s_legacy_build() {
+    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    let listed = |name: &str, hash: u8, environment: Option<String>| {
+        pplx_space_template_mgr_client::proto::TemplateFullInfo {
+            name: name.into(),
+            content_hash: Some(Digest::blake3([hash; 32]).to_string()),
+            execution: Some(pplx_space_execution_common::proto::ExecutionMetadata {
+                environment,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    };
+    let initial = || {
+        Some(
+            pplx_space_node_runtime_core::catalog::initial_environment_reference()
+                .unwrap()
+                .to_string(),
+        )
+    };
+    let other = || Some(EnvironmentReference::new(Digest::sha256([2; 32])).to_string());
+    let published = |templates| {
+        local_state::published_template_builds(templates)
+            .into_iter()
+            .map(|(name, template)| (name, (template.content_hash.unwrap(), template.execution)))
+            .collect::<Vec<_>>()
+    };
+    let unbound = pplx_space_template_mgr_client::proto::TemplateFullInfo {
+        execution: None,
+        ..listed("unbound", 4, None)
+    };
+
+    assert_eq!(
+        published(vec![
+            // A twin listed either side of its legacy sibling loses.
+            listed("twins", 1, other()),
+            listed("twins", 1, initial()),
+            listed("twins", 1, other()),
+            // Only another environment's build: publish it.
+            listed("bound", 3, other()),
+            unbound.clone(),
+            // The last listed legacy build wins, as before partitions.
+            listed("latest", 5, None),
+            listed("latest", 6, None),
+        ]),
+        vec![
+            (
+                "bound".into(),
+                (
+                    Digest::blake3([3; 32]).to_string(),
+                    listed("", 0, other()).execution
+                )
+            ),
+            (
+                "latest".into(),
+                (
+                    Digest::blake3([6; 32]).to_string(),
+                    listed("", 0, None).execution
+                )
+            ),
+            (
+                "twins".into(),
+                (
+                    Digest::blake3([1; 32]).to_string(),
+                    listed("", 0, initial()).execution
+                )
+            ),
+            (
+                "unbound".into(),
+                (Digest::blake3([4; 32]).to_string(), None)
+            ),
+        ]
+    );
+}

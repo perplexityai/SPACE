@@ -107,6 +107,24 @@ struct ScratchScriptBundle {
 
 pub struct BuildOutcome {
     pub content_hash: Option<String>,
+    /// Environment the registered build is bound to, which selects the
+    /// template-manager cache partition its artifacts live in.
+    pub environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+}
+
+/// A build template-manager accepted.
+pub(crate) struct RegisteredBuild {
+    content_hash: String,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+}
+
+impl From<RegisteredBuild> for BuildOutcome {
+    fn from(build: RegisteredBuild) -> Self {
+        Self {
+            content_hash: Some(build.content_hash),
+            environment: build.environment,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1345,14 +1363,12 @@ impl TemplateBuilder {
         // layout and deliberately leaves the source intact so a retry after
         // a lost response converges on the published digest. The guard drops
         // (and reaps) when this function returns.
-        let content_hash = build_phase(template_id, BuildPhase::RegisterTemplate, async {
+        let registered = build_phase(template_id, BuildPhase::RegisterTemplate, async {
             register_built_template(template_id, &staging_dir_name, false).await
         })
         .await?;
         drop(staging_guard);
-        Ok(BuildOutcome {
-            content_hash: Some(content_hash),
-        })
+        Ok(registered.into())
     }
 
     async fn build_from_scratch(
@@ -1495,14 +1511,12 @@ impl TemplateBuilder {
         }
 
         println!("Scratch build output: {final_output_dir}");
-        let content_hash = build_phase(template_id, BuildPhase::RegisterTemplate, async {
+        let registered = build_phase(template_id, BuildPhase::RegisterTemplate, async {
             register_built_template(template_id, &staging_dir_name, true).await
         })
         .await?;
 
-        Ok(BuildOutcome {
-            content_hash: Some(content_hash),
-        })
+        Ok(registered.into())
     }
 }
 
@@ -1526,13 +1540,13 @@ async fn register_built_template(
     template_id: &str,
     staging_dir_name: &str,
     scratch: bool,
-) -> Result<String, BuildError> {
+) -> Result<RegisteredBuild, BuildError> {
     const ATTEMPTS: u32 = 30;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
     let mut last_error = None;
     for attempt in 1..=ATTEMPTS {
         match register_built_template_once(template_id, staging_dir_name, scratch).await {
-            Ok(content_hash) => return Ok(content_hash),
+            Ok(registered) => return Ok(registered),
             Err(error) => {
                 tracing::warn!(
                     template_id,
@@ -1554,7 +1568,7 @@ async fn register_built_template_once(
     template_id: &str,
     staging_dir_name: &str,
     scratch: bool,
-) -> Result<String, BuildError> {
+) -> Result<RegisteredBuild, BuildError> {
     let Ok(mut tmpl_client) = pplx_space_template_mgr_client::connect().await else {
         if scratch {
             eprintln!("  WARNING: could not connect to template-manager to register scratch build");
@@ -1572,6 +1586,7 @@ async fn register_built_template_once(
                 name: template_id.to_string(),
                 content_hash: None,
                 tag: Some(DEFAULT_TEMPLATE_TAG.to_string()),
+                environment: None,
             }),
             network_policy: None,
             staging_dir: Some(staging_dir_name.to_string()),
@@ -1592,10 +1607,27 @@ async fn register_built_template_once(
                 "  Content hash: {}",
                 registered_hash.as_deref().unwrap_or("<unknown>")
             );
-            registered_hash.ok_or_else(|| {
+            let content_hash = registered_hash.ok_or_else(|| {
                 BuildError::message(format!(
                     "template-manager registration for '{template_id}' returned no content hash"
                 ))
+            })?;
+            // Template-managers that predate cache partitions never echo an
+            // environment; they keep every build in the legacy layout.
+            let environment = inner
+                .template
+                .as_ref()
+                .and_then(|template| template.environment.as_deref())
+                .map(str::parse)
+                .transpose()
+                .map_err(|error| {
+                    BuildError::message(format!(
+                        "template-manager registration for '{template_id}' returned an invalid environment: {error}"
+                    ))
+                })?;
+            Ok(RegisteredBuild {
+                content_hash,
+                environment,
             })
         }
         Err(e) => {
@@ -1625,7 +1657,9 @@ pub async fn prune_replaced_template_builds(template_id: &str, keep_hash: &str) 
         }
     };
 
-    let old_hashes: Vec<String> = response
+    // A hash cached for several environments is listed once per cache
+    // partition, and one delete removes them all.
+    let old_hashes: std::collections::BTreeSet<String> = response
         .templates
         .into_iter()
         .filter(|template| template.name == template_id)
@@ -1645,6 +1679,7 @@ pub async fn prune_replaced_template_builds(template_id: &str, keep_hash: &str) 
                     name: template_id.to_string(),
                     content_hash: Some(hash.clone()),
                     tag: None,
+                    environment: None,
                 }),
             })
             .await;

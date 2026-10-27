@@ -99,8 +99,14 @@ impl ImportFixture {
             name: "register-refresh-test".into(),
             content_hash: Some(content_hash.clone()),
             tag: None,
+            environment: None,
         };
-        let directory = build_artifacts_dir(&root, &template.name, &content_hash);
+        let directory = build_artifacts_dir(
+            &root,
+            &template.name,
+            &content_hash,
+            crate::db::TemplateCachePartition::Legacy,
+        );
         std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
         std::fs::rename(source.path(), &directory).unwrap();
         let mut service =
@@ -208,6 +214,7 @@ impl ImportFixture {
             &self.service.artifact_store.root,
             &self.template.name,
             hash,
+            crate::db::TemplateCachePartition::Legacy,
             1,
             512,
         );
@@ -222,10 +229,13 @@ impl ImportFixture {
         }
         crate::db::upsert_snapshot(
             &self.service.db.lock().unwrap(),
-            &self.template.name,
-            hash,
-            1,
-            512,
+            crate::db::SnapshotKey {
+                name: &self.template.name,
+                content_hash: hash,
+                cache_partition: crate::db::TemplateCachePartition::Legacy,
+                vcpu: 1,
+                memory_mib: 512,
+            },
             "original",
         )
         .unwrap();
@@ -235,10 +245,13 @@ impl ImportFixture {
     fn snapshot_state(&self, path: &Path) -> (Vec<Vec<u8>>, String, String) {
         let row = crate::db::get_snapshot(
             &self.service.db.lock().unwrap(),
-            &self.template.name,
-            self.template.content_hash.as_deref().unwrap(),
-            1,
-            512,
+            crate::db::SnapshotKey {
+                name: &self.template.name,
+                content_hash: self.template.content_hash.as_deref().unwrap(),
+                cache_partition: crate::db::TemplateCachePartition::Legacy,
+                vcpu: 1,
+                memory_mib: 512,
+            },
         )
         .unwrap()
         .unwrap();
@@ -258,6 +271,7 @@ impl ImportFixture {
             &self.service.db.lock().unwrap(),
             &self.template.name,
             self.template.content_hash.as_deref().unwrap(),
+            crate::db::TemplateCachePartition::Legacy,
         )
         .unwrap()
         .unwrap();

@@ -38,14 +38,14 @@ use crate::proto::{
     BtrfsEncodeRootfsSendRequest, BtrfsEncodeRootfsSendResponse,
     BtrfsEncodeSnapshotRootfsSendRequest, BtrfsEncodeSnapshotRootfsSendResponse,
     BtrfsFinalizeTemplateSubvolumeRequest, BtrfsFinalizeTemplateSubvolumeResponse,
-    BtrfsReceiveInstanceRequest, BtrfsReceiveInstanceResponse,
+    BtrfsReceiveInstanceRequest, BtrfsReceiveInstanceResponse, EnvironmentTemplateBuild,
 };
 
 use pplx_space_common_core::host::linux::paths::TEMPLATE_CACHE_DIR_MODE;
 use pplx_space_common_svc::core::host::linux::identities::{gids, users};
 
 use super::validation::validate_sandbox_id;
-use super::{CACHE_DIR, NodeManagerService, TEMPLATE_DIR};
+use super::{CACHE_DIR, NodeManagerService};
 use super::{artifact_fs, trusted_paths};
 
 const ALLOW_NODEMGR_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
@@ -113,8 +113,89 @@ fn validate_content_hash(hash: &str) -> Result<(), Status> {
         })
 }
 
-fn template_digest_dir(name: &str, content_hash: &str) -> PathBuf {
-    PathBuf::from(format!("{TEMPLATE_DIR}/{name}/{content_hash}"))
+/// A template build named by a btrfs request: the legacy `content_hash`
+/// field, or an [`EnvironmentTemplateBuild`] for a build in an environment's
+/// cache partition. Both forms are validated here, at the privilege boundary,
+/// and the partition is derived from the environment rather than trusted.
+#[derive(Clone, Debug)]
+struct TemplateBuildTarget {
+    name: String,
+    content_hash: String,
+    partition: pplx_space_common_core::types::TemplateCachePartition,
+}
+
+impl TemplateBuildTarget {
+    fn parse(
+        name: &str,
+        content_hash: &str,
+        environment_build: Option<&EnvironmentTemplateBuild>,
+    ) -> Result<Self, Status> {
+        use pplx_space_common_core::types::{EnvironmentReference, TemplateCachePartition};
+
+        validate_template_name(name)?;
+        let (content_hash, partition) = match environment_build {
+            None => (content_hash, TemplateCachePartition::Legacy),
+            Some(build) => {
+                if !content_hash.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "set either content_hash or environment_build, not both",
+                    ));
+                }
+                let environment =
+                    build
+                        .environment
+                        .parse::<EnvironmentReference>()
+                        .map_err(|error| {
+                            Status::invalid_argument(format!(
+                                "invalid environment_build.environment '{}': {error}",
+                                build.environment
+                            ))
+                        })?;
+                let partition = pplx_space_node_runtime_core::catalog::template_cache_partition(
+                    Some(environment),
+                );
+                if partition == TemplateCachePartition::Legacy {
+                    return Err(Status::invalid_argument(
+                        "environment_build names the initial environment; use content_hash",
+                    ));
+                }
+                (build.content_hash.as_str(), partition)
+            }
+        };
+        validate_content_hash(content_hash)?;
+        Ok(Self {
+            name: name.to_string(),
+            content_hash: content_hash.to_string(),
+            partition,
+        })
+    }
+
+    fn dir_name(&self) -> String {
+        self.partition.build_dir_name(&self.content_hash)
+    }
+
+    fn digest_dir(&self) -> PathBuf {
+        PathBuf::from(
+            pplx_space_common_core::host::linux::paths::template_build_dir(
+                &self.name,
+                &self.content_hash,
+                self.partition,
+            ),
+        )
+    }
+
+    fn received_uuid(&self) -> uuid::Uuid {
+        pplx_space_common_core::host::btrfs::deterministic_template_received_uuid(
+            &self.name,
+            &self.dir_name(),
+        )
+    }
+}
+
+impl std::fmt::Display for TemplateBuildTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.name, self.dir_name())
+    }
 }
 
 fn sandbox_dir(sandbox_id: &str) -> PathBuf {
@@ -169,18 +250,13 @@ struct ValidatedSendParent {
     uuid: uuid::Uuid,
 }
 
-fn validated_send_parent(
-    template_name: &str,
-    content_hash: &str,
-) -> Result<ValidatedSendParent, Status> {
-    validate_template_name(template_name)?;
-    validate_content_hash(content_hash)?;
-    let path = template_digest_dir(template_name, content_hash);
+fn validated_send_parent(template: &TemplateBuildTarget) -> Result<ValidatedSendParent, Status> {
+    let path = template.digest_dir();
     if !artifact_fs::is_subvolume(&path)? {
         return Err(lineage_precondition(
             LineageFallbackCause::TemplateNotSubvolume,
             format!(
-                "btrfs-send codec requires template {template_name}@{content_hash} to be a local \
+                "btrfs-send codec requires template {template} to be a local \
                  btrfs subvolume; this node still has the legacy directory-form template. \
                  Retry with format=full or wait for tmplmgr to re-install this build."
             ),
@@ -198,11 +274,7 @@ fn validated_send_parent(
             path.display()
         ))
     })?;
-    let expected_received =
-        pplx_space_common_core::host::btrfs::deterministic_template_received_uuid(
-            template_name,
-            content_hash,
-        );
+    let expected_received = template.received_uuid();
     if info.received_uuid != Some(expected_received) {
         return Err(lineage_precondition(
             LineageFallbackCause::TemplateReceivedUuidMismatch,
@@ -453,10 +525,13 @@ impl NodeManagerService {
             ALLOW_NODEMGR_ADMIN_OR_TMPLMGR,
         )?;
         let req = request.get_ref();
-        validate_template_name(&req.template_name)?;
-        validate_content_hash(&req.content_hash)?;
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            req.environment_build.as_ref(),
+        )?;
 
-        let digest_dir = template_digest_dir(&req.template_name, &req.content_hash);
+        let digest_dir = template.digest_dir();
         let digest_dir_for_section = digest_dir.clone();
         self.off_runtime("create template subvolume", move || {
             let digest_dir = digest_dir_for_section;
@@ -500,15 +575,14 @@ impl NodeManagerService {
             ALLOW_NODEMGR_ADMIN_OR_TMPLMGR,
         )?;
         let req = request.get_ref();
-        validate_template_name(&req.template_name)?;
-        validate_content_hash(&req.content_hash)?;
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            req.environment_build.as_ref(),
+        )?;
 
-        let digest_dir = template_digest_dir(&req.template_name, &req.content_hash);
-        let received_uuid =
-            pplx_space_common_core::host::btrfs::deterministic_template_received_uuid(
-                &req.template_name,
-                &req.content_hash,
-            );
+        let digest_dir = template.digest_dir();
+        let received_uuid = template.received_uuid();
         self.off_runtime("finalize template subvolume", move || {
             let digest = trusted_paths::open_directory(&digest_dir)?;
             let (_, info) = artifact_fs::btrfs::info(&digest).map_err(artifact_fs::error)?;
@@ -534,10 +608,13 @@ impl NodeManagerService {
             ALLOW_NODEMGR_ADMIN_OR_TMPLMGR,
         )?;
         let req = request.get_ref();
-        validate_template_name(&req.template_name)?;
-        validate_content_hash(&req.content_hash)?;
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            req.environment_build.as_ref(),
+        )?;
 
-        let digest_dir = template_digest_dir(&req.template_name, &req.content_hash);
+        let digest_dir = template.digest_dir();
         self.off_runtime("delete template subvolume", move || {
             delete_subvolume_or_dir(&digest_dir)
         })
@@ -576,10 +653,15 @@ impl NodeManagerService {
             }
             None => snapshot_dir(&req.sandbox_id),
         };
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            // Sandbox codec requests name legacy-partition builds.
+            None,
+        )?;
         let send_parent = {
             let snapshot_dir = snapshot_dir.clone();
-            let template_name = req.template_name.clone();
-            let content_hash = req.content_hash.clone();
+            let template = template.clone();
             self.off_runtime("validate suspend send parent", move || {
                 trusted_paths::create_directory(&snapshot_dir).map_err(|error| {
                     Status::internal(format!(
@@ -587,7 +669,7 @@ impl NodeManagerService {
                         snapshot_dir.display()
                     ))
                 })?;
-                validated_send_parent(&template_name, &content_hash)
+                validated_send_parent(&template)
             })
             .await?
         };
@@ -701,8 +783,7 @@ impl NodeManagerService {
 
         tracing::info!(
             sandbox_id = %req.sandbox_id,
-            template = %req.template_name,
-            content_hash = %req.content_hash,
+            template = %template,
             stream = %stream_path.display(),
             stream_bytes,
             "btrfs-send codec: rootfs encoded as btrfs send -p stream"
@@ -738,10 +819,15 @@ impl NodeManagerService {
     ) -> Result<Response<BtrfsEncodeSnapshotRootfsSendResponse>, Status> {
         let req = request.get_ref();
         let source = named_snapshot_send_source(&req.sandbox_id, &req.snapshot_name)?;
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            // Sandbox codec requests name legacy-partition builds.
+            None,
+        )?;
         let send_parent = {
             let source = source.clone();
-            let template_name = req.template_name.clone();
-            let content_hash = req.content_hash.clone();
+            let template = template.clone();
             let instance_path = instance_dir(&req.sandbox_id);
             self.off_runtime("validate named-snapshot send lineage", move || {
                 if !artifact_fs::is_subvolume(&source)? {
@@ -753,7 +839,7 @@ impl NodeManagerService {
                         ),
                     ));
                 }
-                let send_parent = validated_send_parent(&template_name, &content_hash)?;
+                let send_parent = validated_send_parent(&template)?;
                 let instance_info = artifact_fs::info(&instance_path).map_err(|error| {
                     lineage_precondition(
                         LineageFallbackCause::InstanceNotSubvolume,
@@ -838,8 +924,7 @@ impl NodeManagerService {
         tracing::info!(
             sandbox_id = %req.sandbox_id,
             snapshot_name = %req.snapshot_name,
-            template = %req.template_name,
-            content_hash = %req.content_hash,
+            template = %template,
             stream = %stream_path.display(),
             stream_bytes,
             "encoded immutable named snapshot as parent-relative btrfs stream"
@@ -873,8 +958,12 @@ impl NodeManagerService {
     ) -> Result<Response<BtrfsReceiveInstanceResponse>, Status> {
         let req = request.get_ref();
         validate_sandbox_id(&req.sandbox_id)?;
-        validate_template_name(&req.template_name)?;
-        validate_content_hash(&req.content_hash)?;
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            // Sandbox codec requests name legacy-partition builds.
+            None,
+        )?;
         let target = req
             .target
             .as_ref()
@@ -882,29 +971,22 @@ impl NodeManagerService {
             .try_into()?;
         let _gate = self.lock_sandbox_cgroups(&req.sandbox_id).await;
         let sandbox_root = self.instance_target_root(&req.sandbox_id, target).await?;
-        self.btrfs_receive_instance_at(
-            &req.sandbox_id,
-            &req.template_name,
-            &req.content_hash,
-            sandbox_root,
-        )
-        .await
+        self.btrfs_receive_instance_at(&req.sandbox_id, &template, sandbox_root)
+            .await
     }
 
     async fn btrfs_receive_instance_at(
         &self,
         sandbox_id: &str,
-        template_name: &str,
-        content_hash: &str,
+        template: &TemplateBuildTarget,
         sandbox_root: PathBuf,
     ) -> Result<Response<BtrfsReceiveInstanceResponse>, Status> {
-        let template_dir = template_digest_dir(template_name, content_hash);
+        let template_dir = template.digest_dir();
         let instance_path = sandbox_root.join("instance");
         let stream_path = rootfs_btrfs_send_path(&sandbox_root.join("snapshot"));
         let stream_len = {
             let template_dir = template_dir.clone();
-            let template_name = template_name.to_string();
-            let content_hash = content_hash.to_string();
+            let template = template.clone();
             let stream_path = stream_path.clone();
             self.off_runtime("validate restore template", move || {
                 let template_path = template_dir.as_path();
@@ -917,25 +999,20 @@ impl NodeManagerService {
                 // which the caller treats as a real codec failure.
                 let template_info = artifact_fs::info(template_path).map_err(|e| {
                     Status::failed_precondition(format!(
-                        "btrfs-send restore needs template {}@{} as a btrfs subvolume on \
+                        "btrfs-send restore needs template {} as a btrfs subvolume on \
                                  this node; read_subvolume_info({}) failed: {e}",
-                        template_name,
-                        content_hash,
+                        template,
                         template_path.display(),
                     ))
                 })?;
-                let expected_received =
-                    pplx_space_common_core::host::btrfs::deterministic_template_received_uuid(
-                        &template_name,
-                        &content_hash,
-                    );
+                let expected_received = template.received_uuid();
                 if template_info.received_uuid != Some(expected_received) {
                     return Err(Status::failed_precondition(format!(
-                        "btrfs-send restore needs template {}@{} \
+                        "btrfs-send restore needs template {} \
                          received_uuid={expected_received} on this node; got {:?}. The template \
                          was installed before the stamp landed; force a re-install via tmplmgr \
                          to recover.",
-                        template_name, content_hash, template_info.received_uuid,
+                        template, template_info.received_uuid,
                     )));
                 }
                 Ok(std::fs::metadata(&stream_path)
@@ -962,8 +1039,7 @@ impl NodeManagerService {
 
         tracing::info!(
             sandbox_id,
-            template = template_name,
-            content_hash,
+            template = %template,
             instance = %instance_path.display(),
             "btrfs-send codec: instance reconstructed from btrfs receive"
         );

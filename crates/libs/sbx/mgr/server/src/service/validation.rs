@@ -426,26 +426,34 @@ pub(super) fn normalize_environment_input(
     Ok(Some(reference))
 }
 
-fn initial_environment_reference() -> Option<pplx_space_common_core::types::EnvironmentReference> {
-    use pplx_space_common_core::types::Arch;
-    use pplx_space_node_runtime_core::catalog::InitialEnvironment;
-    static INITIAL: std::sync::OnceLock<
-        Option<pplx_space_common_core::types::EnvironmentReference>,
-    > = std::sync::OnceLock::new();
-    *INITIAL.get_or_init(
-        || match InitialEnvironment::for_architecture(Arch::X86_64) {
-            Ok(initial) => match initial.definition() {
-                Ok(definition) => Some(definition.reference()),
-                Err(error) => {
-                    tracing::warn!(%error, "initial environment definition unavailable");
-                    None
-                }
-            },
-            Err(error) => {
-                tracing::warn!(%error, "initial environment pins unavailable");
-                None
-            }
-        },
+/// Template cache partition of the build a sandbox with this binding was
+/// created from. A sandbox boots its template's binding, so the two agree
+/// until a runtime upgrade rebinds the sandbox; callers whose guess then
+/// misses fall back through their existing lineage checks.
+pub(crate) fn sandbox_template_partition(
+    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+) -> pplx_space_common_core::types::TemplateCachePartition {
+    pplx_space_node_runtime_core::catalog::template_cache_partition(
+        execution.and_then(|execution| execution.environment()),
+    )
+}
+
+/// Where a capture sandbox's base snapshot is published: under the cache
+/// partition of the environment it booted, so a twin's capture never
+/// overwrites its legacy sibling's snapshot.
+pub(crate) fn template_base_snapshot_dir(
+    template: &str,
+    content_hash: &str,
+    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    vcpu: u32,
+    memory_mib: u32,
+) -> String {
+    pplx_space_common_core::host::linux::paths::template_snapshot_dir(
+        template,
+        content_hash,
+        sandbox_template_partition(execution),
+        vcpu,
+        memory_mib,
     )
 }
 
@@ -454,9 +462,8 @@ fn initial_environment_reference() -> Option<pplx_space_common_core::types::Envi
 pub(super) fn is_non_default_execution(
     execution: &pplx_space_common_core::types::ExecutionMetadata,
 ) -> bool {
-    execution
-        .environment()
-        .is_some_and(|reference| Some(reference) != initial_environment_reference())
+    sandbox_template_partition(Some(execution))
+        != pplx_space_common_core::types::TemplateCachePartition::Legacy
 }
 
 /// Bound environments require qualified memory-state support before any
@@ -479,7 +486,9 @@ pub(super) fn requires_cold_creation(
         Err(error) => {
             tracing::warn!(%error, "additional environment catalog unavailable; retaining initial memory-state support");
             // The initial binding's qualification does not depend on additional pins.
-            initial_environment_reference().into_iter().collect()
+            pplx_space_node_runtime_core::catalog::initial_environment_reference()
+                .into_iter()
+                .collect()
         }
     });
     !supported.contains(&reference)
