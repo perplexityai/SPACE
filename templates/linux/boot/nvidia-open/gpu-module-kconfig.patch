@@ -1,0 +1,12 @@
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -663,8 +663,8 @@
+ 	  memory available to the CPU. Enabled by default when HIGHMEM is
+ 	  selected, but you may say n to override this.
+ 
+ config MMU_NOTIFIER
+-	bool
++	bool "MMU notifier support for external GPU modules"
+ 	select SRCU
+ 	select INTERVAL_TREE
+ 
