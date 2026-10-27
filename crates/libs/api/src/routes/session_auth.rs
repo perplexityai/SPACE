@@ -14,6 +14,7 @@ use uuid::Uuid;
 use super::AppState;
 use crate::{
     auth::{generate_session_token, hash_token, verify_password},
+    external_console::ConsoleAuthConfig,
     middleware::auth::{AuthOrg, AuthUser, bearer_token, require_auth},
     models::{Cluster, LoginRequest, LoginResponse, Organization, User},
 };
@@ -49,6 +50,10 @@ enum AuthRouteError {
     InvalidCredentials,
     #[error("Missing or invalid Authorization header")]
     MissingBearerToken,
+    /// External console mode: identity comes from the console's sign-in
+    /// provider, so this process issues no password sessions.
+    #[error("Password sign-in is disabled; sign in through the console's identity provider")]
+    PasswordLoginDisabled,
     #[error("Internal server error")]
     Internal(#[source] sqlx::Error),
     #[error("Internal server error")]
@@ -82,6 +87,7 @@ impl AuthRouteError {
     fn status(&self) -> StatusCode {
         match self {
             Self::InvalidCredentials | Self::MissingBearerToken => StatusCode::UNAUTHORIZED,
+            Self::PasswordLoginDisabled => StatusCode::FORBIDDEN,
             Self::Internal(_) | Self::Password(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Contended => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -118,15 +124,35 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
     Router::new().nest(
         "/auth/v1",
         Router::new()
+            .route("/config", get(auth_config))
             .route("/sessions", post(create_session))
             .merge(protected),
     )
+}
+
+/// Unauthenticated auth-mode discovery, so the console can choose between its
+/// password form and the external sign-in flow before it holds a credential.
+async fn auth_config(State(state): State<AppState>) -> Response {
+    let config = state
+        .external_console
+        .as_ref()
+        .map_or(ConsoleAuthConfig::Password, |external_console| {
+            external_console.auth_config()
+        });
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(config),
+    )
+        .into_response()
 }
 
 async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, AuthRouteError> {
+    if state.external_console.is_some() {
+        return Err(AuthRouteError::PasswordLoginDisabled);
+    }
     Ok(Json(
         create_session_for_password(&state.pool, request).await?,
     ))
@@ -152,6 +178,13 @@ async fn delete_current_session(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, AuthRouteError> {
+    // External console mode has no SPACE session to revoke: the console ends
+    // the provider session through its logout URL. A bearer token sent
+    // anyway is left alone, because this request did not authenticate with
+    // it.
+    if state.external_console.is_some() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let token = bearer_token(&headers).ok_or(AuthRouteError::MissingBearerToken)?;
     delete_session(&state.pool, token).await?;
     Ok(StatusCode::NO_CONTENT)

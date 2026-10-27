@@ -29,6 +29,7 @@ use axum::{
 use super::{AppState, authz, debug};
 use crate::{
     auth,
+    external_console::ExternalConsoleAuth,
     middleware::auth::{AuthOrg, AuthUser, bearer_token},
     routes::public::error::PublicApiError,
 };
@@ -318,22 +319,39 @@ async fn require_admin_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(token) = bearer_token(request.headers()) else {
-        return PublicApiError::unauthorized("Missing or invalid Authorization header")
-            .into_response();
-    };
-
-    let (user, org) = match auth::get_session_user(&state.pool, token).await {
-        Ok(Some(context)) => context,
-        Ok(None) => {
-            return PublicApiError::unauthorized("Invalid or expired session").into_response();
-        }
-        Err(error) => {
-            if let Some(contended) = read_contention_response(&error) {
-                return contended;
+    // With an external console authenticator installed, a console request
+    // with an admitted assertion is the only admin credential; bearer sessions
+    // are ignored. Admin authorization below is unchanged either way.
+    let (user, org) = if let Some(external_console) = &state.external_console {
+        let method = request.method().clone();
+        match external_console
+            .resolve(&state.pool, &method, request.headers())
+            .await
+        {
+            ExternalConsoleAuth::Principal(principal) => *principal,
+            ExternalConsoleAuth::NotConsole => {
+                return PublicApiError::unauthorized("Console sign-in is required").into_response();
             }
-            tracing::error!(%error, "failed to authenticate admin session");
-            return PublicApiError::internal().into_response();
+            ExternalConsoleAuth::Denied(error) => return error.into_response(),
+        }
+    } else {
+        let Some(token) = bearer_token(request.headers()) else {
+            return PublicApiError::unauthorized("Missing or invalid Authorization header")
+                .into_response();
+        };
+
+        match auth::get_session_user(&state.pool, token).await {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                return PublicApiError::unauthorized("Invalid or expired session").into_response();
+            }
+            Err(error) => {
+                if let Some(contended) = read_contention_response(&error) {
+                    return contended;
+                }
+                tracing::error!(%error, "failed to authenticate admin session");
+                return PublicApiError::internal().into_response();
+            }
         }
     };
 

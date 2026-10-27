@@ -372,6 +372,61 @@ calls.
 | `SPACE_BYOK_VOLUME_ENCRYPTION` | off | |
 | `SPACE_EGRESS_PROFILES`, `SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS` | unset / empty | |
 
+### External console sign-in
+
+By default the console signs in with a SPACE username and password. A
+deployment that puts the console behind an identity-aware proxy can instead
+install an `ExternalConsoleAuthenticator` through
+`ApiExtensions::with_external_console_authenticator` and start the API with
+`pplx_space_api::run_with`. The stock binaries install none, so these variables
+have no effect on them. The authenticator verifies the proxy's signed
+assertion and applies the deployment's admission policy; SPACE holds no
+provider-specific policy and never reads an unsigned identity header. Install
+the same authenticator on every API surface the console calls, including the
+admin API.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `SPACE_EXTERNAL_CONSOLE_TRUSTED_ORIGINS` | **required** with an authenticator | Comma-separated exact origins (`scheme://host[:port]`, at most 16) the console is served from. State-changing console requests must send a matching `Origin`. Invalid or empty fails startup. |
+| `SPACE_EXTERNAL_CONSOLE_PROVIDER_NAME` | `Single sign-on` | Name the console shows on its sign-in card. At most 64 characters, no control characters. |
+| `SPACE_EXTERNAL_CONSOLE_LOGOUT_URL` | unset | Where the console sends the browser to end the provider session: a same-origin absolute path or an `https` URL. |
+
+With an authenticator installed:
+
+- `GET /auth/v1/config` returns `{"mode":"external","provider_name":…,"logout_url":…}`
+  (otherwise `{"mode":"password"}`), unauthenticated and `no-store`, so the
+  console can choose its sign-in flow. A console that gets 404 here assumes
+  password mode.
+- A console request is one that carries `X-Space-Console-Request: 1` exactly
+  once; the console sends it on every request in this mode. Console requests
+  authenticate only with the assertion: none is a 401, and a rejected one is a
+  final 401, 403 or 503. A bearer token sent alongside is never used: console
+  routes ignore it and the native API refuses the combination. State-changing
+  methods also need a trusted `Origin`.
+- The verified email maps to an existing local user by exact match. Nothing is
+  provisioned and no role is granted: the user's own role and organization
+  authorize the request, so a member still cannot reach admin-only routes.
+  Federated owners and legacy disabled service accounts are not eligible.
+- Password login (`POST /auth/v1/sessions`) is refused with 403 and existing
+  password session tokens no longer authenticate, so an old session cannot
+  bypass the mode. `DELETE /auth/v1/session` revokes nothing; the console
+  ends the provider session through the logout URL instead.
+- Requests without the console header are machine requests. The native API
+  authenticates them with API keys exactly as before and never consults an
+  assertion the proxy attached; console-gated routes refuse them. Session
+  tokens are not accepted as native API credentials in this mode.
+- Each console decision increments `auth.external_console.decision` with
+  `result` `accepted`, `missing_assertion`, `unauthenticated`, `forbidden`,
+  `unavailable`, `csrf_rejected`, `no_user` or `lookup_failed`.
+- The authenticator runs inline on every console request with no timeout
+  applied by SPACE; it must bound its own latency.
+- Cross-origin requests never carry credentials: the API's CORS policy sets no
+  `Access-Control-Allow-Credentials`. The origin and header checks above rely
+  on that; do not relax it for the API host.
+
+Removing the authenticator and restarting restores password sign-in;
+password sessions that have not expired become valid again.
+
 ### Template mutation authority
 
 On worker and builder node-api, `DeleteTemplate`, `DeleteTemplateBuild`,

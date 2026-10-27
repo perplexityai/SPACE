@@ -148,3 +148,17 @@ pub fn template_lookup_compatibility(result: &str) {
         &[tag("result", result)],
     );
 }
+
+/// One external console authentication decision on a console gate.
+///
+/// `result`: `"accepted"`, `"missing_assertion"`, `"unauthenticated"`,
+/// `"forbidden"`, `"unavailable"`, `"csrf_rejected"`, `"no_user"` or
+/// `"lookup_failed"`. Only console requests (those carrying the console
+/// request header) are counted.
+pub fn external_console_decision(result: &str) {
+    counter(
+        "auth.external_console.decision",
+        1,
+        &[tag("result", result)],
+    );
+}

@@ -2,6 +2,7 @@ use pplx_space_common_core::types::OrgId;
 
 use crate::api_surface::ApiSurface;
 use crate::e2b::errors::E2bApiError;
+use crate::external_console::ExternalConsoleAuth;
 use crate::federated_identity::{
     FederatedOwner, federated_owner_from_headers, owner_headers_present,
 };
@@ -68,12 +69,43 @@ fn api_key(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
-pub async fn require_auth(
-    State(state): State<AppState>,
+/// Insert the principal a console gate resolved and continue.
+async fn run_as_console_user(
     mut request: Request,
     next: Next,
+    user: User,
+    org: Organization,
 ) -> Response {
+    request.extensions_mut().insert(AuthUser(user));
+    request.extensions_mut().insert(AuthOrg(org));
+    next.run(request).await
+}
+
+/// Console session auth for the `/auth/v1` routes.
+///
+/// With an external console authenticator installed, only a console request
+/// with an admitted assertion passes: a bearer session token is ignored, so an
+/// old password session cannot bypass the mode.
+pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let pool = &state.pool;
+
+    if let Some(external_console) = &state.external_console {
+        let method = request.method().clone();
+        return match external_console
+            .resolve(pool, &method, request.headers())
+            .await
+        {
+            ExternalConsoleAuth::Principal(principal) => {
+                let (user, org) = *principal;
+                run_as_console_user(request, next, user, org).await
+            }
+            ExternalConsoleAuth::NotConsole => {
+                PublicApiError::unauthorized("Console sign-in is required").into_response()
+            }
+            ExternalConsoleAuth::Denied(error) => error.into_response(),
+        };
+    }
+
     let token = bearer_token(request.headers());
 
     let Some(token) = token else {
@@ -84,11 +116,7 @@ pub async fn require_auth(
     };
 
     match crate::auth::get_session_user(pool, token).await {
-        Ok(Some((user, org))) => {
-            request.extensions_mut().insert(AuthUser(user));
-            request.extensions_mut().insert(AuthOrg(org));
-            next.run(request).await
-        }
+        Ok(Some((user, org))) => run_as_console_user(request, next, user, org).await,
         Ok(None) => {
             crate::routes::public::error::PublicApiError::unauthorized("Invalid or expired session")
                 .into_response()
@@ -254,12 +282,47 @@ fn federated_identity_error(
 /// service credential has no business reading `/auth/v1/cluster` or asking
 /// `/auth/v1/session` to delete a session it does not have, so the fallback
 /// belongs to the surface that needs it.
+///
+/// With an external console authenticator installed, the console user comes
+/// from the verified assertion instead of a session. A console request is
+/// decided by its assertion alone: a missing or refused assertion is final,
+/// and an admitted one may not also present a bearer credential. Any other
+/// request may still authenticate with a service credential, but never with a
+/// session token; the proxy's assertion on it is not consulted.
 pub async fn require_native_auth(
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let pool = &state.pool;
+
+    if let Some(external_console) = &state.external_console {
+        let method = request.method().clone();
+        match external_console
+            .resolve(pool, &method, request.headers())
+            .await
+        {
+            ExternalConsoleAuth::Principal(principal) => {
+                if request
+                    .headers()
+                    .contains_key(axum::http::header::AUTHORIZATION)
+                {
+                    return PublicApiError::unauthorized(
+                        "console sign-in may not be combined with another credential",
+                    )
+                    .into_response();
+                }
+                if owner_headers_present(request.headers()) {
+                    return PublicApiError::forbidden("console sign-in may not assert an owner")
+                        .into_response();
+                }
+                let (user, org) = *principal;
+                return run_as_console_user(request, next, user, org).await;
+            }
+            ExternalConsoleAuth::Denied(error) => return error.into_response(),
+            ExternalConsoleAuth::NotConsole => {}
+        }
+    }
 
     let Some(token) = bearer_token(request.headers()) else {
         return crate::routes::public::error::PublicApiError::unauthorized(
@@ -268,19 +331,19 @@ pub async fn require_native_auth(
         .into_response();
     };
 
-    match crate::auth::get_session_user(pool, token).await {
-        Ok(Some((user, org))) => {
-            if owner_headers_present(request.headers()) {
-                return PublicApiError::forbidden("sessions may not assert an owner")
-                    .into_response();
+    if state.external_console.is_none() {
+        match crate::auth::get_session_user(pool, token).await {
+            Ok(Some((user, org))) => {
+                if owner_headers_present(request.headers()) {
+                    return PublicApiError::forbidden("sessions may not assert an owner")
+                        .into_response();
+                }
+                return run_as_console_user(request, next, user, org).await;
             }
-            request.extensions_mut().insert(AuthUser(user));
-            request.extensions_mut().insert(AuthOrg(org));
-            return next.run(request).await;
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return crate::routes::public::error::PublicApiError::from(error).into_response();
+            Ok(None) => {}
+            Err(error) => {
+                return crate::routes::public::error::PublicApiError::from(error).into_response();
+            }
         }
     }
 

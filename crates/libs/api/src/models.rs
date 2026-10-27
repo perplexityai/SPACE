@@ -77,15 +77,27 @@ pub struct User {
     pub updated_at: OffsetDateTime,
 }
 
+// Bootstrap service users created before password markers were normalized
+// store this non-bcrypt value. Keep recognizing it for legacy rows; new
+// service-user provisioning writes the shared `!` marker.
+const LEGACY_DISABLED_SERVICE_ACCOUNT: &str = "disabled-service-account";
+
 impl User {
     pub fn password_login_configured(&self) -> bool {
-        // Bootstrap service users created before password markers were normalized
-        // store this non-bcrypt value. Keep recognizing it for legacy rows; new
-        // service-user provisioning writes the shared `!` marker.
-        const LEGACY_DISABLED_SERVICE_ACCOUNT: &str = "disabled-service-account";
-
         self.owner_source == SandboxOwnerSource::Local
             && self.password_hash != "!"
+            && self.password_hash != LEGACY_DISABLED_SERVICE_ACCOUNT
+    }
+
+    /// Whether a verified external console identity may act as this user.
+    ///
+    /// Federated owners are asserted by trusted machine integrations and never
+    /// sign in to the console, and the legacy disabled service-account marker
+    /// stays disabled. A local user whose password is locked (`!`) remains
+    /// eligible: the external authenticator replaces the password, and its
+    /// admission policy decides which identities reach this lookup at all.
+    pub fn external_console_sign_in_allowed(&self) -> bool {
+        self.owner_source == SandboxOwnerSource::Local
             && self.password_hash != LEGACY_DISABLED_SERVICE_ACCOUNT
     }
 }

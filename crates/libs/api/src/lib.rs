@@ -16,6 +16,7 @@ pub mod command_stream;
 pub mod controllers;
 pub mod e2b;
 pub mod egress_profiles;
+pub mod external_console;
 pub mod federated_identity;
 pub mod fork_operation_executor;
 mod fork_operation_store;
@@ -51,8 +52,8 @@ pub mod user_role;
 mod wake_trace;
 
 pub use run::{
-    ADMIN_SERVICE_NAME, ApiRunConfig, ApiSurface, DEFAULT_SHUTDOWN_GRACE_SECS, PUBLIC_SERVICE_NAME,
-    RunApiError, run,
+    ADMIN_SERVICE_NAME, ApiExtensions, ApiRunConfig, ApiSurface, DEFAULT_SHUTDOWN_GRACE_SECS,
+    PUBLIC_SERVICE_NAME, RunApiError, run, run_with,
 };
 
 #[cfg(test)]

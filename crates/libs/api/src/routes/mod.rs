@@ -54,6 +54,9 @@ pub struct AppState {
     /// See `routes::e2b::template_build` for the persisted keys.
     pub template_build_state: std::sync::Arc<crate::routes::e2b::TemplateBuildState>,
     pub federated_identity: crate::federated_identity::FederatedIdentityConfig,
+    /// External console identity; `None` keeps password sessions. See
+    /// [`crate::external_console`].
+    pub external_console: Option<crate::external_console::ExternalConsole>,
     pub data_plane_base_url: String,
     /// Relays a new command's event stream from `POST .../commands` when the
     /// caller accepts `text/event-stream`; `None` keeps the JSON-only answer.
@@ -188,6 +191,7 @@ impl AppState {
             drain_signal,
             template_build_state,
             federated_identity,
+            external_console: None,
             data_plane_base_url,
             command_stream,
             feature_flags,

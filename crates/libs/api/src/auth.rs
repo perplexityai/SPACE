@@ -74,6 +74,37 @@ pub async fn get_session_user(
     Ok(Some((user, org)))
 }
 
+/// Resolve the local SPACE user an external console identity maps to.
+///
+/// The email is matched exactly against `users.email`; nothing is created or
+/// changed. Only users eligible for console sign-in qualify (see
+/// [`User::external_console_sign_in_allowed`]). The user's own role and
+/// organization authorize the request afterwards, exactly as for a password
+/// session.
+pub async fn get_external_console_user(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<(User, Organization)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, User>(sql!("SELECT * FROM users WHERE email = $1"))
+        .bind(email)
+        .fetch_optional(pool)
+        .await?;
+
+    let Some(user) = row else {
+        return Ok(None);
+    };
+    if !user.external_console_sign_in_allowed() {
+        return Ok(None);
+    }
+
+    let org = sqlx::query_as::<_, Organization>(sql!("SELECT * FROM organizations WHERE id = $1"))
+        .bind(user.org_id)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(Some((user, org)))
+}
+
 /// Resolve a service credential for one surface.
 ///
 /// The surface is part of the lookup rather than a check the caller applies

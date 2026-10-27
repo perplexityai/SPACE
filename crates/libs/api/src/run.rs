@@ -91,6 +91,43 @@ impl std::fmt::Debug for ApiRunConfig {
     }
 }
 
+/// Optional integrations a private `main` installs at startup. Each is off by
+/// default, so [`run`] — which uses [`ApiExtensions::default`] — behaves
+/// exactly as a process with none installed.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct ApiExtensions {
+    external_console_authenticator:
+        Option<std::sync::Arc<dyn crate::external_console::ExternalConsoleAuthenticator>>,
+}
+
+impl ApiExtensions {
+    /// Authenticate console browser requests with `authenticator` instead of
+    /// SPACE password sessions. [`run_with`] reads the console settings from
+    /// the environment ([`crate::external_console::ExternalConsoleSettings::from_env`])
+    /// and refuses to start when they are invalid. See
+    /// [`crate::external_console`] for the request contract.
+    pub fn with_external_console_authenticator(
+        mut self,
+        authenticator: std::sync::Arc<dyn crate::external_console::ExternalConsoleAuthenticator>,
+    ) -> Self {
+        self.external_console_authenticator = Some(authenticator);
+        self
+    }
+}
+
+impl std::fmt::Debug for ApiExtensions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiExtensions")
+            .field(
+                "external_console_authenticator",
+                &self.external_console_authenticator.is_some(),
+            )
+            .finish()
+    }
+}
+
 /// Why [`run`] returned without a clean shutdown. Every variant is fatal to
 /// the process: each names a startup step that leaves the API unable to serve
 /// its surface, or the server itself failing, so none of them is something to
@@ -105,6 +142,8 @@ pub enum RunApiError {
     PublicCursorSecret(String),
     #[error("invalid or missing ECW credential signing configuration: {0}")]
     EcwCredentialConfiguration(#[source] pplx_space_common_svc::ecw_credential::EcwCredentialError),
+    #[error("invalid external console configuration: {0}")]
+    ExternalConsoleConfiguration(#[source] crate::external_console::ExternalConsoleConfigError),
     #[error("failed to bind the API listener on {listen}: {source}")]
     BindListener {
         listen: String,
@@ -158,7 +197,25 @@ fn drain_before_shutdown(
 /// Serve the configured API surface until `shutdown` fires or a fatal
 /// condition ends it. Telemetry must already be initialized by the caller.
 pub async fn run(config: ApiRunConfig, shutdown: CancellationToken) -> Result<(), RunApiError> {
+    run_with(config, ApiExtensions::default(), shutdown).await
+}
+
+/// [`run`] with optional integrations installed.
+pub async fn run_with(
+    config: ApiRunConfig,
+    extensions: ApiExtensions,
+    shutdown: CancellationToken,
+) -> Result<(), RunApiError> {
     let service_name = config.surface.service_name();
+    let external_console = extensions
+        .external_console_authenticator
+        .map(|authenticator| {
+            crate::external_console::ExternalConsoleSettings::from_env().map(|settings| {
+                crate::external_console::ExternalConsole::new(authenticator, settings)
+            })
+        })
+        .transpose()
+        .map_err(RunApiError::ExternalConsoleConfiguration)?;
     let route_ed25519_authority = match config.surface {
         ApiSurface::Admin => None,
         ApiSurface::Public | ApiSurface::Shared => Some(
@@ -189,7 +246,7 @@ pub async fn run(config: ApiRunConfig, shutdown: CancellationToken) -> Result<()
     let drain_signal = pplx_space_common_svc::DrainSignal::new();
     let shutdown_token = drain_before_shutdown(drain_signal.clone(), shutdown);
     let task_tracker = TaskTracker::new();
-    let state = AppState::from_pools_with_lifecycle(
+    let mut state = AppState::from_pools_with_lifecycle(
         pool,
         credentials_pool,
         drain_signal,
@@ -198,6 +255,14 @@ pub async fn run(config: ApiRunConfig, shutdown: CancellationToken) -> Result<()
         route_ed25519_authority.map(std::sync::Arc::new),
     )
     .await?;
+    if let Some(external_console) = external_console {
+        tracing::info!(
+            surface = ?config.surface,
+            trusted_origins = ?external_console.settings().trusted_origins(),
+            "external console identity enabled; console password sessions are disabled"
+        );
+        state.external_console = Some(external_console);
+    }
 
     let activation_server =
         crate::ingress_activation::server(&state, task_tracker.clone(), shutdown_token.clone())
