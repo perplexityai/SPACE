@@ -35,6 +35,7 @@ pub mod env;
 pub mod environment;
 pub use pplx_space_execution_spec::execution;
 pub mod federated_identity;
+pub use pplx_space_execution_spec::guest_image;
 pub use pplx_space_execution_spec::host_cpu;
 pub mod host_linux;
 pub mod kek;
