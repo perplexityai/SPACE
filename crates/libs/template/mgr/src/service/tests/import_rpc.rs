@@ -31,7 +31,7 @@ enum Change {
 #[case::digest(Change::Digest, Code::AlreadyExists)]
 #[case::size(Change::Size, Code::AlreadyExists)]
 #[case::corrupted_rootfs(Change::Corruption, Code::FailedPrecondition)]
-#[case::unsupported_schema(Change::Schema, Code::AlreadyExists)]
+#[case::unsupported_schema(Change::Schema, Code::FailedPrecondition)]
 #[case::registration_failure(Change::Registration, Code::Internal)]
 #[case::description(Change::Description, Code::Ok)]
 #[case::unchanged(Change::Unchanged, Code::Ok)]

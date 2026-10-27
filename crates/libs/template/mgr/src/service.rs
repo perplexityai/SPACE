@@ -2426,3 +2426,30 @@ mod transfer;
 
 use import_helpers::*;
 use support::*;
+
+/// Validate both documents before a reader copies, expands or rewrites a disk.
+fn validate_guest_documents(
+    metadata_bytes: &[u8],
+    manifest_bytes: &[u8],
+) -> Result<pplx_space_common_core::types::TemplateMetadata, Status> {
+    let metadata: pplx_space_common_core::types::TemplateMetadata = if metadata_bytes.is_empty() {
+        Default::default()
+    } else {
+        serde_json::from_slice(metadata_bytes).map_err(|error| {
+            Status::invalid_argument(format!("invalid template metadata: {error}"))
+        })?
+    };
+    metadata
+        .execution_metadata()
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if !manifest_bytes.is_empty() {
+        let manifest: pplx_space_common_core::types::TemplateManifest =
+            serde_json::from_slice(manifest_bytes).map_err(|error| {
+                Status::invalid_argument(format!("invalid template manifest: {error}"))
+            })?;
+        manifest
+            .execution_metadata()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    }
+    Ok(metadata)
+}
