@@ -8,7 +8,7 @@ import secrets
 import shlex
 import time
 from datetime import UTC, datetime, timedelta
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -139,6 +139,23 @@ SANDBOX_CLEANUP_RETRY_SECONDS = 1.0
 # row's idle time in.
 LOCAL_CLEANUP_MAX_QUIESCENCE_SECONDS = 60
 LOCAL_CLEANUP_QUIESCENCE_MARGIN_SECONDS = 2
+
+
+def snapshot_reap_residue(before: Iterable[str], after: Iterable[str]) -> list[str]:
+    """Entries of a reaped sandbox's snapshots directory that show the reap unfinished.
+
+    An entry named after one of `before` is still there, or GC staging is: the
+    reaper stages a directory as `.gc-pending-<artifact>` beside it (or, before
+    staging names had a fixed length, `<name>.gc-pending-<artifact>`) and only
+    then has node-mgr delete it.
+    """
+
+    names = tuple(before)
+    return sorted(
+        entry
+        for entry in after
+        if ".gc-pending-" in entry or any(entry.startswith(name) for name in names)
+    )
 
 
 def retry_sandbox_delete(delete: Callable[[], None]) -> int:
@@ -4848,10 +4865,11 @@ class SnapshotReaperAssertions:
     ) -> None:
         """Block until no trace of the fork's snapshot entries remains on disk.
 
-        The reaper renames the directory to `<name>.gc-pending-<artifact>`
-        before deleting the row, then asks node-mgr to remove it; a failed
-        RPC leaves the sibling behind for the orphan sweep. Waiting on the
-        original name alone would pass over exactly that residue.
+        The reaper renames the directory to `.gc-pending-<artifact>` beside
+        it (`<name>.gc-pending-<artifact>` before staging names had a fixed
+        length) before deleting the row, then asks node-mgr to remove it; a
+        failed RPC leaves the sibling behind for the orphan sweep. Waiting on
+        the original name alone would pass over exactly that residue.
         """
 
         config = self._config
@@ -4867,9 +4885,7 @@ class SnapshotReaperAssertions:
         deadline = time.monotonic() + timeout
         while True:
             after = self._control.sandbox_snapshot_dirs(node_name, self._fixture.sandbox.sandbox_id)
-            residue = sorted(
-                entry for entry in after if any(entry.startswith(name) for name in before)
-            )
+            residue = snapshot_reap_residue(before, after)
             if not residue:
                 self._fixture.record("snapshots_after_reap", list(after))
                 return

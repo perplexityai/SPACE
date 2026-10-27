@@ -1094,14 +1094,17 @@ fn list_pending_backups_fails_rather_than_dropping_an_undecodable_row() {
     );
 }
 
-/// `delete_named_snapshot` orders checkout, byte delete and row delete, and
-/// judges a failed byte delete from the disk: only a missing path commits. The
-/// snapshot's bytes are a real tempdir, so whether they survive is observed
-/// rather than inferred from which RPC ran.
+/// `delete_named_snapshot` follows the snapshot reaper's protocol: checkout,
+/// the path check, the rename to `.gc-pending-<id>` beside `local_path`, and
+/// the row delete; it then hands the staging to the caller, which deletes it
+/// after releasing its locks. The bytes are a real tempdir, so where they end
+/// up is observed rather than inferred. The staging path is spelled out here
+/// instead of taken from the code under test: startup recovery and the orphan
+/// sweep recognize only that shape.
 #[tokio::test]
-async fn named_delete_keeps_the_row_and_the_bytes_together() {
+async fn named_delete_moves_the_bytes_aside_before_deleting_the_row() {
     use crate::db::OptionalExtension as _;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use tonic::Code;
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Setup {
@@ -1113,188 +1116,165 @@ async fn named_delete_keeps_the_row_and_the_bytes_together() {
         SharedPath,
         UnreadableRow,
         PathDiffers,
-        RowCommitFails,
-        FailsAfterRemoving,
-        FailsLeavingBytes,
+        /// Nothing is at `local_path` to rename.
+        AlreadyGone,
+        /// A file holds the staging name, so the rename fails with ENOTDIR,
+        /// for root too.
+        RenameFails,
+        /// As `RenameFails`, and the first rollback fails; dropping the lease
+        /// retries it.
         RollBackFailsOnce,
-        FailsOnUnreadablePath,
-        NotFoundAfterRemoving,
-        NotFoundLeavingBytes,
+        RowCommitFails,
         UncataloguedNotFound,
+        UncataloguedDeleteFails,
     }
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Outcome {
+        /// Deleted, and the staging handed back is the expected path.
+        Staged,
+        /// Deleted, with no staging handed back.
         Deleted,
         InUse,
         Unreadable,
         PathDiffers,
         BytesNotDeleted,
     }
-    use tonic::Code;
-    // (setup, the byte delete removes the bytes, its result, whether it runs,
-    // the outcome, whether the bytes remain, and the row state afterwards)
+    /// Where the snapshot's bytes are afterwards.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Bytes {
+        AtLocalPath,
+        InStaging,
+        Gone,
+    }
+    // (setup, the in-place delete's result, whether it runs, the outcome,
+    // where the bytes are, and the row state afterwards). The in-place delete
+    // removes `local_path` unless it fails with `Unavailable`.
     let cases = [
         (
             Setup::Deletable,
-            true,
             Code::Ok,
-            true,
-            Outcome::Deleted,
             false,
+            Outcome::Staged,
+            Bytes::InStaging,
             None,
         ),
         (
             Setup::Uncatalogued,
-            true,
             Code::Ok,
             true,
             Outcome::Deleted,
-            false,
+            Bytes::Gone,
             None,
         ),
         (
             Setup::Pinned,
-            true,
             Code::Ok,
             false,
             Outcome::InUse,
-            true,
+            Bytes::AtLocalPath,
             Some("ready"),
         ),
         (
             Setup::Restoring,
-            true,
             Code::Ok,
             false,
             Outcome::InUse,
-            true,
+            Bytes::AtLocalPath,
             Some("restoring"),
         ),
         (
             Setup::AlreadyDeleting,
-            true,
             Code::Ok,
             false,
             Outcome::InUse,
-            true,
+            Bytes::AtLocalPath,
             Some("deleting"),
         ),
         (
             Setup::SharedPath,
-            true,
             Code::Ok,
             false,
             Outcome::InUse,
-            true,
+            Bytes::AtLocalPath,
             Some("ready"),
         ),
         (
             Setup::UnreadableRow,
-            true,
             Code::Ok,
             false,
             Outcome::Unreadable,
-            true,
+            Bytes::AtLocalPath,
             Some("ready"),
         ),
         // The row names a path other than the one the caller deletes.
         (
             Setup::PathDiffers,
-            true,
             Code::Ok,
             false,
             Outcome::PathDiffers,
-            true,
+            Bytes::AtLocalPath,
             Some("ready"),
         ),
         (
-            Setup::RowCommitFails,
-            true,
+            Setup::AlreadyGone,
             Code::Ok,
-            true,
-            Outcome::Deleted,
             false,
+            Outcome::Deleted,
+            Bytes::Gone,
+            None,
+        ),
+        (
+            Setup::RenameFails,
+            Code::Ok,
+            false,
+            Outcome::BytesNotDeleted,
+            Bytes::AtLocalPath,
+            Some("ready"),
+        ),
+        (
+            Setup::RollBackFailsOnce,
+            Code::Ok,
+            false,
+            Outcome::BytesNotDeleted,
+            Bytes::AtLocalPath,
+            Some("ready"),
+        ),
+        // The row still owns the staging, for startup recovery to finish, so
+        // none is handed back.
+        (
+            Setup::RowCommitFails,
+            Code::Ok,
+            false,
+            Outcome::Deleted,
+            Bytes::InStaging,
             Some("deleting"),
         ),
         (
-            Setup::FailsAfterRemoving,
-            true,
-            Code::Unavailable,
-            true,
-            Outcome::Deleted,
-            false,
-            None,
-        ),
-        (
-            Setup::FailsLeavingBytes,
-            false,
-            Code::Unavailable,
-            true,
-            Outcome::BytesNotDeleted,
-            true,
-            Some("ready"),
-        ),
-        // The first rollback fails, and dropping the lease retries it.
-        (
-            Setup::RollBackFailsOnce,
-            false,
-            Code::Unavailable,
-            true,
-            Outcome::BytesNotDeleted,
-            true,
-            Some("ready"),
-        ),
-        // An unreadable path rolls back too, so the delete stays retryable.
-        (
-            Setup::FailsOnUnreadablePath,
-            false,
-            Code::Unavailable,
-            true,
-            Outcome::BytesNotDeleted,
-            false,
-            Some("ready"),
-        ),
-        (
-            Setup::NotFoundAfterRemoving,
-            true,
-            Code::NotFound,
-            true,
-            Outcome::Deleted,
-            false,
-            None,
-        ),
-        // Node-manager can answer NotFound for a path it failed to stat.
-        (
-            Setup::NotFoundLeavingBytes,
-            false,
-            Code::NotFound,
-            true,
-            Outcome::BytesNotDeleted,
-            true,
-            Some("ready"),
-        ),
-        (
             Setup::UncataloguedNotFound,
-            true,
             Code::NotFound,
             true,
             Outcome::Deleted,
-            false,
+            Bytes::Gone,
+            None,
+        ),
+        (
+            Setup::UncataloguedDeleteFails,
+            Code::Unavailable,
+            true,
+            Outcome::BytesNotDeleted,
+            Bytes::AtLocalPath,
             None,
         ),
     ];
     const NAME: &str = "d-named-delete";
-    for (setup, removes, code, runs, outcome, kept, state) in cases {
+    const CONTENT: &[u8] = b"snapshot bytes";
+    for (setup, code, runs, outcome, bytes, state) in cases {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut local_path = tmp.path().join(NAME);
-        if setup == Setup::FailsOnUnreadablePath {
-            // A path under a regular file cannot be probed (ENOTDIR).
-            std::fs::write(tmp.path().join("file"), b"x").unwrap();
-            local_path = tmp.path().join("file").join(NAME);
-        } else {
+        let local_path = tmp.path().join(NAME).to_str().unwrap().to_owned();
+        if setup != Setup::AlreadyGone {
             std::fs::create_dir(&local_path).unwrap();
+            std::fs::write(Path::new(&local_path).join("memory"), CONTENT).unwrap();
         }
-        let local_path = local_path.to_str().unwrap().to_owned();
         let sandbox = SandboxId::new().to_string();
         let conn = open_test_db();
         crate::db::fixture::insert_test_sandbox(
@@ -1303,9 +1283,13 @@ async fn named_delete_keeps_the_row_and_the_bytes_together() {
             crate::state::SandboxState::Stopped,
         );
         let id = LocalArtifactId::new();
+        let staging = format!("{}/.gc-pending-{id}", tmp.path().display());
         let catalogued = !matches!(
             setup,
-            Setup::Uncatalogued | Setup::UncataloguedNotFound | Setup::UnreadableRow
+            Setup::Uncatalogued
+                | Setup::UncataloguedNotFound
+                | Setup::UncataloguedDeleteFails
+                | Setup::UnreadableRow
         );
         let db = crate::db::SharedConnection::new(conn);
         let store = LocalArtifacts::new(db.clone());
@@ -1319,6 +1303,9 @@ async fn named_delete_keeps_the_row_and_the_bytes_together() {
                     &local_path,
                 )
                 .unwrap();
+        }
+        if matches!(setup, Setup::RenameFails | Setup::RollBackFailsOnce) {
+            std::fs::write(&staging, b"occupied").unwrap();
         }
         let conn = db.lock().unwrap();
         match setup {
@@ -1371,28 +1358,24 @@ async fn named_delete_keeps_the_row_and_the_bytes_together() {
             Setup::Deletable
             | Setup::Uncatalogued
             | Setup::Restoring
-            | Setup::FailsAfterRemoving
             | Setup::PathDiffers
-            | Setup::FailsLeavingBytes
-            | Setup::FailsOnUnreadablePath
-            | Setup::NotFoundAfterRemoving
-            | Setup::NotFoundLeavingBytes
-            | Setup::UncataloguedNotFound => {}
+            | Setup::AlreadyGone
+            | Setup::RenameFails
+            | Setup::UncataloguedNotFound
+            | Setup::UncataloguedDeleteFails => {}
         }
         drop(conn);
         let reader = (setup == Setup::Restoring).then(|| store.check_out_for_restore(id).unwrap());
-        let ran = Arc::new(AtomicBool::new(false));
-        let delete_bytes = {
-            let (ran, local_path) = (Arc::clone(&ran), local_path.clone());
-            async move {
-                ran.store(true, Ordering::SeqCst);
-                if removes {
-                    std::fs::remove_dir(&local_path).unwrap();
-                }
-                match code {
-                    Code::Ok => Ok(()),
-                    code => Err(tonic::Status::new(code, "injected byte delete result")),
-                }
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let delete_in_place = async {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(Path::new(&local_path).starts_with(tmp.path()));
+            if code != Code::Unavailable {
+                std::fs::remove_dir_all(&local_path).unwrap();
+            }
+            match code {
+                Code::Ok => Ok(()),
+                code => Err(tonic::Status::new(code, "injected byte delete result")),
             }
         };
         let delete_path = if setup == Setup::PathDiffers {
@@ -1402,19 +1385,38 @@ async fn named_delete_keeps_the_row_and_the_bytes_together() {
         };
 
         let result = store
-            .delete_named_snapshot(&sandbox, NAME, &delete_path, delete_bytes)
+            .delete_named_snapshot(&sandbox, NAME, &delete_path, delete_in_place)
             .await;
 
         let observed = match result {
-            NamedSnapshotDelete::Deleted => Outcome::Deleted,
+            NamedSnapshotDelete::Deleted {
+                staging: Some(handed),
+            } => {
+                assert_eq!(handed, staging, "{setup:?}");
+                Outcome::Staged
+            }
+            NamedSnapshotDelete::Deleted { staging: None } => Outcome::Deleted,
             NamedSnapshotDelete::Refused(error) if error.is_in_use() => Outcome::InUse,
             NamedSnapshotDelete::Refused(_) => Outcome::Unreadable,
             NamedSnapshotDelete::PathDiffers { .. } => Outcome::PathDiffers,
             NamedSnapshotDelete::BytesNotDeleted(_) => Outcome::BytesNotDeleted,
         };
         assert_eq!(observed, outcome, "{setup:?}");
-        assert_eq!(ran.load(Ordering::SeqCst), runs, "{setup:?}");
-        assert_eq!(Path::new(&local_path).exists(), kept, "{setup:?}");
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            runs,
+            "{setup:?}"
+        );
+        let content = |dir: &str| std::fs::read(Path::new(dir).join("memory")).ok();
+        let at = match (content(&local_path), content(&staging)) {
+            (Some(at_local), None) if at_local == CONTENT => Bytes::AtLocalPath,
+            (None, Some(staged)) if staged == CONTENT => Bytes::InStaging,
+            (None, None) if !Path::new(&local_path).exists() && !Path::new(&staging).is_dir() => {
+                Bytes::Gone
+            }
+            (local, staged) => panic!("{setup:?}: local_path {local:?}, staging {staged:?}"),
+        };
+        assert_eq!(at, bytes, "{setup:?}");
         let row: Option<String> = db
             .lock()
             .unwrap()
@@ -1427,5 +1429,198 @@ async fn named_delete_keeps_the_row_and_the_bytes_together() {
             .unwrap();
         assert_eq!(row.as_deref(), state, "{setup:?}");
         drop(reader);
+    }
+}
+
+/// The staging name has a fixed length, so a snapshot whose own name is as long
+/// as a filename can be (255 bytes) still moves aside in one rename. Appending
+/// `.gc-pending-<id>` (48 bytes) to the name, as staging once did, fails from
+/// 208 bytes with ENAMETOOLONG and leaves the snapshot undeletable.
+#[tokio::test]
+async fn named_delete_stages_names_of_every_length() {
+    for length in [207, 208, 255] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let name = format!("d-{}", "x".repeat(length - 2));
+        let local_path = tmp.path().join(&name).to_str().unwrap().to_owned();
+        std::fs::create_dir(&local_path).unwrap();
+        std::fs::write(Path::new(&local_path).join("memory"), b"bytes").unwrap();
+        let sandbox = SandboxId::new().to_string();
+        let conn = open_test_db();
+        crate::db::fixture::insert_test_sandbox(
+            &conn,
+            &sandbox,
+            crate::state::SandboxState::Stopped,
+        );
+        let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
+        let id = LocalArtifactId::new();
+        store
+            .publish_named_snapshot(
+                &sandbox,
+                id,
+                ArtifactKind::Disk,
+                &SnapshotName::parse(name.clone()).unwrap(),
+                &local_path,
+            )
+            .unwrap();
+
+        let result = store
+            .delete_named_snapshot(&sandbox, &name, &local_path, async {
+                // Had it run, the outcome would be BytesNotDeleted.
+                Err(tonic::Status::internal(
+                    "a catalogued snapshot is never deleted in place",
+                ))
+            })
+            .await;
+
+        let staging = format!("{}/.gc-pending-{id}", tmp.path().display());
+        assert!(
+            matches!(&result, NamedSnapshotDelete::Deleted { staging: Some(s) } if *s == staging),
+            "{length} bytes: {result:?}"
+        );
+        assert!(!Path::new(&local_path).exists(), "{length} bytes");
+        assert_eq!(
+            std::fs::read(Path::new(&staging).join("memory")).unwrap(),
+            b"bytes",
+            "{length} bytes"
+        );
+        assert!(store.get(id).unwrap().is_none(), "{length} bytes");
+    }
+}
+
+/// Startup recovery treats a `deleting` row as staged when staging exists in
+/// either shape: the fixed-length `.gc-pending-<id>` beside `local_path`, or
+/// `<local_path>.gc-pending-<id>`, which an earlier version left. With the
+/// original path present too, a row that saw no staging would come back
+/// `ready` over bytes it no longer owns.
+#[test]
+fn recover_recognizes_staging_in_either_shape() {
+    for legacy in [false, true] {
+        for pinned in [false, true] {
+            let case = format!("legacy={legacy}, pinned={pinned}");
+            let conn = open_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let local_path = tmp.path().join("artifact").to_str().unwrap().to_string();
+            let id = "01939e3e-8886-7000-8000-000000000001";
+            std::fs::create_dir_all(&local_path).unwrap();
+            let staging = if legacy {
+                format!("{local_path}.gc-pending-{id}")
+            } else {
+                format!("{}/.gc-pending-{id}", tmp.path().display())
+            };
+            std::fs::create_dir_all(&staging).unwrap();
+            insert_row(&conn, id, "sbx-r6", &local_path);
+            if pinned {
+                conn.execute(
+                    "INSERT INTO sandboxes (
+                         id, uuid8, state, template, user, runtime, created_at, updated_at,
+                         process_env_json, auto_lifecycle_json, auto_lifecycle_state_json,
+                         current_local_artifact_id, current_local_artifact_kind,
+                         current_local_artifact_origin
+                     ) VALUES ('sbx-r6', 'uuid8', 'suspended', 'seed', 'u', 'fc', '0', '0',
+                               '{}', '{}', '{}', ?1, 'full', 'suspend')",
+                    params![id],
+                )
+                .unwrap();
+            }
+            let db = crate::db::SharedConnection::new(conn);
+            let store = LocalArtifacts::new(db.clone());
+            force_state(&db, id, "deleting");
+
+            let report = store.recover_stuck_states().unwrap();
+
+            assert_eq!(report.deleting_rolled_back, 0, "{case}");
+            assert_eq!(report.deleting_finished, usize::from(!pinned), "{case}");
+            assert_eq!(report.deleting_deferred, usize::from(pinned), "{case}");
+            assert_eq!(
+                store.get(artifact_id(id)).unwrap().is_some(),
+                pinned,
+                "{case}"
+            );
+        }
+    }
+}
+
+/// Startup recovery resolves `deleting` rows whose names are as long as a
+/// filename can be. The earlier `<local_path>.gc-pending-<id>` shape adds 48
+/// bytes, so from 208 bytes its probe fails with ENAMETOOLONG; such a path
+/// cannot exist, so it reads as absent rather than unreadable, which would
+/// defer the row on every restart. Before the rename the row comes back
+/// `ready` over its bytes. After a rename whose row commit failed, the row is
+/// deleted and its staging is left unowned for the orphan sweep.
+#[tokio::test]
+async fn recover_resolves_deleting_rows_with_long_names() {
+    for length in [207, 208, 255] {
+        for renamed in [false, true] {
+            let case = format!("{length} bytes, renamed={renamed}");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let name = format!("d-{}", "x".repeat(length - 2));
+            let local_path = tmp.path().join(&name).to_str().unwrap().to_owned();
+            std::fs::create_dir(&local_path).unwrap();
+            std::fs::write(Path::new(&local_path).join("memory"), b"bytes").unwrap();
+            let sandbox = SandboxId::new().to_string();
+            let conn = open_test_db();
+            crate::db::fixture::insert_test_sandbox(
+                &conn,
+                &sandbox,
+                crate::state::SandboxState::Stopped,
+            );
+            let db = crate::db::SharedConnection::new(conn);
+            let store = LocalArtifacts::new(db.clone());
+            let id = LocalArtifactId::new();
+            store
+                .publish_named_snapshot(
+                    &sandbox,
+                    id,
+                    ArtifactKind::Disk,
+                    &SnapshotName::parse(name.clone()).unwrap(),
+                    &local_path,
+                )
+                .unwrap();
+            let staging = format!("{}/.gc-pending-{id}", tmp.path().display());
+            if renamed {
+                // A named delete whose row commit fails after the rename.
+                db.lock()
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TEMP TRIGGER refuse_artifact_delete BEFORE DELETE ON local_artifacts
+                         BEGIN SELECT RAISE(ABORT, 'injected row commit failure'); END;",
+                    )
+                    .unwrap();
+                let result = store
+                    .delete_named_snapshot(&sandbox, &name, &local_path, async {
+                        Err(tonic::Status::internal("never deleted in place"))
+                    })
+                    .await;
+                assert!(
+                    matches!(result, NamedSnapshotDelete::Deleted { staging: None }),
+                    "{case}: {result:?}"
+                );
+                db.lock()
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER refuse_artifact_delete")
+                    .unwrap();
+                assert!(Path::new(&staging).join("memory").exists(), "{case}");
+                assert!(!store.gc_staging_is_unowned(id).unwrap(), "{case}");
+            } else {
+                force_state(&db, &id.to_string(), "deleting");
+            }
+
+            let report = store.recover_stuck_states().unwrap();
+
+            assert_eq!(report.deleting_deferred, 0, "{case}");
+            assert_eq!(report.deleting_rolled_back, usize::from(!renamed), "{case}");
+            assert_eq!(report.deleting_finished, usize::from(renamed), "{case}");
+            let row = store.get(id).unwrap();
+            if renamed {
+                assert!(row.is_none(), "{case}");
+                assert!(store.gc_staging_is_unowned(id).unwrap(), "{case}");
+                assert!(Path::new(&staging).join("memory").exists(), "{case}");
+            } else {
+                assert!(row.is_some(), "{case}");
+                // `ready` again: a delete can check it out.
+                store.check_out_for_delete(id).unwrap();
+                assert!(Path::new(&local_path).join("memory").exists(), "{case}");
+            }
+        }
     }
 }

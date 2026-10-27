@@ -498,64 +498,68 @@ async fn process_tick(
     }
 
     // Disk snapshots publish under the artifact lock so backup selection never
-    // races their creation or their retention deletion.
-    {
-        let (_wake_guard, _artifact_guard) = ctx
-            .auto_lifecycle
-            .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
-            .await;
-        // Prune once before creation so a failed byte delete blocks further
-        // growth. Retention keeps a pinned, leased or unreadable snapshot and
-        // capture goes on, so such snapshots can hold a tier above its `KEEP_*`
-        // count. This tick may also add one snapshot per due tier above its
-        // retention count; the next successful prune removes that surplus
-        // before creating more. Deletions from completed pages remain useful
-        // progress on a retry.
-        prune_scheduled_snapshots(&mut node_client, ctx, sandbox_id).await?;
-        // Always create a 1m disk snapshot.
-        let disk_1m_name = format!("d-1m-{ts}");
-        create_disk_snapshot(
-            &mut node_client,
-            sandbox_id,
-            &disk_1m_name,
-            "1m",
-            execution_fence.clone(),
-        )
-        .await?;
-        if let Err(error) =
-            publish_named_artifact(ctx, sandbox_id, &disk_1m_name, ArtifactKind::Disk)
-        {
-            tracing::warn!(
-                sandbox_id,
-                snapshot_name = %disk_1m_name,
-                error = %error,
-                "created scheduled disk snapshot but failed to publish local artifact registry entry"
-            );
-        }
-
-        // Every 5th tick: d-5m (filesystem state ~5 min ago).
-        if tick.is_multiple_of(5) {
-            let disk_5m_name = format!("d-5m-{ts}");
+    // races their creation or their retention deletion; `prune_and_capture`
+    // holds it across both.
+    //
+    // Retention keeps a pinned, leased or unreadable snapshot and capture goes
+    // on, so such snapshots can hold a tier above its `KEEP_*` count. This tick
+    // may also add one snapshot per due tier above its retention count; the
+    // next successful prune removes that surplus before creating more.
+    // Deletions from completed pages remain useful progress on a retry.
+    let cache_root = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+    prune_and_capture(
+        &mut node_client,
+        ctx,
+        sandbox_id,
+        cache_root,
+        async |node_client| {
+            // Always create a 1m disk snapshot.
+            let disk_1m_name = format!("d-1m-{ts}");
             create_disk_snapshot(
-                &mut node_client,
+                node_client,
                 sandbox_id,
-                &disk_5m_name,
-                "5m",
+                &disk_1m_name,
+                "1m",
                 execution_fence.clone(),
             )
             .await?;
             if let Err(error) =
-                publish_named_artifact(ctx, sandbox_id, &disk_5m_name, ArtifactKind::Disk)
+                publish_named_artifact(ctx, sandbox_id, &disk_1m_name, ArtifactKind::Disk)
             {
                 tracing::warn!(
                     sandbox_id,
-                    snapshot_name = %disk_5m_name,
+                    snapshot_name = %disk_1m_name,
                     error = %error,
                     "created scheduled disk snapshot but failed to publish local artifact registry entry"
                 );
             }
-        }
-    }
+
+            // Every 5th tick: d-5m (filesystem state ~5 min ago).
+            if tick.is_multiple_of(5) {
+                let disk_5m_name = format!("d-5m-{ts}");
+                create_disk_snapshot(
+                    node_client,
+                    sandbox_id,
+                    &disk_5m_name,
+                    "5m",
+                    execution_fence.clone(),
+                )
+                .await?;
+                if let Err(error) =
+                    publish_named_artifact(ctx, sandbox_id, &disk_5m_name, ArtifactKind::Disk)
+                {
+                    tracing::warn!(
+                        sandbox_id,
+                        snapshot_name = %disk_5m_name,
+                        error = %error,
+                        "created scheduled disk snapshot but failed to publish local artifact registry entry"
+                    );
+                }
+            }
+            Ok(())
+        },
+    )
+    .await?;
 
     if let Some(tier) = checkpoint_tier {
         let tier = tier.as_str();
@@ -1070,7 +1074,7 @@ pub(crate) fn snapshot_timestamp(now: jiff::Timestamp) -> String {
 }
 
 mod retention;
-use retention::prune_scheduled_snapshots;
+use retention::prune_and_capture;
 
 #[cfg(test)]
 mod tests;

@@ -1323,7 +1323,10 @@ fn validate_cache_artifact_path(local_path: &str) -> Result<(), Status> {
     {
         uuid::Uuid::parse_str(artifact).is_ok()
     } else {
+        // GC staging sits beside the artifact it held: `.gc-pending-<id>`, or
+        // `snapshot.gc-pending-<id>` from an earlier sandbox-manager.
         artifact == "snapshot"
+            || artifact.starts_with(".gc-pending-")
             || artifact.starts_with("snapshot.gc-pending-")
             || (matches!(artifact, "snapshots" | "template-snapshot-staging")
                 && parts.next().is_some())
