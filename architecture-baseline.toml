@@ -45,7 +45,6 @@
 "crates/libs/credential/mgr/server/src/service.rs" = 1052
 "crates/libs/data/plane/server/src/ecw_files.rs" = 1521
 "crates/libs/data/plane/server/src/lib.rs" = 1550
-"crates/libs/data/plane/server/src/native.rs" = 3046
 "crates/libs/data/plane/server/src/state.rs" = 1830
 "crates/libs/db/migrator/src/bootstrap_roles.rs" = 1202
 "crates/libs/internal/api/server/src/adapter.rs" = 1514
@@ -73,7 +72,7 @@
 "crates/libs/node/runtime/supervisor/src/service.rs" = 1002
 "crates/libs/object-store/src/lib.rs" = 1810
 "crates/libs/observability/src/lib.rs" = 1063
-"crates/libs/public/api/src/lib.rs" = 1793
+"crates/libs/public/api/src/lib.rs" = 1731
 "crates/libs/sbx/mgr/server/src/run.rs" = 1091
 "crates/libs/sbx/mgr/server/src/sandbox_eviction.rs" = 1253
 "crates/libs/sbx/mgr/server/src/service/activation_support.rs" = 1574
