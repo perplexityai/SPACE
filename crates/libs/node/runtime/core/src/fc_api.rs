@@ -376,11 +376,7 @@ fn drive_rate_limiter_request_body(drive_id: &str, limiter: &RateLimiter) -> ser
 /// A Firecracker `rate_limiter` object, as a drive or network interface
 /// takes it at boot or in a PATCH.
 pub fn rate_limiter_json(limiter: &RateLimiter) -> serde_json::Value {
-    let bucket = |bucket: TokenBucket| serde_json::json!({ "size": bucket.size, "refill_time": bucket.refill_time_ms });
-    serde_json::json!({
-        "bandwidth": bucket(limiter.bandwidth),
-        "ops": bucket(limiter.operations)
-    })
+    crate::boot::token_buckets(limiter)
 }
 
 /// A Firecracker `balloon` device object, as the VM configuration takes it
