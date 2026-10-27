@@ -1778,6 +1778,7 @@ message GetExecutionCapabilitiesResponse {
   // Protocol support only; each exact environment still requires admission.
   bool environment_selection = 1;
   bool exclusive_devices_v1 = 2;
+  bool firmware_guests_v1 = 3;
 }
 
 message EnvironmentCreateInput {
