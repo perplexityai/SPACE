@@ -5857,6 +5857,7 @@ dependencies = [
  "aws-lc-rs",
  "pplx-space-common-core",
  "pplx-space-common-proto-build",
+ "pplx-space-execution-spec",
  "prost",
  "serde",
  "serde_json",
@@ -5876,6 +5877,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
