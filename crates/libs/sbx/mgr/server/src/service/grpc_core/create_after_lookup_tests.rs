@@ -249,6 +249,7 @@ fn insert_created_row(
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            device_requirements: None,
             id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
             state,

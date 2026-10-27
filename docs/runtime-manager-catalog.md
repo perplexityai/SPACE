@@ -232,6 +232,31 @@ lists Firecracker releases; pass `--runtime cloud-hypervisor` to list CH.
 Release sources must use credential-free HTTPS URLs. Userinfo, query parameters
 and fragments are refused; authentication must not be embedded in these URLs.
 
+For operator-built, pinned artifacts, configure the service with
+`--artifact-source cloud-hypervisor=/opt/runtime-feed`. This replaces only that
+runtime's release and kernel download sources; repeat the flag for another
+runtime. Duplicate runtime entries and unsupported runtime kinds fail startup.
+The feed is read-only to runtime-manager and uses:
+
+```text
+releases/<runtime>/<version>/<architecture>/payload
+kernels/<runtime>/<major.minor>/<architecture>/<kernel-version>/vmlinux.bin
+```
+
+`payload` is a static executable for CH and the usual release tarball for
+Firecracker. Kernel listing intersects catalog pins with files present in the
+feed. Files beneath the configured root must be regular files with no symlink
+components. Keep the feed separate from staging and managed artifact stores.
+A source directory grants no trust: bounded staging checks the catalog hashes,
+then node-manager independently verifies and publishes the bytes. Installation
+and execution policy are unchanged. Auxiliary initramfs/firmware files use the
+separate `--boot-artifacts-source` directory and its pinned identity layout.
+
+Existing HTTPS/S3 job locations retain their encoding. New local-source jobs
+record `file:///` locations; deploy support before submitting them, and finish
+or cancel those jobs before rolling runtime-manager back. Changing the configured
+source does not rewrite an existing job's location or redirect it to new bytes.
+
 Installation does not add a runnable environment, change defaults, or qualify
 any guest kernel, snapshot format or GPU. Diagnostics report the installed CH
 binary without a fake jailer or memory-state format. Template and sandbox
@@ -261,3 +286,38 @@ Artifacts referenced by compiled environments are retained by the removal guard,
 including CH. Installation remains separate from execution permission. See
 [the local builder and worker exercise](execution-environments.md#arm64-local-builder-and-worker-exercise)
 for explicit policy configuration, template builds and sandbox creation.
+
+### Source-built signed boot bundle
+
+The x86-64 binding `ch-54.0-linux-6.1.155-nvidia-580.178.04` pins a separate
+`54.0.0+space.1` CH executable with the contained VFIO Landlock fix, Linux
+`6.1.155-space-gpu`, and an initramfs with NVIDIA 580.178.04 compute modules.
+It does not replace the upstream CPU executable or the default environment.
+The kernel and modules are built together by
+[`build-hardened.sh`](../templates/linux/boot/nvidia-open/build-hardened.sh).
+The per-build signing key is discarded, and matching GSP firmware is built into
+the kernel. A rebuild produces new content identities and needs new reviewed pins.
+
+| Input | SHA-256 |
+|---|---|
+| CH executable | `e255b8139b69f21fe204e2e9436139f289a7ead8e632b0d197d4528a86506de4` |
+| Kernel | `5654b6098b1753729a8df4b19a7a19f48d84d511a704cf61b65773c4e5582c9b` |
+| Initramfs | `7bb3035adffbb30fb55d6429f93315d2ceb1be7818e9247ef13e3423cbfb0be0` |
+
+The catalog also records fs-verity digests measured from these bytes with
+fsverity-utils, SHA-256, 4096-byte blocks and no salt. The initramfs identity is
+part of the boot contract, so the kernel alone cannot satisfy it. Its signature
+enforcement and CUDA computation were checked in a contained launch and in the
+managed development create, stop/start and delete lifecycle. Production hardware
+qualification and recovery acceptance remain separate gates.
+
+These are locally built artifacts, not assets at the upstream CH release URL.
+Deployment needs a reviewed artifact mirror/source containing the pinned bytes;
+changing a download source does not change their authentication. Do not advertise
+the binding as provisionable until that source is configured. The binding is
+excluded from the default execution policy, has no memory-state support and
+enables no device profiles in normal builds. The optional `gpu-development`
+feature adds a boot-fenced, operator-authorized reset-only experiment for one T4;
+see [device lifecycle restrictions](execution-environments.md#runtime-control-transport).
+Device enrollment, first-use evidence and cross-tenant reuse need their own
+qualification; artifact pins cannot establish that hardware is safe to allocate.

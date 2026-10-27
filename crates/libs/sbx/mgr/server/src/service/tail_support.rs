@@ -116,6 +116,9 @@ pub(super) fn activation_metadata_json(
             .transpose()
             .map_err(|error| invalid(error.to_string()))?,
     );
+    if let Some(requirements) = &sandbox.device_requirements {
+        metadata = metadata.with_device_requirements(requirements.clone());
+    }
     metadata.cpu_budget = cpu_budget;
     serde_json::to_string(&metadata)
         .map_err(|error| Status::internal(format!("serialize activation metadata: {error}")))

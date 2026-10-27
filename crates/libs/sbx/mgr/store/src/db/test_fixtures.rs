@@ -238,6 +238,7 @@ impl TestSandboxInsert {
         user: &'a SandboxOwner,
     ) -> InsertSandboxParams<'a> {
         InsertSandboxParams {
+            device_requirements: None,
             id: &self.id,
             uuid8,
             state: self.state,

@@ -271,6 +271,7 @@ async fn allocate_refusal_grants_no_lease(
         netns_path: None,
         sandbox_cgroup_memory_mib: 2048,
         execution_fence: Some(fresh_fence().into()),
+        device_allocation: None,
     };
     let mut caller = live_caller();
     let mut exited = None;
@@ -349,6 +350,7 @@ async fn allocate_grants_a_lease_then_returns_it_without_new_admission() {
                 netns_path: None,
                 sandbox_cgroup_memory_mib,
                 execution_fence: Some(fence.into()),
+                device_allocation: None,
             },
             live_caller(),
         )
