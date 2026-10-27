@@ -112,9 +112,11 @@ async fn local_cache_shares_exact_targets_and_bounds_retention() {
         } else {
             None
         };
-        *provider.inner.rate.lock().unwrap() =
-            (tokio::time::Instant::now(), MAX_REQUESTS_PER_SECOND);
         for index in 0..=MAX_CACHED_CERTIFICATES {
+            // Pin an exhausted window for each miss: a full-cache loop can
+            // outlast the one-second window and reopen the signing budget.
+            *provider.inner.rate.lock().unwrap() =
+                (tokio::time::Instant::now(), MAX_REQUESTS_PER_SECOND);
             assert_eq!(
                 provider
                     .get(format!("rejected{index}.test").parse().unwrap(), 443)
