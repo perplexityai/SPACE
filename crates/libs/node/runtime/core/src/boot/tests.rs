@@ -149,3 +149,29 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
         );
     }
 }
+
+#[test]
+fn standalone_admission_rejects_extra_devices_and_host_paths() {
+    let text = configuration(RuntimeKind::CloudHypervisor, &input()).unwrap();
+    validate_standalone(RuntimeKind::CloudHypervisor, &text).unwrap();
+    let original: Value = serde_json::from_str(&text).unwrap();
+    for (pointer, replacement) in [
+        ("/payload/kernel", json!("/etc/shadow")),
+        ("/vsock/socket", json!("/outside/socket")),
+        ("/disks/0/path", json!("/dev/host")),
+        ("/landlock_enable", json!(false)),
+        ("/memory/shared", json!(true)),
+        ("/disks/0/backing_files", json!(true)),
+        ("/net/0/num_queues", json!(8)),
+    ] {
+        let mut config = original.clone();
+        *config.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            validate_standalone(RuntimeKind::CloudHypervisor, &config.to_string()).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut extra = original;
+    extra["devices"] = json!([{ "path": "/dev/vfio/3" }]);
+    assert!(validate_standalone(RuntimeKind::CloudHypervisor, &extra.to_string()).is_err());
+}
