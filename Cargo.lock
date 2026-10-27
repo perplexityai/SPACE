@@ -4866,6 +4866,7 @@ dependencies = [
  "pplx-space-sandbox-store",
  "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
+ "pplx-space-snapshot-store",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
  "prost",
@@ -7770,6 +7771,7 @@ name = "pplx-space-volmgr"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "bytes",
  "dashmap",

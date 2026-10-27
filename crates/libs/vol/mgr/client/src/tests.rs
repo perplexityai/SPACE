@@ -248,3 +248,60 @@ async fn ensure_file_replica_stops_retrying_at_total_wait_budget() {
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn integrity_requires_matching_completion_evidence_including_during_version_skew() {
+    let expected = proto::ContentIntegrity {
+        digest: "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+        size_bytes: 3,
+    };
+    for (evidence, bytes, valid) in [
+        (None, 3, false),
+        (Some(expected.clone()), 3, true),
+        (Some(expected.clone()), 4, false),
+        (
+            Some(proto::ContentIntegrity {
+                size_bytes: 4,
+                ..expected.clone()
+            }),
+            3,
+            false,
+        ),
+        (
+            Some(proto::ContentIntegrity {
+                digest: format!("sha256:{}", "00".repeat(32)),
+                ..expected.clone()
+            }),
+            3,
+            false,
+        ),
+    ] {
+        let result = run_ensure_file_replica_with(
+            PullFileRequest {
+                expected_integrity: Some(expected.clone()),
+                ..Default::default()
+            },
+            EnsureFileReplicaWaitConfig::default(),
+            |_| async {
+                Ok(tonic::Response::new(SubmitTransferResponse {
+                    job_id: "019d84bd-280d-7331-99c6-b63377f3a3a2".into(),
+                }))
+            },
+            move |_| {
+                let integrity = evidence.clone();
+                async move {
+                    Ok(tonic::Response::new(GetTransferJobResponse {
+                        job: Some(proto::TransferJob {
+                            status: TransferJobStatus::Completed as i32,
+                            bytes_transferred: bytes,
+                            integrity,
+                            ..Default::default()
+                        }),
+                    }))
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+    }
+}

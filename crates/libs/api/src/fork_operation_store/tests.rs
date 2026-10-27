@@ -234,9 +234,71 @@ async fn retiring_a_published_copy_removes_the_snapshot_and_orphans_its_location
         .unwrap();
     assert!(
         store
-            .mark_copied_artifact_ready(snapshot_id, source_sandbox_id, 128)
+            .mark_copied_artifact_ready(snapshot_id, source_sandbox_id, 128, &[])
             .await
             .unwrap()
+    );
+    // A legacy copy remains available without manufacturing identities.
+    assert!(
+        pplx_space_snapshot_store::artifact_digests(&db.pool, snapshot_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let manifest: Vec<_> = [
+        pplx_space_common_core::types::SnapshotArtifact::Rootfs,
+        pplx_space_common_core::types::SnapshotArtifact::Metadata,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(
+        |(index, artifact)| pplx_space_snapshot_store::SnapshotArtifactDigest {
+            artifact,
+            digest: pplx_space_common_core::types::Digest::sha256([index as u8; 32]),
+            size_bytes: 64,
+        },
+    )
+    .collect();
+    for _ in 0..2 {
+        assert!(
+            store
+                .mark_copied_artifact_ready(snapshot_id, source_sandbox_id, 128, &manifest)
+                .await
+                .unwrap()
+        );
+    }
+    let recorded = pplx_space_snapshot_store::artifact_digests(&db.pool, snapshot_id)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 2);
+    for entry in &manifest {
+        assert!(recorded.contains(entry));
+    }
+    assert!(matches!(
+        store
+            .mark_copied_artifact_ready(snapshot_id, source_sandbox_id, 256, &[])
+            .await,
+        Err(ForkOperationStoreError::LegacyReplay)
+    ));
+    let mut conflict = manifest.clone();
+    conflict[1].digest = pplx_space_common_core::types::Digest::sha256([9; 32]);
+    store
+        .mark_copied_artifact_ready(snapshot_id, source_sandbox_id, 256, &conflict)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        pplx_space_snapshot_store::artifact_digests(&db.pool, snapshot_id)
+            .await
+            .unwrap(),
+        recorded
+    );
+    assert_eq!(
+        pplx_space_snapshot_store::get(&db.pool, snapshot_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .size_bytes(),
+        Some(128)
     );
     let target_sandbox_id = SandboxId::new();
     sqlx::query(sql!(
@@ -307,6 +369,31 @@ async fn retiring_a_published_copy_removes_the_snapshot_and_orphans_its_location
     .await
     .unwrap();
     assert!(location_reattached);
+    let mut tx = db.pool.begin().await.unwrap();
+    pplx_space_snapshot_store::record_artifact_digests(&mut tx, snapshot_id, &conflict[1..])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // The disk insert precedes a conflicting metadata row. Neither that insert
+    // nor Ready may survive when the manifest transaction rolls back.
+    store
+        .mark_copied_artifact_ready(snapshot_id, source_sandbox_id, 128, &manifest)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        pplx_space_snapshot_store::get(&db.pool, snapshot_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        pplx_space_common_core::types::SnapshotState::Creating
+    );
+    assert_eq!(
+        pplx_space_snapshot_store::artifact_digests(&db.pool, snapshot_id)
+            .await
+            .unwrap(),
+        conflict[1..]
+    );
 }
 
 #[tokio::test]

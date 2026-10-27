@@ -772,6 +772,7 @@ impl WorkerApi for SimWorkerApiService {
             r#type: sbx::SnapshotType::Disk as i32,
             published_artifact: None,
             published_durable_artifact: Some(sbx::PublishedDurableArtifact {
+                artifact_digests: Vec::new(),
                 storage_uri: durable_artifact.destination_storage_uri,
                 bytes_published: 0,
             }),

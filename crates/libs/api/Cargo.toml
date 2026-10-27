@@ -97,6 +97,7 @@ pplx-space-cluster-pool = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
+pplx-space-snapshot-store = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }

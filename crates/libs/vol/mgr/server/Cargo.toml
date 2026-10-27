@@ -19,13 +19,14 @@ datadog = ["otel", "pplx-space-common-svc/datadog"]
 datadog-otel = ["otel", "datadog"]
 
 [dependencies]
+aws-lc-rs = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 nix = { workspace = true, features = ["time"] }
 rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }

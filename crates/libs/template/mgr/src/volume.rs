@@ -2498,6 +2498,7 @@ fn build_pull_file_request(
     options: PullOptions,
 ) -> PullFileRequest {
     PullFileRequest {
+        expected_integrity: None,
         subject_id,
         s3_uri,
         local_path,

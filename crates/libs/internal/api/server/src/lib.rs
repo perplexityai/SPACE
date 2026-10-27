@@ -49,10 +49,10 @@ use tonic::{Request, Response, Status};
 
 use pplx_space_common_core::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, Digest, ExactStorageUri,
+    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, ExactStorageUri,
     ExecutionGeneration, LocalArtifactId, NodeId, NodeRole as SpaceNodeRole, OrgId, RuntimeKind,
-    SandboxId, SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId,
-    SnapshotKind, SnapshotName, SnapshotState, SubstrateKind, TemplateName,
+    SandboxId, SnapshotContentHash, SnapshotId, SnapshotKind, SnapshotName, SnapshotState,
+    SubstrateKind, TemplateName,
 };
 use pplx_space_common_svc::types::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
@@ -494,31 +494,22 @@ fn parse_artifact_backup_query(
 /// Parse the digests a node reports at finalize: one entry per artifact.
 fn parse_artifact_digests(
     digests: &[crate::proto::SnapshotArtifactDigest],
+    kind: ArtifactKind,
 ) -> Result<Vec<snapshot_store::SnapshotArtifactDigest>, Status> {
-    let mut seen = std::collections::BTreeSet::new();
-    digests
-        .iter()
-        .map(|entry| {
-            let artifact = SnapshotArtifactFile::from_str(&entry.artifact).map_err(|e| {
-                Status::invalid_argument(format!("invalid artifact_digests.artifact: {e}"))
-            })?;
-            if !seen.insert(artifact) {
-                return Err(Status::invalid_argument(format!(
-                    "duplicate artifact_digests entry for {artifact}"
-                )));
-            }
-            let digest = Digest::from_str(&entry.digest).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "invalid artifact_digests.digest for {artifact}: {e}"
-                ))
-            })?;
-            Ok(snapshot_store::SnapshotArtifactDigest {
-                artifact,
-                digest,
-                size_bytes: entry.size_bytes,
-            })
+    pplx_space_sbx_mgr_client::artifact_integrity::parse_backup(digests, kind)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
+        .map(|manifest| {
+            manifest
+                .into_iter()
+                .map(
+                    |(artifact, (digest, size_bytes))| snapshot_store::SnapshotArtifactDigest {
+                        artifact,
+                        digest,
+                        size_bytes,
+                    },
+                )
+                .collect()
         })
-        .collect()
 }
 
 fn snapshot_insert_status(error: snapshot_store::InsertSnapshotError) -> Status {
@@ -667,7 +658,7 @@ impl ClusterApiService {
         target_state: SnapshotState,
         bytes_uploaded: i64,
         failure_reason: Option<&str>,
-        artifact_digests: &[snapshot_store::SnapshotArtifactDigest],
+        artifact_digests: &[crate::proto::SnapshotArtifactDigest],
         remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<(), Status> {
         let attempt = self
@@ -682,6 +673,23 @@ impl ClusterApiService {
                 "backup attempt",
             )
             .await?;
+
+        let artifact_digests = if artifact_digests.is_empty() {
+            // Legacy attempts can also predate the registered artifact kind.
+            Vec::new()
+        } else {
+            parse_artifact_digests(
+                artifact_digests,
+                attempt
+                    .artifact()
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "backup attempt has no registered artifact kind",
+                        )
+                    })?
+                    .kind(),
+            )?
+        };
 
         // For READY, persist the uploaded bytes and clear any
         // prior-attempt failure reason. For FAILED, persist the operator
@@ -757,7 +765,7 @@ impl ClusterApiService {
         let sandbox_id = finalized_snapshot.sandbox_id;
 
         if target_state.is_ready() {
-            snapshot_store::record_artifact_digests(&mut tx, snapshot_id, artifact_digests)
+            snapshot_store::record_artifact_digests(&mut tx, snapshot_id, &artifact_digests)
                 .await
                 .map_err(|error| match &error {
                     snapshot_store::RecordArtifactDigestsError::Conflict { .. } => {
@@ -1031,13 +1039,12 @@ impl ClusterApiService {
                 ));
             }
         };
-        let artifact_digests = parse_artifact_digests(&req.artifact_digests)?;
         self.finalize_backup_attempt(
             SnapshotId::from_uuid(backup_attempt_id.as_uuid()),
             target_state,
             req.bytes_uploaded,
             req.failure_reason.as_deref(),
-            &artifact_digests,
+            &req.artifact_digests,
             remote_addr,
         )
         .await?;

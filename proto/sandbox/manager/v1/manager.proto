@@ -4,6 +4,7 @@ package space.sandbox.manager.v1;
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "execution/v1/execution.proto";
+import "node/api/v1/artifact.proto";
 import "net/gateway/v1/gateway.proto";
 import "net/policy/v1/policy.proto";
 import "spaced/operations/v1/operations.proto";
@@ -956,11 +957,15 @@ message DurableArtifactSnapshotSource {
   string destination_storage_uri = 2;
   string destination_sandbox_id = 3;
   ArtifactOrigin destination_origin = 4;
+  // Empty denotes a legacy source; nonempty manifests must be verified.
+  repeated space.node.api.v1.SnapshotArtifactDigest source_artifact_digests = 5;
 }
 
 message PublishedDurableArtifact {
   string storage_uri = 1;
   uint64 bytes_published = 2;
+  // Empty denotes a legacy copy, never authentication of downloaded bytes.
+  repeated space.node.api.v1.SnapshotArtifactDigest artifact_digests = 3;
 }
 
 message CreateTemplateBaseSnapshotRequest {

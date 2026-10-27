@@ -7,12 +7,19 @@
 
 use uuid::Uuid;
 
+mod artifact_proto {
+    tonic::include_proto!("space.node.api.v1");
+}
+
+pub mod artifact_integrity;
+
 pub mod operations {
     pub use pplx_space_spaced_common::proto::operations::*;
 }
 
 #[allow(clippy::large_enum_variant)]
 pub mod proto {
+    pub use super::artifact_proto::SnapshotArtifactDigest;
     tonic::include_proto!("space.sandbox.manager.v1");
     pub use pplx_space_net_gateway_protocol::proto::{SandboxSubstrateKind, SpaceApiRouteIdentity};
 

@@ -62,6 +62,12 @@ pub enum ForkOperationStoreError {
     Serialize(#[from] serde_json::Error),
     #[error("public operation storage failed: {0}")]
     PublicOperation(#[from] crate::public_operations::PublicOperationStoreError),
+    #[error("read fork artifact identities: {0}")]
+    ReadDigests(#[from] pplx_space_snapshot_store::GetArtifactDigestsError),
+    #[error("record fork artifact identities: {0}")]
+    RecordDigests(#[from] pplx_space_snapshot_store::RecordArtifactDigestsError),
+    #[error("a legacy replay cannot replace an authenticated fork manifest")]
+    LegacyReplay,
     #[error("fork operation claim was superseded")]
     ClaimSuperseded,
     #[error("capture leader selection requires a frozen source")]
@@ -365,7 +371,9 @@ impl ForkOperationStore {
         snapshot_id: SnapshotId,
         owner_sandbox_id: SandboxId,
         size_bytes: u64,
+        digests: &[pplx_space_snapshot_store::SnapshotArtifactDigest],
     ) -> Result<bool, ForkOperationStoreError> {
+        let mut tx = self.pool().begin().await?;
         let updated = sqlx::query(sql!(
             "UPDATE snapshots
              SET state = 'ready', size_bytes = $2
@@ -379,10 +387,22 @@ impl ForkOperationStore {
         .bind(snapshot_id)
         .bind(i64::try_from(size_bytes).unwrap_or(i64::MAX))
         .bind(owner_sandbox_id.as_uuid())
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
-        Ok(updated == 1)
+        if updated == 0 {
+            return Ok(false);
+        }
+        if digests.is_empty()
+            && !pplx_space_snapshot_store::artifact_digests(&mut *tx, snapshot_id)
+                .await?
+                .is_empty()
+        {
+            return Err(ForkOperationStoreError::LegacyReplay);
+        }
+        pplx_space_snapshot_store::record_artifact_digests(&mut tx, snapshot_id, digests).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn rebind_copied_artifact_owner(

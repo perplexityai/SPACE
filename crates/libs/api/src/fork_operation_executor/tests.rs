@@ -940,3 +940,40 @@ fn direct_copy_target_accepts_a_direct_endpoint() {
         false,
     ));
 }
+
+#[test]
+fn copied_manifest_never_downgrades_or_relabels_authenticated_content() {
+    use pplx_space_sbx_mgr_client::proto::SnapshotArtifactDigest;
+    let source = vec![
+        SnapshotArtifactDigest {
+            artifact: "rootfs".into(),
+            digest: format!("sha256:{}", "12".repeat(32)),
+            size_bytes: 4,
+        },
+        SnapshotArtifactDigest {
+            artifact: "metadata.json".into(),
+            digest: format!("sha256:{}", "34".repeat(32)),
+            size_bytes: 7,
+        },
+    ];
+    let mut projected = source.clone();
+    projected[1].digest = format!("sha256:{}", "56".repeat(32));
+    for (trusted_source, output, success, retry) in [
+        (false, false, true, false),
+        (false, true, false, false),
+        (true, false, false, true),
+        (true, true, true, false),
+    ] {
+        let result = copied_artifact_manifest(
+            if trusted_source { &source } else { &[] },
+            if output { &projected } else { &[] },
+        );
+        assert_eq!(result.is_ok(), success);
+        assert_eq!(matches!(result, Err(ForkExecutionError::Retry(_))), retry);
+    }
+    projected[0].digest = projected[1].digest.clone();
+    copied_artifact_manifest(&source, &projected).unwrap_err();
+    projected[0] = source[0].clone();
+    projected[0].size_bytes += 1;
+    copied_artifact_manifest(&source, &projected).unwrap_err();
+}
