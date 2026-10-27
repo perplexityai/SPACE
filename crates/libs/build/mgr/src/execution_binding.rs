@@ -36,7 +36,9 @@ pub enum BuildExecutionBindingError {
     Reference,
     #[error("compatible environment resolution: {0}")]
     Selection(#[from] pplx_space_node_mgr_client::environment_selection::SelectionResponseError),
-    #[error("scratch build requires Firecracker/Linux/{architecture}, got {runtime:?}/{guest:?}")]
+    #[error(
+        "scratch build requires a supported Linux/{architecture} boot adapter, got {runtime:?}/{guest:?}"
+    )]
     ScratchRequirements {
         architecture: pplx_space_common_core::types::Arch,
         runtime: pplx_space_common_core::types::RuntimeKind,
@@ -63,6 +65,10 @@ pub(super) struct BuildExecutionBinding {
 }
 
 impl BuildExecutionBinding {
+    pub(super) fn runtime_kind(&self) -> pplx_space_common_core::types::RuntimeKind {
+        self.execution.runtime().kind
+    }
+
     pub(super) fn reference(&self) -> EnvironmentReference {
         self.definition.reference()
     }
@@ -117,8 +123,10 @@ impl BuildExecutionBinding {
             os: GuestOperatingSystem::Linux,
             architecture,
         };
-        if self.execution.runtime().kind != RuntimeKind::Firecracker
-            || self.execution.guest() != guest
+        if !matches!(
+            self.execution.runtime().kind,
+            RuntimeKind::Firecracker | RuntimeKind::CloudHypervisor
+        ) || self.execution.guest() != guest
         {
             return Err(BuildExecutionBindingError::ScratchRequirements {
                 architecture,
@@ -233,10 +241,58 @@ impl BuildExecutionBinding {
         command: &mut tokio::process::Command,
         pin: Option<&super::GuestKernelPin>,
     ) -> Result<(), BuildExecutionBindingError> {
-        let (kernel, state_format) = self
-            .definition
-            .firecracker_linux_contract()
-            .ok_or(BuildExecutionBindingError::ScratchProfile)?;
+        use pplx_space_common_core::types::{BootProfile, ExecutionCompatibilityProfile};
+        use pplx_space_execution_common::environment::{
+            FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT,
+        };
+        let spec = self.definition.descriptor().spec();
+        let BootProfile::ArtifactsV1 {
+            contract,
+            artifacts,
+        } = &spec.boot
+        else {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        };
+        let [boot] = artifacts.as_slice() else {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        };
+        let ExecutionCompatibilityProfile::RuntimeV1 {
+            contract: machine,
+            state_format,
+        } = &spec.compatibility
+        else {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        };
+        let (expected_boot, expected_machine, expected_format) = match self.execution.runtime().kind
+        {
+            pplx_space_common_core::types::RuntimeKind::Firecracker => {
+                self.definition
+                    .firecracker_linux_contract()
+                    .ok_or(BuildExecutionBindingError::ScratchProfile)?;
+                (
+                    FIRECRACKER_BOOT_CONTRACT,
+                    FIRECRACKER_MACHINE_CONTRACT,
+                    BootProfile::LINUX_DIRECT_FORMAT,
+                )
+            }
+            pplx_space_common_core::types::RuntimeKind::CloudHypervisor => (
+                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_BOOT_CONTRACT,
+                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_MACHINE_CONTRACT,
+                pplx_space_execution_common::environment::cloud_hypervisor_linux_format(
+                    self.execution.guest().architecture,
+                ),
+            ),
+            _ => return Err(BuildExecutionBindingError::ScratchProfile),
+        };
+        if contract.as_str() != expected_boot
+            || machine.as_str() != expected_machine
+            || boot.role().as_str() != BootProfile::LINUX_DIRECT_ROLE
+            || boot.format().as_str() != expected_format
+            || boot.component().kind != pplx_space_common_core::types::ArtifactComponentKind::Kernel
+        {
+            return Err(BuildExecutionBindingError::ScratchProfile);
+        }
+        let kernel = boot.component();
         if pin.is_some_and(|pin| pin.version != kernel.version || pin.digest != kernel.digest) {
             return Err(BuildExecutionBindingError::KernelPin);
         }
@@ -247,9 +303,14 @@ impl BuildExecutionBinding {
             self.execution.runtime().version.as_str(),
         );
         command.env(
-            "SPACE_SEED_STATE_FORMAT_VERSION",
-            state_format.version.as_str(),
+            "SPACE_SEED_STATE_FORMAT",
+            state_format.as_ref().map_or("", |s| s.format.as_str()),
         );
+        command.env(
+            "SPACE_SEED_STATE_FORMAT_VERSION",
+            state_format.as_ref().map_or("", |s| s.version.as_str()),
+        );
+        command.env("SPACE_SEED_KERNEL_FORMAT", boot.format().as_str());
         command.env("SPACE_SEED_KERNEL_VERSION", kernel.version.as_str());
         command.env("SPACE_SEED_KERNEL_DIGEST", kernel.digest.to_string());
         Ok(())
@@ -300,6 +361,8 @@ pub(super) fn configure_legacy_scratch(
         INITIAL_FIRECRACKER_RUNTIME_VERSION, INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
     };
     command.env("SPACE_SEED_RUNTIME", "firecracker");
+    command.env("SPACE_SEED_STATE_FORMAT", "firecracker-snapshot");
+    command.env("SPACE_SEED_KERNEL_FORMAT", "vmlinux");
     command.env(
         "SPACE_SEED_RUNTIME_VERSION",
         INITIAL_FIRECRACKER_RUNTIME_VERSION,
