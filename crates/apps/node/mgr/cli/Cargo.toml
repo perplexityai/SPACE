@@ -19,8 +19,9 @@ serde_json = { workspace = true }
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "sync"] }
 tonic = { workspace = true }
+tokio-stream = { workspace = true }
 
 # internal
 pplx-space-common-cli = { workspace = true }

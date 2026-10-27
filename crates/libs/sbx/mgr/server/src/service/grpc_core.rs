@@ -300,15 +300,20 @@ impl SandboxManagerService {
                     .unwrap_or("<unhashed>"),
                 &resolved_template.arch,
             )?;
-            reject_incompatible_template_spaced_compatibility(
+            let image_path = std::path::PathBuf::from(&resolved_template.template_dir);
+            let image = tokio::task::spawn_blocking(move || super::guest_image::read_contract(&image_path))
+                .await.map_err(|error| Status::internal(format!("read guest image task: {error}")))??;
+            if image.expects_agent() {
+                reject_incompatible_template_spaced_compatibility(
                 template,
                 resolved_template
                     .content_hash
                     .as_deref()
                     .unwrap_or("<unhashed>"),
                 resolved_template.spaced_version.as_deref(),
-                resolved_template.spaced_compatibility_family.as_deref(),
-            )?;
+                    resolved_template.spaced_compatibility_family.as_deref(),
+                )?;
+            }
 
             let (effective_mode, intent) = self.resolve_create_intent(
                 req,
