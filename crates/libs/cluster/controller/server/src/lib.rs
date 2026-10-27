@@ -23,6 +23,7 @@ mod kube_node_sync;
 mod leader_election;
 #[cfg(test)]
 mod lifecycle_writer_test_support;
+mod lost_started_sandboxes;
 mod node_drain;
 mod node_group_labeler;
 mod node_group_mirror;

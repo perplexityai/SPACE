@@ -175,12 +175,14 @@ pub enum SandboxEventType {
     /// un-uploadable local state the stuck restore left behind is abandoned.
     /// Records the immutable drain-progress decision, not a runtime transition.
     LocalSnapshotPromotionAbandoned,
-    /// A reconciler determined that no recoverable copy of a suspended
-    /// sandbox's state exists anywhere — its local suspended artifact is gone
-    /// (pruned from the node's disk, or the node's backing instance is
-    /// confirmed terminated) and no ready remote snapshot exists — and flipped
-    /// the row to `failed`. Terminal: the user's next wake/restore gets a
-    /// clean lifecycle error instead of a confusing snapshot-not-found.
+    /// A reconciler determined that no recoverable copy of a sandbox's state
+    /// exists anywhere and flipped the row to `failed`: a suspended sandbox
+    /// whose local suspended artifact is gone (pruned from the node's disk, or
+    /// the node's backing instance is confirmed terminated) with no ready
+    /// remote snapshot, or a started sandbox whose node is confirmed gone and
+    /// whose only snapshot predates its last activity. Terminal: the user's
+    /// next wake/restore gets a clean lifecycle error instead of a confusing
+    /// snapshot-not-found. Existing snapshots are kept.
     SandboxLost,
     /// A node's cold-sandbox eviction loop removed a suspended sandbox's
     /// entire local presence (cache directory including the rootfs

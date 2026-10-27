@@ -65,6 +65,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_ORPHANED_RESTORE_POD_GC_TEARDOWN_STUCK_AFTER_SECS` | 300 | How long a pod may stay terminating before it's reported as a stuck teardown. Seconds; a value above one day clamps to it, and `0` or a non-number keeps the default. |
 | `SPACE_RECONCILE_QUEUE_GC_ENABLED` | off | Needs AWS: it calls EC2 `DescribeInstances`, at `AWS_ENDPOINT_URL_EC2` when that is set. |
 | `SPACE_ORPHANED_NODES_ENABLED` | off | Needs AWS. |
+| `SPACE_LOST_STARTED_SANDBOX_RECONCILER_ENABLED` | off | Needs AWS. Fails a `started` sandbox whose recovery found no restore source covering its last command or access, once the node it last ran on is confirmed gone: Kubernetes has no Node by that name and EC2 has no instance for it, or only `terminated` ones. The sandbox keeps its snapshots and is not restored automatically. |
 | `SPACE_NODE_DRAIN_ENABLED` | off | |
 | `SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` | off | |
 | `SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE` | off | Parks nodes that still hold stopped, created, deleting or quarantined residents in `draining` instead of advancing them to `drained`. |

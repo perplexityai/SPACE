@@ -28,6 +28,7 @@ use crate::drained_node_terminator;
 use crate::execution_materialization_backfill;
 use crate::failed_restorable_repair;
 use crate::kube_node_sync;
+use crate::lost_started_sandboxes;
 use crate::node_drain;
 use crate::node_group_labeler;
 use crate::node_group_mirror;
@@ -824,6 +825,31 @@ pub async fn run_reconcilers(
                 tracing::info!(
                     "reconcile-queue GC (kube-presence detector) is disabled \
                      (the fixed-enabled gone-node queue GC=false)"
+                );
+            }
+
+            // Lost-started-sandbox reconciler: fails a `started` sandbox whose
+            // recovery already refused for lack of a current restore source,
+            // once the node it last ran on is confirmed gone (kube Node absent
+            // and EC2 reports no live instance). Default-disabled via
+            // `SPACE_LOST_STARTED_SANDBOX_RECONCILER_ENABLED=true`; the AWS SDK
+            // is only initialized when it is enabled.
+            let lost_started_config = lost_started_sandboxes::ReconcilerConfig::from_env();
+            if lost_started_config.enabled {
+                let aws_config =
+                    aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
+                handles.push(tokio::spawn(lost_started_sandboxes::run(
+                    lost_started_config,
+                    lost_started_sandboxes::LostStartedDbStore::new(pool.clone()),
+                    reconcile_queue_gc::SubstrateKubeNodePresence::new(kube.clone()),
+                    orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client)),
+                    shutdown_token.child_token(),
+                )));
+            } else {
+                tracing::info!(
+                    "lost-started-sandboxes reconciler is disabled \
+                     (SPACE_LOST_STARTED_SANDBOX_RECONCILER_ENABLED unset); skipping AWS SDK init"
                 );
             }
 

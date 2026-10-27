@@ -140,6 +140,13 @@ reconcilers:
       SPACE_STARTED_SANDBOX_REPAIR_ENABLED: "true"
   orphanedSandboxes:
     env: {}
+  # Fails `started` sandboxes whose recovery refused for lack of a current
+  # restore source once their node is confirmed gone. On Kind the EC2 lookup
+  # answers from the fake EC2 endpoint, which reports no instance for a deleted
+  # Node, so the node-loss scenarios exercise the real verdict path.
+  lostStartedSandboxes:
+    env:
+      SPACE_LOST_STARTED_SANDBOX_RECONCILER_ENABLED: "true"
   warmPool:
     env: {}
   # Default-on locally so the kind e2e node-drain test can exercise the
