@@ -321,3 +321,27 @@ feature adds a boot-fenced, operator-authorized reset-only experiment for one T4
 see [device lifecycle restrictions](execution-environments.md#runtime-control-transport).
 Device enrollment, first-use evidence and cross-tenant reuse need their own
 qualification; artifact pins cannot establish that hardware is safe to allocate.
+
+### Device capacity and ownership
+
+Operators can inspect node-local device capacity with `space-nodemgr devices list`.
+The default output includes per-profile totals and unresolved allocation owners.
+Counts describe enrolled device units (whole reset domains), not fractional
+slots or all hardware physically present in the node. Member locators are shown
+separately. Unenrolled hardware is not available to SPACE.
+
+Parent `READY` is qualification state, not a free-capacity count. `AVAILABLE`
+requires current admission eligibility and no unresolved holder. Reserved,
+attaching, attached and releasing sandbox allocations remain `ALLOCATED`.
+`CLEANING` includes queued and active background reset/cleaning work;
+`QUARANTINED` requires operator attention. `UNAVAILABLE` includes enrollment
+that current policy cannot admit. These totals are an observation, not a
+reservation or a guarantee that a particular environment, memory budget or
+multi-device request fits.
+
+Use `space-nodemgr devices list --json` for one enriched JSON record per parent.
+This replaces the previous development CLI's default JSON output; scripts must
+now pass `--json`. A new client talking to an older server shows `UNKNOWN`
+availability rather than inferring free capacity from `READY`. The existing
+operator-only authorization is unchanged; sandbox-manager and tenants cannot
+read host-device ownership through this RPC.
