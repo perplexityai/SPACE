@@ -2310,7 +2310,14 @@ impl SandboxManagerService {
         // metadata, this call also performs the first rootfs clone.
         let mut prepare_client = node_client.clone();
         let prepare_rootfs_size_mb = prepare_template.as_ref().and(sandbox.rootfs_size_mb);
-        let trust = self.initial_trust_enrollment(&sandbox).await?;
+        let inherited_trust = self.initial_trust_enrollment(&sandbox).await?;
+        // A disk-only fork cold-boots from rebound producer metadata. It
+        // inherits the trust mode, not the producer's historical key pin.
+        let trust = if start_ctx.restore_artifact_as_new.is_some() && inherited_trust.is_scoped() {
+            self.fresh_scoped_enrollment(&sandbox.id).await?
+        } else {
+            inherited_trust
+        };
         let prepare_sandbox = async {
             prepare_client
                 .prepare_sandbox(PrepareSandboxRequest {

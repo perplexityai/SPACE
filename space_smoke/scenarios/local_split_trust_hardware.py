@@ -256,10 +256,18 @@ def hardware_derivation(test: smoke.KindEcw) -> None:
             child = test.sandboxes.fork(test.sandbox).sandbox
             child_key = public_key_fingerprint(_anchor(test, child))
             proof = control.probe_anchor_access(child.sandbox_id)
+            expected_child_key = hardware.expected_public_key(
+                child.sandbox_id, key_id=replacement_key_id,
+            )
+            test.record("fork_key_selection", {
+                "sandbox_id": child.sandbox_id, "expected_key_id": replacement_key_id,
+                "actual_proof": proof, "spki_sha256": child_key,
+                "expected_spki_sha256": expected_child_key,
+            })
             test.verify(
                 proof["anchor_key_id"] == replacement_key_id
-                and child_key == hardware.expected_public_key(child.sandbox_id, key_id=replacement_key_id),
-                "fork kept its producer's old key pin instead of selecting the active key",
+                and child_key == expected_child_key,
+                "fork did not select the active hardware key for its own identity",
             )
             test.verify(_anchor(test, test.sandbox) == original, "fork changed parent trust")
             intercepted_https(test, child)
