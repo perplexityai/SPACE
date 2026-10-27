@@ -126,7 +126,7 @@ pub struct SandboxRecord {
     pub name: Option<String>,
     pub user_id: UserId,
     pub org_id: OrgId,
-    pub managed_by: String,
+    pub managed_by: SubstrateKind,
     pub lifecycle: String,
     pub placement: String,
     pub active_node_id: Option<NodeId>,
@@ -597,7 +597,7 @@ pub async fn auto_lifecycle_policy(
 /// not absence.
 #[derive(Debug, sqlx::FromRow)]
 pub struct AutoLifecycleExecution {
-    pub managed_by: String,
+    pub managed_by: SubstrateKind,
     pub lifecycle: String,
     pub placement: String,
     pub active_node_id: Option<NodeId>,
@@ -613,12 +613,8 @@ impl AutoLifecycleExecution {
     /// generation, no direct route and no activation lease has no execution,
     /// but only if its substrate
     /// [proves execution absence](SubstrateKind::proves_execution_absence).
-    /// `managed_by` holds the column's text; a value that does not parse
-    /// proves nothing.
     pub fn proves_no_execution(&self) -> bool {
-        self.managed_by
-            .parse::<SubstrateKind>()
-            .is_ok_and(SubstrateKind::proves_execution_absence)
+        self.managed_by.proves_execution_absence()
             && self.placement == "unplaced"
             && self.active_node_id.is_none()
             && self.target_node_id.is_none()

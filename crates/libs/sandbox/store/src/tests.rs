@@ -1,6 +1,6 @@
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{LocalArtifactId, OrgId, UserId};
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
@@ -99,18 +99,16 @@ fn field_patch_default_does_not_require_t_default() {
     );
 }
 
-/// Only a Kubernetes-managed row can prove there is no execution; a Direct or
-/// unrecognized `managed_by` leaves the outcome uncertain.
+/// Only a Kubernetes-managed row can prove there is no execution; a Direct
+/// row leaves the outcome uncertain.
 #[test]
 fn proves_no_execution_only_for_kubernetes_rows() {
     for (managed_by, proves) in [
-        ("k8s", true),
-        ("space", false),
-        ("kubernetes", false),
-        ("", false),
+        (SubstrateKind::Kubernetes, true),
+        (SubstrateKind::Space, false),
     ] {
         let execution = AutoLifecycleExecution {
-            managed_by: managed_by.to_owned(),
+            managed_by,
             lifecycle: "started".to_owned(),
             placement: "unplaced".to_owned(),
             active_node_id: None,
@@ -139,7 +137,7 @@ async fn get_returns_the_inserted_row() -> TestResult {
     assert_eq!(record.name.as_deref(), Some("store-get"));
     assert_eq!(record.user_id, UserId::from_uuid(SEED_USER));
     assert_eq!(record.org_id, OrgId::from_uuid(SEED_ORG));
-    assert_eq!(record.managed_by, "k8s");
+    assert_eq!(record.managed_by, SubstrateKind::Kubernetes);
     assert_eq!(record.lifecycle, "suspended");
     // Column defaults flow through the record untouched.
     assert_eq!(record.placement, "unplaced");

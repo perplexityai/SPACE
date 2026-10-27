@@ -197,11 +197,7 @@ catches the common forms in production code: SQL comparisons of `managed_by`
 with `'k8s'` or `'space'`, and Rust comparisons, label-string matches and match
 arms on `"k8s"` or `"space"` beside a substrate name. It is a line matcher and
 can miss a literal; its comment lists what it does not catch. Test files and
-the test-support modules its `allow` list names are exempt. Existing debt: the
-sandbox store's public `SandboxRecord.managed_by` and
-`AutoLifecycleExecution.managed_by` fields, which single-row reads still return
-as text (`proves_no_execution` parses the latter). Convert them when touched;
-they are not a pattern to copy.
+the test-support modules its `allow` list names are exempt.
 
 - A decision about one row's substrate, its sandbox or node `managed_by`,
   calls a `SubstrateKind` method named for the question (for example
