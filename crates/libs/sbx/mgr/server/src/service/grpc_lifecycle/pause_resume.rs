@@ -236,6 +236,15 @@ impl SandboxManagerService {
 
         let sandbox = self.lookup_sandbox(sandbox_id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Pause")?;
+        let runtime: pplx_space_common_core::types::RuntimeKind = sandbox
+            .runtime
+            .parse()
+            .map_err(|e| Status::failed_precondition(format!("runtime: {e}")))?;
+        if !runtime.baseline_capabilities().pause_resume {
+            return Err(Status::failed_precondition(format!(
+                "runtime {runtime} does not support pause"
+            )));
+        }
         let mut event_details =
             SandboxEventDetails::default().with_from_state(sandbox.state.to_string());
         if let Some(trigger) = sandbox_event_trigger(&request) {

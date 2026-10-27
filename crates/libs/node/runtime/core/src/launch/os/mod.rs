@@ -8,6 +8,27 @@ pub use linux::*;
 #[cfg(not(target_os = "linux"))]
 pub use other::*;
 
+/// A lifetime witness without signaling authority. The namespace runner must
+/// observe itself across fork, where the signalable handle's self-PID guard
+/// deliberately does not apply.
+pub struct ProcessObserver(ProcessHandle);
+impl ProcessObserver {
+    pub fn current() -> Result<Self, ProcessHandleError> {
+        pin_current_process().map(Self)
+    }
+    pub fn pid(&self) -> u32 {
+        self.0.pid()
+    }
+    pub fn has_exited(&self) -> std::io::Result<bool> {
+        self.0.has_exited()
+    }
+}
+impl From<ProcessHandle> for ProcessObserver {
+    fn from(handle: ProcessHandle) -> Self {
+        Self(handle)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessOwnership {
     Owned,

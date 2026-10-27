@@ -237,7 +237,13 @@ fn inspect_entry(
             };
             if !matches!(
                 comm.trim(),
-                "firecracker" | "space-spaced-ho" | "space-netgtw-sv"
+                "firecracker"
+                    | "cloud-hypervisor"
+                    | "cloud-hyperviso"
+                    | "space-spaced-host-svc"
+                    | "space-spaced-ho"
+                    | "space-netgtw-svc"
+                    | "space-netgtw-sv"
             ) {
                 return Ok(());
             }
