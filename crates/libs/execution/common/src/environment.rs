@@ -11,6 +11,16 @@ mod profiles;
 mod transport;
 pub use binding::{EnvironmentBindingError, EnvironmentRequirementsError};
 pub use transport::{FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT};
+pub const CLOUD_HYPERVISOR_BOOT_CONTRACT: &str = "cloud-hypervisor-linux-direct-v1";
+pub const CLOUD_HYPERVISOR_MACHINE_CONTRACT: &str = "cloud-hypervisor-pci-v1";
+
+/// The direct-boot image format is part of the compiled CH boot contract.
+pub const fn cloud_hypervisor_linux_format(architecture: Arch) -> &'static str {
+    match architecture {
+        Arch::Aarch64 => "linux-image",
+        Arch::X86_64 => "vmlinux",
+    }
+}
 
 /// Original encoding; existing definitions retain these bytes and references.
 pub const ENVIRONMENT_SCHEMA_VERSION: u32 = 1;
