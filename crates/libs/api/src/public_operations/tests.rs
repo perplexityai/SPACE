@@ -1891,6 +1891,89 @@ async fn seed_sandbox(
     Ok(())
 }
 
+async fn bind_file_key(
+    pool: &PgPool,
+    org_id: OrgId,
+    path_template: &'static str,
+    key: &str,
+    fingerprint: char,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let key = IdempotencyKey::parse(key)?;
+    let fingerprint = RequestFingerprint::parse(fingerprint.to_string().repeat(64))?;
+    Ok(bind_idempotency_key(
+        pool,
+        org_id,
+        &CreatePublicOperationIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new(path_template),
+            key: &key,
+            request_fingerprint: &fingerprint,
+        },
+    )
+    .await?)
+}
+
+async fn expire_keys(pool: &PgPool, org_id: OrgId, keys: &[&str]) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE public_idempotency_records
+         SET expires_at = NOW() - INTERVAL '1 second'
+         WHERE org_id = $1 AND idempotency_key = ANY($2)"
+    ))
+    .bind(org_id)
+    .bind(keys)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A key binding outlives its retention sweep only until it is next used:
+/// an expired binding takes the next request's fingerprint, and each binding
+/// deletes some of its own route's expired ones, never another route's.
+#[tokio::test]
+async fn a_key_binding_expires_and_prunes_its_own_route() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let write = "/v1/sandboxes/{sandbox_id}/files:write";
+    let mkdir = "/v1/sandboxes/{sandbox_id}/files:mkdir";
+
+    assert!(bind_file_key(&db.pool, org_id, write, "key", 'a').await?);
+    assert!(bind_file_key(&db.pool, org_id, write, "key", 'a').await?);
+    assert!(!bind_file_key(&db.pool, org_id, write, "key", 'b').await?);
+    expire_keys(&db.pool, org_id, &["key"]).await?;
+    assert!(bind_file_key(&db.pool, org_id, write, "key", 'b').await?);
+    assert!(!bind_file_key(&db.pool, org_id, write, "key", 'a').await?);
+
+    let stale = [
+        "stale-0", "stale-1", "stale-2", "stale-3", "stale-4", "stale-5",
+    ];
+    for key in stale {
+        bind_file_key(&db.pool, org_id, write, key, 'a').await?;
+    }
+    bind_file_key(&db.pool, org_id, mkdir, "stale-mkdir", 'a').await?;
+    let mut expired = stale.to_vec();
+    expired.push("stale-mkdir");
+    expire_keys(&db.pool, org_id, &expired).await?;
+    assert!(bind_file_key(&db.pool, org_id, write, "fresh", 'c').await?);
+
+    let remaining: Vec<(String, i64)> = sqlx::query_as(sql!(
+        "SELECT path_template, COUNT(*)
+         FROM public_idempotency_records
+         WHERE org_id = $1 AND expires_at <= NOW()
+         GROUP BY path_template
+         ORDER BY path_template"
+    ))
+    .bind(org_id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        remaining,
+        vec![(mkdir.to_string(), 1), (write.to_string(), 2)]
+    );
+    Ok(())
+}
+
 async fn seed_org(pool: &PgPool) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::now_v7();
     sqlx::query(sql!(

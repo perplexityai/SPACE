@@ -186,6 +186,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native_contract.command_validation",
                 "native_contract.command_wakes_idle_suspended_sandbox",
                 "native_contract.completed_delete_replay",
+                "native_contract.file_idempotency_conflict",
                 "native_contract.idempotency_conflict",
                 "native_contract.permanent_command_error",
                 "native_contract.process_session_wakes_idle_suspended_sandbox",

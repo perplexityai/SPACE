@@ -382,17 +382,17 @@ mod batch_body_limits {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    const KEY: &str = "native-file-write-limit-key";
+    pub(super) const KEY: &str = "native-file-write-limit-key";
 
-    struct Fixture {
-        _db: TestDb,
-        app: Router,
-        sandbox_id: PublicSandboxId,
+    pub(super) struct Fixture {
+        pub(super) db: TestDb,
+        pub(super) app: Router,
+        pub(super) sandbox_id: PublicSandboxId,
     }
 
     /// A native key and a stopped sandbox it owns, so requests pass auth and
     /// owner scope and reach the handler's body extraction and validation.
-    async fn fixture() -> TestDbResult<Fixture> {
+    pub(super) async fn fixture() -> TestDbResult<Fixture> {
         let db = pg_test_db().await?;
         sqlx::query(sql!(
             "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
@@ -418,7 +418,7 @@ mod batch_body_limits {
             .nest("/v1", crate::routes::public::v1_router(state.clone()))
             .with_state(state);
         Ok(Fixture {
-            _db: db,
+            db,
             app,
             sandbox_id,
         })
@@ -602,6 +602,187 @@ mod batch_body_limits {
         let (status, body) = post(&fixture, "write_batch", batch(false)).await?;
         assert_ne!(status, StatusCode::BAD_REQUEST, "{body}");
         Ok(())
+    }
+}
+
+/// A file mutation's `Idempotency-Key` belongs to the request it first came
+/// with. The fixture's sandbox is stopped, so a request bound to its key goes
+/// on to the sandbox and fails there; a refused one is answered with
+/// `idempotency_conflict` before the sandbox is asked anything.
+mod key_binding {
+    use super::batch_body_limits::{Fixture, KEY, fixture};
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Method, Request},
+    };
+    use pplx_space_common_core::sql;
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    async fn post(
+        fixture: &Fixture,
+        sandbox_id: &PublicSandboxId,
+        action: &str,
+        key: &str,
+        body: &Value,
+    ) -> TestDbResult<(StatusCode, Value)> {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/sandboxes/{sandbox_id}/files:{action}"))
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("content-type", "application/json")
+            .header("idempotency-key", key)
+            .body(Body::from(serde_json::to_vec(body)?))?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fixture.app.clone().oneshot(request),
+        )
+        .await??;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        Ok((status, serde_json::from_slice(&body)?))
+    }
+
+    fn is_conflict(status: StatusCode, body: &Value) -> bool {
+        status == StatusCode::CONFLICT && body["code"] == "idempotency_conflict"
+    }
+
+    /// Send `first` twice under one key, then each of `changed` under it.
+    /// The repeat reaches the sandbox as the first did; every change is
+    /// refused.
+    async fn assert_bound(
+        fixture: &Fixture,
+        action: &str,
+        first: Value,
+        changed: &[Value],
+    ) -> TestDbResult<()> {
+        let key = format!("file-{action}-binding");
+        let sandbox = &fixture.sandbox_id;
+        let (status, body) = post(fixture, sandbox, action, &key, &first).await?;
+        assert!(!is_conflict(status, &body), "{action}: {body}");
+        let (replay_status, replay) = post(fixture, sandbox, action, &key, &first).await?;
+        assert_eq!(
+            (replay_status, &replay["code"]),
+            (status, &body["code"]),
+            "{action}: {replay}"
+        );
+        for request in changed {
+            let (status, body) = post(fixture, sandbox, action, &key, request).await?;
+            assert!(is_conflict(status, &body), "{action} {request}: {body}");
+        }
+        Ok(())
+    }
+
+    /// The sandbox scopes its replay to itself, and so does the binding: the
+    /// same key in another sandbox, or on another route, is a new request.
+    #[tokio::test]
+    async fn a_reused_write_key_refuses_another_path_or_body() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let write = |path: &str, data: &[u8], append: bool| {
+            json!({
+                "path": path,
+                "data_base64": BASE64_STANDARD.encode(data),
+                "append": append,
+            })
+        };
+        assert_bound(
+            &fixture,
+            "write",
+            write("/workspace/a", b"first", false),
+            &[
+                write("/workspace/b", b"first", false),
+                write("/workspace/a", b"other", false),
+                write("/workspace/a", b"first", true),
+                json!({
+                    "path": "/workspace/a",
+                    "data_base64": BASE64_STANDARD.encode(b"first"),
+                    "user": "root",
+                }),
+            ],
+        )
+        .await?;
+
+        let other = PublicSandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, network_policy_generation)
+             VALUES ($1, $2, $3, 'stopped', 1)"
+        ))
+        .bind(other.as_uuid())
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .execute(&fixture.db.pool)
+        .await?;
+        let key = "file-write-binding";
+        let (status, body) = post(
+            &fixture,
+            &other,
+            "write",
+            key,
+            &write("/workspace/b", b"other", false),
+        )
+        .await?;
+        assert!(!is_conflict(status, &body), "{body}");
+        let mkdir = json!({ "path": "/workspace/b" });
+        let (status, body) = post(&fixture, &fixture.sandbox_id, "mkdir", key, &mkdir).await?;
+        assert!(!is_conflict(status, &body), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reused_batch_key_refuses_other_entries() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let entry = |path: &str, data: &[u8]| json!({ "path": path, "data_base64": BASE64_STANDARD.encode(data) });
+        assert_bound(
+            &fixture,
+            "write_batch",
+            json!({ "entries": [entry("/workspace/a", b"1"), entry("/workspace/b", b"2")] }),
+            &[
+                json!({ "entries": [entry("/workspace/a", b"1"), entry("/workspace/c", b"2")] }),
+                json!({ "entries": [entry("/workspace/a", b"1"), entry("/workspace/b", b"3")] }),
+                json!({ "entries": [entry("/workspace/a", b"1")] }),
+            ],
+        )
+        .await
+    }
+
+    /// mkdir and remove never pass the key to the sandbox, and rename's
+    /// sandbox replay compares only the key. All three refuse a changed
+    /// request rather than ignoring or replaying it.
+    #[tokio::test]
+    async fn mkdir_remove_and_rename_keys_refuse_a_changed_request() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        assert_bound(
+            &fixture,
+            "mkdir",
+            json!({ "path": "/workspace/d" }),
+            &[
+                json!({ "path": "/workspace/e" }),
+                json!({ "path": "/workspace/d", "parents": false }),
+            ],
+        )
+        .await?;
+        assert_bound(
+            &fixture,
+            "remove",
+            json!({ "path": "/workspace/d" }),
+            &[
+                json!({ "path": "/workspace/e" }),
+                json!({ "path": "/workspace/d", "recursive": true }),
+            ],
+        )
+        .await?;
+        assert_bound(
+            &fixture,
+            "rename",
+            json!({ "old_path": "/workspace/a", "new_path": "/workspace/b" }),
+            &[
+                json!({ "old_path": "/workspace/a", "new_path": "/workspace/c" }),
+                json!({ "old_path": "/workspace/c", "new_path": "/workspace/b" }),
+            ],
+        )
+        .await
     }
 }
 

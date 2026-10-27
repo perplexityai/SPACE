@@ -142,6 +142,7 @@ _DURATION_SECONDS = {
         "native.m1_generated_sdk_conformance": 20,
         "native.resident_pause": 5,
         "native_contract.command_validation": 6,
+        "native_contract.file_idempotency_conflict": 5,
         "native_contract.idempotency_conflict": 5,
         "native_contract.tenant_isolation": 5,
         "native_contract.token_scope": 5,

@@ -77,6 +77,8 @@ const DEFAULT_IDEMPOTENCY_TTL_HOURS: i64 = 24;
 /// controller replicas so the keyed-claim rule sees every committed claim.
 pub const PUBLIC_OPERATION_CLAIM_LOCK_KEY: i64 = 0x7370_6163_655f_6f70;
 
+mod key_bindings;
+pub(crate) use key_bindings::bind_idempotency_key;
 mod responses;
 pub(crate) use responses::ResponseAdmissionError;
 mod sandbox_quota;

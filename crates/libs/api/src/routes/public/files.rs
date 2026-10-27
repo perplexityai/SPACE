@@ -17,6 +17,9 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
+use pplx_space_public_api::routes::{
+    CREATE_DIRECTORY, REMOVE_FILE, RENAME_FILE, WRITE_FILE, WRITE_FILE_BATCH,
+};
 use pplx_space_public_api::{
     FileChangeTrackingRequest, FileChangeTrackingResponse, FileEventKind, FileInfo,
     FileListRequest, FileListResponse, FileMkdirRequest, FileModifiedEntry, FileModifiedRequest,
@@ -237,29 +240,57 @@ pub async fn write_file(
     // The decoded chunks are all the RPC needs; don't hold the encoded copy
     // for the rest of the request.
     drop(data_base64);
+    let mut fingerprint = RequestDigest::default();
+    fingerprint
+        .field(path.as_bytes())
+        .flag(append)
+        .flag(parents)
+        .user(user.as_ref())
+        .chunks(&chunks);
+    let binding = bind_request_key(&state, &sandbox, WRITE_FILE, &idempotency_key, fingerprint);
     let metric = SandboxApiMetricIdentity::native("files_write");
     if !parents {
-        let response = state
-            .sandbox_controller
-            .spaced_write(
-                &state.pool,
-                &sandbox,
-                metric,
-                stream::iter(spaced_write_requests(
-                    sandbox.id,
-                    path,
-                    append,
-                    idempotency_key,
-                    chunks,
-                    user,
-                )),
+        // Bind the key while the write connects, which hides the binding's
+        // round trip, but hold the open message until the key is bound. A
+        // refused key ends the stream before it opens, which the sandbox
+        // manager rejects before the guest sees anything. Connecting may
+        // still have woken a dormant sandbox, as the request would have.
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let mut requests = Some(spaced_write_requests(
+            sandbox.id,
+            path,
+            append,
+            idempotency_key.clone(),
+            chunks,
+            user,
+        ));
+        let requests = stream::once(bound_rx).flat_map(move |bound| {
+            stream::iter(
+                requests
+                    .take()
+                    .filter(|_| bound == Ok(true))
+                    .into_iter()
+                    .flatten(),
             )
-            .await
-            .map_err(controller_error)?;
+        });
+        let binding = async {
+            let result = binding.await;
+            let _ = bound_tx.send(result.is_ok());
+            result
+        };
+        let (bound, response) = tokio::join!(
+            binding,
+            state
+                .sandbox_controller
+                .spaced_write(&state.pool, &sandbox, metric, requests),
+        );
+        bound?;
+        let response = response.map_err(controller_error)?;
         return Ok(Json(FileWriteResponse {
             bytes_written: response.bytes_written,
         }));
     }
+    binding.await?;
     // Kept for a second attempt; each attempt copies one chunk at a time.
     let chunks: Arc<[Vec<u8>]> = chunks.into();
     let attempt = |key: IdempotencyKey| {
@@ -336,6 +367,25 @@ pub async fn write_file_batch(
             append: entry.append,
         });
     }
+    let mut fingerprint = RequestDigest::default();
+    fingerprint
+        .flag(parents)
+        .user(user.as_ref())
+        .count(entries.len());
+    for entry in &entries {
+        fingerprint
+            .field(entry.path.as_bytes())
+            .flag(entry.append)
+            .field(&entry.data);
+    }
+    bind_request_key(
+        &state,
+        &sandbox,
+        WRITE_FILE_BATCH,
+        &idempotency_key,
+        fingerprint,
+    )
+    .await?;
     let attempt = |entries: Vec<SpacedWriteBatchEntry>, key: &IdempotencyKey| {
         state.sandbox_controller.spaced_write_batch(
             &state.pool,
@@ -380,10 +430,23 @@ pub async fn mkdir_file(
     Path(sandbox_id): Path<String>,
     Json(request): Json<FileMkdirRequest>,
 ) -> Result<Json<FileMutationResponse>, PublicApiError> {
-    let _idempotency_key = idempotency_key(&headers)?;
+    let idempotency_key = idempotency_key(&headers)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     let user = parse_guest_user(request.user)?;
     let path = parse_guest_path(request.path)?;
+    let mut fingerprint = RequestDigest::default();
+    fingerprint
+        .field(path.as_bytes())
+        .flag(request.parents)
+        .user(user.as_ref());
+    bind_request_key(
+        &state,
+        &sandbox,
+        CREATE_DIRECTORY,
+        &idempotency_key,
+        fingerprint,
+    )
+    .await?;
     state
         .sandbox_controller
         .spaced_mkdir(
@@ -405,10 +468,16 @@ pub async fn remove_file(
     Path(sandbox_id): Path<String>,
     Json(request): Json<FileRemoveRequest>,
 ) -> Result<Json<FileMutationResponse>, PublicApiError> {
-    let _idempotency_key = idempotency_key(&headers)?;
+    let idempotency_key = idempotency_key(&headers)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     let user = parse_guest_user(request.user)?;
     let path = parse_guest_path(request.path)?;
+    let mut fingerprint = RequestDigest::default();
+    fingerprint
+        .field(path.as_bytes())
+        .flag(request.recursive)
+        .user(user.as_ref());
+    bind_request_key(&state, &sandbox, REMOVE_FILE, &idempotency_key, fingerprint).await?;
     state
         .sandbox_controller
         .spaced_remove(
@@ -443,6 +512,12 @@ pub async fn rename_file(
     let user = parse_guest_user(request.user)?;
     let old_path = parse_guest_path(request.old_path)?;
     let new_path = parse_guest_path(request.new_path)?;
+    let mut fingerprint = RequestDigest::default();
+    fingerprint
+        .field(old_path.as_bytes())
+        .field(new_path.as_bytes())
+        .user(user.as_ref());
+    bind_request_key(&state, &sandbox, RENAME_FILE, &idempotency_key, fingerprint).await?;
     state
         .sandbox_controller
         .spaced_rename(
@@ -1020,6 +1095,9 @@ fn path_basename(path: &str) -> &str {
         .find(|segment| !segment.is_empty())
         .unwrap_or(path)
 }
+
+mod key_binding;
+use key_binding::{RequestDigest, bind_request_key};
 
 #[cfg(test)]
 mod tests;
