@@ -15,7 +15,7 @@ use pplx_space_public_api::{
 };
 use pplx_space_sandbox_store as sandbox_store;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, Postgres, Transaction, types::Json};
+use sqlx::{FromRow, PgPool, Postgres, Row, Transaction, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -1372,10 +1372,12 @@ pub struct ListAdminPublicOperations {
 pub struct PublicOperationClaim {
     pub claim_token: String,
     pub operations: Vec<ClaimedPublicOperation>,
-    /// The claim took nothing although operations were due: each was held
-    /// back by earlier work on its sandbox, its organization's limit, or a
-    /// lack of slots of its class.
-    pub held_back: bool,
+    /// The claim found due operations other than teardowns, and its
+    /// organization limit held back every one of them, so until an execution
+    /// ends or another organization's work arrives, claiming again takes
+    /// none of them either. Work held back only by earlier work on its
+    /// sandbox, or by a row another transaction has locked, does not count.
+    pub org_limit_held_back: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1933,7 +1935,7 @@ async fn claim_operations(
         return Ok(PublicOperationClaim {
             claim_token: new_claim_token(),
             operations: Vec::new(),
-            held_back: false,
+            org_limit_held_back: false,
         });
     }
 
@@ -1970,7 +1972,7 @@ async fn claim_operations(
             return Ok(PublicOperationClaim {
                 claim_token,
                 operations: Vec::new(),
-                held_back: false,
+                org_limit_held_back: false,
             });
         }
     }
@@ -2009,9 +2011,17 @@ async fn claim_operations(
     // another organization submits later. Organizations all at their limit
     // share that one budget.
     // That rank needs a window, which cannot share a level with `FOR
-    // UPDATE`, so `picked_other` locks the chosen rows by key and re-checks
-    // that each is still claimable.
-    let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
+    // UPDATE`, so `first_other` admits up to `2 * $12` and `picked_other`
+    // locks the first `$12` of them it can by key, re-checking that each is
+    // still claimable. Admitting more than it takes keeps a row another
+    // transaction has locked from shrinking the claim, unless more than `$12`
+    // of the admitted ones are. A locked row still counts toward its
+    // organization's limit and the headroom budget in this claim, since
+    // finding it locked takes the lock, so work admitted only past it waits
+    // for the next claim. When it claims nothing, the statement returns
+    // one row with no operation, whose `org_limit_held_back` says whether
+    // other work was due and the organization limit held all of it back.
+    let rows = sqlx::query(sql!(
         "WITH shared AS (
              SELECT org_id, target_id
              FROM public_operations
@@ -2131,7 +2141,7 @@ async fn claim_operations(
                 OR org_slots <= $15
                 OR admissible_rank <= $12 - $16
              ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
-             LIMIT $12
+             LIMIT 2 * $12
          ),
          picked_other AS (
              SELECT candidate.operation_id,
@@ -2149,6 +2159,10 @@ async fn claim_operations(
                    candidate.claim_token = ''
                    OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
                )
+             ORDER BY first_other.next_attempt_at ASC,
+                      first_other.requested_at ASC,
+                      first_other.operation_id ASC
+             LIMIT $12
              FOR UPDATE OF candidate SKIP LOCKED
          ),
          picked_teardown AS (
@@ -2181,38 +2195,47 @@ async fn claim_operations(
              ) claimable
              ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
              LIMIT $1
+         ),
+         claimed AS (
+             UPDATE public_operations o
+             SET state = $5,
+                 attempts = o.attempts + 1,
+                 claim_token = $3,
+                 claim_generation = o.claim_generation + 1,
+                 claimed_at = NOW(),
+                 started_at = COALESCE(o.started_at, NOW()),
+                 progress_message = CASE
+                     WHEN o.progress_message = '' THEN 'operation claimed'
+                     ELSE o.progress_message
+                 END,
+                 updated_at = NOW()
+             FROM picked
+             WHERE o.operation_id = picked.operation_id
+             RETURNING o.operation_id,
+                       o.org_id,
+                       o.actor_user_id,
+                       o.api_product,
+                       o.kind,
+                       o.target_type,
+                       o.target_id,
+                       o.payload_json,
+                       o.attempts,
+                       o.claim_generation,
+                       o.traceparent,
+                       CASE WHEN picked.first_start
+                           THEN FLOOR(EXTRACT(EPOCH FROM NOW() - o.created_at))::BIGINT
+                       END AS age_at_first_claim_secs,
+                       (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
+                           AS queue_wait_ms,
+                       picked.reclaimed
          )
-         UPDATE public_operations o
-         SET state = $5,
-             attempts = o.attempts + 1,
-             claim_token = $3,
-             claim_generation = o.claim_generation + 1,
-             claimed_at = NOW(),
-             started_at = COALESCE(o.started_at, NOW()),
-             progress_message = CASE
-                 WHEN o.progress_message = '' THEN 'operation claimed'
-                 ELSE o.progress_message
-             END,
-             updated_at = NOW()
-         FROM picked
-         WHERE o.operation_id = picked.operation_id
-         RETURNING o.operation_id,
-                   o.org_id,
-                   o.actor_user_id,
-                   o.api_product,
-                   o.kind,
-                   o.target_type,
-                   o.target_id,
-                   o.payload_json,
-                   o.attempts,
-                   o.claim_generation,
-                   o.traceparent,
-                   CASE WHEN picked.first_start
-                       THEN FLOOR(EXTRACT(EPOCH FROM NOW() - o.created_at))::BIGINT
-                   END AS age_at_first_claim_secs,
-                   (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
-                       AS queue_wait_ms,
-                   picked.reclaimed"
+         SELECT claimed.*, summary.org_limit_held_back
+         FROM (
+             SELECT $12::BIGINT > 0
+                    AND NOT EXISTS (SELECT 1 FROM first_other)
+                    AND EXISTS (SELECT 1 FROM other_candidates) AS org_limit_held_back
+         ) summary
+         LEFT JOIN claimed ON TRUE"
     ))
     .bind(i64::from(input.limits.total))
     .bind(duration_secs_i64(input.claim_stale_after))
@@ -2251,7 +2274,13 @@ async fn claim_operations(
 
     let mut operations = Vec::with_capacity(rows.len());
     let mut queue_waits = Vec::with_capacity(rows.len());
+    let mut org_limit_held_back = false;
     for row in rows {
+        if row.try_get::<Option<Uuid>, _>("operation_id")?.is_none() {
+            org_limit_held_back = row.try_get("org_limit_held_back")?;
+            continue;
+        }
+        let row = DispatcherClaimRow::from_row(&row)?;
         let operation = ClaimedPublicOperation::try_from(row.operation)?;
         // A stale reclaim was already running, so its wait is not queue time.
         queue_waits.push((!row.reclaimed).then_some(row.queue_wait_ms));
@@ -2267,27 +2296,6 @@ async fn claim_operations(
         .await?;
         operations.push(operation);
     }
-    // A count, not `EXISTS`: the planner reads `EXISTS` as wanting one early
-    // row and picks a sequential scan, which with many active rows costs more
-    // than the claim; a count reads only the due range of the state index.
-    let held_back = operations.is_empty()
-        && sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT COUNT(*) > 0
-             FROM public_operations
-             WHERE state IN ($1, $2)
-               AND kind = ANY($3)
-               AND next_attempt_at <= NOW()
-               AND (
-                   claim_token = ''
-                   OR claimed_at <= NOW() - make_interval(secs => $4::BIGINT)
-               )"
-        ))
-        .bind(OperationState::Queued.as_str())
-        .bind(OperationState::Running.as_str())
-        .bind(&kind_labels)
-        .bind(duration_secs_i64(input.claim_stale_after))
-        .fetch_one(&mut *tx)
-        .await?;
     tx.commit().await?;
 
     for (operation, wait_ms) in operations.iter().zip(queue_waits) {
@@ -2308,7 +2316,7 @@ async fn claim_operations(
     Ok(PublicOperationClaim {
         claim_token,
         operations,
-        held_back,
+        org_limit_held_back,
     })
 }
 

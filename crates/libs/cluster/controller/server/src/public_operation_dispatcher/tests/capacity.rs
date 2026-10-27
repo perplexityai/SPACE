@@ -979,6 +979,166 @@ async fn an_organization_alone_leaves_its_headroom_of_the_free_slots() -> TestRe
     Ok(())
 }
 
+/// The operations a claim takes, sorted, and whether it says the
+/// organization limit held back all other work.
+async fn claim_reporting(
+    store: &PublicOperationStore,
+    limits: ClaimLimits,
+) -> Result<(Vec<OperationId>, bool), pplx_space_api::public_operations::PublicOperationStoreError>
+{
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limits,
+            claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
+            claimable_kinds: NATIVE_PUBLIC_OPERATION_KINDS,
+        })
+        .await?;
+    let mut claimed = claim
+        .operations
+        .iter()
+        .map(|operation| operation.id)
+        .collect::<Vec<_>>();
+    claimed.sort();
+    Ok((claimed, claim.org_limit_held_back))
+}
+
+#[tokio::test]
+async fn a_claim_reports_work_held_back_only_by_the_organization_limit() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let limits = |non_teardown, contended, headroom| ClaimLimits {
+        non_teardown,
+        per_org_non_teardown: Some(org_limit(contended, headroom)),
+        ..ClaimLimits::any(non_teardown)
+    };
+    // A create runs under a live claim this caller does not execute, as on
+    // another replica, and a pause of its sandbox is due behind it.
+    queue_all(
+        &store,
+        org_id,
+        &[(OperationKind::CreateSandbox, "sbx_running_elsewhere")],
+    )
+    .await?;
+    claim_with(&store, ClaimLimits::any(1)).await?;
+    queue_all(
+        &store,
+        org_id,
+        &[(OperationKind::PauseSandbox, "sbx_running_elsewhere")],
+    )
+    .await?;
+    // Its sandbox holds the pause back, not the organization limit.
+    assert_eq!(
+        claim_reporting(&store, limits(4, 2, 0)).await?,
+        (vec![], false)
+    );
+
+    // Another transaction holds the earliest of two creates locked: the
+    // claim takes the next one instead, both being within the limit.
+    let creates = queue_all(
+        &store,
+        org_id,
+        &[
+            (OperationKind::CreateSandbox, "sbx_locked_create"),
+            (OperationKind::CreateSandbox, "sbx_next_create"),
+        ],
+    )
+    .await?;
+    let mut lock = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM public_operations WHERE operation_id = $1 FOR UPDATE"
+    ))
+    .bind(creates[0].as_uuid())
+    .execute(&mut *lock)
+    .await?;
+    assert_eq!(
+        claim_reporting(&store, limits(1, 4, 0)).await?,
+        (vec![creates[1]], false)
+    );
+    // With only the locked one left, nothing is held back by the limit.
+    assert_eq!(
+        claim_reporting(&store, limits(1, 4, 0)).await?,
+        (vec![], false)
+    );
+    lock.rollback().await?;
+
+    // The organization runs its limit of two, no other waits, and its
+    // headroom is every free slot: the limit holds the create back.
+    assert_eq!(
+        claim_reporting(&store, limits(1, 2, 1)).await?,
+        (vec![], true)
+    );
+    assert_eq!(
+        claim_reporting(&store, limits(1, 2, 0)).await?,
+        (vec![creates[0]], false)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sandbox_blocked_operation_does_not_slow_claims() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let busy_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    // A create runs under a live claim this dispatcher does not hold, and a
+    // delete of its sandbox is due behind it.
+    queue_all(
+        &store,
+        busy_org,
+        &[(OperationKind::CreateSandbox, "sbx_busy_elsewhere")],
+    )
+    .await?;
+    claim_with(&store, ClaimLimits::any(1)).await?;
+    queue_all(
+        &store,
+        busy_org,
+        &[(OperationKind::DeleteSandbox, "sbx_busy_elsewhere")],
+    )
+    .await?;
+    let executor = HeldWork::default();
+    executor.release.cancel();
+    let claims = Arc::new(AtomicUsize::new(0));
+    let hook: BeforeClaimHook = {
+        let claims = claims.clone();
+        Arc::new(move || {
+            claims.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        })
+    };
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(super::BEFORE_CLAIM.scope(
+        hook,
+        run(
+            fast_loop_config(4),
+            store.clone(),
+            executor.clone(),
+            shutdown.clone(),
+        ),
+    ));
+
+    // The loop keeps claiming every tick, not about four times a second, so
+    // unrelated work is picked up at once.
+    let before = claims.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let during = claims.load(Ordering::SeqCst) - before;
+    assert!(during >= 10, "{during} claims in half a second");
+    let unrelated = queue_all(
+        &store,
+        other_org,
+        &[(OperationKind::CreateSandbox, "sbx_unrelated_create")],
+    )
+    .await?[0];
+    wait_for_state(&db.pool, unrelated, OperationState::Succeeded).await?;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_claim_that_finds_its_work_held_back_waits_before_the_next() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {

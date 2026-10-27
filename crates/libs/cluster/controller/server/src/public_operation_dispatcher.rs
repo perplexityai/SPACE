@@ -74,10 +74,11 @@ const ORG_SLOT_LIMIT_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_LIM
 /// without waiting for the first one's executions to end.
 const DEFAULT_ORG_SLOT_HEADROOM: u32 = 2;
 const ORG_SLOT_HEADROOM_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_HEADROOM";
-/// After a claim that took nothing although work was due, or while only
-/// slots kept for teardowns were free, how long the loop waits before
-/// claiming again, unless an execution finishes first. Such a claim reads
-/// the whole backlog for nothing.
+/// After a claim that took nothing because the organization limit held back
+/// every due operation other than a teardown, or while only slots kept for
+/// teardowns were free, how long the loop waits before claiming again,
+/// unless an execution finishes first. Until then such a claim reads the
+/// whole backlog for nothing.
 const HELD_BACK_CLAIM_BACKOFF: Duration = Duration::from_millis(250);
 const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
 /// How soon an operation handed back because its key is already executing
@@ -492,10 +493,10 @@ pub async fn run<E>(
                             finished_meanwhile = true;
                         }
                         let claimed = claim.operations.len();
-                        // Everything due was held back, or only a teardown
-                        // could start and none was due.
+                        // The organization limit held back all other work,
+                        // or only a teardown could start and none was due.
                         claim_backoff_until = (claimed == 0
-                            && (claim.held_back || claim_slots.free_other == 0)
+                            && (claim.org_limit_held_back || claim_slots.free_other == 0)
                             && !finished_meanwhile)
                             .then(|| Instant::now() + HELD_BACK_CLAIM_BACKOFF);
                         for operation in claim.operations {
