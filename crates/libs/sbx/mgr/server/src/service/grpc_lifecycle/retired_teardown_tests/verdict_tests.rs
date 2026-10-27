@@ -280,6 +280,7 @@ async fn redrive_refusal() -> RedrivenRefusal {
                 artifact: &artifact,
                 format: SuspendSnapshotFormat::Full,
                 origin: super::super::TeardownBackupOrigin::Captured,
+                just_captured: false,
             },
         ),
     )
@@ -481,6 +482,7 @@ async fn an_artifact_refusal_leaves_the_attempt_budget_whole() {
         artifact: &artifact,
         format: SuspendSnapshotFormat::Full,
         origin: super::super::TeardownBackupOrigin::Captured,
+        just_captured: false,
     };
     assert_eq!(
         service.teardown_use_of_upload(&backup, &job).unwrap(),

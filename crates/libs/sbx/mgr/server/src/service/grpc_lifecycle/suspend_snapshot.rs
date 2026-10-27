@@ -1115,6 +1115,7 @@ impl SandboxManagerService {
                         artifact: &staged_artifact,
                         format: published_format,
                         origin: TeardownBackupOrigin::Captured,
+                        just_captured: true,
                     },
                 )
                 .await?;

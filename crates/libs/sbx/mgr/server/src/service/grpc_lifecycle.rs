@@ -371,6 +371,10 @@ struct TeardownSuspendBackup<'a> {
     artifact: &'a crate::db::LocalArtifactRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
     origin: TeardownBackupOrigin,
+    /// This call captured the artifact under an id it minted, so the cluster
+    /// cannot hold a backup of it yet and asking would only return NOT_FOUND.
+    /// A later drive of the same artifact asks again.
+    just_captured: bool,
 }
 
 impl TeardownSuspendBackup<'_> {

@@ -115,6 +115,7 @@ async fn refused_teardown_with(payload: impl FnOnce(LocalArtifactId) -> String) 
                 artifact: &artifact,
                 format: SuspendSnapshotFormat::Full,
                 origin: super::TeardownBackupOrigin::Captured,
+                just_captured: false,
             },
         )
         .await

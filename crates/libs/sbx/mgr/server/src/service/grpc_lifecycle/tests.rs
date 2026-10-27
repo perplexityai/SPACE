@@ -1326,6 +1326,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
                     artifact: &artifact,
                     format: SuspendSnapshotFormat::Full,
                     origin: super::TeardownBackupOrigin::Captured,
+                    just_captured: false,
                 },
             )
             .await

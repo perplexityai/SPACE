@@ -21,6 +21,7 @@ fn only_a_captured_teardown_artifact_carries_its_generation() {
         artifact: &artifact,
         format: SuspendSnapshotFormat::Full,
         origin,
+        just_captured: false,
     };
     assert_eq!(
         backup(super::super::TeardownBackupOrigin::Captured).registration_generation(),

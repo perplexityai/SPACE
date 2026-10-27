@@ -942,6 +942,7 @@ impl SandboxManagerService {
                         artifact: &artifact,
                         format,
                         origin: TeardownBackupOrigin::Captured,
+                        just_captured: false,
                     },
                 )
                 .await?;
@@ -969,6 +970,7 @@ impl SandboxManagerService {
                         artifact: &artifact,
                         format,
                         origin: TeardownBackupOrigin::PreviouslySuspended,
+                        just_captured: false,
                     },
                 )
                 .await
@@ -1149,8 +1151,10 @@ impl SandboxManagerService {
         // An active local upload still owns its completion. Only probe before
         // enqueueing or joining a terminal job: a restored artifact can already
         // be durable without a local completion marker. A failed probe leaves
-        // the ordinary upload path responsible for durability.
-        if persisted_job.as_ref().is_none_or(|job| job.is_terminal())
+        // the ordinary upload path responsible for durability. A just-captured
+        // artifact has no backup to find.
+        if !backup.just_captured
+            && persisted_job.as_ref().is_none_or(|job| job.is_terminal())
             && matches!(
                 self.existing_ready_artifact_backup_response(backup.artifact)
                     .await,
