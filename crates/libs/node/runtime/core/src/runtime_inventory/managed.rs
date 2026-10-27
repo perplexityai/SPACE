@@ -467,7 +467,7 @@ fn runtime_from_source(
                 return Ok(runtime);
             }
             Err(error) if error.is_unsupported() => {
-                tracing::warn!(integrity = "publication-sha256", %error, "fs-verity unavailable; retaining verified legacy execution protection");
+                tracing::warn!(integrity = "catalog-sha256", %error, "fs-verity unavailable; using catalog SHA-256 authentication");
             }
             Err(error) => return Err(error.into()),
         }
@@ -476,9 +476,11 @@ fn runtime_from_source(
         RuntimeSource::Store(path) => store.verify_managed_release_at(pin, path)?,
         RuntimeSource::Baked(path) => store.verify_release_at(pin, path)?,
     };
-    DRIVERS
+    let mut runtime = DRIVERS
         .get(pin.release.kind)?
-        .inspect_installation(source.path().to_owned(), pin.release.version.clone())
+        .inspect_installation(source.path().to_owned(), pin.release.version.clone())?;
+    runtime.files.integrity = ExecutionSourceIntegrity::CatalogSha256;
+    Ok(runtime)
 }
 
 struct StagedKernel {
@@ -504,7 +506,7 @@ fn kernel_from_source(
                 });
             }
             Err(error) if error.is_unsupported() => {
-                tracing::warn!(integrity = "publication-sha256", %error, "kernel fs-verity unavailable; retaining verified legacy execution protection");
+                tracing::warn!(integrity = "catalog-sha256", %error, "kernel fs-verity unavailable; using catalog SHA-256 authentication");
             }
             Err(error) => return Err(error.into()),
         }
@@ -521,7 +523,7 @@ fn kernel_from_source(
     };
     Ok(StagedKernel {
         path,
-        integrity: ExecutionSourceIntegrity::Legacy,
+        integrity: ExecutionSourceIntegrity::CatalogSha256,
     })
 }
 

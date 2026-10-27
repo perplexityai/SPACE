@@ -5,13 +5,23 @@ use pplx_space_common_core::types::{LinuxPid, LinuxUid};
 pub(super) struct ExpectedSpacedHostPeer {
     runtime_pid: LinuxPid,
     sandbox_uid: LinuxUid,
+    runtime: pplx_space_common_core::types::RuntimeKind,
 }
 
 impl ExpectedSpacedHostPeer {
+    pub(super) fn for_runtime(
+        mut self,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+    ) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
     pub(super) const fn new(runtime_pid: LinuxPid, sandbox_uid: u32) -> Self {
         Self {
             runtime_pid,
             sandbox_uid: LinuxUid::new(sandbox_uid),
+            runtime: pplx_space_common_core::types::RuntimeKind::Firecracker,
         }
     }
 }
@@ -286,7 +296,13 @@ pub(super) fn prepare_sidecar_launch_args(
             args,
             program,
             "--vsock-uds",
-            &format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/v.sock"),
+            &pplx_space_node_runtime_core::control::guest_socket_path(
+                expected_peer.runtime,
+                sandbox_id,
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()))?
+            .display()
+            .to_string(),
         )?;
         reject_caller_controlled_launch_arg(args, program, "--firecracker-pid")?;
         reject_caller_controlled_launch_arg(args, program, "--firecracker-uid")?;

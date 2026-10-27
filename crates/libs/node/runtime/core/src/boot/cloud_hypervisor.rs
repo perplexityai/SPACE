@@ -47,7 +47,7 @@ pub(super) fn configuration(input: &LinuxBoot<'_>) -> Result<Value, BootConfigEr
         Arch::Aarch64 => "ttyAMA0",
         Arch::X86_64 => "ttyS0",
     };
-    Ok(json!({
+    let rendered = json!({
         "cpus": { "boot_vcpus": input.cpus.get(), "max_vcpus": input.cpus.get() },
         "memory": { "size": bytes, "shared": false, "hugepages": false, "thp": false },
         "payload": { "kernel": "/vmlinux.bin", "cmdline": super::command_line(input, "net.ifnames=0", "", console) },
@@ -56,5 +56,124 @@ pub(super) fn configuration(input: &LinuxBoot<'_>) -> Result<Value, BootConfigEr
         "serial": { "mode": if input.console { "Tty" } else { "Off" } },
         "console": { "mode": "Off" },
         "landlock_enable": true
-    }))
+    });
+    let parsed: Configuration = serde_json::from_value(rendered)?;
+    parsed.validate()?;
+    Ok(serde_json::to_value(parsed)?)
+}
+
+/// The only admitted standalone device model. Both the renderer and the
+/// privileged consumer use this codec; unknown fields fail at every level.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Configuration {
+    cpus: Cpus,
+    memory: Memory,
+    payload: Payload,
+    disks: [Disk; 1],
+    net: [Net; 1],
+    vsock: Vsock,
+    serial: Console,
+    console: Console,
+    landlock_enable: bool,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Cpus {
+    boot_vcpus: std::num::NonZeroU32,
+    max_vcpus: std::num::NonZeroU32,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Memory {
+    size: std::num::NonZeroU64,
+    shared: bool,
+    hugepages: bool,
+    thp: bool,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Payload {
+    kernel: String,
+    cmdline: String,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Disk {
+    id: String,
+    path: String,
+    readonly: bool,
+    image_type: ImageType,
+    backing_files: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limiter_config: Option<Limiter>,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum ImageType {
+    Raw,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Net {
+    id: String,
+    tap: pplx_space_common_core::types::LinuxInterfaceName,
+    mac: pplx_space_common_core::types::MacAddress,
+    num_queues: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limiter_config: Option<Limiter>,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Limiter {
+    bandwidth: Bucket,
+    ops: Bucket,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Bucket {
+    size: u64,
+    refill_time: u64,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Vsock {
+    cid: pplx_space_common_core::types::VsockCid,
+    socket: String,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Console {
+    mode: ConsoleMode,
+}
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ConsoleMode {
+    Off,
+    Tty,
+}
+
+impl Configuration {
+    fn validate(&self) -> Result<(), BootConfigError> {
+        if !self.landlock_enable
+            || self.payload.kernel != "/vmlinux.bin"
+            || self.disks[0].path != "/rootfs.ext4"
+            || self.vsock.socket != "/v.sock"
+            || self.memory.shared
+            || self.memory.hugepages
+            || self.memory.thp
+            || self.disks[0].backing_files
+            || self.disks[0].readonly
+            || self.net[0].num_queues != 2
+            || self.console.mode != ConsoleMode::Off
+            || self.cpus.boot_vcpus != self.cpus.max_vcpus
+        {
+            return Err(BootConfigError::Invalid("unqualified boot device model"));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn parse(configuration: &str) -> Result<Configuration, BootConfigError> {
+    let parsed: Configuration = serde_json::from_str(configuration)?;
+    parsed.validate()?;
+    Ok(parsed)
 }

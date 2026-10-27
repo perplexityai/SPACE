@@ -175,7 +175,7 @@ fn periodic_recovery_bounds_discovery_and_advances_past_retained_or_malformed_ro
         let id = SandboxId::new().to_string();
         insert_test_sandbox(
             &conn,
-            TestSandboxInsert::new(&id, "sandbox1", SandboxState::Started),
+            TestSandboxInsert::new(&id, "sandbox1", SandboxState::Stopped),
         );
     }
     let corrupt = SandboxId::new().to_string();
@@ -190,6 +190,7 @@ fn periodic_recovery_bounds_discovery_and_advances_past_retained_or_malformed_ro
     .unwrap();
     let mut expected = Vec::new();
     for state in [
+        SandboxState::Started,
         SandboxState::Paused,
         SandboxState::Resuming,
         SandboxState::Checkpointing,

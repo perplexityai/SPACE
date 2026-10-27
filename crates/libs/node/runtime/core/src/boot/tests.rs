@@ -2,7 +2,7 @@ use super::*;
 use pplx_space_common_core::types::{BalloonDevice, TokenBucket};
 use serde_json::{Value, json};
 
-fn input() -> LinuxBoot<'static> {
+pub(crate) fn input() -> LinuxBoot<'static> {
     LinuxBoot {
         guest: GuestPlatform {
             os: GuestOperatingSystem::Linux,
@@ -147,5 +147,47 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
             config["network-interfaces"][0]["tx_rate_limiter"],
             config["drives"][0]["rate_limiter"]
         );
+    }
+}
+
+#[test]
+fn standalone_admission_rejects_extra_devices_and_host_paths() {
+    let text = configuration(RuntimeKind::CloudHypervisor, &input()).unwrap();
+    validate_standalone(RuntimeKind::CloudHypervisor, &text).unwrap();
+    let original: Value = serde_json::from_str(&text).unwrap();
+    for (pointer, replacement) in [
+        ("/payload/kernel", json!("/etc/shadow")),
+        ("/vsock/socket", json!("/outside/socket")),
+        ("/disks/0/path", json!("/dev/host")),
+        ("/landlock_enable", json!(false)),
+        ("/memory/shared", json!(true)),
+        ("/disks/0/backing_files", json!(true)),
+        ("/net/0/num_queues", json!(8)),
+    ] {
+        let mut config = original.clone();
+        *config.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            validate_standalone(RuntimeKind::CloudHypervisor, &config.to_string()).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut extra = original;
+    extra["devices"] = json!([{ "path": "/dev/vfio/3" }]);
+    validate_standalone(RuntimeKind::CloudHypervisor, &extra.to_string()).unwrap_err();
+}
+
+#[test]
+fn standalone_refuses_unqualified_memory_devices() {
+    for balloon in [false, true] {
+        let mut boot = input();
+        if balloon {
+            boot.balloon = Some(BalloonConfig::new(BalloonDevice::FreePageHinting, 1));
+        } else {
+            boot.huge_pages = true;
+        }
+        assert!(matches!(
+            configuration(RuntimeKind::CloudHypervisor, &boot),
+            Err(BootConfigError::UnsupportedFeature { .. })
+        ));
     }
 }
