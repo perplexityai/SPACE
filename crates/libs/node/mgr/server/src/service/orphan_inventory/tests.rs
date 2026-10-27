@@ -157,13 +157,32 @@ fn process_evidence_preserves_tracked_ancestry_and_unreadable_is_not_absence() {
         std::fs::write(process.join("comm"), "firecracker\n").unwrap();
         std::fs::write(process.join("cgroup"), cgroup).unwrap();
     }
+    // execveat on older kernels can leave a numeric comm. The executable
+    // identity still identifies the VMM; cgroup ancestry protects live leases.
+    #[cfg(unix)]
+    for (pid, owner) in [(104, &orphan), (105, &tracked)] {
+        let process = processes.join(pid.to_string());
+        std::fs::create_dir(&process).unwrap();
+        std::fs::write(process.join("comm"), "7\n").unwrap();
+        std::os::unix::fs::symlink("/runtime/bin/cloud-hypervisor", process.join("exe")).unwrap();
+        std::fs::write(
+            process.join("cgroup"),
+            format!("0::/space/sbx-{owner}/vm\n"),
+        )
+        .unwrap();
+    }
     let evidence = Evidence {
         sandboxes: HashSet::from([tracked]),
         slots: HashSet::new(),
         pids: HashSet::new(),
     };
     let page = Scan::new().page(&evidence, &roots, || Ok(vec![]));
-    assert_eq!(page.orphaned_processes, [format!("102:{orphan}")]);
+    let mut expected = vec![format!("102:{orphan}")];
+    #[cfg(unix)]
+    expected.push(format!("104:{orphan}"));
+    let mut found = page.orphaned_processes;
+    found.sort();
+    assert_eq!(found, expected);
     assert!(!page.complete);
     assert!(page.next_page_token.is_empty());
     assert!(!page.warnings.is_empty());

@@ -470,7 +470,7 @@ impl SandboxManagerService {
             Ok(VmState::Paused) => crate::db::PauseFailedRecoveryTarget::Paused,
             Ok(VmState::NotStarted | VmState::Shutdown) => {
                 return self
-                    .quarantine_interrupted_pause(row, "Firecracker reported NotStarted")
+                    .quarantine_interrupted_pause(row, "runtime reported not started or shut down")
                     .await;
             }
             Err(error) => {

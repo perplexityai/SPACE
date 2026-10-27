@@ -956,17 +956,25 @@ async fn resolve_sandbox_selector(
         .map_err(|e| format!("ERROR: {e}"))?
         .into_inner()
         .leases;
+    resolve_lease_selector(leases, selector)
+}
 
-    let leases = leases
-        .into_iter()
-        .map(|lease| parse_lease_sandbox_id(&lease).map(|id| (lease, id)))
-        .collect::<Result<Vec<_>, _>>()?;
-    match selector.find(leases.iter(), |(_, id)| *id) {
-        Some(OneOrMany::One((lease, _))) => Ok(lease.sandbox_id.clone()),
+fn resolve_lease_selector(
+    leases: Vec<NetworkLease>,
+    selector: &SandboxSelector,
+) -> Result<String, String> {
+    // A retired execution's slot may still be cleaning when its sandbox
+    // starts again. Select the sandbox identity, not an individual lease.
+    let sandboxes = leases
+        .iter()
+        .map(parse_lease_sandbox_id)
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    match selector.find(sandboxes, |id| *id) {
+        Some(OneOrMany::One(id)) => Ok(id.to_string()),
         Some(OneOrMany::Many(matches)) => {
             let mut message = format!("Ambiguous sandbox selector '{selector}', matches:");
-            for (lease, _) in &matches {
-                message.push_str(&format!("\n  {}", sandbox_label_or_id(&lease.sandbox_id)));
+            for id in matches {
+                message.push_str(&format!("\n  {}", sandbox_label_or_id(&id.to_string())));
             }
             Err(message)
         }
