@@ -421,11 +421,11 @@ func TestSandboxResourceAnnotationsOverrideOCIResources(t *testing.T) {
 		t.Fatalf("sandboxMemoryMiB() error = %v", err)
 	}
 
-	if vcpu != 2 {
-		t.Fatalf("sandboxVCPU() = %d, want 2", vcpu)
+	if vcpu == nil || *vcpu != 2 {
+		t.Fatalf("sandboxVCPU() = %v, want 2", vcpu)
 	}
-	if memoryMiB != 8192 {
-		t.Fatalf("sandboxMemoryMiB() = %d, want 8192", memoryMiB)
+	if memoryMiB == nil || *memoryMiB != 8192 {
+		t.Fatalf("sandboxMemoryMiB() = %v, want 8192", memoryMiB)
 	}
 }
 
@@ -433,17 +433,17 @@ func TestSandboxResourceAnnotationsRejectInvalidValues(t *testing.T) {
 	tests := []struct {
 		name       string
 		annotation string
-		parse      func(*ociSpec) (uint32, error)
+		parse      func(*ociSpec) (*uint32, error)
 	}{
 		{
 			name:       "vcpu",
 			annotation: sandboxVCPUAnnotation,
-			parse:      func(spec *ociSpec) (uint32, error) { return spec.sandboxVCPU() },
+			parse:      func(spec *ociSpec) (*uint32, error) { return spec.sandboxVCPU() },
 		},
 		{
 			name:       "memory",
 			annotation: sandboxMemoryMiBAnnotation,
-			parse:      func(spec *ociSpec) (uint32, error) { return spec.sandboxMemoryMiB() },
+			parse:      func(spec *ociSpec) (*uint32, error) { return spec.sandboxMemoryMiB() },
 		},
 	}
 
@@ -2968,5 +2968,30 @@ func TestInitialCreateEnvMetadataBoundaries(t *testing.T) {
 				t.Fatal("initial Create environment contract mismatch")
 			}
 		})
+	}
+}
+
+func TestSandboxResourceDefaultsAreDelegated(t *testing.T) {
+	spec := &ociSpec{}
+	cpu, err := spec.sandboxVCPU()
+	if err != nil || cpu != nil {
+		t.Fatalf("omitted CPU = %v, %v", cpu, err)
+	}
+	memory, err := spec.sandboxMemoryMiB()
+	if err != nil || memory != nil {
+		t.Fatalf("omitted memory = %v, %v", memory, err)
+	}
+	quota, period, limit := int64(150000), uint64(100000), int64(1024*1024+1)
+	spec.Linux = &ociLinux{Resources: &ociLinuxResources{
+		CPU:    &ociLinuxCPU{Quota: &quota, Period: &period},
+		Memory: &ociLinuxMemory{Limit: &limit},
+	}}
+	cpu, err = spec.sandboxVCPU()
+	if err != nil || cpu == nil || *cpu != 2 {
+		t.Fatalf("OCI CPU = %v, %v", cpu, err)
+	}
+	memory, err = spec.sandboxMemoryMiB()
+	if err != nil || memory == nil || *memory != 2 {
+		t.Fatalf("OCI memory = %v, %v", memory, err)
 	}
 }

@@ -56,8 +56,6 @@ const (
 	sbxMgrSocket       = "/space/run/sandbox-manager/sandbox-manager.sock"
 	runtime            = "fc"
 	defaultTemplate    = "seed"
-	defaultVCPU        = 2
-	defaultMemoryMiB   = 1024
 	defaultProxyPort   = 9800
 	defaultNodeAPIPort = 9800
 	maxRouteGeneration = uint64(1<<63 - 1)
@@ -522,8 +520,8 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		)
 		startRequest := &pb.StartRequest{
 			SandboxId:                sbxID,
-			Vcpu:                     ptr(sandboxVCPU),
-			MemoryMib:                ptr(sandboxMemoryMiB),
+			Vcpu:                     sandboxVCPU,
+			MemoryMib:                sandboxMemoryMiB,
 			Checkpoint:               sandboxCheckpoint,
 			Blocking:                 false,
 			NetnsPath:                ptr(netnsPath),
@@ -602,8 +600,8 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 				nodeAPIProxyTargetPort(),
 			)
 		}
-		logShim("Create: restored sandbox %s active (template=%s restore_mode=%s vcpu=%d memory_mib=%d env_count=%d pid=%d, ns=%s)",
-			sbxID, sandboxTemplate, restoreMode, sandboxVCPU, sandboxMemoryMiB, len(sandboxEnv), t.pid, startResp.GetNamespace())
+		logShim("Create: restored sandbox %s active (template=%s restore_mode=%s vcpu=%v memory_mib=%v env_count=%d pid=%d, ns=%s)",
+			sbxID, sandboxTemplate, restoreMode, optionalResource(sandboxVCPU), optionalResource(sandboxMemoryMiB), len(sandboxEnv), t.pid, startResp.GetNamespace())
 		emitShimOperationLatency("create", createStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
 		return &taskAPI.CreateTaskResponse{Pid: uint32(t.pid)}, nil
 	}
@@ -699,8 +697,8 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		SandboxId: sbxID,
 		Blocking:  false,
 		StartContext: &pb.WakeStartContext{
-			Vcpu:      ptr(sandboxVCPU),
-			MemoryMib: ptr(sandboxMemoryMiB),
+			Vcpu:      sandboxVCPU,
+			MemoryMib: sandboxMemoryMiB,
 			NetnsPath: ptr(netnsPath),
 			RouteIdentity: routeIdentity(
 				sandboxRouteGeneration,
@@ -765,8 +763,8 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			nodeAPIProxyTargetPort(),
 		)
 	}
-	logShim("Create: sandbox %s active (template=%s vcpu=%d memory_mib=%d env_count=%d pid=%d, ns=%s, reused_existing=%t)",
-		sbxID, sandboxTemplate, sandboxVCPU, sandboxMemoryMiB, len(createReq.Env), t.pid, sandboxState.GetNamespace(), reusedExisting)
+	logShim("Create: sandbox %s active (template=%s vcpu=%v memory_mib=%v env_count=%d pid=%d, ns=%s, reused_existing=%t)",
+		sbxID, sandboxTemplate, optionalResource(sandboxVCPU), optionalResource(sandboxMemoryMiB), len(createReq.Env), t.pid, sandboxState.GetNamespace(), reusedExisting)
 
 	s.tasks[r.ID] = t
 	createSucceeded = true
@@ -2788,11 +2786,12 @@ func (s *ociSpec) requestedSandboxID() *uuid.UUID {
 	return &parsed
 }
 
-func (s *ociSpec) sandboxVCPU() (uint32, error) {
+// Omitted shape belongs to the template or captured snapshot, not the shim.
+func (s *ociSpec) sandboxVCPU() (*uint32, error) {
 	if value, err := s.positiveUint32Annotation(sandboxVCPUAnnotation); err != nil {
-		return 0, err
+		return nil, err
 	} else if value != nil {
-		return *value, nil
+		return value, nil
 	}
 	if s.Linux != nil && s.Linux.Resources != nil && s.Linux.Resources.CPU != nil &&
 		s.Linux.Resources.CPU.Quota != nil && s.Linux.Resources.CPU.Period != nil &&
@@ -2801,24 +2800,24 @@ func (s *ociSpec) sandboxVCPU() (uint32, error) {
 		period := *s.Linux.Resources.CPU.Period
 		rounded := (quota + period - 1) / period
 		if rounded > 0 {
-			return uint32(rounded), nil
+			return ptr(uint32(rounded)), nil
 		}
 	}
-	return defaultVCPU, nil
+	return nil, nil
 }
 
-func (s *ociSpec) sandboxMemoryMiB() (uint32, error) {
+func (s *ociSpec) sandboxMemoryMiB() (*uint32, error) {
 	if value, err := s.positiveUint32Annotation(sandboxMemoryMiBAnnotation); err != nil {
-		return 0, err
+		return nil, err
 	} else if value != nil {
-		return *value, nil
+		return value, nil
 	}
 	if s.Linux != nil && s.Linux.Resources != nil && s.Linux.Resources.Memory != nil &&
 		s.Linux.Resources.Memory.Limit != nil && *s.Linux.Resources.Memory.Limit > 0 {
 		limitBytes := uint64(*s.Linux.Resources.Memory.Limit)
-		return uint32((limitBytes + 1024*1024 - 1) / (1024 * 1024)), nil
+		return ptr(uint32((limitBytes + 1024*1024 - 1) / (1024 * 1024))), nil
 	}
-	return defaultMemoryMiB, nil
+	return nil, nil
 }
 
 func (s *ociSpec) positiveUint32Annotation(annotation string) (*uint32, error) {
@@ -3019,4 +3018,11 @@ func readSpecFrom(bundlePath string) (*ociSpec, error) {
 		return nil, fmt.Errorf("%w: %w", errParseOCISpec, err)
 	}
 	return &spec, nil
+}
+
+func optionalResource(value *uint32) any {
+	if value == nil {
+		return "inherited"
+	}
+	return *value
 }
