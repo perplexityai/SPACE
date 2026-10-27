@@ -195,7 +195,9 @@ python3 infra/space/kind/scripts/image-provenance.py check \
 ```
 
 Nothing prunes `provenance/` or `runs/`; their files are a few kilobytes each
-and can be deleted at any time.
+and can be deleted at any time. Neither the prunes nor `teardown.sh` remove
+`image-refs/<cluster>/` either, the references the last build of each image
+handed Tilt ([Image delivery](#image-delivery)), a few bytes per image.
 
 ### Image delivery
 
@@ -226,7 +228,9 @@ has run) matches every node, and an image with no recorded pod template, or
 a cluster whose node labels cannot be read, gets every node. Nodes keep their
 images when a pod is evicted or a Node object is deleted and registers again,
 so a drained pod rescheduled within its pool finds its image. A node that
-gains a matching label later gets the image at the image's next build.
+gains a matching label later gets the image at the image's next build. Pods
+SPACE creates at runtime are not in these manifests and get no image from this
+step; today they all run `registry.k8s.io/pause`.
 
 The load is the last step of each build in Tilt's log, its lines prefixed
 `[kind-load]`, ending with how many nodes it loaded and how long it took.
@@ -1242,17 +1246,18 @@ are never touched. `--dry-run` lists what it would remove;
 `SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0` turns it off.
 
 The host's Docker store, where the images are built, keeps old builds too.
-Every Tilt build of an image adds two tags to it: `:tilt-build-<time>`, the
-`$SPACE_BUILD_REF` the Tiltfile's build commands tag, and the `:tilt-<hash>`
-Tilt deploys. Tilt's built-in pruner (`docker_prune_settings`) never removes
-these builds, whatever their labels, because it passes over every image with
-more than one tag. On Docker's graph-driver store, a rebuilt `:local` image
-also leaves its previous build behind untagged; the containerd image store
-drops it. So the same script runs with `--host`: as the Tilt resource
-`prune-host-images` whenever an update has settled. It applies the rules above to the host's images, with any
-container on the host holding an image, and also keeps each image's newest
-build that nothing current names, so the build before the current one stays.
-`SPACE_TILT_PRUNE_HOST_IMAGES=0` turns it off.
+Every Tilt build of an image adds two tags to it: `:tilt-build-<time>-<nonce>`,
+the `$SPACE_BUILD_REF` the Tiltfile's build commands tag, and the
+`:tilt-<hash>` Tilt deploys. Tilt's built-in pruner (`docker_prune_settings`)
+never removes these builds, whatever their labels, because it passes over every
+image with more than one tag. On Docker's graph-driver store, a rebuilt
+`:local` image also leaves its previous build behind untagged; the containerd
+image store drops it. So the same script runs with `--host`: as the Tilt
+resource `prune-host-images` whenever an update has settled. It applies the
+rules above to the host's images, with any container on the host holding an
+image, and also keeps each image's newest build that nothing current names, so
+the build before the current one stays. `SPACE_TILT_PRUNE_HOST_IMAGES=0` turns
+it off.
 
 Do not run `crictl rmi --prune` in a node instead. It removes every image no
 container is using at that moment, which includes SPACE images Kind cannot pull

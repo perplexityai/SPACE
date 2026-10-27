@@ -259,7 +259,7 @@ update_settings(max_parallel_updates = MAX_PARALLEL_UPDATES)
 # command ends by loading the build into the nodes itself, onto the nodes its
 # pods can schedule onto, and Tilt's own load step is off. See there. Tilt
 # sets no $EXPECTED_REF for a build that names its own reference, so each
-# build tags $SPACE_BUILD_REF, `<name>:tilt-build-<time>`, the tag Tilt gave.
+# build tags $SPACE_BUILD_REF, `<name>:tilt-build-<time>-<nonce>`.
 IMAGE_BUILDS = []
 
 def space_image(ref, command, deps):
@@ -416,10 +416,10 @@ space_image(
 # Every manifest goes to Tilt through deploy_yaml, which also records where
 # each image's pods can schedule: the nodeSelector, required node affinity and
 # nodeName of every pod template, by the repository of each image it runs
-# (any tag, as Tilt's image injection matches). The image's load reads them
-# (kind-load-image.py), so call k8s_yaml nowhere else: a pod template that
-# bypassed deploy_yaml could land on a node its image was never loaded onto,
-# and wait there in ImagePullBackOff.
+# (any tag: a superset of the references Tilt injects into). The image's load
+# reads them (kind-load-image.py), so call k8s_yaml nowhere else: a pod
+# template that bypassed deploy_yaml could land on a node its image was never
+# loaded onto, and wait there in ImagePullBackOff.
 POD_PLACEMENT = {}
 
 def image_repository(image):
@@ -913,7 +913,11 @@ k8s_resource(
 # loads it only onto the nodes its pods can schedule onto (POD_PLACEMENT, from
 # the manifests above) that do not already hold that digest, and writes the tag
 # to the file Tilt then deploys it under (outputs_image_ref_to). An unchanged
-# image keeps its tag, so its workloads do not roll.
+# image keeps its tag, so its workloads do not roll. Every checkout on the host
+# builds into the same Docker store, so the build tag carries the shell's pid
+# and a random nonce besides the time: two builds of one image in the same
+# second, from two checkouts, must not share a tag (Tilt runs the command
+# with `sh`, which may have no $RANDOM).
 IMAGE_REF_DIR = "{}/image-refs/{}".format(
     os.getenv("SPACE_TILT_STATE_DIR", "") or os.getenv("HOME", "") + "/.space-devbox/kind", KIND_CLUSTER)
 for image in IMAGE_BUILDS:
@@ -922,7 +926,7 @@ for image in IMAGE_BUILDS:
     custom_build(
         ref = image["ref"],
         command = " && ".join([
-            "SPACE_BUILD_REF={}:tilt-build-$(date +%s)".format(name),
+            "SPACE_BUILD_REF={}:tilt-build-$(date +%s)-$$-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')".format(name),
             image["command"],
             ("python3 infra/space/kind/scripts/kind-load-image.py --cluster {} --image {} " +
              "--build-ref \"$SPACE_BUILD_REF\" --ref-file '{}'").format(KIND_CLUSTER, name, ref_file),
@@ -955,13 +959,14 @@ if os.getenv("SPACE_KIND_PRUNE_SUPERSEDED_IMAGES", "1") != "0":
     )
 
 # The host's Docker store, where those builds are made, keeps every one of them
-# too: each Tilt build adds a `:tilt-build-<time>` tag (the $SPACE_BUILD_REF the
-# build commands above tag) and the `:tilt-<hash>` Tilt deploys. Tilt's built-in
-# pruner (docker_prune_settings) cannot remove them, labelled or not: it passes
-# over every image with more than one tag (internal/engine/dockerprune/
-# docker_pruner.go in tilt-dev/tilt). So whenever an update has settled, the
-# same script removes from the host the builds of SPACE's images it would remove
-# from the nodes, except that the build before the current one stays too.
+# too: each Tilt build adds a `:tilt-build-<time>-<nonce>` tag (the
+# $SPACE_BUILD_REF the build commands above tag) and the `:tilt-<hash>` Tilt
+# deploys. Tilt's built-in pruner (docker_prune_settings) cannot remove them,
+# labelled or not: it passes over every image with more than one tag
+# (internal/engine/dockerprune/docker_pruner.go in tilt-dev/tilt). So whenever
+# an update has settled, the same script removes from the host the builds of
+# SPACE's images it would remove from the nodes, except that the build before
+# the current one stays too.
 # SPACE_TILT_PRUNE_HOST_IMAGES=0 leaves the resource out.
 if os.getenv("SPACE_TILT_PRUNE_HOST_IMAGES", "1") != "0":
     local_resource(

@@ -25,11 +25,11 @@ An image is removed only when all of these hold:
 With --host the same rules select from the host's Docker store, where the
 builds are made, except that each image also keeps its newest build nothing
 current names: the build before the current one. There every Tilt build adds a
-`:tilt-build-<time>` tag and the `:tilt-<hash>` Tilt deploys (custom_build),
-and on Docker's graph-driver store a rebuilt `:local` leaves the previous
-build untagged. Tilt's docker_prune_settings pruner removes none of them: it passes
-over every image with more than one tag (internal/engine/dockerprune/
-docker_pruner.go in tilt-dev/tilt).
+`:tilt-build-<time>-<nonce>` tag and the `:tilt-<hash>` Tilt deploys
+(custom_build), and on Docker's graph-driver store a rebuilt `:local` leaves
+the previous build untagged. Tilt's docker_prune_settings pruner removes none
+of them: it passes over every image with more than one tag
+(internal/engine/dockerprune/docker_pruner.go in tilt-dev/tilt).
 
 Anything else, third-party images included, is left alone. Pruning is skipped
 while the Tilt serving this cluster has a build pending or in progress, because

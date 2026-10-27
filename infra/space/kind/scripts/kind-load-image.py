@@ -12,7 +12,9 @@ every image to all six nodes again, changed or not. This script:
 
 * tags the build `<name>:tilt-<the first 16 hex digits of its config
   digest>`, so an unchanged image keeps its reference (no workload rolls)
-  and a changed one always gets a new reference;
+  and a changed one always gets a new reference. --build-ref is read once:
+  the tag is applied to the image ID that read returned, so a build that
+  retags --build-ref meanwhile cannot put its content under this reference;
 * loads that reference onto each node a pod running the image can schedule
   onto, except a node whose CRI already holds it at that config digest. A
   digest that cannot be read counts as absent, so the node is loaded;
@@ -21,7 +23,7 @@ every image to all six nodes again, changed or not. This script:
 Where the image's pods can schedule comes from the manifests Tilt deploys: the
 Tiltfile passes, in SPACE_KIND_IMAGE_PLACEMENT, the nodeSelector, required
 node affinity and nodeName of every pod template that runs the image (its
-`deploy` helper records them from the rendered charts). A node is a target
+`deploy_yaml` helper records them from the rendered charts). A node is a target
 when it satisfies any one of them. The set only ever errs toward more nodes:
 tolerations and taints are ignored; an affinity operator or field this script
 does not evaluate matches every node; a label key that no node carries, which
@@ -62,18 +64,19 @@ def hex_digest(value: str) -> str:
     return value.rsplit("@", 1)[-1].removeprefix("sha256:")
 
 
-def config_digest(ref: str) -> str:
-    """The config digest of a local image: what the nodes' CRI names it by.
+def resolve(ref: str) -> tuple[str, str]:
+    """(image ID, config digest) of a local image, from one read of `ref`.
 
-    On Docker's containerd image store the image ID is the manifest digest
-    and the config digest is its descriptor's annotation; on the graph-driver
-    store the image ID is the config digest.
+    The config digest is what the nodes' CRI names the image by. On Docker's
+    containerd image store the image ID is the manifest digest and the config
+    digest is its descriptor's annotation; on the graph-driver store the
+    image ID is the config digest.
     """
     image = json.loads(run(["docker", "image", "inspect", ref]))[0]
     descriptor = image.get("Descriptor") or {}
     if descriptor.get("mediaType", "").endswith("index.v1+json"):
         raise SystemExit(f"kind-load: {ref} is an image index; build it with --provenance=false")
-    return (descriptor.get("annotations") or {}).get("config.digest") or image["Id"]
+    return image["Id"], (descriptor.get("annotations") or {}).get("config.digest") or image["Id"]
 
 
 def content_ref(image: str, config: str) -> str:
@@ -188,9 +191,9 @@ def placement() -> list[dict] | None:
 
 def load(args: argparse.Namespace) -> int:
     started = time.monotonic()
-    config = config_digest(args.build_ref)
+    image_id, config = resolve(args.build_ref)
     ref = content_ref(args.image, config)
-    run(["docker", "tag", args.build_ref, ref])
+    run(["docker", "tag", image_id, ref])
     nodes = kind_nodes(args.cluster)
     constraints = placement()
     if not constraints:
@@ -217,8 +220,10 @@ def load(args: argparse.Namespace) -> int:
     path = Path(args.ref_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(ref + "\n")
+    # The build reference names this invocation: kind-bringup-timeline.py
+    # counts each load once by it.
     log(f"{ref}: on {len(targets)} of {len(nodes)} nodes, {len(missing)} loaded, "
-        f"in {time.monotonic() - started:.1f} s")
+        f"in {time.monotonic() - started:.1f} s (build {args.build_ref})")
     return 0
 
 
@@ -235,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
         return load(args)
     except subprocess.CalledProcessError as error:
         log(f"ERROR: {' '.join(error.cmd[:6])} failed: {(error.stderr or '').strip()}")
+        return 2
+    except (subprocess.SubprocessError, OSError, ValueError) as error:
+        log(f"ERROR: {error}")
         return 2
 
 
