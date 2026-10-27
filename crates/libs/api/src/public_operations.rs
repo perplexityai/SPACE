@@ -664,8 +664,9 @@ impl PublicOperationStore {
     /// A new wake records `marker` as the path template of an idempotency
     /// record of its own, read back by [`Self::system_operation_marker`]: the
     /// one place an operation row's existing shape can carry it, since the
-    /// payload is the plain `:wake` payload every controller accepts. The
-    /// record's key is fresh, so no request replays it.
+    /// payload is the plain `:wake` payload every controller accepts. No route
+    /// serves that path template, and the record's key is named for the
+    /// operation, so no request replays it.
     pub async fn create_or_join_active_sandbox_wake(
         &self,
         org_id: OrgId,
@@ -685,23 +686,41 @@ impl PublicOperationStore {
         .await
     }
 
-    /// The path template [`Self::create_or_join_active_sandbox_wake`] marked
-    /// an operation with, or `None` for an operation created without one, or
-    /// whose record has expired.
+    /// Which of `markers` [`Self::create_or_join_active_sandbox_wake`] marked
+    /// the org's operation with, or `None` for an operation created without
+    /// one, or whose record has been removed since it expired. A point read
+    /// of the idempotency records' lookup index, since the record's key is
+    /// named for the operation.
     pub async fn system_operation_marker(
         &self,
+        org_id: OrgId,
         operation_id: OperationId,
-    ) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar::<_, String>(sql!(
+        markers: &[OperationPathTemplate],
+    ) -> Result<Option<OperationPathTemplate>, sqlx::Error> {
+        let candidates: Vec<&str> = markers.iter().map(|marker| marker.as_str()).collect();
+        let stored = sqlx::query_scalar::<_, String>(sql!(
             "SELECT path_template
                FROM public_idempotency_records
-              WHERE operation_id = $1
-              ORDER BY created_at, id
+              WHERE org_id = $1
+                AND api_product = $2
+                AND method = $3
+                AND path_template = ANY($4)
+                AND idempotency_key = $5
               LIMIT 1"
         ))
-        .bind(operation_id.as_uuid())
+        .bind(org_id)
+        .bind(ApiProduct::Native.as_str())
+        .bind(HttpOperationMethod::Post.as_str())
+        .bind(&candidates)
+        .bind(system_marker_key(operation_id).as_str())
         .fetch_optional(&self.pool)
-        .await
+        .await?;
+        Ok(stored.and_then(|stored| {
+            markers
+                .iter()
+                .copied()
+                .find(|marker| marker.as_str() == stored)
+        }))
     }
 
     /// The system's (actorless) operation of `kind` on a sandbox, joining one
@@ -747,17 +766,9 @@ impl PublicOperationStore {
                 OperationId::from_uuid(operation_id),
             ));
         }
-        let marker_key = IdempotencyKey::parse(format!("system-{}", Uuid::now_v7()))
-            .expect("a generated idempotency key is valid");
         let marker_fingerprint =
             RequestFingerprint::parse(hex::encode(Sha256::digest(payload_json.to_string())))
                 .expect("a SHA-256 digest is a request fingerprint");
-        let idempotency = marker.map(|path_template| CreatePublicOperationIdempotency {
-            method: HttpOperationMethod::Post,
-            path_template,
-            key: &marker_key,
-            request_fingerprint: &marker_fingerprint,
-        });
         let (result, superseded) = create_operation_tx(
             &mut tx,
             CreatePublicOperation {
@@ -770,11 +781,30 @@ impl PublicOperationStore {
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(target_id),
                 payload_json,
-                idempotency,
+                idempotency: None,
                 traceparent,
             },
         )
         .await?;
+        // The marker's key needs the operation's id, so its record follows
+        // the operation rather than going in with it.
+        if let (Some(path_template), CreatePublicOperationResult::Created(operation_id)) =
+            (marker, &result)
+        {
+            insert_idempotency_record_tx(
+                &mut tx,
+                org_id,
+                ApiProduct::Native,
+                &CreatePublicOperationIdempotency {
+                    method: HttpOperationMethod::Post,
+                    path_template,
+                    key: &system_marker_key(*operation_id),
+                    request_fingerprint: &marker_fingerprint,
+                },
+                *operation_id,
+            )
+            .await?;
+        }
         tx.commit().await?;
         superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
@@ -2061,6 +2091,14 @@ async fn superseding_delete_tx(
     .fetch_optional(&mut **tx)
     .await?;
     Ok(delete.map(OperationId::from_uuid))
+}
+
+/// The key of the idempotency record that marks the system's wake, named for
+/// the operation so [`PublicOperationStore::system_operation_marker`] reads
+/// it through the records' lookup index.
+fn system_marker_key(operation_id: OperationId) -> IdempotencyKey {
+    IdempotencyKey::parse(format!("system-implicit-wake-{operation_id}"))
+        .expect("an operation id makes a valid idempotency key")
 }
 
 async fn insert_idempotency_record_tx(

@@ -1140,9 +1140,12 @@ async fn untracked_runtime_actions_without_placement_are_unavailable() -> TestRe
 /// command's. A caller's `:wake` is not policy-gated.
 #[tokio::test(flavor = "current_thread")]
 async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> TestResult {
-    use crate::public_operations::{ApiProduct, ClaimedPublicOperation};
+    use crate::controllers::substrate::ExecutionActivityKind::{Access, Command};
+    use crate::public_operations::{
+        ApiProduct, ClaimedPublicOperation, CreatePublicOperationResult, PublicOperationStore,
+    };
     use crate::public_sandbox_operations::{
-        SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload,
+        SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload, implicit_wake_marker,
     };
     use pplx_space_public_api::{
         OperationId, OperationKind, OperationState, PublicErrorCode, PublicSandboxId,
@@ -1158,8 +1161,9 @@ async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> Test
     let executor = SandboxLifecycleOperationExecutor::new(pool.clone(), direct_controller(pool));
 
     let caller: UserId = "00000000-0000-0000-0000-000000000010".parse()?;
-    let access = Some("system:implicit-wake:access");
-    let command = Some("system:implicit-wake:command");
+    let org_id = "00000000-0000-0000-0000-000000000001".parse()?;
+    let access = Some(Access);
+    let command = Some(Command);
     // (actor, wake.on, if not the access policy placing it sets, marker, wakes)
     for (actor, wake_on, marker, wakes) in [
         (None, None, None, true),
@@ -1184,44 +1188,40 @@ async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> Test
             .execute(pool)
             .await?;
         }
-        let operation_id = OperationId::new();
-        if let Some(marker) = marker {
-            sqlx::query(sql!(
-                "INSERT INTO public_operations (operation_id, org_id, kind, target_type, target_id)
-                 VALUES ($1, '00000000-0000-0000-0000-000000000001', 'wake_sandbox', 'sandbox', $2)"
-            ))
-            .bind(operation_id.as_uuid())
-            .bind(PublicSandboxId::from(sandbox_id).to_string())
-            .execute(pool)
-            .await?;
-            sqlx::query(sql!(
-                "INSERT INTO public_idempotency_records (id, org_id, method, path_template,
-                     idempotency_key, request_fingerprint, operation_id)
-                 VALUES ($1, '00000000-0000-0000-0000-000000000001', 'POST', $2, $3, $4, $5)"
-            ))
-            .bind(uuid::Uuid::now_v7())
-            .bind(marker)
-            .bind(format!("system-{}", uuid::Uuid::now_v7()))
-            .bind("0".repeat(64))
-            .bind(operation_id.as_uuid())
-            .execute(pool)
-            .await?;
+        let payload = SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::from(sandbox_id),
+            action: SandboxLifecycleAction::Wake,
+            rollback: None,
         }
+        .into_json();
+        let operation_id = match marker {
+            Some(activity) => {
+                let created = PublicOperationStore::new(pool.clone())
+                    .create_or_join_active_sandbox_wake(
+                        org_id,
+                        &PublicSandboxId::from(sandbox_id).to_string(),
+                        payload.clone(),
+                        None,
+                        implicit_wake_marker(activity),
+                    )
+                    .await?;
+                let CreatePublicOperationResult::Created(operation_id) = created else {
+                    panic!("a new wake: {created:?}");
+                };
+                operation_id
+            }
+            None => OperationId::new(),
+        };
         let case = format!("{actor:?} {wake_on:?} {marker:?}");
         let operation = ClaimedPublicOperation {
             id: operation_id,
-            org_id: "00000000-0000-0000-0000-000000000001".parse()?,
+            org_id,
             actor_user_id: actor,
             api_product: ApiProduct::Native,
             kind: OperationKind::WakeSandbox,
             target_type: None,
             target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
-            payload: SandboxLifecycleOperationPayload {
-                sandbox_id: PublicSandboxId::from(sandbox_id),
-                action: SandboxLifecycleAction::Wake,
-                rollback: None,
-            }
-            .into_json(),
+            payload,
             attempts: 1,
             claim_generation: 1,
             traceparent: None,

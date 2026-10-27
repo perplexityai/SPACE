@@ -519,9 +519,13 @@ impl SandboxLifecycleOperationExecutor {
         operation: &ClaimedPublicOperation,
     ) -> Result<ExecutionActivityKind, SandboxLifecycleExecutionError> {
         let marker = crate::public_operations::PublicOperationStore::new(self.pool.clone())
-            .system_operation_marker(operation.id)
+            .system_operation_marker(
+                operation.org_id,
+                operation.id,
+                &[IMPLICIT_WAKE_FOR_COMMAND, IMPLICIT_WAKE_FOR_ACCESS],
+            )
             .await?;
-        Ok(implicit_wake_marker_activity(marker.as_deref()))
+        Ok(implicit_wake_marker_activity(marker))
     }
 
     pub async fn execute(
@@ -1019,8 +1023,8 @@ pub(crate) const fn implicit_wake_marker(activity: ExecutionActivityKind) -> Ope
 /// The activity an [`implicit_wake_marker`] names. A wake with none, queued
 /// before the marker existed or whose record expired, is a command's: every
 /// such wake was queued for a new command or process session.
-fn implicit_wake_marker_activity(marker: Option<&str>) -> ExecutionActivityKind {
-    if marker == Some(IMPLICIT_WAKE_FOR_ACCESS.as_str()) {
+fn implicit_wake_marker_activity(marker: Option<OperationPathTemplate>) -> ExecutionActivityKind {
+    if marker == Some(IMPLICIT_WAKE_FOR_ACCESS) {
         ExecutionActivityKind::Access
     } else {
         ExecutionActivityKind::Command
