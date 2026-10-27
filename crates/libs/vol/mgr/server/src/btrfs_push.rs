@@ -112,6 +112,8 @@ impl crate::service::VolumeManagerService {
         .await?;
         let payload = Payload {
             transfer: TransferPayload {
+                completion_integrity: None,
+                expected_integrity: None,
                 subject_id: subject_id.clone(),
                 local_path,
                 s3_uri: req.s3_uri,

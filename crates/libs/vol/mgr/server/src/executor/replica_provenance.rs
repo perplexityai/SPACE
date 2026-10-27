@@ -90,41 +90,23 @@ impl TransferExecutor {
         target: ObjectTarget<'_>,
         local_path: &Path,
         requested_materialization: MaterializationMode,
+        cancellation: &CancellationToken,
     ) -> Result<Option<u64>, JobError> {
         let local_size = match tokio::fs::metadata(local_path).await {
             Ok(meta) if meta.is_file() => meta.len(),
-            Ok(_) => return Ok(None),
-            Err(_) => return Ok(None),
+            _ => return Ok(None),
         };
-
-        if !p.raw && is_zstd(local_path).await {
+        if p.expected_integrity.is_none() && !p.raw && is_zstd(local_path).await {
             return Ok(None);
         }
-
-        let provenance_path = verified_replica_provenance_path(local_path);
-        let provenance_bytes = match tokio::fs::read(&provenance_path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Ok(None),
-        };
-        let provenance = match serde_json::from_slice::<FileReplicaProvenance>(&provenance_bytes) {
-            Ok(provenance) => provenance,
-            Err(_) => return Ok(None),
-        };
-
-        let Some(object_meta) = self
-            .store
-            .head(creds, target)
-            .await
-            .map_err(|e| classify(&e))?
-        else {
+        let Ok(bytes) = tokio::fs::read(verified_replica_provenance_path(local_path)).await else {
             return Ok(None);
         };
-
+        let Ok(provenance) = serde_json::from_slice::<FileReplicaProvenance>(&bytes) else {
+            return Ok(None);
+        };
         // Sparse LUKS is a write optimization, not a new replica contract.
-        // Keep verified dense backings from older downloads: fetching them
-        // again only to punch holes would add disk and network work on retry.
-        let requested_materialization = if matches!(
+        let mode = if matches!(
             p.effective_snapshot_artifact(),
             Some(SnapshotArtifact::EncryptedSnapshotVolume | SnapshotArtifact::EncryptedRootfsCow)
         ) {
@@ -132,16 +114,39 @@ impl TransferExecutor {
         } else {
             requested_materialization
         };
-        if provenance.replica == file_replica_provenance(p, &object_meta, local_size)
-            && materialization_is_compatible(
-                requested_materialization,
-                provenance.materialization.as_ref(),
-            )
-        {
-            Ok(Some(local_size))
-        } else {
-            Ok(None)
+        if !materialization_is_compatible(mode, provenance.materialization.as_ref()) {
+            return Ok(None);
         }
+        if let Some(expected) = p.expected_integrity {
+            let replica = &provenance.replica;
+            // Content authentication replaces object-store HEAD/ETag trust.
+            // Still enforce the destination's attribution and materialization.
+            let compatible = replica.version == VERIFIED_REPLICA_PROVENANCE_VERSION
+                && replica.subject_id == p.subject_id
+                && replica.s3_uri == p.s3_uri
+                && replica.raw == p.raw
+                && replica.snapshot_artifact == p.snapshot_artifact;
+            return Ok(
+                if compatible && integrity::file_matches(local_path, expected, cancellation).await?
+                {
+                    Some(local_size)
+                } else {
+                    None
+                },
+            );
+        }
+        let Some(object_meta) = self
+            .store
+            .head(creds, target)
+            .await
+            .map_err(|error| classify(&error))?
+        else {
+            return Ok(None);
+        };
+        Ok(
+            (provenance.replica == file_replica_provenance(p, &object_meta, local_size))
+                .then_some(local_size),
+        )
     }
 
     pub(super) async fn write_file_replica_provenance(

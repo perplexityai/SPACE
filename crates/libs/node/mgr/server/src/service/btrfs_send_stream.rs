@@ -1,4 +1,4 @@
-//! Framing check for a send stream before node-manager forwards it.
+//! Protocol v1 framing shared by snapshot upload and restore.
 //!
 //! `BTRFS_IOC_SEND` writes into a pipe that volume-manager drains. When the
 //! pipe is full, a signal, stop or cgroup freeze on the sending thread makes
@@ -11,6 +11,11 @@
 //! header, with the CRC field zeroed, and its payload. Verifying it here, and
 //! requiring exactly one stream that ends with `END`, turns a restarted send
 //! into a failed transfer that volume-manager retries from the start.
+//!
+//! SPACE sends with flags=0 and version=0 (v1). Restore must check command
+//! numbers as well as the version: btrfs receive dispatches ENCODED_WRITE even
+//! in a v1-labelled stream. This gate excludes userspace decompression; it
+//! does not authenticate artifacts or validate command paths and clone sources.
 
 const MAGIC: &[u8; 13] = b"btrfs-stream\0";
 /// `BTRFS_SEND_C_END`.
@@ -38,11 +43,11 @@ pub(super) enum FramingError {
     BadMagic,
     #[error("send stream version {0} is not supported")]
     Version(u32),
+    #[error("send command {cmd} at offset {offset} is not a protocol v1 command")]
+    Command { offset: u64, cmd: u16 },
     #[error("send command at offset {offset} declares {len} payload bytes")]
     CommandTooLarge { offset: u64, len: u32 },
-    #[error(
-        "send command {cmd} at offset {offset} fails its CRC; the send was interrupted and restarted"
-    )]
+    #[error("send command {cmd} at offset {offset} fails its CRC")]
     Crc { offset: u64, cmd: u16 },
     #[error("send stream continues past its END command at offset {offset}")]
     DataAfterEnd { offset: u64 },
@@ -105,7 +110,7 @@ impl SendStreamFraming {
                     }
                     let [.., v0, v1, v2, v3] = *header;
                     let version = u32::from_le_bytes([v0, v1, v2, v3]);
-                    if !(1..=2).contains(&version) {
+                    if version != 1 {
                         return Err(FramingError::Version(version));
                     }
                     self.start_command();
@@ -115,6 +120,13 @@ impl SendStreamFraming {
                         continue;
                     }
                     let [l0, l1, l2, l3, c0, c1, s0, s1, s2, s3] = *header;
+                    let cmd = u16::from_le_bytes([c0, c1]);
+                    if !(1..=22).contains(&cmd) {
+                        return Err(FramingError::Command {
+                            offset: self.item_offset,
+                            cmd,
+                        });
+                    }
                     let len = u32::from_le_bytes([l0, l1, l2, l3]);
                     if len > MAX_COMMAND_LEN {
                         return Err(FramingError::CommandTooLarge {
@@ -125,7 +137,7 @@ impl SendStreamFraming {
                     let mut digest = CRC32C.digest();
                     digest.update(&[l0, l1, l2, l3, c0, c1, 0, 0, 0, 0]);
                     self.state = State::Payload {
-                        cmd: u16::from_le_bytes([c0, c1]),
+                        cmd,
                         stored: u32::from_le_bytes([s0, s1, s2, s3]),
                         remaining: len,
                         digest,

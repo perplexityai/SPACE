@@ -311,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let response = client
                 .pull_file(PullFileRequest {
+                    expected_integrity: None,
                     subject_id: subject,
                     s3_uri,
                     local_path,
@@ -349,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let response = client
                 .submit_pull_file(PullFileRequest {
+                    expected_integrity: None,
                     subject_id: subject,
                     s3_uri,
                     local_path,
