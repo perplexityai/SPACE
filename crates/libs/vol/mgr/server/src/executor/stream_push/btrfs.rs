@@ -1,8 +1,9 @@
 //! Encode the privileged send stream without an uncompressed staging file.
 //! The terminal source frame, encoder finalization, and HEAD all gate success.
 use super::*;
+use crate::executor::integrity::Hasher;
 use pplx_space_node_mgr_client::proto::{BtrfsSendChunk, BtrfsSendLease};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use tokio_stream::StreamExt;
 
 #[cfg(test)]
@@ -16,6 +17,7 @@ struct RemoteReader {
     runtime: tokio::runtime::Handle,
     cancellation: CancellationToken,
     consumed: u64,
+    hash: Hasher,
     finished: bool,
 }
 
@@ -31,6 +33,10 @@ impl Read for RemoteReader {
             let count = self.buffer.read(out)?;
             if count != 0 {
                 self.consumed += count as u64;
+                self.hash.update(
+                    out.get(..count)
+                        .ok_or_else(|| io::Error::other("invalid read length"))?,
+                );
                 return Ok(count);
             }
             if self.finished {
@@ -134,16 +140,17 @@ impl TransferExecutor {
             runtime: tokio::runtime::Handle::current(),
             cancellation: cancellation.clone(),
             consumed: 0,
+            hash: Hasher::new(),
             finished: false,
         };
         let uses_streaming = streaming.is_some();
-        let (logical, wire) = if let Some((config, uploader)) = streaming {
+        let (identity, wire) = if let Some((config, uploader)) = streaming {
             let admission = ProducerAdmission {
                 codec,
                 _producer: producer.expect("streaming acquired producer admission"),
             };
             let (reader, writer) = tokio::io::duplex(PIPE_BYTES);
-            let count = Arc::new(AtomicU64::new(0));
+            let count = Arc::new(OnceLock::new());
             let actual = count.clone();
             let token = cancellation.clone();
             let task = tokio::task::spawn_blocking(move || {
@@ -162,7 +169,9 @@ impl TransferExecutor {
                         .and_then(|()| buffered.flush())
                 };
                 if result.is_ok() {
-                    actual.store(input.consumed, Ordering::Release);
+                    actual
+                        .set(input.hash.finish())
+                        .map_err(|_| io::Error::other("send identity already set"))?;
                 }
                 stream_push_producer("rootfs_btrfs_send", started, output.waited, result.is_ok());
                 result
@@ -191,11 +200,16 @@ impl TransferExecutor {
                     }
                     error => JobError::Retriable(error.to_string()),
                 })?;
-            (count.load(Ordering::Acquire), wire)
+            (
+                *count
+                    .get()
+                    .ok_or_else(|| JobError::Retriable("missing send identity".into()))?,
+                wire,
+            )
         } else {
             let directory = self.shadow_staging_dir.clone();
             let compress = self.config.compress;
-            let (temp, logical) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let (temp, identity) = tokio::task::spawn_blocking(move || -> io::Result<_> {
                 let _codec = codec;
                 let mut input = input;
                 let mut temp = tempfile::Builder::new()
@@ -208,7 +222,7 @@ impl TransferExecutor {
                     std::io::copy(&mut input, &mut temp)?;
                 }
                 temp.flush()?;
-                Ok((temp, input.consumed))
+                Ok((temp, input.hash.finish()))
             })
             .await
             .map_err(|error| JobError::Retriable(error.to_string()))?
@@ -229,15 +243,16 @@ impl TransferExecutor {
                     PushPayloadEncoding::Raw
                 },
                 PushPayloadPhase::Prepared,
-                logical,
+                identity.size_bytes,
                 wire,
             );
             self.store
                 .put_file(creds, target, temp.path())
                 .await
                 .map_err(|error| classify(&error))?;
-            (logical, wire)
+            (identity, wire)
         };
+        let logical = identity.size_bytes;
         if uses_streaming {
             stream_push_payload(
                 "rootfs_btrfs_send",
@@ -271,6 +286,7 @@ impl TransferExecutor {
                         wire,
                     );
                 }
+                self.completion_store.record(job, identity)?;
                 bytes_len_to_job_i64(logical, "btrfs send size")
             }
             Ok(_) => Err(JobError::Retriable(

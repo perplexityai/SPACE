@@ -1282,3 +1282,41 @@ async fn serialized_subjects_do_not_starve_other_subjects() {
     driver.await.expect("queue driver task should not panic");
     remove_test_db(path);
 }
+
+#[derive(Clone)]
+struct CompletionPayloadExecutor(TestExecutor);
+
+#[async_trait]
+impl JobExecutor for CompletionPayloadExecutor {
+    async fn execute(&self, job: &Job, cancellation: CancellationToken) -> Result<i64, JobError> {
+        self.0.execute(job, cancellation).await
+    }
+
+    fn completion_payload(&self, _job: &Job) -> Result<Option<String>, JobError> {
+        Ok(Some(r#"{"verified":true}"#.into()))
+    }
+}
+
+#[tokio::test]
+async fn worker_publishes_completion_payload_only_after_success() {
+    let path = test_db_path("completion-payload");
+    let executor = CompletionPayloadExecutor(TestExecutor::blocking());
+    let worker = BackgroundWorker::new(
+        Arc::new(Mutex::new(open_test_db(&path))),
+        executor.clone(),
+        WorkerConfig::new(1, Duration::from_secs(5), 1),
+    );
+    let id = worker.submit("pull", "{}", None, None).unwrap();
+    executor.0.wait_started(1).await;
+    assert_eq!(worker.get_job(&id).unwrap().unwrap().payload, "{}");
+    executor.0.release();
+    let job = worker
+        .wait_for_job(&id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(job.status, "completed");
+    assert_eq!(job.payload, r#"{"verified":true}"#);
+    assert_eq!(job.bytes_processed, 1);
+    assert!(worker.shutdown(Duration::from_secs(1)).await);
+    remove_test_db(path);
+}

@@ -464,6 +464,8 @@ where
 enum Transfers {
     Running,
     Completed,
+    /// An upload completed by a worker that predates content receipts.
+    CompletedWithoutReceipt,
     /// As vol-mgr reports a transfer whose retries ran out during an
     /// object-store outage.
     Failed,
@@ -509,7 +511,9 @@ impl FakeVolumeManager {
                         answer(request, move |request: vol::GetTransferJobRequest| {
                             let (status, error) = match transfers {
                                 Transfers::Running => (vol::TransferJobStatus::Running, None),
-                                Transfers::Completed => (vol::TransferJobStatus::Completed, None),
+                                Transfers::Completed | Transfers::CompletedWithoutReceipt => {
+                                    (vol::TransferJobStatus::Completed, None)
+                                }
                                 Transfers::Failed => (
                                     vol::TransferJobStatus::Failed,
                                     Some("object store unreachable".to_string()),
@@ -518,8 +522,17 @@ impl FakeVolumeManager {
                             Ok(vol::GetTransferJobResponse {
                                 job: Some(vol::TransferJob {
                                     job_id: request.job_id,
+                                    kind: "push".into(),
                                     status: status as i32,
                                     bytes_transferred: 18,
+                                    // Content hashing is covered by volume-manager tests;
+                                    // this fake supplies the completed upload contract.
+                                    integrity: (transfers == Transfers::Completed).then(|| {
+                                        vol::ContentIntegrity {
+                                            digest: format!("sha256:{}", "12".repeat(32)),
+                                            size_bytes: 18,
+                                        }
+                                    }),
                                     error,
                                     ..Default::default()
                                 }),
@@ -565,6 +578,10 @@ enum NodeLocalUpload {
     Running,
     /// vol-mgr gave up on its transfer; the teardown's new attempt completes.
     TransferFailed,
+    /// A legacy upload lacks a receipt; an upgraded worker supplies the retry's.
+    MissingReceipt,
+    /// Both attempts complete without receipts, exhausting automatic recovery.
+    MissingReceiptTwice,
     /// vol-mgr gave up on its transfer, and on the teardown's new attempt too.
     TransferFailedTwice,
     /// vol-mgr gave up on its transfer, and on an attempt a backup requested
@@ -717,6 +734,8 @@ async fn teardown_after_node_local_suspend_shares_its_upload_or_settles_its_fail
         let cases = [
             NodeLocalUpload::Running,
             NodeLocalUpload::TransferFailed,
+            NodeLocalUpload::MissingReceipt,
+            NodeLocalUpload::MissingReceiptTwice,
             NodeLocalUpload::TransferFailedTwice,
             NodeLocalUpload::TwoFailedAttempts,
             NodeLocalUpload::RegistrationRecovers,
@@ -831,6 +850,9 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
         NodeLocalUpload::TransferFailed
         | NodeLocalUpload::TransferFailedTwice
         | NodeLocalUpload::TwoFailedAttempts => Transfers::Failed,
+        NodeLocalUpload::MissingReceipt | NodeLocalUpload::MissingReceiptTwice => {
+            Transfers::CompletedWithoutReceipt
+        }
     });
     let scratch = tempfile::tempdir().unwrap();
     let NodeLocalSuspended {
@@ -909,10 +931,15 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
             Some(node_local)
         }
         NodeLocalUpload::TransferFailed
+        | NodeLocalUpload::MissingReceipt
+        | NodeLocalUpload::MissingReceiptTwice
         | NodeLocalUpload::TransferFailedTwice
         | NodeLocalUpload::RegistrationRecovers => {
             ended(&service, &node_local, JobStatus::Failed).await;
-            let recovers = !matches!(upload, NodeLocalUpload::TransferFailedTwice);
+            let recovers = !matches!(
+                upload,
+                NodeLocalUpload::TransferFailedTwice | NodeLocalUpload::MissingReceiptTwice
+            );
             if recovers {
                 volume_manager.report(Transfers::Running);
             }
@@ -930,7 +957,9 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
                 .expect("a new attempt replaces the failed upload");
             assert_eq!(uploads(&service, &id).len(), 2, "exactly one new attempt");
             match upload {
-                NodeLocalUpload::TransferFailed | NodeLocalUpload::RegistrationRecovers => {
+                NodeLocalUpload::TransferFailed
+                | NodeLocalUpload::MissingReceipt
+                | NodeLocalUpload::RegistrationRecovers => {
                     result
                         .unwrap_or_else(|error| panic!("the retried suspend is durable: {error}"));
                     Some(retry.job_id)

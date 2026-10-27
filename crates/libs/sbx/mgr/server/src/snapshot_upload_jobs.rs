@@ -23,8 +23,8 @@
 //!    state. Any permanent vol-mgr failure → [`JobError::Permanent`]; any
 //!    transient transport/RPC failure → [`JobError::Retriable`].
 //! 3. Calls `ClusterApi.FinalizeArtifactBackup` with `target_state=READY`
-//!    only once *all* of those uploads succeed, so the row never becomes
-//!    visible to restore while any file (including metadata) is missing.
+//!    only after every upload returns a matching content receipt, including
+//!    metadata. Finalization persists those identities with the ready row.
 //!    4xx-equivalent statuses → permanent; everything else → retriable. On
 //!    permanent failure earlier in the pipeline, the worker best-effort
 //!    flips the row to `target_state=FAILED` so retention can prune the
@@ -296,11 +296,13 @@ impl JobExecutor for SnapshotUploadExecutor {
                 }
             }
         }
-        if artifact_results.len() != artifacts.len() {
-            let error = JobError::permanent("snapshot upload is missing artifact or metadata jobs");
-            converge_failed_upload(&payload, "incomplete_transfer_set", error.message()).await;
-            return Err(error);
-        }
+        let artifact_digests = match completed_artifact_manifest(&artifacts, &artifact_results) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                converge_failed_upload(&payload, "incomplete_transfer_set", error.message()).await;
+                return Err(error);
+            }
+        };
         crate::snapshot_upload::cleanup_metadata_staging_dir(&payload);
 
         // All VM files and staged metadata are uploaded before publishing Ready.
@@ -316,7 +318,8 @@ impl JobExecutor for SnapshotUploadExecutor {
             .collect::<Vec<_>>();
         let vm_total_bytes = vm_artifact_total_bytes(&artifact_bytes, vm_artifact_count);
         let finalize_started_at = Instant::now();
-        let finalize_result = finalize_with_cluster_api_ready(&snapshot_id, vm_total_bytes).await;
+        let finalize_result =
+            finalize_with_cluster_api_ready(&snapshot_id, vm_total_bytes, artifact_digests).await;
         pplx_space_metrics::snapshot::delivery_duration_ms(
             "cluster_finalize",
             origin,
@@ -1053,9 +1056,70 @@ fn vm_artifact_total_bytes(polled_bytes: &[u64], vm_artifact_count: usize) -> u6
 /// Completed transfer bytes and persisted queue/transfer timing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ArtifactTransferObservation {
+    integrity: pplx_space_volmgr_client::Integrity,
     bytes: u64,
     queue_duration_ms: Option<f64>,
     transfer_duration_ms: Option<f64>,
+}
+
+fn completed_artifact_observation(
+    job: &pplx_space_volmgr_client::proto::TransferJob,
+    job_id: JobId,
+) -> Result<ArtifactTransferObservation, JobError> {
+    if job.job_id != job_id.to_string() || !matches!(job.kind.as_str(), "push" | "push_btrfs_send")
+    {
+        return Err(JobError::permanent(
+            "upload receipt is not for the requested upload job",
+        ));
+    }
+    let receipt = job.integrity.clone().ok_or_else(|| {
+        JobError::permanent(
+            "upload has no content receipt; retry backup from its retained source on upgraded workers",
+        )
+    })?;
+    let integrity: pplx_space_volmgr_client::Integrity = receipt
+        .try_into()
+        .map_err(|e| JobError::permanent(format!("invalid upload integrity: {e}")))?;
+    if integrity.size_bytes != job.bytes_transferred {
+        return Err(JobError::permanent(
+            "upload receipt length differs from completed transfer",
+        ));
+    }
+    Ok(ArtifactTransferObservation {
+        integrity,
+        bytes: job.bytes_transferred,
+        queue_duration_ms: job
+            .started_at
+            .as_deref()
+            .and_then(|started| sqlite_duration_ms(&job.created_at, started)),
+        transfer_duration_ms: job
+            .started_at
+            .as_deref()
+            .zip(job.completed_at.as_deref())
+            .and_then(|(started, completed)| sqlite_duration_ms(started, completed)),
+    })
+}
+
+fn completed_artifact_manifest(
+    artifacts: &[crate::snapshot_upload::Artifact],
+    results: &[ArtifactTransferObservation],
+) -> Result<Vec<pplx_space_node_api_client::proto::SnapshotArtifactDigest>, JobError> {
+    if artifacts.len() != results.len() {
+        return Err(JobError::permanent(
+            "snapshot upload is missing artifact or metadata jobs",
+        ));
+    }
+    Ok(artifacts
+        .iter()
+        .zip(results)
+        .map(
+            |(artifact, result)| pplx_space_node_api_client::proto::SnapshotArtifactDigest {
+                artifact: artifact.kind.file_name().to_string(),
+                digest: result.integrity.digest().to_string(),
+                size_bytes: result.integrity.size_bytes,
+            },
+        )
+        .collect())
 }
 
 /// Observe a durable transfer until terminal, bounded by the worker's overall
@@ -1124,6 +1188,7 @@ async fn poll_artifact_job(
 
         match TransferJobStatus::try_from(job.status).ok() {
             Some(TransferJobStatus::Completed) => {
+                let observation = completed_artifact_observation(&job, job_id)?;
                 tracing::info!(
                     sandbox_id,
                     job_id = %job_id,
@@ -1138,22 +1203,7 @@ async fn poll_artifact_job(
                         .transfer_job_id(job_id.to_string())
                         .bytes_transferred(job.bytes_transferred.to_string()),
                 );
-                let queue_duration_ms = job
-                    .started_at
-                    .as_deref()
-                    .and_then(|started_at| sqlite_duration_ms(&job.created_at, started_at));
-                let transfer_duration_ms = job
-                    .started_at
-                    .as_deref()
-                    .zip(job.completed_at.as_deref())
-                    .and_then(|(started_at, completed_at)| {
-                        sqlite_duration_ms(started_at, completed_at)
-                    });
-                return Ok(ArtifactTransferObservation {
-                    bytes: job.bytes_transferred,
-                    queue_duration_ms,
-                    transfer_duration_ms,
-                });
+                return Ok(observation);
             }
             Some(TransferJobStatus::Failed) => {
                 let error = job.error.unwrap_or_default();
@@ -1369,6 +1419,7 @@ fn begin_artifact_backup_request(
 async fn finalize_with_cluster_api_ready(
     snapshot_id: &str,
     bytes_uploaded: u64,
+    artifact_digests: Vec<pplx_space_node_api_client::proto::SnapshotArtifactDigest>,
 ) -> Result<(), JobError> {
     let bytes = bytes_uploaded_i64(snapshot_id, bytes_uploaded);
     let mut client = connect_cluster_api().await?;
@@ -1377,7 +1428,7 @@ async fn finalize_with_cluster_api_ready(
         target_state: pplx_space_node_api_client::proto::SuspendSnapshotTerminalState::Ready as i32,
         bytes_uploaded: bytes,
         failure_reason: None,
-        artifact_digests: Vec::new(),
+        artifact_digests,
     };
 
     match client.finalize_artifact_backup(req).await {

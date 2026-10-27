@@ -534,3 +534,94 @@ fn count_failed_jobs_by_dedup_key_counts_one_failure_kind_of_one_key() {
         0
     );
 }
+
+#[test]
+fn completion_payload_is_atomic_and_fenced_to_the_claim_and_input() {
+    for scenario in [
+        "complete", "cancel", "replace", "restart", "refund", "rollback",
+    ] {
+        let conn = mem_conn();
+        let id = fixture_job_id(scenario);
+        insert_job(
+            &conn,
+            InsertJob {
+                job_id: &id,
+                kind: "pull",
+                payload: r#"{"expected":"abc"}"#,
+                subject_id: None,
+                dedup_key: None,
+                max_attempts: 3,
+                traceparent: None,
+                priority: JobPriority::default(),
+            },
+        )
+        .unwrap();
+        let job = try_claim_pending_job(
+            &conn,
+            &id,
+            "first",
+            Duration::from_secs(60),
+            SubjectConcurrency::Parallel,
+        )
+        .unwrap()
+        .unwrap();
+        let verified = r#"{"expected":"abc","verified":"abc"}"#;
+        // Verification alone leaves no durable evidence. A crash before the
+        // completion statement must leave only the original expectation.
+        assert_eq!(get_job(&conn, &id).unwrap().unwrap().payload, job.payload);
+        match scenario {
+            "cancel" => {
+                request_job_cancellation(&conn, &id).unwrap();
+            }
+            "replace" => {
+                update_active_job_payload(&conn, &id, "{}", job.priority).unwrap();
+            }
+            "restart" | "rollback" => {
+                reset_running_kind(&conn, "pull").unwrap();
+                let next = try_claim_pending_job(
+                    &conn,
+                    &id,
+                    "successor",
+                    Duration::from_secs(60),
+                    SubjectConcurrency::Parallel,
+                )
+                .unwrap()
+                .unwrap();
+                if scenario == "rollback" {
+                    // An old worker has no completion payload hook.
+                    complete_leased_job(&conn, &id, "successor", 3).unwrap();
+                }
+                assert!(next.attempts > job.attempts);
+            }
+            "refund" => {
+                yield_leased_job(&conn, &id, "first").unwrap();
+                let next = try_claim_pending_job(
+                    &conn,
+                    &id,
+                    "successor",
+                    Duration::from_secs(60),
+                    SubjectConcurrency::Parallel,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(next.attempts, job.attempts);
+            }
+            "complete" => {}
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            complete_job_with_payload(&conn, &job, 3, verified).unwrap(),
+            scenario == "complete",
+            "{scenario}"
+        );
+        let after = get_job(&conn, &id).unwrap().unwrap();
+        if scenario == "complete" {
+            assert_eq!(after.status, "completed");
+            assert_eq!(after.lease_owner, None);
+            assert_eq!(after.bytes_processed, 3);
+            assert_eq!(after.payload, verified);
+        } else {
+            assert!(!after.payload.contains("verified"), "{scenario}");
+        }
+    }
+}

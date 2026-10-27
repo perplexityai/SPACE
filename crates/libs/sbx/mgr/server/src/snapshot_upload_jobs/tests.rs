@@ -1259,3 +1259,78 @@ fn absent_volume_manager_socket() -> std::path::PathBuf {
         .join(format!("space-sbx-mgr-test-{}", uuid::Uuid::now_v7()))
         .join("absent-volume-manager.sock")
 }
+
+#[test]
+fn publication_requires_matching_receipts_and_a_complete_manifest() {
+    use pplx_space_volmgr_client::proto::{ContentIntegrity, TransferJob};
+    let id = JobId::new();
+    let good = TransferJob {
+        job_id: id.to_string(),
+        kind: "push".into(),
+        status: TransferJobStatus::Completed as i32,
+        bytes_transferred: 3,
+        integrity: Some(ContentIntegrity {
+            digest: format!("sha256:{}", "12".repeat(32)),
+            size_bytes: 3,
+        }),
+        ..Default::default()
+    };
+    for problem in ["none", "missing", "size", "digest", "job", "kind"] {
+        let mut job = good.clone();
+        match problem {
+            "missing" => job.integrity = None,
+            "size" => job.bytes_transferred += 1,
+            "digest" => job.integrity.as_mut().unwrap().digest = "unknown".into(),
+            "job" => job.job_id = JobId::new().to_string(),
+            "kind" => job.kind = "pull".into(),
+            _ => {}
+        }
+        assert_eq!(
+            completed_artifact_observation(&job, id).is_ok(),
+            problem == "none",
+            "{problem}"
+        );
+    }
+    // Artifact selection itself is covered by the upload format tests. This
+    // checks that publication includes metadata and preserves each identity.
+    let meta = reclaim_fixture_meta(
+        None,
+        Some(pplx_space_common_core::types::ArtifactKind::Full),
+        None,
+        None,
+    );
+    let artifacts = upload_artifacts_for_meta(&meta);
+    let observations: Vec<_> = artifacts
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let mut job = good.clone();
+            job.bytes_transferred = (index + 1) as u64;
+            job.integrity = Some(ContentIntegrity {
+                digest: format!("sha256:{}", format!("{:02x}", index + 1).repeat(32)),
+                size_bytes: job.bytes_transferred,
+            });
+            completed_artifact_observation(&job, id).unwrap()
+        })
+        .collect();
+    let manifest = completed_artifact_manifest(&artifacts, &observations).unwrap();
+    assert_eq!(manifest.len(), 4);
+    assert_eq!(
+        manifest
+            .iter()
+            .map(|d| d.artifact.as_str())
+            .collect::<Vec<_>>(),
+        ["binfile", "memfile", "rootfs", "metadata.json"]
+    );
+    for (index, entry) in manifest.iter().enumerate() {
+        assert_eq!(
+            entry.digest,
+            format!("sha256:{}", format!("{:02x}", index + 1).repeat(32))
+        );
+        assert_eq!(entry.size_bytes, (index + 1) as u64);
+    }
+    completed_artifact_manifest(&artifacts, &observations[..3]).unwrap_err();
+    let mut extra = observations.clone();
+    extra.push(observations[0]);
+    completed_artifact_manifest(&artifacts, &extra).unwrap_err();
+}
