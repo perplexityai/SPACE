@@ -26,7 +26,7 @@ use crate::{
     middleware::auth::{AuthOrg, AuthUser},
     models::Sandbox,
     public_operations::{HttpOperationMethod, OperationPathTemplate, PublicOperationStore},
-    public_sandbox_operations::SandboxLifecycleOperationPayload,
+    public_sandbox_operations::{SandboxLifecycleOperationPayload, implicit_wake_activity_enabled},
     public_sandbox_projection::public_lifecycle_state,
     public_sessions::{
         CreatePublicSession, CreatePublicSessionIdempotency, ListPublicSessions,
@@ -150,6 +150,7 @@ pub async fn create_process_session(
             org.id,
             sandbox_id,
             ExecutionActivityKind::Command,
+            implicit_wake_activity_enabled(),
         )
         .await?;
     }
@@ -191,6 +192,7 @@ pub async fn create_command(
             org.id,
             sandbox_id,
             ExecutionActivityKind::Command,
+            implicit_wake_activity_enabled(),
         )
         .await?;
     }
@@ -303,6 +305,16 @@ fn sandbox_lifecycle(sandbox: &Sandbox) -> Result<SandboxLifecycle, PublicApiErr
 /// pausing or suspending refuses the activation for now; the operation
 /// retries until it settles.
 ///
+/// With `record_activity` ([`implicit_wake_activity_enabled`]), a new wake
+/// records `activity`, and the executor judges the policy by it; without,
+/// the wake goes in as it did before the record, and runs by the command
+/// rule. A join keeps the activity of the wake it joins, whatever this
+/// caller's: each caller's activity was allowed when it asked, so the wake's
+/// rule can refuse the joiner's only if the policy narrowed in between, as
+/// from `access` to `command` under a wake for access that a new command
+/// joins. That wake is refused when it runs; the joiner's next attach finds
+/// nothing coming and queues a fresh wake for its own activity.
+///
 /// Called for a replayed session too, so a retry heals a wake that failed to
 /// queue after its session was created.
 async fn enqueue_implicit_wake(
@@ -310,11 +322,13 @@ async fn enqueue_implicit_wake(
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
     activity: ExecutionActivityKind,
+    record_activity: bool,
 ) -> Result<(), PublicApiError> {
     let payload = SandboxLifecycleOperationPayload {
         sandbox_id,
         action: SandboxLifecycleAction::Wake,
         rollback: None,
+        wake_activity: record_activity.then_some(activity.into()),
     }
     .into_json();
     PublicOperationStore::new(pool.clone())
@@ -323,7 +337,6 @@ async fn enqueue_implicit_wake(
             &sandbox_id.to_string(),
             payload,
             crate::public_operations::request_traceparent(),
-            crate::public_sandbox_operations::implicit_wake_marker(activity),
         )
         .await?;
     Ok(())
@@ -336,11 +349,14 @@ async fn enqueue_implicit_wake(
 /// the attach should keep waiting. A sandbox that is running or heading there
 /// again since the resolver looked needs no wake and keeps waiting too, as
 /// does one a start, resume, restore or wake queued since then is about to
-/// place; only one nothing can wake for `activity` answers no.
+/// place; only one nothing can wake for `activity` answers no. A new wake
+/// records `activity` as [`enqueue_implicit_wake`] says for
+/// `record_activity`.
 pub(crate) async fn queue_implicit_wake(
     pool: &sqlx::PgPool,
     sandbox: &Sandbox,
     activity: ExecutionActivityKind,
+    record_activity: bool,
 ) -> Result<bool, PublicApiError> {
     let lifecycle = sandbox_lifecycle(sandbox)?;
     match activity_admission(activity, lifecycle, &sandbox.auto_lifecycle.0) {
@@ -376,7 +392,8 @@ pub(crate) async fn queue_implicit_wake(
         }
         CommandAdmission::AdmitAndWake => {
             let sandbox_id = PublicSandboxId::from(sandbox.id);
-            enqueue_implicit_wake(pool, sandbox.org_id, sandbox_id, activity).await?;
+            enqueue_implicit_wake(pool, sandbox.org_id, sandbox_id, activity, record_activity)
+                .await?;
             Ok(true)
         }
     }

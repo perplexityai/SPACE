@@ -647,7 +647,6 @@ impl PublicOperationStore {
             target_id,
             payload_json,
             traceparent,
-            None,
         )
         .await
     }
@@ -660,20 +659,12 @@ impl PublicOperationStore {
     /// wake is queued behind that one. A caller's `:wake` joins it by the same
     /// rule while it is still queued
     /// ([`PublicOperationAdmission::create_or_join_active_wake`]).
-    ///
-    /// A new wake records `marker` as the path template of an idempotency
-    /// record of its own, read back by [`Self::system_operation_marker`]: the
-    /// one place an operation row's existing shape can carry it, since the
-    /// payload is the plain `:wake` payload every controller accepts. No route
-    /// serves that path template, and the record's key is named for the
-    /// operation, so no request replays it.
     pub async fn create_or_join_active_sandbox_wake(
         &self,
         org_id: OrgId,
         target_id: &str,
         payload_json: serde_json::Value,
         traceparent: Option<String>,
-        marker: OperationPathTemplate,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
         self.create_or_join_active_sandbox_operation(
             org_id,
@@ -681,46 +672,8 @@ impl PublicOperationStore {
             target_id,
             payload_json,
             traceparent,
-            Some(marker),
         )
         .await
-    }
-
-    /// Which of `markers` [`Self::create_or_join_active_sandbox_wake`] marked
-    /// the org's operation with, or `None` for an operation created without
-    /// one, or whose record has been removed since it expired. A point read
-    /// of the idempotency records' lookup index, since the record's key is
-    /// named for the operation.
-    pub async fn system_operation_marker(
-        &self,
-        org_id: OrgId,
-        operation_id: OperationId,
-        markers: &[OperationPathTemplate],
-    ) -> Result<Option<OperationPathTemplate>, sqlx::Error> {
-        let candidates: Vec<&str> = markers.iter().map(|marker| marker.as_str()).collect();
-        let stored = sqlx::query_scalar::<_, String>(sql!(
-            "SELECT path_template
-               FROM public_idempotency_records
-              WHERE org_id = $1
-                AND api_product = $2
-                AND method = $3
-                AND path_template = ANY($4)
-                AND idempotency_key = $5
-              LIMIT 1"
-        ))
-        .bind(org_id)
-        .bind(ApiProduct::Native.as_str())
-        .bind(HttpOperationMethod::Post.as_str())
-        .bind(&candidates)
-        .bind(system_marker_key(operation_id).as_str())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(stored.and_then(|stored| {
-            markers
-                .iter()
-                .copied()
-                .find(|marker| marker.as_str() == stored)
-        }))
     }
 
     /// The system's (actorless) operation of `kind` on a sandbox, joining one
@@ -734,7 +687,6 @@ impl PublicOperationStore {
         target_id: &str,
         payload_json: serde_json::Value,
         traceparent: Option<String>,
-        marker: Option<OperationPathTemplate>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_active_sandbox_operation(&mut tx, org_id, kind, target_id).await?;
@@ -760,23 +712,12 @@ impl PublicOperationStore {
                 .await?
                 .map(|joinable| joinable.operation_id)
         };
-        // A join keeps the marker of the wake it joins, whatever this
-        // caller's activity. Each caller's activity was allowed by the policy
-        // when it asked, so the wake's rule can refuse the joiner's only if
-        // the policy narrowed in between, as from `access` to `command` under
-        // a wake marked for access that a new command joins. Judged when it
-        // runs, that wake is refused; the joiner's next attach finds nothing
-        // coming and queues a fresh wake for its own activity, so the edge
-        // heals itself.
         if let Some(operation_id) = existing {
             tx.commit().await?;
             return Ok(CreatePublicOperationResult::Existing(
                 OperationId::from_uuid(operation_id),
             ));
         }
-        let marker_fingerprint =
-            RequestFingerprint::parse(hex::encode(Sha256::digest(payload_json.to_string())))
-                .expect("a SHA-256 digest is a request fingerprint");
         let (result, superseded) = create_operation_tx(
             &mut tx,
             CreatePublicOperation {
@@ -794,25 +735,6 @@ impl PublicOperationStore {
             },
         )
         .await?;
-        // The marker's key needs the operation's id, so its record follows
-        // the operation rather than going in with it.
-        if let (Some(path_template), CreatePublicOperationResult::Created(operation_id)) =
-            (marker, &result)
-        {
-            insert_idempotency_record_tx(
-                &mut tx,
-                org_id,
-                ApiProduct::Native,
-                &CreatePublicOperationIdempotency {
-                    method: HttpOperationMethod::Post,
-                    path_template,
-                    key: &system_marker_key(*operation_id),
-                    request_fingerprint: &marker_fingerprint,
-                },
-                *operation_id,
-            )
-            .await?;
-        }
         tx.commit().await?;
         superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
@@ -2099,14 +2021,6 @@ async fn superseding_delete_tx(
     .fetch_optional(&mut **tx)
     .await?;
     Ok(delete.map(OperationId::from_uuid))
-}
-
-/// The key of the idempotency record that marks the system's wake, named for
-/// the operation so [`PublicOperationStore::system_operation_marker`] reads
-/// it through the records' lookup index.
-fn system_marker_key(operation_id: OperationId) -> IdempotencyKey {
-    IdempotencyKey::parse(format!("system-implicit-wake-{operation_id}"))
-        .expect("an operation id makes a valid idempotency key")
 }
 
 async fn insert_idempotency_record_tx(

@@ -945,6 +945,7 @@ async fn enqueue_lifecycle_operation(
         sandbox_id,
         action,
         rollback,
+        wake_activity: None,
     }
     .into_json();
     let input = CreatePublicOperation {

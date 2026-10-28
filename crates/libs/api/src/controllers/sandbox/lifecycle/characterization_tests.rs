@@ -846,6 +846,7 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
             sandbox_id: PublicSandboxId::from(sandbox_id),
             action: SandboxLifecycleAction::Start,
             rollback: None,
+            wake_activity: None,
         }
         .into_json(),
         attempts: 1,
@@ -1135,17 +1136,17 @@ async fn untracked_runtime_actions_without_placement_are_unavailable() -> TestRe
 /// lifecycle executor like a `:wake`, but only while the sandbox's wake
 /// policy, read when it executes, still lets the session's activity wake it:
 /// allowed, it wakes the paused resident; not allowed, it fails as a conflict
-/// and leaves the sandbox paused. A wake marked for access, as for a
-/// reattach to a running process, needs `access`; so does an unmarked one,
-/// whose activity is unknown. A caller's `:wake` is not policy-gated.
+/// and leaves the sandbox paused. A wake recording access, as for a
+/// reattach to a running process, needs `access`. One recording no activity,
+/// as an older API or one with the record switched off queues every wake, is
+/// judged as a command, as an older executor judges it. A caller's `:wake`
+/// is not policy-gated.
 #[tokio::test(flavor = "current_thread")]
-async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> TestResult {
-    use crate::controllers::substrate::ExecutionActivityKind::{Access, Command};
-    use crate::public_operations::{
-        ApiProduct, ClaimedPublicOperation, CreatePublicOperationResult, PublicOperationStore,
-    };
+async fn a_system_wake_operation_runs_only_while_the_policy_allows_its_activity() -> TestResult {
+    use crate::public_operations::{ApiProduct, ClaimedPublicOperation};
     use crate::public_sandbox_operations::{
-        SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload, implicit_wake_marker,
+        ImplicitWakeActivity::{Access, Command},
+        SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload,
     };
     use pplx_space_public_api::{
         OperationId, OperationKind, OperationState, PublicErrorCode, PublicSandboxId,
@@ -1164,16 +1165,18 @@ async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> Test
     let org_id = "00000000-0000-0000-0000-000000000001".parse()?;
     let access = Some(Access);
     let command = Some(Command);
-    // (actor, wake.on, if not the access policy placing it sets, marker, wakes)
-    for (actor, wake_on, marker, wakes) in [
+    // (actor, wake.on, if not the access policy placing it sets, recorded
+    // activity, wakes)
+    for (actor, wake_on, recorded, wakes) in [
         (None, None, None, true),
         (None, Some(&[][..]), None, false),
         (Some(caller), Some(&[]), None, true),
+        (Some(caller), Some(&["command"]), access, true),
         (None, None, access, true),
         (None, Some(&["command"]), command, true),
         (None, Some(&["command"]), access, false),
-        // Unmarked: queued by an older API, or its record expired.
-        (None, Some(&["command"]), None, false),
+        // Recording none: queued by an older API, or with the record off.
+        (None, Some(&["command"]), None, true),
     ] {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, "paused", "space").await?;
@@ -1193,29 +1196,12 @@ async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> Test
             sandbox_id: PublicSandboxId::from(sandbox_id),
             action: SandboxLifecycleAction::Wake,
             rollback: None,
+            wake_activity: recorded,
         }
         .into_json();
-        let operation_id = match marker {
-            Some(activity) => {
-                let created = PublicOperationStore::new(pool.clone())
-                    .create_or_join_active_sandbox_wake(
-                        org_id,
-                        &PublicSandboxId::from(sandbox_id).to_string(),
-                        payload.clone(),
-                        None,
-                        implicit_wake_marker(activity),
-                    )
-                    .await?;
-                let CreatePublicOperationResult::Created(operation_id) = created else {
-                    panic!("a new wake: {created:?}");
-                };
-                operation_id
-            }
-            None => OperationId::new(),
-        };
-        let case = format!("{actor:?} {wake_on:?} {marker:?}");
+        let case = format!("{actor:?} {wake_on:?} {recorded:?}");
         let operation = ClaimedPublicOperation {
-            id: operation_id,
+            id: OperationId::new(),
             org_id,
             actor_user_id: actor,
             api_product: ApiProduct::Native,

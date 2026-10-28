@@ -739,6 +739,7 @@ mod not_running {
                     sandbox_id,
                     action: SandboxLifecycleAction::Wake,
                     rollback: None,
+                    wake_activity: None,
                 }
                 .into_json(),
                 idempotency: None,
@@ -847,18 +848,16 @@ mod not_running {
         Ok(())
     }
 
-    /// The activity marker on each wake operation for `sandbox_id`.
-    async fn wake_markers(
+    /// The activity recorded on each wake operation for `sandbox_id`.
+    async fn wake_activities(
         fixture: &Fixture,
         sandbox_id: PublicSandboxId,
     ) -> TestDbResult<Vec<Option<String>>> {
         Ok(sqlx::query_scalar(sql!(
-            "SELECT record.path_template
-               FROM public_operations operation
-               LEFT JOIN public_idempotency_records record
-                 ON record.operation_id = operation.operation_id
-              WHERE operation.kind = 'wake_sandbox' AND operation.target_id = $1
-              ORDER BY operation.requested_at, operation.operation_id"
+            "SELECT payload_json->>'wake_activity'
+               FROM public_operations
+              WHERE kind = 'wake_sandbox' AND target_id = $1
+              ORDER BY requested_at, operation_id"
         ))
         .bind(sandbox_id.to_string())
         .fetch_all(&fixture.db.pool)
@@ -870,9 +869,9 @@ mod not_running {
     {
         use crate::controllers::substrate::ExecutionActivityKind::{Access, Command};
         let fixture = fixture().await?;
-        let for_command = Some("system:implicit-wake:command");
-        let for_access = Some("system:implicit-wake:access");
-        for (lifecycle, wake_on, activity, queued, marker) in [
+        let for_command = Some("command");
+        let for_access = Some("access");
+        for (lifecycle, wake_on, activity, queued, recorded) in [
             ("suspended", &["access"][..], Access, true, for_access),
             ("suspended", &["access"], Command, true, for_command),
             ("suspended", &["command"], Command, true, for_command),
@@ -896,20 +895,20 @@ mod not_running {
             let case = format!("{lifecycle} {wake_on:?} {activity:?}");
             for _ in 0..2 {
                 assert_eq!(
-                    queue_implicit_wake(&fixture.db.pool, &stored, activity)
+                    queue_implicit_wake(&fixture.db.pool, &stored, activity, true)
                         .await
                         .map_err(|e| format!("{e:?}"))?,
                     queued,
                     "{case}"
                 );
             }
-            let expected: Vec<_> = marker.map(str::to_owned).into_iter().map(Some).collect();
+            let expected: Vec<_> = recorded.map(str::to_owned).into_iter().map(Some).collect();
             assert_eq!(
-                wake_markers(&fixture, sandbox_id).await?,
+                wake_activities(&fixture, sandbox_id).await?,
                 expected,
                 "{case}"
             );
-            if marker.is_some() {
+            if recorded.is_some() {
                 assert_eq!(
                     wakes(&fixture, sandbox_id).await?,
                     vec![(None, "native".to_string())]
@@ -935,11 +934,11 @@ mod not_running {
                 .await?
                 .expect("seeded sandbox");
         assert!(
-            queue_implicit_wake(&fixture.db.pool, &stored, Command)
+            queue_implicit_wake(&fixture.db.pool, &stored, Command, true)
                 .await
                 .map_err(|e| format!("{e:?}"))?
         );
-        assert!(wake_markers(&fixture, sandbox_id).await?.is_empty());
+        assert!(wake_activities(&fixture, sandbox_id).await?.is_empty());
 
         // A start that completed since the resolver looked, so nothing is
         // queued any more: keep waiting, with no wake.
@@ -955,20 +954,56 @@ mod not_running {
         .execute(&fixture.db.pool)
         .await?;
         assert!(
-            queue_implicit_wake(&fixture.db.pool, &stored, Command)
+            queue_implicit_wake(&fixture.db.pool, &stored, Command, true)
                 .await
                 .map_err(|e| format!("{e:?}"))?
         );
-        assert!(wake_markers(&fixture, sandbox_id).await?.is_empty());
+        assert!(wake_activities(&fixture, sandbox_id).await?.is_empty());
 
-        // A new command's wake is a command's.
+        // With the record off, the wake is queued in the payload every
+        // executor parses, which runs it as a command's.
+        let sandbox_id = sandbox(&fixture, "suspended", &["access"]).await?;
+        let stored =
+            crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                .await?
+                .expect("seeded sandbox");
+        assert!(
+            queue_implicit_wake(&fixture.db.pool, &stored, Access, false)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+        );
+        assert_eq!(
+            wake_payloads(&fixture, sandbox_id).await?,
+            vec![json!({ "sandbox_id": sandbox_id, "action": "wake" })]
+        );
+
+        // So is a new command's, with the record off by default.
         let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
         let (status, _, body) = command(&fixture, sandbox_id, "commands").await?;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(
-            wake_markers(&fixture, sandbox_id).await?,
-            vec![for_command.map(str::to_owned)]
+            wake_payloads(&fixture, sandbox_id).await?,
+            vec![json!({ "sandbox_id": sandbox_id, "action": "wake" })]
         );
         Ok(())
+    }
+
+    /// The payload of each wake operation for `sandbox_id`.
+    async fn wake_payloads(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+    ) -> TestDbResult<Vec<Value>> {
+        Ok(sqlx::query_scalar::<_, sqlx::types::Json<Value>>(sql!(
+            "SELECT payload_json
+               FROM public_operations
+              WHERE kind = 'wake_sandbox' AND target_id = $1
+              ORDER BY requested_at, operation_id"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_all(&fixture.db.pool)
+        .await?
+        .into_iter()
+        .map(|payload| payload.0)
+        .collect())
     }
 }

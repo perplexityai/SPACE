@@ -117,11 +117,16 @@ impl AccessBackend for StoredAccess {
         else {
             return Ok(false);
         };
-        crate::routes::public::sessions::queue_implicit_wake(&self.pool, &sandbox, activity)
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!("could not queue the command wake: {error:?}"))
-            })
+        crate::routes::public::sessions::queue_implicit_wake(
+            &self.pool,
+            &sandbox,
+            activity,
+            crate::public_sandbox_operations::implicit_wake_activity_enabled(),
+        )
+        .await
+        .map_err(|error| {
+            Status::unavailable(format!("could not queue the command wake: {error:?}"))
+        })
     }
     async fn observe(&self, id: SandboxId) -> Result<Observation, Status> {
         let sandbox = fetch_sandbox(&self.pool, id)
