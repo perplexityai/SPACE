@@ -1,5 +1,6 @@
 use super::*;
-use crate::proto::ExecutionInventoryUnavailable;
+use crate::node_publish::validate::execution_observation::ObservationError;
+use crate::proto::{ExecutionInventoryUnavailable, execution_inventory_observation::Outcome};
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
 use pplx_space_execution_common::proto::{RuntimeIdentity, RuntimeInstallation, RuntimeKind};
@@ -78,12 +79,26 @@ fn old_readers_keep_inventory_but_cannot_manufacture_observation_support() {
 fn invalid_or_conflicting_reports_never_become_positive_evidence() {
     let empty = NodeExecutionInventory::default();
     let installed = installed();
-    for (observation, legacy) in [
-        (ExecutionInventoryObservation::default(), None),
-        (complete(empty.clone()), Some(&installed)),
-        (unavailable(), Some(&empty)),
+    for (observation, legacy, message) in [
+        (
+            ExecutionInventoryObservation::default(),
+            None,
+            "execution observation is missing a supported outcome",
+        ),
+        (
+            complete(empty.clone()),
+            Some(&installed),
+            "complete execution observation disagrees with legacy inventory",
+        ),
+        (
+            unavailable(),
+            Some(&empty),
+            "unavailable execution observation cannot include legacy inventory",
+        ),
     ] {
-        decode(Some(&observation), legacy).unwrap_err();
+        let error = Status::from(decode(Some(&observation), legacy).unwrap_err());
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), message);
     }
     assert!(decode(None, None).unwrap().is_none());
     assert!(matches!(

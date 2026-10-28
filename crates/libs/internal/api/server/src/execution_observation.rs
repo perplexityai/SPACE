@@ -7,7 +7,8 @@ use sqlx::types::Json;
 use tonic::Status;
 
 use crate::node_publish::validate::execution_inventory::ValidatedExecutionInventory;
-use crate::proto::{ExecutionInventoryObservation, execution_inventory_observation::Outcome};
+use crate::node_publish::validate::execution_observation::{Report, decode};
+use crate::proto::ExecutionInventoryObservation;
 
 /// The outcome recorded only when the surrounding publication commits.
 #[derive(Clone, Copy, Debug)]
@@ -27,47 +28,6 @@ impl InventoryStatus {
     }
 }
 
-#[derive(Debug)]
-enum Report<'a> {
-    Complete(&'a NodeExecutionInventory),
-    Legacy(&'a NodeExecutionInventory),
-    Unavailable,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ObservationError {
-    #[error("execution observation is missing a supported outcome")]
-    MissingOutcome,
-    #[error("complete execution observation disagrees with legacy inventory")]
-    ConflictingInventory,
-    #[error("unavailable execution observation cannot include legacy inventory")]
-    UnavailableWithInventory,
-}
-
-fn decode<'a>(
-    observation: Option<&'a ExecutionInventoryObservation>,
-    legacy: Option<&'a NodeExecutionInventory>,
-) -> Result<Option<Report<'a>>, ObservationError> {
-    let Some(observation) = observation else {
-        return Ok(legacy.map(Report::Legacy));
-    };
-    match observation.outcome.as_ref() {
-        Some(Outcome::Complete(inventory)) => {
-            if legacy.is_some_and(|legacy| legacy != inventory) {
-                return Err(ObservationError::ConflictingInventory);
-            }
-            Ok(Some(Report::Complete(inventory)))
-        }
-        Some(Outcome::Unavailable(_)) => {
-            if legacy.is_some() {
-                return Err(ObservationError::UnavailableWithInventory);
-            }
-            Ok(Some(Report::Unavailable))
-        }
-        None => Err(ObservationError::MissingOutcome),
-    }
-}
-
 /// Holds decoded evidence after acquiring this publication's node lock.
 /// Construct before census writes; consume before the status upsert.
 pub(super) struct PreparedObservation<'a> {
@@ -81,9 +41,7 @@ pub(super) async fn prepare<'a>(
     observation: Option<&'a ExecutionInventoryObservation>,
     legacy: Option<&'a NodeExecutionInventory>,
 ) -> Result<Option<PreparedObservation<'a>>, Status> {
-    let Some(report) =
-        decode(observation, legacy).map_err(|error| Status::invalid_argument(error.to_string()))?
-    else {
+    let Some(report) = decode(observation, legacy)? else {
         return Ok(None);
     };
     // Acquire before census writes to preserve node-before-sandbox lock order.
