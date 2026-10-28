@@ -42,6 +42,7 @@ fn components(conn: &Connection, hash: &str) -> i64 {
 fn cfg(budget: u64, headroom: f64, grace_secs: u64, now: u64) -> EvictionConfig {
     EvictionConfig {
         budget_bytes: budget,
+        idle_ttl_secs: None,
         headroom_fraction: headroom,
         grace_secs,
         now_secs: now,
@@ -174,6 +175,7 @@ fn execute_one_deletes_when_no_race() {
     seed_build(&conn, "seed", "h1", 1_000);
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -211,6 +213,7 @@ fn execute_one_skips_pin_added_between_plan_and_execute() {
     plant_pin(&conn, "seed", "h1");
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -245,6 +248,7 @@ fn execute_one_skips_active_added_between_plan_and_execute() {
     seed_build(&conn, "seed", "h1", 1_000);
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -276,6 +280,7 @@ fn execute_one_keeps_db_row_when_disk_delete_fails() {
     seed_build(&conn, "seed", "h1", 1_000);
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -325,6 +330,7 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
     let db = Arc::new(Mutex::new(raw));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 800,
         headroom_fraction: 0.9,
@@ -396,6 +402,7 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
     let db = Arc::new(Mutex::new(conn));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 1,
         headroom_fraction: 0.9,
@@ -454,6 +461,7 @@ async fn execute_one_async_releases_db_lock_during_disk_delete() {
     let db = Arc::new(Mutex::new(raw));
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -535,6 +543,7 @@ async fn execute_one_async_marks_deleting_before_disk_delete() {
     let db = Arc::new(Mutex::new(raw));
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -626,6 +635,7 @@ async fn execute_one_async_second_eviction_skips_deleting_row() {
     let db = Arc::new(Mutex::new(raw));
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -644,7 +654,7 @@ async fn execute_one_async_second_eviction_skips_deleting_row() {
     let outcome = execute_one_async(db, HashSet::new(), HashSet::new(), cand, delete_disk)
         .await
         .unwrap();
-    assert_eq!(outcome, EvictionOutcome::SkippedRowMissing);
+    assert_eq!(outcome, EvictionOutcome::SkippedRowChanged);
     assert!(
         !*disk_called.lock().unwrap(),
         "second eviction must not delete disk for a row already mid-eviction"
@@ -674,6 +684,7 @@ async fn gc_tick_does_not_deadlock_when_disk_size_fn_relocks_db() {
     let db = Arc::new(Mutex::new(raw));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 100, // over budget, so this candidate is planned
         headroom_fraction: 0.9,
@@ -735,6 +746,7 @@ async fn run_loop_exits_when_active_fetch_is_stuck() {
     let db = Arc::new(Mutex::new(conn));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 1,
         headroom_fraction: 0.9,
@@ -791,6 +803,7 @@ async fn run_loop_returns_immediately_when_disabled() {
     let db = Arc::new(Mutex::new(conn));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: false,
         budget_bytes: 0,
         headroom_fraction: 0.9,
@@ -834,6 +847,7 @@ async fn gc_tick_skips_active_builds_passed_in_by_caller() {
     let db = Arc::new(Mutex::new(raw));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 100, // way over budget
         headroom_fraction: 0.9,
@@ -895,6 +909,7 @@ async fn gc_tick_skips_warm_pool_protected_builds() {
     let db = Arc::new(Mutex::new(raw));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 100, // way over budget
         headroom_fraction: 0.9,
@@ -947,6 +962,7 @@ fn execute_one_skips_warm_pool_added_between_plan_and_execute() {
     let conn = crate::db::test_conn();
     seed_build(&conn, "web-runtime", "sha256:pool", 500);
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "web-runtime".into(),
         content_hash: "sha256:pool".into(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -1020,7 +1036,7 @@ fn gc_config_malformed_budget_disables_gc() {
 }
 
 /// `execute_one` on a row that's already gone returns
-/// `SkippedRowMissing` without invoking disk delete. Covers the
+/// `SkippedRowChanged` without invoking disk delete. Covers the
 /// case where a concurrent `DeleteTemplateBuild` RPC raced us
 /// (e.g. an operator manually deleted between plan and execute).
 #[test]
@@ -1029,6 +1045,7 @@ fn execute_one_skips_when_row_missing() {
     // Note: NO seed_build call — the row never existed.
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -1041,7 +1058,7 @@ fn execute_one_skips_when_row_missing() {
     })
     .unwrap();
 
-    assert_eq!(outcome, EvictionOutcome::SkippedRowMissing);
+    assert_eq!(outcome, EvictionOutcome::SkippedRowChanged);
     assert!(
         !disk_called.get(),
         "disk delete must not run when the DB row is already gone"
@@ -1082,7 +1099,7 @@ fn pin_key_is_template_plus_hash_not_just_hash() {
 // The comment on `execute_one_keeps_db_row_when_disk_delete_fails`
 // claims "the build row stays so the next tick can retry". In
 // practice the CAS in `execute_precheck` only matches
-// `state='ready'`, so the next tick logs SkippedRowMissing and the
+// `state='ready'`, so the next tick logs SkippedRowChanged and the
 // row sits in `state='deleting'` until daemon restart. That is a
 // liveness gap with two production-realistic triggers, both
 // surfaced by the btrfs install path:
@@ -1121,6 +1138,7 @@ async fn execute_one_async_leaves_row_in_deleting_after_phase2_error() {
     let db = Arc::new(Mutex::new(raw));
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: crate::db::TemplateCachePartition::Legacy,
@@ -1186,6 +1204,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_intact() {
     let db = Arc::new(Mutex::new(raw));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 100,
         headroom_fraction: 0.9,
@@ -1269,6 +1288,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
     let db = Arc::new(Mutex::new(raw));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 100,
         headroom_fraction: 0.9,
@@ -1347,6 +1367,7 @@ async fn gc_tick_releases_stuck_deleting_row_when_pin_lands() {
     let db = Arc::new(Mutex::new(raw));
 
     let cfg = GcConfig {
+        idle_ttl: None,
         enabled: true,
         budget_bytes: 100,
         headroom_fraction: 0.9,
@@ -1462,6 +1483,7 @@ fn execute_one_on_a_twin_leaves_its_legacy_sibling() {
     .unwrap();
 
     let cand = EvictionCandidate {
+        last_touch_secs: jiff::Timestamp::now().as_second().max(0).cast_unsigned(),
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
         cache_partition: partition,
@@ -1488,4 +1510,58 @@ fn execute_one_on_a_twin_leaves_its_legacy_sibling() {
         .query_row("SELECT COUNT(*) FROM template_snapshots", [], |r| r.get(0))
         .unwrap();
     assert_eq!(snapshots, 0);
+}
+
+#[test]
+fn idle_ttl_can_enable_gc_without_a_byte_budget() {
+    for (value, expected) in [
+        ("86400", Some(86400)),
+        ("0", None),
+        ("", None),
+        ("bad", None),
+        ("-1", None),
+    ] {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        env.set(GcConfig::ENV_BUDGET, "0");
+        env.set(GcConfig::ENV_IDLE_TTL_SECS, value);
+        let config = GcConfig::from_environment(&env);
+        assert_eq!(config.enabled, expected.is_some());
+        assert_eq!(config.idle_ttl.map(|ttl| ttl.as_secs()), expected);
+        assert_eq!(config.budget_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn gc_skips_a_build_used_after_planning() {
+    let raw = crate::db::test_conn();
+    seed_build(&raw, "seed", "h1", 100);
+    raw.execute(
+        "UPDATE template_builds SET created_at = '1', last_used_at = '1'",
+        [],
+    )
+    .unwrap();
+    let candidate = plan_from_db(
+        &raw,
+        &keys(&[]),
+        &keys(&[]),
+        &EvictionConfig {
+            idle_ttl_secs: Some(100),
+            ..cfg(1000, 0.9, 60, 1000)
+        },
+        |_, _, _, fallback, _| fallback,
+    )
+    .unwrap()
+    .candidates
+    .remove(0);
+    crate::db::touch_build(&raw, "seed", "h1", TemplateCachePartition::Legacy).unwrap();
+    let db = Arc::new(Mutex::new(raw));
+    let delete: DeleteDiskFn = Arc::new(|_, _, _| panic!("a newly used build must survive"));
+    let outcome = execute_one_async(Arc::clone(&db), keys(&[]), keys(&[]), candidate, delete)
+        .await
+        .unwrap();
+    assert_eq!(outcome, EvictionOutcome::SkippedRowChanged);
+    assert_eq!(
+        crate::db::list_builds(&db.lock().unwrap()).unwrap().len(),
+        1
+    );
 }

@@ -57,10 +57,12 @@ hashAlgorithm: ""
 #
 # The GC interval and grace and the prefetch latest-N are test hooks
 # (`GcConfig::from_env` in eviction.rs, `LATEST_N_TEST_HOOK` in prefetch.rs);
-# the release lane (`rustBuild: release`) renders only the budget, which
+# the release lane (`rustBuild: release`) renders the budget and idle TTL, which
 # release binaries read.
 templateCache:
   budgetBytes: "1610612736"
+  # Opt-in idle expiry in seconds, independent of the byte budget.
+  idleTtlSeconds: "0"
   gcIntervalSecs: "15"
   gcGraceSecs: "60"
   prefetchLatestN: "1"
