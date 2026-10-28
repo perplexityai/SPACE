@@ -2,4 +2,5 @@
 
 pub(crate) mod diagnostics;
 pub(crate) mod outcome;
+pub(crate) mod store;
 pub(crate) mod validate;
