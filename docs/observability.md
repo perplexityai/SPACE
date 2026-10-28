@@ -412,25 +412,9 @@ reaches:
   Each ref saves its latest writer's `traceparent`, except that an unsampled
   writer never replaces a sampled one, and a pass is a root that links to the
   saved contexts of the refs it claimed.
-- An on-demand `shim.create` attempt joins the context in its Pod's
-  `space.pplx.net/traceparent` annotation while the Unix-millisecond deadline
-  in `space.pplx.net/trace-join-until` is still in the future. The API writes
-  this fixed deadline before submitting the pod, using the smaller of its
-  pod-proxy readiness timeout and its combined readiness phase budget.
-  Starting the window before submission is conservative: slow submission
-  may end joining before the actual readiness wait ends. The parent is the
-  `substrate.k8s.materialize_pod` producer, not the later `wait_pod_ip` span,
-  so node work is in the same trace but not nested under that wait span.
-  Each attempt retains `task_id`, the containerd task/sandbox ID, to
-  distinguish retries inside the window.
-- Kubelet retries keep the pod annotations unchanged. At or after the join
-  deadline, each `shim.create` is instead a linked root, so an indefinitely
-  retrying pod cannot grow the origin trace indefinitely. Readiness timeouts
-  may defer pod cleanup; deletion is not the bound. Missing, malformed, or
-  nonpositive deadlines also preserve linked roots, including old API pods,
-  pooled pods, restore pods, and background recreation. A missing or invalid
-  traceparent yields a plain root. The shim's teardown spans still link to
-  their task's create, whether that create joined or linked.
+- Each `shim.create` joins its Pod's annotated context; invalid/missing context
+  starts a plain root. Kubelet retries intentionally grow the same trace,
+  distinguished by `task_id`. Teardown still links to its task's create.
 
 The shim's teardown spans, `shim.kill` and `shim.delete` with their
 `shim.sbxmgr.teardown_release` child, wait at most 45 seconds for sbx-manager
@@ -466,14 +450,6 @@ most eight origins, sampled ones first, so one with any sampled origin always
 links it and is kept. Datadog's rate limit (`DD_TRACE_RATE_LIMIT`) still
 applies to a kept root, and sampling rules sent
 by Remote Configuration replace the whole list, these two included.
-
-Joined `shim.create` spans retain `origin_trace_id` and `origin_sampled` for
-search compatibility, but inherit the remote parent's trace ID, span ID as
-parent, and sampling decision. Their manager RPC descendants propagate that
-same trace. Join deadlines assume synchronized API and node wall clocks;
-clock skew shifts the cutoff, but retries never extend the stored deadline.
-Deploying only the new shim leaves old pods linked; deploying only the new
-API leaves old shims linked. Both versions are needed for the joined view.
 
 A node-ctl `node_ctl.pass` root covers one claim of cluster reconcile refs,
 from a trigger or the 60-second timer (`cause`). It exists only for a claim
@@ -804,10 +780,7 @@ request's trace ID:
 
 - node-manager's sandbox cleanup, which runs in a task the `CleanupSandbox`
   call that started it owns;
-- sandbox-manager's lifecycle cleanup admission, which its RPC awaits;
-- an on-demand shim create that starts inside its pod's trace-join window,
-  including the sandbox-manager and template/volume work it awaits. Later
-  attempts and pods without that window use linked roots instead.
+- sandbox-manager's lifecycle cleanup admission, which its RPC awaits.
 
 Work that outlives the request runs under a root linked to it, which records
 the request's trace ID as `origin_trace_id` and is sampled as the request was;

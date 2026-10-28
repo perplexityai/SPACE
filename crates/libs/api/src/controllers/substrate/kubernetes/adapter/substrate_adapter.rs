@@ -281,26 +281,6 @@ impl SubstrateAdapter for KubernetesSubstrate {
         };
 
         let pod_create_started_at = Instant::now();
-        // Join only on-demand creates owned by this readiness waiter.
-        // Start the join window before submission, conservatively earlier than
-        // the readiness timers below, and cap it at their earliest deadline.
-        // Never renew it: timeout cleanup may be deferred while kubelet retries.
-        let trace_join_until = if fork_restore.is_none() {
-            let join_window = self.k8s.create_data_plane_ready_timeout.min(
-                self.budgets
-                    .create_ready
-                    .saturating_sub(self.budgets.create_ready_phase_margin),
-            );
-            match jiff::Timestamp::now().checked_add(join_window) {
-                Ok(deadline) => Some(deadline),
-                Err(error) => {
-                    tracing::warn!(%error, "trace join deadline unavailable; using linked traces");
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let common = SandboxPodCommon {
             pod_name: &pod_name,
             sandbox_id: sandbox_uuid,
@@ -352,7 +332,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // From here until the response, the apiserver may accept a pod this
         // call never learns, so the guard keeps the claim that names it.
         cancel_guard.begin_pod_create();
-        let pod = match create_sandbox_pod(&self.k8s, pod_request, trace_join_until)
+        let pod = match create_sandbox_pod(&self.k8s, pod_request)
             .instrument(tracing::info_span!(
                 "substrate.k8s.create_pod",
                 sandbox_id = %sandbox_id,

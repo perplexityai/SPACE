@@ -86,8 +86,7 @@ func (p *otlpTracePipeline) startLinked(ctx context.Context, name string, carrie
 }
 func (p *otlpTracePipeline) startChild(ctx context.Context, name string, carrier propagation.MapCarrier, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
 	parent := trace.SpanContextFromContext(tracePropagation.Extract(context.Background(), carrier))
-	// An invalid extracted context masks any unrelated current span but keeps
-	// the caller's cancellation, deadline, and request-local values intact.
+	// Mask unrelated spans without discarding caller cancellation.
 	ctx = trace.ContextWithRemoteSpanContext(ctx, parent)
 	return p.start(ctx, name, attrs...)
 }

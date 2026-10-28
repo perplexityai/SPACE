@@ -28,7 +28,6 @@ about 11 s after its spans end.
 
 from __future__ import annotations
 
-import base64
 import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
@@ -70,10 +69,9 @@ class TelemetryDeliveryAssertions:
         fixture.record("telemetry_window_start", self._since)
 
     def expect_traces(self) -> None:
-        """The bounded on-demand create joins its API parent in Tempo."""
+        """The shim create joins its API parent in Tempo."""
 
         sandbox_id = self._fixture.sandbox.sandbox_id
-        api_spans = f'{{resource.service.name="{API_SERVICE}" && span.sandbox_id="{sandbox_id}"}}'
         shim_creates = (
             f'{{resource.service.name="{SHIM_SERVICE}" && name="shim.create"'
             f' && span.sandbox_id="{sandbox_id}"}}'
@@ -101,30 +99,16 @@ class TelemetryDeliveryAssertions:
             bool(shim_traces),
             f"Tempo found no {SHIM_SERVICE} create trace for {sandbox_id}",
         )
-        # Tempo search may drop a trace ID's leading zeros.
-        shim_trace_ids = {int(trace, 16) for trace in shim_traces}
-
-        def joined_api_traces() -> list[str]:
-            return [trace for trace in search(api_spans, limit=50) if int(trace, 16) in shim_trace_ids]
-
-        found = self._poll(joined_api_traces, bool, budget=TRACE_BUDGET_SECONDS)
-        self._fixture.record("tempo_trace_ids", found)
-        self._fixture.verify(
-            bool(found),
-            f"Tempo found no shared {API_SERVICE} and shim create trace for {sandbox_id}",
-            failure_evidence=lambda: {"tempo_api_trace_ids": search(api_spans, limit=50)},
-        )
-
         def joins_api(trace: list[tuple[Mapping[str, str], list[Mapping[str, Any]]]]) -> bool:
             api_parents = {
-                base64.b64decode(span["spanId"])
+                span["spanId"]
                 for attributes, spans in trace
                 if attributes.get("service.name") == API_SERVICE
                 for span in spans
                 if span.get("name") == "substrate.k8s.materialize_pod" and span.get("spanId")
             }
             return any(
-                base64.b64decode(span.get("parentSpanId") or "") in api_parents
+                span.get("parentSpanId") in api_parents
                 for attributes, spans in trace
                 if attributes.get("service.name") == SHIM_SERVICE
                 for span in spans
@@ -133,22 +117,12 @@ class TelemetryDeliveryAssertions:
 
         # Services flush independently, so search finding the shared trace
         # does not guarantee the parent and child are both queryable yet.
-        trace = self._poll(lambda: self._trace(found[0]), joins_api, budget=TRACE_BUDGET_SECONDS)
+        trace = self._poll(lambda: self._trace(shim_traces[0]), joins_api, budget=TRACE_BUDGET_SECONDS)
         services = {attributes.get("service.name", "") for attributes, _ in trace}
         self._fixture.record("tempo_trace_services", sorted(services))
-        self._fixture.record(
-            "tempo_shim_create_parent_ids",
-            [
-                base64.b64decode(span.get("parentSpanId") or "").hex()
-                for attributes, spans in trace
-                if attributes.get("service.name") == SHIM_SERVICE
-                for span in spans
-                if span.get("name") == "shim.create"
-            ],
-        )
         self._fixture.verify(
             joins_api(trace),
-            f"Tempo returned trace {found[0]} without a shim create parented by {API_SERVICE} pod materialization",
+            f"Tempo returned trace {shim_traces[0]} without a shim create parented by {API_SERVICE} pod materialization",
         )
         shim_batches = [attributes for attributes, _ in trace if attributes.get("service.name") == SHIM_SERVICE]
         self._node = shim_batches[0].get("k8s.node.name") or None

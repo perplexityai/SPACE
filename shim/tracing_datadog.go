@@ -40,7 +40,7 @@ func newDatadogTracePipeline() tracePipeline {
 
 // originSamplingRules keeps or drops a root that links to an origin as the
 // origin was sampled, as the Rust services' rules do: two rules on
-// origin_sampled ahead of the rules
+// origin_sampled, which only such roots carry, ahead of the rules
 // DD_TRACE_SAMPLING_RULES configures. The tracer lets those environment rules
 // replace any given in code, so they are read here, appended, and taken out
 // of the environment it reads. Rules it cannot parse are left for the tracer

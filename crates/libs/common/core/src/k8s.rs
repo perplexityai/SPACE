@@ -69,8 +69,6 @@ pub const SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION: &str =
 pub const SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION: &str =
     "space.pplx.net/network-policy-authority";
 pub const SANDBOX_TRACEPARENT_ANNOTATION: &str = "space.pplx.net/traceparent";
-/// Unix milliseconds before which shim create attempts may join the origin trace.
-pub const SANDBOX_TRACE_JOIN_UNTIL_ANNOTATION: &str = "space.pplx.net/trace-join-until";
 pub const SANDBOX_OWNER_ANNOTATION: &str = "space.pplx.net/sandbox-owner";
 pub const SANDBOX_USER_ANNOTATION: &str = "space.pplx.net/sandbox-user";
 /// BYOK: the sandbox's immutable encrypted-volumes flag. Rendered only when
