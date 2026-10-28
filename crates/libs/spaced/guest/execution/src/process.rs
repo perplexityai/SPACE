@@ -48,7 +48,7 @@ const SLOW_START_PHASE: Duration = Duration::from_secs(1);
 struct RecoveryLaunch {
     fence: pplx_space_spaced_guest_protocol::recovery::RecoveryFence,
     // Retained through launch and key publication, even after the caller leaves.
-    _activation: tokio::sync::OwnedRwLockReadGuard<()>,
+    _activation: crate::recovery::ActivationLease,
 }
 
 struct RecoveryStartAdmission {
@@ -317,13 +317,7 @@ impl Process for ExecutionService {
         let mut ingress = ingress;
         let recovery = if request.recovery.is_some() {
             // A queued activation update must not turn requests into payload-holding waiters.
-            let activation = self
-                .inner
-                .recovery
-                .launches
-                .clone()
-                .try_read_owned()
-                .map_err(|_| pplx_space_spaced_guest_protocol::recovery::RecoveryReason::TemporarilyUnavailable.into_status())?;
+            let activation = self.inner.recovery.lease()?;
             let permit = crate::payload::acquire(
                 &self.inner.process_payload_slots,
                 pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
@@ -819,7 +813,11 @@ impl Process for ExecutionService {
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let record = &target.record;
-        record.write_stdin(&request.data).await?;
+        tokio::select! {
+            biased;
+            _ = target.cancelled() => return Err(pplx_space_spaced_guest_protocol::recovery::RecoveryReason::InputOutcomeUncertain.into_status()),
+            result = record.write_stdin(&request.data) => result?,
+        }
         tracing::debug!(
             command = "bridge_guest_process_send_input",
             process_id = %process_id,
@@ -870,7 +868,11 @@ impl Process for ExecutionService {
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let record = &target.record;
-        record.close_stdin().await?;
+        tokio::select! {
+            biased;
+            _ = target.cancelled() => return Err(pplx_space_spaced_guest_protocol::recovery::RecoveryReason::MutationOutcomeUnknown.into_status()),
+            result = record.close_stdin() => result?,
+        }
         tracing::debug!(
             command = "bridge_guest_process_close_stdin",
             process_id = %process_id,

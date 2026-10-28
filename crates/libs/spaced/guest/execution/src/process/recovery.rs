@@ -67,7 +67,24 @@ pub(super) struct ProcessTarget {
     pub(super) id: ProcessId,
     pub(super) record: Arc<ProcessRecord>,
     // Activation changes cannot pass a control effect still using this record.
-    _activation: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _activation: Option<crate::recovery::ActivationLease>,
+}
+
+impl ProcessTarget {
+    pub(super) fn recovery_cancellation(&self) -> &CancellationToken {
+        &self
+            ._activation
+            .as_ref()
+            .expect("recovery effect has an activation lease")
+            .cancellation
+    }
+
+    pub(super) async fn cancelled(&self) {
+        match &self._activation {
+            Some(lease) => lease.cancellation.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 impl ExecutionService {
@@ -79,13 +96,7 @@ impl ExecutionService {
         let (id, expected, activation) = match address {
             ProcessAddress::Legacy(id) => (id, None, None),
             ProcessAddress::Recovery(handle) => {
-                let activation = self
-                    .inner
-                    .recovery
-                    .launches
-                    .clone()
-                    .try_read_owned()
-                    .map_err(|_| RecoveryReason::TemporarilyUnavailable.into_status())?;
+                let activation = self.inner.recovery.lease()?;
                 self.inner.recovery.check(handle.fence)?;
                 (
                     handle.process_id,

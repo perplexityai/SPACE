@@ -113,7 +113,11 @@ impl ExecutionService {
                     .reserve(sequence, binding)?;
                 let outcome = match reservation {
                     Reservation::Replay(outcome) => outcome,
-                    Reservation::Wait(receiver) => ledger::wait(receiver).await,
+                    Reservation::Wait(receiver) => {
+                        // A waiter owns no effect and must not delay quiescing its owner.
+                        drop(target);
+                        ledger::wait(receiver).await
+                    }
                     Reservation::Owner(owner) => {
                         // A retained receipt is replayable after exit, but a new effect is not.
                         if target.record.journal.is_completed() {
@@ -126,7 +130,7 @@ impl ExecutionService {
                             _payload: payload,
                             _admission: admission,
                         };
-                        let shutdown = self.inner.shutdown.clone();
+                        let shutdown = owned.target.recovery_cancellation().clone();
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         self.inner.process_tasks.spawn(async move {
                             let result = owned.run(shutdown).await;
@@ -179,21 +183,35 @@ async fn write_descriptor<T: tokio::io::AsyncWrite + Unpin>(
             result = writer.write(data.get(written..).expect("writer progress stays within input")) => result,
         };
         match result {
-            Ok(0) | Err(_) => {
-                return Outcome::Interrupted {
-                    written: written as u64,
-                };
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(0) => {
+                return write_failure(std::io::Error::from(std::io::ErrorKind::WriteZero), written);
             }
+            Err(error) => return write_failure(error, written),
             Ok(count) => written += count,
         }
     }
-    tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => Outcome::Interrupted {written: written as u64},
-        result = writer.flush() => match result {
-            Ok(()) => Outcome::Applied,
-            Err(_) => Outcome::Interrupted {written: written as u64},
-        },
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Outcome::Interrupted { written: written as u64 },
+            result = writer.flush() => result,
+        };
+        match result {
+            Ok(()) => return Outcome::Applied,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return write_failure(error, written),
+        }
+    }
+}
+
+fn write_failure(error: std::io::Error, written: usize) -> Outcome {
+    if written == 0 {
+        Outcome::from_result(Err(map_io_error(error)))
+    } else {
+        Outcome::Interrupted {
+            written: written as u64,
+        }
     }
 }
 

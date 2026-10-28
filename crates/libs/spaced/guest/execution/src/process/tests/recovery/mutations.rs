@@ -1,4 +1,4 @@
-use super::handles::{output, running};
+use super::handles::{output, running, running_command};
 use super::*;
 use pplx_space_spaced_guest_protocol::{
     proto::operations::RecoveryHandle, recovery::RecoveryReason,
@@ -79,78 +79,97 @@ async fn mutation_receipts_replay_after_lost_replies_and_process_exit() {
 }
 
 #[tokio::test]
-async fn cancellation_keeps_the_mutation_owner_and_its_activation_barrier() {
-    let service = cancellation_service();
-    let handle = running(&service, false).await;
-    let record = service
-        .inner
-        .processes
-        .get_running(&ProcessId::parse(&handle.process_id).unwrap())
+async fn quiescing_or_shutdown_settles_a_blocked_sequenced_input() {
+    for shutdown in [false, true] {
+        let service = cancellation_service();
+        let handle = running_command(
+            &service,
+            false,
+            vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()],
+        )
+        .await;
+        let record = service
+            .inner
+            .processes
+            .get_running(&ProcessId::parse(&handle.process_id).unwrap())
+            .unwrap();
+        let ProcessInput::Pipe(stdin) = &record.input else {
+            panic!("pipe")
+        };
+        let slots = service.inner.process_payload_slots.available_permits();
+        let data = vec![b'x'; 1024 * 1024];
+        let mut first = Box::pin(input(&service, &handle, 1, &data));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                assert!(futures_util::poll!(&mut first).is_pending());
+                if record.recovery.as_ref().unwrap().mutations.has_pending()
+                    && stdin.descriptor.try_lock().is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
         .unwrap();
-    let ProcessInput::Pipe(stdin) = &record.input else {
-        panic!("pipe")
-    };
-    let slots = service.inner.process_payload_slots.available_permits();
-    let locked = stdin.descriptor.lock().await;
-    let mut first = Box::pin(input(&service, &handle, 1, b"owned\n"));
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            assert!(futures_util::poll!(&mut first).is_pending());
-            if record.recovery.as_ref().unwrap().mutations.has_pending() {
-                break;
+        let mut duplicate = Box::pin(input(&service, &handle, 1, &data));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                assert!(futures_util::poll!(&mut duplicate).is_pending());
+                if record.recovery.as_ref().unwrap().mutations.has_waiter() {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let mut duplicate = Box::pin(input(&service, &handle, 1, b"owned\n"));
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            assert!(futures_util::poll!(&mut duplicate).is_pending());
-            if record.recovery.as_ref().unwrap().mutations.has_waiter() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        service.inner.process_payload_slots.available_permits(),
-        slots - 2
-    );
-    assert_eq!(
-        input(&service, &handle, 1, b"conflict")
+        })
+        .await
+        .unwrap();
+        drop(first);
+        let quiesced = if shutdown {
+            service.cancel();
+            Ok(Ok(()))
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                service.configure_process_recovery(None),
+            )
             .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
-    );
-    drop(first);
-    assert_eq!(
-        service.inner.process_payload_slots.available_permits(),
-        slots - 2
-    );
-    // A duplicate is a waiter, not a second effect owner.
-    drop(duplicate);
-    let mut disabling = Box::pin(service.configure_process_recovery(None));
-    assert!(futures_util::poll!(&mut disabling).is_pending());
-    drop(locked);
-    tokio::time::timeout(Duration::from_secs(2), &mut disabling)
-        .await
-        .unwrap()
-        .unwrap();
-    // No memory restore took place: re-enable this same activation to retry the receipt.
-    service
-        .configure_process_recovery(Some(handle.expected_activation_id.parse().unwrap()))
-        .await
-        .unwrap();
-    input(&service, &handle, 1, b"owned\n").await.unwrap();
-    close(&service, &handle, 2).await.unwrap();
-    assert_eq!(output(&service, handle).await, b"owned\n");
-    service.cancel();
-    service.drain().await.unwrap();
+        };
+        // Even a failing negative control must release its real child and writer.
+        if quiesced.is_err() {
+            service.cancel();
+        }
+        let error = tokio::time::timeout(Duration::from_secs(2), duplicate)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            RecoveryReason::from_status(&error),
+            Some(RecoveryReason::InputOutcomeUncertain)
+        );
+        assert!(!record.recovery.as_ref().unwrap().mutations.has_pending());
+        assert_eq!(
+            service.inner.process_payload_slots.available_permits(),
+            slots
+        );
+        if !shutdown && quiesced.is_ok() {
+            service
+                .configure_process_recovery(Some(handle.expected_activation_id.parse().unwrap()))
+                .await
+                .unwrap();
+            let replay = input(&service, &handle, 1, &data).await.unwrap_err();
+            assert_eq!(replay.code(), error.code());
+            assert_eq!(
+                replay.metadata().clone().into_headers(),
+                error.metadata().clone().into_headers()
+            );
+        }
+        service.cancel();
+        service.drain().await.unwrap();
+        quiesced
+            .expect("a blocked stdin must not block quiescing")
+            .unwrap();
+    }
 }
 
 #[tokio::test]

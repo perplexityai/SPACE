@@ -203,8 +203,7 @@ async fn recovery_snapshot_barrier_settles_cancelled_start_before_disabling() {
     wait_for_start_owner(&service).await;
     pending.abort();
     let _ = pending.await;
-    let disabling = service.configure_process_recovery(None);
-    tokio::pin!(disabling);
+    let mut disabling = Box::pin(service.configure_process_recovery(None));
     assert!(futures_util::poll!(&mut disabling).is_pending());
     let slots = service.inner.process_payload_slots.available_permits();
     let (refusal, remaining) = {
@@ -215,7 +214,11 @@ async fn recovery_snapshot_barrier_settles_cancelled_start_before_disabling() {
             service.inner.process_payload_slots.available_permits(),
         )
     };
+    drop(disabling);
+    let disabled = service.process_execution_info().activation_id.is_none();
     placement.release();
+    assert!(disabled, "abandoned quiescing must remain disabled");
+    let mut disabling = Box::pin(service.configure_process_recovery(None));
     assert!(
         matches!(refusal, std::task::Poll::Ready(status) if status.code() == tonic::Code::Unavailable)
     );

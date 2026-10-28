@@ -309,7 +309,8 @@ key and the command inside `RecoveryStart`; the legacy `command` stays empty.
 Same-key retries replay the original launch before account lookup, mutable
 configuration or caller-assigned process-ID collision checks. A different
 supplied request is `InvalidArgument`; mixing legacy and recovery starts under
-one key is `FailedPrecondition`. Environment map order is immaterial, but omitted
+one key is `FailedPrecondition`. UUID spelling and environment map order are
+immaterial, but omitted
 values and explicit defaults are distinct. Recovery environment entries must be
 valid; legacy sanitization is unchanged. Only a fixed-size digest is retained,
 not another copy of the command or environment. Recovery `Started` events carry
@@ -321,7 +322,12 @@ for admitted recovery starts to publish their outcomes, including starts whose
 callers disconnected. If it fails or is cancelled, do not take the snapshot.
 After restoring memory, install a fresh externally supplied activation before
 accepting recovery requests. Repeating an activation without a restore is
-idempotent. Legacy calls are unaffected by this gate.
+idempotent. A quiesced service returns `Unavailable` with
+`temporarily_unavailable`; a different installed activation returns
+`FailedPrecondition` with `activation_changed`. Cancelling configuration leaves
+recovery disabled until another configuration completes. Legacy calls are
+unaffected by this gate. Discovery lists implemented contracts; an absent
+activation means recovery is not ready to accept calls.
 
 Keep the original key, request and expected IDs when retrying, and bound retries
 from the first attempt by the advertised retention window. Output and process
@@ -354,9 +360,8 @@ and process-ID reuse cannot redirect it to a replacement process. A new activati
 retires handles for processes started under the previous activation; replacing
 only the token in an old handle cannot renew it.
 
-Disabling recovery waits for admitted control calls, including a blocked stdin
-write; it does not wait for read streams or legacy calls. Bound pending calls
-with an application deadline before preparing a snapshot. Version 1 adds fencing
+Disabling recovery interrupts blocked recovery controls before waiting for their
+leases; it does not wait for read streams or legacy calls. Version 1 adds fencing
 only: a cancelled write may have delivered a prefix, and input or signals must
 not be automatically retried. Version-2 mutation receipts are described below.
 The daemon routing path still filters `process_recovery_handles` until its
@@ -382,15 +387,20 @@ receipt stores a fixed-size digest and bounded outcome, not stdin bytes.
 All sequenced calls, including duplicate waiters, hold payload admission. Once
 an effect begins, its tracked owner keeps capacity and the activation lease
 until the outcome is published, even if the caller drops its future. Quiescing
-recovery therefore waits for that owner; a caller deadline does not cancel it.
-If an owner cannot settle, abort snapshot preparation or cancel and drain the
-service. Cancellation permanently closes that service.
+recovery cancels blocked effects and waits for their receipts before completing.
+A caller deadline alone does not cancel the owner. Receipt waiters do not hold an
+activation lease. Service shutdown also interrupts these effects.
 
 Interrupted input reports `Aborted` with `InputOutcomeUncertain` and the known
 written prefix in `space-process-input-written`. This counts bytes accepted by
 the writer, not bytes consumed by the child. Do not resend the remainder.
 An owner lost after beginning records `MutationOutcomeUnknown`; retries preserve
 that uncertainty. Signals acknowledge OS delivery attempts, not handling by the
-child. Legacy and version-1 controls remain outside this ordering, so callers
-must coordinate any mixing. Daemon routing still filters this capability until
+child. An I/O failure before any byte was written is a known failure, preserving
+its status metadata; interrupted system calls are retried.
+
+A next-sequence signal cannot overtake a pending input. To terminate a process
+with blocked input, use version-1 fenced `SendSignal(SIGKILL)` without a sequence,
+or the legacy kill operation where only a legacy ID is available. These controls
+remain outside sequence ordering; callers must coordinate any mixing. Daemon routing still filters this capability until
 its activation handshake and forwarding are implemented.

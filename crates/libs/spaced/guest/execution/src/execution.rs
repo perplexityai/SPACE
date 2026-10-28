@@ -172,6 +172,7 @@ impl ExecutionService {
                 .activation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .id
                 .map(|id| id.to_string()),
             idempotency_retention: Some(
                 prost_types::Duration::try_from(self.inner.recovery.idempotency)
@@ -197,8 +198,9 @@ impl ExecutionService {
     /// Enable recovery with an epoch supplied from outside this service's memory,
     /// or disable it before taking a memory snapshot. Recovery is disabled at
     /// construction. Disabling waits for admitted recovery starts to publish
-    /// their outcomes and for admitted control calls to finish. It does not wait
-    /// for read streams. Cancelling this future leaves the prior state intact.
+    /// their outcomes and interrupts pending control effects before waiting for
+    /// their receipts. It does not wait for read streams. Cancelling this future
+    /// leaves recovery disabled until a subsequent configuration completes.
     /// A restored service must receive a fresh epoch before recovery calls.
     /// Repeating the same epoch is idempotent. Legacy operations are unaffected.
     pub async fn configure_process_recovery(
@@ -206,18 +208,34 @@ impl ExecutionService {
         activation: Option<pplx_space_common_core::types::ProcessRecoveryToken>,
     ) -> Result<(), Status> {
         let _operation = self.inner.lifecycle.admit()?;
-        let _launches = self.inner.recovery.launches.write().await;
+        let recovery = &self.inner.recovery;
+        let _configuration = recovery.configuration.lock().await;
+        {
+            let mut current = recovery
+                .activation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.id == activation && !current.cancellation.is_cancelled() {
+                return Ok(());
+            }
+            current.id = None;
+            // Interrupt effect owners before waiting for their leases. In particular,
+            // a process that never reads stdin must not hold snapshot preparation open.
+            current.cancellation.cancel();
+        }
+        let _launches = recovery.launches.write().await;
         let _gate = self
             .inner
             .start_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *self
-            .inner
-            .recovery
+        *recovery
             .activation
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = activation;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = crate::recovery::Activation {
+            id: activation,
+            cancellation: self.inner.shutdown.child_token(),
+        };
         Ok(())
     }
 
@@ -274,7 +292,11 @@ impl ExecutionService {
             inner: Arc::new(ExecutionServiceInner {
                 recovery: crate::recovery::RecoveryState {
                     instance: pplx_space_common_core::types::ProcessRecoveryToken::new(),
-                    activation: std::sync::Mutex::new(None),
+                    activation: std::sync::Mutex::new(crate::recovery::Activation {
+                        id: None,
+                        cancellation: shutdown.child_token(),
+                    }),
+                    configuration: tokio::sync::Mutex::new(()),
                     launches: Arc::new(tokio::sync::RwLock::new(())),
                     idempotency: config.process_retention.idempotency,
                 },
