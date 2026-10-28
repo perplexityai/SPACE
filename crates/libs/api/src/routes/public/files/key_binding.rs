@@ -1,5 +1,8 @@
 use pplx_space_common_core::types::{GuestUserName, IdempotencyKey};
-use pplx_space_public_api::{RequestFingerprint, routes::NativeOperation};
+use pplx_space_public_api::{
+    RequestFingerprint,
+    routes::{NativeHttpMethod, NativeOperation},
+};
 use sha2::{Digest as _, Sha256};
 
 use super::super::error::PublicApiError;
@@ -26,14 +29,20 @@ pub(super) async fn bind_request_key(
     key: &IdempotencyKey,
     fingerprint: &RequestFingerprint,
 ) -> Result<(), PublicApiError> {
-    let mut scoped = Sha256::new();
-    scoped.update(sandbox.id.to_string());
-    scoped.update([0]);
-    scoped.update(key.as_str());
-    let scoped = IdempotencyKey::parse(hex::encode(scoped.finalize()))
-        .map_err(|_| PublicApiError::internal())?;
+    let mut scoped = RequestDigest::default();
+    scoped
+        .field(sandbox.id.to_string().as_bytes())
+        .field(key.as_str().as_bytes());
+    let scoped =
+        IdempotencyKey::parse(scoped.finish()?.as_str()).map_err(|_| PublicApiError::internal())?;
+    let method = match route.method() {
+        NativeHttpMethod::Post => HttpOperationMethod::Post,
+        NativeHttpMethod::Patch => HttpOperationMethod::Patch,
+        NativeHttpMethod::Delete => HttpOperationMethod::Delete,
+        NativeHttpMethod::Get | NativeHttpMethod::Put => return Err(PublicApiError::internal()),
+    };
     let idempotency = CreatePublicOperationIdempotency {
-        method: HttpOperationMethod::Post,
+        method,
         path_template: OperationPathTemplate::new(route.path()),
         key: &scoped,
         request_fingerprint: fingerprint,
