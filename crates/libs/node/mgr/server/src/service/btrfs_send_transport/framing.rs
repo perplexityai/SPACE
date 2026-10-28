@@ -200,5 +200,103 @@ impl SendStreamFraming {
     }
 }
 
+/// Most stream headers [`last_complete_stream`] tries: a restarted send writes
+/// one partial stream per restart, and restarts are rare.
+const MAX_STREAM_CANDIDATES: usize = 64;
+const SALVAGE_CHUNK: usize = 1 << 20;
+
+/// Where the complete stream of a restarted send begins.
+///
+/// Before the framing check above existed, a send the kernel restarted mid-pipe
+/// was stored as its partial output followed by a complete stream of the same
+/// read-only snapshot. Returns the offset of the earliest stream header from
+/// which every command passes its CRC and the stream ends with END exactly at
+/// the end of `file`. `Some(0)` means `file` is already one valid stream;
+/// `None` means no header starts a valid stream, so nothing can be salvaged.
+/// The earliest valid header is the complete stream's own: a header-shaped run
+/// of bytes inside its payload cannot validate past the next real command.
+pub(in crate::service) fn last_complete_stream(
+    file: &std::fs::File,
+) -> std::io::Result<Option<u64>> {
+    for offset in stream_headers(file)? {
+        if stream_valid_from(file, offset)? {
+            return Ok(Some(offset));
+        }
+    }
+    Ok(None)
+}
+
+/// Read size for a scan of `file`: whole small files, else [`SALVAGE_CHUNK`].
+fn chunk_for(file: &std::fs::File) -> std::io::Result<usize> {
+    let len = file.metadata()?.len();
+    Ok(usize::try_from(len).map_or(SALVAGE_CHUNK, |len| len.min(SALVAGE_CHUNK)))
+}
+
+/// Offsets of the first [`MAX_STREAM_CANDIDATES`] supported stream headers.
+fn stream_headers(file: &std::fs::File) -> std::io::Result<Vec<u64>> {
+    use std::os::unix::fs::FileExt;
+    const HEADER: usize = 17;
+    let mut found = Vec::new();
+    let mut buf = vec![0; chunk_for(file)?.max(1)];
+    // Unscanned tail of the previous read, then the new read; `base` is the
+    // file offset of `window[0]`.
+    let mut window = Vec::with_capacity(buf.len() + HEADER);
+    let (mut base, mut next) = (0u64, 0u64);
+    loop {
+        let read = file.read_at(&mut buf, next)?;
+        next += read as u64;
+        window.extend_from_slice(buf.get(..read).unwrap_or_default());
+        let mut at = 0;
+        while let Some(skip) = window
+            .get(at..)
+            .and_then(|rest| rest.iter().position(|&byte| byte == MAGIC[0]))
+        {
+            at += skip;
+            let Some(header) = window.get(at..at + HEADER) else {
+                break;
+            };
+            if is_stream_header(header) {
+                found.push(base + at as u64);
+                if found.len() == MAX_STREAM_CANDIDATES {
+                    return Ok(found);
+                }
+            }
+            at += 1;
+        }
+        if read == 0 {
+            return Ok(found);
+        }
+        // Keep the bytes that may begin a header the next read completes.
+        let keep_from = window.len().saturating_sub(HEADER - 1);
+        window.drain(..keep_from);
+        base += keep_from as u64;
+    }
+}
+
+fn is_stream_header(header: &[u8]) -> bool {
+    let version = header
+        .get(MAGIC.len()..)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_le_bytes);
+    header.starts_with(MAGIC) && version.is_some_and(|version| (1..=2).contains(&version))
+}
+
+fn stream_valid_from(file: &std::fs::File, offset: u64) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let mut framing = SendStreamFraming::new();
+    let mut buf = vec![0; chunk_for(file)?.max(1)];
+    let mut at = offset;
+    loop {
+        let read = file.read_at(&mut buf, at)?;
+        if read == 0 {
+            return Ok(framing.finish().is_ok());
+        }
+        if framing.feed(buf.get(..read).unwrap_or_default()).is_err() {
+            return Ok(false);
+        }
+        at += read as u64;
+    }
+}
+
 #[cfg(test)]
 mod tests;

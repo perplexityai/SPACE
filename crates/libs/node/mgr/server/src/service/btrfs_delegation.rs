@@ -1030,12 +1030,21 @@ impl NodeManagerService {
         )?;
 
         let owner = self.artifact_work.clone();
-        self.off_runtime("receive and publish btrfs stream", move || {
-            let receive = artifact_fs::receive::ReceiveRoot::open(&sandbox_root)?;
-            let stream = receive.stream()?;
-            receive.receive(stream, owner.as_ref().map(|owner| &owner.cancel))
-        })
-        .await?;
+        let salvaged = self
+            .off_runtime("receive and publish btrfs stream", move || {
+                let receive = artifact_fs::receive::ReceiveRoot::open(&sandbox_root)?;
+                receive.receive_staged(owner.as_ref().map(|owner| &owner.cancel))
+            })
+            .await?;
+        if let Some(offset) = salvaged {
+            pplx_space_metrics::node_manager::btrfs_receive_stream_salvaged();
+            tracing::warn!(
+                sandbox_id,
+                template = %template,
+                complete_stream_offset = offset,
+                "btrfs-send codec: received the complete stream of a send restarted mid-pipe"
+            );
+        }
 
         tracing::info!(
             sandbox_id,

@@ -146,6 +146,86 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
     }
 }
 
+/// A stream an older node-manager stored after the kernel restarted its send
+/// (its partial output, then a complete stream) restores from the complete
+/// stream; a valid stream receives as before; a stream with no complete part
+/// still fails.
+#[test]
+#[ignore = "requires root and an explicitly supplied disposable btrfs fixture directory"]
+fn a_restarted_send_restores_from_its_complete_stream() {
+    let Some(fixture) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
+        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let temp = tempfile::tempdir_in(fixture).unwrap();
+    let fixture = temp.path().canonicalize().unwrap();
+    let parent = trusted_paths::open_directory(&fixture).unwrap();
+    btrfs::create(&parent, "template".as_ref()).unwrap();
+    let template = directory(&parent, "template".as_ref()).unwrap();
+    std::fs::write(fixture.join("template/rootfs.ext4"), b"template").unwrap();
+    btrfs::set_readonly(&template, true).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        btrfs::snapshot(&template, &parent, "source".as_ref(), false).unwrap();
+        std::fs::write(fixture.join("source/rootfs.ext4"), b"restored data").unwrap();
+        let source = directory(&parent, "source".as_ref()).unwrap();
+        btrfs::snapshot(&source, &parent, "instance.ro".as_ref(), true).unwrap();
+        let snapshot = directory(&parent, "instance.ro".as_ref()).unwrap();
+        let stream = File::create(fixture.join("stream")).unwrap();
+        btrfs::send(&template, &snapshot, &stream).unwrap();
+        drop(snapshot);
+        remove_at(&parent, "instance.ro".as_ref()).unwrap();
+        let bytes = std::fs::read(fixture.join("stream")).unwrap();
+        let cut = bytes.len() / 2;
+
+        for (case, staged, expected) in [
+            ("valid", bytes.clone(), Some(None)),
+            (
+                "restarted",
+                [&bytes[..cut], &bytes[..]].concat(),
+                Some(Some(cut as u64)),
+            ),
+            ("partial", bytes[..cut].to_vec(), None),
+        ] {
+            let destination = fixture.join(case);
+            std::fs::create_dir_all(destination.join("snapshot")).unwrap();
+            std::fs::write(destination.join("snapshot/rootfs.btrfs-send"), &staged).unwrap();
+            let receive = ReceiveRoot::open(&destination).unwrap();
+            let received = receive.receive_staged(None);
+            match expected {
+                Some(salvaged) => {
+                    assert_eq!(received.unwrap(), salvaged, "{case}");
+                    assert_eq!(
+                        std::fs::read(destination.join("instance/rootfs.ext4")).unwrap(),
+                        b"restored data",
+                        "{case}"
+                    );
+                    assert!(!destination.join("instance.ro").exists(), "{case}");
+                }
+                None => {
+                    received.unwrap_err();
+                    assert!(!destination.join("instance").exists(), "{case}");
+                }
+            }
+        }
+    });
+    // A deliberately failing red run must not strand subvolumes either.
+    for case in ["valid", "restarted", "partial"] {
+        let Ok(dir) = trusted_paths::open_directory(&fixture.join(case)) else {
+            continue;
+        };
+        for name in super::super::entries(&dir).unwrap() {
+            let _ = remove_at(&dir, &name);
+        }
+    }
+    for name in super::super::entries(&parent).unwrap() {
+        remove_at(&parent, &name).unwrap();
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn replace_destination(destination: &Path, link: bool) -> std::io::Result<PathBuf> {
     let original = destination.with_file_name("original");
     std::fs::rename(destination, &original)?;

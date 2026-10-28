@@ -78,3 +78,74 @@ fn a_corrupted_byte_fails_its_command() {
 fn a_stream_without_the_header_fails() {
     assert_eq!(check(&[&STREAM[1..]]), Err(FramingError::BadMagic));
 }
+
+fn salvage(bytes: &[u8]) -> Option<u64> {
+    use std::io::Write;
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(bytes).unwrap();
+    last_complete_stream(&file).unwrap()
+}
+
+#[test]
+fn a_valid_stream_needs_no_salvage() {
+    assert_eq!(salvage(STREAM), Some(0));
+}
+
+/// Wherever the kernel interrupted the first send, the restart's complete
+/// stream is found where it begins: every cut through the stream header, the
+/// first commands and the tail, and a prime stride through the rest.
+#[test]
+fn a_restarted_send_salvages_its_complete_stream_wherever_it_was_cut() {
+    let len = STREAM.len();
+    let cuts = (1..len.min(128))
+        .chain((128..len).step_by(61))
+        .chain(len.saturating_sub(64).max(1)..len);
+    for cut in cuts {
+        let restarted = [&STREAM[..cut], STREAM].concat();
+        assert_eq!(salvage(&restarted), Some(cut as u64), "cut at {cut}");
+    }
+}
+
+#[test]
+fn repeated_restarts_salvage_the_last_complete_stream() {
+    let (a, b) = (STREAM.len() / 3, STREAM.len() / 2);
+    let restarted = [&STREAM[..a], &STREAM[..b], STREAM].concat();
+    assert_eq!(salvage(&restarted), Some((a + b) as u64));
+}
+
+#[test]
+fn nothing_is_salvaged_without_a_complete_valid_stream() {
+    let cut = STREAM.len() / 2;
+    assert_eq!(salvage(&[&STREAM[..cut], &STREAM[..cut]].concat()), None);
+    let mut corrupted = [&STREAM[..cut], STREAM].concat();
+    let last = corrupted.len() - STREAM.len() / 2;
+    corrupted[last] ^= 0x01;
+    assert_eq!(salvage(&corrupted), None);
+    assert_eq!(salvage(&[]), None);
+    assert_eq!(salvage(&STREAM[1..]), None);
+}
+
+/// A header-shaped prefix that does not start a valid stream is passed over.
+#[test]
+fn a_header_shaped_prefix_is_not_salvaged() {
+    let fake = [&STREAM[..17], b"not a command".as_slice(), STREAM].concat();
+    assert_eq!(salvage(&fake), Some(30));
+}
+
+/// A stream header split across the scan's reads is still found.
+#[test]
+fn a_header_across_a_read_boundary_is_found() {
+    for before in [
+        SALVAGE_CHUNK - 9,
+        SALVAGE_CHUNK - 1,
+        SALVAGE_CHUNK,
+        SALVAGE_CHUNK + 3,
+    ] {
+        let prefixed = [vec![0u8; before].as_slice(), STREAM].concat();
+        assert_eq!(
+            salvage(&prefixed),
+            Some(before as u64),
+            "{before} bytes before"
+        );
+    }
+}

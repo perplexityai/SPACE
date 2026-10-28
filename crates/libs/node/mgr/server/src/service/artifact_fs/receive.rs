@@ -22,6 +22,35 @@ impl ReceiveRoot {
         trusted_paths::open_regular_file(&snapshot, "rootfs.btrfs-send".as_ref())
     }
 
+    /// Receive the staged stream. A node-manager that predates the framing
+    /// check on upload could store a send the kernel restarted mid-pipe: its
+    /// partial output followed by a complete stream of the same read-only
+    /// snapshot, which `btrfs receive` rejects. When the receive fails and the
+    /// staged stream is one, receive its complete stream instead. Returns the
+    /// offset received from when it salvaged one.
+    pub(in crate::service) fn receive_staged(
+        &self,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<u64>, Status> {
+        let failure = match self.receive(self.stream()?, cancel) {
+            Ok(()) => return Ok(None),
+            Err(status) if status.code() == tonic::Code::Cancelled => return Err(status),
+            Err(status) => status,
+        };
+        let mut stream = self.stream()?;
+        match crate::service::btrfs_send_transport::framing::last_complete_stream(&stream)
+            .map_err(error)?
+        {
+            Some(offset) if offset > 0 => {
+                use std::io::{Seek, SeekFrom};
+                stream.seek(SeekFrom::Start(offset)).map_err(error)?;
+                self.receive(stream, cancel)?;
+                Ok(Some(offset))
+            }
+            _ => Err(failure),
+        }
+    }
+
     pub(in crate::service) fn receive(
         &self,
         stream: File,
