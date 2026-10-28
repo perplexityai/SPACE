@@ -200,7 +200,7 @@ message GetModifiedFilesResponse {
 message ProcessExecutionInfo {
   // Changes when the execution service is constructed again, not on reconnect.
   string instance_id = 1;
-  // Unknown names may be ignored. Absence does not establish support.
+  // Unknown names may be ignored. Absence means unsupported.
   repeated string capabilities = 2;
 }
 

@@ -101,13 +101,15 @@ impl SpacedHostService {
         )
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let guest_uptime = validate_optional_duration("guest_uptime", response.guest_uptime)?;
-        let process_execution = response.process_execution.map(|mut info| {
+        let process_execution = response.process_execution.and_then(|mut info| {
+            // Invalid discovery must not change ordinary guest readiness.
+            uuid::Uuid::parse_str(&info.instance_id).ok()?;
             // A newer guest can advertise guarantees this host cannot forward.
             info.capabilities.retain(|capability| {
                 capability
                     == pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume.as_str()
             });
-            info
+            Some(info)
         });
         Ok(Some(GuestReadySnapshot {
             process_execution,
