@@ -116,7 +116,7 @@ flock -x 9
 SPACE_SEED_OUTPUT_DIR="$out" PATH="$base_path" bash "$script" >"$work/case1.log" 2>&1 9>&- &
 pids+=("$!")
 waiter=$!
-if ! wait_for 'grep -q "another seed build holds" "$work/case1.log"'; then
+if ! wait_for 'grep -q "build.lock is held" "$work/case1.log"'; then
     fail "case 1: the build did not wait on a held lock" "$work/case1.log"
 fi
 sed -i 's/^date = .*/date = "release-20991231"/' "$recipe"
@@ -144,7 +144,7 @@ else
     SPACE_SEED_OUTPUT_DIR="$out" PATH="$base_path" bash "$script" >"$work/case2-writer.log" 2>&1 &
     pids+=("$!")
     writer=$!
-    if ! wait_for 'grep -q "another seed build holds" "$work/case2-writer.log"'; then
+    if ! wait_for 'grep -q "build.lock is held" "$work/case2-writer.log"'; then
         fail "case 2: a build did not wait for the --read-lock command" "$work/case2-writer.log"
     fi
     if grep -q "^$out " "$STUB_RUNS" || [[ -e "$out/rootfs.ext4" ]]; then
