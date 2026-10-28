@@ -10,7 +10,7 @@ use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
 use crate::node_publish::outcome::PublishOutcome;
 use crate::node_publish::validate::ValidatedPublish;
 use crate::published_state::{
-    prune_absent_node_templates, publish_validated_sandbox_states,
+    ApplySandboxClaimsError, prune_absent_node_templates, publish_validated_sandbox_states,
     publish_validated_template_states,
 };
 use crate::status::{
@@ -18,13 +18,25 @@ use crate::status::{
     upsert_node_status_from_publish,
 };
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApplyPublishError {
+    #[error("begin node state publish: {0}")]
+    Begin(#[source] sqlx::Error),
+    #[error("commit node state publish: {0}")]
+    Commit(#[source] sqlx::Error),
+    #[error(transparent)]
+    Sandboxes(#[from] ApplySandboxClaimsError),
+    #[error(transparent)]
+    Legacy(#[from] Status),
+}
+
 /// Apply all publication evidence in one transaction and retain row-lock order.
 /// Backup certification follows its set-replace; receipt fencing follows every
 /// publication write. A successful commit is required to produce an outcome.
 pub(crate) async fn apply(
     pool: &PgPool,
     publish: ValidatedPublish,
-) -> Result<PublishOutcome, Status> {
+) -> Result<PublishOutcome, ApplyPublishError> {
     let ValidatedPublish {
         origin,
         reported_window,
@@ -45,10 +57,7 @@ pub(crate) async fn apply(
         diagnostic.emit(&origin);
     }
 
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|err| Status::internal(format!("begin node state publish: {err}")))?;
+    let mut tx = pool.begin().await.map_err(ApplyPublishError::Begin)?;
 
     // Opt-in synthetic timing: exclude pool acquisition and BEGIN, and
     // include the entire open transaction through successful COMMIT.
@@ -139,9 +148,7 @@ pub(crate) async fn apply(
     let delete_consumption =
         consume_validated_auto_lifecycle_delete_completions(&mut tx, origin.id, delete_completions)
             .await?;
-    tx.commit()
-        .await
-        .map_err(|err| Status::internal(format!("commit node state publish: {err}")))?;
+    tx.commit().await.map_err(ApplyPublishError::Commit)?;
     if let Some(started) = transaction_started {
         tracing::trace!(
             target: "space_publish_timing",

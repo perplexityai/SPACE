@@ -966,7 +966,21 @@ pub async fn publish_sandbox_states(
     states: &[PublishedSandboxState],
 ) -> Result<SandboxPublicationOutcome, Status> {
     let inventory = ValidatedSandboxInventory::from_proto(states);
-    publish_validated_sandbox_states(conn, node_id, inventory).await
+    publish_validated_sandbox_states(conn, node_id, inventory)
+        .await
+        .map_err(Status::from)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApplySandboxClaimsError {
+    #[error(transparent)]
+    Absent(#[from] absent_sandboxes::RemoveAbsentSandboxesError),
+    #[error(transparent)]
+    Degraded(#[from] degraded_observations::UpsertDegradedObservationsError),
+    #[error(transparent)]
+    FailureEpisodes(#[from] failure_episodes::ReconcileFailureEpisodesError),
+    #[error(transparent)]
+    Legacy(#[from] Status),
 }
 
 /// Apply parsed node claims on the caller's connection. Lifecycle guards and
@@ -976,7 +990,7 @@ pub(crate) async fn publish_validated_sandbox_states(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     inventory: ValidatedSandboxInventory,
-) -> Result<SandboxPublicationOutcome, Status> {
+) -> Result<SandboxPublicationOutcome, ApplySandboxClaimsError> {
     for diagnostic in inventory.diagnostics() {
         diagnostic.emit(node_id);
     }
@@ -992,18 +1006,12 @@ pub(crate) async fn publish_validated_sandbox_states(
     let mut post_commit_events = Vec::new();
     let mut post_commit_state_convergence = Vec::new();
 
-    let mut accepted = absent_sandboxes::remove(&mut *conn, node_id, &absent_ids)
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let mut accepted = absent_sandboxes::remove(&mut *conn, node_id, &absent_ids).await?;
 
-    let degraded_accepted = degraded_observations::upsert(&mut *conn, node_id, &state_only)
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let degraded_accepted = degraded_observations::upsert(&mut *conn, node_id, &state_only).await?;
     accepted = accepted.saturating_add(degraded_accepted);
 
-    failure_episodes::reconcile(&mut *conn, node_id, &failure_episode_rows)
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?;
+    failure_episodes::reconcile(&mut *conn, node_id, &failure_episode_rows).await?;
 
     if rows.is_empty() {
         return Ok(SandboxPublicationOutcome {
