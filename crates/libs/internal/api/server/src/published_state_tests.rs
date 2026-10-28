@@ -758,7 +758,7 @@ async fn post_selection_execution_identity_change_blocks_exact_finalization() ->
     .bind(sandbox_id)
     .execute(&db.pool)
     .await?;
-    let projected = apply_suspended_k8s_finalization(
+    let projected = suspend_finalization::apply(
         &mut tx,
         &[SuspendedFinalizationCandidate {
             sandbox_id,

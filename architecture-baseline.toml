@@ -173,7 +173,8 @@
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
 "crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 12
 "crates/libs/internal/api/server/src/data_plane_sessions/service_route.rs" = 1
-"crates/libs/internal/api/server/src/node_publish/store/published_state.rs" = 4
+"crates/libs/internal/api/server/src/node_publish/store/published_state.rs" = 1
+"crates/libs/internal/api/server/src/node_publish/store/suspend_finalization.rs" = 3
 "crates/libs/internal/api/server/src/node_publish/store/lifecycle_transitions.rs" = 3
 "crates/libs/internal/api/server/src/node_publish/store/activity.rs" = 1
 "crates/libs/internal/api/server/src/node_publish/store/absent_sandboxes.rs" = 1

@@ -29,15 +29,13 @@ use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, node_published_execution_identity_matches,
-    publish_clear_or_preserve_current_local_artifact_marker_assignments,
-    started_suspend_revert_eligibility, suspended_k8s_finalization_sql,
-    suspended_projection_lifecycle_eligible,
+    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
 };
 
 use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes, lifecycle_transitions,
     network_policy, observed_state, sandbox_facet_observations, snapshot_inventory,
+    suspend_finalization::{self, SuspendedFinalizationCandidate},
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 #[cfg(test)]
@@ -52,6 +50,7 @@ use crate::node_publish::validate::templates::ValidatedTemplateInventory;
 use crate::proto::PublishedSandboxState;
 #[cfg(test)]
 use crate::proto::PublishedTemplateState;
+#[cfg(test)]
 use crate::sandbox_quarantine_store;
 
 const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
@@ -886,6 +885,8 @@ pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     NetworkPolicyCondition(#[from] network_policy::ClearApplyFailureError),
     #[error(transparent)]
+    SuspendFinalization(#[from] suspend_finalization::FinalizeSuspensionError),
+    #[error(transparent)]
     FailureEpisodes(#[from] failure_episodes::ReconcileFailureEpisodesError),
     #[error(transparent)]
     SnapshotInventory(#[from] snapshot_inventory::ReplaceSnapshotInventoryError),
@@ -1371,7 +1372,7 @@ async fn project_node_published_suspended_sandboxes(
             published_execution_identity: candidate.published_execution_identity.clone(),
         })
         .collect::<Vec<_>>();
-    let rows = apply_suspended_k8s_finalization(conn, &finalization_candidates).await?;
+    let rows = suspend_finalization::apply(conn, &finalization_candidates).await?;
     let projected_ids = rows
         .iter()
         .map(|(sandbox_id, _)| *sandbox_id)
@@ -1448,7 +1449,7 @@ pub(crate) async fn project_ready_suspend_snapshot(
         return Ok(None);
     };
 
-    let projected = apply_suspended_k8s_finalization(
+    let projected = suspend_finalization::apply(
         conn,
         &[SuspendedFinalizationCandidate {
             sandbox_id,
@@ -1466,190 +1467,6 @@ pub(crate) async fn project_ready_suspend_snapshot(
     } else {
         Ok(None)
     }
-}
-
-struct SuspendedFinalizationCandidate {
-    sandbox_id: SandboxId,
-    clear_marker: bool,
-    published_artifact: Option<sandbox_quarantine_store::PublishedSuspendArtifact>,
-    published_execution_identity: Option<sandbox_quarantine_store::PublishedExecutionIdentity>,
-}
-
-async fn apply_suspended_k8s_finalization(
-    conn: &mut sqlx::PgConnection,
-    candidates: &[SuspendedFinalizationCandidate],
-) -> Result<Vec<(SandboxId, bool)>, Status> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let artifact_marker_assignments =
-        publish_clear_or_preserve_current_local_artifact_marker_assignments(
-            "s",
-            "candidate.published_artifact_id",
-            "candidate.published_artifact_kind",
-            "candidate.published_artifact_origin",
-            "candidate.clear_marker",
-        );
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "candidate",
-        &artifact_marker_assignments,
-        SuspendedTargetNodeAssignment::PreserveOrBackfillActive,
-    );
-    let candidate_ids = candidates
-        .iter()
-        .map(|candidate| candidate.sandbox_id)
-        .collect::<Vec<_>>();
-    let clear_markers = candidates
-        .iter()
-        .map(|candidate| candidate.clear_marker)
-        .collect::<Vec<_>>();
-    let published_artifact_ids = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_artifact
-                .as_ref()
-                .map(|artifact| artifact.id.as_uuid())
-        })
-        .collect::<Vec<_>>();
-    let published_artifact_kinds = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_artifact
-                .as_ref()
-                .map(|artifact| artifact.kind.as_str())
-        })
-        .collect::<Vec<_>>();
-    let published_artifact_origins = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_artifact
-                .as_ref()
-                .map(|artifact| artifact.origin.as_str())
-        })
-        .collect::<Vec<_>>();
-    let published_execution_generations = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_execution_identity
-                .as_ref()
-                .map(|identity| identity.generation.get())
-        })
-        .collect::<Vec<_>>();
-    let published_pod_uids = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_execution_identity
-                .as_ref()
-                .map(|identity| identity.pod_uid.as_str())
-        })
-        .collect::<Vec<_>>();
-    let published_pod_uids_were_missing = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_execution_identity
-                .as_ref()
-                .map(|identity| identity.pod_uid_was_missing)
-        })
-        .collect::<Vec<_>>();
-    let candidate_cte = "candidate AS (
-             SELECT *
-               FROM UNNEST(
-                   $1::UUID[], $2::BOOL[], $3::UUID[], $4::TEXT[], $5::TEXT[],
-                   $6::BIGINT[], $7::TEXT[], $8::BOOL[]
-               ) AS candidate(
-                   id, clear_marker, published_artifact_id,
-                   published_artifact_kind, published_artifact_origin,
-                   published_execution_generation, published_pod_uid,
-                   published_pod_uid_was_missing
-               )
-         )";
-    let exact_execution_identity = node_published_execution_identity_matches(
-        "e",
-        "candidate.published_execution_generation",
-        "candidate.published_pod_uid",
-        "candidate.published_pod_uid_was_missing",
-    );
-    let finalization_query = format!(
-        "WITH {candidate_cte},
-         retired_execution AS (
-             UPDATE sandbox_k8s_executions e
-                SET {active_execution_assignments}
-               FROM candidate
-              WHERE e.sandbox_id = candidate.id
-                AND e.active
-                AND (
-                    candidate.published_artifact_id IS NULL
-                    OR ({exact_execution_identity})
-                )
-             RETURNING e.sandbox_id
-         ),
-         eligible_candidate AS (
-             SELECT candidate.*
-               FROM candidate
-              WHERE candidate.published_artifact_id IS NULL
-                 OR EXISTS (
-                     SELECT 1
-                       FROM retired_execution retired
-                      WHERE retired.sandbox_id = candidate.id
-                 )
-         ),
-         reset_port_exposures AS (
-             UPDATE sandbox_port_exposures spe
-                SET {open_port_exposure_assignments}
-               FROM eligible_candidate candidate
-              WHERE spe.sandbox_id = candidate.id
-                AND spe.desired_state = 'open'
-             RETURNING spe.sandbox_id
-         )
-         UPDATE sandboxes s
-            SET {sandbox_assignments}
-           FROM eligible_candidate candidate
-          WHERE s.id = candidate.id
-          RETURNING s.id, candidate.clear_marker",
-        active_execution_assignments = finalization.active_execution_assignments("e"),
-        open_port_exposure_assignments = finalization.open_port_exposure_assignments(),
-        sandbox_assignments = finalization.sandbox_assignments(),
-    );
-    let projected: Vec<(SandboxId, bool)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(sql!(finalization_query.as_str())))
-            .bind(&candidate_ids)
-            .bind(&clear_markers)
-            .bind(&published_artifact_ids)
-            .bind(&published_artifact_kinds)
-            .bind(&published_artifact_origins)
-            .bind(&published_execution_generations)
-            .bind(&published_pod_uids)
-            .bind(&published_pod_uids_were_missing)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|err| {
-                Status::internal(format!("finalize suspended sandbox lifecycle: {err}"))
-            })?;
-
-    // A committed suspend finalization means the claimed pod was already torn
-    // down, so the finalized sandbox's warm-pool slot row (if any) is only a
-    // receipt. Retire it in the same transaction; otherwise it lives until
-    // the warm-pool reconciler's suspended-fossil drain rediscovers it by
-    // scanning the whole receipt backlog.
-    let retired_reservations = projected
-        .iter()
-        .map(|(sandbox_id, _)| *sandbox_id)
-        .collect::<Vec<_>>();
-    pplx_space_cluster_pool::WarmPoolStore::delete_claimed_slots_for_retired_executions(
-        &mut *conn,
-        &retired_reservations,
-    )
-    .await
-    .map_err(|err| Status::internal(format!("delete retired warm-pool slot receipts: {err}")))?;
-
-    Ok(projected)
 }
 
 pub async fn prune_absent_node_templates(

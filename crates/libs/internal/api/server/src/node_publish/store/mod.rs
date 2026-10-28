@@ -10,6 +10,7 @@ pub(crate) mod network_policy;
 pub(crate) mod observed_state;
 pub(crate) mod sandbox_facet_observations;
 pub(crate) mod snapshot_inventory;
+pub(crate) mod suspend_finalization;
 
 use crate::auto_lifecycle_delete_completions::consume_validated_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
