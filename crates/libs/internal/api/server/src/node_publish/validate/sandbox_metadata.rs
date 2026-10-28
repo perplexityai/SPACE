@@ -12,15 +12,19 @@ use crate::optional_trimmed;
 pub(crate) struct PublishedRuntimeLabel(String);
 
 impl PublishedRuntimeLabel {
+    pub(crate) fn from_optional(raw: Option<&str>) -> Option<Self> {
+        optional_trimmed(raw).map(Self)
+    }
+
     pub(crate) fn try_from_proto(
         raw: Option<&str>,
         execution: Option<&ExecutionProjection>,
     ) -> Result<Option<Self>, Status> {
-        let Some(label) = optional_trimmed(raw) else {
+        let Some(label) = Self::from_optional(raw) else {
             return Ok(None);
         };
         if let Some(execution) = execution {
-            let runtime = RuntimeKind::parse(&label)
+            let runtime = RuntimeKind::parse(label.as_str())
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
             if runtime != execution.runtime_kind() {
                 return Err(Status::invalid_argument(
@@ -28,7 +32,7 @@ impl PublishedRuntimeLabel {
                 ));
             }
         }
-        Ok(Some(Self(label)))
+        Ok(Some(label))
     }
 
     pub(crate) fn as_str(&self) -> &str {

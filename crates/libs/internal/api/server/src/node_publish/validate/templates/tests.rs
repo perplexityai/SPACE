@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::ExecutionMetadata;
+use pplx_space_common_core::types::{Arch, ExecutionMetadata};
 use pplx_space_sbx_mgr_client::proto::{AutoLifecyclePolicy, AutoLifecycleWakePolicy};
 use tonic::Code;
 
