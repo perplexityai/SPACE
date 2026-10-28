@@ -42,13 +42,13 @@ impl SlotValidationError {
 #[derive(Debug, thiserror::Error)]
 pub(super) enum SlotResetError {
     #[error(
-        "cannot reset slot {slot} generation {generation} for sandbox {sandbox_id}: runtime is {liveness:?}"
+        "cannot reset slot {slot} generation {generation} for sandbox {sandbox_id}: runtime is {blocker}"
     )]
     RuntimeNotGone {
         slot: u32,
         generation: u64,
         sandbox_id: String,
-        liveness: LeaseLiveness,
+        blocker: RuntimeBlocker,
     },
     #[error(
         "cleanup required before resetting slot {slot} generation {generation} for sandbox {sandbox_id}: {reason}"
@@ -789,19 +789,19 @@ pub(super) fn assert_lease_process_stopped(
     info: &SlotInfo,
     successor: Option<&SlotInfo>,
 ) -> Result<(), SlotResetError> {
-    assert_lease_process_stopped_with(info, released_lease_liveness(info, successor))
+    assert_lease_process_stopped_with(info, released_lease_runtime(info, successor))
 }
 
 pub(super) fn assert_lease_process_stopped_with(
     info: &SlotInfo,
-    liveness: LeaseLiveness,
+    blocker: Option<RuntimeBlocker>,
 ) -> Result<(), SlotResetError> {
-    if liveness != LeaseLiveness::Gone {
+    if let Some(blocker) = blocker {
         return Err(SlotResetError::RuntimeNotGone {
             slot: info.slot,
             generation: info.generation,
             sandbox_id: info.sandbox_id.clone(),
-            liveness,
+            blocker,
         });
     }
     Ok(())

@@ -505,8 +505,10 @@ mod slot_pool_tests {
                     last_error: None,
                     memory_reservation_mib: Some(8320),
                 };
+                let blocker =
+                    RuntimeBlocker::new(liveness, liveness::EvidenceSource::TrackedPid, None);
                 assert_eq!(
-                    assert_lease_process_stopped_with(&record.info, liveness).is_ok(),
+                    assert_lease_process_stopped_with(&record.info, blocker).is_ok(),
                     liveness == LeaseLiveness::Gone
                 );
                 let updates = runtime_reconcile_updates(vec![record], |_| liveness);
@@ -1289,7 +1291,12 @@ mod slot_pool_tests {
             pod_netns: Some("pod-a".to_string()),
         };
 
-        let err = assert_lease_process_stopped_with(&info, LeaseLiveness::Live)
+        let blocker = RuntimeBlocker::new(
+            LeaseLiveness::Live,
+            liveness::EvidenceSource::VmCgroup,
+            None,
+        );
+        let err = assert_lease_process_stopped_with(&info, blocker)
             .expect_err("live VM must block slot reset");
 
         assert!(matches!(
@@ -1297,7 +1304,10 @@ mod slot_pool_tests {
             SlotResetError::RuntimeNotGone {
                 slot: 0,
                 generation: 1,
-                liveness: LeaseLiveness::Live,
+                blocker: RuntimeBlocker {
+                    liveness: LeaseLiveness::Live,
+                    ..
+                },
                 ..
             }
         ));
@@ -2595,8 +2605,15 @@ mod slot_pool_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn reset_slot_stops_waiting_for_sandbox_runtime_once_it_runs_on_a_newer_slot() {
         let sandbox_id = SandboxId::new().to_string();
-        // The sandbox's cgroups and fc.pid show a running VM.
-        super::liveness::set_test_sandbox_runtime_evidence(&sandbox_id, LeaseLiveness::Live);
+        // The sandbox's cgroups and fc.pid show a running VM, and nothing
+        // remains of the released slot's own runtime.
+        super::liveness::set_test_runtime_evidence(
+            &sandbox_id,
+            super::liveness::TestRuntimeEvidence {
+                sandbox: LeaseLiveness::Live,
+                slot: None,
+            },
+        );
         // A file owned by the released lease UID stops the reset just after
         // the runtime check, so `last_error` shows which gate it reached.
         let cache_root = tempfile::tempdir().unwrap();
