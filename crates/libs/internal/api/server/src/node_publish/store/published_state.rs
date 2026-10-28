@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
+use pplx_space_common_core::types::{NodeId, SnapshotId};
 
 use pplx_space_common_core::sql;
 use std::collections::BTreeSet;
@@ -13,7 +13,7 @@ use pplx_space_common_core::types::NodeRole;
 use pplx_space_common_core::types::{
     ArtifactKind, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
+    SandboxTransitionTargetState,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -36,8 +36,8 @@ use pplx_space_sandbox_portability::{
 };
 
 use crate::node_publish::store::{
-    absent_sandboxes, activity, degraded_observations, failure_episodes, observed_state,
-    sandbox_facet_observations, snapshot_inventory,
+    absent_sandboxes, activity, degraded_observations, failure_episodes, lifecycle_transitions,
+    observed_state, sandbox_facet_observations, snapshot_inventory,
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 #[cfg(test)]
@@ -874,6 +874,12 @@ pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     ObservedState(#[from] observed_state::UpsertObservedStateError),
     #[error(transparent)]
+    Restored(#[from] lifecycle_transitions::ConvergeRestoredError),
+    #[error(transparent)]
+    Stopped(#[from] lifecycle_transitions::ConvergeStoppedError),
+    #[error(transparent)]
+    Failed(#[from] lifecycle_transitions::ConvergeFailedError),
+    #[error(transparent)]
     FailureEpisodes(#[from] failure_episodes::ReconcileFailureEpisodesError),
     #[error(transparent)]
     SnapshotInventory(#[from] snapshot_inventory::ReplaceSnapshotInventoryError),
@@ -982,47 +988,8 @@ pub(crate) async fn publish_validated_sandbox_states(
         .filter(|row| row.assigned_to_node && row.first_seen)
         .map(|row| row.sandbox_id)
         .collect::<Vec<_>>();
-    // Publishing `started` proves the node-local runtime finished, but for
-    // Kubernetes sandboxes the control plane also needs a routable active
-    // execution row. The blocking wake/restore path is what hydrates that row
-    // with `running` + pod IP; if it timed out first, keep the row in
-    // `restoring` so the next connect can wait on and hydrate the in-flight
-    // pod instead of treating it as a started sandbox with a broken execution.
-    // Evacuation-marked rows are owned by the node-drain redrive (the same
-    // exemption the sweeper makes) and are left alone.
-    let routable_execution =
-        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
-    let restored_convergence_query = format!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT,
-                 transition_receipt_kind TEXT
-             )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'started'
-         FROM input
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1
-           AND s.evacuation_restore_target IS NULL
-           AND LOWER(TRIM(input.status)) = 'started'
-           AND input.transition_receipt_kind IS DISTINCT FROM $3
-           AND LOWER(TRIM(s.lifecycle)) = 'restoring'
-           AND {routable_execution}
-         RETURNING s.id"
-    );
-    let restored_ids = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
-        restored_convergence_query.as_str()
-    )))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("converge restored sandbox lifecycle: {err}")))?;
+    let restored_ids =
+        lifecycle_transitions::converge_restored(conn, node_id, rows_json.clone()).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &restored_ids,
@@ -1093,34 +1060,8 @@ pub(crate) async fn publish_validated_sandbox_states(
         },
     ));
 
-    let stopped_ids = sqlx::query_scalar::<_, SandboxId>(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'stopped'
-         FROM input
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1
-           AND LOWER(TRIM(input.status)) = 'stopped'
-           AND LOWER(TRIM(s.lifecycle)) IN (
-               'started',
-               'paused',
-               'suspended',
-               'stopping',
-               'restoring'
-           )
-         RETURNING s.id"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("promote stopped sandbox lifecycle: {err}")))?;
+    let stopped_ids =
+        lifecycle_transitions::converge_stopped(conn, node_id, rows_json.clone()).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &stopped_ids,
@@ -1130,7 +1071,7 @@ pub(crate) async fn publish_validated_sandbox_states(
     );
 
     let failed_sandboxes =
-        project_node_published_failed_sandboxes(conn, node_id, rows_json.clone()).await?;
+        lifecycle_transitions::converge_failed(conn, node_id, rows_json.clone()).await?;
     emit_node_published_state_events(
         node_id,
         &failed_sandboxes,
@@ -1506,64 +1447,6 @@ pub(crate) async fn publish_validated_sandbox_states(
             .map(DegradedSandboxClaim::sandbox_id)
             .collect(),
     })
-}
-
-/// Moves the reporting node's `k8s` rows that it published `failed` to
-/// Postgres `public.sandboxes.lifecycle = 'failed'`, returning each moved row
-/// with the lifecycle it left.
-///
-/// The claim locks before it checks, as the suspended projection does. A row a
-/// concurrent writer holds is read again at its committed version once the lock
-/// is granted, so a `deleting` or `quarantined` committed meanwhile, or a row
-/// that left this node, is refused rather than overwritten, and the returned
-/// from-state is the lifecycle the update actually replaced. `FOR NO KEY UPDATE`
-/// is the mode the `UPDATE` itself takes on the same rows, so taking it in the
-/// claim moves the lock earlier in the statement without adding a conflict.
-async fn project_node_published_failed_sandboxes(
-    conn: &mut sqlx::PgConnection,
-    node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
-) -> Result<Vec<(SandboxId, String)>, Status> {
-    let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
-         ),
-         claimed AS (
-             SELECT s.id, s.lifecycle
-             FROM sandboxes s
-             JOIN input ON input.sandbox_id = s.id
-             WHERE s.active_node_id = $1
-               AND s.managed_by = $3
-               AND LOWER(TRIM(input.status)) = 'failed'
-               AND LOWER(TRIM(s.lifecycle)) NOT IN (
-                   'failed',
-                   'quarantined',
-                   'deleted',
-                   'cleanup_required',
-                   'deleting'
-               )
-             FOR NO KEY UPDATE OF s
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'failed'
-         FROM claimed
-         WHERE s.id = claimed.id
-         RETURNING s.id, claimed.lifecycle"
-    ))
-    .bind(node_id)
-    .bind(rows_json)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("mark failed sandbox lifecycle: {err}")))?;
-    Ok(failed_sandboxes
-        .into_iter()
-        .map(|(sandbox_id, lifecycle)| (SandboxId::from_uuid(sandbox_id), lifecycle))
-        .collect())
 }
 
 struct SuspendedProjectionOutcome {

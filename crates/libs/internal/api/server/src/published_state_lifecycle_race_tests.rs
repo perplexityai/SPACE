@@ -14,7 +14,8 @@ use pplx_space_test_env::TestResult;
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Transaction};
 
-use super::{project_node_published_failed_sandboxes, publish_sandbox_states};
+use super::publish_sandbox_states;
+use crate::node_publish::store::lifecycle_transitions::converge_failed;
 use crate::proto::PublishedSandboxState;
 
 /// Bounds both the wait for the projection to block and its completion.
@@ -172,9 +173,7 @@ async fn failed_projection_decides_on_the_row_committed_while_it_waits() -> Test
             { "sandbox_id": sandbox_id.to_string(), "status": "failed" }
         ]));
         let projection = tokio::spawn(async move {
-            let moved =
-                project_node_published_failed_sandboxes(&mut projection_tx, node_id, rows_json)
-                    .await?;
+            let moved = converge_failed(&mut projection_tx, node_id, rows_json).await?;
             projection_tx.commit().await?;
             TestResult::<Vec<_>>::Ok(moved)
         });
