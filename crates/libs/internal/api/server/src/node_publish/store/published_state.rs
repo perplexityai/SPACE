@@ -441,7 +441,6 @@ pub(crate) async fn publish_validated_sandbox_states(
         absent_ids,
         rows,
         state_only,
-        failure_episode_rows,
         snapshot_rows,
         quarantine_inputs,
         publishes_network_policy,
@@ -454,7 +453,13 @@ pub(crate) async fn publish_validated_sandbox_states(
     let degraded_accepted = degraded_observations::upsert(&mut *conn, node_id, state_only).await?;
     accepted = accepted.saturating_add(degraded_accepted);
 
-    failure_episodes::reconcile(&mut *conn, node_id, failure_episode_rows).await?;
+    failure_episodes::reconcile(
+        &mut *conn,
+        node_id,
+        &plan.failure_episodes.observations,
+        &plan.failure_episodes.clears,
+    )
+    .await?;
 
     if rows.is_empty() {
         return Ok(SandboxPublicationOutcome {

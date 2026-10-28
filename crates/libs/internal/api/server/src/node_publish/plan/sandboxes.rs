@@ -5,13 +5,13 @@ use pplx_space_common_core::types::{
 
 use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
 use super::activity::ActivityClaim;
+use super::failure_episode::FailureEpisodePlan;
 use super::lifecycle::{FailedClaim, PauseFailedRecoveryClaim, RestoreClaim, StoppedClaim};
 use super::recovery_observation::{ClearRecoveryObservationClaim, RecoveryObservationClaim};
 use super::suspend_handoff::SuspendHandoffClaim;
 use super::suspended::SuspendedClaim;
 use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::node_publish::validate::{
-    failure_episode::FailureEpisodeClaim,
     quarantine::QuarantineRecoveryProjectionState,
     quarantine_claim::QuarantineClaim,
     sandbox_inventory::{DegradedSandboxClaim, ValidatedSandboxInventory},
@@ -45,7 +45,7 @@ pub(crate) struct SandboxPlan {
     pub(crate) recovery_observations: Vec<RecoveryObservationClaim>,
     pub(crate) clear_recovery_observations: Vec<ClearRecoveryObservationClaim>,
     pub(crate) state_only: Vec<DegradedSandboxClaim>,
-    pub(crate) failure_episodes: Vec<FailureEpisodeClaim>,
+    pub(crate) failure_episodes: FailureEpisodePlan,
     pub(crate) snapshots: Vec<SnapshotClaim>,
     pub(crate) quarantine: Vec<QuarantineClaim>,
     pub(crate) diagnostics: Vec<SandboxDiagnostic>,
@@ -69,7 +69,7 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             recovery_observations: Vec::new(),
             clear_recovery_observations: Vec::new(),
             state_only: inventory.state_only.into_iter().map(Into::into).collect(),
-            failure_episodes: inventory.failure_episodes,
+            failure_episodes: inventory.failure_episodes.into(),
             snapshots: Vec::new(),
             quarantine: Vec::new(),
             diagnostics: inventory.diagnostics,

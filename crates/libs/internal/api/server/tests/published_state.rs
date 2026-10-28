@@ -426,9 +426,31 @@ async fn sandbox_failure_episode_provenance_is_recorded_and_cleared() -> TestRes
     failed.pod_uid = Some("pod-attempt-a".to_string());
     failed.activation_attempt_id = Some(k8s_attempt_id.to_string());
     failed.failure_reason = Some("internal runtime diagnostics".to_string());
+    let neighbor_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, neighbor_id, node_id, "failed").await?;
+    let mut neighbor_failed = published_sandbox_state(neighbor_id, "failed");
+    neighbor_failed.execution_generation = Some(4);
     let mut conn = db.pool.acquire().await?;
-    publish_sandbox_states(&mut conn, node_id, &[failed]).await?;
+    publish_sandbox_states(&mut conn, node_id, &[neighbor_failed]).await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[failed, published_sandbox_state(neighbor_id, "started")],
+    )
+    .await?;
     drop(conn);
+    let neighbor_has_episode: bool = sqlx::query_scalar(sql!(
+        "SELECT observed_payload ? $4::TEXT
+         FROM node_facet_observed_status
+         WHERE node_id = $1 AND facet = $2 AND element = $3"
+    ))
+    .bind(node_id)
+    .bind(FACET_SANDBOX_DESIRED_STATE)
+    .bind(neighbor_id.to_string())
+    .bind(SANDBOX_FAILURE_EPISODE_KEY)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(!neighbor_has_episode);
 
     // An empty census carries no evidence to replace or clear this episode.
     // Later nonempty publications below still exercise both guarded writes.
