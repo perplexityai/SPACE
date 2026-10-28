@@ -5,6 +5,18 @@ use super::*;
 use pplx_space_common_core::sql;
 use std::sync::LazyLock;
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PruneSandboxCensusError {
+    #[error("prune absent published sandbox observations: {0}")]
+    Prune(#[source] sqlx::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum UpsertPublishedNodeStatusError {
+    #[error("upsert node status from publish: {0}")]
+    Upsert(#[source] sqlx::Error),
+}
+
 /// Built once: every input is bound, so the text is the same on every publish.
 /// Mirrors `sandbox_quarantine_store`'s composed queries in this crate.
 ///
@@ -113,7 +125,7 @@ pub(super) async fn prune_absent_node_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     present_sandbox_ids: &[SandboxId],
-) -> Result<(), Status> {
+) -> Result<(), PruneSandboxCensusError> {
     sqlx::query(sqlx::AssertSqlSafe(
         PRUNE_ABSENT_NODE_SANDBOXES_QUERY.as_str(),
     ))
@@ -123,11 +135,7 @@ pub(super) async fn prune_absent_node_sandboxes(
     .bind(SubstrateKind::Space)
     .execute(&mut *conn)
     .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "prune absent published sandbox observations: {err}"
-        ))
-    })?;
+    .map_err(PruneSandboxCensusError::Prune)?;
     Ok(())
 }
 
@@ -242,7 +250,7 @@ pub(super) async fn upsert_node_status_from_publish(
     inventory_prune: SandboxInventoryPrune,
     local_backup_report: LocalBackupInventoryReport,
     execution_observation: Option<crate::execution_observation::PublishedExecutionObservation>,
-) -> Result<(), Status> {
+) -> Result<(), UpsertPublishedNodeStatusError> {
     let (
         scheduling_status,
         scheduling_reason,
@@ -457,7 +465,7 @@ pub(super) async fn upsert_node_status_from_publish(
     )
     .execute(&mut *conn)
     .await
-    .map_err(|err| Status::internal(format!("upsert node status from publish: {err}")))?;
+    .map_err(UpsertPublishedNodeStatusError::Upsert)?;
     Ok(())
 }
 

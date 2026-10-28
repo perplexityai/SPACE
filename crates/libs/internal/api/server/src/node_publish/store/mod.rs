@@ -27,6 +27,22 @@ pub(crate) enum ApplyPublishError {
     #[error(transparent)]
     Sandboxes(#[from] ApplySandboxClaimsError),
     #[error(transparent)]
+    PendingBackupDecision(#[from] node_local_backup_pending::DecidePendingBackupError),
+    #[error(transparent)]
+    PendingBackupReconciliation(#[from] node_local_backup_pending::ReconcilePendingBackupError),
+    #[error(transparent)]
+    ExecutionPreparation(#[from] crate::execution_observation::PrepareExecutionObservationError),
+    #[error(transparent)]
+    ExecutionInventory(#[from] crate::execution_observation::PublishExecutionInventoryError),
+    #[error(transparent)]
+    SandboxCensus(#[from] crate::status::PruneSandboxCensusError),
+    #[error(transparent)]
+    NodeStatus(#[from] crate::status::UpsertPublishedNodeStatusError),
+    #[error(transparent)]
+    DeleteCompletions(
+        #[from] crate::auto_lifecycle_delete_completions::ConsumeDeleteCompletionsError,
+    ),
+    #[error(transparent)]
     Legacy(#[from] Status),
 }
 

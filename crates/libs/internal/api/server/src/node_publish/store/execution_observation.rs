@@ -3,12 +3,39 @@
 
 use pplx_space_common_core::{sql, types::NodeId};
 use sqlx::types::Json;
-use tonic::Status;
 
 use crate::node_publish::validate::execution_inventory::ValidatedExecutionInventory;
 use crate::node_publish::validate::execution_observation::{
     ExecutionInventoryEvidence, ValidatedReport,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PrepareExecutionObservationError {
+    #[error("lock node execution publication: {0}")]
+    Lock(#[source] sqlx::Error),
+    #[error("publishing node no longer exists")]
+    MissingNode,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PublishExecutionInventoryError {
+    #[error("replace node runtime inventory: {0}")]
+    ReplaceRuntimes(#[source] sqlx::Error),
+    #[error("replace node component inventory: {0}")]
+    ReplaceComponents(#[source] sqlx::Error),
+    #[error("insert node runtime inventory: {0}")]
+    InsertRuntimes(#[source] sqlx::Error),
+    #[error("prune node runtime guests: {0}")]
+    PruneGuests(#[source] sqlx::Error),
+    #[error("insert node runtime guests: {0}")]
+    InsertGuests(#[source] sqlx::Error),
+    #[error("prune node state formats: {0}")]
+    PruneFormats(#[source] sqlx::Error),
+    #[error("insert node state formats: {0}")]
+    InsertFormats(#[source] sqlx::Error),
+    #[error("insert node component inventory: {0}")]
+    InsertComponents(#[source] sqlx::Error),
+}
 
 /// The outcome recorded only when the surrounding publication commits.
 #[derive(Clone, Copy, Debug)]
@@ -36,11 +63,14 @@ pub(super) struct PreparedObservation {
     report: ValidatedReport,
 }
 
+/// Lock the registered node before inventory writes, including empty censuses.
+/// Omitted evidence acquires no lock; a missing registration is distinct from
+/// an unavailable inventory and must not create a new node.
 pub(super) async fn prepare(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     node_id: NodeId,
     report: Option<ValidatedReport>,
-) -> Result<Option<PreparedObservation>, Status> {
+) -> Result<Option<PreparedObservation>, PrepareExecutionObservationError> {
     let Some(report) = report else {
         return Ok(None);
     };
@@ -53,8 +83,8 @@ pub(super) async fn prepare(
         .bind(node_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|error| Status::internal(format!("lock node execution publication: {error}")))?
-        .ok_or_else(|| Status::not_found("publishing node no longer exists"))?;
+        .map_err(PrepareExecutionObservationError::Lock)?
+        .ok_or(PrepareExecutionObservationError::MissingNode)?;
     Ok(Some(PreparedObservation { node_id, report }))
 }
 
@@ -63,10 +93,13 @@ pub(super) struct PublishedExecutionObservation {
     pub policy: Option<pplx_space_common_core::types::ExecutionPolicyObservation>,
 }
 
+/// Apply inventory evidence under the node lock acquired by `prepare`.
+/// Omitted or unavailable evidence preserves inventory rows; a complete empty
+/// census replaces the inventory. Unchanged rows are a successful outcome.
 pub(super) async fn publish(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     prepared: Option<PreparedObservation>,
-) -> Result<Option<PublishedExecutionObservation>, Status> {
+) -> Result<Option<PublishedExecutionObservation>, PublishExecutionInventoryError> {
     let Some(PreparedObservation { node_id, report }) = prepared else {
         return Ok(None);
     };
@@ -98,7 +131,7 @@ async fn publish_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     inventory: ValidatedExecutionInventory,
-) -> Result<(), Status> {
+) -> Result<(), PublishExecutionInventoryError> {
     let (runtime_rows, component_rows) = inventory.into_legacy_rows();
     let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
     let component_rows = Json(serde_json::Value::Array(component_rows));
@@ -115,7 +148,7 @@ async fn publish_inventory(
     .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("replace node runtime inventory: {error}")))?;
+    .map_err(PublishExecutionInventoryError::ReplaceRuntimes)?;
     sqlx::query(sql!(
         "DELETE FROM node_artifact_components installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -131,7 +164,7 @@ async fn publish_inventory(
     .bind(&component_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("replace node component inventory: {error}")))?;
+    .map_err(PublishExecutionInventoryError::ReplaceComponents)?;
 
     sqlx::query(sql!(
         "WITH input AS (
@@ -147,7 +180,7 @@ async fn publish_inventory(
     .bind(runtime_rows.clone())
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("insert node runtime inventory: {error}")))?;
+    .map_err(PublishExecutionInventoryError::InsertRuntimes)?;
     // A retained runtime can lose a guest or format; pruning only removed
     // runtime parents would leave those capabilities advertised indefinitely.
     sqlx::query(sql!(
@@ -166,7 +199,7 @@ async fn publish_inventory(
     .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("prune node runtime guests: {error}")))?;
+    .map_err(PublishExecutionInventoryError::PruneGuests)?;
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -188,7 +221,7 @@ async fn publish_inventory(
     .bind(runtime_rows.clone())
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("insert node runtime guests: {error}")))?;
+    .map_err(PublishExecutionInventoryError::InsertGuests)?;
     sqlx::query(sql!(
         "DELETE FROM node_runtime_state_formats installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -206,7 +239,7 @@ async fn publish_inventory(
     .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("prune node state formats: {error}")))?;
+    .map_err(PublishExecutionInventoryError::PruneFormats)?;
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -242,7 +275,7 @@ async fn publish_inventory(
     .bind(runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("insert node state formats: {error}")))?;
+    .map_err(PublishExecutionInventoryError::InsertFormats)?;
 
     sqlx::query(sql!(
         "WITH input AS (
@@ -278,7 +311,7 @@ async fn publish_inventory(
     .bind(component_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("insert node component inventory: {error}")))?;
+    .map_err(PublishExecutionInventoryError::InsertComponents)?;
     Ok(())
 }
 

@@ -1,6 +1,7 @@
 use tonic::Status;
 
 use super::store::ApplyPublishError;
+use crate::execution_observation::PrepareExecutionObservationError;
 use crate::published_state::ApplySandboxClaimsError;
 
 // Keep transport mapping at the RPC boundary. Legacy operations retain their
@@ -10,9 +11,18 @@ impl From<ApplyPublishError> for Status {
         match error {
             ApplyPublishError::Legacy(error) => error,
             ApplyPublishError::Sandboxes(error) => error.into(),
-            error @ (ApplyPublishError::Begin(_) | ApplyPublishError::Commit(_)) => {
-                Self::internal(error.to_string())
-            }
+            ApplyPublishError::ExecutionPreparation(
+                error @ PrepareExecutionObservationError::MissingNode,
+            ) => Self::not_found(error.to_string()),
+            error @ (ApplyPublishError::Begin(_)
+            | ApplyPublishError::Commit(_)
+            | ApplyPublishError::PendingBackupDecision(_)
+            | ApplyPublishError::PendingBackupReconciliation(_)
+            | ApplyPublishError::ExecutionPreparation(_)
+            | ApplyPublishError::ExecutionInventory(_)
+            | ApplyPublishError::SandboxCensus(_)
+            | ApplyPublishError::NodeStatus(_)
+            | ApplyPublishError::DeleteCompletions(_)) => Self::internal(error.to_string()),
         }
     }
 }

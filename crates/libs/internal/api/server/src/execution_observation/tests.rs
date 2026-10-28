@@ -1,4 +1,5 @@
 use super::*;
+use crate::node_publish::store::ApplyPublishError;
 use crate::node_publish::validate::execution_observation::{ObservationError, Report, decode};
 use crate::proto::{
     ExecutionInventoryObservation, ExecutionInventoryUnavailable,
@@ -11,6 +12,7 @@ use pplx_space_execution_common::proto::{
 };
 use pplx_space_test_env::TestResult;
 use prost::Message;
+use tonic::Status;
 
 // A deployed reader knows field 8 but not the observation envelope at field 11.
 #[derive(Clone, PartialEq, Message)]
@@ -124,8 +126,12 @@ async fn publish_with_status(
     observation: Option<&ExecutionInventoryObservation>,
     legacy: Option<&NodeExecutionInventory>,
 ) -> Result<(), Status> {
-    let prepared = prepare(tx, node_id, validated_report(observation, legacy)?).await?;
-    let outcome = publish(tx, prepared).await?;
+    let prepared = prepare(tx, node_id, validated_report(observation, legacy)?)
+        .await
+        .map_err(ApplyPublishError::from)?;
+    let outcome = publish(tx, prepared)
+        .await
+        .map_err(ApplyPublishError::from)?;
     crate::status::upsert_node_status_from_publish(
         tx,
         node_id,
@@ -136,6 +142,8 @@ async fn publish_with_status(
         outcome,
     )
     .await
+    .map_err(ApplyPublishError::from)
+    .map_err(Status::from)
 }
 
 fn validated_report(
@@ -227,6 +235,21 @@ async fn observation_and_projection_follow_publication_outcomes_atomically() -> 
 }
 
 #[tokio::test]
+async fn missing_node_publication_retains_not_found_status() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let node_id = NodeId::new();
+    let empty = complete(NodeExecutionInventory::default());
+    let mut tx = db.pool.begin().await?;
+    let error = publish_with_status(&mut tx, node_id, Some(&empty), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound);
+    assert_eq!(error.message(), "publishing node no longer exists");
+    tx.rollback().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn empty_publications_serialize_until_status_receipt_commits() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
@@ -247,7 +270,10 @@ async fn empty_publications_serialize_until_status_receipt_commits() -> TestResu
         Err(error) => error,
         Ok(_) => panic!("concurrent empty publication did not wait for the node lock"),
     };
-    assert_eq!(error.code(), tonic::Code::Internal);
+    assert_eq!(
+        Status::from(ApplyPublishError::from(error)).code(),
+        tonic::Code::Internal
+    );
     second.rollback().await?;
     crate::status::upsert_node_status_from_publish(
         &mut first,
