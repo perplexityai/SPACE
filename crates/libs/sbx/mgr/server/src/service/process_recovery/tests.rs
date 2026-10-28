@@ -161,13 +161,19 @@ async fn recovery_adapters_refuse_mixed_or_stale_requests_before_waking() {
                     if mixed {
                         assert_eq!(status.code(), tonic::Code::InvalidArgument);
                     } else {
-                        assert!(matches!(
-                            RecoveryReason::from_status(&status),
-                            Some(
-                                RecoveryReason::ActivationChanged
-                                    | RecoveryReason::TemporarilyUnavailable
-                            )
-                        ));
+                        let expected = if state == SandboxState::Suspended {
+                            RecoveryReason::ActivationChanged
+                        } else if service
+                            .lookup_sandbox(&id.to_string())
+                            .unwrap()
+                            .node_execution_id
+                            .is_none()
+                        {
+                            RecoveryReason::TemporarilyUnavailable
+                        } else {
+                            RecoveryReason::ActivationChanged
+                        };
+                        assert_eq!(RecoveryReason::from_status(&status), Some(expected));
                     }
                 }};
             }
@@ -255,3 +261,100 @@ async fn recovery_adapters_refuse_mixed_or_stale_requests_before_waking() {
         service.shutdown_token.cancel();
     }
 }
+
+#[test]
+fn rearm_failures_are_temporary_without_masking_unsupported_or_stale_handles() {
+    for code in [
+        tonic::Code::ResourceExhausted,
+        tonic::Code::Unavailable,
+        tonic::Code::FailedPrecondition,
+        tonic::Code::DeadlineExceeded,
+    ] {
+        assert_eq!(
+            RecoveryReason::from_status(&rearm_status(Status::new(
+                code,
+                "synthetic rearm failure"
+            ))),
+            Some(RecoveryReason::TemporarilyUnavailable)
+        );
+    }
+    let unsupported = pplx_space_common_grpc::guest_capability_unsupported_status(
+        pplx_space_common_grpc::GuestCapability::ProcessRecoveryStart,
+        "unsupported",
+    );
+    assert!(
+        pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&rearm_status(unsupported))
+            .is_some()
+    );
+    assert_eq!(
+        RecoveryReason::from_status(&rearm_status(
+            RecoveryReason::ActivationChanged.into_status()
+        )),
+        Some(RecoveryReason::ActivationChanged)
+    );
+}
+
+#[tokio::test]
+async fn recovery_wake_rechecks_a_matching_fence_after_lock_admission() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox_with_runtime(&conn, &id, SandboxState::Started);
+    let service = SandboxManagerService::for_test(conn);
+    let sandbox = service.lookup_sandbox(&id).unwrap();
+    let fence = pplx_space_spaced_common::recovery::RecoveryFence {
+        instance: ProcessRecoveryToken::new(),
+        activation: sandbox
+            .node_execution_id
+            .unwrap()
+            .to_string()
+            .parse()
+            .unwrap(),
+    };
+    resident_recovery_fence(&sandbox, fence).unwrap();
+    let active = service
+        .ensure_active_for_guest_activity_with_start(
+            None,
+            &id,
+            true,
+            Some(Duration::from_secs(1)),
+            GuestActivityKind::Access,
+            WakeStartConfig {
+                recovery_fence: Some(fence),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(active.node_execution_id, sandbox.node_execution_id);
+    let guard = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
+    let mut waking = Box::pin(service.ensure_active_for_guest_activity_with_start(
+        None,
+        &id,
+        true,
+        Some(Duration::from_secs(1)),
+        GuestActivityKind::Access,
+        WakeStartConfig {
+            recovery_fence: Some(fence),
+            ..Default::default()
+        },
+    ));
+    assert!(futures_util::poll!(&mut waking).is_pending());
+    crate::db::test_fixtures::state_write_fixtures::force_state(
+        &service.db_conn().unwrap(),
+        &id,
+        SandboxState::Suspended,
+    );
+    drop(guard);
+    let status = waking.await.err().expect("stale activation");
+    assert_eq!(
+        RecoveryReason::from_status(&status),
+        Some(RecoveryReason::ActivationChanged)
+    );
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Suspended
+    );
+    service.shutdown_token.cancel();
+}
+
+mod transport;

@@ -189,3 +189,15 @@ async fn recovery_activation_rejects_malformed_and_previous_service_barriers() {
         service.inner.execution.drain().await.unwrap();
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn flush_admission_timeout_remains_retryable() {
+    let lifecycle = RecoveryLifecycle::new();
+    let held = lifecycle.acquire().unwrap();
+    let start = tokio::time::Instant::now();
+    let error = lifecycle.acquire_flush().await.unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+    drop(held);
+    drop(lifecycle.acquire_flush().await.unwrap());
+}

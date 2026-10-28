@@ -108,6 +108,8 @@ impl SandboxManagerService {
         };
         let timeout = proto_duration_to_std(req.timeout)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCKING_READY_TIMEOUT_SECS as u64));
+        let timeout =
+            grpc_timeout_budget(&request).map_or(timeout, |remaining| remaining.min(timeout));
         let response = self
             .legacy_recovery_ready(
                 &sandbox,

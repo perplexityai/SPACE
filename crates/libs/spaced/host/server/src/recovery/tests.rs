@@ -388,3 +388,15 @@ async fn recovery_start_does_not_replay_a_dispatched_request() {
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
 }
+
+#[tokio::test(start_paused = true)]
+async fn flush_admission_timeout_remains_retryable() {
+    let lifecycle = RecoveryLifecycle::new(ProcessRecoveryToken::new());
+    let held = lifecycle.acquire().unwrap();
+    let start = tokio::time::Instant::now();
+    let error = lifecycle.acquire_flush().await.unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+    drop(held);
+    drop(lifecycle.acquire_flush().await.unwrap());
+}

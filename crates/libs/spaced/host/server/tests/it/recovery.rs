@@ -43,7 +43,10 @@ async fn host(
 async fn activate(client: &SpacedHostClient) -> proto::ProcessExecutionInfo {
     let ready = client.wait_ready(Duration::from_secs(2)).await.unwrap();
     let barrier = ready.process_recovery_barrier_id.unwrap().parse().unwrap();
-    client.resume_process_recovery(barrier).await.unwrap();
+    client
+        .resume_process_recovery(barrier, std::time::Duration::from_secs(20))
+        .await
+        .unwrap();
     let ready = client.wait_ready(Duration::from_secs(2)).await.unwrap();
     assert!(ready.process_recovery_barrier_id.is_none());
     let info = ready.process_execution.unwrap();

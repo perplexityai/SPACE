@@ -52,7 +52,7 @@ impl RecoveryLifecycle {
             self.transaction.clone().acquire_owned(),
         )
         .await
-        .map_err(|_| Status::unavailable("recovery activation has not settled"))?
+        .map_err(|_| Status::resource_exhausted("recovery activation has not settled"))?
         .map_err(|_| Status::unavailable("recovery lifecycle is closed"))
     }
 }

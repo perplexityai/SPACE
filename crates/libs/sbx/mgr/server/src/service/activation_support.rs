@@ -23,6 +23,7 @@ pub(super) enum GuestActivityKind {
 
 #[derive(Clone, Debug)]
 pub(super) struct WakeStartConfig {
+    pub(super) recovery_fence: Option<pplx_space_spaced_common::recovery::RecoveryFence>,
     pub(super) activation_auto_lifecycle: Option<AutoLifecyclePolicy>,
     pub(super) expected_execution_generation: Option<ExecutionGeneration>,
     pub(super) operation_activation_attempt_id: Option<SandboxActivationAttemptId>,
@@ -63,6 +64,7 @@ pub(super) struct WakeStartConfig {
 impl Default for WakeStartConfig {
     fn default() -> Self {
         Self {
+            recovery_fence: None,
             activation_auto_lifecycle: None,
             expected_execution_generation: None,
             operation_activation_attempt_id: None,

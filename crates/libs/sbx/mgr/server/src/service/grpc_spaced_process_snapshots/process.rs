@@ -13,6 +13,9 @@ impl SandboxManagerService {
             ALLOW_SANDBOX_OPERATOR,
         )?;
         let wake_budget = grpc_timeout_budget(&request);
+        let recovery_budget =
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(Duration::from_secs(30))
+                .with_grpc_timeout_metadata(request.metadata());
         let req = request.get_ref();
         let route_auth =
             self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::StartProcess)?;
@@ -33,8 +36,17 @@ impl SandboxManagerService {
             .first()
             .cloned()
             .unwrap_or_default();
-        let sandbox = match self
-            .ensure_active_for_authorized_guest_activity(
+        let sandbox = match if let Some(fence) = fence {
+            self.ensure_recovery_active(
+                &req.sandbox_id,
+                &route_auth,
+                fence,
+                &recovery_budget,
+                GuestActivityKind::Command,
+            )
+            .await
+        } else {
+            self.ensure_active_for_authorized_guest_activity(
                 &route_auth,
                 &req.sandbox_id,
                 true,
@@ -42,7 +54,7 @@ impl SandboxManagerService {
                 GuestActivityKind::Command,
             )
             .await
-        {
+        } {
             Ok(sandbox) => sandbox,
             Err(error) => {
                 emit_sandbox_event(
@@ -62,7 +74,8 @@ impl SandboxManagerService {
         route_auth.authorize_sandbox(&sandbox)?;
         let identity_token = self.route_stream_identity_token(&sandbox)?;
         let client = match if recovery {
-            self.connect_recovery_host(&sandbox, &route_auth).await
+            self.connect_recovery_host(&sandbox, &route_auth, &recovery_budget)
+                .await
         } else {
             self.connect_spaced_host(&sandbox).await
         } {
@@ -143,6 +156,9 @@ impl SandboxManagerService {
             ALLOW_SANDBOX_OPERATOR,
         )?;
         let wake_budget = grpc_timeout_budget(&request);
+        let recovery_budget =
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(Duration::from_secs(30))
+                .with_grpc_timeout_metadata(request.metadata());
         let req = request.get_ref();
         let route_auth =
             self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::ConnectProcess)?;
@@ -159,12 +175,22 @@ impl SandboxManagerService {
             &route_auth,
             handle.as_ref().map(|handle| handle.fence),
         )?;
+        let fence = handle.as_ref().map(|handle| handle.fence);
         let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
-        let sandbox = self
-            .ensure_active_for_read_only_guest_activity(
+        let sandbox = if let Some(fence) = fence {
+            self.ensure_recovery_active(
+                &req.sandbox_id,
+                &route_auth,
+                fence,
+                &recovery_budget,
+                GuestActivityKind::Access,
+            )
+            .await
+        } else {
+            self.ensure_active_for_read_only_guest_activity(
                 Some(route_auth.clone()),
                 &req.sandbox_id,
                 true,
@@ -172,11 +198,13 @@ impl SandboxManagerService {
                 GuestActivityKind::Access,
                 "SpacedConnectProcess",
             )
-            .await?;
+            .await
+        }?;
         route_auth.authorize_sandbox(&sandbox)?;
         let identity_token = self.route_stream_identity_token(&sandbox)?;
         let client = if recovery {
-            self.connect_recovery_host(&sandbox, &route_auth).await?
+            self.connect_recovery_host(&sandbox, &route_auth, &recovery_budget)
+                .await?
         } else {
             self.connect_spaced_host(&sandbox).await?
         };
@@ -252,6 +280,9 @@ impl SandboxManagerService {
             ALLOW_SANDBOX_OPERATOR,
         )?;
         let wake_budget = grpc_timeout_budget(&request);
+        let recovery_budget =
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(Duration::from_secs(30))
+                .with_grpc_timeout_metadata(request.metadata());
         let req = request.get_ref();
         let route_auth =
             self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::SendSignal)?;
@@ -268,6 +299,7 @@ impl SandboxManagerService {
             &route_auth,
             handle.as_ref().map(|handle| handle.fence),
         )?;
+        let fence = handle.as_ref().map(|handle| handle.fence);
         let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
@@ -276,18 +308,29 @@ impl SandboxManagerService {
         if signal <= 0 {
             return Err(Status::invalid_argument("signal must be greater than 0"));
         }
-        let sandbox = self
-            .ensure_active_for_authorized_guest_activity(
+        let sandbox = if let Some(fence) = fence {
+            self.ensure_recovery_active(
+                &req.sandbox_id,
+                &route_auth,
+                fence,
+                &recovery_budget,
+                GuestActivityKind::Access,
+            )
+            .await
+        } else {
+            self.ensure_active_for_authorized_guest_activity(
                 &route_auth,
                 &req.sandbox_id,
                 true,
                 wake_budget,
                 GuestActivityKind::Access,
             )
-            .await?;
+            .await
+        }?;
         route_auth.authorize_sandbox(&sandbox)?;
         let client = if recovery {
-            self.connect_recovery_host(&sandbox, &route_auth).await?
+            self.connect_recovery_host(&sandbox, &route_auth, &recovery_budget)
+                .await?
         } else {
             self.connect_spaced_host(&sandbox).await?
         };
@@ -311,6 +354,9 @@ impl SandboxManagerService {
             ALLOW_SANDBOX_OPERATOR,
         )?;
         let wake_budget = grpc_timeout_budget(&request);
+        let recovery_budget =
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(Duration::from_secs(30))
+                .with_grpc_timeout_metadata(request.metadata());
         let req = request.get_ref();
         let route_auth =
             self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::SendInput)?;
@@ -327,22 +373,34 @@ impl SandboxManagerService {
             &route_auth,
             handle.as_ref().map(|handle| handle.fence),
         )?;
+        let fence = handle.as_ref().map(|handle| handle.fence);
         let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
-        let sandbox = self
-            .ensure_active_for_authorized_guest_activity(
+        let sandbox = if let Some(fence) = fence {
+            self.ensure_recovery_active(
+                &req.sandbox_id,
+                &route_auth,
+                fence,
+                &recovery_budget,
+                GuestActivityKind::Access,
+            )
+            .await
+        } else {
+            self.ensure_active_for_authorized_guest_activity(
                 &route_auth,
                 &req.sandbox_id,
                 true,
                 wake_budget,
                 GuestActivityKind::Access,
             )
-            .await?;
+            .await
+        }?;
         route_auth.authorize_sandbox(&sandbox)?;
         let client = if recovery {
-            self.connect_recovery_host(&sandbox, &route_auth).await?
+            self.connect_recovery_host(&sandbox, &route_auth, &recovery_budget)
+                .await?
         } else {
             self.connect_spaced_host(&sandbox).await?
         };
@@ -366,6 +424,9 @@ impl SandboxManagerService {
             ALLOW_SANDBOX_OPERATOR,
         )?;
         let wake_budget = grpc_timeout_budget(&request);
+        let recovery_budget =
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(Duration::from_secs(30))
+                .with_grpc_timeout_metadata(request.metadata());
         let req = request.get_ref();
         let route_auth =
             self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::CloseStdin)?;
@@ -382,22 +443,34 @@ impl SandboxManagerService {
             &route_auth,
             handle.as_ref().map(|handle| handle.fence),
         )?;
+        let fence = handle.as_ref().map(|handle| handle.fence);
         let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
-        let sandbox = self
-            .ensure_active_for_authorized_guest_activity(
+        let sandbox = if let Some(fence) = fence {
+            self.ensure_recovery_active(
+                &req.sandbox_id,
+                &route_auth,
+                fence,
+                &recovery_budget,
+                GuestActivityKind::Access,
+            )
+            .await
+        } else {
+            self.ensure_active_for_authorized_guest_activity(
                 &route_auth,
                 &req.sandbox_id,
                 true,
                 wake_budget,
                 GuestActivityKind::Access,
             )
-            .await?;
+            .await
+        }?;
         route_auth.authorize_sandbox(&sandbox)?;
         let client = if recovery {
-            self.connect_recovery_host(&sandbox, &route_auth).await?
+            self.connect_recovery_host(&sandbox, &route_auth, &recovery_budget)
+                .await?
         } else {
             self.connect_spaced_host(&sandbox).await?
         };
@@ -419,6 +492,9 @@ impl SandboxManagerService {
             ALLOW_SANDBOX_OPERATOR,
         )?;
         let wake_budget = grpc_timeout_budget(&request);
+        let recovery_budget =
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(Duration::from_secs(30))
+                .with_grpc_timeout_metadata(request.metadata());
         let req = request.get_ref();
         let route_auth =
             self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::ResizePty)?;
@@ -435,6 +511,7 @@ impl SandboxManagerService {
             &route_auth,
             handle.as_ref().map(|handle| handle.fence),
         )?;
+        let fence = handle.as_ref().map(|handle| handle.fence);
         let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
@@ -442,18 +519,29 @@ impl SandboxManagerService {
         let size = operation
             .size
             .ok_or_else(|| Status::invalid_argument("pty size is required"))?;
-        let sandbox = self
-            .ensure_active_for_authorized_guest_activity(
+        let sandbox = if let Some(fence) = fence {
+            self.ensure_recovery_active(
+                &req.sandbox_id,
+                &route_auth,
+                fence,
+                &recovery_budget,
+                GuestActivityKind::Access,
+            )
+            .await
+        } else {
+            self.ensure_active_for_authorized_guest_activity(
                 &route_auth,
                 &req.sandbox_id,
                 true,
                 wake_budget,
                 GuestActivityKind::Access,
             )
-            .await?;
+            .await
+        }?;
         route_auth.authorize_sandbox(&sandbox)?;
         let client = if recovery {
-            self.connect_recovery_host(&sandbox, &route_auth).await?
+            self.connect_recovery_host(&sandbox, &route_auth, &recovery_budget)
+                .await?
         } else {
             self.connect_spaced_host(&sandbox).await?
         };
