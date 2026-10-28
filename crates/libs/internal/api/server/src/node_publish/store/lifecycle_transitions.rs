@@ -40,9 +40,7 @@ pub(crate) async fn converge_restored(
     // pod instead of treating it as a started sandbox with a broken execution.
     // Evacuation-marked rows are owned by the node-drain redrive (the same
     // exemption the sweeper makes) and are left alone.
-    let routable_execution =
-        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
-    let restored_convergence_query = format!(
+    sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
              SELECT sandbox_id, status, transition_receipt_kind
              FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -60,12 +58,19 @@ pub(crate) async fn converge_restored(
            AND LOWER(TRIM(input.status)) = 'started'
            AND input.transition_receipt_kind IS DISTINCT FROM $3
            AND LOWER(TRIM(s.lifecycle)) = 'restoring'
-           AND {routable_execution}
+           AND (
+               s.managed_by <> $4
+               OR EXISTS (
+                   SELECT 1
+                     FROM sandbox_k8s_executions rex
+                    WHERE rex.sandbox_id = s.id
+                      AND rex.active
+                      AND rex.state = 'running'
+                      AND rex.pod_ip IS NOT NULL
+               )
+           )
          RETURNING s.id"
-    );
-    sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
-        restored_convergence_query.as_str()
-    )))
+    ))
     .bind(node_id)
     .bind(rows_json)
     .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
