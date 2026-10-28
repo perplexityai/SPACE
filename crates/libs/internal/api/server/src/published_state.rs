@@ -37,6 +37,7 @@ use pplx_space_sandbox_portability::{
     suspended_projection_lifecycle_eligible,
 };
 
+use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::node_publish::validate::failure_episode::FailureEpisodeClaim;
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 use crate::node_publish::validate::quarantine::{
@@ -78,29 +79,19 @@ struct AcceptedSandboxPublishRow {
 }
 
 fn parse_published_transition_receipt(
+    node_id: NodeId,
     state: &PublishedSandboxState,
 ) -> Result<
     Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
     PublishedTransitionReceiptError,
 > {
-    use pplx_space_metrics::sandbox::publication::StatePublicationField as Field;
-
     let parsed = receipts::parse(state);
     if let Some(fallback) = parsed.fallback {
-        let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::FallbackTransitionReason;
-        pplx_space_metrics::sandbox::publication::degraded(
-            pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-            Field::TransitionReceiptReasonCode,
-            disposition,
-        );
-        tracing::warn!(
-            sandbox_id = %state.sandbox_id,
-            reason_code = fallback.raw_reason,
-            error = %fallback.error,
-            %disposition,
-            fallback_reason_code = %fallback.reason,
-            "using target-specific fallback for a forward-compatible activation rollback reason"
-        );
+        SandboxDiagnostic::FallbackTransitionReason {
+            raw_id: state.sandbox_id.clone(),
+            fallback,
+        }
+        .emit(node_id);
     }
     parsed.receipt
 }
@@ -1048,19 +1039,11 @@ pub async fn publish_sandbox_states(
         let sandbox_id = match parse_sandbox_id(&state.sandbox_id) {
             Ok(sandbox_id) => sandbox_id,
             Err(error) => {
-                let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitSandbox;
-                pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                    pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
-                    disposition,
-                );
-                tracing::warn!(
-                    %node_id,
-                    sandbox_id = %state.sandbox_id,
-                    %error,
-                    %disposition,
-                    "omitting malformed sandbox identity from node publication"
-                );
+                SandboxDiagnostic::OmitSandbox {
+                    raw_id: state.sandbox_id.clone(),
+                    error,
+                }
+                .emit(node_id);
                 continue;
             }
         };
@@ -1112,23 +1095,10 @@ pub async fn publish_sandbox_states(
             );
             continue;
         }
-        let transition_receipt = match parse_published_transition_receipt(state) {
+        let transition_receipt = match parse_published_transition_receipt(node_id, state) {
             Ok(receipt) => receipt,
             Err(error) => {
-                let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitTransitionReceipt;
-                pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                    error.field,
-                    disposition,
-                );
-                tracing::warn!(
-                    %node_id,
-                    %sandbox_id,
-                    field = %error.field,
-                    %disposition,
-                    %error,
-                    "ignoring malformed or forward-incompatible transition receipt without rejecting sandbox state"
-                );
+                SandboxDiagnostic::OmitTransitionReceipt { sandbox_id, error }.emit(node_id);
                 None
             }
         };
@@ -1140,19 +1110,7 @@ pub async fn publish_sandbox_states(
                     (Some(observation), false)
                 }
                 Err(error) => {
-                    let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitQuarantineRecoveryObservation;
-                    pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                    pplx_space_metrics::sandbox::publication::StatePublicationField::QuarantineRecoveryObservation,
-                    disposition,
-                );
-                    tracing::warn!(
-                        %node_id,
-                        %sandbox_id,
-                        %error,
-                        %disposition,
-                        "ignoring malformed quarantine recovery observation without rejecting sandbox state"
-                    );
+                    SandboxDiagnostic::OmitQuarantineRecovery { sandbox_id, error }.emit(node_id);
                     (None, true)
                 }
             };
@@ -1163,13 +1121,12 @@ pub async fn publish_sandbox_states(
         let parse_result = (|| -> Result<(), Status> {
             if let Some(claim) = QuarantineClaim::from_proto(sandbox_id, state) {
                 if let Some((value, error)) = claim.unrecognized_reason() {
-                    tracing::warn!(
-                        %node_id,
-                        %sandbox_id,
-                        quarantine_reason_code = %value,
-                        %error,
-                        "downgrading unknown node quarantine reason without rejecting state publication"
-                    );
+                    SandboxDiagnostic::UnknownQuarantineReason {
+                        sandbox_id,
+                        label: value.to_owned(),
+                        error: error.clone(),
+                    }
+                    .emit(node_id);
                 }
                 quarantine_inputs.push(claim);
             }
@@ -1177,13 +1134,11 @@ pub async fn publish_sandbox_states(
             let validation =
                 ValidatedSandboxObservation::parse(sandbox_id, state, transition_receipt.as_ref());
             if let Some(warning) = validation.version_warning {
-                tracing::warn!(
-                    %node_id,
-                    %sandbox_id,
-                    spaced_version = %warning.label,
-                    error = %warning.error,
-                    "dropping invalid sandbox spaced version from node publish"
-                );
+                SandboxDiagnostic::InvalidSpacedVersion {
+                    sandbox_id,
+                    warning,
+                }
+                .emit(node_id);
             }
             let observation = validation.observation?;
             row_publishes_network_policy = observation.publishes_network_policy();
@@ -1202,20 +1157,7 @@ pub async fn publish_sandbox_states(
             rows.truncate(row_count);
             snapshot_rows.truncate(snapshot_count);
             quarantine_inputs.truncate(quarantine_count);
-            let disposition =
-                pplx_space_metrics::sandbox::publication::StatePublicationDisposition::StateOnly;
-            pplx_space_metrics::sandbox::publication::degraded(
-                pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
-                disposition,
-            );
-            tracing::warn!(
-                %node_id,
-                %sandbox_id,
-                %error,
-                %disposition,
-                "publishing sandbox lifecycle without malformed optional fields"
-            );
+            SandboxDiagnostic::StateOnly { sandbox_id, error }.emit(node_id);
             state_only.insert(
                 sandbox_uuid,
                 serde_json::json!({
