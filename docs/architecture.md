@@ -48,6 +48,15 @@ compatible with these requests and replies.
 
 The API records desired state in PostgreSQL. Controllers and worker services reconcile the running system with that state, so an accepted request is not a readiness signal.
 
+Node publications parse their evidence before opening the publication
+transaction. The [publication store](../crates/libs/internal/api/server/src/node_publish/store/mod.rs)
+applies that evidence with the existing database guards and row-lock order,
+replaces the pending-backup set before stamping its freshness, and evaluates
+delete receipts after sandbox, execution, pruning, and node-status writes.
+All phases share one transaction; only a successful commit produces the outcome
+that emits post-commit events. No protocol or schema agreement beyond the
+existing contracts is required between server versions.
+
 SPACE can manage workers directly or through Kubernetes. The [direct adapter](../crates/libs/api/src/controllers/substrate/direct.rs) calls worker services without creating Kubernetes sandbox pods. The [Kubernetes adapter](../crates/libs/api/src/controllers/substrate/kubernetes/mod.rs) is used by the local Kind installation in these guides.
 
 ### Local Kind topology

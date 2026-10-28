@@ -678,4 +678,5 @@ pub(super) async fn clear_finalized(
 }
 
 #[cfg(test)]
+#[path = "../../node_local_backup_pending/tests.rs"]
 mod tests;

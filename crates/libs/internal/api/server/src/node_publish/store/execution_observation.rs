@@ -283,4 +283,5 @@ async fn publish_inventory(
 }
 
 #[cfg(test)]
+#[path = "../../execution_observation/tests.rs"]
 mod tests;

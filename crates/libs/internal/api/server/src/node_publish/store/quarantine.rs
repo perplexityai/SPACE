@@ -1,4 +1,4 @@
-//! Transaction-scoped Postgres operations for node-authored quarantine recovery.
+//! Transaction-scoped PostgreSQL operations for node-authored quarantine recovery.
 
 use pplx_space_common_core::types::NodeId;
 

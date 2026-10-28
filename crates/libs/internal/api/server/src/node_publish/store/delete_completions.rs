@@ -591,4 +591,5 @@ async fn apply_receipt(
 }
 
 #[cfg(test)]
+#[path = "../../auto_lifecycle_delete_completions/tests.rs"]
 mod tests;

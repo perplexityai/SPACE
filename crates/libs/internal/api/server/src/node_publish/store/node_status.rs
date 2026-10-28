@@ -516,9 +516,9 @@ pub(super) fn reconcile_retry_delay_secs(attempts_before_failure: i32) -> i64 {
 }
 
 #[cfg(test)]
-#[path = "status_tests.rs"]
+#[path = "../../status_tests.rs"]
 mod status_tests;
 
 #[cfg(test)]
-#[path = "status_freshness_tests.rs"]
+#[path = "../../status_freshness_tests.rs"]
 mod status_freshness_tests;

@@ -2833,8 +2833,8 @@ async fn publish_sandbox_snapshots_batch(
 }
 
 #[cfg(test)]
-#[path = "published_state_lifecycle_race_tests.rs"]
+#[path = "../../published_state_lifecycle_race_tests.rs"]
 mod published_state_lifecycle_race_tests;
 #[cfg(test)]
-#[path = "published_state_tests.rs"]
+#[path = "../../published_state_tests.rs"]
 mod published_state_tests;

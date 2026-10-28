@@ -414,13 +414,15 @@ enables it on its own dev-dependency, as `pplx-space-metrics` does.
 
 ### The one legacy variant
 
-Three files keep their test body as a *flat* sibling named
+Three modules keep their test body as a flat file named
 `<host>_tests.rs`, reached with an explicit `#[path = "…"]`:
 `crates/libs/sbx/mgr/server/src/sidecar_env.rs`,
-`crates/libs/internal/api/server/src/status.rs`, and
-`crates/libs/internal/api/server/src/published_state.rs`. This works, but it
+`crates/libs/internal/api/server/src/node_publish/store/node_status.rs`, and
+`crates/libs/internal/api/server/src/node_publish/store/published_state.rs`.
+The publication modules retain their existing test paths and snapshot namespaces.
+This works, but it
 needs an attribute to say what `mod tests;` says for free, and it puts test
-files in the same directory listing as production ones. Don't propagate it; new
+files in the root source directory listing. Don't propagate it; new
 test modules use the plain `#[cfg(test)] mod <name>;` + `<host>/<name>.rs` form.
 
 ## Service-dependency tests
