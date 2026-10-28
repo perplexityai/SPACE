@@ -1,6 +1,7 @@
 use sqlx::PgPool;
 use tonic::Status;
 
+pub(crate) mod absent_sandboxes;
 pub(crate) mod failure_episodes;
 
 use crate::auto_lifecycle_delete_completions::consume_validated_auto_lifecycle_delete_completions;
