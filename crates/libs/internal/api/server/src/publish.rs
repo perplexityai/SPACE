@@ -1,8 +1,8 @@
-use super::metadata::*;
 use super::status::*;
 use super::*;
 use crate::auto_lifecycle_delete_completions::consume_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
+use crate::node_publish::validate::census::SandboxCensus;
 use crate::node_publish::validate::node_role::PublicationRoleIntent;
 use crate::node_publish::validate::node_status::ValidatedNodeStatus;
 use pplx_space_metrics::internal_api::{LocalBackupQueueOutcome, local_backup_queue_reconcile};
@@ -14,7 +14,6 @@ impl ClusterApiService {
         &self,
         request: Request<PublishNodeStateRequest>,
     ) -> Result<Response<PublishNodeStateResponse>, Status> {
-        let sandbox_inventory_complete = request.get_ref().sandbox_inventory_complete;
         let template_inventory_complete = request.get_ref().template_inventory_complete;
         let auto_lifecycle_delete_completions_received =
             request.get_ref().auto_lifecycle_delete_completions.len();
@@ -38,26 +37,12 @@ impl ClusterApiService {
             .node_status
             .map(ValidatedNodeStatus::try_from_proto)
             .transpose()?;
-        // Per-row validation and telemetry live in `publish_sandbox_states`.
-        // Pruning reuses only identities that can name a central row.
-        let mut sandbox_inventory_prunable = sandbox_inventory_complete;
-        let present_sandbox_ids = request
-            .sandboxes
-            .iter()
-            .filter_map(|sandbox| match parse_sandbox_id(&sandbox.sandbox_id) {
-                Ok(sandbox_id) => sandbox.present.then_some(sandbox_id),
-                Err(error) => {
-                    sandbox_inventory_prunable = false;
-                    tracing::warn!(
-                        node_id = %origin.display_id,
-                        sandbox_id = %sandbox.sandbox_id,
-                        %error,
-                        "preserving existing node associations because a complete inventory contains an invalid sandbox identity"
-                    );
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let (sandbox_census, census_diagnostics) =
+            SandboxCensus::from_proto(&request.sandboxes, request.sandbox_inventory_complete);
+        let sandbox_inventory_complete = sandbox_census.claimed_complete();
+        for diagnostic in census_diagnostics {
+            diagnostic.emit(&origin);
+        }
         let present_template_keys = request
             .templates
             .iter()
@@ -100,8 +85,8 @@ impl ClusterApiService {
         // `sandbox_observed_states` are then written from one decision in one
         // transaction, so they cannot come to disagree — which is what lets the
         // drain gates read the timestamp as "this node's census is current".
-        let inventory_prune = if sandbox_inventory_prunable {
-            prune_absent_node_sandboxes(&mut tx, origin.id, &present_sandbox_ids).await?;
+        let inventory_prune = if let Some(present_ids) = sandbox_census.pruning_ids() {
+            prune_absent_node_sandboxes(&mut tx, origin.id, present_ids).await?;
             SandboxInventoryPrune::Applied
         } else {
             SandboxInventoryPrune::Skipped

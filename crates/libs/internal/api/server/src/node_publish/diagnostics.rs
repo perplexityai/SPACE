@@ -14,6 +14,24 @@ use super::validate::receipts::{PublishedTransitionReceiptError, RollbackReasonF
 use super::validate::sandbox_observation::InvalidSpacedVersion;
 
 #[derive(Debug)]
+pub(crate) struct InvalidCensusIdentity {
+    pub(crate) raw_id: String,
+    pub(crate) error: Status,
+}
+
+impl InvalidCensusIdentity {
+    pub(crate) fn emit(&self, origin: &crate::OriginNode) {
+        tracing::warn!(
+            target: "pplx_space_internal_api_server::publish",
+            node_id = %origin.display_id,
+            sandbox_id = %self.raw_id,
+            error = %self.error,
+            "preserving existing node associations because a complete inventory contains an invalid sandbox identity"
+        );
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum DeleteCompletionDiagnostic {
     Oversized {
         received: usize,
