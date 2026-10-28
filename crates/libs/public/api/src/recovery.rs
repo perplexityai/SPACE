@@ -6,8 +6,9 @@
 use serde::{Deserialize, Serialize};
 
 /// The data-plane connection must acknowledge this protocol before a client
-/// sends credentials or a recovery request. Discovery covers the engine route;
-/// this handshake covers the independently deployed data plane.
+/// sends an attach frame or recovery request. Header authentication sends its
+/// credential in the upgrade request, before acknowledgement. Discovery covers
+/// the engine route; this handshake covers the independently deployed data plane.
 pub const RECOVERY_WEBSOCKET_PROTOCOL: &str = "space.process-recovery.v1";
 
 /// Create an immutable recovery command session without starting it.
@@ -15,6 +16,7 @@ pub const RECOVERY_WEBSOCKET_PROTOCOL: &str = "space.process-recovery.v1";
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateRecoveryCommandRequest {
+    /// Must be 1. Unknown versions are rejected before creating a session.
     pub contract_version: u32,
     pub expected_instance_id: String,
     pub expected_activation_id: String,

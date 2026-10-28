@@ -103,14 +103,20 @@ pub(super) async fn bridge(state: DataPlaneState, attached: AttachedSession, soc
     let shutdown = state.stream_shutdown_token.clone();
     let result = async {
         // A client that only attaches never starts work or holds a payload permit.
-        let first = tokio::time::timeout(state.attach_deadline, source.next())
-            .await
-            .map_err(|_| Status::deadline_exceeded("recovery request deadline elapsed"))?
-            .ok_or_else(|| Status::cancelled("client disconnected"))?
-            .map_err(|_| Status::cancelled("client disconnected"))?;
-        let Message::Text(text) = first else {
-            return Err(Status::invalid_argument("expected a recovery request"));
-        };
+        let text = tokio::time::timeout(state.attach_deadline, async {
+            loop {
+                match source.next().await {
+                    Some(Ok(Message::Text(text))) => return Ok(text),
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Binary(_))) => {
+                        return Err(Status::invalid_argument("expected a recovery request"));
+                    }
+                    _ => return Err(Status::cancelled("client disconnected")),
+                }
+            }
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("recovery request deadline elapsed"))??;
         if text.len() > MAX_CLIENT_BYTES_DURING_OPEN {
             return Err(Status::resource_exhausted("recovery request too large"));
         }
@@ -207,13 +213,14 @@ where
     // route refresh must never rewrite a fence or fall back to a legacy call.
     macro_rules! unary {
         ($method:ident, $envelope:ident, $operation:expr, $sequence:expr) => {{
-            let request = node_api_request_with_route_token_state(
+            let mut request = node_api_request_with_route_token_state(
                 pplx_space_sbx_mgr_client::proto::$envelope {
                     sandbox_id,
                     operation: Some($operation),
                 },
                 route,
             )?;
+            request.set_timeout(deadline);
             tokio::time::timeout(deadline, client.$method(request))
                 .await
                 .map_err(|_| Status::deadline_exceeded("process mutation deadline elapsed"))??;

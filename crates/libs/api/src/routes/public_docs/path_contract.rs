@@ -307,7 +307,7 @@ pub(super) fn insert_process_paths(paths: &mut Map<String, Value>) {
         pplx_space_public_api::routes::CREATE_RECOVERY_COMMAND,
         json!({
             "summary": "Create a recovery command session",
-            "description": "Creates an immutable command session without starting work. Attach over WebSocket and explicitly send recovery_start. Existing command, terminal and SSE behavior is unchanged.",
+            "description": "Creates an immutable command session without starting work or waking the sandbox. Offer and require the space.process-recovery.v1 WebSocket subprotocol, authenticate, then explicitly send recovery_start. Existing command, terminal and SSE behavior is unchanged.",
             "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1}}],
             "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateRecoveryCommandRequest"}}}},
             "responses": {
@@ -315,7 +315,7 @@ pub(super) fn insert_process_paths(paths: &mut Map<String, Value>) {
                 "400": {"description": "Invalid recovery request"},
                 "401": {"description": "Authentication required"},
                 "404": {"description": "Sandbox not found"},
-                "409": {"description": "Idempotency key conflicts"},
+                "409": {"description": "Idempotency key conflicts or sandbox is not running; no wake is queued"},
                 "500": {"description": "Command creation failed"}
             }
         }),
@@ -327,12 +327,12 @@ pub(super) fn insert_process_paths(paths: &mut Map<String, Value>) {
             "summary": "Discover process recovery support",
             "description": "Returns the current engine and activation fences and the start-key retry window. Discover before the first recovery start; never refresh fences to retry an uncertain start.",
             "responses": {
-                "200": {"description": "Current execution contract", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProcessExecution"}}}},
+                "200": {"description": "Current execution contract; a missing activation means rearming is pending", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProcessExecution"}}}},
                 "400": {"description": "Invalid sandbox id"},
                 "401": {"description": "Authentication required"},
                 "404": {"description": "Sandbox not found"},
-                "412": {"description": "Recovery discovery unsupported"},
-                "503": {"description": "Execution unavailable"}
+                "412": {"description": "The ready engine route does not support recovery discovery"},
+                "503": {"description": "Sandbox or node execution is not ready; retry discovery within a caller deadline"}
             }
         }),
     );

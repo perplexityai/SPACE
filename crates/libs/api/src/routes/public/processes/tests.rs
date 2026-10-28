@@ -208,3 +208,40 @@ fn process_page_orders_processes_and_resumes_after_cursor() {
     );
     assert_eq!(second.next_cursor, None);
 }
+
+#[test]
+fn discovery_distinguishes_node_startup_from_unsupported_execution() {
+    use axum::response::IntoResponse;
+    let starting = pplx_space_common_grpc::mark_sandbox_not_running(
+        tonic::Status::failed_precondition("sandbox is starting, not started"),
+        "starting",
+    );
+    assert_eq!(
+        process_discovery_error(starting.clone().into())
+            .into_response()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // Other process routes retain their existing precondition status.
+    assert_eq!(
+        controller_error(starting.into()).into_response().status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    for (status, expected) in [
+        (
+            tonic::Status::failed_precondition("unsupported"),
+            StatusCode::PRECONDITION_FAILED,
+        ),
+        (
+            tonic::Status::permission_denied("refused"),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        assert_eq!(
+            process_discovery_error(status.into())
+                .into_response()
+                .status(),
+            expected
+        );
+    }
+}

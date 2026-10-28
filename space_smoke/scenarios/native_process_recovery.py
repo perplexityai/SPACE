@@ -11,7 +11,7 @@ from space_smoke.registry import scenario
 from space_smoke.runtime import SubprocessExecutor
 
 
-def _call(test, command, request, *, error=None, code=None):
+def _call(test, command, request, *, error=None, code=None, allow_deadline=False):
     result = SubprocessExecutor().run(
         ["node", "examples/process_recovery.mjs"],
         input_text=json.dumps({
@@ -28,8 +28,11 @@ def _call(test, command, request, *, error=None, code=None):
     elif error is None:
         test.context.verify(response["error"] is None, "recovery operation failed", error=response["error"])
     else:
-        test.context.verify(response["error"] and response["error"].get("reason") == error,
-                            "wrong recovery refusal", error=response["error"])
+        failure = response["error"]
+        test.context.verify(failure and (failure.get("reason") == error or
+                            (allow_deadline and failure.get("code") == 4)),
+                            "wrong recovery refusal", error=failure)
+        return failure
     return response["frames"]
 
 
@@ -67,7 +70,7 @@ def process_recovery(test: NativeHardeningFixture) -> None:
     sandbox = test.create_ready()
     path = f"/v1/sandboxes/{sandbox}"
     discovery = _discovery(test, path)
-    test.context.verify({"process_recovery_start", "process_recovery_handles", "process_mutation_receipts"}
+    test.context.verify({"process_recovery_start", "process_recovery_handles", "process_mutation_receipts", "process_output_gap_resume"}
                         <= set(discovery["capabilities"]), "recovery not advertised")
     test.context.verify(bool(discovery["activation_id"]) and discovery["idempotency_retention_ms"] > 0,
                         "missing recovery retry bounds")
@@ -159,7 +162,10 @@ def process_recovery(test: NativeHardeningFixture) -> None:
         pending_input = {"type": "recovery_input", "handle": blocked_handle,
                          "sequence": 1, "data_base64": base64.b64encode(b"x" * (512 * 1024)).decode()}
         with ThreadPoolExecutor(max_workers=1) as writes:
-            writing = writes.submit(_call, test, blocked, pending_input, error="input_outcome_uncertain")
+            # A transport deadline can lose the reply while the engine still owns
+            # the write. The receipt after rearm, not timing of this reply, proves it.
+            writing = writes.submit(_call, test, blocked, pending_input,
+                                    error="input_outcome_uncertain", allow_deadline=True)
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 observed = test.request("POST", path + "/files:stat", body={"path": consumed})
@@ -169,10 +175,9 @@ def process_recovery(test: NativeHardeningFixture) -> None:
                 time.sleep(0.1)
             else:
                 raise AssertionError("stdin write did not reach the child")
-            test.context.verify(not writing.done(), "input did not block before pause")
             operation = test.request("POST", path + ":pause", idempotency_key=test.key("blocked-pause")).require(202)
             test.wait_operation(operation["operation_id"])
-            writing.result(timeout=5)
+            first_result = writing.result(timeout=35)
         test.wait_sandbox(sandbox, "paused")
         operation = test.request("POST", path + ":resume", idempotency_key=test.key("blocked-resume")).require(202)
         test.wait_operation(operation["operation_id"])
@@ -181,7 +186,11 @@ def process_recovery(test: NativeHardeningFixture) -> None:
         test.context.verify(resumed["instance_id"] == discovery["instance_id"] and
                             resumed["activation_id"] == discovery["activation_id"],
                             "resident pause changed recovery identity")
-        _call(test, blocked, pending_input, error="input_outcome_uncertain")
+        receipt = _call(test, blocked, pending_input, error="input_outcome_uncertain")
+        test.context.verify(0 < receipt["input_written"] < 512 * 1024,
+                            "blocked input did not preserve its written prefix")
+        if first_result.get("reason") == "input_outcome_uncertain":
+            test.context.verify(first_result == receipt, "input receipt changed after rearm")
         _call(test, blocked, {"type": "recovery_signal", "handle": blocked_handle,
                               "sequence": 2, "signal": 9})
 

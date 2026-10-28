@@ -47,6 +47,7 @@ pub struct ControllerError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControllerErrorKind {
     General,
+    SandboxNotRunning,
     SandboxAlreadyExists,
     RestoreContextUnavailable,
     /// A database statement lost a race for a lock. Carried so the public and
@@ -125,6 +126,10 @@ impl ControllerError {
             refused_before_start: false,
             guest_path_not_found: false,
         }
+    }
+
+    pub(crate) fn is_sandbox_not_running(&self) -> bool {
+        matches!(self.kind, ControllerErrorKind::SandboxNotRunning)
     }
 
     /// Whether the backend said it refused this request before doing any of
@@ -506,6 +511,9 @@ impl From<tonic::Status> for ControllerError {
             http_status_for_grpc_code(status.code()),
             status.message().to_owned(),
         );
+        if pplx_space_common_grpc::sandbox_not_running_state(&status).is_some() {
+            error.kind = ControllerErrorKind::SandboxNotRunning;
+        }
         error.refused_before_start = pplx_space_common_grpc::is_refused_before_start(&status);
         error.guest_path_not_found = pplx_space_common_grpc::is_guest_path_not_found(&status);
         match pplx_space_common_grpc::retry_after(&status) {

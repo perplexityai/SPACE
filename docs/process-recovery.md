@@ -57,10 +57,12 @@ Connect to `attach.url`, resolved against your configured data-plane origin.
 Validate the destination before sending the session's `attach.token`; never send
 it to a redirect or an unverified origin. Offer the WebSocket subprotocol
 `space.process-recovery.v1` and require that exact acknowledgement before sending
-credentials or requests. An older data plane cannot acknowledge it: close the
+an attach frame or operation. An older data plane cannot acknowledge it: close the
 connection and never fall back to a legacy frame. Authenticate with the existing
-`{"type":"attach","token":"…"}` frame or authorization header. After the
-server's `attached` frame, send exactly one recovery request:
+`{"type":"attach","token":"…"}` frame after acknowledgement. Authorization-header
+authentication is also supported, but sends the credential in the upgrade request,
+before acknowledgement. After the server's `attached` frame, send exactly one
+recovery request:
 
 | Request type | Fields | Result |
 | --- | --- | --- |
@@ -76,7 +78,9 @@ A handle contains `instance_id`, `activation_id`, `process_id` and
 cannot be used through another command session or retargeted to a new activation.
 The transport never starts a process on attach or reconnect, changes fences,
 retries a dispatched operation, or falls back to legacy calls. SSE does not
-support recovery commands and refuses them before starting work.
+support recovery commands and refuses them before starting work. Each explicit
+operation refreshes its route before its single backend dispatch, including after
+a restore; this lookup does not retry an effect.
 
 Each successful request ends with `recovery_complete`. A `recovery_error` carries
 the numeric gRPC code, an optional stable recovery `reason`, and `input_written`

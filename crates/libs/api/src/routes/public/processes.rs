@@ -78,7 +78,7 @@ pub async fn get_process_execution(
             None,
         )
         .await
-        .map_err(controller_error)?;
+        .map_err(process_discovery_error)?;
     let info = ready.process_execution.ok_or_else(|| {
         PublicApiError::failed_precondition("process recovery discovery is unavailable")
     })?;
@@ -318,6 +318,14 @@ async fn ensure_sandbox_owner(
 ) -> Result<Sandbox, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(sandbox_id)?;
     authorized_sandbox(authorized, &state.pool, org_id, sandbox_id).await
+}
+
+fn process_discovery_error(error: ControllerError) -> PublicApiError {
+    if error.is_sandbox_not_running() {
+        PublicApiError::service_unavailable("sandbox is not ready for process discovery")
+    } else {
+        controller_error(error)
+    }
 }
 
 pub(in crate::routes::public) fn controller_error(error: ControllerError) -> PublicApiError {

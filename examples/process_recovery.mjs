@@ -37,7 +37,7 @@ export async function recoveryRequest({dataPlaneUrl, attach, request, timeoutMs 
       socket.close();
       if (error) reject(error); else resolve();
     };
-    const timer = setTimeout(() => finish(new Error('request deadline elapsed; outcome may be uncertain')), timeoutMs);
+    const timer = setTimeout(() => finish(new Error(attached ? 'request deadline elapsed; outcome may be uncertain' : 'attachment deadline elapsed; request not sent')), timeoutMs);
     socket.addEventListener('open', () => {
       if (socket.protocol !== protocol) return finish(new Error('data plane does not support process recovery'));
       socket.send(JSON.stringify({type: 'attach', token: attach.token}));
@@ -68,8 +68,8 @@ export async function recoveryRequest({dataPlaneUrl, attach, request, timeoutMs 
         onEvent(frame);
       } catch (error) { finish(error); }
     });
-    socket.addEventListener('error', () => finish(new Error('transport failed; outcome may be uncertain')));
-    socket.addEventListener('close', () => finish(new Error('stream ended without completion; outcome may be uncertain')));
+    socket.addEventListener('error', () => finish(new Error(attached ? 'transport failed; outcome may be uncertain' : 'recovery handshake or attachment failed; request not sent')));
+    socket.addEventListener('close', () => finish(new Error(attached ? 'stream ended without completion; outcome may be uncertain' : 'connection closed before attachment; request not sent')));
   });
 }
 

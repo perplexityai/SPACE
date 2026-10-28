@@ -88,6 +88,10 @@ pub(crate) async fn handle_socket(
         protocol == pplx_space_public_api::recovery::RECOVERY_WEBSOCKET_PROTOCOL
     });
     if recovery_session != recovery_protocol {
+        pplx_space_metrics::data_plane::attach(
+            session_id.kind().as_str(),
+            "unsupported_session_kind",
+        );
         state.revocation_cache.forget(session_id);
         close_with_error(socket, DataPlaneErrorCode::UnsupportedSessionKind, false).await;
         return;
