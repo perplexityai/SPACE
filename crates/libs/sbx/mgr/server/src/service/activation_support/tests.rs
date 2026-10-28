@@ -914,3 +914,144 @@ async fn activation_env_retry_does_not_overwrite_a_replaced_execution_or_configu
         assert_eq!(calls.get(), 1);
     }
 }
+
+async fn commit_start(service: &SandboxManagerService, id: &str) {
+    complete_start_after_readiness(
+        service.db.clone(),
+        id,
+        &BTreeMap::new(),
+        30,
+        "start",
+        None,
+        StartReadiness {
+            guest: std::future::ready(Ok(
+                pplx_space_spaced_host_client::proto::WaitReadyResponse::default(),
+            )),
+            policy: None::<std::future::Ready<Result<(), Status>>>,
+        },
+    )
+    .await
+    .expect("the start commits");
+}
+
+// The paused clock in these tests moves only while every task waits on a
+// timer, so elapsed time shows whether a waiter noticed a commit through the
+// signal (no time) or through its next 200 ms re-read of the row.
+
+#[tokio::test(start_paused = true)]
+async fn guest_activity_waiting_on_a_start_proceeds_when_the_start_commits() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Starting);
+    let service = SandboxManagerService::for_test(conn);
+    let waiter = service.ensure_active_for_guest_activity_with_start(
+        None,
+        &id,
+        false,
+        None,
+        GuestActivityKind::Command,
+        WakeStartConfig::default(),
+    );
+    tokio::pin!(waiter);
+    assert!(futures_util::poll!(&mut waiter).is_pending());
+
+    let committed_at = tokio::time::Instant::now();
+    commit_start(&service, &id).await;
+    let row = waiter
+        .await
+        .expect("guest activity proceeds once the start commits");
+    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(committed_at.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_start_that_commits_after_the_starting_read_ends_the_wait() {
+    let notify = tokio::sync::Notify::new();
+    let started_at = tokio::time::Instant::now();
+    wait_while_starting(&notify, Duration::from_millis(200), || {
+        // The start commits after the read saw `Starting` and before the
+        // wait is first polled.
+        notify.notify_waiters();
+        Ok(true)
+    })
+    .await
+    .expect("the wait ends");
+    assert_eq!(started_at.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_sandboxs_start_does_not_end_a_starting_wait() {
+    let conn = crate::db::test_conn();
+    let waiting = SandboxId::new().to_string();
+    let other = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &waiting, SandboxState::Starting);
+    insert_test_sandbox(&conn, &other, SandboxState::Starting);
+    let service = SandboxManagerService::for_test(conn);
+    let waiter = service.ensure_active_for_guest_activity_with_start(
+        None,
+        &waiting,
+        false,
+        None,
+        GuestActivityKind::Command,
+        WakeStartConfig::default(),
+    );
+    tokio::pin!(waiter);
+    assert!(futures_util::poll!(&mut waiter).is_pending());
+
+    commit_start(&service, &other).await;
+    tokio::select! {
+        biased;
+        result = &mut waiter => panic!(
+            "the other sandbox's start ended the wait: {:?}",
+            result.map(|row| row.state)
+        ),
+        () = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+
+    let committed_at = tokio::time::Instant::now();
+    commit_start(&service, &waiting).await;
+    let row = waiter
+        .await
+        .expect("guest activity proceeds once its own start commits");
+    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(committed_at.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_start_does_not_wake_a_waiter_on_another_transition() {
+    let conn = crate::db::test_conn();
+    let restoring = SandboxId::new().to_string();
+    let starting = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &restoring, SandboxState::Restoring);
+    insert_test_sandbox(&conn, &starting, SandboxState::Starting);
+    let service = SandboxManagerService::for_test(conn);
+    let waiter = service.ensure_active_for_guest_activity_with_start(
+        None,
+        &restoring,
+        false,
+        None,
+        GuestActivityKind::Command,
+        WakeStartConfig::default(),
+    );
+    tokio::pin!(waiter);
+    assert!(futures_util::poll!(&mut waiter).is_pending());
+    let waiting_since = tokio::time::Instant::now();
+
+    // Restore completion is not signalled, so only a wake from the start
+    // below would let the waiter see `Started` before its re-read.
+    assert!(
+        crate::db::mark_restore_succeeded(
+            &service.db.lock().unwrap(),
+            &restoring,
+            SandboxState::Started,
+            None,
+        )
+        .unwrap()
+    );
+    commit_start(&service, &starting).await;
+    let row = waiter
+        .await
+        .expect("guest activity proceeds once the restore commits");
+    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(waiting_since.elapsed(), Duration::from_millis(200));
+}

@@ -23,6 +23,17 @@ use super::tail_support::*;
 use super::validation::duration_ceil_secs;
 use super::*;
 
+/// How long a waiter on another owner's transition sleeps before re-reading
+/// the row: 200 ms, or less when the wake budget is nearly spent.
+fn transition_poll_interval(
+    deadline: Option<tokio::time::Instant>,
+    state: SandboxState,
+) -> Result<Duration, Status> {
+    Ok(remaining_wake_budget(deadline, state)?
+        .map(|remaining| remaining.min(Duration::from_millis(200)))
+        .unwrap_or(Duration::from_millis(200)))
+}
+
 pub(super) const WAKE_ROUTE_SECURITY_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const WAKE_ROUTE_SECURITY_CONNECT_RETRY_POLICY: pplx_space_common_grpc::GrpcRetryPolicy =
     pplx_space_common_grpc::GrpcRetryPolicy {
@@ -726,8 +737,24 @@ impl SandboxManagerService {
                     )
                     .await?;
                 }
+                SandboxState::Starting => {
+                    // Another owner is starting the sandbox; its commit ends
+                    // the wait at once.
+                    let poll_interval = transition_poll_interval(wait_deadline, sandbox.state)?;
+                    wait_for_activation_admission(
+                        &sandbox.id,
+                        super::activation_support::wait_while_starting(
+                            super::activation_support::start_succeeded_notify(),
+                            poll_interval,
+                            || {
+                                Ok(self.lookup_sandbox(&sandbox.id)?.state
+                                    == SandboxState::Starting)
+                            },
+                        ),
+                    )
+                    .await??;
+                }
                 SandboxState::Creating
-                | SandboxState::Starting
                 | SandboxState::Pausing
                 | SandboxState::Resuming
                 | SandboxState::Checkpointing
@@ -735,9 +762,7 @@ impl SandboxManagerService {
                 | SandboxState::Restoring
                 | SandboxState::Stopping
                 | SandboxState::CleanupRequired => {
-                    let sleep_for = remaining_wake_budget(wait_deadline, sandbox.state)?
-                        .map(|remaining| remaining.min(Duration::from_millis(200)))
-                        .unwrap_or(Duration::from_millis(200));
+                    let sleep_for = transition_poll_interval(wait_deadline, sandbox.state)?;
                     wait_for_activation_admission(&sandbox.id, tokio::time::sleep(sleep_for))
                         .await?;
                 }

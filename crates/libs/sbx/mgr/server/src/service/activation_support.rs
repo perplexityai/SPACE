@@ -1189,6 +1189,41 @@ pub(super) fn evaluate_start_gate(
     }
 }
 
+/// Signalled each time `complete_start_after_readiness` commits `Started`, so
+/// a caller waiting in `ensure_active_with_start` on a `Starting` row (guest
+/// activity or a blocking Wake) proceeds at once instead of at its next
+/// re-read of the row. Restore completion, which also finishes a start served
+/// from a base snapshot, is not signalled. One signal serves every sandbox on
+/// the node: a waiter woken for another sandbox repeats one pass of its wait
+/// loop.
+pub(super) fn start_succeeded_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+pub(super) fn notify_start_succeeded() {
+    start_succeeded_notify().notify_waiters();
+}
+
+/// Waits up to `poll_interval`, or until `notify` fires, while
+/// `still_starting` reports the row it reads is `Starting`. The wait is
+/// created before that read, so a start that commits after the read still
+/// ends it.
+pub(super) async fn wait_while_starting(
+    notify: &tokio::sync::Notify,
+    poll_interval: Duration,
+    still_starting: impl FnOnce() -> Result<bool, Status>,
+) -> Result<(), Status> {
+    let committed = notify.notified();
+    if still_starting()? {
+        tokio::select! {
+            () = tokio::time::sleep(poll_interval) => {}
+            () = committed => {}
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn wait_ready_and_mark_started(
     db: crate::db::SharedConnection,
     sandbox_id: &str,
@@ -1352,6 +1387,7 @@ where
                     .guest_uptime_ms(guest_uptime_ms.to_string())
                     .elapsed_ms(ready_elapsed.as_millis().to_string()),
             );
+            notify_start_succeeded();
             Ok(())
         }
         StartGate::GuestNotReady(error) => {
