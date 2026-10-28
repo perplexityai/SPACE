@@ -28,6 +28,7 @@ use tonic::Status;
 use crate::node_publish::validate::delete_completions::{
     DeleteCompletionClaim as ParsedCompletion, ValidatedDeleteCompletions,
 };
+#[cfg(test)]
 use crate::proto::AutoLifecycleDeleteCompletion;
 
 #[derive(Debug, FromRow)]
@@ -173,7 +174,8 @@ fn is_retryable_finalize_error(error: &sqlx::Error) -> bool {
     contention::is_lock_contention(error)
 }
 
-pub(super) async fn consume_auto_lifecycle_delete_completions(
+#[cfg(test)]
+async fn consume_auto_lifecycle_delete_completions(
     tx: &mut Transaction<'_, Postgres>,
     origin_node_id: NodeId,
     completions: &[AutoLifecycleDeleteCompletion],

@@ -2,7 +2,35 @@ use pplx_space_common_core::types::SandboxId;
 
 use crate::metadata::parse_sandbox_id;
 use crate::node_publish::diagnostics::InvalidCensusIdentity;
-use crate::proto::PublishedSandboxState;
+use crate::optional_trimmed;
+use crate::proto::{PublishedSandboxState, PublishedTemplateState};
+
+/// Pruning keys use the inventory's open legacy labels, not the stricter
+/// creation-name or digest grammars. Storage alone consumes their SQL encoding.
+#[derive(Debug)]
+pub(crate) struct TemplateCensus {
+    present_keys: Vec<(String, String)>,
+}
+
+impl TemplateCensus {
+    pub(crate) fn from_proto(states: &[PublishedTemplateState]) -> Self {
+        let present_keys = states
+            .iter()
+            .filter(|template| template.present)
+            .filter_map(|template| {
+                let name = optional_trimmed(Some(&template.template))?;
+                let content_hash =
+                    optional_trimmed(template.content_hash.as_deref()).unwrap_or_default();
+                Some((name, content_hash))
+            })
+            .collect();
+        Self { present_keys }
+    }
+
+    pub(crate) fn legacy_keys(&self) -> &[(String, String)] {
+        &self.present_keys
+    }
+}
 
 /// The node's completeness claim is distinct from permission to prune. An
 /// invalid complete report must still withdraw backup-census certification.
