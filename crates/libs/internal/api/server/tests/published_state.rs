@@ -430,6 +430,12 @@ async fn sandbox_failure_episode_provenance_is_recorded_and_cleared() -> TestRes
     publish_sandbox_states(&mut conn, node_id, &[failed]).await?;
     drop(conn);
 
+    // An empty census carries no evidence to replace or clear this episode.
+    // Later nonempty publications below still exercise both guarded writes.
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, node_id, &[]).await?;
+    drop(conn);
+
     let sqlx::types::Json(payload): sqlx::types::Json<serde_json::Value> =
         sqlx::query_scalar(sql!(
             "SELECT observed_payload

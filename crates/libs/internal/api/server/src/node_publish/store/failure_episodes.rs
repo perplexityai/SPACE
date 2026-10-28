@@ -24,6 +24,9 @@ pub(crate) async fn reconcile(
     node_id: NodeId,
     claims: &[FailureEpisodeClaim],
 ) -> Result<bool, ReconcileFailureEpisodesError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
     let rows = Json(serde_json::Value::Array(
         claims.iter().map(FailureEpisodeClaim::legacy_row).collect(),
     ));
