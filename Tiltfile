@@ -348,9 +348,10 @@ custom_build(
 # SPACE_SEED_OUTPUT_DIR (default below), and the image is built from what it
 # wrote. The seed-artifacts resource below runs the same SEED_BUILD, with the
 # same resolution, earlier. The docker build reads that directory under
-# build-seed.sh's lock (--read-lock), so a seed build that starts once
-# build-seed.sh has returned here waits for the image instead of rewriting the
-# directory under it.
+# build-seed.sh's lock (--read-lock). A seed build either finishes before the
+# image build reads the directory, and the image gets its output, or waits
+# until the image is built. None rewrites the directory while the image build
+# reads it.
 SEED_BUILD = " && ".join([
     'seed_dir="${SPACE_SEED_OUTPUT_DIR:-$HOME/.space-devbox/kind/seed/build}"',
     'SPACE_SEED_OUTPUT_DIR="$seed_dir" SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh'.format(

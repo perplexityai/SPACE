@@ -84,7 +84,7 @@ seed_lock() { # -x | -s
   mkdir -p "$OUT_DIR"
   exec 7>>"$SEED_LOCK"
   if ! flock -n "$1" 7; then
-    log "another seed build holds $SEED_LOCK; waiting for it"
+    log "$SEED_LOCK is held (a seed build, or an image build reading the directory); waiting"
     flock "$1" 7
   fi
 }
