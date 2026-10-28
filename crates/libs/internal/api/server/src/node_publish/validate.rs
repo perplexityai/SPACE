@@ -10,4 +10,5 @@ pub(crate) mod node_status;
 pub(crate) mod quarantine;
 pub(crate) mod receipts;
 pub(crate) mod sandbox_identity;
+pub(crate) mod snapshots;
 pub(crate) mod templates;
