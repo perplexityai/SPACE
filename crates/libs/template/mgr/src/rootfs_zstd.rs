@@ -4,6 +4,8 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use pplx_space_stopwatch::{Stopwatch, measure};
+
 use pplx_space_common_core::types::{
     Digest, DigestParseError, HashAlg, TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_FILE,
     TEMPLATE_ROOTFS_ZSTD_LEVEL,
@@ -31,9 +33,9 @@ const MAX_ENCODER_WORKERS: u32 = 16;
 struct StageTiming {
     span: tracing::Span,
     started: Instant,
-    busy: Duration,
-    recv_wait: Duration,
-    send_wait: Duration,
+    busy: Stopwatch,
+    recv_wait: Stopwatch,
+    send_wait: Stopwatch,
     bytes: u64,
 }
 
@@ -75,15 +77,15 @@ impl StageTiming {
                 hole_bytes = tracing::field::Empty,
             ),
             started: Instant::now(),
-            busy: Duration::ZERO,
-            recv_wait: Duration::ZERO,
-            send_wait: Duration::ZERO,
+            busy: Stopwatch::new(),
+            recv_wait: Stopwatch::new(),
+            send_wait: Stopwatch::new(),
             bytes: 0,
         }
     }
 
     fn total(&self) -> Duration {
-        self.busy + self.recv_wait + self.send_wait
+        self.busy.elapsed() + self.recv_wait.elapsed() + self.send_wait.elapsed()
     }
 
     fn record_ms(&self, field: &'static str, elapsed: Duration) {
@@ -93,9 +95,9 @@ impl StageTiming {
 
 impl Drop for StageTiming {
     fn drop(&mut self) {
-        self.record_ms("busy_ms", self.busy);
-        self.record_ms("recv_wait_ms", self.recv_wait);
-        self.record_ms("send_wait_ms", self.send_wait);
+        self.record_ms("busy_ms", self.busy.elapsed());
+        self.record_ms("recv_wait_ms", self.recv_wait.elapsed());
+        self.record_ms("send_wait_ms", self.send_wait.elapsed());
         self.record_ms("wall_ms", self.started.elapsed());
         self.span.record("bytes", self.bytes);
     }
@@ -110,18 +112,6 @@ fn spawn_in_current_span<T: Send + 'static>(
     thread::Builder::new()
         .name(name.to_string())
         .spawn(move || span.in_scope(work))
-}
-
-/// Iterate a channel until it closes, adding each blocking receive to `wait`.
-fn timed_recv<'a, T>(rx: &'a Receiver<T>, wait: &'a mut Duration) -> impl Iterator<Item = T> + 'a {
-    std::iter::from_fn(move || timed(wait, || rx.recv().ok()))
-}
-
-fn timed<T>(elapsed: &mut Duration, operation: impl FnOnce() -> T) -> T {
-    let started = Instant::now();
-    let result = operation();
-    *elapsed += started.elapsed();
-    result
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -459,9 +449,9 @@ fn decode_rootfs_chunks(
     pipeline: MaterializationPipeline,
 ) -> Result<(MaterializationPipeline, u64), RootfsZstdError> {
     let mut timing = StageTiming::new(RootfsStage::Decode);
-    let mut read_time = Duration::ZERO;
+    let mut read_time = Stopwatch::new();
     loop {
-        let Ok(buffer) = timed(&mut timing.recv_wait, || free_rx.recv()) else {
+        let Ok(buffer) = timing.recv_wait.time(|| free_rx.recv()) else {
             return Err(pipeline.abort(RootfsZstdError::Pipeline {
                 operation: "wait for reusable decode buffer",
             }));
@@ -472,14 +462,13 @@ fn decode_rootfs_chunks(
             }));
         }
         let input_before = decoder.get_ref().timing.total();
-        let read_before = read_time;
-        let result = timed(&mut read_time, || {
-            read_decoded_rootfs_chunk(decoder, buffer)
-        });
+        let (result, read) = measure(|| read_decoded_rootfs_chunk(decoder, buffer));
+        read_time.add(read);
         // zstd reads include input I/O and compressed-hash backpressure.
         // Attribute those to compressed_input instead of calling them decode.
-        timing.busy += (read_time - read_before)
-            .saturating_sub(decoder.get_ref().timing.total() - input_before);
+        timing
+            .busy
+            .add(read.saturating_sub(decoder.get_ref().timing.total() - input_before));
         let chunk = match result {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
@@ -491,13 +480,17 @@ fn decode_rootfs_chunks(
             }
         };
         timing.bytes += usize_to_u64_saturating(chunk.len);
-        if timed(&mut timing.send_wait, || pipeline.send_decoded(chunk)).is_err() {
+        if timing
+            .send_wait
+            .time(|| pipeline.send_decoded(chunk))
+            .is_err()
+        {
             return Err(pipeline.abort(RootfsZstdError::Pipeline {
                 operation: "send decoded rootfs chunk to hash stage",
             }));
         }
     }
-    timing.record_ms("read_ms", read_time);
+    timing.record_ms("read_ms", read_time.elapsed());
     Ok((pipeline, timing.bytes))
 }
 
@@ -591,15 +584,15 @@ pub(crate) fn hash_rootfs_file(
     let mut rootfs_hasher = ContentHasher::new(algorithm);
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut timing = StageTiming::new(RootfsStage::RawHash);
-    let mut read_time = Duration::ZERO;
+    let mut read_time = Stopwatch::new();
     loop {
-        let read = timed(&mut read_time, || reader.read(&mut buffer)).map_err(|source| {
-            RootfsZstdError::Io {
+        let read = read_time
+            .time(|| reader.read(&mut buffer))
+            .map_err(|source| RootfsZstdError::Io {
                 operation: "hash rootfs",
                 path: rootfs_path.display().to_string(),
                 source,
-            }
-        })?;
+            })?;
         if read == 0 {
             break;
         }
@@ -608,15 +601,15 @@ pub(crate) fn hash_rootfs_file(
             path: rootfs_path.display().to_string(),
             source: invalid_data("read byte count exceeded rootfs hash buffer"),
         })?;
-        timed(&mut timing.busy, || rootfs_hasher.update(bytes));
+        timing.busy.time(|| rootfs_hasher.update(bytes));
         rootfs_size = rootfs_size.saturating_add(usize_to_u64_saturating(read));
         timing.bytes = rootfs_size;
     }
-    timing.record_ms("read_ms", read_time);
+    timing.record_ms("read_ms", read_time.elapsed());
     tracing::Span::current().record("decoded_bytes", rootfs_size);
     let _finalize = tracing::info_span!("rootfs.finalize").entered();
     page_cache::advise_dontneed(reader.get_ref(), rootfs_path, "hash rootfs input");
-    let hash = timed(&mut timing.busy, || rootfs_hasher.finish().to_string());
+    let hash = timing.busy.time(|| rootfs_hasher.finish().to_string());
     Ok((hash, rootfs_size))
 }
 
@@ -791,32 +784,35 @@ impl<R: Read> HashedCompressedInput<R> {
         self.position = 0;
         let mut chunk = match self.spare.take() {
             Some(chunk) => chunk,
-            None => timed(&mut self.timing.recv_wait, || self.free_rx.recv())
+            None => self
+                .timing
+                .recv_wait
+                .time(|| self.free_rx.recv())
                 .map_err(|_| invalid_data("compressed hash stage stopped"))?,
         };
         let Some(filled) = std::sync::Arc::get_mut(&mut chunk) else {
             return Err(invalid_data("compressed input buffer still shared"));
         };
         filled.len = 0;
-        let read_started = Instant::now();
-        while filled.len < filled.buffer.len() {
-            let Some(tail) = filled.buffer.get_mut(filled.len..) else {
-                break;
-            };
-            match self.inner.read(tail) {
-                Ok(0) => {
-                    self.eof = true;
+        self.timing.busy.time(|| {
+            while filled.len < filled.buffer.len() {
+                let Some(tail) = filled.buffer.get_mut(filled.len..) else {
                     break;
-                }
-                Ok(read) => filled.len = filled.len.saturating_add(read),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    self.pending_error = Some(error);
-                    break;
+                };
+                match self.inner.read(tail) {
+                    Ok(0) => {
+                        self.eof = true;
+                        break;
+                    }
+                    Ok(read) => filled.len = filled.len.saturating_add(read),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        self.pending_error = Some(error);
+                        break;
+                    }
                 }
             }
-        }
-        self.timing.busy += read_started.elapsed();
+        });
         self.timing.bytes += usize_to_u64_saturating(filled.len);
         if filled.len == 0 {
             self.spare = Some(chunk);
@@ -826,10 +822,10 @@ impl<R: Read> HashedCompressedInput<R> {
             .hash_tx
             .as_ref()
             .ok_or_else(|| invalid_data("compressed input read after hashing finished"))?;
-        timed(&mut self.timing.send_wait, || {
-            hash_tx.send(std::sync::Arc::clone(&chunk))
-        })
-        .map_err(|_| invalid_data("compressed hash stage stopped"))?;
+        self.timing
+            .send_wait
+            .time(|| hash_tx.send(std::sync::Arc::clone(&chunk)))
+            .map_err(|_| invalid_data("compressed hash stage stopped"))?;
         self.current = Some(chunk);
         Ok(())
     }
@@ -898,16 +894,16 @@ fn hash_compressed_rootfs_chunks(
 ) -> Result<String, RootfsZstdError> {
     let mut timing = StageTiming::new(RootfsStage::CompressedHash);
     let mut hasher = sha256_hasher();
-    for chunk in timed_recv(&chunk_rx, &mut timing.recv_wait) {
+    for chunk in timing.recv_wait.time_each(chunk_rx) {
         let bytes = chunk.bytes().map_err(|_| RootfsZstdError::Pipeline {
             operation: "read compressed chunk bytes",
         })?;
-        timed(&mut timing.busy, || hasher.update(bytes));
+        timing.busy.time(|| hasher.update(bytes));
         timing.bytes += usize_to_u64_saturating(bytes.len());
         // The reader may have stopped; a closed pool only ends recycling.
-        let _ = timed(&mut timing.send_wait, || free_tx.send(chunk));
+        let _ = timing.send_wait.time(|| free_tx.send(chunk));
     }
-    Ok(timed(&mut timing.busy, || sha256_digest(hasher)))
+    Ok(timing.busy.time(|| sha256_digest(hasher)))
 }
 
 fn write_decoded_rootfs_chunks(
@@ -926,22 +922,25 @@ fn write_decoded_rootfs_chunks(
             }
         })?;
     let mut decoded_size = 0u64;
-    for chunk in timed_recv(&chunk_rx, &mut timing.recv_wait) {
+    for chunk in timing.recv_wait.time_each(chunk_rx) {
         decoded_size = decoded_size.saturating_add(usize_to_u64_saturating(chunk.len));
         let bytes = chunk.bytes()?;
         // Includes zero classification, buffered writes and hole seeks without
         // adding a timer to each sparse block.
-        timed(&mut timing.busy, || sparse_writer.write_all(bytes)).map_err(|source| {
-            RootfsZstdError::Io {
+        timing
+            .busy
+            .time(|| sparse_writer.write_all(bytes))
+            .map_err(|source| RootfsZstdError::Io {
                 operation: "write sparse rootfs temp",
                 path: tmp.display().to_string(),
                 source,
-            }
-        })?;
+            })?;
         timing.bytes = decoded_size;
-        let _ = timed(&mut timing.send_wait, || free_tx.send(chunk.into_buffer()));
+        let _ = timing.send_wait.time(|| free_tx.send(chunk.into_buffer()));
     }
-    let (output, hole_bytes) = timed(&mut timing.busy, || sparse_writer.finish_with_stats())
+    let (output, hole_bytes) = timing
+        .busy
+        .time(|| sparse_writer.finish_with_stats())
         .map_err(|source| RootfsZstdError::Io {
             operation: "finalize sparse rootfs temp",
             path: tmp.display().to_string(),
@@ -963,18 +962,19 @@ fn hash_decoded_rootfs_chunks(
     let mut timing = StageTiming::new(RootfsStage::DecodedHash);
     let mut hasher = ContentHasher::new(algorithm);
     let mut decoded_size = 0u64;
-    for chunk in timed_recv(&chunk_rx, &mut timing.recv_wait) {
+    for chunk in timing.recv_wait.time_each(chunk_rx) {
         decoded_size = decoded_size.saturating_add(usize_to_u64_saturating(chunk.len));
         let bytes = chunk.bytes()?;
-        timed(&mut timing.busy, || hasher.update(bytes));
+        timing.busy.time(|| hasher.update(bytes));
         timing.bytes = decoded_size;
-        timed(&mut timing.send_wait, || writer_tx.send(chunk)).map_err(|_| {
-            RootfsZstdError::Pipeline {
+        timing
+            .send_wait
+            .time(|| writer_tx.send(chunk))
+            .map_err(|_| RootfsZstdError::Pipeline {
                 operation: "send hashed rootfs chunk to sparse writer",
-            }
-        })?;
+            })?;
     }
-    let rootfs_hash = timed(&mut timing.busy, || hasher.finish().to_string());
+    let rootfs_hash = timing.busy.time(|| hasher.finish().to_string());
     Ok(RootfsHashOutput {
         decoded_size,
         rootfs_hash,

@@ -106,6 +106,7 @@ members = [
     "crates/libs/common/core",
     "crates/libs/semver",
     "crates/libs/durations",
+    "crates/libs/stopwatch",
     "crates/libs/common/cli",
     "crates/libs/common/connection/admission",
     "crates/libs/common/grpc",
@@ -352,6 +353,7 @@ pplx-space-build-mgr-server = { path = "crates/libs/build/mgr/server" }
 pplx-space-byte-size = { path = "crates/libs/byte-size" }
 pplx-space-common-core = { path = "crates/libs/common/core" }
 pplx-space-durations = { path = "crates/libs/durations" }
+pplx-space-stopwatch = { path = "crates/libs/stopwatch" }
 pplx-space-common-cli = { path = "crates/libs/common/cli" }
 pplx-space-common-connection-admission = { path = "crates/libs/common/connection/admission" }
 pplx-space-common-grpc = { path = "crates/libs/common/grpc" }

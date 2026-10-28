@@ -7574,6 +7574,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-stopwatch"
+version = "0.8.0"
+
+[[package]]
 name = "pplx-space-systemd-watchdog"
 version = "0.8.0"
 dependencies = [
@@ -7608,6 +7612,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-sbx-mgr-client",
  "pplx-space-sqlite",
+ "pplx-space-stopwatch",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
  "pplx-space-volmgr-client",
