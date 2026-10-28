@@ -14,8 +14,7 @@ use pplx_space_common_core::types::{
     ArtifactKind, ExecutionGeneration, NodeRole, PodUid, PolicyAuthority, RuntimeKind,
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SemVer,
+    SandboxTransitionReceipt, SandboxTransitionReceiptKind, SandboxTransitionTargetState, SemVer,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -49,6 +48,7 @@ use crate::node_publish::validate::fields::{
 use crate::node_publish::validate::quarantine::{
     QuarantineRecoveryProjectionState, quarantine_recovery_projection,
 };
+use crate::node_publish::validate::receipts::{self, PublishedTransitionReceiptError};
 use crate::node_publish::validate::sandbox_identity::SandboxIdentityEvidence;
 use crate::node_publish::validate::templates::template_state_row;
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
@@ -81,13 +81,6 @@ struct AcceptedSandboxPublishRow {
     status_changed: bool,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("invalid {field}: {message}")]
-struct PublishedTransitionReceiptError {
-    field: pplx_space_metrics::sandbox::publication::StatePublicationField,
-    message: String,
-}
-
 fn parse_published_transition_receipt(
     state: &PublishedSandboxState,
 ) -> Result<
@@ -96,161 +89,24 @@ fn parse_published_transition_receipt(
 > {
     use pplx_space_metrics::sandbox::publication::StatePublicationField as Field;
 
-    let Some(receipt) = state.transition_receipt.as_ref() else {
-        return Ok(None);
-    };
-    let required = |value: Option<&str>, field| {
-        optional_trimmed(value).ok_or_else(|| PublishedTransitionReceiptError {
-            field,
-            message: "required receipt field is missing or blank".to_string(),
-        })
-    };
-    let id = required(Some(&receipt.id), Field::TransitionReceiptId)?
-        .parse()
-        .map_err(|error: uuid::Error| PublishedTransitionReceiptError {
-            field: Field::TransitionReceiptId,
-            message: error.to_string(),
-        })?;
-    let kind = required(Some(&receipt.kind), Field::TransitionReceiptKind)?
-        .parse()
-        .map_err(
-            |error: pplx_space_common_core::types::SandboxTransitionReceiptKindParseError| {
-                PublishedTransitionReceiptError {
-                    field: Field::TransitionReceiptKind,
-                    message: error.to_string(),
-                }
-            },
-        )?;
-    let target_state: SandboxTransitionTargetState = required(
-        Some(&receipt.target_state),
-        Field::TransitionReceiptTargetState,
-    )?
-    .parse()
-    .map_err(
-        |error: pplx_space_common_core::types::SandboxTransitionTargetStateParseError| {
-            PublishedTransitionReceiptError {
-                field: Field::TransitionReceiptTargetState,
-                message: error.to_string(),
-            }
-        },
-    )?;
-    let execution_generation =
-        ExecutionGeneration::new(receipt.execution_generation).map_err(|error| {
-            PublishedTransitionReceiptError {
-                field: Field::TransitionReceiptExecutionGeneration,
-                message: error.to_string(),
-            }
-        })?;
-    let reason_code: Option<SandboxQuarantineReasonCode> = if kind
-        == SandboxTransitionReceiptKind::ActivationCompleted
-    {
-        None
-    } else {
-        optional_trimmed(Some(&receipt.reason_code))
-                .map(|reason_value| match reason_value.parse() {
-                    Ok(reason_code) => Ok(reason_code),
-                    Err(error) if kind == SandboxTransitionReceiptKind::ActivationRollback => {
-                        let fallback = match target_state {
-                            SandboxTransitionTargetState::Created => {
-                                SandboxQuarantineReasonCode::CreateInterrupted
-                            }
-                            SandboxTransitionTargetState::Stopped => {
-                                SandboxQuarantineReasonCode::ColdActivationInterrupted
-                            }
-                            SandboxTransitionTargetState::Suspended => {
-                                SandboxQuarantineReasonCode::RestoreActivationInterrupted
-                            }
-                            SandboxTransitionTargetState::Started
-                            | SandboxTransitionTargetState::Paused => {
-                                return Err(PublishedTransitionReceiptError {
-                                    field: Field::TransitionReceiptTargetState,
-                                    message: format!(
-                                        "activation rollback cannot target {target_state}"
-                                    ),
-                                });
-                            }
-                        };
-                        let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::FallbackTransitionReason;
-                        pplx_space_metrics::sandbox::publication::degraded(
-                            pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                            Field::TransitionReceiptReasonCode,
-                            disposition,
-                        );
-                        tracing::warn!(
-                            sandbox_id = %state.sandbox_id,
-                            reason_code = reason_value,
-                            %error,
-                            %disposition,
-                            fallback_reason_code = %fallback,
-                            "using target-specific fallback for a forward-compatible activation rollback reason"
-                        );
-                        Ok(fallback)
-                    }
-                    Err(error) => Err(PublishedTransitionReceiptError {
-                        field: Field::TransitionReceiptReasonCode,
-                        message: error.to_string(),
-                    }),
-                })
-                .transpose()?
-    };
-    let status = optional_trimmed(state.status.as_deref()).unwrap_or_default();
-    if !status.eq_ignore_ascii_case(target_state.as_str()) {
-        return Err(PublishedTransitionReceiptError {
-            field: Field::TransitionReceiptTargetState,
-            message: format!("receipt target {target_state} disagrees with status {status:?}"),
-        });
+    let parsed = receipts::parse(state);
+    if let Some(fallback) = parsed.fallback {
+        let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::FallbackTransitionReason;
+        pplx_space_metrics::sandbox::publication::degraded(
+            pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
+            Field::TransitionReceiptReasonCode,
+            disposition,
+        );
+        tracing::warn!(
+            sandbox_id = %state.sandbox_id,
+            reason_code = fallback.raw_reason,
+            error = %fallback.error,
+            %disposition,
+            fallback_reason_code = %fallback.reason,
+            "using target-specific fallback for a forward-compatible activation rollback reason"
+        );
     }
-    if kind == SandboxTransitionReceiptKind::QuarantineRecovery
-        && reason_code
-            .as_ref()
-            .is_some_and(|reason| reason.automatic_recovery_policy().is_none())
-    {
-        return Err(PublishedTransitionReceiptError {
-            field: Field::TransitionReceiptKind,
-            message: "quarantine recovery requires a reviewed pre-resume reason".to_string(),
-        });
-    }
-    let activation_attempt_id = receipt
-        .activation_attempt_id
-        .as_deref()
-        .map(|value| {
-            value
-                .trim()
-                .parse()
-                .map_err(|error: uuid::Error| PublishedTransitionReceiptError {
-                    field: Field::TransitionReceiptActivationAttemptId,
-                    message: error.to_string(),
-                })
-        })
-        .transpose()?;
-    let receipt = SandboxTransitionReceipt::try_new(
-        id,
-        kind,
-        target_state,
-        execution_generation,
-        reason_code,
-        activation_attempt_id,
-    )
-    .map_err(|error| PublishedTransitionReceiptError {
-        field: match error {
-            SandboxTransitionReceiptInvariantError::MissingActivationAttempt => {
-                Field::TransitionReceiptActivationAttemptId
-            }
-            SandboxTransitionReceiptInvariantError::MissingReasonCode
-            | SandboxTransitionReceiptInvariantError::UnexpectedReasonCode => {
-                Field::TransitionReceiptReasonCode
-            }
-            SandboxTransitionReceiptInvariantError::InvalidActivationCompletionTarget {
-                ..
-            }
-            | SandboxTransitionReceiptInvariantError::InvalidActivationRollbackTarget { .. }
-            | SandboxTransitionReceiptInvariantError::InvalidQuarantineRecoveryTarget { .. } => {
-                Field::TransitionReceiptTargetState
-            }
-        },
-        message: error.to_string(),
-    })?;
-    Ok(Some(receipt))
+    parsed.receipt
 }
 
 struct ObservedStateComparableColumn {
