@@ -1038,7 +1038,7 @@ that parent through blocking tasks and the decompression worker threads.
 `rootfs.verify`, and `rootfs.publish` spans. Setup covers opening the input,
 creating the temporary output and applying its backing policy. Pipeline covers
 decoder/buffer initialization and all concurrent stages through their joins.
-Finalize is a sibling that overlaps the pipeline tail: decoder finish,
+Finalize is a child of pipeline covering its tail: decoder finish,
 compressed-hash finalization/cache advice, and decoded-hash/writer joins.
 Verify precedes publish, which covers rename and stat.
 
@@ -1061,8 +1061,8 @@ on drop, including partial work on errors.
 zstd-read time before subtracting input work. The writer also records
 `data_bytes` and `hole_bytes`, whose sum is its `bytes` on success. These
 describe logical sparse classification, not physical disk allocation or
-durable writes. `decompress_rootfs` records `decoded_bytes` after decode and
-`compressed_bytes` after finalization succeeds.
+durable writes. `decompress_rootfs` records `decoded_bytes` and `compressed_bytes` once the
+pipeline has joined successfully.
 
 The uncompressed-only path uses `rootfs.raw_setup` for backing-policy work,
 then `hash_rootfs_file` with setup, raw-hash stage and finalize spans.
