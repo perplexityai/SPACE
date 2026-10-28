@@ -1,4 +1,6 @@
 use pplx_space_common_core::env::{Environment, ProcessEnvironment};
+
+pub mod publish_load;
 use pplx_space_common_core::types::{
     LocalArtifactId, NodeId, OrgId, SandboxId, SnapshotId, UserId,
 };

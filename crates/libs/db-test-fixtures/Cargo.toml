@@ -15,7 +15,9 @@ workspace = true
 # feature enabled here unifies into every release build that resolves the
 # whole workspace. The crate reads its own variables directly instead.
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
-sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
+pplx-space-sql-locator = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["postgres"] }
 thiserror = { workspace = true }

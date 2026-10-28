@@ -5794,7 +5794,9 @@ name = "pplx-space-db-test-fixtures"
 version = "0.8.0"
 dependencies = [
  "pplx-space-common-core",
+ "pplx-space-sql-locator",
  "pplx-space-test-env",
+ "serde_json",
  "sqlx",
  "tempfile",
  "testcontainers",
@@ -6871,6 +6873,30 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-publish-load"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jiff",
+ "nix 0.31.3",
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-node-api-client",
+ "pplx-space-rustls-provider",
+ "pplx-space-sbx-mgr-client",
+ "pplx-space-sql-locator",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tonic",
  "uuid",
 ]
 
@@ -9796,6 +9822,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -9937,6 +9964,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls-native-certs",
  "socket2",
  "sync_wrapper",
  "tokio",

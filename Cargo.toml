@@ -169,6 +169,7 @@ members = [
     "crates/libs/vol/mgr/client",
     "crates/libs/vol/mgr/server",
     "crates/tools/archcheck",
+    "crates/tools/publish-load",
 ]
 
 [workspace.package]
