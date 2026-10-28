@@ -443,6 +443,35 @@ pub(super) async fn select_activation_rollback_candidates(
     if claims.is_empty() {
         return Ok(Vec::new());
     }
+    let ids: Vec<_> = claims.iter().map(|claim| claim.sandbox_id).collect();
+    let statuses: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.status.map(|status| status.as_str()))
+        .collect();
+    let receipts: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.receipt_id.as_uuid())
+        .collect();
+    let targets: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.target_state.as_str())
+        .collect();
+    let generations: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.execution_generation.get())
+        .collect();
+    let attempts: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.activation_attempt_id.as_uuid())
+        .collect();
+    let reasons: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.reason_code.as_str())
+        .collect();
+    let failures: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.failure_reason.as_deref())
+        .collect();
     type CandidateRow = (
         SandboxId,
         SandboxCleanupEpisodeId,
@@ -463,22 +492,13 @@ pub(super) async fn select_activation_rollback_candidates(
                 LOWER(TRIM(s.lifecycle)),
                 input.failure_reason
            FROM sandboxes s
-           JOIN jsonb_to_recordset($2::jsonb) AS input(
-               sandbox_id UUID,
-               status TEXT,
-               transition_receipt_id UUID,
-               transition_receipt_kind TEXT,
-               transition_receipt_target_state TEXT,
-               transition_receipt_execution_generation BIGINT,
-               transition_receipt_reason_code TEXT,
-               transition_receipt_recovery_policy TEXT,
-               transition_receipt_activation_attempt_id UUID,
-               failure_reason TEXT,
-               current_local_artifact_id UUID,
-               current_local_artifact_kind TEXT,
-               current_local_artifact_origin TEXT,
-               execution_generation BIGINT,
-               pod_uid TEXT
+           JOIN UNNEST(
+               $2::UUID[], $3::TEXT[], $4::UUID[], $5::TEXT[],
+               $6::BIGINT[], $7::UUID[], $8::TEXT[], $9::TEXT[]
+           ) AS input(
+               sandbox_id, status, transition_receipt_id, transition_receipt_target_state,
+               transition_receipt_execution_generation, transition_receipt_activation_attempt_id,
+               transition_receipt_reason_code, failure_reason
            )
              ON input.sandbox_id = s.id
            JOIN sandbox_k8s_executions execution
@@ -487,7 +507,6 @@ pub(super) async fn select_activation_rollback_candidates(
             AND execution.generation = input.transition_receipt_execution_generation
             AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
           WHERE s.active_node_id = $1
-            AND input.transition_receipt_kind = $3
             AND LOWER(TRIM(input.status)) = input.transition_receipt_target_state
             AND input.transition_receipt_target_state IN ('created', 'stopped', 'suspended')
             AND LOWER(TRIM(s.lifecycle)) NOT IN (
@@ -496,8 +515,14 @@ pub(super) async fn select_activation_rollback_candidates(
           FOR UPDATE OF s, execution"
     ))
     .bind(node_id)
-    .bind(Json(claims))
-    .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
+    .bind(ids)
+    .bind(statuses)
+    .bind(receipts)
+    .bind(targets)
+    .bind(generations)
+    .bind(attempts)
+    .bind(reasons)
+    .bind(failures)
     .fetch_all(&mut *conn)
     .await
     .map_err(SelectActivationRollbacksError::Select)?;

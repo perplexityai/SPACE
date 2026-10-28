@@ -32,25 +32,16 @@ impl ActivationCompletionClaim {
 }
 
 /// Rollback evidence retains the receipt identity and diagnostic used by history.
-#[derive(Debug, serde::Serialize)]
-#[serde(tag = "transition_receipt_kind", rename = "activation_rollback")]
+#[derive(Debug)]
 pub(crate) struct ActivationRollbackClaim {
-    sandbox_id: SandboxId,
-    status: Option<SandboxLifecycle>,
-    #[serde(rename = "transition_receipt_id")]
-    receipt_id: SandboxCleanupEpisodeId,
-    #[serde(rename = "transition_receipt_target_state")]
-    target_state: SandboxTransitionTargetState,
-    #[serde(rename = "transition_receipt_execution_generation")]
-    execution_generation: ExecutionGeneration,
-    #[serde(rename = "transition_receipt_activation_attempt_id")]
-    activation_attempt_id: SandboxActivationAttemptId,
-    #[serde(
-        rename = "transition_receipt_reason_code",
-        serialize_with = "serialize_reason"
-    )]
-    reason_code: SandboxQuarantineReasonCode,
-    failure_reason: Option<String>,
+    pub(crate) sandbox_id: SandboxId,
+    pub(crate) status: Option<SandboxLifecycle>,
+    pub(crate) receipt_id: SandboxCleanupEpisodeId,
+    pub(crate) target_state: SandboxTransitionTargetState,
+    pub(crate) execution_generation: ExecutionGeneration,
+    pub(crate) activation_attempt_id: SandboxActivationAttemptId,
+    pub(crate) reason_code: SandboxQuarantineReasonCode,
+    pub(crate) failure_reason: Option<String>,
 }
 
 impl ActivationRollbackClaim {
@@ -69,11 +60,4 @@ impl ActivationRollbackClaim {
             failure_reason: observation.failure_reason().map(str::to_owned),
         })
     }
-}
-
-fn serialize_reason<S: serde::Serializer>(
-    reason: &SandboxQuarantineReasonCode,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(reason.as_str())
 }
