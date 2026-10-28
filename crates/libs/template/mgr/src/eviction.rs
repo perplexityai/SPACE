@@ -789,9 +789,9 @@ impl GcConfig {
     pub(crate) const ENV_INTERVAL_SECS: &'static str = "SPACE_TEMPLATE_GC_INTERVAL_SECS";
     pub(crate) const ENV_GRACE_SECS: &'static str = "SPACE_TEMPLATE_GC_GRACE_SECS";
 
-    /// 100 GiB: a ceiling that is never reached on a lightly used node, so
-    /// the loop is a no-op there, while a node that accumulates builds still
-    /// reclaims LRU builds instead of filling its disk.
+    /// 100 GiB: byte-budget eviction leaves a lightly used node untouched,
+    /// while a node that accumulates builds reclaims LRU builds instead of
+    /// filling its disk. Idle expiry is configured independently.
     pub(crate) const DEFAULT_BUDGET_BYTES: u64 = 100 * 1024 * 1024 * 1024;
     const DEFAULT_INTERVAL_SECS: u64 = 300;
     /// 30 minutes. Wider than the worst-case window between
