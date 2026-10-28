@@ -26,7 +26,8 @@
 #
 # Idempotent: skips the (slow, privileged) rootfs build when the inputs
 # (guest binaries, builder script, seed recipe source, pubkey) are unchanged.
-# Concurrent runs on one output directory are serialized by a file lock.
+# Concurrent runs on one output directory are serialized by a file lock, which
+# `--read-lock` holds shared for a command that reads the directory.
 #
 # The builder image's layers and the recipe's Ubuntu cloud image (its signed
 # checksums and the squashfs) come from the Kind registry layer cache
@@ -38,6 +39,8 @@
 #   bash infra/space/kind/scripts/build-seed.sh
 #   bash infra/space/kind/scripts/build-seed.sh --cache-only   # build just the
 #       stages the cache keeps; main CI exports them (runtime-image-cache.sh publish)
+#   bash infra/space/kind/scripts/build-seed.sh --read-lock -- <command> [args...]
+#       run <command> while no seed build can rewrite SPACE_SEED_OUTPUT_DIR
 #
 # Env knobs:
 #   SPACE_SEED_OUTPUT_DIR       artifact dir (default: ~/.space-devbox/kind/seed/build)
@@ -65,6 +68,34 @@ SEED_STATE_FORMAT_VERSION="${SPACE_SEED_STATE_FORMAT_VERSION:-9.0.0}"
 log() { printf '[build-seed] %s\n' "$*"; }
 die() { printf '[build-seed] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Tilt runs the seed build from its seed-artifacts resource and from the
+# seed-publish image build, which can overlap, and that image build then reads
+# $OUT_DIR. A lock in $OUT_DIR keeps them apart. A build holds it exclusively
+# from before it reads any input until its outputs and stamp are written, so a
+# build that waited reads the inputs as they are once it runs, and a later
+# caller finds the seed up to date instead of rebuilding it under the first.
+# `--read-lock` holds it shared for the command it runs, so no build rewrites
+# the directory while that command reads it. The lock goes on fd 7, which the
+# command and every child inherit.
+SEED_LOCK="$OUT_DIR/.build.lock"
+seed_lock() { # -x | -s
+  command -v flock >/dev/null 2>&1 \
+    || die "flock (util-linux) is required: Tilt runs this from two resources"
+  mkdir -p "$OUT_DIR"
+  exec 7>>"$SEED_LOCK"
+  if ! flock -n "$1" 7; then
+    log "another seed build holds $SEED_LOCK; waiting for it"
+    flock "$1" 7
+  fi
+}
+
+if [[ "${1:-}" == "--read-lock" ]]; then
+  [[ "${2:-}" == "--" && $# -gt 2 ]] || die "usage: $0 --read-lock -- <command> [args...]"
+  shift 2
+  seed_lock -s
+  exec "$@"
+fi
+
 command -v docker >/dev/null 2>&1 || die "docker not on PATH"
 command -v python3 >/dev/null 2>&1 || die "python3 not on PATH (needed to author manifest.json)"
 
@@ -83,13 +114,16 @@ seed_source_value() {
     in_source && $1 == key { gsub(/"/, "", $2); print $2; exit }
   ' "$SEED_RECIPE"
 }
-SEED_SOURCE_TYPE="$(seed_source_value type)"
-SEED_UBUNTU_RELEASE="$(seed_source_value release)"
-SEED_UBUNTU_VERSION="$(seed_source_value version)"
-SEED_UBUNTU_DATE="$(seed_source_value date)"
-for v in SEED_SOURCE_TYPE SEED_UBUNTU_RELEASE SEED_UBUNTU_VERSION SEED_UBUNTU_DATE; do
-  [[ -n "${!v}" ]] || die "failed to read ${v#SEED_} from $SEED_RECIPE"
-done
+read_seed_source() {
+  SEED_SOURCE_TYPE="$(seed_source_value type)"
+  SEED_UBUNTU_RELEASE="$(seed_source_value release)"
+  SEED_UBUNTU_VERSION="$(seed_source_value version)"
+  SEED_UBUNTU_DATE="$(seed_source_value date)"
+  local v
+  for v in SEED_SOURCE_TYPE SEED_UBUNTU_RELEASE SEED_UBUNTU_VERSION SEED_UBUNTU_DATE; do
+    [[ -n "${!v}" ]] || die "failed to read ${v#SEED_} from $SEED_RECIPE"
+  done
+}
 
 # ── Seed builder builds (templates/firecracker/seed/Dockerfile) ──────────────
 # In GitHub CI (SPACE_CI_IMAGE_MIRROR set) the builder's base comes from the
@@ -122,28 +156,19 @@ seed_builder_build() {
 }
 SEED_CACHE_OPTION=()
 
+# The cache-only build writes nothing to $OUT_DIR, so it takes no lock.
 if [[ "${1:-}" == "--cache-only" ]]; then
+  read_seed_source
   log "building the seed builder's cached stages (the builder and the recipe's cloud image)"
   # The export is this mode's only purpose, so its failure is not ignored.
   SEED_CACHE_OPTION=(--fail-on-export-error)
   seed_builder_build --target cloud-image --output type=cacheonly
   exit 0
 fi
-(( $# == 0 )) || die "usage: $0 [--cache-only]"
+(( $# == 0 )) || die "usage: $0 [--cache-only | --read-lock -- <command>]"
 
-# Tilt runs this from its seed-artifacts resource and from the seed-publish
-# image build, which can overlap. A file lock in $OUT_DIR serializes the
-# writers, so a later caller finds the seed up to date instead of rebuilding
-# it under the first. Off Linux there may be no flock; callers then run
-# unguarded.
-mkdir -p "$OUT_DIR"
-if command -v flock >/dev/null 2>&1; then
-  exec 7>"$OUT_DIR/.build.lock"
-  if ! flock -n 7; then
-    log "another seed build holds $OUT_DIR/.build.lock; waiting for it"
-    flock 7
-  fi
-fi
+seed_lock -x
+read_seed_source
 
 # $OUT_DIR is shared by every checkout on the host; see the library for who
 # reads this mark.
