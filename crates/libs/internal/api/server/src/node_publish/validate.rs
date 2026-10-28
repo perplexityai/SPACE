@@ -5,5 +5,6 @@
 //! complete validated publication can replace the legacy input boundary.
 
 pub(crate) mod fields;
+pub(crate) mod node_status;
 pub(crate) mod quarantine;
 pub(crate) mod templates;

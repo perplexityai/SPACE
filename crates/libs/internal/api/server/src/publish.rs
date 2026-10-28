@@ -3,6 +3,7 @@ use super::status::*;
 use super::*;
 use crate::auto_lifecycle_delete_completions::consume_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
+use crate::node_publish::validate::node_status::ValidatedNodeStatus;
 use pplx_space_metrics::internal_api::{LocalBackupQueueOutcome, local_backup_queue_reconcile};
 use pplx_space_node_api_client::node_status_freshness::reported_freshness;
 use pplx_space_placement::StoredSandboxLifecycle;
@@ -56,7 +57,7 @@ impl ClusterApiService {
         );
         let node_status = request
             .node_status
-            .map(published_node_status_db)
+            .map(ValidatedNodeStatus::try_from_proto)
             .transpose()?;
         // Per-row validation and telemetry live in `publish_sandbox_states`.
         // Pruning reuses only identities that can name a central row.
