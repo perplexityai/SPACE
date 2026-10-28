@@ -31,7 +31,7 @@ use crate::node_publish::store::{
     quarantine_claims::{self, ClaimedQuarantineProjection},
     quarantine_persistence, sandbox_facet_observations, snapshot_inventory,
     suspend_finalization::{self, SuspendedFinalizationCandidate},
-    template_components, template_inventory, template_pruning,
+    template_components, template_inventory, template_network_policy, template_pruning,
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 #[cfg(test)]
@@ -268,96 +268,7 @@ pub(crate) async fn publish_validated_template_states(
     )
     .await?;
 
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 network_policy_json JSONB,
-                 network_policy_generation BIGINT,
-                 network_policy_authority TEXT
-             )
-         )
-         INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_generation, observed_payload,
-             applied_source, applied_authority, observed_at, updated_at
-         )
-         SELECT
-             $1,
-             $3,
-             'template:' || template_name,
-             network_policy_generation,
-             network_policy_json,
-             NULL,
-             network_policy_authority,
-             NOW(),
-             NOW()
-         FROM input
-         WHERE network_policy_generation IS NOT NULL
-           AND EXISTS (
-               SELECT 1 FROM node_template_inventory inventory
-               WHERE inventory.node_id = $1 AND inventory.template_name = input.template_name
-           )
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_generation = EXCLUDED.observed_generation,
-             observed_payload = EXCLUDED.observed_payload,
-             applied_source = EXCLUDED.applied_source,
-             applied_authority = EXCLUDED.applied_authority,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE (
-             node_facet_observed_status.observed_generation,
-             node_facet_observed_status.observed_payload,
-             node_facet_observed_status.applied_source,
-             node_facet_observed_status.applied_authority
-         ) IS DISTINCT FROM (
-             EXCLUDED.observed_generation,
-             EXCLUDED.observed_payload,
-             EXCLUDED.applied_source,
-             EXCLUDED.applied_authority
-         )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_NETWORK_POLICY)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "upsert template network policy facet status: {err}"
-        ))
-    })?;
-
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 network_policy_generation BIGINT
-             )
-         )
-         DELETE FROM node_facet_conditions nfc
-         USING input
-         WHERE nfc.node_id = $1
-           AND nfc.facet = $3
-           AND nfc.element = 'template:' || input.template_name
-           AND input.network_policy_generation IS NOT NULL
-           AND nfc.condition_type = 'ApplyFailed'
-           AND EXISTS (
-               SELECT 1 FROM node_template_inventory inventory
-               WHERE inventory.node_id = $1 AND inventory.template_name = input.template_name
-           )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_NETWORK_POLICY)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "clear template network policy apply condition: {err}"
-        ))
-    })?;
+    template_network_policy::observe(conn, node_id, &rows_json).await?;
 
     accepted = accepted.saturating_add(usize_to_u64(accepted_rows.len()));
     Ok(accepted)

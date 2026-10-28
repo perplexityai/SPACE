@@ -10,9 +10,9 @@ use sqlx::PgPool;
 pub async fn seed_policy_failure(
     pool: &PgPool,
     node_id: NodeId,
-    sandbox_id: SandboxId,
+    target: NetworkPolicyTarget,
 ) -> Result<()> {
-    let element = NetworkPolicyTarget::sandbox(sandbox_id).as_element_string();
+    let element = target.as_element_string();
     sqlx::query(sql!(
         "INSERT INTO node_facet_observed_status (node_id, facet, element, observed_at)
          VALUES ($1, $2, $3, NOW())
@@ -74,5 +74,45 @@ pub async fn verify_policy_observation(
     .await?
     .context("network-policy observation missing")?;
     ensure!(matches, "network-policy observation or condition differed");
+    Ok(())
+}
+
+/// Check the fixture template's policy without explicit locks. A generation
+/// report must clear its failure, while an omitted generation must preserve it.
+pub async fn verify_template_policy_observation(
+    pool: &PgPool,
+    node_id: NodeId,
+    generation: i64,
+    failure_present: bool,
+) -> Result<()> {
+    let target = NetworkPolicyTarget::template(
+        pplx_space_db_test_fixtures::publish_load::TEMPLATE_NAME.parse()?,
+    );
+    let matches = sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT COALESCE(nfos.observed_generation = $4, FALSE)
+                    AND nfos.observed_payload IS NOT NULL
+                    AND COALESCE(nfos.applied_authority = $5, FALSE)
+                    AND EXISTS (
+                        SELECT 1 FROM node_facet_conditions nfc
+                        WHERE nfc.node_id = nfos.node_id AND nfc.facet = nfos.facet
+                          AND nfc.element = nfos.element AND nfc.condition_type = $6
+                    ) = $7
+         FROM node_facet_observed_status nfos
+         WHERE nfos.node_id = $1 AND nfos.facet = $2 AND nfos.element = $3"
+    ))
+    .bind(node_id)
+    .bind(FACET_NETWORK_POLICY)
+    .bind(target.as_element_string())
+    .bind(generation)
+    .bind(PolicyAuthority::Cluster.as_str())
+    .bind("ApplyFailed")
+    .bind(failure_present)
+    .fetch_optional(pool)
+    .await?
+    .context("template network-policy observation missing")?;
+    ensure!(
+        matches,
+        "template network-policy observation or condition differed"
+    );
     Ok(())
 }

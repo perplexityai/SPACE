@@ -15,6 +15,7 @@ use pplx_space_node_api_client::proto::{
 };
 use pplx_space_publish_load::{Args, Node, service::LocalService, store};
 use pplx_space_sbx_mgr_client::proto::{SnapshotDetail, SnapshotType};
+use pplx_space_state_reconciliation::NetworkPolicyTarget;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -30,6 +31,8 @@ enum ScenarioKind {
     NodeStatus,
     Templates,
     RepeatedTemplates,
+    TemplatePolicy,
+    OmittedTemplatePolicy,
     AbsentTemplates,
     EmptyTemplateCensus,
     OrdinarySingle,
@@ -178,6 +181,39 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
             store::template_inventory_hashes(&db.pool, node.id.parse()?).await? == template_hashes,
             "repeated template inventory changed release identity"
         );
+        let mut template_policy = templates.clone();
+        let policy_state = template_policy
+            .templates
+            .first_mut()
+            .context("template missing")?;
+        policy_state.network_policy = Some(NetworkPolicyV1 {
+            version: NetworkPolicyVersion::V1.into(),
+            egress_default_action: EgressDefaultAction::Allow.into(),
+            ..Default::default()
+        });
+        policy_state.network_policy_generation = 11;
+        policy_state.network_policy_authority = PolicyAuthority::Cluster.as_proto_i32();
+        for (kind, publication, failure_present) in [
+            (ScenarioKind::TemplatePolicy, template_policy, false),
+            (ScenarioKind::OmittedTemplatePolicy, templates.clone(), true),
+        ] {
+            store::seed_policy_failure(
+                &db.pool,
+                node.id.parse()?,
+                NetworkPolicyTarget::template(
+                    pplx_space_db_test_fixtures::publish_load::TEMPLATE_NAME.parse()?,
+                ),
+            )
+            .await?;
+            scenarios.push(capture(db, &service, kind, publication).await?);
+            store::verify_template_policy_observation(
+                &db.pool,
+                node.id.parse()?,
+                11,
+                failure_present,
+            )
+            .await?;
+        }
         let mut absent_templates = templates.clone();
         absent_templates.template_inventory_complete = false;
         absent_templates
@@ -283,7 +319,12 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
                 name,
                 ScenarioKind::NetworkPolicy | ScenarioKind::OmittedNetworkPolicy
             ) {
-                store::seed_policy_failure(&db.pool, node_id, sandbox_id).await?;
+                store::seed_policy_failure(
+                    &db.pool,
+                    node_id,
+                    NetworkPolicyTarget::sandbox(sandbox_id),
+                )
+                .await?;
             }
             let mut partial = request(node);
             partial.sandboxes.push(sandbox);

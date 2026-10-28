@@ -18,7 +18,9 @@ use uuid::Uuid;
 use crate::{Args, Node};
 
 mod policy;
-pub use policy::{seed_policy_failure, verify_policy_observation};
+pub use policy::{
+    seed_policy_failure, verify_policy_observation, verify_template_policy_observation,
+};
 mod quarantine;
 pub use quarantine::verify_quarantine;
 mod templates;
