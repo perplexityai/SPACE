@@ -24,9 +24,13 @@ pub(crate) async fn replace(
         return Ok(());
     }
 
-    let snapshot_ids_payload = snapshot_rows
+    let snapshot_sandbox_ids = snapshot_rows
         .iter()
-        .map(SnapshotClaim::legacy_key)
+        .map(|row| row.sandbox_id)
+        .collect::<Vec<_>>();
+    let snapshot_ids = snapshot_rows
+        .iter()
+        .map(|row| row.snapshot_id.as_str())
         .collect::<Vec<_>>();
     sqlx::query(sql!(
         "WITH scope AS (
@@ -34,10 +38,7 @@ pub(crate) async fn replace(
          ),
          incoming AS (
              SELECT sandbox_id, snapshot_id
-             FROM jsonb_to_recordset($2::jsonb) AS incoming(
-                 sandbox_id UUID,
-                 snapshot_id TEXT
-             )
+             FROM UNNEST($2::UUID[], $3::TEXT[]) AS incoming(sandbox_id, snapshot_id)
          )
          DELETE FROM sandbox_snapshot_inventory ssi
          USING scope
@@ -50,42 +51,69 @@ pub(crate) async fn replace(
            )"
     ))
     .bind(sandbox_ids)
-    .bind(Json(serde_json::Value::Array(snapshot_ids_payload)))
+    .bind(&snapshot_sandbox_ids)
+    .bind(&snapshot_ids)
     .execute(&mut *conn)
     .await
     .map_err(ReplaceSnapshotInventoryError::Prune)?;
 
-    if snapshot_rows.is_empty() {
+    upsert(conn, sandbox_ids, snapshot_rows).await
+}
+
+/// Upsert only in the accepted sandbox scope, locking conflicting inventory
+/// rows. Empty claims issue no SQL; unchanged descriptions preserve both clocks.
+async fn upsert(
+    conn: &mut PgConnection,
+    sandbox_ids: &[SandboxId],
+    snapshot_rows: &[SnapshotClaim],
+) -> Result<(), ReplaceSnapshotInventoryError> {
+    if snapshot_rows.is_empty() || sandbox_ids.is_empty() {
         return Ok(());
     }
+    // All columns visit the same claims, preserving nullable array positions.
+    macro_rules! column {
+        ($value:expr) => {
+            snapshot_rows.iter().map($value).collect::<Vec<_>>()
+        };
+    }
+    sqlx::query(UPSERT_SNAPSHOT_INVENTORY_SQL)
+        .bind(sandbox_ids)
+        .bind(column!(|row| row.sandbox_id))
+        .bind(column!(|row| row.snapshot_id.as_str()))
+        .bind(column!(SnapshotClaim::kind))
+        .bind(column!(|row| row.state.as_str()))
+        .bind(column!(|row| row.timestamp.as_deref()))
+        .bind(column!(|row| row.source_node_id.as_deref()))
+        .bind(column!(|row| row.label.as_deref()))
+        .bind(column!(|row| row.retention_tier.as_deref()))
+        .bind(column!(|row| row.vcpu))
+        .bind(column!(|row| row.memory_mib))
+        .bind(column!(|row| row.size_bytes))
+        .bind(column!(|row| row.template_id.as_deref()))
+        .bind(column!(|row| row.content_hash.as_deref()))
+        .bind(column!(|row| Json(&row.locations)))
+        .execute(&mut *conn)
+        .await
+        .map_err(ReplaceSnapshotInventoryError::Upsert)?;
+    Ok(())
+}
 
-    let snapshot_rows = snapshot_rows
-        .iter()
-        .map(SnapshotClaim::legacy_row)
-        .collect::<Vec<_>>();
-    sqlx::query(sql!(
-        "WITH scope AS (
+const UPSERT_SNAPSHOT_INVENTORY_SQL: &str = sql!(
+    "WITH scope AS (
              SELECT UNNEST($1::UUID[]) AS sandbox_id
          ),
          input AS (
              SELECT sandbox_id, snapshot_id, type, state, timestamp, source_node_id,
                     label, retention_tier, vcpu, memory_mib, size_bytes, template_id,
                     content_hash, locations
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 snapshot_id TEXT,
-                 type TEXT,
-                 state TEXT,
-                 timestamp TEXT,
-                 source_node_id TEXT,
-                 label TEXT,
-                 retention_tier TEXT,
-                 vcpu INTEGER,
-                 memory_mib INTEGER,
-                 size_bytes BIGINT,
-                 template_id TEXT,
-                 content_hash TEXT,
-                 locations JSONB
+             FROM UNNEST(
+                 $2::UUID[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[],
+                 $7::TEXT[], $8::TEXT[], $9::TEXT[], $10::INTEGER[], $11::INTEGER[],
+                 $12::BIGINT[], $13::TEXT[], $14::TEXT[], $15::JSONB[]
+             ) AS input(
+                 sandbox_id, snapshot_id, type, state, timestamp, source_node_id,
+                 label, retention_tier, vcpu, memory_mib, size_bytes, template_id,
+                 content_hash, locations
              )
          )
          INSERT INTO sandbox_snapshot_inventory (
@@ -154,11 +182,7 @@ pub(crate) async fn replace(
              EXCLUDED.content_hash,
              EXCLUDED.locations
          )"
-    ))
-    .bind(sandbox_ids)
-    .bind(Json(snapshot_rows))
-    .execute(&mut *conn)
-    .await
-    .map_err(ReplaceSnapshotInventoryError::Upsert)?;
-    Ok(())
-}
+);
+
+#[cfg(test)]
+mod tests;

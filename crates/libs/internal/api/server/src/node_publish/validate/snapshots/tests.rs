@@ -57,10 +57,9 @@ fn unknown_snapshot_types_remain_explicit_unknown_observations() {
                 ..SnapshotDetail::default()
             },
         )
-        .unwrap()
-        .legacy_row();
-        assert_eq!(row["type"], expected);
-        assert!(row["size_bytes"].is_null());
-        assert_eq!(row["locations"], serde_json::json!([]));
+        .unwrap();
+        assert_eq!(row.kind(), expected);
+        assert!(row.size_bytes.is_none());
+        assert!(row.locations.is_empty());
     }
 }

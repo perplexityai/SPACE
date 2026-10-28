@@ -114,11 +114,8 @@ fn incomplete_rich_evidence_drops_only_its_own_snapshots_policy_and_quarantine_c
         let plan = SandboxPlan::from(inventory);
         assert_eq!(plan.observations.len(), 2, "{rejection}");
         assert_eq!(plan.snapshots.len(), 2, "{rejection}");
-        assert_eq!(
-            plan.snapshots[0].legacy_row()["snapshot_id"],
-            "keep-earlier"
-        );
-        assert_eq!(plan.snapshots[1].legacy_row()["snapshot_id"], "keep-later");
+        assert_eq!(plan.snapshots[0].snapshot_id, "keep-earlier");
+        assert_eq!(plan.snapshots[1].snapshot_id, "keep-later");
         assert!(plan.quarantine.is_empty(), "{rejection}");
         assert!(plan.network_policy.observations.is_empty(), "{rejection}");
         assert_eq!(plan.state_only.len(), 1, "{rejection}");

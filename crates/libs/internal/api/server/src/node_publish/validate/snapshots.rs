@@ -9,24 +9,24 @@ use super::fields::{u32_to_i32, u64_to_i64};
 /// must not acquire the stricter path-name or central UUID validation rules.
 #[derive(Debug)]
 pub(crate) struct SnapshotClaim {
-    sandbox_id: SandboxId,
-    snapshot_id: String,
+    pub(in crate::node_publish) sandbox_id: SandboxId,
+    pub(in crate::node_publish) snapshot_id: String,
     kind: SnapshotType,
-    state: String,
-    timestamp: Option<String>,
-    source_node_id: Option<String>,
-    label: Option<String>,
-    retention_tier: Option<String>,
-    vcpu: i32,
-    memory_mib: i32,
-    size_bytes: Option<i64>,
-    template_id: Option<String>,
-    content_hash: Option<String>,
-    locations: Vec<SnapshotLocationClaim>,
+    pub(in crate::node_publish) state: String,
+    pub(in crate::node_publish) timestamp: Option<String>,
+    pub(in crate::node_publish) source_node_id: Option<String>,
+    pub(in crate::node_publish) label: Option<String>,
+    pub(in crate::node_publish) retention_tier: Option<String>,
+    pub(in crate::node_publish) vcpu: i32,
+    pub(in crate::node_publish) memory_mib: i32,
+    pub(in crate::node_publish) size_bytes: Option<i64>,
+    pub(in crate::node_publish) template_id: Option<String>,
+    pub(in crate::node_publish) content_hash: Option<String>,
+    pub(in crate::node_publish) locations: Vec<SnapshotLocationClaim>,
 }
 
 #[derive(Debug, serde::Serialize)]
-struct SnapshotLocationClaim {
+pub(in crate::node_publish) struct SnapshotLocationClaim {
     location_type: String,
     node_id: Option<String>,
     node_address: Option<String>,
@@ -76,35 +76,12 @@ impl SnapshotClaim {
         })
     }
 
-    pub(crate) fn legacy_key(&self) -> serde_json::Value {
-        serde_json::json!({
-            "sandbox_id": self.sandbox_id,
-            "snapshot_id": self.snapshot_id,
-        })
-    }
-
-    pub(crate) fn legacy_row(&self) -> serde_json::Value {
-        let kind = match self.kind {
+    pub(in crate::node_publish) fn kind(&self) -> &'static str {
+        match self.kind {
             SnapshotType::Disk => "disk",
             SnapshotType::Full => "full",
             SnapshotType::Unspecified => "unknown",
-        };
-        serde_json::json!({
-            "sandbox_id": self.sandbox_id,
-            "snapshot_id": self.snapshot_id,
-            "type": kind,
-            "state": self.state,
-            "timestamp": self.timestamp,
-            "source_node_id": self.source_node_id,
-            "label": self.label,
-            "retention_tier": self.retention_tier,
-            "vcpu": self.vcpu,
-            "memory_mib": self.memory_mib,
-            "size_bytes": self.size_bytes,
-            "template_id": self.template_id,
-            "content_hash": self.content_hash,
-            "locations": self.locations,
-        })
+        }
     }
 }
 
