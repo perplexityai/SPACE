@@ -90,6 +90,7 @@ pub(crate) struct EvictionCandidate {
     pub(crate) content_hash: String,
     pub(crate) cache_partition: TemplateCachePartition,
     pub(crate) size_bytes: u64,
+    pub(crate) last_touch_secs: u64,
 }
 
 /// Template-side wrapper around [`lru_reaper::plan_evictions`]: maps
@@ -139,6 +140,7 @@ pub(crate) fn plan_evictions(
             content_hash: c.key.1,
             cache_partition: c.key.2,
             size_bytes: c.size_bytes,
+            last_touch_secs: c.last_touch_secs,
         })
         .collect()
 }
@@ -293,10 +295,9 @@ pub(crate) enum EvictionOutcome {
     /// reachable when the set changed between plan and execute within
     /// one tick — plan-time filtering uses the same snapshot.
     SkippedWarmPoolAtExecute,
-    /// The build row was already gone by the time we tried to delete
-    /// it (e.g. a manual `DeleteTemplateBuild` raced us). No work to
-    /// do; not an error.
-    SkippedRowMissing,
+    /// The build was removed, is no longer ready, or was used after planning.
+    /// The compare-and-swap declined deletion; retry from a fresh plan.
+    SkippedRowChanged,
 }
 
 /// Outcome of the pre-check phase of `execute_one_async`. Either
@@ -307,7 +308,7 @@ enum PrecheckOutcome {
     SkipPinned,
     SkipActive,
     SkipWarmPool,
-    SkipRowMissing,
+    SkipRowChanged,
 }
 
 /// Pre-check phase: active-set + pin check, then atomically transition
@@ -354,18 +355,22 @@ fn execute_precheck(
     // Compare-and-swap: only proceed when the row is still
     // `state='ready'`. A zero-row UPDATE means the row was deleted
     // out from under us OR another path (manual delete, parallel
-    // eviction) already grabbed it.
+    // eviction) already grabbed it, or a resolution advanced its last touch.
+    // Check the touch in this transaction so a sandbox attaching after the
+    // plan gets its full grace period before this build can be deleted.
     let updated = tx.execute(
         "UPDATE template_builds SET state = 'deleting'
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND state = 'ready'",
+         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND state = 'ready'
+           AND MAX(CAST(created_at AS INTEGER), CAST(last_used_at AS INTEGER)) <= ?4",
         params![
             candidate.name,
             candidate.content_hash,
-            candidate.cache_partition.key()
+            candidate.cache_partition.key(),
+            i64::try_from(candidate.last_touch_secs).unwrap_or(i64::MAX)
         ],
     )?;
     if updated == 0 {
-        return Ok(PrecheckOutcome::SkipRowMissing);
+        return Ok(PrecheckOutcome::SkipRowChanged);
     }
 
     tx.commit()?;
@@ -419,7 +424,7 @@ pub(crate) fn execute_one(
         PrecheckOutcome::SkipPinned => return Ok(EvictionOutcome::SkippedPinnedAtExecute),
         PrecheckOutcome::SkipActive => return Ok(EvictionOutcome::SkippedActiveAtExecute),
         PrecheckOutcome::SkipWarmPool => return Ok(EvictionOutcome::SkippedWarmPoolAtExecute),
-        PrecheckOutcome::SkipRowMissing => return Ok(EvictionOutcome::SkippedRowMissing),
+        PrecheckOutcome::SkipRowChanged => return Ok(EvictionOutcome::SkippedRowChanged),
         PrecheckOutcome::Proceed => {}
     }
     delete_disk(
@@ -478,7 +483,7 @@ pub(crate) async fn execute_one_async(
         PrecheckOutcome::SkipPinned => return Ok(EvictionOutcome::SkippedPinnedAtExecute),
         PrecheckOutcome::SkipActive => return Ok(EvictionOutcome::SkippedActiveAtExecute),
         PrecheckOutcome::SkipWarmPool => return Ok(EvictionOutcome::SkippedWarmPoolAtExecute),
-        PrecheckOutcome::SkipRowMissing => return Ok(EvictionOutcome::SkippedRowMissing),
+        PrecheckOutcome::SkipRowChanged => return Ok(EvictionOutcome::SkippedRowChanged),
         PrecheckOutcome::Proceed => {}
     }
 
@@ -760,21 +765,23 @@ pub(crate) fn empty_warm_pool_fetch() -> FetchWarmPoolFn {
 ///
 /// Env vars are read once at daemon startup via [`GcConfig::from_env`]. The
 /// loop is enabled with a [`GcConfig::DEFAULT_BUDGET_BYTES`] cache budget;
-/// `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` overrides the budget, and an explicit
-/// `0` disables the loop (it then spawns, logs once, and returns without ever
-/// reading from the DB or touching disk), as does a value that is not a byte
-/// count (with a warning). The loop only reclaims once the node
-/// is over budget and never within the grace period.
+/// `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` overrides the budget. An explicit zero
+/// or invalid budget disables byte-budget eviction. `SPACE_TEMPLATE_CACHE_IDLE_TTL_SECS`
+/// independently enables idle expiry; unset, zero or invalid disables expiry.
+/// Both policies preserve the protected sets and grace period. The loop exits
+/// without reading the DB or touching disk when both policies are disabled.
 #[derive(Clone, Debug)]
 pub struct GcConfig {
     pub enabled: bool,
     pub budget_bytes: u64,
+    pub idle_ttl: Option<Duration>,
     pub headroom_fraction: f64,
     pub interval: Duration,
     pub grace: Duration,
 }
 
 impl GcConfig {
+    pub(crate) const ENV_IDLE_TTL_SECS: &'static str = "SPACE_TEMPLATE_CACHE_IDLE_TTL_SECS";
     pub(crate) const ENV_BUDGET: &'static str = "SPACE_TEMPLATE_CACHE_BUDGET_BYTES";
     /// Test hooks (`pplx_space_common_core::env::test_hook`): compiled in only
     /// with the `test-hooks` feature, so release binaries cannot shrink the
@@ -782,9 +789,9 @@ impl GcConfig {
     pub(crate) const ENV_INTERVAL_SECS: &'static str = "SPACE_TEMPLATE_GC_INTERVAL_SECS";
     pub(crate) const ENV_GRACE_SECS: &'static str = "SPACE_TEMPLATE_GC_GRACE_SECS";
 
-    /// 100 GiB: a ceiling that is never reached on a lightly used node, so
-    /// the loop is a no-op there, while a node that accumulates builds still
-    /// reclaims LRU builds instead of filling its disk.
+    /// 100 GiB: byte-budget eviction leaves a lightly used node untouched,
+    /// while a node that accumulates builds reclaims LRU builds instead of
+    /// filling its disk. Idle expiry is configured independently.
     pub(crate) const DEFAULT_BUDGET_BYTES: u64 = 100 * 1024 * 1024 * 1024;
     const DEFAULT_INTERVAL_SECS: u64 = 300;
     /// 30 minutes. Wider than the worst-case window between
@@ -814,20 +821,32 @@ impl GcConfig {
             Some(raw) => match raw.trim().parse::<u64>() {
                 Ok(n) => Some(n).filter(|n| *n > 0),
                 // The loop deletes cached builds, so a value that is not a
-                // byte count disables it instead of silently applying the
-                // default budget.
+                // byte count disables budget eviction instead of silently
+                // applying the default budget.
                 Err(_) => {
                     tracing::warn!(
                         env_var = Self::ENV_BUDGET,
                         value = %raw,
-                        "invalid template cache budget; template GC is disabled \
+                        "invalid template cache budget; byte-budget eviction is disabled \
                          (set a byte count, or unset the variable for the default)",
                     );
                     None
                 }
             },
         };
-        let enabled = budget.is_some();
+        let idle_ttl =
+            env.var(Self::ENV_IDLE_TTL_SECS)
+                .ok()
+                .and_then(|raw| match raw.trim().parse::<u64>() {
+                    Ok(0) => None,
+                    Ok(secs) => Some(Duration::from_secs(secs)),
+                    Err(_) => {
+                        warn!(env_var = Self::ENV_IDLE_TTL_SECS, value = %raw,
+                        "invalid template cache idle TTL; idle eviction is disabled");
+                        None
+                    }
+                });
+        let enabled = budget.is_some() || idle_ttl.is_some();
         let interval_secs = pplx_space_common_core::env::test_hook(env, Self::ENV_INTERVAL_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
@@ -848,6 +867,7 @@ impl GcConfig {
         Self {
             enabled,
             budget_bytes: budget.unwrap_or(0),
+            idle_ttl,
             headroom_fraction: Self::HEADROOM_FRACTION,
             interval: Duration::from_secs(interval_secs),
             grace: Duration::from_secs(grace_secs),
@@ -864,7 +884,7 @@ pub(crate) struct GcTickReport {
     pub(crate) skipped_pinned: usize,
     pub(crate) skipped_active: usize,
     pub(crate) skipped_warm_pool: usize,
-    pub(crate) skipped_row_missing: usize,
+    pub(crate) skipped_row_changed: usize,
     pub(crate) errors: usize,
     pub(crate) bytes_before: u64,
     pub(crate) bytes_freed: u64,
@@ -923,7 +943,12 @@ pub(crate) async fn gc_tick(
 ) -> Result<GcTickReport, GcTickError> {
     let now_secs = jiff::Timestamp::now().as_second().max(0).cast_unsigned();
     let evict_cfg = EvictionConfig {
-        budget_bytes: cfg.budget_bytes,
+        budget_bytes: if cfg.budget_bytes == 0 {
+            u64::MAX
+        } else {
+            cfg.budget_bytes
+        },
+        idle_ttl_secs: cfg.idle_ttl.map(|ttl| ttl.as_secs()),
         headroom_fraction: cfg.headroom_fraction,
         grace_secs: cfg.grace.as_secs(),
         now_secs,
@@ -1019,9 +1044,9 @@ pub(crate) async fn gc_tick(
                 report.skipped_warm_pool += 1;
                 pplx_space_metrics::template::gc_skipped("warm_pool_at_execute");
             }
-            Ok(Ok(EvictionOutcome::SkippedRowMissing)) => {
-                report.skipped_row_missing += 1;
-                pplx_space_metrics::template::gc_skipped("row_missing");
+            Ok(Ok(EvictionOutcome::SkippedRowChanged)) => {
+                report.skipped_row_changed += 1;
+                pplx_space_metrics::template::gc_skipped("row_changed");
             }
             Ok(Err(err)) => {
                 warn!(
@@ -1048,7 +1073,8 @@ pub(crate) async fn gc_tick(
         }
     }
 
-    if report.bytes_before > cfg.budget_bytes
+    if cfg.budget_bytes > 0
+        && report.bytes_before > cfg.budget_bytes
         && report.bytes_freed.saturating_add(cfg.budget_bytes) < report.bytes_before
     {
         warn!(
@@ -1096,13 +1122,14 @@ pub async fn run_loop(
     if !cfg.enabled {
         info!(
             env_var = GcConfig::ENV_BUDGET,
-            "template eviction disabled (budget is zero); loop exiting",
+            "template eviction disabled (no byte budget or idle TTL); loop exiting",
         );
         return;
     }
 
     info!(
         budget_bytes = cfg.budget_bytes,
+        idle_ttl_secs = cfg.idle_ttl.map(|ttl| ttl.as_secs()),
         interval_secs = cfg.interval.as_secs(),
         grace_secs = cfg.grace.as_secs(),
         headroom_fraction = cfg.headroom_fraction,
@@ -1208,7 +1235,7 @@ pub async fn run_loop(
                     skipped_pinned = report.skipped_pinned,
                     skipped_active = report.skipped_active,
                     skipped_warm_pool = report.skipped_warm_pool,
-                    skipped_row_missing = report.skipped_row_missing,
+                    skipped_row_changed = report.skipped_row_changed,
                     errors = report.errors,
                     bytes_before = report.bytes_before,
                     bytes_freed = report.bytes_freed,

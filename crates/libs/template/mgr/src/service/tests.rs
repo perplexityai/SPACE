@@ -2398,3 +2398,100 @@ async fn register_template_uses_producer_algorithm(
         assert_eq!(build.runtime, "ch");
     }
 }
+
+#[tokio::test]
+async fn idle_gc_removes_last_build_and_enqueues_inventory() {
+    use crate::eviction::{DeleteDiskFn, DiskSizeFn, GcConfig, gc_tick};
+    use std::collections::HashSet;
+    use std::time::Duration;
+    let keys = |pairs: &[(&str, &str)]| -> HashSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, h)| (n.to_string(), h.to_string()))
+            .collect()
+    };
+    let raw = crate::db::test_conn();
+    for name in [
+        "expired",
+        "active",
+        "warm",
+        "tag-pin",
+        "release-pin",
+        "in-grace",
+    ] {
+        insert_ready_build(&raw, name, "h1");
+    }
+    raw.execute(
+        "UPDATE template_builds SET created_at = '1', last_used_at = '1'",
+        [],
+    )
+    .unwrap();
+    crate::db::touch_build(&raw, "in-grace", "h1", TemplateCachePartition::Legacy).unwrap();
+    let service = TemplateManagerService::new(raw)
+        .unwrap()
+        .without_sbx_connect_retries();
+    let db = Arc::clone(&service.db);
+    let pins = crate::pinned_digests::PinnedDigestsStore::new(Arc::clone(&db));
+    pins.upsert_tag("tag-pin", "latest", TemplateCachePartition::Legacy, "h1")
+        .unwrap();
+    pins.upsert_release("release-pin", "h1", "release-1", "1")
+        .unwrap();
+    let before = service
+        .list_templates(internal_request(ListTemplatesRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(before.templates.len(), 6);
+    let config = GcConfig {
+        enabled: true,
+        budget_bytes: 0,
+        idle_ttl: Some(Duration::from_secs(3600)),
+        headroom_fraction: 0.9,
+        interval: Duration::from_secs(60),
+        grace: Duration::from_secs(1800),
+    };
+    let size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
+    let delete: DeleteDiskFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+    // A live sandbox holds the old build even after the TTL has elapsed.
+    let report = gc_tick(
+        Arc::clone(&db),
+        &config,
+        keys(&[("expired", "h1"), ("active", "h1")]),
+        keys(&[("warm", "h1")]),
+        Arc::clone(&size),
+        Arc::clone(&delete),
+        crate::eviction::noop_reaper_probe(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.deleted, 0);
+    // Deleting that sandbox releases its active reference for the next tick.
+    let report = gc_tick(
+        Arc::clone(&db),
+        &config,
+        keys(&[("active", "h1")]),
+        keys(&[("warm", "h1")]),
+        size,
+        delete,
+        crate::eviction::noop_reaper_probe(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.deleted, 1);
+    let after = service
+        .list_templates(internal_request(ListTemplatesRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(after.templates.len(), 5);
+    assert!(
+        after
+            .templates
+            .iter()
+            .all(|template| template.name != "expired")
+    );
+    let conn = db.lock().unwrap();
+    let dirty = crate::db::list_node_dirty_refs(&conn, 10).unwrap();
+    assert_eq!(dirty.len(), 1);
+    assert_eq!(dirty[0].element_value, "expired");
+}

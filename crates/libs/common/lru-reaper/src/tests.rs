@@ -21,6 +21,7 @@ fn keys(pairs: &[(&str, &str)]) -> HashSet<StrKey> {
 fn cfg(budget: u64, headroom: f64, grace_secs: u64, now: u64) -> EvictionConfig {
     EvictionConfig {
         budget_bytes: budget,
+        idle_ttl_secs: None,
         headroom_fraction: headroom,
         grace_secs,
         now_secs: now,
@@ -212,4 +213,54 @@ fn works_with_single_string_key() {
     );
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].key, "art-a");
+}
+
+#[test]
+fn idle_expiry_preserves_protections_and_uses_the_latest_touch() {
+    let items = vec![
+        item("seed", "expired", 0, 0, 100),
+        item("seed", "pinned", 100, 0, 100),
+        item("seed", "active", 100, 0, 100),
+        item("seed", "boundary", 100, 0, 900),
+        item("seed", "newly-created", 100, 950, 0),
+        item("seed", "recently-used", 100, 0, 950),
+        item("seed", "future", 100, 1100, 0),
+    ];
+    let pinned = keys(&[("seed", "pinned")]);
+    let active = keys(&[("seed", "active")]);
+    for (ttl, grace, expected) in [
+        (None, 60, vec![]),
+        (Some(0), 60, vec![]),
+        (Some(100), 60, vec!["expired"]),
+        (Some(100), 901, vec![]),
+    ] {
+        let config = EvictionConfig {
+            idle_ttl_secs: ttl,
+            ..cfg(1000, 0.9, grace, 1000)
+        };
+        let plan = plan_evictions(items.clone(), &pinned, &active, &config);
+        assert_eq!(
+            plan.iter().map(|c| c.key.1.as_str()).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn idle_expiry_continues_after_byte_target_is_met() {
+    let items = vec![
+        // Old LRU ordering, but the creation clock keeps this build within TTL.
+        item("seed", "budget-victim", 500, 950, 0),
+        item("seed", "expired", 100, 0, 100),
+        item("seed", "fresh", 100, 0, 950),
+    ];
+    let config = EvictionConfig {
+        idle_ttl_secs: Some(100),
+        ..cfg(600, 0.9, 10, 1000)
+    };
+    let plan = plan_evictions(items, &keys(&[]), &keys(&[]), &config);
+    assert_eq!(
+        plan.iter().map(|c| c.key.1.as_str()).collect::<Vec<_>>(),
+        vec!["budget-victim", "expired"]
+    );
 }

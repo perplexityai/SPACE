@@ -65,6 +65,10 @@ spec:
             - name: SPACE_TEMPLATE_CACHE_BUDGET_BYTES
               value: {{ . | quote }}
             {{- end }}
+            {{- with .idleTtlSeconds }}
+            - name: SPACE_TEMPLATE_CACHE_IDLE_TTL_SECS
+              value: {{ . | quote }}
+            {{- end }}
             {{- if eq (include "space-node-service.rustBuild" $) "test-hooks" }}
             {{- with .gcIntervalSecs }}
             - name: SPACE_TEMPLATE_GC_INTERVAL_SECS

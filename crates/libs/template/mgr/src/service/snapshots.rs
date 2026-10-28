@@ -3,6 +3,9 @@ mod retry_backoff;
 use pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
 pub(super) use retry_backoff::RetryBackoff;
 
+#[cfg(test)]
+mod tests;
+
 pub(super) struct BuildBaseSnapshotArgs<'a> {
     pub(super) sandbox_id: &'a str,
     pub(super) template_name: &'a str,
@@ -868,7 +871,9 @@ impl TemplateManagerService {
                         Status::not_found(format!("no builds found for '{template}'"))
                     })?;
                 validate_content_hash(&build.content_hash)?;
-                touch_lru(&conn, &build.name, &build.content_hash, partition);
+                // Periodic policy inspection is not use. Actual snapshot
+                // capture resolves the build through sandbox creation, which
+                // advances LRU and establishes an active reference.
                 let snapshot = crate::db::get_snapshot(
                     &conn,
                     crate::db::SnapshotKey {

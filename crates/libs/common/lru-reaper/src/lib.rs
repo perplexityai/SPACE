@@ -5,7 +5,8 @@
 //! items plus their disk footprint, the union of currently-pinned
 //! keys, the set of keys actively in use, and a disk-budget config,
 //! it returns the ordered list of items to delete to bring usage back
-//! below `budget_bytes * headroom_fraction`.
+//! below `budget_bytes * headroom_fraction`, plus unprotected items past
+//! an optional idle TTL.
 //!
 //! ## Protected sets
 //!
@@ -61,6 +62,8 @@ pub struct EvictionInput<K> {
 pub struct EvictionCandidate<K> {
     pub key: K,
     pub size_bytes: u64,
+    /// Last touch observed while planning, for the caller's delete pre-check.
+    pub last_touch_secs: u64,
 }
 
 /// Planner inputs that don't come from the item set itself.
@@ -72,15 +75,18 @@ pub struct EvictionCandidate<K> {
 #[derive(Debug, Clone, Copy)]
 pub struct EvictionConfig {
     pub budget_bytes: u64,
+    /// Opt-in idle expiry, independent of the byte budget. None or zero disables it.
+    pub idle_ttl_secs: Option<u64>,
     pub headroom_fraction: f64,
     pub grace_secs: u64,
     pub now_secs: u64,
 }
 
-/// Decide which items to evict. Returns an empty `Vec` when usage is
-/// already at or below `budget_bytes` — the caller skips the delete
-/// loop. When usage is over budget but every eligible item is
-/// pinned/active/in-grace, returns whatever subset can be freed
+/// Decide which items to evict. Idle, unprotected items expire even below
+/// `budget_bytes` when `idle_ttl_secs` is enabled. Idle means strictly older
+/// than the TTL since the later of creation and last use. When usage is over
+/// budget but every eligible item is pinned/active/in-grace, returns whatever
+/// subset can be freed
 /// (possibly empty); the caller is expected to log/metric and move
 /// on rather than evict a protected item.
 ///
@@ -98,19 +104,22 @@ where
     K: Clone + Eq + Hash + Ord,
 {
     let total: u64 = items.iter().map(|b| b.size_bytes).sum();
-    if total <= cfg.budget_bytes {
-        return Vec::new();
-    }
-
-    let target = headroom_target_bytes(cfg.budget_bytes, cfg.headroom_fraction);
-    let need_to_free = total.saturating_sub(target);
-    plan_evictions_to_free(
+    let need_to_free = if total > cfg.budget_bytes {
+        total.saturating_sub(headroom_target_bytes(
+            cfg.budget_bytes,
+            cfg.headroom_fraction,
+        ))
+    } else {
+        0
+    };
+    plan_with_idle_expiry(
         items,
         pinned,
         active,
         need_to_free,
         cfg.grace_secs,
         cfg.now_secs,
+        cfg.idle_ttl_secs,
     )
 }
 
@@ -137,7 +146,7 @@ fn headroom_target_bytes(budget_bytes: u64, headroom_fraction: f64) -> u64 {
 /// identical; only the stop condition's source differs. Returns an
 /// empty `Vec` when `need_to_free` is 0.
 pub fn plan_evictions_to_free<K>(
-    mut items: Vec<EvictionInput<K>>,
+    items: Vec<EvictionInput<K>>,
     pinned: &HashSet<K>,
     active: &HashSet<K>,
     need_to_free: u64,
@@ -147,7 +156,31 @@ pub fn plan_evictions_to_free<K>(
 where
     K: Clone + Eq + Hash + Ord,
 {
-    if need_to_free == 0 {
+    plan_with_idle_expiry(
+        items,
+        pinned,
+        active,
+        need_to_free,
+        grace_secs,
+        now_secs,
+        None,
+    )
+}
+
+fn plan_with_idle_expiry<K>(
+    mut items: Vec<EvictionInput<K>>,
+    pinned: &HashSet<K>,
+    active: &HashSet<K>,
+    need_to_free: u64,
+    grace_secs: u64,
+    now_secs: u64,
+    idle_ttl_secs: Option<u64>,
+) -> Vec<EvictionCandidate<K>>
+where
+    K: Clone + Eq + Hash + Ord,
+{
+    let idle_ttl_secs = idle_ttl_secs.filter(|ttl| *ttl > 0);
+    if need_to_free == 0 && idle_ttl_secs.is_none() {
         return Vec::new();
     }
 
@@ -160,7 +193,7 @@ where
     let mut freed: u64 = 0;
     let mut out = Vec::new();
     for it in items {
-        if freed >= need_to_free {
+        if freed >= need_to_free && idle_ttl_secs.is_none() {
             break;
         }
         if pinned.contains(&it.key) {
@@ -170,13 +203,18 @@ where
             continue;
         }
         let last_touch = it.created_at_secs.max(it.last_used_at_secs);
-        if now_secs.saturating_sub(last_touch) < grace_secs {
+        let idle_secs = now_secs.saturating_sub(last_touch);
+        if idle_secs < grace_secs {
+            continue;
+        }
+        if freed >= need_to_free && !idle_ttl_secs.is_some_and(|ttl| idle_secs > ttl) {
             continue;
         }
         freed = freed.saturating_add(it.size_bytes);
         out.push(EvictionCandidate {
             key: it.key,
             size_bytes: it.size_bytes,
+            last_touch_secs: last_touch,
         });
     }
     out

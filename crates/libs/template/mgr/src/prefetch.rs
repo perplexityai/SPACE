@@ -81,15 +81,15 @@
 //!   tuple of the template leaves the prune keep-set; the template's
 //!   release pins prune to empty), which makes any residue *eligible*
 //!   for LRU eviction. Note the weaker verb: unpinning does not
-//!   evict. [`crate::eviction`] is enabled by default (100 GiB budget) —
-//!   and being enabled, it only reclaims once the node is *over budget*,
-//!   and never within the grace period (1800 s default). So the residue
-//!   becomes evictable, on the GC's schedule rather than this tick's.
-//!   (With `SPACE_TEMPLATE_CACHE_BUDGET_BYTES=0` the loop returns
-//!   without reading the DB or touching disk, so the residue is never
-//!   evicted at all.) Treat this as defense in
-//!   depth, not as the residue gate; the RFC assigns eviction-on-flip
-//!   to the flip path that will own it.
+//!   evict. [`crate::eviction`] reclaims when the node exceeds its byte
+//!   budget (100 GiB default) or an enabled idle TTL expires, while
+//!   preserving active, warm-pool and grace-period protection (1800 s
+//!   default). The residue becomes evictable on the GC's schedule rather
+//!   than this tick's. Disabling both the byte budget and idle TTL makes
+//!   the loop return without reading the DB or touching disk; setting
+//!   `SPACE_TEMPLATE_CACHE_BUDGET_BYTES=0` alone still permits idle expiry.
+//!   Treat this as defense in depth, not as the residue gate; the RFC assigns
+//!   eviction-on-flip to the flip path that will own it.
 //!   Either pass's verdict triggers both drops: the tag pass may see no
 //!   visibility at all when the tag no longer resolves (only the
 //!   latest-N verdict can clear its stale tag pins — carried on the
