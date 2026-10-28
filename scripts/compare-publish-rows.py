@@ -72,16 +72,18 @@ def node_scope(table: str, row: dict[str, Any]) -> str:
     return str(UUID(int=UUID(sandbox).int & ~((1 << 24) - 1)))
 
 
-def canonicalize(directory: Path) -> dict[str, Any]:
-    report = json.loads((directory / "report.json").read_text())
-    epoch = report["activity_epoch_seconds"] * 10**9
-    tables = {table: json.loads((directory / f"{table}.json").read_text()) for table in TABLES}
+def canonicalize_tables(
+    tables: dict[str, list[dict[str, Any]]], seed: int, activity_epoch_seconds: int
+) -> dict[str, Any]:
+    if set(tables) != set(TABLES):
+        raise ValueError("publish-owned table set differs")
+    epoch = activity_epoch_seconds * 10**9
     generated: dict[str, str] = {}
     for row in tables["sandbox_k8s_executions"]:
         generated[row["id"]] = f"execution:{row['sandbox_id']}:{row['generation']}"
     for row in tables["sandbox_quarantine_history"]:
         identifier = UUID(row["id"]).int
-        seeded = identifier >> 96 == report["seed"] and (identifier >> 64) & 0xffffffff == 0x7000
+        seeded = identifier >> 96 == seed and (identifier >> 64) & 0xffffffff == 0x7000
         if not seeded:
             # Receipt IDs are deterministic fences, never surrogate IDs.
             key = [row[name] for name in (
@@ -124,11 +126,7 @@ def canonicalize(directory: Path) -> dict[str, Any]:
                 result[column] = generated.get(value, value)
         return result
 
-    result: dict[str, Any] = {
-        "workload": {key: report[key] for key in (
-            "seed", "nodes", "sandboxes_per_node", "simulated_minutes", "time_scale", "publishes"
-        )}
-    }
+    result: dict[str, Any] = {}
     for table, rows in tables.items():
         result[table] = sorted(
             (convert(table, row) for row in rows),
@@ -137,13 +135,40 @@ def canonicalize(directory: Path) -> dict[str, Any]:
     return result
 
 
+def canonicalize(directory: Path) -> dict[str, Any]:
+    report = json.loads((directory / "report.json").read_text())
+    tables = {table: json.loads((directory / f"{table}.json").read_text()) for table in TABLES}
+    result = canonicalize_tables(tables, report["seed"], report["activity_epoch_seconds"])
+    result["workload"] = {key: report[key] for key in (
+        "seed", "nodes", "sandboxes_per_node", "simulated_minutes", "time_scale", "publishes"
+    )}
+    return result
+
+
+def canonicalize_scenarios(path: Path) -> dict[str, Any]:
+    report = json.loads(path.read_text())
+    if report["schema"] != 1 or not report["scenarios"]:
+        raise ValueError("unsupported or empty scenario report")
+    scenarios: dict[str, Any] = {}
+    for scenario in report["scenarios"]:
+        name = scenario["name"]
+        if name in scenarios:
+            raise ValueError(f"duplicate scenario: {name}")
+        scenarios[name] = canonicalize_tables(
+            scenario["rows"], report["seed"], report["activity_epoch_seconds"]
+        )
+    return {"seed": report["seed"], "scenarios": scenarios}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", type=Path)
     parser.add_argument("head", type=Path)
+    parser.add_argument("--scenarios", action="store_true", help="compare statements.json row captures")
     parser.add_argument("--output", type=Path, help="optional new directory for canonical evidence")
     args = parser.parse_args()
-    base, head = canonicalize(args.base), canonicalize(args.head)
+    canonicalizer = canonicalize_scenarios if args.scenarios else canonicalize
+    base, head = canonicalizer(args.base), canonicalizer(args.head)
     if args.output:
         args.output.mkdir(parents=True, exist_ok=False)
         for name, value in (("base", base), ("head", head)):

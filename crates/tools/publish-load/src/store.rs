@@ -301,14 +301,18 @@ pub async fn verify_transitions(pool: &PgPool, args: &Args) -> Result<()> {
 
 /// Export publish-owned fixture projections without explicit row locks.
 /// Empty tables are meaningful empty JSON arrays, not validation failures.
+pub async fn rows(pool: &PgPool) -> Result<Vec<(&'static str, Vec<serde_json::Value>)>> {
+    fixtures::outcome::dump(pool)
+        .await
+        .map_err(anyhow::Error::from_boxed)
+}
+
+/// Write raw publish-owned rows to the caller's new output directory.
 pub async fn dump(pool: &PgPool, output: &Path) -> Result<()> {
     // Raw rows are retained separately from summary metrics. Comparisons must
     // explicitly account for server timestamps and generated history UUIDs;
     // this export alone does not assert row equivalence.
-    for (table, rows) in fixtures::outcome::dump(pool)
-        .await
-        .map_err(anyhow::Error::from_boxed)?
-    {
+    for (table, rows) in rows(pool).await? {
         tokio::fs::write(
             output.join(format!("{table}.json")),
             serde_json::to_vec_pretty(&rows)?,

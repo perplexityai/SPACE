@@ -22,6 +22,7 @@ use serde::Serialize;
 struct Scenario {
     name: ScenarioKind,
     statements: BTreeMap<String, i64>,
+    rows: BTreeMap<&'static str, Vec<serde_json::Value>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -58,6 +59,7 @@ enum ScenarioKind {
 struct Report {
     schema: u32,
     seed: u64,
+    activity_epoch_seconds: u64,
     scenarios: Vec<Scenario>,
 }
 
@@ -130,7 +132,12 @@ async fn capture(
         !statements.is_empty(),
         "scenario captured no service statements"
     );
-    Ok(Scenario { name, statements })
+    let rows = store::rows(&db.pool).await?.into_iter().collect();
+    Ok(Scenario {
+        name,
+        statements,
+        rows,
+    })
 }
 
 async fn run(args: &Args, db: &TestDb) -> Result<()> {
@@ -447,6 +454,7 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
         let report = Report {
             schema: 1,
             seed: args.seed,
+            activity_epoch_seconds: 0,
             scenarios,
         };
         tokio::fs::write(
