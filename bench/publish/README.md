@@ -136,7 +136,8 @@ their equality and ordering within each node; the status deadline retains its
 exact offset from `observed_at`. Nothing is silently dropped, including nulls.
 Normalization is restricted to explicitly named timestamp and generated-identifier
 columns. Other text and nested JSON remain literal, even when a string
-looks like a timestamp or happens to equal a generated identifier.
+looks like a timestamp or happens to equal a generated identifier. This includes
+`sandbox_observed_states.observed_created_at`, which is node-supplied text.
 This is normalized row equivalence, not byte equality of independent wall clocks,
 and does not prove identical elapsed time between server writes. Raw exports
 remain available for inspection. There is no counter-freshness exemption.

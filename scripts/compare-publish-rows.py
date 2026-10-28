@@ -30,7 +30,8 @@ SERVER_TIMESTAMPS = {
         "created_at", "updated_at", "lifecycle_changed_at", "placement_changed_at",
         "restore_lease_expires_at", "next_restore_attempt_at", "next_auto_event_at",
     },
-    "sandbox_observed_states": {"observed_at", "observed_created_at", "updated_at"},
+    # observed_created_at is opaque node-supplied text, not a database clock.
+    "sandbox_observed_states": {"observed_at", "updated_at"},
     "node_facet_observed_status": {"observed_at", "updated_at"},
     "sandbox_quarantine_state": {
         "entered_at", "updated_at", "next_action_after", "claim_expires_at",
