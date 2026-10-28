@@ -21,6 +21,7 @@ pub(crate) mod activity;
 pub(crate) mod lifecycle;
 pub(crate) mod recovery_observation;
 pub(crate) mod sandboxes;
+pub(crate) mod suspend_handoff;
 pub(crate) mod suspended;
 
 /// Ownership of checked claims moves into the plan without cloning opaque payloads.

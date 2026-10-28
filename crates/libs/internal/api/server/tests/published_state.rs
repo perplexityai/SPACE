@@ -2080,7 +2080,7 @@ async fn publishing_suspended_node_state_with_mismatched_execution_identity_pres
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn publishing_local_suspend_handoff_records_only_kubernetes_rows() -> TestResult {
+async fn publishing_local_suspend_handoff_requires_identity_to_record_or_clear() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -2105,25 +2105,43 @@ async fn publishing_local_suspend_handoff_records_only_kubernetes_rows() -> Test
         sandboxes.push((sandbox_id, managed_by == "k8s"));
     }
 
-    let mut conn = db.pool.acquire().await?;
-    publish_sandbox_states(&mut conn, node_id, &published).await?;
-    drop(conn);
+    for (status, generation, pod_uid, retains_handoff) in [
+        (Some("suspended"), Some(1), Some("pod-uid-1"), true),
+        (None, Some(1), Some("pod-uid-1"), true),
+        (Some("started"), None, Some("pod-uid-1"), true),
+        (Some("started"), Some(1), None, true),
+        (Some("started"), Some(1), Some("pod-uid-1"), false),
+    ] {
+        let mut reports = published.clone();
+        for report in &mut reports {
+            report.status = status.map(str::to_owned);
+            report.execution_generation = generation;
+            report.pod_uid = pod_uid.map(str::to_owned);
+        }
+        let mut conn = db.pool.acquire().await?;
+        publish_sandbox_states(&mut conn, node_id, &reports).await?;
+        drop(conn);
 
-    for (sandbox_id, recorded) in sandboxes {
-        let handoff: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
+        for (sandbox_id, recorded) in &sandboxes {
+            let handoff: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS (
                  SELECT 1 FROM node_facet_observed_status
                   WHERE node_id = $1 AND facet = $2 AND element = $3
                     AND observed_payload ? $4
              )"
-        ))
-        .bind(node_id)
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .bind(sandbox_id.to_string())
-        .bind(SANDBOX_LOCAL_SUSPEND_KEY)
-        .fetch_one(&db.pool)
-        .await?;
-        assert_eq!(handoff, recorded, "sandbox {sandbox_id}");
+            ))
+            .bind(node_id)
+            .bind(FACET_SANDBOX_DESIRED_STATE)
+            .bind(sandbox_id.to_string())
+            .bind(SANDBOX_LOCAL_SUSPEND_KEY)
+            .fetch_one(&db.pool)
+            .await?;
+            assert_eq!(
+                handoff,
+                *recorded && retains_handoff,
+                "sandbox {sandbox_id}, status {status:?}, generation {generation:?}, pod {pod_uid:?}"
+            );
+        }
     }
     Ok(())
 }

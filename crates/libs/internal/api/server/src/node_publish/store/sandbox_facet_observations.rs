@@ -8,6 +8,7 @@ use sqlx::{PgConnection, types::Json};
 use crate::node_publish::plan::recovery_observation::{
     ClearRecoveryObservationClaim, RecoveryObservationClaim,
 };
+use crate::node_publish::plan::suspend_handoff::SuspendHandoffClaim;
 
 const QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS: i64 = 60 * 60;
 
@@ -32,17 +33,23 @@ pub(crate) enum ReconcileRecoveryObservationError {
 pub(crate) async fn upsert_suspend_handoff(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[SuspendHandoffClaim],
 ) -> Result<bool, UpsertSuspendHandoffError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
     let result = sqlx::query(sql!(
         "WITH input AS (
              SELECT sandbox_id, status, execution_generation, pod_uid,
                     current_local_artifact_id, current_local_artifact_kind,
                     current_local_artifact_origin
-             FROM jsonb_to_recordset($2::JSONB) AS input(
-                 sandbox_id UUID, status TEXT, execution_generation BIGINT,
-                 pod_uid TEXT, current_local_artifact_id UUID,
-                 current_local_artifact_kind TEXT, current_local_artifact_origin TEXT
+             FROM UNNEST(
+                 $2::UUID[], $6::TEXT[], $7::BIGINT[], $8::TEXT[],
+                 $9::UUID[], $10::TEXT[], $11::TEXT[]
+             ) AS input(
+                 sandbox_id, status, execution_generation, pod_uid,
+                 current_local_artifact_id, current_local_artifact_kind,
+                 current_local_artifact_origin
              )
          ), observation AS (
              SELECT input.sandbox_id,
@@ -88,10 +95,66 @@ pub(crate) async fn upsert_suspend_handoff(
                IS DISTINCT FROM EXCLUDED.observed_payload -> $4::TEXT"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(SANDBOX_LOCAL_SUSPEND_KEY)
     .bind(SubstrateKind::Kubernetes)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.status.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.execution_generation.get())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.pod_uid.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| {
+                claim
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| artifact.id().as_uuid())
+            })
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| {
+                claim
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| artifact.kind().as_str())
+            })
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| {
+                claim
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| artifact.origin().as_str())
+            })
+            .collect::<Vec<_>>(),
+    )
     .execute(&mut *conn)
     .await
     .map_err(UpsertSuspendHandoffError::Upsert)?;

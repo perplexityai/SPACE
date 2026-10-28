@@ -489,7 +489,8 @@ pub(crate) async fn publish_validated_sandbox_states(
         .iter()
         .map(|row| row.sandbox_id)
         .collect::<Vec<_>>();
-    sandbox_facet_observations::upsert_suspend_handoff(conn, node_id, &rows_json).await?;
+    sandbox_facet_observations::upsert_suspend_handoff(conn, node_id, &plan.suspend_handoffs)
+        .await?;
 
     post_commit_state_convergence.extend(accepted_rows.iter().filter_map(|row| {
         if !row.status_changed {

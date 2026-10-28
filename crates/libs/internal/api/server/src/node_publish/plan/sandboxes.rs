@@ -7,6 +7,7 @@ use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
 use super::activity::ActivityClaim;
 use super::lifecycle::{FailedClaim, PauseFailedRecoveryClaim, RestoreClaim, StoppedClaim};
 use super::recovery_observation::{ClearRecoveryObservationClaim, RecoveryObservationClaim};
+use super::suspend_handoff::SuspendHandoffClaim;
 use super::suspended::SuspendedClaim;
 use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::node_publish::validate::{
@@ -33,6 +34,7 @@ pub(crate) struct SandboxPlan {
     pub(crate) absent_ids: Vec<SandboxId>,
     pub(crate) observations: Vec<ObservedClaim>,
     pub(crate) activities: Vec<ActivityClaim>,
+    pub(crate) suspend_handoffs: Vec<SuspendHandoffClaim>,
     pub(crate) restored: Vec<RestoreClaim>,
     pub(crate) suspended: Vec<SuspendedClaim>,
     pub(crate) pause_failed_recoveries: Vec<PauseFailedRecoveryClaim>,
@@ -56,6 +58,7 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             absent_ids: inventory.absent_ids,
             observations: Vec::with_capacity(inventory.observations.len()),
             activities: Vec::new(),
+            suspend_handoffs: Vec::new(),
             restored: Vec::new(),
             suspended: Vec::new(),
             pause_failed_recoveries: Vec::new(),
@@ -75,6 +78,8 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
         for claim in inventory.observations {
             plan.activities
                 .extend(ActivityClaim::from_observation(&claim.observation));
+            plan.suspend_handoffs
+                .extend(SuspendHandoffClaim::from_observation(&claim.observation));
             match &claim.recovery {
                 QuarantineRecoveryProjectionState::Observed(observation) => {
                     plan.recovery_observations.push(RecoveryObservationClaim {

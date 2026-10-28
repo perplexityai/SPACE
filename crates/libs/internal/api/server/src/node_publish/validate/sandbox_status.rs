@@ -2,7 +2,7 @@ use pplx_space_common_core::types::SandboxLifecycle;
 
 use crate::metadata::optional_trimmed;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ReportedStatus {
     Known {
         lifecycle: SandboxLifecycle,
@@ -15,7 +15,7 @@ enum ReportedStatus {
 ///
 /// Publication has historically accepted nonempty unknown labels. They remain
 /// explicit opaque evidence rather than acquiring a known lifecycle's authority.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PublishedSandboxStatus(ReportedStatus);
 
 impl PublishedSandboxStatus {

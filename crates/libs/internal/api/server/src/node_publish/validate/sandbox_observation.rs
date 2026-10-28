@@ -84,6 +84,10 @@ impl ValidatedSandboxObservation {
         self.sandbox_id
     }
 
+    pub(crate) fn status(&self) -> Option<&PublishedSandboxStatus> {
+        self.status.as_ref()
+    }
+
     pub(crate) fn last_used_at(&self) -> Option<&PublishedActivityTimestamp> {
         self.last_used_at.as_ref()
     }
