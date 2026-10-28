@@ -31,24 +31,6 @@ pub(super) use errors::{
     RecoverPauseFailedError, SelectActivationRollbacksError, SelectSuspendedProjectionsError,
 };
 
-const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
-    sandbox_id UUID,
-    status TEXT,
-    transition_receipt_id UUID,
-    transition_receipt_kind TEXT,
-    transition_receipt_target_state TEXT,
-    transition_receipt_execution_generation BIGINT,
-    transition_receipt_reason_code TEXT,
-    transition_receipt_recovery_policy TEXT,
-    transition_receipt_activation_attempt_id UUID,
-    failure_reason TEXT,
-    current_local_artifact_id UUID,
-    current_local_artifact_kind TEXT,
-    current_local_artifact_origin TEXT,
-    execution_generation BIGINT,
-    pod_uid TEXT
-";
-
 #[derive(Debug)]
 pub(super) struct QuarantineRecoveryCandidate {
     pub(super) quarantine_id: Uuid,
@@ -357,10 +339,26 @@ pub(super) async fn consume_activation_completion_receipts(
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
 ) -> Result<Vec<SandboxId>, ConsumeActivationReceiptsError> {
-    let query = format!(
+    sqlx::query_scalar(sql!(
         "WITH input AS (
              SELECT *
-               FROM jsonb_to_recordset($2::jsonb) AS published({TRANSITION_RECEIPT_RECORD_COLUMNS})
+               FROM jsonb_to_recordset($2::jsonb) AS published(
+                   sandbox_id UUID,
+                   status TEXT,
+                   transition_receipt_id UUID,
+                   transition_receipt_kind TEXT,
+                   transition_receipt_target_state TEXT,
+                   transition_receipt_execution_generation BIGINT,
+                   transition_receipt_reason_code TEXT,
+                   transition_receipt_recovery_policy TEXT,
+                   transition_receipt_activation_attempt_id UUID,
+                   failure_reason TEXT,
+                   current_local_artifact_id UUID,
+                   current_local_artifact_kind TEXT,
+                   current_local_artifact_origin TEXT,
+                   execution_generation BIGINT,
+                   pod_uid TEXT
+               )
          ), released AS (
              UPDATE sandbox_k8s_executions execution
                 SET activation_attempt_id = NULL,
@@ -404,8 +402,7 @@ pub(super) async fn consume_activation_completion_receipts(
                 'suspending', 'suspended', 'quarantined', 'deleting', 'deleted', 'cleanup_required'
             )
          RETURNING sandbox.id"
-    );
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+    ))
         .bind(node_id)
         .bind(rows_json)
         .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
@@ -433,7 +430,7 @@ pub(super) async fn select_activation_rollback_candidates(
         SandboxLifecycle,
         Option<String>,
     );
-    let query = format!(
+    let rows: Vec<CandidateRow> = sqlx::query_as(sql!(
         "SELECT s.id,
                 input.transition_receipt_id,
                 input.transition_receipt_execution_generation,
@@ -443,7 +440,23 @@ pub(super) async fn select_activation_rollback_candidates(
                 LOWER(TRIM(s.lifecycle)),
                 input.failure_reason
            FROM sandboxes s
-           JOIN jsonb_to_recordset($2::jsonb) AS input({TRANSITION_RECEIPT_RECORD_COLUMNS})
+           JOIN jsonb_to_recordset($2::jsonb) AS input(
+               sandbox_id UUID,
+               status TEXT,
+               transition_receipt_id UUID,
+               transition_receipt_kind TEXT,
+               transition_receipt_target_state TEXT,
+               transition_receipt_execution_generation BIGINT,
+               transition_receipt_reason_code TEXT,
+               transition_receipt_recovery_policy TEXT,
+               transition_receipt_activation_attempt_id UUID,
+               failure_reason TEXT,
+               current_local_artifact_id UUID,
+               current_local_artifact_kind TEXT,
+               current_local_artifact_origin TEXT,
+               execution_generation BIGINT,
+               pod_uid TEXT
+           )
              ON input.sandbox_id = s.id
            JOIN sandbox_k8s_executions execution
              ON execution.sandbox_id = s.id
@@ -458,14 +471,13 @@ pub(super) async fn select_activation_rollback_candidates(
                 'quarantined', 'deleted', 'deleting', 'cleanup_required'
             )
           FOR UPDATE OF s, execution"
-    );
-    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(rows_json)
-        .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(SelectActivationRollbacksError::Select)?;
+    ))
+    .bind(node_id)
+    .bind(rows_json)
+    .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(SelectActivationRollbacksError::Select)?;
 
     rows.into_iter()
         .map(
@@ -716,13 +728,9 @@ pub(super) async fn recover_pause_failed_from_inventory(
     Ok(recoveries)
 }
 
-/// Select node-published suspended projections and generation-fenced
-/// quarantine recovery receipts in the node-publish transaction.
-pub(super) async fn select_suspended_projection_candidates(
-    conn: &mut sqlx::PgConnection,
-    node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
-) -> Result<Vec<SuspendedProjectionCandidate>, SelectSuspendedProjectionsError> {
+// Keep portability predicates shared, with the complete locking statement built
+// once. Every publication still evaluates those predicates against its own rows.
+static SELECT_SUSPENDED_PROJECTIONS: LazyLock<String> = LazyLock::new(|| {
     let eligibility = started_suspend_revert_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
@@ -745,7 +753,7 @@ pub(super) async fn select_suspended_projection_candidates(
         &committed_suspend_evidence,
         Some(&node_suspend_evidence),
     );
-    let query = format!(
+    sql!(format!(
         "WITH input AS (
              SELECT published.*,
                     published.transition_receipt_kind = $3
@@ -755,7 +763,23 @@ pub(super) async fn select_suspended_projection_candidates(
                           FROM sandbox_quarantine_history consumed
                          WHERE consumed.id = published.transition_receipt_id
                     ) AS has_unconsumed_recovery_receipt
-               FROM jsonb_to_recordset($2::jsonb) AS published({TRANSITION_RECEIPT_RECORD_COLUMNS})
+               FROM jsonb_to_recordset($2::jsonb) AS published(
+                   sandbox_id UUID,
+                   status TEXT,
+                   transition_receipt_id UUID,
+                   transition_receipt_kind TEXT,
+                   transition_receipt_target_state TEXT,
+                   transition_receipt_execution_generation BIGINT,
+                   transition_receipt_reason_code TEXT,
+                   transition_receipt_recovery_policy TEXT,
+                   transition_receipt_activation_attempt_id UUID,
+                   failure_reason TEXT,
+                   current_local_artifact_id UUID,
+                   current_local_artifact_kind TEXT,
+                   current_local_artifact_origin TEXT,
+                   execution_generation BIGINT,
+                   pod_uid TEXT
+               )
          )
          SELECT s.id,
                 CASE WHEN LOWER(TRIM(s.lifecycle)) = 'quarantined'
@@ -860,7 +884,17 @@ pub(super) async fn select_suspended_projection_candidates(
                 )
             )
           FOR UPDATE OF s",
-    );
+    ))
+});
+
+/// Select node-published suspended projections and generation-fenced recovery
+/// receipts owned by this node. Lock qualifying sandbox rows through finalization;
+/// an empty result is a normal no-match outcome, not a failed recovery.
+pub(super) async fn select_suspended_projection_candidates(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows_json: Json<serde_json::Value>,
+) -> Result<Vec<SuspendedProjectionCandidate>, SelectSuspendedProjectionsError> {
     type CandidateRow = (
         SandboxId,
         bool,
@@ -875,16 +909,17 @@ pub(super) async fn select_suspended_projection_candidates(
         Option<String>,
         Option<bool>,
     );
-    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(rows_json)
-        .bind(SandboxTransitionReceiptKind::QuarantineRecovery.as_str())
-        .bind(SandboxQuarantineSource::SbxManager.as_str())
-        .bind(SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact.as_str())
-        .bind(SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact.as_str())
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(SelectSuspendedProjectionsError::Select)?;
+    let rows: Vec<CandidateRow> =
+        sqlx::query_as(sqlx::AssertSqlSafe(SELECT_SUSPENDED_PROJECTIONS.as_str()))
+            .bind(node_id)
+            .bind(rows_json)
+            .bind(SandboxTransitionReceiptKind::QuarantineRecovery.as_str())
+            .bind(SandboxQuarantineSource::SbxManager.as_str())
+            .bind(SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact.as_str())
+            .bind(SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact.as_str())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(SelectSuspendedProjectionsError::Select)?;
 
     rows.into_iter()
         .map(
