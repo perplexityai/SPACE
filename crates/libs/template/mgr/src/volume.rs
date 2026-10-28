@@ -2967,6 +2967,7 @@ fn check_manifest_digests_for_target(
     Ok(())
 }
 
+#[tracing::instrument(skip_all, err)]
 async fn materialize_rootfs(
     manifest: &pplx_space_common_core::types::TemplateManifest,
     digest_dir: &str,
@@ -3045,7 +3046,9 @@ async fn materialize_rootfs(
     let phase_started = Instant::now();
     let decompress_futs = decompress_jobs.into_iter().map(
         |(compressed, uncompressed, expected_digest, policy)| async move {
+            let parent = tracing::Span::current();
             tokio::task::spawn_blocking(move || {
+                let _entered = parent.enter();
                 crate::rootfs_zstd::decompress_rootfs(
                     Path::new(&compressed),
                     Path::new(&uncompressed),
@@ -3156,7 +3159,10 @@ async fn materialize_rootfs(
         .algorithm();
     let hash_source = rootfs_path.to_string();
     let phase_started = Instant::now();
+    let parent = tracing::Span::current();
     let (rootfs_hash, rootfs_size) = match tokio::task::spawn_blocking(move || {
+        let _entered = parent.enter();
+        let setup = tracing::info_span!("rootfs.raw_setup").entered();
         backing_policy
             .prepare_raw(Path::new(&hash_source))
             .map_err(|source| crate::rootfs_zstd::RootfsZstdError::Io {
@@ -3164,6 +3170,7 @@ async fn materialize_rootfs(
                 path: hash_source.clone(),
                 source,
             })?;
+        drop(setup);
         crate::rootfs_zstd::hash_rootfs_file(Path::new(&hash_source), algorithm)
     })
     .await
