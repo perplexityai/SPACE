@@ -202,7 +202,7 @@ async fn local_authority_signs_leaves_without_host_control_and_retires_leases() 
         .unwrap();
     let certified = first.certified_key().unwrap();
     let (_, leaf) = X509Certificate::from_der(&certified.cert[0]).unwrap();
-    assert_eq!(leaf.subject().to_string(), "CN=SPACE TLS interception");
+    assert_eq!(leaf.subject().to_string(), "CN=SPACE Gateway");
     assert_ne!(leaf.subject(), leaf.issuer());
     let san = leaf.subject_alternative_name().unwrap().unwrap();
     assert_eq!(

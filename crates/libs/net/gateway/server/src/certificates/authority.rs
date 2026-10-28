@@ -29,6 +29,8 @@ use pplx_space_metrics::gateway::readiness::{self as metrics, Outcome};
 
 const MAX_CERTIFICATE_BYTES: usize = 16 * 1024;
 const LEAF_LIFETIME_SECS: i64 = 86_400;
+/// Fixed subject Common Name for every leaf; the SAN carries the hostname.
+const LEAF_COMMON_NAME: &str = "SPACE Gateway";
 // Delegation cannot outlive the verified node CA. No independent AWS lifetime
 // or idempotency contract applies to a certificate signed locally by that node.
 
@@ -149,7 +151,7 @@ impl AuthorityLease {
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
-            .push(DnType::CommonName, "SPACE TLS interception");
+            .push(DnType::CommonName, LEAF_COMMON_NAME);
         params.not_before = time::OffsetDateTime::from_unix_timestamp(not_before)
             .map_err(|_| Status::internal("invalid leaf validity"))?;
         params.not_after = time::OffsetDateTime::from_unix_timestamp(not_after)
