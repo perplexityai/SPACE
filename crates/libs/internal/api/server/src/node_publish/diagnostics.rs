@@ -1,12 +1,71 @@
-use pplx_space_common_core::types::{NodeId, SandboxId, SandboxQuarantineVocabularyParseError};
+use pplx_space_common_core::types::{
+    AutoLifecycleDeleteReceiptId, NodeId, SandboxId, SandboxQuarantineVocabularyParseError,
+};
+use pplx_space_common_svc::types::AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT;
 use pplx_space_metrics::sandbox::publication::{
+    AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,
     StatePublicationComponent as Component, StatePublicationDisposition as Disposition,
     StatePublicationField as Field, degraded,
 };
 use tonic::Status;
 
+use super::validate::delete_completions::CompletionValidationError;
 use super::validate::receipts::{PublishedTransitionReceiptError, RollbackReasonFallback};
 use super::validate::sandbox_observation::InvalidSpacedVersion;
+
+#[derive(Debug)]
+pub(crate) enum DeleteCompletionDiagnostic {
+    Oversized {
+        received: usize,
+        dropped: usize,
+    },
+    Malformed {
+        receipt_id: String,
+        error: CompletionValidationError,
+        disposition: AutoLifecycleDeleteCompletionDisposition,
+    },
+    Duplicate {
+        sandbox_id: SandboxId,
+        receipt_id: AutoLifecycleDeleteReceiptId,
+    },
+}
+
+impl DeleteCompletionDiagnostic {
+    pub(crate) fn emit(&self, origin_node_id: NodeId) {
+        const TARGET: &str = "pplx_space_internal_api_server::auto_lifecycle_delete_completions";
+        match self {
+            Self::Oversized { received, dropped } => tracing::warn!(
+                target: TARGET,
+                node_id = %origin_node_id,
+                received,
+                limit = AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT,
+                dropped,
+                "truncating oversized auto-lifecycle delete completion batch"
+            ),
+            Self::Malformed {
+                receipt_id,
+                error,
+                disposition,
+            } => tracing::warn!(
+                target: TARGET,
+                %receipt_id,
+                %error,
+                %disposition,
+                "ignoring auto-lifecycle delete completion this receiver cannot act on"
+            ),
+            Self::Duplicate {
+                sandbox_id,
+                receipt_id,
+            } => tracing::debug!(
+                target: TARGET,
+                %sandbox_id,
+                %receipt_id,
+                reason = %AutoLifecycleDeleteCompletionReason::DuplicateSandboxReceipt,
+                "deferring auto-lifecycle delete completion"
+            ),
+        }
+    }
+}
 
 // Keep the existing diagnostic target while parsing moves to a pure boundary.
 const LOG_TARGET: &str = "pplx_space_internal_api_server::published_state";

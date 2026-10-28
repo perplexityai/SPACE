@@ -1,23 +1,21 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    str::FromStr,
-};
+use std::{collections::BTreeMap, str::FromStr};
 
 use pplx_space_common_core::{
     sql,
     types::{
         AutoLifecycleDeleteReceiptId, AutoLifecycleIdleAction, AutoLifecyclePolicy,
-        ExecutionGeneration, ExecutionGenerationParseError, NodeId, SandboxActivationAttemptId,
-        SandboxId, SandboxIdParseError, SandboxLifecycle, SandboxQuarantineReasonCode,
-        SandboxQuarantineSource,
+        ExecutionGeneration, NodeId, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+        SandboxQuarantineReasonCode, SandboxQuarantineSource,
     },
 };
 use pplx_space_common_svc::sql::contention::{self, is_lock_not_available};
+#[cfg(test)]
 use pplx_space_common_svc::types::{
-    AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE, AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT,
-    AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE,
-    AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT, AutoLifecyclePolicyFingerprint,
-    AutoLifecyclePolicyFingerprintParseError,
+    AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE, AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT,
+};
+use pplx_space_common_svc::types::{
+    AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT,
+    AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE, AutoLifecyclePolicyFingerprint,
 };
 use pplx_space_metrics::sandbox::publication::{
     AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,
@@ -27,72 +25,10 @@ use pplx_space_sandbox_teardown::finalize_sandbox_db_delete_tx;
 use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
 use tonic::Status;
 
+use crate::node_publish::validate::delete_completions::{
+    DeleteCompletionClaim as ParsedCompletion, ValidatedDeleteCompletions,
+};
 use crate::proto::AutoLifecycleDeleteCompletion;
-
-#[derive(Debug)]
-struct ParsedCompletion {
-    receipt_id: AutoLifecycleDeleteReceiptId,
-    sandbox_id: SandboxId,
-    execution_generation: ExecutionGeneration,
-    route_activation_id: SandboxActivationAttemptId,
-    policy_fingerprint: AutoLifecyclePolicyFingerprint,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ParsedCompletionError {
-    #[error("invalid auto-lifecycle delete receipt_id: {0}")]
-    ReceiptId(#[source] uuid::Error),
-    #[error("invalid auto-lifecycle delete sandbox_id: {0}")]
-    SandboxId(#[source] SandboxIdParseError),
-    #[error("invalid auto-lifecycle delete execution_generation: {0}")]
-    ExecutionGeneration(#[source] ExecutionGenerationParseError),
-    #[error("invalid auto-lifecycle delete route_activation_id: {0}")]
-    RouteActivationId(#[source] uuid::Error),
-    #[error("invalid auto-lifecycle delete policy fingerprint: {0}")]
-    PolicyFingerprint(#[source] AutoLifecyclePolicyFingerprintParseError),
-}
-
-impl ParsedCompletionError {
-    /// True when the receipt is well-formed for a newer receiver than this one.
-    ///
-    /// Such a receipt must never be acknowledged: acknowledgement is the
-    /// publisher's signal to prune, so acknowledging here would discard a
-    /// deletion this build merely cannot interpret. Deferring keeps it on the
-    /// node until an upgraded receiver accepts it.
-    fn is_forward_incompatible(&self) -> bool {
-        matches!(
-            self,
-            Self::PolicyFingerprint(
-                AutoLifecyclePolicyFingerprintParseError::UnsupportedVersion(_)
-            )
-        )
-    }
-}
-
-impl TryFrom<&AutoLifecycleDeleteCompletion> for ParsedCompletion {
-    type Error = ParsedCompletionError;
-
-    fn try_from(value: &AutoLifecycleDeleteCompletion) -> Result<Self, Self::Error> {
-        let receipt_id = AutoLifecycleDeleteReceiptId::from_str(&value.receipt_id)
-            .map_err(ParsedCompletionError::ReceiptId)?;
-        let sandbox_id =
-            SandboxId::from_str(&value.sandbox_id).map_err(ParsedCompletionError::SandboxId)?;
-        let execution_generation = ExecutionGeneration::try_from(value.execution_generation)
-            .map_err(ParsedCompletionError::ExecutionGeneration)?;
-        let route_activation_id = SandboxActivationAttemptId::from_str(&value.route_activation_id)
-            .map_err(ParsedCompletionError::RouteActivationId)?;
-        let policy_fingerprint =
-            AutoLifecyclePolicyFingerprint::from_str(&value.auto_lifecycle_policy_fingerprint)
-                .map_err(ParsedCompletionError::PolicyFingerprint)?;
-        Ok(Self {
-            receipt_id,
-            sandbox_id,
-            execution_generation,
-            route_activation_id,
-            policy_fingerprint,
-        })
-    }
-}
 
 #[derive(Debug, FromRow)]
 struct CompletionAuthorityRow {
@@ -237,119 +173,40 @@ fn is_retryable_finalize_error(error: &sqlx::Error) -> bool {
     contention::is_lock_contention(error)
 }
 
-/// Parse the request's receipts, dropping and reporting the ones this build
-/// cannot act on.
-fn parse_completions(
-    consumption: &mut AutoLifecycleDeleteConsumption,
-    completions: &[AutoLifecycleDeleteCompletion],
-) -> Vec<ParsedCompletion> {
-    completions
-        .iter()
-        .filter_map(|completion| {
-            let error = match ParsedCompletion::try_from(completion) {
-                Ok(completion) => return Some(completion),
-                Err(error) => error,
-            };
-            let receipt_id = AutoLifecycleDeleteReceiptId::from_str(&completion.receipt_id).ok();
-            let (disposition, reason) = match (receipt_id, error.is_forward_incompatible()) {
-                (None, _) => (
-                    AutoLifecycleDeleteCompletionDisposition::Unacknowledgeable,
-                    AutoLifecycleDeleteCompletionReason::MalformedReceipt,
-                ),
-                (Some(_), true) => (
-                    AutoLifecycleDeleteCompletionDisposition::Deferred,
-                    AutoLifecycleDeleteCompletionReason::UnsupportedFingerprintVersion,
-                ),
-                (Some(receipt_id), false) => {
-                    consumption.acknowledged_receipt_ids.push(receipt_id);
-                    (
-                        AutoLifecycleDeleteCompletionDisposition::AcknowledgedNoop,
-                        AutoLifecycleDeleteCompletionReason::MalformedReceipt,
-                    )
-                }
-            };
-            consumption.completion_metrics.push((disposition, reason));
-            tracing::warn!(
-                receipt_id = %completion.receipt_id,
-                %error,
-                %disposition,
-                "ignoring auto-lifecycle delete completion this receiver cannot act on"
-            );
-            None
-        })
-        .collect()
-}
-
-/// Choose the bounded work set.
-///
-/// The durable publisher rotates retries before constructing the request, so
-/// take receipts in publisher order and sort only the selected window, which
-/// keeps lock acquisition deterministic without discarding that fairness.
-fn select_completions(
-    consumption: &mut AutoLifecycleDeleteConsumption,
-    parsed_completions: Vec<ParsedCompletion>,
-) -> Vec<ParsedCompletion> {
-    let mut selected_sandboxes = BTreeSet::new();
-    let mut selected = Vec::with_capacity(
-        parsed_completions
-            .len()
-            .min(AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE),
-    );
-    for completion in parsed_completions {
-        // Only a receipt for an already-selected sandbox is a duplicate. A
-        // receipt the budget turned away leaves its sandbox unselected, so a
-        // second receipt for it is reported against the budget that displaced
-        // it rather than against the receipt that never ran.
-        if selected_sandboxes.contains(&completion.sandbox_id) {
-            defer_completion(
-                consumption,
-                &completion,
-                AutoLifecycleDeleteCompletionReason::DuplicateSandboxReceipt,
-            );
-        } else if selected.len() < AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE {
-            selected_sandboxes.insert(completion.sandbox_id);
-            selected.push(completion);
-        } else {
-            consumption.deferred_by_batch_limit =
-                consumption.deferred_by_batch_limit.saturating_add(1);
-        }
-    }
-    // One receipt per sandbox survives selection, so the sandbox id alone is a
-    // total order over the window.
-    selected.sort_unstable_by_key(|completion| completion.sandbox_id);
-    selected
-}
-
 pub(super) async fn consume_auto_lifecycle_delete_completions(
     tx: &mut Transaction<'_, Postgres>,
     origin_node_id: NodeId,
     completions: &[AutoLifecycleDeleteCompletion],
 ) -> Result<AutoLifecycleDeleteConsumption, Status> {
-    let mut consumption = AutoLifecycleDeleteConsumption::default();
-    if completions.is_empty() {
-        return Ok(consumption);
-    }
-    // Bound the work the repeated field itself can create. Parsing, metric
-    // accumulation, and the acknowledgement list all scale with the field, not
-    // with the batch budget below.
-    let completions = if completions.len() > AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT {
-        let (accepted, over_limit) =
-            completions.split_at(AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT);
-        consumption.deferred_by_request_limit = over_limit.len();
-        tracing::warn!(
-            node_id = %origin_node_id,
-            received = completions.len(),
-            limit = AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT,
-            dropped = over_limit.len(),
-            "truncating oversized auto-lifecycle delete completion batch"
-        );
-        accepted
-    } else {
-        completions
-    };
+    let completions = ValidatedDeleteCompletions::from_proto(completions);
+    consume_validated_auto_lifecycle_delete_completions(tx, origin_node_id, completions).await
+}
 
-    let parsed_completions = parse_completions(&mut consumption, completions);
-    let selected = select_completions(&mut consumption, parsed_completions);
+/// Consume selected claims after this publication's final evidence writes.
+/// Selection cannot authorize deletion: the existing row locks and guards do.
+pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
+    tx: &mut Transaction<'_, Postgres>,
+    origin_node_id: NodeId,
+    completions: ValidatedDeleteCompletions,
+) -> Result<AutoLifecycleDeleteConsumption, Status> {
+    for diagnostic in &completions.diagnostics {
+        diagnostic.emit(origin_node_id);
+    }
+    let ValidatedDeleteCompletions {
+        selected,
+        acknowledged_receipt_ids,
+        deferred_by_batch_limit,
+        deferred_by_request_limit,
+        completion_metrics,
+        ..
+    } = completions;
+    let mut consumption = AutoLifecycleDeleteConsumption {
+        acknowledged_receipt_ids,
+        deferred_by_batch_limit,
+        deferred_by_request_limit,
+        completion_metrics,
+        ..Default::default()
+    };
     if selected.is_empty() {
         return Ok(consumption);
     }
