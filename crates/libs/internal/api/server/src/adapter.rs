@@ -349,6 +349,22 @@ impl ClusterApi for ClusterApiService {
             .await
             .map_err(|err| template_publication::storage_status("begin tx", &err))?;
 
+        // Acquire the template before its grant, matching explicit recreation
+        // which revokes old grants while holding the same lifecycle lock.
+        let release_org_id = self
+            .lock_template_for_publication(&mut tx, &template_name, template_org)
+            .await;
+        // Preserve grant-denial precedence without reversing the lock order.
+        // Storage failures must escape immediately: their transaction may be aborted.
+        if let Err(error) = &release_org_id
+            && !matches!(
+                error.code(),
+                tonic::Code::NotFound | tonic::Code::PermissionDenied
+            )
+        {
+            return Err(error.clone());
+        }
+
         // Consumed with the release it authorizes: a rolled-back publication
         // keeps its grant, and a committed one cannot be repeated.
         if let Some(grant) = system_grant
@@ -377,9 +393,7 @@ impl ClusterApi for ClusterApiService {
         {
             return Err(template_publication::missing_tenant_publication_grant());
         }
-        let release_org_id = self
-            .lock_template_for_publication(&mut tx, &template_name, template_org)
-            .await?;
+        let release_org_id = release_org_id?;
         let release = ensure_template_release(
             &mut tx,
             template_name.as_str(),

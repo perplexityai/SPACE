@@ -3,8 +3,8 @@ use std::str::FromStr;
 use pplx_space_common_core::{
     sql,
     types::{
-        BuildRunId, BuildRunIdParseError, NodeId, OrgId, SystemPublicationGrantId, TemplateName,
-        TenantPublicationGrantId,
+        BuildRunId, BuildRunIdParseError, NodeId, OrgId, SystemPublicationGrantId,
+        TemplateDesiredState, TemplateName, TenantPublicationGrantId,
     },
 };
 use sqlx::{PgExecutor, PgPool};
@@ -53,6 +53,8 @@ pub enum TemplateBuildJobsStoreError {
     InvalidDaemonJobId(#[from] BuildRunIdParseError),
     #[error("template build inputs belong to another organization")]
     OwnershipConflict,
+    #[error("template deletion must finish before starting a new build")]
+    LifecycleConflict,
     #[error("tenant publication requires the accepting builder identity")]
     BuilderIdentityRequired,
 }
@@ -72,6 +74,7 @@ impl TemplateBuildJobsStoreError {
             Self::Storage(error) => Some(error),
             Self::InvalidDaemonJobId(_)
             | Self::OwnershipConflict
+            | Self::LifecycleConflict
             | Self::BuilderIdentityRequired => None,
         }
     }
@@ -252,6 +255,23 @@ impl TemplateBuildJobsStore {
         ))
         .execute(&self.pool)
         .await?;
+        let mut tx = self.pool.begin().await?;
+        // This lock is the authorization point for a new submission. A trigger
+        // after recreation may build; a grant issued before deletion is revoked.
+        if let Some((owner, desired_state)) = sqlx::query_as::<_, (Option<OrgId>, String)>(sql!(
+            "SELECT org_id, desired_state FROM templates WHERE name = $1 FOR UPDATE"
+        ))
+        .bind(template_name.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            if owner != Some(org_id) {
+                return Err(TemplateBuildJobsStoreError::OwnershipConflict);
+            }
+            if desired_state != TemplateDesiredState::Present.as_str() {
+                return Err(TemplateBuildJobsStoreError::LifecycleConflict);
+            }
+        }
         let grant = TenantPublicationGrantId::new();
         sqlx::query(sql!(
             "INSERT INTO template_tenant_publication_grants (id, template_name, org_id)
@@ -260,8 +280,9 @@ impl TemplateBuildJobsStore {
         .bind(grant.as_uuid())
         .bind(template_name.as_str())
         .bind(org_id.as_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(grant)
     }
 
@@ -375,8 +396,46 @@ impl TemplateBuildJobsStore {
         build_id: &str,
         spec: BuildSpec,
     ) -> Result<(), TemplateBuildJobsStoreError> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
-            return Err(TemplateBuildJobsStoreError::OwnershipConflict);
+        let mut tx = self.pool.begin().await?;
+        if let Some((owner, desired_state)) = sqlx::query_as::<_, (Option<OrgId>, String)>(sql!(
+            "SELECT org_id, desired_state FROM templates WHERE name = $1 FOR UPDATE"
+        ))
+        .bind(template_name.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            if owner.is_some_and(|owner| owner != org_id) {
+                return Err(TemplateBuildJobsStoreError::OwnershipConflict);
+            }
+            if desired_state == TemplateDesiredState::Deleted.as_str() && owner == Some(org_id) {
+                let inventory = crate::template_inventory_store::nodes_with_template_inventory(
+                    &mut *tx,
+                    template_name,
+                )
+                .await?;
+                if !inventory.is_empty() {
+                    return Err(TemplateBuildJobsStoreError::LifecycleConflict);
+                }
+                // Only explicit build admission can reuse a completed tombstone.
+                // Revocation fences builders dispatched before its deletion.
+                sqlx::query(sql!(
+                    "DELETE FROM template_tenant_publication_grants WHERE template_name = $1"
+                ))
+                .bind(template_name.as_str())
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(sql!(
+                    "UPDATE templates SET desired_state = $2, delete_operation_id = NULL,
+                         delete_requested_at = NULL, delete_requested_by = NULL, updated_at = NOW()
+                     WHERE name = $1"
+                ))
+                .bind(template_name.as_str())
+                .bind(TemplateDesiredState::Present.as_str())
+                .execute(&mut *tx)
+                .await?;
+            } else if desired_state != TemplateDesiredState::Present.as_str() {
+                return Err(TemplateBuildJobsStoreError::LifecycleConflict);
+            }
         }
         let result = sqlx::query(sql!(
             "INSERT INTO template_build_jobs (template_id, build_id, cpu_count, memory_mb, tags, org_id)
@@ -393,12 +452,13 @@ impl TemplateBuildJobsStore {
         .bind(spec.memory_mb.map(|value| value as i32))
         .bind(spec.tags)
         .bind(org_id.as_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
+        tx.commit().await?;
         Ok(())
     }
 

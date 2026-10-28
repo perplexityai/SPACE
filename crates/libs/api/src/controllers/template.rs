@@ -35,6 +35,13 @@ fn build_jobs_store_error(
     message: &'static str,
     error: TemplateBuildJobsStoreError,
 ) -> ControllerError {
+    if matches!(
+        error,
+        TemplateBuildJobsStoreError::OwnershipConflict
+            | TemplateBuildJobsStoreError::LifecycleConflict
+    ) {
+        return ControllerError::conflict(error.to_string());
+    }
     match error.as_sql() {
         Some(sql) => db_contention_error(message, sql),
         None => crate::controllers::internal_error(message, error),

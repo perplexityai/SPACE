@@ -82,7 +82,11 @@ fn template_build_store_error(
     what: &'static str,
     error: TemplateBuildJobsStoreError,
 ) -> E2bApiError {
-    if matches!(error, TemplateBuildJobsStoreError::OwnershipConflict) {
+    if matches!(
+        error,
+        TemplateBuildJobsStoreError::OwnershipConflict
+            | TemplateBuildJobsStoreError::LifecycleConflict
+    ) {
         return E2bApiError::new(axum::http::StatusCode::CONFLICT, error.to_string());
     }
     match error.as_sql() {

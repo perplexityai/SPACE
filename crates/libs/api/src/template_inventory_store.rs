@@ -2,7 +2,7 @@
 
 use pplx_space_common_core::{
     sql,
-    types::{MemorySize, RuntimeKind, TemplateName, VcpuCount},
+    types::{MemorySize, NodeId, RuntimeKind, SubstrateKind, TemplateName, VcpuCount},
 };
 use sqlx::PgExecutor;
 
@@ -51,6 +51,30 @@ pub(crate) async fn release_build_shape(
     .fetch_optional(executor)
     .await?;
     Ok(row.and_then(|(vcpu, memory_mib)| TemplateBuildShape::from_inventory(vcpu, memory_mib)))
+}
+
+/// Inventory that must converge before deletion or same-name recreation.
+/// A retired Direct node cannot reconcile its stale inventory; Kubernetes
+/// inventory remains authoritative until the registry removes it.
+pub(crate) async fn nodes_with_template_inventory(
+    executor: impl sqlx::PgExecutor<'_>,
+    template: &TemplateName,
+) -> Result<Vec<NodeId>, sqlx::Error> {
+    sqlx::query_scalar::<_, NodeId>(sql!(
+        "SELECT DISTINCT nti.node_id
+         FROM node_template_inventory nti
+         JOIN nodes n ON n.id = nti.node_id
+         LEFT JOIN node_direct nd ON nd.node_id = n.id
+         WHERE nti.template_name = $1
+           AND (
+             n.managed_by != $2
+             OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
+           )"
+    ))
+    .bind(template.as_str())
+    .bind(SubstrateKind::Space)
+    .fetch_all(executor)
+    .await
 }
 
 #[cfg(test)]

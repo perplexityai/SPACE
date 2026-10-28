@@ -948,6 +948,39 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
         .expect("delete operation recorded")
     };
 
+    // Failing the intent write must roll back the operation and its key too:
+    // a dispatcher must never observe a delete without its lifecycle fence.
+    sqlx::query(sql!(
+        "ALTER TABLE templates ADD CONSTRAINT reject_delete_intent
+         CHECK (desired_state <> 'deleting')"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(IDEMPOTENCY_KEY_HEADER, "failed-delete-retry-first".parse()?);
+    let rejected = delete_template(
+        State(state.clone()),
+        Extension(AuthUser(actor.clone())),
+        headers,
+        Path(template.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(rejected.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let orphan_operations: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM public_operations
+         WHERE kind = 'delete_template' AND target_id = $1"
+    ))
+    .bind(template.as_str())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(orphan_operations, 0, "operation and intent commit together");
+    sqlx::query(sql!(
+        "ALTER TABLE templates DROP CONSTRAINT reject_delete_intent"
+    ))
+    .execute(&db.pool)
+    .await?;
+
     let first = delete("failed-delete-retry-first").await;
     let first_id = recorded_operation().await;
     assert_eq!(

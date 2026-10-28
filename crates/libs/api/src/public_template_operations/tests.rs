@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::NodeId;
+use uuid::Uuid;
 
 use pplx_space_db_test_fixtures::pg_test_db;
 
@@ -39,6 +40,143 @@ async fn template_delete_inventory_query_uses_direct_node_deleted_state() -> Tes
     expected.sort_unstable();
     assert_eq!(nodes, expected);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_template_delete_preserves_recreated_release() -> TestResult {
+    use crate::public_operations::{
+        ApiProduct, CreatePublicOperation, CreatePublicOperationResult, PublicOperationStore,
+    };
+    use pplx_space_common_core::types::OrgId;
+    use pplx_space_public_api::{OperationKind, OperationTargetType};
+
+    let db = pg_test_db().await?;
+    let template = TemplateName::parse("recreated-template")?;
+    insert_template(&db.pool, &template).await?;
+    let org = OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID);
+    let payload = DeleteTemplateOperationPayload::new(template.clone()).into_json();
+    let CreatePublicOperationResult::Created(id) = PublicOperationStore::new(db.pool.clone())
+        .create_operation(CreatePublicOperation {
+            org_id: org,
+            actor_user_id: None,
+            api_product: ApiProduct::Admin,
+            kind: OperationKind::DeleteTemplate,
+            target_type: Some(OperationTargetType::Template),
+            target_id: Some(template.as_str()),
+            payload_json: payload.clone(),
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?
+    else {
+        return Err("expected a new delete operation".into());
+    };
+    let operation = ClaimedPublicOperation {
+        id,
+        org_id: org,
+        actor_user_id: None,
+        api_product: ApiProduct::Admin,
+        kind: OperationKind::DeleteTemplate,
+        target_type: Some(OperationTargetType::Template),
+        target_id: Some(template.to_string()),
+        payload,
+        attempts: 1,
+        claim_generation: 1,
+        traceparent: None,
+        age_at_first_claim_secs: None,
+    };
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, $2, 'fc', 'sha256:recreated')"
+    ))
+    .bind(release_id)
+    .bind(template.as_str())
+    .execute(&db.pool)
+    .await?;
+    let executor = DeleteTemplateOperationExecutor::new(db.pool.clone());
+    // A recreated template has cleared the prior operation. Its old claim
+    // must not reinstall intent or remove the replacement release.
+    assert_eq!(
+        executor.execute(&operation).await.state,
+        OperationState::Failed
+    );
+    let (state, release_exists): (String, bool) = sqlx::query_as(sql!(
+        "SELECT desired_state, EXISTS(SELECT 1 FROM template_releases WHERE id = $2)
+         FROM templates WHERE name = $1"
+    ))
+    .bind(template.as_str())
+    .bind(release_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(state, "present");
+    assert!(release_exists);
+
+    let CreatePublicOperationResult::Created(replacement_id) =
+        PublicOperationStore::new(db.pool.clone())
+            .create_operation(CreatePublicOperation {
+                org_id: org,
+                actor_user_id: None,
+                api_product: ApiProduct::Admin,
+                kind: OperationKind::DeleteTemplate,
+                target_type: Some(OperationTargetType::Template),
+                target_id: Some(template.as_str()),
+                payload_json: operation.payload.clone(),
+                idempotency: None,
+                traceparent: None,
+            })
+            .await?
+    else {
+        return Err("expected a replacement delete operation".into());
+    };
+    sqlx::query(sql!(
+        "UPDATE templates SET desired_state = 'deleting', delete_operation_id = $2
+         WHERE name = $1"
+    ))
+    .bind(template.as_str())
+    .bind(replacement_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(
+        executor.execute(&operation).await.state,
+        OperationState::Failed
+    );
+    let (current_id, release_exists): (Option<Uuid>, bool) = sqlx::query_as(sql!(
+        "SELECT delete_operation_id, EXISTS(SELECT 1 FROM template_releases WHERE id = $2)
+         FROM templates WHERE name = $1"
+    ))
+    .bind(template.as_str())
+    .bind(release_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(current_id, Some(replacement_id.as_uuid()));
+    assert!(release_exists);
+
+    // The matching current delete still removes the release, and retrying
+    // after its commit is idempotent.
+    sqlx::query(sql!(
+        "UPDATE templates SET desired_state = 'deleting', delete_operation_id = $2
+         WHERE name = $1"
+    ))
+    .bind(template.as_str())
+    .bind(id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(
+        executor.execute(&operation).await.state,
+        OperationState::Succeeded
+    );
+    assert_eq!(
+        executor.execute(&operation).await.state,
+        OperationState::Succeeded
+    );
+    let remaining: i64 =
+        sqlx::query_scalar(sql!("SELECT COUNT(*) FROM template_releases WHERE id = $1"))
+            .bind(release_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(remaining, 0);
     Ok(())
 }
 
@@ -95,6 +233,14 @@ async fn template_delete_waits_for_inventory_without_spending_failure_budget() -
         traceparent: None,
         age_at_first_claim_secs: None,
     };
+    sqlx::query(sql!(
+        "UPDATE templates SET desired_state = 'deleting', delete_operation_id = $2
+         WHERE name = $1"
+    ))
+    .bind(template.as_str())
+    .bind(id.as_uuid())
+    .execute(&db.pool)
+    .await?;
     let executor = DeleteTemplateOperationExecutor::new(db.pool.clone());
     let pending = executor.execute(&operation).await;
     assert_eq!(pending.state, OperationState::Queued);
@@ -135,8 +281,13 @@ async fn template_delete_waits_for_inventory_without_spending_failure_budget() -
     assert_eq!(error["reason"], "template_delete_cleanup_timeout");
     assert_eq!(error["blocking_nodes"], serde_json::json!([node]));
     assert_eq!(
-        fetch_template_desired_state(&db.pool, &template).await?,
-        Some(TemplateDesiredState::Deleting)
+        sqlx::query_scalar::<_, String>(sql!(
+            "SELECT desired_state FROM templates WHERE name = $1"
+        ))
+        .bind(template.as_str())
+        .fetch_one(&db.pool)
+        .await?,
+        TemplateDesiredState::Deleting.as_str()
     );
 
     sqlx::query(sql!(
@@ -150,8 +301,13 @@ async fn template_delete_waits_for_inventory_without_spending_failure_budget() -
         OperationState::Succeeded
     );
     assert_eq!(
-        fetch_template_desired_state(&db.pool, &template).await?,
-        Some(TemplateDesiredState::Deleted)
+        sqlx::query_scalar::<_, String>(sql!(
+            "SELECT desired_state FROM templates WHERE name = $1"
+        ))
+        .bind(template.as_str())
+        .fetch_one(&db.pool)
+        .await?,
+        TemplateDesiredState::Deleted.as_str()
     );
     Ok(())
 }

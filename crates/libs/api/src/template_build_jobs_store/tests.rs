@@ -542,3 +542,135 @@ async fn tenant_publication_grants_are_per_submission_and_pinned_to_their_builde
     );
     Ok(())
 }
+
+#[rstest]
+#[tokio::test]
+async fn explicit_build_recreates_only_a_clean_same_owner_tombstone(
+    #[future] store_fixture: TestDbResult<StoreFixture>,
+) -> TestDbResult<()> {
+    let fixture = store_fixture.await?;
+    let store = &fixture.store;
+    let pool = &fixture.db.pool;
+    let name = TemplateName::parse("reusable-app")?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id, desired_state, description)
+         VALUES ($1, $2, $3, 'present', 'retain owner metadata')"
+    ))
+    .bind(uuid::Uuid::now_v7())
+    .bind(name.as_str())
+    .bind(TEST_ORG.as_uuid())
+    .execute(pool)
+    .await?;
+    let old_grant = store
+        .record_tenant_publication_grant(TEST_ORG, &name)
+        .await?;
+    for state in ["deleting", "deleted"] {
+        sqlx::query(sql!(
+            "UPDATE templates SET desired_state = $2 WHERE name = $1"
+        ))
+        .bind(name.as_str())
+        .bind(state)
+        .execute(pool)
+        .await?;
+        store
+            .record_tenant_publication_grant(TEST_ORG, &name)
+            .await
+            .unwrap_err();
+        if state == "deleting" {
+            store
+                .record_build_spec(TEST_ORG, &name, "during-delete", BuildSpec::default())
+                .await
+                .unwrap_err();
+        }
+    }
+    store
+        .record_build_spec(
+            OrgId::from_uuid(uuid::Uuid::from_u128(2)),
+            &name,
+            "foreign",
+            BuildSpec::default(),
+        )
+        .await
+        .unwrap_err();
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (node_id, template_name, content_hash, runtime)
+         VALUES ($1, $2, 'sha256:test', 'fc')"
+    ))
+    .bind(fixture.builder_nodes[0])
+    .bind(name.as_str())
+    .execute(pool)
+    .await?;
+    store
+        .record_build_spec(TEST_ORG, &name, "not-clean", BuildSpec::default())
+        .await
+        .unwrap_err();
+    sqlx::query(sql!(
+        "DELETE FROM node_template_inventory WHERE template_name = $1"
+    ))
+    .bind(name.as_str())
+    .execute(pool)
+    .await?;
+    // Completed deletion ignores a retired Direct node's stale inventory.
+    // Reusing the name must honor the same lifecycle boundary.
+    sqlx::query(sql!("UPDATE nodes SET managed_by = 'space' WHERE id = $1"))
+        .bind(fixture.builder_nodes[0])
+        .execute(pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_direct (node_id, node_api_endpoint, deleted_at)
+         VALUES ($1, '127.0.0.1:9802', NOW())"
+    ))
+    .bind(fixture.builder_nodes[0])
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (node_id, template_name, content_hash, runtime)
+         VALUES ($1, $2, 'sha256:retired', 'fc')"
+    ))
+    .bind(fixture.builder_nodes[0])
+    .bind(name.as_str())
+    .execute(pool)
+    .await?;
+    let spec = BuildSpec {
+        tags: vec!["latest".into()],
+        cpu_count: Some(4),
+        memory_mb: Some(8192),
+    };
+    store
+        .record_build_spec(TEST_ORG, &name, "new-build", spec.clone())
+        .await?;
+    let row: (String, Option<OrgId>, Option<String>) = sqlx::query_as(sql!(
+        "SELECT desired_state, org_id, description FROM templates WHERE name = $1"
+    ))
+    .bind(name.as_str())
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        row,
+        (
+            "present".into(),
+            Some(TEST_ORG),
+            Some("retain owner metadata".into())
+        )
+    );
+    let old_exists: bool = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM template_tenant_publication_grants WHERE id = $1)"
+    ))
+    .bind(old_grant.as_uuid())
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        !old_exists,
+        "pre-delete builds must lose publication authority"
+    );
+    assert_eq!(
+        store
+            .lookup_build_spec(TEST_ORG, &name, "new-build")
+            .await?,
+        Some(spec)
+    );
+    store
+        .record_tenant_publication_grant(TEST_ORG, &name)
+        .await?;
+    Ok(())
+}

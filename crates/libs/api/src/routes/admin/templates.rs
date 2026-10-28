@@ -43,7 +43,7 @@ use crate::{
     public_operations::{
         ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
         CreatePublicOperationResult, HttpOperationMethod, OperationPathTemplate,
-        PublicOperationStore, PublicOperationStoreError,
+        PublicOperationStoreError, create_operation_tx,
     },
     public_template_operations::DeleteTemplateOperationPayload,
     reconcile_queue::{ReconcileFacet, ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx},
@@ -186,7 +186,7 @@ fn contention_response(scope: ContentionScope, error: &sqlx::Error) -> Option<Ap
     Some(contention_envelope(status, message))
 }
 
-/// [`contention_response`] for a [`PublicOperationStore`] failure, so a
+/// [`contention_response`] for a [`crate::public_operations::PublicOperationStore`] failure, so a
 /// store-backed arm answers exactly as this module's bare `sqlx` arms do.
 fn store_contention_response(
     scope: ContentionScope,
@@ -1004,7 +1004,7 @@ fn template_delete_fingerprint(
 /// Whether a public operation can still run: it exists and is queued or
 /// running.
 async fn delete_operation_is_active(
-    pool: &sqlx::PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     operation_id: pplx_space_public_api::OperationId,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(sql!(
@@ -1016,7 +1016,7 @@ async fn delete_operation_is_active(
          )"
     ))
     .bind(operation_id.as_uuid())
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -1044,6 +1044,19 @@ pub async fn delete_template(
         Err(response) => return response.into_response(),
     };
 
+    // Publish the dispatchable operation and its lifecycle fence together.
+    // The template lock also serializes this intent with same-name revival.
+    let mut tx = match begin_tx(
+        &state.pool,
+        Some(&template_name),
+        "failed to begin template delete admission",
+    )
+    .await
+    {
+        Ok(tx) => tx,
+        Err(response) => return response.into_response(),
+    };
+
     // The third column is false when the recorded delete operation reached a
     // terminal state or was garbage-collected. Such a delete can never finish
     // on its own, so a new request replaces it instead of returning it.
@@ -1053,10 +1066,11 @@ pub async fn delete_template(
                 COALESCE(po.state IN ('queued', 'running'), FALSE)
          FROM templates t
          LEFT JOIN public_operations po ON po.operation_id = t.delete_operation_id
-         WHERE t.name = $1"
+         WHERE t.name = $1
+         FOR UPDATE OF t"
     ))
     .bind(template_name.as_str())
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     {
         Ok(value) => value,
@@ -1070,7 +1084,6 @@ pub async fn delete_template(
         }
     };
 
-    let mut stale_delete_operation_id = None;
     match existing_state {
         Some((state, Some(operation_id), true))
             if state == TemplateDesiredState::Deleting.as_str() =>
@@ -1092,7 +1105,6 @@ pub async fn delete_template(
                 stale_operation_id = %operation_id,
                 "template delete operation is no longer active; starting a replacement"
             );
-            stale_delete_operation_id = Some(operation_id);
         }
         Some((state, _, _)) if state == TemplateDesiredState::Deleted.as_str() => {
             return api_error(StatusCode::NOT_FOUND, "Template not found").into_response();
@@ -1106,9 +1118,9 @@ pub async fn delete_template(
         Err(error) => return error.into_response(),
     };
     let template_target = template_name.to_string();
-    let store = PublicOperationStore::new(state.pool.clone());
-    let operation = match store
-        .create_operation(CreatePublicOperation {
+    let (operation_result, superseded) = match create_operation_tx(
+        &mut tx,
+        CreatePublicOperation {
             org_id: managing_org_id,
             actor_user_id: Some(actor.id),
             api_product: ApiProduct::Admin,
@@ -1123,17 +1135,30 @@ pub async fn delete_template(
                 request_fingerprint: &fingerprint,
             }),
             traceparent: crate::public_operations::request_traceparent(),
-        })
-        .await
+        },
+    )
+    .await
     {
-        Ok(CreatePublicOperationResult::Created(operation_id)) => operation_id,
-        Ok(CreatePublicOperationResult::Existing(operation_id)) => {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(response) = store_contention_response(ContentionScope::Writing, &error) {
+                return response.into_response();
+            }
+            tracing::error!(%error, template = template_name.as_str(), "failed to create template delete operation");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                .into_response();
+        }
+    };
+    let created = matches!(operation_result, CreatePublicOperationResult::Created(_));
+    let operation = match operation_result {
+        CreatePublicOperationResult::Created(operation_id) => operation_id,
+        CreatePublicOperationResult::Existing(operation_id) => {
             // A replayed key answers with its original operation. Once that
             // operation is terminal it must not become the template's
             // current delete: it would never run, and installing it could
             // displace an active replacement. The caller retries with a new
             // key.
-            match delete_operation_is_active(&state.pool, operation_id).await {
+            match delete_operation_is_active(&mut *tx, operation_id).await {
                 Ok(true) => operation_id,
                 Ok(false) => {
                     return (
@@ -1155,7 +1180,7 @@ pub async fn delete_template(
                 }
             }
         }
-        Ok(CreatePublicOperationResult::IdempotencyConflict { operation_id, .. }) => {
+        CreatePublicOperationResult::IdempotencyConflict { operation_id, .. } => {
             let details = operation_id
                 .map(|id| PublicErrorDetail {
                     key: "operation_id".to_string(),
@@ -1170,7 +1195,7 @@ pub async fn delete_template(
             )
             .into_response();
         }
-        Ok(CreatePublicOperationResult::AdmissionDenied) => {
+        CreatePublicOperationResult::AdmissionDenied => {
             tracing::error!(
                 template = template_name.as_str(),
                 "template delete operation unexpectedly refused admission"
@@ -1178,44 +1203,15 @@ pub async fn delete_template(
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
                 .into_response();
         }
-        Err(error) => {
-            // Retryable despite being a write: the operation is keyed on the
-            // caller's required `Idempotency-Key`, so a replay of the same
-            // request returns that operation's id rather than opening a second
-            // delete.
-            if let Some(response) = store_contention_response(ContentionScope::Writing, &error) {
-                return response.into_response();
-            }
-            tracing::error!(%error, template = template_name.as_str(), "failed to create template delete operation");
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
-                .into_response();
-        }
     };
 
-    let mut tx = match begin_tx(
-        &state.pool,
-        Some(&template_name),
-        "failed to begin template delete mark",
-    )
-    .await
-    {
-        Ok(tx) => tx,
-        Err(response) => return response.into_response(),
-    };
     let mark_result: Result<u64, sqlx::Error> = async {
-        // The operation id is replaced only when it still names the stale
-        // operation observed above, so a concurrent replacement keeps its
-        // own id instead of being overwritten.
         let updated = sqlx::query(sql!(
             "UPDATE templates
              SET desired_state = $2,
                  delete_requested_at = COALESCE(delete_requested_at, NOW()),
                  delete_requested_by = COALESCE(delete_requested_by, $3),
-                 delete_operation_id = CASE
-                     WHEN delete_operation_id IS NULL
-                       OR delete_operation_id = $6 THEN $4
-                     ELSE delete_operation_id
-                 END,
+                 delete_operation_id = $4,
                  updated_at = NOW()
              WHERE name = $1
                AND desired_state <> $5"
@@ -1225,7 +1221,6 @@ pub async fn delete_template(
         .bind(actor.id)
         .bind(operation.as_uuid())
         .bind(TemplateDesiredState::Deleted.as_str())
-        .bind(stale_delete_operation_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1238,6 +1233,14 @@ pub async fn delete_template(
             .await?;
         }
         tx.commit().await?;
+        superseded.record();
+        if created {
+            pplx_space_metrics::operations::created(
+                ApiProduct::Admin.as_str(),
+                OperationKind::DeleteTemplate.as_str(),
+                OperationTargetType::Template.as_str(),
+            );
+        }
         Ok(updated)
     }
     .await;
@@ -1252,11 +1255,7 @@ pub async fn delete_template(
             }),
         )
             .into_response(),
-        // Retryable even though the delete operation row is already committed
-        // above: nothing outside the database has run yet, and a replay of the
-        // same request carries the same `Idempotency-Key`, so it adopts that
-        // operation rather than opening a second one. The `UPDATE` itself is
-        // `COALESCE`-guarded and re-applies to the same values.
+        // The required key makes a retry safe even if commit's response was lost.
         Err(error) => contention_response(ContentionScope::Writing, &error)
             .unwrap_or_else(|| {
                 tracing::error!(%error, template = template_name.as_str(), "failed to mark template deleting");
