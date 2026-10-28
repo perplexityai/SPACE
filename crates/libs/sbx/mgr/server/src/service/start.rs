@@ -1472,6 +1472,22 @@ impl SandboxManagerService {
         }
 
         self.resolve_start_context_route_identity(&sandbox, ctx)?;
+        // Ask before staging the snapshot and before `restore_started`, so a
+        // retry the control plane already retired neither stages a snapshot
+        // nor counts as a failed restore. Kubelet repeats such a retry until
+        // the pod is deleted. `start_from_checkpoint` asks again before it
+        // claims the row, for a retirement that lands during staging.
+        let open_route_activation = super::activation_support::open_route_activation_claim(
+            &ctx.space_api_route_identity,
+            ctx.route_identity_provenance,
+            ctx.open_activation_claim_eligible,
+        );
+        start_stage(
+            "restore.execution_currency",
+            &sandbox.id,
+            self.refuse_retired_activation_retry(&sandbox.id, open_route_activation.as_ref()),
+        )
+        .await?;
 
         let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
         let local_snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
@@ -2051,15 +2067,11 @@ impl SandboxManagerService {
             activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
             return Err(error);
         }
-        let open_route_activation = start_ctx
-            .open_activation_claim_eligible
-            .then(|| {
-                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
-                    &start_ctx.space_api_route_identity,
-                    start_ctx.route_identity_provenance,
-                )
-            })
-            .flatten();
+        let open_route_activation = super::activation_support::open_route_activation_claim(
+            &start_ctx.space_api_route_identity,
+            start_ctx.route_identity_provenance,
+            start_ctx.open_activation_claim_eligible,
+        );
         if let Err(error) = self
             .refuse_retired_activation_retry(id, open_route_activation.as_ref())
             .await

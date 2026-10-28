@@ -317,6 +317,23 @@ pub(super) fn fresh_runtime_activation_identity(
     direct_route_identity(1, local_node_id)
 }
 
+/// The open-claim identity a cluster-fenced activation records, or `None`
+/// when the activation isn't eligible to hold one.
+pub(super) fn open_route_activation_claim(
+    space_api_route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity_provenance: crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
+    open_activation_claim_eligible: bool,
+) -> Option<crate::db::route_activation_claims::OpenRouteActivationClaim> {
+    open_activation_claim_eligible
+        .then(|| {
+            crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                space_api_route_identity,
+                route_identity_provenance,
+            )
+        })
+        .flatten()
+}
+
 impl SandboxManagerService {
     /// Refuse to start the runtime of an activation this node already began
     /// for `claim` once the control plane has retired its execution. Kubelet
@@ -344,6 +361,14 @@ impl SandboxManagerService {
         let generation = claim.execution_generation();
         if retry && crate::route_activation_claims::retired_on_cluster(sandbox_id, generation).await
         {
+            // The gRPC layer logs a `FailedPrecondition` reply at debug, so
+            // without this line a pod kubelet keeps retrying leaves no trace
+            // in the logs. The pod only stops once something deletes it.
+            tracing::warn!(
+                sandbox_id,
+                %generation,
+                "refused a retried activation of a retired execution; its pod must be deleted"
+            );
             return Err(Status::failed_precondition(format!(
                 "execution generation {generation} of sandbox {sandbox_id} was retired; \
                  its runtime must not start"

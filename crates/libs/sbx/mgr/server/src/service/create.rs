@@ -770,14 +770,14 @@ impl SandboxManagerService {
             .transition(SandboxState::Restoring)
             .map_err(Status::from)?;
 
-        let open_route_activation = open_activation_claim_eligible
-            .then(|| {
-                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
-                    &space_api_route_identity,
-                    route_identity_provenance,
-                )
-            })
-            .flatten();
+        let open_route_activation = super::activation_support::open_route_activation_claim(
+            &space_api_route_identity,
+            route_identity_provenance,
+            open_activation_claim_eligible,
+        );
+        // An in-place restore already asked before staging, so this ask
+        // catches a retirement that landed during staging. A warm start asks
+        // only here.
         self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
             .await?;
 

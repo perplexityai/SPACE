@@ -5,7 +5,7 @@
 
 use super::*;
 
-use pplx_space_common_core::types::{NodeId, RouteGeneration, SandboxActivationAttemptId};
+use pplx_space_common_core::types::{RouteGeneration, SandboxActivationAttemptId};
 use pplx_space_node_api_client::proto::{
     ExecutionCurrency, GetExecutionCurrencyRequest, GetExecutionCurrencyResponse,
 };
@@ -68,16 +68,19 @@ fn begun_restore() -> (
     SandboxManagerService,
     String,
     crate::db::route_activation_claims::OpenRouteActivationClaim,
+    pplx_space_common_core::types::SpaceApiRouteIdentity,
 ) {
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     crate::db::fixture::insert_test_sandbox(&conn, &id, SandboxState::Suspended);
+    // The suspend's capture, which a failed restore's cleanup keeps.
+    crate::service::tests::service_tests::register_full_suspend_artifact(&conn, &id);
     let attempt = SandboxActivationAttemptId::new();
     let route = pplx_space_common_core::types::SpaceApiRouteIdentity {
         sandbox_id: Some(id.parse().unwrap()),
         route_generation: Some(RouteGeneration::new(GENERATION as u64).unwrap()),
         execution_generation: Some(generation(GENERATION)),
-        current_node_id: Some(NodeId::new()),
+        current_node_id: Some(crate::service::test_options::test_node_id()),
         substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes),
         activation_attempt_id: Some(attempt),
         pod_uid: Some("retried-pod".parse().unwrap()),
@@ -105,12 +108,12 @@ fn begun_restore() -> (
     )
     .unwrap()
     .expect("the restore claims the suspended row");
-    (SandboxManagerService::for_test(conn), id, claim)
+    (SandboxManagerService::for_test(conn), id, claim, route)
 }
 
 /// Asks whether a retry of [`begun_restore`] may start.
 async fn retry_of_begun_restore() -> Result<(), tonic::Status> {
-    let (service, id, claim) = begun_restore();
+    let (service, id, claim, _) = begun_restore();
     service
         .refuse_retired_activation_retry(&id, Some(&claim))
         .await
@@ -177,7 +180,7 @@ async fn a_first_activation_is_not_asked() {
         currency: ExecutionCurrency::Retired,
     };
     with_cluster_api(retired, async || {
-        let (service, _, claim) = begun_restore();
+        let (service, _, claim, _) = begun_restore();
         let other = SandboxId::new().to_string();
         crate::db::fixture::insert_test_sandbox(
             &service.db.lock().unwrap(),
@@ -188,6 +191,68 @@ async fn a_first_activation_is_not_asked() {
             .refuse_retired_activation_retry(&other, Some(&claim))
             .await
             .expect("a first activation starts unasked");
+    })
+    .await;
+}
+
+/// A retried in-place restore of a retired execution is refused before it
+/// stages its snapshot, so the retries kubelet repeats until the pod is
+/// deleted never begin a restore.
+///
+/// The test holds the sandbox's staging lock, so a request that reached
+/// staging would wait out the admission cap and fail `Unavailable` there,
+/// before any snapshot lookup or volume-manager call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_checkpoint_restore_of_a_retired_execution_is_refused_before_staging() {
+    let retired = CurrencyClusterApi {
+        currency: ExecutionCurrency::Retired,
+    };
+    with_cluster_api(retired, async || {
+        // The restore's first attempt failed, and its runtime cleanup rolled
+        // the row back to `suspended` with the claim kept open for the retry.
+        let (service, id, _, route) = begun_restore();
+        {
+            let db = service.db.lock().unwrap();
+            let episode = crate::db::cleanup_episode(&db, &id).unwrap().unwrap();
+            crate::db::request_cleanup_episode(
+                &db,
+                &id,
+                episode.id,
+                pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed,
+                "restore prepare failed",
+            )
+            .unwrap();
+            assert!(
+                crate::db::complete_cleanup_episode(&db, &id, episode.id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            SandboxState::Suspended
+        );
+        let _staging = Arc::clone(&service.auto_lifecycle.staging_lock(&id))
+            .lock_owned()
+            .await;
+        let error =
+            service
+                .start_sandbox(
+                    pplx_space_sbx_mgr_client::proto::StartRequest {
+                        sandbox_id: id,
+                        checkpoint: Some("suspend".to_string()),
+                        route_identity:
+                            crate::service::activation_support::space_api_route_identity_to_wire(
+                                &route,
+                            ),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .expect_err("the retired execution's runtime must not start");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        assert!(error.message().contains("was retired"), "{error}");
     })
     .await;
 }
