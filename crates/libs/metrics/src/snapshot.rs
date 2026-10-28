@@ -33,6 +33,19 @@
 //! emits a consistent codec dimension across its `started`, per-step
 //! `step.duration_ms`, terminal `completed` / `failed`, and per-artifact
 //! `bytes` records.
+//!
+//! ## Codec fallback
+//!
+//! A suspend that falls back from the btrfs-send codec to Full is the one
+//! exception to that, and to pairing `started` with a single terminal record.
+//! It emits `failed` with `codec:btrfs_send_v1`, `step:btrfs_send` and
+//! `reason:fallback_to_full`, including a `duration_ms` sample with
+//! `result:failure` timed from the start of that step. It then continues as
+//! `codec:full`, so its `bytes` and its own `completed` or `failed` carry
+//! `codec:full`, while its `started` carries `codec:btrfs_send_v1`. Exclude
+//! `reason:fallback_to_full` when counting failed suspends or their latency.
+//! `docs/observability.md` ("Btrfs-send suspend fallback") says when it
+//! happens.
 
 use std::time::Instant;
 
@@ -104,7 +117,8 @@ fn encrypted_tag(encrypted: bool) -> String {
 }
 
 /// Emit at the start of a create flow. Pair with exactly one of
-/// [`create_completed`] or [`create_failed`].
+/// [`create_completed`] or [`create_failed`], after the extra
+/// [`create_failed`] of a codec fallback (see the module docs).
 pub fn create_started(kind: &str, codec: &str, encrypted: bool) {
     counter(
         "snapshot.create.started",

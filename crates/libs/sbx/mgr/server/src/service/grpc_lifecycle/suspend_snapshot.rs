@@ -821,7 +821,7 @@ impl SandboxManagerService {
             //
             // - `FailedPrecondition` from the encoder means the sandbox
             //   is btrfs-send-*ineligible* (instance not a subvolume,
-            //   template plain-dir, parent_uuid lineage broken,
+            //   template plain-dir or absent, parent_uuid lineage broken,
             //   received_uuid mismatch). The encoder bails before any
             //   side-effect; FC's `rootfs.ext4` from `create_snapshot` is
             //   still intact on disk. If the caller didn't *explicitly*
@@ -877,6 +877,11 @@ impl SandboxManagerService {
                             template_hash = sandbox.template_hash.as_deref().unwrap_or(""),
                             from_codec = pplx_space_metrics::snapshot::CODEC_BTRFS_SEND_V1,
                             to_codec = pplx_space_metrics::snapshot::CODEC_FULL,
+                            lineage_cause = status
+                                .metadata()
+                                .get(pplx_space_node_mgr_client::BTRFS_LINEAGE_CAUSE_METADATA)
+                                .and_then(|cause| cause.to_str().ok())
+                                .unwrap_or(""),
                             reason = %status.message(),
                             "btrfs-send precondition not met; suspending with Full codec instead"
                         );

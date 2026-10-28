@@ -1054,6 +1054,39 @@ failed stage span carries just the common fields.
 The stage with high `busy_ms` and low waits is the limiter. Stage wall times
 overlap and must not be added, and busy is elapsed time, not CPU time.
 
+## Btrfs-send suspend fallback
+
+`BtrfsEncodeRootfsSend` returns `FAILED_PRECONDITION` when a sandbox can't use
+the btrfs-send codec. When a lineage check failed, the status metadata
+`x-space-btrfs-lineage-cause` names it: `instance_not_subvolume`,
+`instance_parent_mismatch`, `template_not_subvolume`,
+`template_received_uuid_mismatch` or `template_absent`. Other
+`FAILED_PRECONDITION` statuses carry no cause, for example a refused execution
+fence, a privileged path that can't be opened safely, or a failed btrfs
+operation, including one during the send.
+
+`template_absent` means the legacy-partition build of the sandbox's template
+hash isn't on its node. That happens after a Full-codec restore placed the
+sandbox on a node without that build, after the build was evicted, or for a
+sandbox booted from another cache partition, since the sandbox codec names
+legacy builds only (see
+[Template caches per environment](execution-environments.md#template-caches-per-environment)).
+
+Unless the caller asked for btrfs-send explicitly, sandbox-manager suspends
+with the Full codec on any `FAILED_PRECONDITION`. It logs `btrfs-send
+precondition not met; suspending with Full codec instead` with the cause as
+`lineage_cause`, empty when the status carries none, and counts
+`snapshot.create.failed` with `step:btrfs_send` and `reason:fallback_to_full`.
+The suspend continues as `codec:full`; the snapshot metrics module docs
+(`crates/libs/metrics/src/snapshot.rs`, "Codec fallback") describe what that
+does to the codec and pairing of its metrics. Other encode errors count
+`reason:encode_failed`, emit a `suspend_failed` sandbox event with the same
+operation and reason, and fail the suspend.
+
+The named-snapshot encoder used by forks returns `NOT_FOUND` for an absent
+template build rather than a lineage precondition, which the fork executor
+treats as terminal instead of capturing again.
+
 ## Reconnect attribution baseline
 
 Measure ECW reconnects at the API HTTP server span, including both
