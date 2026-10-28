@@ -76,24 +76,17 @@ pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
     }
 }
 
-/// Run `request` while this holds `public_operations` locked, so that the
-/// request's first read of that table waits. While it waits, record the
-/// row of `sandbox_id` for `create`, a queued or running native create of it, and finish
-/// `create`, each as its execution does; then release the lock and return
-/// what `request` returned. The request's earlier reads of the sandbox row
-/// therefore miss it, and its read of the create sees it finished.
-pub(crate) async fn finish_create_while_a_request_reads_operations<T: Send + 'static>(
+/// Lock `public_operations` in `lock`, a connection inside a transaction, and
+/// start `request`, returning once the request's first read of that table
+/// waits on the lock. Its earlier reads have run; it finishes after `lock`'s
+/// transaction ends, so what that transaction commits is what it reads next.
+pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
     pool: &PgPool,
-    create: pplx_space_public_api::OperationId,
-    sandbox_id: pplx_space_public_api::PublicSandboxId,
+    lock: &mut sqlx::PgConnection,
     request: impl std::future::Future<Output = T> + Send + 'static,
-) -> pplx_space_db_test_fixtures::TestDbResult<T> {
+) -> pplx_space_db_test_fixtures::TestDbResult<tokio::task::JoinHandle<T>> {
     use pplx_space_common_core::sql;
-    use sqlx::{Connection, PgConnection};
 
-    // Outside the pool, which the request and the wait below draw on.
-    let mut connection = PgConnection::connect_with(&pool.connect_options()).await?;
-    let mut lock = connection.begin().await?;
     sqlx::query(sql!(
         "LOCK TABLE public_operations IN ACCESS EXCLUSIVE MODE"
     ))
@@ -113,13 +106,24 @@ pub(crate) async fn finish_create_while_a_request_reads_operations<T: Send + 'st
         .fetch_one(pool)
         .await?;
         if waiting {
-            break;
+            return Ok(request);
         }
         if request.is_finished() || std::time::Instant::now() >= deadline {
             return Err("the request never read public_operations".into());
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// Insert `sandbox_id`'s row for `create`, a native create of it, and mark
+/// `create` `succeeded`, as an execution that builds the sandbox does.
+pub(crate) async fn record_the_row_and_succeed(
+    connection: &mut sqlx::PgConnection,
+    create: pplx_space_public_api::OperationId,
+    sandbox_id: pplx_space_public_api::PublicSandboxId,
+) -> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_common_core::sql;
+
     sqlx::query(sql!(
         "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, network_policy_override_json,
              network_policy_generation)
@@ -131,7 +135,7 @@ pub(crate) async fn finish_create_while_a_request_reads_operations<T: Send + 'st
     .bind(sqlx::types::Json(
         pplx_space_net_common::NetworkPolicyV1::default(),
     ))
-    .execute(&mut *lock)
+    .execute(&mut *connection)
     .await?;
     sqlx::query(sql!(
         "UPDATE public_operations
@@ -139,8 +143,30 @@ pub(crate) async fn finish_create_while_a_request_reads_operations<T: Send + 'st
          WHERE operation_id = $1"
     ))
     .bind(create.as_uuid())
-    .execute(&mut *lock)
+    .execute(&mut *connection)
     .await?;
+    Ok(())
+}
+
+/// Run `request` until its first read of `public_operations` waits, then
+/// insert `sandbox_id`'s row and mark `create` `succeeded` in one
+/// transaction, standing for an execution whose row commit and completion
+/// both land while the request waits. Returns what `request` returned; its
+/// earlier reads of the sandbox row missed it, and its read of `create` sees
+/// it finished.
+pub(crate) async fn finish_create_while_a_request_reads_operations<T: Send + 'static>(
+    pool: &PgPool,
+    create: pplx_space_public_api::OperationId,
+    sandbox_id: pplx_space_public_api::PublicSandboxId,
+    request: impl std::future::Future<Output = T> + Send + 'static,
+) -> pplx_space_db_test_fixtures::TestDbResult<T> {
+    use sqlx::{Connection, PgConnection};
+
+    // Outside the pool, which the request and the wait draw on.
+    let mut connection = PgConnection::connect_with(&pool.connect_options()).await?;
+    let mut lock = connection.begin().await?;
+    let request = start_a_request_blocked_on_operations(pool, &mut lock, request).await?;
+    record_the_row_and_succeed(&mut lock, create, sandbox_id).await?;
     lock.commit().await?;
     connection.close().await?;
     Ok(request.await?)

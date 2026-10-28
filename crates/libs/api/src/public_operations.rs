@@ -291,39 +291,24 @@ impl PublicOperationStore {
         .await?)
     }
 
-    /// Whether a create of `target_id` that the caller's owner scope can see,
-    /// as [`Self::operation_in_owner_scope`] scopes it, is still queued or
-    /// running. Such a create may not have recorded its sandbox row yet.
+    /// Whether a create of `target` still queued or running is one the
+    /// caller's owner scope can see, as [`Self::operation_in_owner_scope`]
+    /// scopes it. Such a create may not have recorded its sandbox row yet.
     pub(crate) async fn sandbox_create_in_flight_in_owner_scope(
         &self,
         org_id: OrgId,
         subject_id: Option<UserId>,
-        target_id: &str,
+        target: pplx_space_public_api::PublicSandboxId,
     ) -> Result<bool, PublicOperationStoreError> {
-        Ok(sqlx::query_scalar(sql!(
-            "SELECT EXISTS(
-                 SELECT 1 FROM public_operations op
-                 LEFT JOIN users actor ON actor.id = op.actor_user_id
-                 WHERE op.org_id = $1
-                   AND op.target_type = $2
-                   AND op.target_id = $3
-                   AND op.kind = $4
-                   AND op.state IN ($5, $6)
-                   AND ($7::UUID IS NULL OR op.api_product = 'native')
-                   AND (($7::UUID IS NOT NULL AND op.actor_user_id = $7)
-                     OR ($7::UUID IS NULL AND
-                         (op.actor_user_id IS NULL OR actor.owner_source = 'local')))
-             )"
-        ))
-        .bind(org_id)
-        .bind(OperationTargetType::Sandbox.as_str())
-        .bind(target_id)
-        .bind(OperationKind::CreateSandbox.as_str())
-        .bind(OperationState::Queued.as_str())
-        .bind(OperationState::Running.as_str())
-        .bind(subject_id)
-        .fetch_one(&self.pool)
-        .await?)
+        for create in sandbox_creates_in_flight(&self.pool, org_id, target).await? {
+            if self
+                .operation_in_owner_scope(org_id, subject_id, create)
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// A create retried while waiting for capacity can carry a newer grant.
@@ -1191,40 +1176,25 @@ impl PublicOperationAdmission {
     /// sandbox row, or a create of it still queued or running, which records
     /// that row only when it executes.
     ///
-    /// Each statement reads its own snapshot. A create commits its row before
-    /// it leaves the queued and running states, so a create that finishes
+    /// Each statement reads its own snapshot. A create that succeeds commits
+    /// its row before it leaves queued or running, so one that finishes
     /// between the first two reads leaves a row the last one sees.
     pub(crate) async fn delete_target_belongs_to_org(
         &mut self,
-        sandbox_id: SandboxId,
+        sandbox_id: pplx_space_public_api::PublicSandboxId,
         org_id: OrgId,
     ) -> Result<bool, PublicOperationStoreError> {
-        if self.sandbox_belongs_to_org(sandbox_id, org_id).await? {
+        let row = SandboxId::from(sandbox_id);
+        if self.sandbox_belongs_to_org(row, org_id).await? {
             return Ok(true);
         }
-        let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
-        let create_in_flight = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT EXISTS(
-                 SELECT 1 FROM public_operations
-                 WHERE org_id = $1
-                   AND target_type = $2
-                   AND target_id = $3
-                   AND kind = $4
-                   AND state IN ($5, $6)
-             )"
-        ))
-        .bind(org_id)
-        .bind(OperationTargetType::Sandbox.as_str())
-        .bind(&target_id)
-        .bind(OperationKind::CreateSandbox.as_str())
-        .bind(OperationState::Queued.as_str())
-        .bind(OperationState::Running.as_str())
-        .fetch_one(&mut *self.tx)
-        .await?;
-        if create_in_flight {
+        if !sandbox_creates_in_flight(&mut *self.tx, org_id, sandbox_id)
+            .await?
+            .is_empty()
+        {
             return Ok(true);
         }
-        self.sandbox_belongs_to_org(sandbox_id, org_id).await
+        self.sandbox_belongs_to_org(row, org_id).await
     }
 
     pub(crate) async fn lock_target_lifecycle(
@@ -1831,6 +1801,33 @@ pub async fn create_operation_tx(
         CreatePublicOperationResult::Created(operation_id),
         superseded,
     ))
+}
+
+/// The creates of `target`, a sandbox of `org_id`, that are still queued or
+/// running. A create can answer before its sandbox has a row, and one that
+/// succeeds commits its row before it leaves queued or running.
+async fn sandbox_creates_in_flight<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    org_id: OrgId,
+    target: pplx_space_public_api::PublicSandboxId,
+) -> Result<Vec<OperationId>, sqlx::Error> {
+    let creates = sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT operation_id FROM public_operations
+         WHERE org_id = $1
+           AND target_type = $2
+           AND target_id = $3
+           AND kind = $4
+           AND state IN ($5, $6)"
+    ))
+    .bind(org_id)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(target.to_string())
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .fetch_all(executor)
+    .await?;
+    Ok(creates.into_iter().map(OperationId::from_uuid).collect())
 }
 
 /// The terminal record of a create canceled because a delete of its sandbox

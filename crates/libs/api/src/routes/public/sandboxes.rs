@@ -926,15 +926,16 @@ async fn enqueue_lifecycle_operation(
         }
         ObservePublicOperationIdempotency::Missing => {}
     }
-    let target = SandboxId::from_uuid(sandbox_id.as_uuid());
-    // A create answers before its sandbox has a row. A delete in between
+    // A create can answer before its sandbox has a row. A delete in between
     // cancels or waits for that create, so it must not miss it.
     let found = if action == SandboxLifecycleAction::Delete {
         admission
-            .delete_target_belongs_to_org(target, org_id)
+            .delete_target_belongs_to_org(sandbox_id, org_id)
             .await?
     } else {
-        admission.sandbox_belongs_to_org(target, org_id).await?
+        admission
+            .sandbox_belongs_to_org(SandboxId::from_uuid(sandbox_id.as_uuid()), org_id)
+            .await?
     };
     if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
@@ -1318,7 +1319,7 @@ fn update_request_fingerprint(
     })
 }
 
-fn lifecycle_request_fingerprint(
+pub(super) fn lifecycle_request_fingerprint(
     sandbox_id: PublicSandboxId,
     action: SandboxLifecycleAction,
     rollback: Option<&RollbackSandboxRequest>,
@@ -1339,14 +1340,14 @@ fn lifecycle_request_fingerprint(
     })
 }
 
-fn lifecycle_method(action: SandboxLifecycleAction) -> HttpOperationMethod {
+pub(super) fn lifecycle_method(action: SandboxLifecycleAction) -> HttpOperationMethod {
     match action {
         SandboxLifecycleAction::Delete => HttpOperationMethod::Delete,
         _ => HttpOperationMethod::Post,
     }
 }
 
-fn lifecycle_path_template(action: SandboxLifecycleAction) -> OperationPathTemplate {
+pub(super) fn lifecycle_path_template(action: SandboxLifecycleAction) -> OperationPathTemplate {
     OperationPathTemplate::new(lifecycle_operation(action).path())
 }
 
