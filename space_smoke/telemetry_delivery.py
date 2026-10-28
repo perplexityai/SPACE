@@ -8,9 +8,8 @@ that cannot write drops, and Alloy's targets are a path glob. A passing
 lifecycle smoke proves none of it, so this reads each backend back for the
 scenario's own sandbox, never for whatever an earlier scenario left behind:
 
-- Tempo holds the shim's create trace for the sandbox, its spans carrying the
-  sandbox's `sandbox_id`, and the space-api trace that created the sandbox,
-  which that create links to: each create attempt roots its own trace;
+- Tempo holds the sandbox's create trace with both space-api and shim spans,
+  and the shim's create is a child of the API's pod materialization span;
 - Prometheus holds the shim's create latency from a shim process that started
   after the scenario did, on the node that trace names, and a space-api create
   count that grew after the scenario's start;
@@ -71,7 +70,7 @@ class TelemetryDeliveryAssertions:
         fixture.record("telemetry_window_start", self._since)
 
     def expect_traces(self) -> None:
-        """The shim's create trace for this sandbox links to a space-api trace naming it, and Tempo returns both by ID."""
+        """The bounded on-demand create joins its API parent in Tempo."""
 
         sandbox_id = self._fixture.sandbox.sandbox_id
         api_spans = f'{{resource.service.name="{API_SERVICE}" && span.sandbox_id="{sandbox_id}"}}'
@@ -102,40 +101,56 @@ class TelemetryDeliveryAssertions:
             bool(shim_traces),
             f"Tempo found no {SHIM_SERVICE} create trace for {sandbox_id}",
         )
-        shim_trace = self._trace(shim_traces[0])
-        shim_batches = [attributes for attributes, _ in shim_trace if attributes.get("service.name") == SHIM_SERVICE]
-        # Tempo search may drop a trace ID's leading zeros and fetched spans
-        # spell IDs in base64, so IDs compare as numbers.
-        linked = {
-            int(base64.b64decode(link["traceId"]).hex(), 16)
-            for attributes, spans in shim_trace
-            if attributes.get("service.name") == SHIM_SERVICE
-            for span in spans
-            if span.get("name") == "shim.create"
-            for link in span.get("links") or ()
-        }
-        self._fixture.record("tempo_shim_create_links", sorted(f"{trace:032x}" for trace in linked))
-        self._fixture.verify(
-            bool(shim_batches) and bool(linked),
-            f"Tempo returned trace {shim_traces[0]} without a {SHIM_SERVICE} create that links to its cause",
-        )
+        # Tempo search may drop a trace ID's leading zeros.
+        shim_trace_ids = {int(trace, 16) for trace in shim_traces}
 
-        def linked_api_traces() -> list[str]:
-            return [trace for trace in search(api_spans, limit=50) if int(trace, 16) in linked]
+        def joined_api_traces() -> list[str]:
+            return [trace for trace in search(api_spans, limit=50) if int(trace, 16) in shim_trace_ids]
 
-        found = self._poll(linked_api_traces, bool, budget=TRACE_BUDGET_SECONDS)
+        found = self._poll(joined_api_traces, bool, budget=TRACE_BUDGET_SECONDS)
         self._fixture.record("tempo_trace_ids", found)
         self._fixture.verify(
             bool(found),
-            f"Tempo found no {API_SERVICE} trace for {sandbox_id} that the shim's create links to",
+            f"Tempo found no shared {API_SERVICE} and shim create trace for {sandbox_id}",
             failure_evidence=lambda: {"tempo_api_trace_ids": search(api_spans, limit=50)},
         )
-        api_services = {attributes.get("service.name", "") for attributes, _ in self._trace(found[0])}
-        self._fixture.record("tempo_trace_services", sorted(api_services))
-        self._fixture.verify(
-            API_SERVICE in api_services,
-            f"Tempo returned trace {found[0]} without {API_SERVICE} spans",
+
+        def joins_api(trace: list[tuple[Mapping[str, str], list[Mapping[str, Any]]]]) -> bool:
+            api_parents = {
+                base64.b64decode(span["spanId"])
+                for attributes, spans in trace
+                if attributes.get("service.name") == API_SERVICE
+                for span in spans
+                if span.get("name") == "substrate.k8s.materialize_pod" and span.get("spanId")
+            }
+            return any(
+                base64.b64decode(span.get("parentSpanId") or "") in api_parents
+                for attributes, spans in trace
+                if attributes.get("service.name") == SHIM_SERVICE
+                for span in spans
+                if span.get("name") == "shim.create"
+            )
+
+        # Services flush independently, so search finding the shared trace
+        # does not guarantee the parent and child are both queryable yet.
+        trace = self._poll(lambda: self._trace(found[0]), joins_api, budget=TRACE_BUDGET_SECONDS)
+        services = {attributes.get("service.name", "") for attributes, _ in trace}
+        self._fixture.record("tempo_trace_services", sorted(services))
+        self._fixture.record(
+            "tempo_shim_create_parent_ids",
+            [
+                base64.b64decode(span.get("parentSpanId") or "").hex()
+                for attributes, spans in trace
+                if attributes.get("service.name") == SHIM_SERVICE
+                for span in spans
+                if span.get("name") == "shim.create"
+            ],
         )
+        self._fixture.verify(
+            joins_api(trace),
+            f"Tempo returned trace {found[0]} without a shim create parented by {API_SERVICE} pod materialization",
+        )
+        shim_batches = [attributes for attributes, _ in trace if attributes.get("service.name") == SHIM_SERVICE]
         self._node = shim_batches[0].get("k8s.node.name") or None
         self._fixture.record("sandbox_node", self._node)
 
