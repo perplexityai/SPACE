@@ -34,15 +34,20 @@ impl ReceiveRoot {
     ) -> Result<Option<u64>, Status> {
         let failure = match self.receive(self.stream()?, cancel) {
             Ok(()) => return Ok(None),
-            Err(status) if status.code() == tonic::Code::Cancelled => return Err(status),
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+                ) =>
+            {
+                return Err(status);
+            }
             Err(status) => status,
         };
         let mut stream = self.stream()?;
         let cancelled = || cancel.is_some_and(CancellationToken::is_cancelled);
-        let complete = crate::service::btrfs_send_transport::framing::last_complete_stream(
-            &stream, &cancelled,
-        )
-        .map_err(error)?;
+        let complete = crate::service::btrfs_send_stream::last_complete_stream(&stream, &cancelled)
+            .map_err(error)?;
         if cancelled() {
             return Err(Status::cancelled(
                 "btrfs receive cancelled while looking for a complete stream",
@@ -64,6 +69,19 @@ impl ReceiveRoot {
         stream: File,
         cancel: Option<&CancellationToken>,
     ) -> Result<(), Status> {
+        let deadline = std::time::Instant::now() + crate::host_command::MUTATION_BUDGET;
+        let stream = ValidatedStream::prepare(&self.directory, &stream, cancel, deadline)?;
+        self.receive_validated(stream, cancel)
+    }
+
+    fn receive_validated(
+        &self,
+        stream: ValidatedStream,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), Status> {
+        // Validation has its own bounded allowance; keep the full mutation
+        // budget for scrub and receive regardless of how large the stream is.
+        let deadline = std::time::Instant::now() + crate::host_command::MUTATION_BUDGET;
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(Status::cancelled("btrfs receive cancelled before scrub"));
         }
@@ -71,10 +89,13 @@ impl ReceiveRoot {
         configure_receiver(&mut command, &self.directory).map_err(error)?;
         remove_at(&self.directory, "instance".as_ref())?;
         remove_at(&self.directory, "instance.ro".as_ref())?;
+        let budget = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| Status::deadline_exceeded("btrfs receive timed out before execution"))?;
         let output = crate::host_command::stream_in_namespace(
             &mut command,
-            crate::host_command::MUTATION_BUDGET,
-            std::process::Stdio::from(stream),
+            budget,
+            std::process::Stdio::from(stream.0),
             std::process::Stdio::piped(),
             cancel,
         )
@@ -104,6 +125,99 @@ impl ReceiveRoot {
     }
 }
 
+/// The receiver consumes the same private inode that passed validation. An
+/// open source fd alone is insufficient: cache peers can still write that inode.
+struct ValidatedStream(File);
+
+impl ValidatedStream {
+    #[cfg(target_os = "linux")]
+    fn prepare(
+        directory: &File,
+        mut source: &File,
+        cancel: Option<&CancellationToken>,
+        deadline: std::time::Instant,
+    ) -> Result<Self, Status> {
+        use std::io::{Read, Seek};
+
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+
+        use super::super::btrfs_send_stream::SendStreamFraming;
+
+        let check_budget = || {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(Status::cancelled("btrfs receive validation cancelled"));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(
+                    "btrfs receive validation timed out",
+                ));
+            }
+            Ok(())
+        };
+        check_budget()?;
+        if !source.metadata().map_err(error)?.is_file() {
+            return Err(Status::invalid_argument(
+                "btrfs send input must be a regular file",
+            ));
+        }
+        // No directory entry, even temporarily: a peer with write access to
+        // the staging directory cannot replace or open this root-owned inode.
+        // Closing it on success, rejection, cancellation or restart reclaims it.
+        let mut stream = File::from(
+            openat(
+                directory,
+                ".",
+                OFlag::O_TMPFILE | OFlag::O_RDWR | OFlag::O_CLOEXEC,
+                Mode::S_IRUSR | Mode::S_IWUSR,
+            )
+            .map_err(error)?,
+        );
+        pplx_space_common_io::reflink::preserve_nocow(source, &stream).map_err(error)?;
+        // Both files live on the cache btrfs filesystem. Do not silently turn
+        // failure into a potentially unbounded byte copy under the mutation lock.
+        rustix::fs::ioctl_ficlone(&stream, source).map_err(error)?;
+        // Recovery seeks past an interrupted send. Validate and receive that
+        // same suffix of the private inode, never the discarded prefix.
+        let offset = source.stream_position().map_err(error)?;
+        stream
+            .seek(std::io::SeekFrom::Start(offset))
+            .map_err(error)?;
+        let mut framing = SendStreamFraming::new();
+        let mut buffer = [0_u8; 128 * 1024];
+        loop {
+            check_budget()?;
+            let count = stream.read(&mut buffer).map_err(error)?;
+            if count == 0 {
+                break;
+            }
+            let data = buffer
+                .get(..count)
+                .ok_or_else(|| error("invalid read length"))?;
+            framing.feed(data).map_err(|error| {
+                Status::invalid_argument(format!("btrfs send stream rejected: {error}"))
+            })?;
+        }
+        framing.finish().map_err(|error| {
+            Status::invalid_argument(format!("btrfs send stream rejected: {error}"))
+        })?;
+        stream
+            .seek(std::io::SeekFrom::Start(offset))
+            .map_err(error)?;
+        Ok(Self(stream))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn prepare(
+        _directory: &File,
+        _source: &File,
+        _cancel: Option<&CancellationToken>,
+        _deadline: std::time::Instant,
+    ) -> Result<Self, Status> {
+        Err(error("btrfs receive requires Linux"))
+    }
+}
+
 /// The CLI realpaths its destination and reopens descendants while receiving;
 /// passing /proc/self/fd alone would silently lose the pinned identity. Give
 /// this child a private bind of the pinned directory, then let receive chroot
@@ -115,7 +229,15 @@ fn configure_receiver(
     command: &mut std::process::Command,
     directory: &File,
 ) -> std::io::Result<()> {
-    command.args(["receive", "--chroot", "-m", "/space/cache", "--", "/tmp"]);
+    command.args([
+        "receive",
+        "-e",
+        "--chroot",
+        "-m",
+        "/space/cache",
+        "--",
+        "/tmp",
+    ]);
     attach_destination_at_tmp(command, directory)
 }
 

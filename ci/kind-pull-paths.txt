@@ -14,6 +14,7 @@ space_smoke/**
 Tiltfile
 docker/Dockerfile.rust-build-kind
 docker/Dockerfile.worker
+docker/build-btrfs-progs.sh
 # The runtime images Tilt builds, whose dependency stages
 # infra/space/kind/scripts/runtime-image-cache.sh names, and the seed
 # builder infra/space/kind/scripts/build-seed.sh runs.

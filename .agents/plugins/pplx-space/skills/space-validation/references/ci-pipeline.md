@@ -5,10 +5,11 @@ GitHub Actions workflows live in `.github/workflows/`; shared runners live in
 `ci/scripts/`. Cargo artifacts remain separately cached through sccache.
 
 GitHub Actions jobs get the same kind of image through `ci/scripts/ci-image.sh`.
-Its tag hashes `ci/Dockerfile.ci` and `rust-toolchain.toml`, which the image
-installs, and only main pushes publish it to `ghcr.io/perplexityai/space-ci`.
+Its tag hashes `ci/Dockerfile.ci`, `rust-toolchain.toml`, and
+`docker/build-btrfs-progs.sh`. Only main pushes publish it to
+`ghcr.io/perplexityai/space-ci`.
 Other jobs pull that tag and build locally when it is new or unavailable, so a
-change to either file is still tested before it merges. Keep tools that every
+change to any input is still tested before it merges. Keep tools that every
 run needs, such as cargo-vet and cargo-deny, in the Dockerfile rather than
 installing them in a job.
 
