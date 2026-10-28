@@ -9,14 +9,13 @@ use time::format_description::well_known::Rfc3339;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::metadata::artifact_kind_from_proto;
 use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeRole, PodUid,
-    PolicyAuthority, RuntimeKind, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
-    SandboxQuarantineSource, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SemVer,
+    ArtifactKind, ExecutionGeneration, NodeRole, PodUid, PolicyAuthority, RuntimeKind,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
+    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    SandboxTransitionTargetState, SemVer,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -45,12 +44,12 @@ use pplx_space_sbx_mgr_client::proto::{SnapshotDetail, SnapshotType};
 
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 use crate::node_publish::validate::fields::{
-    execution_projection, non_zero_u64_to_i64, proto_timestamp, proto_timestamp_to_rfc3339,
-    published_artifact_origin, u32_to_i32, u64_to_i64,
+    execution_projection, non_zero_u64_to_i64, proto_timestamp_to_rfc3339, u32_to_i32, u64_to_i64,
 };
 use crate::node_publish::validate::quarantine::{
     QuarantineRecoveryProjectionState, quarantine_recovery_projection,
 };
+use crate::node_publish::validate::sandbox_identity::SandboxIdentityEvidence;
 use crate::node_publish::validate::templates::template_state_row;
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
 use crate::sandbox_quarantine_store;
@@ -1434,57 +1433,8 @@ pub async fn publish_sandbox_states(
                     ));
                 }
             }
-            let current_local_artifact = match (
-                optional_trimmed(state.current_local_artifact_id.as_deref()),
-                state.current_local_artifact_kind,
-                state.current_local_artifact_origin,
-            ) {
-                (None, None, None) => None,
-                (Some(raw_id), Some(raw_kind), Some(raw_origin)) => {
-                    let artifact_id = raw_id.parse::<LocalArtifactId>().map_err(|error| {
-                        Status::invalid_argument(format!(
-                            "invalid current_local_artifact_id: {error}"
-                        ))
-                    })?;
-                    let kind = artifact_kind_from_proto(raw_kind).ok_or_else(|| {
-                        Status::invalid_argument("current_local_artifact_kind must be DISK or FULL")
-                    })?;
-                    let origin = published_artifact_origin(raw_origin)?;
-                    if transition_receipt.is_some_and(|receipt| {
-                        receipt.kind() == SandboxTransitionReceiptKind::QuarantineRecovery
-                    }) && (kind != ArtifactKind::Full || origin != ArtifactOrigin::Suspend)
-                    {
-                        return Err(Status::invalid_argument(
-                            "suspended recovery artifact must be a full suspend artifact",
-                        ));
-                    }
-                    Some((artifact_id.as_uuid(), kind, origin))
-                }
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "current local artifact identity must be fully present or absent",
-                    ));
-                }
-            };
-            let state_changed_at = state
-                .state_changed_at
-                .as_ref()
-                .map(|timestamp| proto_timestamp(timestamp, "state_changed_at"))
-                .transpose()?;
-            if optional_trimmed(state.status.as_deref()).is_none() && state_changed_at.is_some() {
-                return Err(Status::invalid_argument("state_changed_at requires status"));
-            }
-            let execution_generation = state
-                .execution_generation
-                .map(ExecutionGeneration::new)
-                .transpose()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let pod_uid = state
-                .pod_uid
-                .as_deref()
-                .map(PodUid::parse)
-                .transpose()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let identity =
+                SandboxIdentityEvidence::try_from_proto(state, transition_receipt.as_ref())?;
             let mut row = serde_json::json!({
                 "sandbox_id": sandbox_uuid,
                 "status": optional_trimmed(state.status.as_deref()),
@@ -1583,25 +1533,28 @@ pub async fn publish_sandbox_states(
             );
             row_fields.insert(
                 "current_local_artifact_id".to_string(),
-                current_local_artifact
-                    .map(|(id, _, _)| serde_json::Value::String(id.to_string()))
+                identity
+                    .current_local_artifact()
+                    .map(|artifact| serde_json::Value::String(artifact.id().to_string()))
                     .unwrap_or(serde_json::Value::Null),
             );
             row_fields.insert(
                 "current_local_artifact_kind".to_string(),
-                current_local_artifact
-                    .map(|(_, kind, _)| serde_json::Value::String(kind.to_string()))
+                identity
+                    .current_local_artifact()
+                    .map(|artifact| serde_json::Value::String(artifact.kind().to_string()))
                     .unwrap_or(serde_json::Value::Null),
             );
             row_fields.insert(
                 "current_local_artifact_origin".to_string(),
-                current_local_artifact
-                    .map(|(_, _, origin)| serde_json::Value::String(origin.to_string()))
+                identity
+                    .current_local_artifact()
+                    .map(|artifact| serde_json::Value::String(artifact.origin().to_string()))
                     .unwrap_or(serde_json::Value::Null),
             );
             row_fields.insert(
                 "state_changed_at".to_string(),
-                match state_changed_at {
+                match identity.state_changed_at() {
                     Some(changed_at) => {
                         serde_json::Value::String(changed_at.format(&Rfc3339).map_err(|error| {
                             Status::internal(format!("format state_changed_at: {error}"))
@@ -1612,13 +1565,15 @@ pub async fn publish_sandbox_states(
             );
             row_fields.insert(
                 "execution_generation".to_string(),
-                execution_generation
+                identity
+                    .execution_generation()
                     .map(|generation| serde_json::Value::from(generation.get()))
                     .unwrap_or(serde_json::Value::Null),
             );
             row_fields.insert(
                 "pod_uid".to_string(),
-                pod_uid
+                identity
+                    .pod_uid()
                     .map(|pod_uid| serde_json::Value::String(pod_uid.to_string()))
                     .unwrap_or(serde_json::Value::Null),
             );
