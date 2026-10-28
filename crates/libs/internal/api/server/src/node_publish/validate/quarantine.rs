@@ -15,6 +15,7 @@ pub(crate) struct QuarantineRecoveryProjection {
     pub(crate) next_attempt_at: Option<String>,
 }
 
+#[derive(Debug)]
 pub(crate) enum QuarantineRecoveryProjectionState {
     Absent,
     Degraded,

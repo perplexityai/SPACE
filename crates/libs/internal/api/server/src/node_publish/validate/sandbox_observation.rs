@@ -49,6 +49,7 @@ pub(crate) struct ValidatedSandboxObservation {
     spaced_version: Option<SemVer>,
     execution: Option<ExecutionProjection>,
     identity: SandboxIdentityEvidence,
+    state_changed_at: Option<PublishedActivityTimestamp>,
     pid: Option<i32>,
     // These annotations are open legacy text, not lifecycle or execution authority.
     template: Option<String>,
@@ -125,7 +126,6 @@ impl ValidatedSandboxObservation {
             runtime,
             spaced_version,
             execution,
-            identity,
             pid: state
                 .pid
                 .map(|value| u32_to_i32(value, "pid"))
@@ -172,6 +172,21 @@ impl ValidatedSandboxObservation {
             .unwrap_or(NetworkPolicySource::Unspecified),
             network_policy_authority: policy_authority(state.observed_network_policy_authority)?,
             auto_lifecycle_authority: policy_authority(state.auto_lifecycle_authority)?,
+            // Formatting is the last fallible core-row conversion. Keeping it
+            // here makes accepted evidence safe to serialize without changing
+            // which malformed optional field wins.
+            state_changed_at: identity
+                .state_changed_at()
+                .map(|value| {
+                    value
+                        .format(&Rfc3339)
+                        .map(PublishedActivityTimestamp)
+                        .map_err(|error| {
+                            Status::internal(format!("format state_changed_at: {error}"))
+                        })
+                })
+                .transpose()?,
+            identity,
         })
     }
 
@@ -184,18 +199,9 @@ impl ValidatedSandboxObservation {
         receipt: Option<&SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
         recovery: Option<&QuarantineRecoveryProjection>,
         recovery_degraded: bool,
-    ) -> Result<serde_json::Value, Status> {
+    ) -> serde_json::Value {
         let execution = self.execution.as_ref();
         let artifact = self.identity.current_local_artifact();
-        let changed_at = self
-            .identity
-            .state_changed_at()
-            .map(|value| {
-                value
-                    .format(&Rfc3339)
-                    .map_err(|error| Status::internal(format!("format state_changed_at: {error}")))
-            })
-            .transpose()?;
         let recovery = recovery.map(|observation| {
             serde_json::json!({
                 "schema_version": observation.schema_version,
@@ -210,7 +216,7 @@ impl ValidatedSandboxObservation {
             NetworkPolicySource::Override => Some("override"),
             NetworkPolicySource::Unspecified => None,
         };
-        Ok(serde_json::json!({
+        serde_json::json!({
             "sandbox_id": self.sandbox_id,
             "status": self.status.as_ref().map(PublishedSandboxStatus::as_str),
             "template": self.template,
@@ -261,10 +267,10 @@ impl ValidatedSandboxObservation {
             "current_local_artifact_id": artifact.map(|artifact| artifact.id().to_string()),
             "current_local_artifact_kind": artifact.map(|artifact| artifact.kind().to_string()),
             "current_local_artifact_origin": artifact.map(|artifact| artifact.origin().to_string()),
-            "state_changed_at": changed_at,
+            "state_changed_at": self.state_changed_at,
             "execution_generation": self.identity.execution_generation().map(|generation| generation.get()),
             "pod_uid": self.identity.pod_uid().map(ToString::to_string),
-        }))
+        })
     }
 }
 
