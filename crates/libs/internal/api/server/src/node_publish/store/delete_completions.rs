@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, str::FromStr};
+#[cfg(test)]
+use std::str::FromStr;
+use std::{collections::BTreeMap, ops::ControlFlow};
 
 use pplx_space_common_core::{
     sql,
@@ -31,6 +33,9 @@ use crate::node_publish::validate::delete_completions::{
 };
 #[cfg(test)]
 use crate::proto::AutoLifecycleDeleteCompletion;
+
+#[path = "delete_completions/authority.rs"]
+mod authority;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ConsumeDeleteCompletionsError {
@@ -407,99 +412,15 @@ async fn apply_receipt(
             AutoLifecycleDeleteCompletionReason::MissingLineage,
         ));
     };
-    let latest_generation = evidence.latest_execution_generation;
-    if latest_generation > completion.execution_generation {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::StaleGeneration,
-        ));
-    }
-    if latest_generation < completion.execution_generation {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::AheadOfLineage,
-        ));
-    }
-    let Some(route_activation_id) = evidence.route_activation_id else {
-        // Receipts are emitted only after the route-assignment write has
-        // populated this identity. A missing value is legacy or partial
-        // central evidence and cannot be relaxed to generation-only ABA
-        // fencing.
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::MissingRouteIdentity,
-        ));
-    };
-    if route_activation_id != completion.route_activation_id {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::RouteIncarnationMismatch,
-        ));
-    }
-    if !evidence.publisher_owns_execution {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::DifferentExecutionNode,
-        ));
+    if let Some(outcome) = authority::execution_outcome(&evidence, completion) {
+        return Ok(outcome);
     }
 
-    let stored_lifecycle = match StoredSandboxLifecycle::from_str(&row.lifecycle) {
-        Ok(lifecycle) => lifecycle,
-        Err(error) => {
-            tracing::warn!(
-                sandbox_id = %completion.sandbox_id,
-                receipt_id = %completion.receipt_id,
-                lifecycle = %row.lifecycle,
-                %error,
-                "acknowledging auto-lifecycle delete completion for unknown central lifecycle"
-            );
-            return Ok(ReceiptOutcome::AcknowledgedNoop(
-                AutoLifecycleDeleteCompletionReason::UnknownLifecycle,
-            ));
-        }
+    let authority = match authority::decide(row, completion) {
+        ControlFlow::Continue(authority) => authority,
+        ControlFlow::Break(outcome) => return Ok(outcome),
     };
-    let from_lifecycle = match stored_lifecycle {
-        StoredSandboxLifecycle::Deleted => {
-            return Ok(ReceiptOutcome::AcknowledgedNoop(
-                AutoLifecycleDeleteCompletionReason::DeletedTombstone,
-            ));
-        }
-        StoredSandboxLifecycle::CleanupRequired => {
-            return Ok(ReceiptOutcome::AcknowledgedNoop(
-                AutoLifecycleDeleteCompletionReason::CleanupRequired,
-            ));
-        }
-        StoredSandboxLifecycle::Live(lifecycle) => lifecycle,
-    };
-    let current_policy =
-        match serde_json::from_value::<AutoLifecyclePolicy>(row.auto_lifecycle_json.0) {
-            Ok(policy) => policy,
-            Err(error) => {
-                tracing::warn!(
-                    sandbox_id = %completion.sandbox_id,
-                    receipt_id = %completion.receipt_id,
-                    %error,
-                    "deferring auto-lifecycle delete completion with unreadable central policy"
-                );
-                return Ok(ReceiptOutcome::Deferred(
-                    AutoLifecycleDeleteCompletionReason::PolicyUnreadable,
-                ));
-            }
-        };
-    let current_policy_fingerprint = AutoLifecyclePolicyFingerprint::for_policy(&current_policy);
-    if current_policy_fingerprint != completion.policy_fingerprint {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::PolicyMismatch,
-        ));
-    }
-    // The fingerprint already commits to the delete action. Retain this
-    // explicit authorization check as defense against a nonconforming
-    // publisher or a future fingerprint projection bug.
-    if !current_policy.contains_action(AutoLifecycleIdleAction::Delete) {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::PolicyDoesNotAuthorizeDelete,
-        ));
-    }
-    if from_lifecycle.is_transient() {
-        return Ok(ReceiptOutcome::Deferred(
-            AutoLifecycleDeleteCompletionReason::TransientLifecycle,
-        ));
-    }
+    let from_lifecycle = authority.prior_lifecycle();
 
     if from_lifecycle == SandboxLifecycle::Quarantined {
         let matching_orphan_quarantine = sqlx::query_scalar::<_, bool>(sql!(
@@ -535,58 +456,8 @@ async fn apply_receipt(
                 AutoLifecycleDeleteCompletionReason::QuarantineHold,
             ));
         }
-    } else {
-        match row.active_node_id {
-            Some(node_id) if node_id == origin_node_id => {}
-            Some(_) => {
-                return Ok(ReceiptOutcome::AcknowledgedNoop(
-                    AutoLifecycleDeleteCompletionReason::DifferentActiveNode,
-                ));
-            }
-            None => match from_lifecycle {
-                // Dormant rows clear their active placement by construction, so
-                // the locked latest execution row is the durable ownership
-                // evidence.
-                SandboxLifecycle::Stopped | SandboxLifecycle::Suspended => {}
-                // A live-looking row with no active node is mid-transition.
-                // Defer until placement is republished, but only for as long as
-                // a transition could plausibly still be running.
-                SandboxLifecycle::Started | SandboxLifecycle::Paused => {
-                    if row.ownership_evidence_expired {
-                        return Ok(ReceiptOutcome::AcknowledgedNoop(
-                            AutoLifecycleDeleteCompletionReason::OwnershipEvidenceExpired,
-                        ));
-                    }
-                    return Ok(ReceiptOutcome::Deferred(
-                        AutoLifecycleDeleteCompletionReason::AwaitingOwnershipEvidence,
-                    ));
-                }
-                // Never placed or already failed out of placement: there is no
-                // ownership left to prove, and no retry would produce one.
-                SandboxLifecycle::Created | SandboxLifecycle::Failed => {
-                    return Ok(ReceiptOutcome::AcknowledgedNoop(
-                        AutoLifecycleDeleteCompletionReason::OwnershipAbsent,
-                    ));
-                }
-                // Transient states returned above and quarantine took the other
-                // branch. Fail closed rather than widen the delete-authorizing
-                // set if that ever stops holding.
-                SandboxLifecycle::Creating
-                | SandboxLifecycle::Starting
-                | SandboxLifecycle::Restoring
-                | SandboxLifecycle::Pausing
-                | SandboxLifecycle::Resuming
-                | SandboxLifecycle::Suspending
-                | SandboxLifecycle::Stopping
-                | SandboxLifecycle::Deleting
-                | SandboxLifecycle::Checkpointing
-                | SandboxLifecycle::Quarantined => {
-                    return Ok(ReceiptOutcome::AcknowledgedNoop(
-                        AutoLifecycleDeleteCompletionReason::OwnershipAbsent,
-                    ));
-                }
-            },
-        }
+    } else if let Some(outcome) = authority.ownership_outcome(origin_node_id) {
+        return Ok(outcome);
     }
     if evidence.creating_snapshot_exists {
         return Ok(ReceiptOutcome::Deferred(
