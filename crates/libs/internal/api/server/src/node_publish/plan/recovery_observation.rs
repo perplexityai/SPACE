@@ -4,18 +4,30 @@ use serde::ser::SerializeStruct;
 use crate::node_publish::validate::quarantine::QuarantineRecoveryProjection;
 
 /// Validated node-local recovery evidence, separate from canonical quarantine.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug)]
 pub(crate) struct RecoveryObservationClaim {
     pub(crate) sandbox_id: SandboxId,
-    #[serde(
-        rename = "quarantine_recovery_payload",
-        serialize_with = "serialize_projection"
-    )]
     pub(crate) observation: QuarantineRecoveryProjection,
 }
 
+impl RecoveryObservationClaim {
+    pub(crate) fn payload(&self) -> RecoveryObservationPayload<'_> {
+        RecoveryObservationPayload(&self.observation)
+    }
+}
+
+/// Only this JSON column is encoded; the sandbox identity is a separate bind.
+#[derive(Debug)]
+pub(crate) struct RecoveryObservationPayload<'a>(&'a QuarantineRecoveryProjection);
+
+impl serde::Serialize for RecoveryObservationPayload<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_projection(self.0, serializer)
+    }
+}
+
 /// A non-degraded report explicitly omitted node-local recovery evidence.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug)]
 pub(crate) struct ClearRecoveryObservationClaim {
     pub(crate) sandbox_id: SandboxId,
 }

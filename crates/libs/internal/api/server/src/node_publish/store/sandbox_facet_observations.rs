@@ -123,28 +123,17 @@ async fn upsert_quarantine_recovery(
         return Ok(false);
     }
     let written = sqlx::query(sql!(
-        "WITH input AS (
-             SELECT sandbox_id, quarantine_recovery_payload,
-                    quarantine_recovery_observation_degraded
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         publishable AS (
-             SELECT input.sandbox_id, input.quarantine_recovery_payload,
-                    input.quarantine_recovery_observation_degraded
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NOT NULL
+        "WITH publishable AS (
+             SELECT sandbox_id, quarantine_recovery_payload
+             FROM UNNEST($2::UUID[], $3::JSONB[])
+                 AS input(sandbox_id, quarantine_recovery_payload)
          )
          INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_payload, observed_at, updated_at
          )
          SELECT
              $1,
-             $3,
+             $4,
              publishable.sandbox_id::TEXT,
              jsonb_build_object(
                  'quarantine_recovery',
@@ -162,10 +151,21 @@ async fn upsert_quarantine_recovery(
          WHERE node_facet_observed_status.observed_payload -> 'quarantine_recovery'
                IS DISTINCT FROM EXCLUDED.observed_payload -> 'quarantine_recovery'
             OR node_facet_observed_status.observed_at
-               < NOW() - make_interval(secs => $4::BIGINT)"
+               < NOW() - make_interval(secs => $5::BIGINT)"
     ))
     .bind(node_id)
-    .bind(Json(claims))
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| Json(claim.payload()))
+            .collect::<Vec<_>>(),
+    )
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
     .execute(&mut *conn)
@@ -185,20 +185,9 @@ async fn clear_quarantine_recovery(
         return Ok(false);
     }
     let cleared = sqlx::query(sql!(
-        "WITH input AS (
-             SELECT sandbox_id, quarantine_recovery_payload,
-                    quarantine_recovery_observation_degraded
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         clearable AS (
-             SELECT input.sandbox_id
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NULL
+        "WITH clearable AS (
+             SELECT sandbox_id
+             FROM UNNEST($2::UUID[]) AS input(sandbox_id)
          )
          UPDATE node_facet_observed_status observed
          SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
@@ -212,7 +201,12 @@ async fn clear_quarantine_recovery(
            AND observed.observed_payload ? 'quarantine_recovery'"
     ))
     .bind(node_id)
-    .bind(Json(claims))
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .execute(&mut *conn)
     .await
