@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use sqlx::types::Json;
-use time::format_description::well_known::Rfc3339;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -13,7 +12,7 @@ use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::{
     ArtifactKind, NodeRole, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptKind, SandboxTransitionTargetState, SemVer,
+    SandboxTransitionReceipt, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -31,7 +30,6 @@ use pplx_space_common_svc::{
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_sandbox_portability::{
     SuspendedTargetNodeAssignment, node_published_execution_identity_matches,
     publish_clear_or_preserve_current_local_artifact_marker_assignments,
@@ -41,22 +39,18 @@ use pplx_space_sandbox_portability::{
 
 use crate::node_publish::validate::failure_episode::FailureEpisodeClaim;
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
-use crate::node_publish::validate::fields::{
-    execution_projection, non_zero_u64_to_i64, proto_timestamp_to_rfc3339, u32_to_i32, u64_to_i64,
-};
 use crate::node_publish::validate::quarantine::{
     QuarantineRecoveryProjectionState, quarantine_recovery_projection,
 };
 use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
 use crate::node_publish::validate::receipts::{self, PublishedTransitionReceiptError};
-use crate::node_publish::validate::sandbox_identity::SandboxIdentityEvidence;
-use crate::node_publish::validate::sandbox_metadata::{PublishedRuntimeLabel, policy_authority};
+use crate::node_publish::validate::sandbox_observation::ValidatedSandboxObservation;
 use crate::node_publish::validate::snapshots::snapshot_json;
 use crate::node_publish::validate::templates::template_state_row;
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
 use crate::sandbox_quarantine_store;
 
-use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
+use super::{optional_trimmed, parse_sandbox_id, trimmed_required};
 
 const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
 ON CONFLICT (node_id, facet, element) DO UPDATE
@@ -307,14 +301,6 @@ pub(crate) fn capture_host_cpu(
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn network_policy_source_str(source: i32) -> Option<&'static str> {
-    match NetworkPolicySource::try_from(source).unwrap_or(NetworkPolicySource::Unspecified) {
-        NetworkPolicySource::Template => Some("template"),
-        NetworkPolicySource::Override => Some("override"),
-        NetworkPolicySource::Unspecified => None,
-    }
 }
 
 fn sandbox_policy_reconcile_refs_for_new_sandboxes(
@@ -996,27 +982,6 @@ impl PostCommitSandboxEvent {
     }
 }
 
-fn published_spaced_version(
-    node_id: NodeId,
-    sandbox_id: SandboxId,
-    raw: Option<&str>,
-) -> Option<SemVer> {
-    let raw = optional_trimmed(raw)?;
-    match SemVer::parse(&raw) {
-        Ok(version) => Some(version),
-        Err(error) => {
-            tracing::warn!(
-                %node_id,
-                %sandbox_id,
-                spaced_version = %raw,
-                error = %error,
-                "dropping invalid sandbox spaced version from node publish"
-            );
-            None
-        }
-    }
-}
-
 /// Deletes the stopped Direct sandboxes a node reported absent, and detaches
 /// their snapshots' storage locations.
 ///
@@ -1209,164 +1174,24 @@ pub async fn publish_sandbox_states(
                 quarantine_inputs.push(claim);
             }
 
-            let observed_network_policy = state
-                .observed_network_policy
-                .as_ref()
-                .map(proto_network_policy_to_common)
-                .transpose()?;
-            let observed_network_policy_generation = non_zero_u64_to_i64(
-                state.observed_network_policy_generation,
-                "observed_network_policy_generation",
-            )?;
-            row_publishes_network_policy = observed_network_policy_generation.is_some();
-            let execution = execution_projection(state.execution.as_ref())?;
-            let spaced_version =
-                published_spaced_version(node_id, sandbox_uuid, state.spaced_version.as_deref());
-            let runtime = PublishedRuntimeLabel::try_from_proto(
-                state.runtime.as_deref(),
-                execution.as_ref(),
-            )?;
-            let identity =
-                SandboxIdentityEvidence::try_from_proto(state, transition_receipt.as_ref())?;
-            let mut row = serde_json::json!({
-                "sandbox_id": sandbox_uuid,
-                "status": optional_trimmed(state.status.as_deref()),
-                "template": optional_trimmed(state.template.as_deref()),
-                "runtime": runtime.as_ref().map(PublishedRuntimeLabel::as_str)
-                    .or_else(|| execution.as_ref().map(|execution| execution.runtime.as_str())),
-                "spaced_version": spaced_version.as_ref().map(ToString::to_string),
-                "runtime_version": execution.as_ref().map(|execution| execution.runtime_version.clone()),
-                "guest_os": execution.as_ref().map(|execution| execution.guest_os.clone()),
-                "guest_arch": execution.as_ref().map(|execution| execution.guest_arch.clone()),
-                "state_format_name": execution.as_ref().and_then(|execution| execution.state_format_name.clone()),
-                "state_format_version": execution.as_ref().and_then(|execution| execution.state_format_version.clone()),
-                "execution_metadata": execution.as_ref().map(|execution| execution.metadata.clone()),
-                "execution_components": execution.as_ref().map(|execution| execution.components.clone()).unwrap_or_default(),
-                "pid": state.pid.map(|value| u32_to_i32(value, "pid")).transpose()?,
-                "namespace": optional_trimmed(state.namespace.as_deref()),
-                "uptime": optional_trimmed(state.uptime.as_deref()),
-                "sandbox_owner": optional_trimmed(state.owner.as_deref()),
-                "sandbox_user": optional_trimmed(state.owner.as_deref()),
-                "image_hash": optional_trimmed(state.content_hash.as_deref()),
-                "snapshots_enabled": state.snapshots_enabled,
-                "pool_template": optional_trimmed(state.pool_template.as_deref()),
-                "failure_reason": optional_trimmed(state.failure_reason.as_deref()),
-                "observed_created_at": optional_trimmed(state.created_at.as_deref()),
-                "last_used_at": state.last_used_at.as_ref()
-                    .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_used_at"))
-                    .transpose()?,
-                "last_access_at": state.last_access_at.as_ref()
-                    .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_access_at"))
-                    .transpose()?,
-                "last_command_at": state.last_command_at.as_ref()
-                    .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_command_at"))
-                    .transpose()?,
-                "network_tx_bytes": state.network_tx_bytes
-                    .map(|value| u64_to_i64(value, "network_tx_bytes"))
-                    .transpose()?,
-                "network_rx_bytes": state.network_rx_bytes
-                    .map(|value| u64_to_i64(value, "network_rx_bytes"))
-                    .transpose()?,
-                "disk_usage_bytes": state.disk_usage_bytes
-                    .map(|value| u64_to_i64(value, "disk_usage_bytes"))
-                    .transpose()?,
-                "observed_network_policy_json": observed_network_policy,
-                "observed_network_policy_generation": observed_network_policy_generation,
-                "observed_network_policy_source": network_policy_source_str(
-                    state.observed_network_policy_source,
-                ),
-                "observed_network_policy_authority": policy_authority(
-                    state.observed_network_policy_authority,
-                )?.map(|authority| authority.as_str()),
-                "auto_lifecycle_authority": policy_authority(
-                    state.auto_lifecycle_authority,
-                )?.map(|authority| authority.as_str()),
-                "quarantine_reason_code": optional_trimmed(state.quarantine_reason_code.as_deref()),
-                "transition_receipt_id": transition_receipt.map(|receipt| receipt.id().as_uuid()),
-                "transition_receipt_kind": transition_receipt.map(|receipt| receipt.kind().as_str()),
-                "transition_receipt_target_state": transition_receipt.map(|receipt| receipt.target_state().as_str()),
-                "transition_receipt_execution_generation": transition_receipt
-                    .map(|receipt| receipt.execution_generation().get()),
-                "transition_receipt_reason_code": transition_receipt
-                    .and_then(|receipt| receipt.reason_code().map(|reason| reason.as_str())),
-                "transition_receipt_activation_attempt_id": transition_receipt
-                    .and_then(|receipt| receipt.activation_attempt_id().map(|id| id.as_uuid())),
-            });
-            let row_fields = row.as_object_mut().ok_or_else(|| {
-                Status::internal("published sandbox state did not serialize as an object")
-            })?;
-            let quarantine_recovery_payload = quarantine_recovery.as_ref().map(|observation| {
-                serde_json::json!({
-                    "schema_version": observation.schema_version,
-                    "local_quarantine_id": observation.local_quarantine_id,
-                    "observed_owner": observation.observed_owner_name(),
-                    "attempt_count": observation.attempt_count,
-                    "next_attempt_at": observation.next_attempt_at.as_deref(),
-                })
-            });
-            row_fields.insert(
-                "quarantine_recovery_payload".to_string(),
-                quarantine_recovery_payload.unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "quarantine_recovery_observation_degraded".to_string(),
-                serde_json::Value::Bool(quarantine_recovery_degraded),
-            );
-            row_fields.insert(
-                "transition_receipt_recovery_policy".to_string(),
-                transition_receipt
-                    .and_then(|receipt| receipt.reason_code().copied())
-                    .and_then(|reason| reason.automatic_recovery_policy())
-                    .map(|policy| serde_json::Value::String(policy.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_id".to_string(),
-                identity
-                    .current_local_artifact()
-                    .map(|artifact| serde_json::Value::String(artifact.id().to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_kind".to_string(),
-                identity
-                    .current_local_artifact()
-                    .map(|artifact| serde_json::Value::String(artifact.kind().to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_origin".to_string(),
-                identity
-                    .current_local_artifact()
-                    .map(|artifact| serde_json::Value::String(artifact.origin().to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "state_changed_at".to_string(),
-                match identity.state_changed_at() {
-                    Some(changed_at) => {
-                        serde_json::Value::String(changed_at.format(&Rfc3339).map_err(|error| {
-                            Status::internal(format!("format state_changed_at: {error}"))
-                        })?)
-                    }
-                    None => serde_json::Value::Null,
-                },
-            );
-            row_fields.insert(
-                "execution_generation".to_string(),
-                identity
-                    .execution_generation()
-                    .map(|generation| serde_json::Value::from(generation.get()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "pod_uid".to_string(),
-                identity
-                    .pod_uid()
-                    .map(|pod_uid| serde_json::Value::String(pod_uid.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            rows.push(row);
+            let validation =
+                ValidatedSandboxObservation::parse(sandbox_id, state, transition_receipt.as_ref());
+            if let Some(warning) = validation.version_warning {
+                tracing::warn!(
+                    %node_id,
+                    %sandbox_id,
+                    spaced_version = %warning.label,
+                    error = %warning.error,
+                    "dropping invalid sandbox spaced version from node publish"
+                );
+            }
+            let observation = validation.observation?;
+            row_publishes_network_policy = observation.publishes_network_policy();
+            rows.push(observation.legacy_row(
+                transition_receipt.as_ref(),
+                quarantine_recovery.as_ref(),
+                quarantine_recovery_degraded,
+            )?);
             for snapshot in &state.snapshots {
                 snapshot_rows.push(snapshot_json(sandbox_uuid, snapshot)?);
             }
