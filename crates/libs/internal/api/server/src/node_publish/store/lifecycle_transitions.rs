@@ -3,7 +3,7 @@ use pplx_space_common_core::{
     sql,
     types::{NodeId, SandboxId, SandboxTransitionReceiptKind, SubstrateKind},
 };
-use sqlx::{PgConnection, types::Json};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -46,12 +46,9 @@ pub(crate) async fn converge_restored(
     // exemption the sweeper makes) and are left alone.
     sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
-             SELECT sandbox_id, status, transition_receipt_kind
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT,
-                 transition_receipt_kind TEXT
-             )
+             SELECT sandbox_id, transition_receipt_kind
+             FROM UNNEST($2::UUID[], $3::TEXT[])
+                 AS input(sandbox_id, transition_receipt_kind)
          )
          UPDATE sandboxes s
          SET lifecycle = 'started'
@@ -59,11 +56,10 @@ pub(crate) async fn converge_restored(
          WHERE s.id = input.sandbox_id
            AND s.active_node_id = $1
            AND s.evacuation_restore_target IS NULL
-           AND LOWER(TRIM(input.status)) = 'started'
-           AND input.transition_receipt_kind IS DISTINCT FROM $3
+           AND input.transition_receipt_kind IS DISTINCT FROM $4
            AND LOWER(TRIM(s.lifecycle)) = 'restoring'
            AND (
-               s.managed_by <> $4
+               s.managed_by <> $5
                OR EXISTS (
                    SELECT 1
                      FROM sandbox_k8s_executions rex
@@ -76,7 +72,18 @@ pub(crate) async fn converge_restored(
          RETURNING s.id"
     ))
     .bind(node_id)
-    .bind(Json(claims))
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.transition_receipt_kind.map(|kind| kind.as_str()))
+            .collect::<Vec<_>>(),
+    )
     .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)
@@ -97,18 +104,14 @@ pub(crate) async fn converge_stopped(
     }
     sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
-             SELECT sandbox_id, status
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
+             SELECT sandbox_id
+             FROM UNNEST($2::UUID[]) AS input(sandbox_id)
          )
          UPDATE sandboxes s
          SET lifecycle = 'stopped'
          FROM input
          WHERE s.id = input.sandbox_id
            AND s.active_node_id = $1
-           AND LOWER(TRIM(input.status)) = 'stopped'
            AND LOWER(TRIM(s.lifecycle)) IN (
                'started',
                'paused',
@@ -119,7 +122,12 @@ pub(crate) async fn converge_stopped(
          RETURNING s.id"
     ))
     .bind(node_id)
-    .bind(Json(claims))
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
     .fetch_all(&mut *conn)
     .await
     .map_err(ConvergeStoppedError::Update)
@@ -146,11 +154,8 @@ pub(crate) async fn converge_failed(
     }
     let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
         "WITH input AS (
-             SELECT sandbox_id, status
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
+             SELECT sandbox_id
+             FROM UNNEST($2::UUID[]) AS input(sandbox_id)
          ),
          claimed AS (
              SELECT s.id, s.lifecycle
@@ -158,7 +163,6 @@ pub(crate) async fn converge_failed(
              JOIN input ON input.sandbox_id = s.id
              WHERE s.active_node_id = $1
                AND s.managed_by = $3
-               AND LOWER(TRIM(input.status)) = 'failed'
                AND LOWER(TRIM(s.lifecycle)) NOT IN (
                    'failed',
                    'quarantined',
@@ -175,7 +179,12 @@ pub(crate) async fn converge_failed(
          RETURNING s.id, claimed.lifecycle"
     ))
     .bind(node_id)
-    .bind(Json(claims))
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)
     .await
