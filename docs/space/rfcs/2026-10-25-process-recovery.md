@@ -161,7 +161,7 @@ Legacy keys used only by legacy requests keep their current behavior.
 | Environment | Validate the complete supplied map, then compare entries independent of order. Recovery starts reject invalid entries; legacy parsing remains unchanged. |
 | Timeout, background, stdin, PTY, clean environment | Include every field and option presence. Validate values before binding. |
 | Configured environment, account data and default cwd | Resolve once for the owning launch. A retry replays that launch, even if defaults or account data change. |
-| Engine instance and contract version | Validate the instance before key lookup; versions with different request semantics cannot share a binding. |
+| Engine instance, activation and contract version | Validate the identities before key lookup and compare UUID values, not their spelling; versions with different request semantics cannot share a binding. |
 
 Store a server-computed cryptographic digest of canonical request data alongside
 the bounded key record; do not retain another copy of argv or environment.
@@ -190,7 +190,15 @@ through `process_execution_info()`. Older guests and adapters omit it; absence
 never authorizes an opt-in. Each adapter intersects the guest list with the
 guarantees its request path implements; unknown names are omitted. A newer guest
 behind an older adapter must not advertise a guarantee that the adapter would strip on the request.
-Version numbers alone never establish support.
+Version numbers alone never establish support. Native and raw guest discovery
+identify implemented contracts; a missing activation means they cannot accept
+recovery calls yet. Routed discovery additionally filters recovery capabilities
+until activation is confirmed.
+
+For the public command transport, manager discovery does not establish support
+on an independently deployed data plane. Require the WebSocket subprotocol
+`space.process-recovery.v1` to be acknowledged by the serving connection before
+sending credentials or recovery requests. There is no fallback to legacy frames.
 
 The identity belongs to the in-memory execution state. Cloning a service handle
 or reconnecting does not change it; constructing a replacement does. A memory
@@ -236,6 +244,27 @@ restore, including suspend/restore; resident pause/resume keeps the instance.
 Legacy operations retain their current lifecycle behavior. Fencing prevents new
 requests using old handles; it cannot undo external effects of rolled-back work.
 
+Quiescing is transient: recovery calls return `Unavailable` with
+`temporarily_unavailable` while activation is absent or changing. Only a different
+installed activation returns `activation_changed`; callers must not abandon live
+handles merely because a scheduled flush quiesced the service. New recovery calls
+fail promptly instead of queuing with payload capacity behind the barrier.
+Disabling interrupts blocked recovery effects and waits for their terminal
+receipts before flushing. Once quiescing begins, cancelling configuration leaves
+recovery disabled until a subsequent change completes the barrier.
+
+Recovery rearming is optional on ordinary readiness: first observe the guest,
+then attempt rearming within a small part of the remaining request budget. A busy
+snapshot lock or failed rearm removes recovery capabilities without failing
+readiness. Preparation waits briefly for an admitted rearm instead of immediately
+refusing because its lifecycle permit is busy.
+
+Before implicitly resuming a resident paused sandbox, the manager validates its
+external activation. Recovery requests never restore a suspended sandbox using
+old fences. New public recovery command sessions require a running sandbox and
+do not enqueue a wake; callers explicitly resume or restore, then discover the
+execution for new work. Legacy command wake policy is unchanged.
+
 ### Deduplicate process mutations
 
 SendInput, CloseStdin and SendSignal share one ordered sequence per recovery
@@ -266,8 +295,14 @@ precedes the running-process check; a completed process can still answer a retry
 Admission refusals and cancelled reservations that have not begun effects do not
 consume a sequence. Once begun, a tracked owner retains admission and completes
 the effect and receipt publication despite caller cancellation. Service shutdown
-can interrupt it, but must publish a known failure or an explicit uncertain
-outcome, never free that sequence for another attempt.
+and quiescing can interrupt it, but must publish a known failure or an explicit
+uncertain outcome, never free that sequence for another attempt. Duplicate
+waiters own no effect and do not keep the activation barrier open.
+
+An earlier blocked mutation prevents the next sequence, including a sequenced
+kill. A version-1 fenced SIGKILL (without a sequence), or legacy kill when only a
+legacy ID is available, remains an explicit cleanup escape outside receipt
+ordering. It must not be retried as an exactly-once mutation.
 
 A terminal result consumes its sequence, including a recorded error. A partial
 stdin write reports the known written prefix and an uncertain remainder; the
