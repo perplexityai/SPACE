@@ -550,6 +550,19 @@ pub fn dormant_activation(sample: DormantActivation<'_>) {
     }
 }
 
+/// Records the outcome of one sandbox API route response.
+///
+/// A 4xx or 5xx response increments `sandbox.api.request_error` exactly once,
+/// tagged with `op`, `surface`, `status_code` and `result_class`. This is the
+/// failed-request count.
+///
+/// It is deliberately a separate metric from `sandbox.api.error`, which holds
+/// the step-level errors that handlers classify by `reason`
+/// (`api_step_error`, `lifecycle_error`). Those can fire several times for one
+/// request, or for a request that later succeeds, and many route failures
+/// (404s, validation errors) have no step error at all. If both were emitted
+/// under one name, summing that metric would count each classified failure
+/// twice.
 pub fn route_outcome(
     identity: SandboxApiMetricIdentity,
     status_code: u16,
@@ -577,9 +590,7 @@ pub fn route_outcome(
     timing_ms("sandbox.api.latency_ms", elapsed_ms(started_at), &tags);
 
     if status_code >= 400 {
-        tags.push(tag("step", "route"));
-        tags.push(tag("reason", "http_response"));
-        counter("sandbox.api.error", 1, &tags);
+        counter("sandbox.api.request_error", 1, &tags);
     }
 }
 
@@ -1315,3 +1326,6 @@ pub mod reconciler {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;
