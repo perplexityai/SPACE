@@ -1,5 +1,5 @@
 //! Snapshot profile validation at the node transport boundary. Artifact names
-//! are profile-owned; the Firecracker adapter consumes memory and machine-state.
+//! are profile-owned; VM adapters consume memory and machine-state.
 
 use crate::proto::*;
 use crate::runtime_paths::SnapshotFiles;
@@ -18,7 +18,7 @@ pub enum StateContractError {
     Unknown(String),
 }
 
-fn firecracker_files(
+fn memory_state_files(
     artifacts: Vec<VmStateArtifact>,
 ) -> Result<(String, String), StateContractError> {
     let mut state = None;
@@ -39,10 +39,10 @@ fn firecracker_files(
     ))
 }
 
-impl TryFrom<CaptureVmStateRequest> for FirecrackerCapture {
+impl TryFrom<CaptureVmStateRequest> for StateCapture {
     type Error = Status;
     fn try_from(request: CaptureVmStateRequest) -> Result<Self, Self::Error> {
-        let (snapshot_path, mem_file_path) = firecracker_files(request.artifacts)
+        let (snapshot_path, mem_file_path) = memory_state_files(request.artifacts)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let storage = request.storage.unwrap_or_default();
         let environment_reference = request
@@ -65,10 +65,10 @@ impl TryFrom<CaptureVmStateRequest> for FirecrackerCapture {
     }
 }
 
-impl TryFrom<RestoreVmStateRequest> for FirecrackerRestore {
+impl TryFrom<RestoreVmStateRequest> for StateRestore {
     type Error = Status;
     fn try_from(request: RestoreVmStateRequest) -> Result<Self, Self::Error> {
-        let (snapshot_path, mem_file_path) = firecracker_files(request.artifacts)
+        let (snapshot_path, mem_file_path) = memory_state_files(request.artifacts)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let storage = request.storage.unwrap_or_default();
         let execution_fence =
@@ -89,14 +89,14 @@ impl TryFrom<RestoreVmStateRequest> for FirecrackerRestore {
 pub(crate) mod tests;
 
 #[derive(Clone, Debug)]
-pub(crate) struct FirecrackerCapture {
+pub(crate) struct StateCapture {
     pub sandbox_id: SnapshotSandbox,
     pub environment_reference: Option<EnvironmentReference>,
     pub storage: SnapshotStorage,
     pub execution_fence: ParsedExecutionFence,
 }
 #[derive(Clone, Debug)]
-pub(crate) struct FirecrackerRestore {
+pub(crate) struct StateRestore {
     pub sandbox_id: SnapshotSandbox,
     pub storage: SnapshotStorage,
     pub execution_fence: ParsedExecutionFence,

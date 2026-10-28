@@ -6,6 +6,8 @@ use super::*;
 pub enum StageExecutionError {
     #[error("fs-verity API unavailable on execution filesystem {}", .0.display())]
     UnsupportedBackend(PathBuf),
+    #[error("catalog-only staging requires a filesystem without fs-verity: {}", .0.display())]
+    FallbackOnCapableBackend(PathBuf),
     #[error("inspect fs-verity API at {}: {source}", path.display())]
     BackendInspection {
         path: PathBuf,
@@ -52,6 +54,7 @@ impl StageExecutionError {
                 ..
             } => pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source),
             Self::UnsupportedBackend(_)
+            | Self::FallbackOnCapableBackend(_)
             | Self::Catalog(_)
             | Self::MissingPin(_)
             | Self::InvalidSource(_)
@@ -189,6 +192,62 @@ impl ArtifactStore {
             pin.digest(),
         )?;
         Ok(target)
+    }
+
+    /// Publish authenticated fresh inodes on the same unsupported filesystem
+    /// the launcher will inspect. Never infer source-file integrity from the
+    /// capability of a different filesystem or accept a caller downgrade flag.
+    pub(crate) fn stage_catalog_release_at(
+        &self,
+        pin: &PinnedRelease,
+        source: &Path,
+        parent: &Path,
+    ) -> Result<PathBuf, StageExecutionError> {
+        let root = self.prepare_execution_namespace(parent, "releases")?;
+        match self.require_verity_api(&root) {
+            Err(StageExecutionError::UnsupportedBackend(_)) => {}
+            Err(error) => return Err(error),
+            Ok(()) => return Err(StageExecutionError::FallbackOnCapableBackend(root)),
+        }
+        RootProtection::Store.check(source, self.owner)?;
+        let target = Self::execution_release_path(parent, pin)?;
+        let invalid = || StageExecutionError::InvalidSource(source.to_owned());
+        let source_parent = source.parent().ok_or_else(invalid)?;
+        let source_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(invalid)?;
+        let directory = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(invalid)?;
+        let files = pin
+            .binaries
+            .iter()
+            .map(|file| PlannedFile {
+                path: file.path,
+                sha256: file.sha256,
+                size: None,
+                mode: 0o755,
+            })
+            .collect::<Vec<_>>();
+        let _lock =
+            lock_root(&root).map_err(|error| io_publish("lock execution cache", &root, error))?;
+        clear_root_leftovers(&root)
+            .map_err(|error| io_publish("clear interrupted execution cache", &root, error))?;
+        Ok(self
+            .publish(
+                &root,
+                directory,
+                PublishSource::Store {
+                    root: source_parent,
+                    directory: source_name,
+                },
+                &files,
+                pin.digest(),
+                RootProtection::ExecutionCache,
+            )?
+            .path)
     }
 
     pub fn stage_sealed_kernel_at(

@@ -11,6 +11,7 @@ use std::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+use super::size::MemorySize;
 use super::{Arch, Digest, HostCpu, RuntimeKind, VcpuCount};
 
 /// Firecracker release assigned to durable artifacts written before execution metadata existed.
@@ -463,6 +464,12 @@ pub struct SnapshotExecutionMetadata {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     cpu_budget: Option<VcpuCount>,
+    /// Captured guest RAM; needed when the memory payload is encrypted.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    guest_memory: Option<MemorySize>,
     /// CPU of the host that captured the VM state, if known. Legacy absence
     /// remains unknown; see [`HostCpu`] for why the instance type isn't enough.
     #[cfg_attr(
@@ -480,6 +487,7 @@ impl SnapshotExecutionMetadata {
         Ok(Self {
             execution: metadata,
             cpu_budget: None,
+            guest_memory: None,
             host_cpu: None,
         })
     }
@@ -491,6 +499,15 @@ impl SnapshotExecutionMetadata {
 
     pub const fn cpu_budget(&self) -> Option<VcpuCount> {
         self.cpu_budget
+    }
+
+    pub fn with_guest_memory(mut self, memory: Option<MemorySize>) -> Self {
+        self.guest_memory = memory;
+        self
+    }
+
+    pub const fn guest_memory(&self) -> Option<MemorySize> {
+        self.guest_memory
     }
 
     pub fn with_host_cpu(mut self, host_cpu: Option<HostCpu>) -> Self {
@@ -517,9 +534,12 @@ impl SnapshotExecutionMetadata {
         let Self {
             execution,
             cpu_budget,
+            guest_memory,
             host_cpu: _,
         } = self;
-        *execution == other.execution && *cpu_budget == other.cpu_budget
+        *execution == other.execution
+            && *cpu_budget == other.cpu_budget
+            && *guest_memory == other.guest_memory
     }
 
     pub fn into_execution(self) -> ExecutionMetadata {
@@ -534,6 +554,8 @@ struct SnapshotExecutionMetadataWire {
     execution: ExecutionMetadata,
     #[serde(default)]
     cpu_budget: Option<VcpuCount>,
+    #[serde(default)]
+    guest_memory: Option<MemorySize>,
     /// Read as any value and parsed leniently: the capture CPU is placement
     /// evidence, so a value this release doesn't accept (written by a newer
     /// release, then rolled back), whether a string or not, reads as unknown
@@ -551,12 +573,15 @@ impl<'de> Deserialize<'de> for SnapshotExecutionMetadata {
         let wire = SnapshotExecutionMetadataWire::deserialize(deserializer)?;
         Self::new(wire.execution)
             .map(|metadata| {
-                metadata.with_cpu_budget(wire.cpu_budget).with_host_cpu(
-                    wire.host_cpu
-                        .as_ref()
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|raw| HostCpu::parse(raw).ok()),
-                )
+                metadata
+                    .with_cpu_budget(wire.cpu_budget)
+                    .with_guest_memory(wire.guest_memory)
+                    .with_host_cpu(
+                        wire.host_cpu
+                            .as_ref()
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|raw| HostCpu::parse(raw).ok()),
+                    )
             })
             .map_err(de::Error::custom)
     }

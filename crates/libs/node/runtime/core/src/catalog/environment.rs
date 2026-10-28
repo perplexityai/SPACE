@@ -323,13 +323,17 @@ impl CompiledEnvironment {
             })
         })
         .collect::<Result<_, CatalogError>>()?;
-        environments.push(Self::cloud_hypervisor(architecture)?);
+        environments.push(Self::cloud_hypervisor(&catalog, architecture, false)?);
+        environments.push(Self::cloud_hypervisor(&catalog, architecture, true)?);
         record_upgrade_edges(&mut environments, CERTIFIED_UPGRADE_EDGES);
         Ok(environments)
     }
 
-    fn cloud_hypervisor(architecture: Arch) -> Result<Self, CatalogError> {
-        let catalog = RuntimeCatalog::compiled()?;
+    fn cloud_hypervisor(
+        catalog: &RuntimeCatalog,
+        architecture: Arch,
+        memory_state: bool,
+    ) -> Result<Self, CatalogError> {
         let missing = || CatalogError::MissingEnvironmentPins {
             runtime: "54.0",
             kernel: "7.2.8+",
@@ -346,7 +350,7 @@ impl CompiledEnvironment {
             })
             .ok_or_else(missing)?
             .clone();
-        let definition = standalone_definition(&release, &kernel)
+        let definition = standalone_definition(&release, &kernel, memory_state)
             .map_err(CatalogError::EnvironmentDefinition)?;
         Ok(Self {
             runtime_ordering_key: semver::Version::new(54, 0, 0),
@@ -354,8 +358,12 @@ impl CompiledEnvironment {
             release,
             kernel,
             definition,
-            memory_state: false,
-            name: "ch-54.0-linux-7.2.8",
+            memory_state,
+            name: if memory_state {
+                "ch-54.0-linux-7.2.8-state-v1"
+            } else {
+                "ch-54.0-linux-7.2.8"
+            },
             upgrade_targets: Vec::new(),
         })
     }
@@ -504,6 +512,7 @@ use pplx_space_execution_common::environment::{
 fn standalone_definition(
     release: &PinnedRelease,
     kernel: &PinnedKernel,
+    memory_state: bool,
 ) -> Result<EnvironmentDefinition, CompiledEnvironmentDefinitionError> {
     let host = HostPlatform {
         os: HostOperatingSystem::Linux,
@@ -541,7 +550,14 @@ fn standalone_definition(
             isolation: IsolationClass::HardwareVm,
             compatibility: ExecutionCompatibilityProfile::RuntimeV1 {
                 contract: CLOUD_HYPERVISOR_MACHINE_CONTRACT.parse()?,
-                state_format: None,
+                state_format: if memory_state {
+                    Some(StateFormatIdentity {
+                        format: "cloud-hypervisor-snapshot".parse()?,
+                        version: "54.0.1".parse()?,
+                    })
+                } else {
+                    None
+                },
             },
         }
         .try_into()?,

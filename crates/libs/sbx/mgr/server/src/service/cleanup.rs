@@ -789,6 +789,63 @@ impl SandboxManagerService {
         }
     }
 
+    /// Only positive process-exit evidence may stop a Started sandbox. Hold the
+    /// cleanup fence from re-reading its execution through durable admission;
+    /// an absent socket, unreadable /proc, or a reused live PID is not death.
+    pub(super) async fn admit_exited_runtime(
+        &self,
+        observed: crate::db::SandboxRow,
+    ) -> Result<Option<CleanupAdmission>, CleanupAdmissionError> {
+        let sandbox_id: SandboxId = observed
+            .id
+            .parse()
+            .map_err(|error| Status::internal(format!("sandbox id: {error}")))?;
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // A healthy process must not acquire a cleanup fence or contend
+            // with filesystem cleanup permits. Recheck the same witness under
+            // the fence after positive exit evidence.
+            let Some(pid) = observed.pid else { return Ok(None); };
+            let exited = || -> Result<bool, Status> {
+                match pplx_space_node_runtime_core::launch::ProcessHandle::open(pid) {
+                    Ok(process) => process.has_exited().map_err(|error| Status::unavailable(format!("observe runtime exit: {error}"))),
+                    Err(error) if error.is_not_found() => Ok(true),
+                    Err(error) => Err(Status::unavailable(format!("pin runtime: {error}"))),
+                }
+            };
+            if !exited()? { return Ok(None); }
+            let fence = match service.try_cleanup_fence(&observed.id) {
+                CleanupLockTryResult::Acquired(fence) => fence,
+                CleanupLockTryResult::Busy => return Ok(None),
+            };
+            let _writer = service.state_writer_lease("RuntimeExitRecovery")?;
+            let current = service.lookup_sandbox(&observed.id)?;
+            if current.state != SandboxState::Started || current.node_execution_id.is_none()
+                || current.node_execution_id != observed.node_execution_id
+                || current.pid != observed.pid {
+                return Ok(None);
+            }
+            if !exited()? { return Ok(None); }
+            let admission = service.admit_lifecycle_cleanup_fenced(sandbox_id, CleanupAdmissionSpec {
+                mode: CleanupAdmissionMode::ObservedState {
+                    state: SandboxState::Started,
+                    execution_generation: Some(current.space_api_route_identity.execution_generation),
+                },
+                template_filter: None,
+                require_template_owner: false,
+                target_state: SandboxState::Stopping,
+                keep_filesystem: true,
+                completion: CleanupCompletion::MarkStopped,
+                immediate_kill: true,
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                persist_intent: true,
+            }, fence)?;
+            service.ensure_cleanup_executor();
+            tracing::warn!(sandbox_id = %observed.id, pid, "runtime exited; admitted fenced cleanup preserving sandbox disk");
+            Ok(Some(admission))
+        }).await.map_err(|error| Status::internal(format!("runtime recovery: {error}")))?
+    }
+
     pub(super) async fn admit_lifecycle_cleanup_from_observed_state(
         &self,
         sandbox_id: SandboxId,

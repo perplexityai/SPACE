@@ -62,17 +62,17 @@ impl NodeManagerService {
         }
     }
 
-    pub(super) async fn require_verified_environment_layout(&self) -> Result<(), Status> {
+    pub(super) async fn require_verified_environment_layout(
+        &self,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+    ) -> Result<(), Status> {
         if !cfg!(target_os = "linux") {
             return Err(Status::failed_precondition(
                 "verified managed execution requires a Linux host",
             ));
         }
         let paths = self.runtime_paths.clone();
-        let store = artifact_store(
-            &paths.store,
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
-        )?;
+        let store = artifact_store(&paths.store, runtime)?;
         self.off_runtime("verify environment layout", move || {
             separate_store(&paths, store.releases_root())
                 .map_err(|error| Status::failed_precondition(describe(&error)))
@@ -97,7 +97,6 @@ impl NodeManagerService {
                 "generic environment schema 2 is required",
             ));
         }
-        self.require_verified_environment_layout().await?;
         if let Some(compatible) = request.compatible {
             if request.reference.is_some() {
                 return Err(Status::invalid_argument(
@@ -151,6 +150,8 @@ impl NodeManagerService {
         let requested = definition
             .execution_requirements()
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        self.require_verified_environment_layout(requested.runtime().kind)
+            .await?;
         let inventory = self.runtime_inventory().await?;
         let resolved = inventory
             .resolve(
@@ -188,7 +189,7 @@ impl NodeManagerService {
         let policy = self.execution_policy_in(scope);
         let definition =
             if let Some(reference) = requested.and_then(|metadata| metadata.environment()) {
-                self.require_verified_environment_layout().await?;
+                self.require_verified_environment_layout(runtime).await?;
                 let definition = select_definition(&policy, Some(reference), mode)?;
                 if let Some(requested) = requested {
                     definition
@@ -387,9 +388,8 @@ impl Artifact {
     }
 }
 
-/// Initial execution discovery is Firecracker-based. Before another runtime
-/// becomes executable, extend managed-root filtering here and overlap
-/// checks here and in `require_verified_environment_layout` to cover its store.
+/// Initial discovery retains the Firecracker migration fallback. Every allowed
+/// non-initial binding must also have a separate runtime store.
 /// Publication and removal already check the selected runtime's store separately.
 pub(super) fn execution_inventory(
     paths: &crate::config::RuntimePaths,
@@ -441,6 +441,10 @@ pub(super) fn execution_inventory(
                 continue;
             }
         };
+        if let Err(error) = separate_store(paths, environment_store.releases_root()) {
+            tracing::warn!(%error, "environment store overlaps execution roots; retaining other bindings");
+            continue;
+        }
         if let Err(error) =
             inventory.include_environment(&environment_store, environment, &paths.kernels)
         {

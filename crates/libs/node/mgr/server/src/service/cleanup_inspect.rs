@@ -591,6 +591,7 @@ impl NodeManagerService {
                 format!("{RUN_DIR}/{sandbox_id}"),
                 format!("{CACHE_DIR}/{sandbox_id}"),
                 format!("{JAIL_DIR}/firecracker/{sandbox_id}"),
+                format!("{JAIL_DIR}/cloud-hypervisor/{sandbox_id}"),
                 format!("/sys/fs/cgroup/space/sbx-{sandbox_id}"),
                 format!("/sys/fs/cgroup/space/{sandbox_id}"),
             ] {
@@ -784,7 +785,16 @@ impl NodeManagerService {
         };
 
         let run_dir = format!("{RUN_DIR}/{sandbox_id}");
-        let jail_root = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root");
+        // Inspection reports filesystem presence, not execution authority.
+        // Probe both owned adapter roots even when metadata is damaged.
+        let jail_roots = [
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            pplx_space_common_core::types::RuntimeKind::CloudHypervisor,
+        ]
+        .into_iter()
+        .map(|runtime| pplx_space_node_runtime_core::control::isolation_root(runtime, sandbox_id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
         let slot_allocated = {
             self.pool
@@ -864,11 +874,13 @@ impl NodeManagerService {
             },
             cache_dir_exists: std::path::Path::new(&format!("{CACHE_DIR}/{sandbox_id}")).exists(),
             run_dir_exists: std::path::Path::new(&run_dir).exists(),
-            isolation_root_exists: std::path::Path::new(&jail_root).exists(),
+            isolation_root_exists: jail_roots.iter().any(|root| root.exists()),
             vm_config_exists: std::path::Path::new(&format!("{run_dir}/vm-config.json")).exists(),
-            runtime_log_exists: std::path::Path::new(&format!("{jail_root}/fc.log")).exists()
+            runtime_log_exists: jail_roots
+                .iter()
+                .any(|root| root.join("console.log").exists() || root.join("fc.log").exists())
                 || std::path::Path::new(&format!("{run_dir}/fc.log")).exists(),
-            vsock_sock_exists: std::path::Path::new(&format!("{jail_root}/v.sock")).exists(),
+            vsock_sock_exists: jail_roots.iter().any(|root| root.join("v.sock").exists()),
             spaced_sock_exists: std::path::Path::new(&format!("{run_dir}/spaced-host.sock"))
                 .exists(),
             rootfs_exists: std::path::Path::new(&format!(

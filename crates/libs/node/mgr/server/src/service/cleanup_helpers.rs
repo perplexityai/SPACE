@@ -677,6 +677,43 @@ pub(super) fn set_btrfs_snapshot_read_only(
 
 pub(super) fn unmount_if_present(path: impl AsRef<Path>) -> Result<bool, String> {
     let path: &Path = path.as_ref();
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| format!("mount path has no parent: {}", path.display()))?;
+    // Nested binds have sandbox-writable parents too. A planted parent link
+    // contains no mounts owned by this jail; leave it for recursive unlinking.
+    match std::fs::symlink_metadata(parent_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "inspect mount parent {}: {error}",
+                parent_path.display()
+            ));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let parent = match super::trusted_paths::open_directory(parent_path) {
+        Ok(parent) => parent,
+        Err(error) if error.code() == tonic::Code::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "pin mount parent {}: {error}",
+                parent_path.display()
+            ));
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let pinned_path = {
+        use std::os::fd::AsRawFd;
+        let name = path
+            .file_name()
+            .ok_or_else(|| format!("mount path has no entry name: {}", path.display()))?;
+        PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name)
+    };
+    #[cfg(target_os = "linux")]
+    let path = pinned_path.as_path();
     // The final jail entry is sandbox-writable. A link (including a loop)
     // has no bind to detach and can be safely unlinked by recursive removal.
     match std::fs::symlink_metadata(path) {
@@ -1114,20 +1151,34 @@ pub(super) async fn cleanup_runtime_artifacts_blocking(
 pub(super) struct RuntimeArtifactCleanupError(Vec<String>);
 
 fn cleanup_runtime_artifacts(sandbox_id: &str) -> Result<Vec<String>, JailCleanupError> {
-    cleanup_runtime_artifacts_at(
+    // All adapter roots must release their binds before shared device teardown.
+    // Inspect by sandbox identity even if artifact metadata is missing or corrupt.
+    let alternate = format!("{JAIL_DIR}/cloud-hypervisor/{sandbox_id}");
+    let mut actions = cleanup_jail_root(
+        &format!("{alternate}/root"),
+        |path| unmount_if_present(path),
+        || Ok(Vec::new()),
+    )?;
+    if remove_dir_all_if_exists(&alternate).map_err(JailCleanupError::Remove)? {
+        actions.push(format!("Removed {alternate}"));
+    }
+    actions.extend(cleanup_runtime_artifacts_at(
         &paths::isolated_net_gateway_run_dir(sandbox_id),
         &format!("{RUN_DIR}/{sandbox_id}"),
         &format!("{JAIL_DIR}/firecracker/{sandbox_id}"),
         &PathBuf::from(format!("{CACHE_DIR}/{sandbox_id}/instance")),
         |path| unmount_if_present(path),
         || teardown_encrypted_volumes_blocking(sandbox_id),
-    )
+    )?);
+    Ok(actions)
 }
 
-pub(super) const JAIL_BIND_NAMES: [&str; 3] = [
+pub(super) const JAIL_BIND_NAMES: [&str; 5] = [
     "rootfs.ext4",
     "memory",
     super::snapshots::ENC_SNAPSHOT_JAIL_SUBDIR,
+    "state/encsnap",
+    "state",
 ];
 
 #[derive(Debug, thiserror::Error)]

@@ -30,6 +30,7 @@ fn bound_execution_requires_positive_peer_acknowledgement() {
 fn create_paths() -> Vec<(&'static str, crate::proto::CreateRequest, bool)> {
     use crate::proto::{BootMode, CreateRequest};
     let cold = CreateRequest {
+        runtime: "fc".into(),
         boot_mode: BootMode::Cold as i32,
         ..Default::default()
     };
@@ -95,7 +96,8 @@ fn compiled_environments_admit_the_create_paths_they_qualify_for_and_never_relab
         let reference = environment.definition().reference();
         let execution = environment.definition().execution_requirements().unwrap();
         let non_default = !environment.is_initial();
-        for (name, request, memory_state) in create_paths() {
+        for (name, mut request, memory_state) in create_paths() {
+            request.runtime = execution.runtime().kind.alias().into();
             for selector in [None, Some(reference)] {
                 let result = super::validate_environment_create(&request, selector, &execution);
                 // A selected create boots cold, so only its snapshots load memory.
@@ -109,7 +111,12 @@ fn compiled_environments_admit_the_create_paths_they_qualify_for_and_never_relab
                     environment.name(),
                     selector.is_some()
                 );
-                if needs_memory_state && !environment.supports_memory_state() {
+                let unqualified_cluster = execution.runtime().kind
+                    == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+                    && (request.sandbox_id.is_some() || request.route_identity.is_some());
+                if unqualified_cluster
+                    || (needs_memory_state && !environment.supports_memory_state())
+                {
                     assert_eq!(
                         result.unwrap_err().code(),
                         tonic::Code::FailedPrecondition,
@@ -450,4 +457,89 @@ fn a_capture_publishes_under_its_own_environment_s_cache_partition() {
         twin_dir.contains(&format!("/seed/snapshots/{hash}@{twin}/")),
         "{twin_dir}"
     );
+}
+
+#[test]
+fn automatic_lifecycle_admission_respects_runtime_capabilities() {
+    use pplx_space_common_core::types::{
+        AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, RuntimeKind,
+    };
+    for action in [
+        AutoLifecycleIdleAction::None,
+        AutoLifecycleIdleAction::Pause,
+        AutoLifecycleIdleAction::Suspend,
+        AutoLifecycleIdleAction::Stop,
+        AutoLifecycleIdleAction::Delete,
+    ] {
+        let policy = AutoLifecyclePolicy {
+            stages: vec![AutoLifecycleStage {
+                condition_set:
+                    pplx_space_common_core::types::AutoLifecycleConditionSetId::AccessIdle,
+                at: 60,
+                action,
+            }],
+            ..AutoLifecyclePolicy::disabled()
+        };
+        super::validate_runtime_lifecycle_policy(RuntimeKind::Firecracker, &policy).unwrap();
+        super::validate_runtime_lifecycle_policy(RuntimeKind::CloudHypervisor, &policy).unwrap();
+        for entry in pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+            pplx_space_common_core::types::Arch::X86_64,
+        )
+        .unwrap()
+        {
+            let execution = entry.definition().execution_requirements().unwrap();
+            let result = super::validate_execution_lifecycle_policy(Some(&execution), &policy);
+            assert_eq!(
+                result.is_ok(),
+                action != AutoLifecycleIdleAction::Suspend || entry.supports_memory_state()
+            );
+        }
+        let result = super::validate_runtime_lifecycle_policy(RuntimeKind::Gvisor, &policy);
+        match action {
+            AutoLifecycleIdleAction::Pause | AutoLifecycleIdleAction::Suspend => {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            }
+            _ => result.unwrap(),
+        }
+    }
+}
+
+#[test]
+fn qualified_template_supports_local_snapshot_and_pool_creation_without_runtime_relabeling() {
+    use crate::proto::{BootMode, CreateRequest};
+    use pplx_space_common_core::types::RuntimeKind;
+    for environment in [Arch::X86_64, Arch::Aarch64]
+        .into_iter()
+        .flat_map(|arch| {
+            pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(arch)
+                .unwrap()
+        })
+        .filter(|entry| entry.supports_memory_state())
+    {
+        let runtime = environment.release().release.kind;
+        let execution = environment.definition().execution_requirements().unwrap();
+        for mode in [BootMode::Cold, BootMode::BaseSnapshot, BootMode::Pool] {
+            let request = CreateRequest {
+                runtime: runtime.alias().into(),
+                boot_mode: mode as i32,
+                pool_template: Some("seed".into()),
+                ..Default::default()
+            };
+            super::validate_environment_create(&request, None, &execution).unwrap();
+            super::validate_environment_create(
+                &CreateRequest {
+                    runtime: if runtime == RuntimeKind::Firecracker {
+                        "ch"
+                    } else {
+                        "fc"
+                    }
+                    .into(),
+                    ..request
+                },
+                None,
+                &execution,
+            )
+            .unwrap_err();
+        }
+    }
 }

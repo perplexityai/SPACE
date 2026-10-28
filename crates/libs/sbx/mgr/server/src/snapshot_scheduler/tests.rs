@@ -505,10 +505,14 @@ fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
         ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]),
         TemplateName::parse("seed").unwrap(),
         None,
-    );
+    )
+    .with_guest_memory(Some(
+        pplx_space_common_core::types::MemorySize::mib(2048).unwrap(),
+    ));
     let execution = checkpoint_sidecar_execution_metadata(metadata).unwrap();
 
     assert_eq!(execution.host_cpu(), HostCpu::current());
+    assert_eq!(execution.guest_memory().unwrap().as_mib_floor(), 2048);
 }
 
 /// Retention maps each `delete_named_snapshot` outcome to its own policy;

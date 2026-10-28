@@ -911,6 +911,12 @@ impl SandboxManagerService {
         }
 
         self.publish_pool_clone(&new_id, &uuid8, cleanup_id, async {
+            if let Some(execution) = &donor.execution_metadata {
+                let db = self.db_conn()?;
+                crate::db::upsert_sandbox_execution_metadata(&db, &new_id, execution).map_err(
+                    |error| Status::internal(format!("persist clone execution: {error}")),
+                )?;
+            }
             use std::os::unix::fs::MetadataExt;
             let prepared = prepare_clone_root(Path::new(CACHE_DIR), &new_id).map_err(|error| {
                 Status::failed_precondition(format!("prepare clone destination: {error}"))

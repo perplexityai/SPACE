@@ -217,7 +217,6 @@ const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACH
 /// Answers whether a sandbox's rootfs is on this node's disk; an error means
 /// presence couldn't be verified.
 pub type RootfsPresenceProbe = Arc<dyn Fn(&str) -> std::io::Result<bool> + Send + Sync>;
-const JAIL_DIR: &str = pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR;
 const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
 const NET_GATEWAY_SIDECAR_PID_NAME: &str = "space-netgtw-svc";
 

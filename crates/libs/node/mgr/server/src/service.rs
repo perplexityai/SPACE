@@ -742,6 +742,6 @@ pub(crate) use cleanup_helpers::RetainedCacheCleanupError;
 pub(crate) use cleanup_helpers::neutralize_retained_cache_owned_by_uid;
 use network_helpers::*;
 
-use crate::snapshot_request::{FirecrackerCapture, FirecrackerRestore};
+use crate::snapshot_request::{StateCapture, StateRestore};
 
 mod runtime_control;

@@ -41,26 +41,22 @@ fn runtime_kind_exposes_baseline_capabilities() {
     assert_eq!(
         RuntimeKind::CloudHypervisor.baseline_capabilities(),
         RuntimeCapabilities {
-            pause_resume: false,
-            snapshot: false,
+            pause_resume: true,
+            snapshot: true,
             fork: false,
-            prewarmed_pool: false,
-            network_gateway: false,
+            prewarmed_pool: true,
+            network_gateway: true,
             volume_manager: false,
         }
     );
     assert!(RuntimeKind::CloudHypervisor.supports_startup(StartupPolicy::ColdOnly));
     for policy in [
-        StartupPolicy::PreferBaseSnapshot,
-        StartupPolicy::RequireBaseSnapshot,
         StartupPolicy::PreferWarmPool,
         StartupPolicy::RequireWarmPool,
     ] {
-        let error = RuntimeKind::CloudHypervisor
+        RuntimeKind::CloudHypervisor
             .validate_startup(policy)
-            .unwrap_err();
-        assert_eq!(error.runtime(), RuntimeKind::CloudHypervisor);
-        assert_eq!(error.policy(), policy);
+            .unwrap();
     }
     assert!(!RuntimeKind::Gvisor.supports_startup(StartupPolicy::RequireBaseSnapshot));
     assert!(!RuntimeKind::Gvisor.supports_startup(StartupPolicy::RequireWarmPool));

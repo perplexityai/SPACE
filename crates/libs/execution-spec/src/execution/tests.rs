@@ -57,25 +57,27 @@ fn snapshots_require_state_format() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn snapshot_cpu_budget_round_trips_without_changing_legacy_shape() {
+fn snapshot_allocation_round_trips_without_changing_legacy_shape() {
     let legacy = serde_json::to_value(ExecutionMetadata::initial_firecracker(
         Arch::Aarch64,
         vec![],
     ))
     .unwrap();
-    for budget in [None, Some(8), Some(0)] {
-        let mut value = legacy.clone();
-        if let Some(budget) = budget {
-            value["cpu_budget"] = budget.into();
+    for (field, positive) in [("cpu_budget", 8u64), ("guest_memory", 4 * 1024 * 1024)] {
+        for budget in [None, Some(positive), Some(0)] {
+            let mut value = legacy.clone();
+            if let Some(budget) = budget {
+                value[field] = budget.into();
+            }
+            let parsed = serde_json::from_value::<SnapshotExecutionMetadata>(value.clone());
+            if budget == Some(0) {
+                assert!(parsed.is_err(), "zero is not a valid allocation");
+            } else {
+                assert_eq!(serde_json::to_value(parsed.unwrap()).unwrap(), value);
+            }
+            value.as_object_mut().unwrap().remove("state_format");
+            serde_json::from_value::<SnapshotExecutionMetadata>(value).unwrap_err();
         }
-        let parsed = serde_json::from_value::<SnapshotExecutionMetadata>(value.clone());
-        if budget == Some(0) {
-            assert!(parsed.is_err(), "zero is not a CPU allocation");
-        } else {
-            assert_eq!(serde_json::to_value(parsed.unwrap()).unwrap(), value);
-        }
-        value.as_object_mut().unwrap().remove("state_format");
-        serde_json::from_value::<SnapshotExecutionMetadata>(value).unwrap_err();
     }
 }
 
@@ -132,6 +134,11 @@ fn snapshot_artifact_identity_ignores_only_the_host_cpu() {
         .clone()
         .with_cpu_budget(Some(VcpuCount::new(std::num::NonZeroU32::new(2).unwrap())));
     assert!(!metadata.same_artifact_identity(&with_cpu_budget));
+
+    let with_memory = metadata
+        .clone()
+        .with_guest_memory(Some(MemorySize::mib(2048).unwrap()));
+    assert!(!metadata.same_artifact_identity(&with_memory));
 
     let other_execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::Aarch64,

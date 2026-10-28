@@ -80,7 +80,8 @@ pub(super) fn sandbox_snapshot_execution_metadata(
     use pplx_space_common_core::types::SnapshotExecutionMetadata;
     match sandbox_artifact_metadata(sandbox_id)? {
         Some(metadata) => Ok(SnapshotExecutionMetadata::new(metadata.execution)?
-            .with_cpu_budget(metadata.cpu_budget)),
+            .with_cpu_budget(metadata.cpu_budget)
+            .with_guest_memory(metadata.guest_memory)),
         None => Ok(SnapshotExecutionMetadata::new(
             initial_firecracker_execution_metadata()?,
         )?),
@@ -90,6 +91,7 @@ pub(super) fn sandbox_snapshot_execution_metadata(
 pub(super) fn activation_metadata_json(
     sandbox: &crate::db::SandboxRow,
     cpu_budget: Option<pplx_space_common_core::types::VcpuCount>,
+    guest_memory: Option<pplx_space_common_core::types::MemorySize>,
 ) -> Result<String, Status> {
     use pplx_space_common_core::types::SandboxArtifactMetadata;
     let invalid = |error: String| Status::failed_precondition(error);
@@ -117,6 +119,7 @@ pub(super) fn activation_metadata_json(
             .map_err(|error| invalid(error.to_string()))?,
     );
     metadata.cpu_budget = cpu_budget;
+    metadata.guest_memory = guest_memory;
     serde_json::to_string(&metadata)
         .map_err(|error| Status::internal(format!("serialize activation metadata: {error}")))
 }

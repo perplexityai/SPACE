@@ -38,8 +38,27 @@ pub enum BootConfigError {
     },
     #[error("guest memory size overflows the runtime's byte count")]
     MemoryOverflow,
+    #[error("invalid runtime boot configuration: {0}")]
+    Invalid(&'static str),
     #[error("serialize runtime boot configuration: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Check resource policy before allocating a network slot; rendering repeats
+/// this boundary for callers outside sandbox-manager.
+pub fn validate_resources(
+    runtime: RuntimeKind,
+    balloon: bool,
+    huge_pages: bool,
+) -> Result<(), BootConfigError> {
+    if runtime == RuntimeKind::CloudHypervisor {
+        for (enabled, feature) in [(balloon, "ballooning"), (huge_pages, "huge pages")] {
+            if enabled {
+                return Err(BootConfigError::UnsupportedFeature { runtime, feature });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn configuration(
@@ -57,6 +76,8 @@ pub fn configuration(
     Ok(serde_json::to_string(&value)?)
 }
 
+// Changes apply only on cold boot. Rebuild templates and base snapshots to
+// roll out new boot arguments to workloads restored from memory state.
 fn command_line(input: &LinuxBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
     use pplx_space_common_core::guest::linux::network::{
         GATEWAY_IPV4_ADDR, IPV4_ADDR, IPV4_NETMASK, PRIMARY_INTERFACE,
@@ -85,7 +106,7 @@ fn command_line(input: &LinuxBoot<'_>, devices: &str, uart: &str, console: &str)
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // The two REST protocols use the same token-bucket schema and millisecond units.
 // Queue topology remains an adapter policy, not part of this encoding.
@@ -102,4 +123,77 @@ fn object<const N: usize>(
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
         .collect()
+}
+
+/// Parsed, admitted input. Control adapters cannot accept unvalidated JSON.
+#[derive(Debug)]
+pub struct StandaloneBoot(cloud_hypervisor::Configuration);
+impl StandaloneBoot {
+    /// Encode the admitted device model for its runtime control protocol.
+    pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&self.0)
+    }
+}
+
+/// Parse the standalone adapter's privileged boot input before process launch.
+pub fn validate_standalone(
+    runtime: RuntimeKind,
+    configuration: &str,
+) -> Result<StandaloneBoot, BootConfigError> {
+    match runtime {
+        RuntimeKind::CloudHypervisor => cloud_hypervisor::parse(configuration).map(StandaloneBoot),
+        _ => Err(BootConfigError::UnsupportedRuntime(runtime)),
+    }
+}
+
+/// Persisted CH machine state uses SPACE's ordinary machine-state and memory
+/// artifact pair. Configuration remains a parsed device model; the opaque VMM
+/// state is consumed only by the contained, pinned runtime.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudHypervisorState {
+    version: StateEncoding,
+    configuration: cloud_hypervisor::Configuration,
+    state: serde_json::Value,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum StateEncoding {
+    #[serde(rename = "cloud-hypervisor-54-v1")]
+    CloudHypervisor54V1,
+}
+
+impl StandaloneBoot {
+    /// Apply the target node's admitted and clamped disk budget before restore.
+    pub fn set_disk_rate(&mut self, rate: RateLimiter) {
+        self.0.set_disk_rate(rate);
+    }
+
+    pub fn memory_bytes(&self) -> u64 {
+        self.0.memory_bytes()
+    }
+
+    pub fn capture_state(&self, state: serde_json::Value) -> Result<Vec<u8>, BootConfigError> {
+        self.0.require_state_access()?;
+        let configuration = self.0.clone();
+        Ok(serde_json::to_vec(&CloudHypervisorState {
+            version: StateEncoding::CloudHypervisor54V1,
+            configuration,
+            state,
+        })?)
+    }
+
+    /// Decode within the caller's bounded read, then bind host resources to the
+    /// admitted target. Snapshot bytes cannot supply additional device paths.
+    pub fn restore_state(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(StandaloneBoot, Vec<u8>), BootConfigError> {
+        let mut snapshot: CloudHypervisorState = serde_json::from_slice(bytes)?;
+        snapshot.configuration.restore_on(&self.0)?;
+        Ok((
+            StandaloneBoot(snapshot.configuration),
+            serde_json::to_vec(&snapshot.state)?,
+        ))
+    }
 }

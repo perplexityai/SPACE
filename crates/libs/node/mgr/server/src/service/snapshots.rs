@@ -1,3 +1,4 @@
+mod cloud_hypervisor;
 mod environment;
 
 use super::cleanup_helpers::*;
@@ -17,6 +18,11 @@ use pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREF
 
 enum CaptureDestination {
     Plain(crate::runtime_paths::CreateSnapshotPaths),
+    Encrypted(pplx_space_common_core::types::NodeSpacePath),
+}
+
+enum RestoreSource {
+    Plain(crate::runtime_paths::LoadSnapshotPaths),
     Encrypted(pplx_space_common_core::types::NodeSpacePath),
 }
 
@@ -206,21 +212,23 @@ impl NodeManagerService {
             .sandbox_id
             .parse::<SandboxId>()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let execution = self.recorded_execution(sandbox_id.to_string()).await?;
-        // Pre-metadata historical sandboxes are Firecracker. New adapters must
-        // persist their execution before launch; missing evidence cannot select CH.
-        let runtime = execution.as_ref().map_or(
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
-            |execution| execution.runtime().kind,
-        );
-        let socket = pplx_space_node_runtime_core::control::socket_path(runtime, sandbox_id)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        let control = pplx_space_node_runtime_core::control::connect(runtime, socket)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        let state = tokio::time::timeout(FIRECRACKER_VM_STATE_TIMEOUT, control.state())
-            .await
-            .map_err(|_| Status::deadline_exceeded("runtime state probe timed out"))?
-            .map_err(|error| Status::unavailable(format!("runtime state probe failed: {error}")))?;
+        let state = tokio::time::timeout(FIRECRACKER_VM_STATE_TIMEOUT, async {
+            let execution = self.recorded_execution(sandbox_id.to_string()).await?;
+            // Only absent historical metadata selects Firecracker. Present but
+            // invalid evidence cannot select a different control protocol.
+            let runtime = execution.as_ref().map_or(
+                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                |execution| execution.runtime().kind,
+            );
+            let control = self
+                .runtime_control(runtime, &sandbox_id.to_string())
+                .await?;
+            control.state().await.map_err(|error| {
+                Status::unavailable(format!("runtime state probe failed: {error}"))
+            })
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("runtime state probe timed out"))??;
         use pplx_space_node_runtime_core::vm_state::VmState;
         let state = match state {
             VmState::NotStarted => crate::proto::VmState::NotStarted,
@@ -274,12 +282,27 @@ impl NodeManagerService {
         self.run_owned_sandbox_work(&owner, async move {
             let _gate = service.lock_sandbox_vm_cgroup_launch(&sandbox_id).await;
             service.check_execution(&sandbox_id, fence.as_ref(), false)?;
-            let api_socket = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
-            let client = crate::fc_api::FcApiClient::new(api_socket);
-            if let Some(hint_timeout) = balloon_hint_timeout {
-                prepare_balloon_for_snapshot(&client, &sandbox_id, hint_timeout).await;
+            let execution = service.recorded_execution(sandbox_id.clone()).await?;
+            let runtime = execution.as_ref().map_or(
+                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                |execution| execution.runtime().kind,
+            );
+            if runtime == pplx_space_common_core::types::RuntimeKind::Firecracker {
+                let api_socket =
+                    format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
+                let client = crate::fc_api::FcApiClient::new(api_socket);
+                if let Some(hint_timeout) = balloon_hint_timeout {
+                    prepare_balloon_for_snapshot(&client, &sandbox_id, hint_timeout).await;
+                }
+                return set_firecracker_paused(&client, paused, VM_PAUSE_STATE_TIMEOUT).await;
             }
-            set_firecracker_paused(&client, paused, VM_PAUSE_STATE_TIMEOUT).await
+            let client = service.runtime_control(runtime, &sandbox_id).await?;
+            tokio::time::timeout(VM_PAUSE_STATE_TIMEOUT, client.set_paused(paused))
+                .await
+                .map_err(|_| Status::deadline_exceeded("runtime pause state change timed out"))?
+                .map_err(|error| {
+                    super::runtime_control::operation_error("set runtime pause state", error)
+                })
         })
         .await
     }
@@ -293,9 +316,9 @@ impl NodeManagerService {
         Ok(())
     }
 
-    pub(super) async fn capture_firecracker_state(
+    pub(super) async fn capture_runtime_state(
         &self,
-        request: Request<FirecrackerCapture>,
+        request: Request<StateCapture>,
     ) -> Result<Response<CaptureVmStateResponse>, Status> {
         let selected_environment = request.get_ref().environment_reference;
         let sandbox_id = request.get_ref().sandbox_id.as_str().to_owned();
@@ -340,6 +363,18 @@ impl NodeManagerService {
                     selected_environment,
                 )
                 .await?;
+            let runtime = service
+                .recorded_execution(req.sandbox_id.as_str().to_owned())
+                .await?
+                .map_or(
+                    pplx_space_common_core::types::RuntimeKind::Firecracker,
+                    |execution| execution.runtime().kind,
+                );
+            if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+                return service
+                    .capture_cloud_hypervisor_state(request, destination)
+                    .await;
+            }
             service.create_snapshot_inner(request, destination).await
         })
         .await
@@ -347,7 +382,7 @@ impl NodeManagerService {
 
     async fn create_snapshot_inner(
         &self,
-        request: Request<FirecrackerCapture>,
+        request: Request<StateCapture>,
         destination: CaptureDestination,
     ) -> Result<Response<CaptureVmStateResponse>, Status> {
         let req = request.get_ref();
@@ -592,9 +627,9 @@ impl NodeManagerService {
         Ok(Response::new(CaptureVmStateResponse {}))
     }
 
-    pub(super) async fn restore_firecracker_state(
+    pub(super) async fn restore_runtime_state(
         &self,
-        request: Request<FirecrackerRestore>,
+        request: Request<StateRestore>,
     ) -> Result<Response<RestoreVmStateResponse>, Status> {
         let sandbox_id = request.get_ref().sandbox_id.as_str().to_owned();
         let service = self.clone();
@@ -613,7 +648,7 @@ impl NodeManagerService {
 
     async fn load_snapshot_inner(
         &self,
-        request: Request<FirecrackerRestore>,
+        request: Request<StateRestore>,
     ) -> Result<Response<RestoreVmStateResponse>, Status> {
         let req = request.get_ref();
         // Validate before either path stages the jail or re-owns the snapshot
@@ -637,17 +672,44 @@ impl NodeManagerService {
             .map_err(slot_store_status)?
             .ok_or_else(|| Status::unavailable("snapshot lease is no longer active"))?;
 
+        // Preserve path refusals before cancellable metadata IO or jail staging.
+        let source = match &req.storage {
+            SnapshotStorage::Encrypted(mount) => {
+                trusted_paths::validate_snapshot_volume(
+                    req.sandbox_id.as_str(),
+                    crate::snapshot_request::path_str(mount)?,
+                )?;
+                RestoreSource::Encrypted(mount.clone())
+            }
+            SnapshotStorage::Plain { files, directory } => RestoreSource::Plain(
+                crate::runtime_paths::RuntimePaths::firecracker().load_snapshot_paths(
+                    req.sandbox_id.as_str(),
+                    files,
+                    directory.as_ref(),
+                )?,
+            ),
+        };
+
+        let runtime = self
+            .recorded_execution(req.sandbox_id.as_str().to_owned())
+            .await?
+            .map_or(
+                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                |execution| execution.runtime().kind,
+            );
+        if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+            return self
+                .restore_cloud_hypervisor_state(request, &lease, source, rootfs_limiter)
+                .await;
+        }
+
         // BYOK encrypted snapshot: bind-mount the already-mounted, decrypted
         // encrypted-snapshot volume into the jail and load vmstate+memory
         // directly from it. The volume stays mounted for the sandbox's life (FC
         // mmaps the memory file); cleanup releases it on delete. No source_dir
         // staging — the bytes never exist in plaintext on disk.
-        let (files, source_dir) = match &req.storage {
-            SnapshotStorage::Encrypted(mount_dir) => {
-                super::trusted_paths::validate_snapshot_volume(
-                    req.sandbox_id.as_str(),
-                    crate::snapshot_request::path_str(mount_dir)?,
-                )?;
+        let paths = match source {
+            RestoreSource::Encrypted(mount_dir) => {
                 {
                     let jail_root = jail_root.clone();
                     let mount_dir = mount_dir.clone();
@@ -676,14 +738,8 @@ impl NodeManagerService {
                 .await?;
                 return Ok(Response::new(RestoreVmStateResponse {}));
             }
-            SnapshotStorage::Plain { files, directory } => (files, directory.as_ref()),
+            RestoreSource::Plain(paths) => paths,
         };
-
-        let paths = crate::runtime_paths::RuntimePaths::firecracker().load_snapshot_paths(
-            req.sandbox_id.as_str(),
-            files,
-            source_dir,
-        )?;
         let fc_snapshot_path = format!("/{}", paths.vmstate_name);
         let fc_mem_file_path = format!("/{}", paths.memory_name);
 
@@ -831,7 +887,7 @@ impl NodeManagerService {
                 sandbox_id,
                 failed_step,
                 error = %status,
-                "unable to roll back loaded snapshot because firecracker pid was not found"
+                "unable to roll back loaded snapshot because runtime pid was not found"
             );
             return;
         };

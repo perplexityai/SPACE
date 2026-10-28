@@ -588,3 +588,55 @@ fn cached_kernel_validation_precedes_unused_source_validation() {
         }
     }
 }
+
+#[test]
+fn catalog_fallback_copies_authenticated_inodes_only_to_unsupported_filesystems() {
+    let fixture = Fixture::new();
+    let parent = fixture._dir.path().join("cache/firecracker");
+    std::fs::create_dir_all(&parent).unwrap();
+    let device = std::fs::metadata(&parent).unwrap().dev();
+    let pin = pin("1.15.1", 1);
+    let source = fixture.release_path("1.15.1", 1);
+    fixture
+        .store
+        .verity_support
+        .lock()
+        .unwrap()
+        .insert(device, true);
+    assert!(matches!(
+        fixture
+            .store
+            .stage_catalog_release_at(&pin, &source, &parent),
+        Err(StageExecutionError::FallbackOnCapableBackend(_))
+    ));
+    fixture
+        .store
+        .verity_support
+        .lock()
+        .unwrap()
+        .insert(device, false);
+    let target = fixture
+        .store
+        .stage_catalog_release_at(&pin, &source, &parent)
+        .unwrap();
+    assert!(target.starts_with(&parent));
+    assert_ne!(
+        std::fs::metadata(target.join("bin/firecracker"))
+            .unwrap()
+            .ino(),
+        std::fs::metadata(source.join("bin/firecracker"))
+            .unwrap()
+            .ino()
+    );
+    std::fs::write(source.join("bin/firecracker"), b"changed source").unwrap();
+    assert_eq!(
+        std::fs::read(target.join("bin/firecracker")).unwrap(),
+        binary(1)
+    );
+    // Retry verifies the published bytes; a damaged destination is never adopted.
+    std::fs::write(target.join("bin/firecracker"), b"damaged cache").unwrap();
+    fixture
+        .store
+        .stage_catalog_release_at(&pin, &source, &parent)
+        .unwrap_err();
+}

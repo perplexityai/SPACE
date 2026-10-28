@@ -302,6 +302,11 @@ pub enum RestoreError {
         #[source]
         source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError,
     },
+    #[error("replace retained restore instance: {source}")]
+    ReplaceInstance {
+        #[source]
+        source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError,
+    },
     /// Anything else — transport blips, S3 read failures, filesystem
     /// errors, malformed registered URIs.
     #[error("{0}")]
@@ -356,6 +361,7 @@ impl RestoreError {
             Self::QuarantineRecoveryTimedOut { .. } => Kind::QuarantineRecoveryTimeout,
             Self::ParentTemplateLookup { .. } => Kind::ParentTemplate,
             Self::BtrfsReceive { .. } => Kind::BtrfsReceive,
+            Self::ReplaceInstance { .. } => Kind::Filesystem,
             Self::ClusterApiUnconfigured(_)
             | Self::SnapshotNotRegistered(_)
             | Self::AdmissionRejected(_)
@@ -430,6 +436,7 @@ impl RestoreError {
             // build, as when these two were rendered through `Other`.
             | Self::ParentTemplateLookup { .. }
             | Self::BtrfsReceive { .. }
+            | Self::ReplaceInstance { .. }
             | Self::Other(..) => None,
             // The one place a server-supplied failure is worth reporting: the
             // status code is a bounded vocabulary, so it is logged while the
@@ -511,6 +518,7 @@ impl RestoreError {
             Self::CanonicalRootConflict { .. } => "canonical_root_conflict",
             Self::ParentTemplateLookup { .. } => "parent_template_lookup",
             Self::BtrfsReceive { .. } => "btrfs_receive",
+            Self::ReplaceInstance { .. } => "replace_instance",
             Self::StoppedMaterializationArtifactUnsuitable { .. } => {
                 "stopped_materialization_artifact_unsuitable"
             }
@@ -2006,19 +2014,7 @@ pub async fn restore_pull_rootfs(
         // explicitly tagged as Full. Either lands in the historical
         // download-rootfs + reflink path for backwards compatibility.
         RestoreCodec::Full => {
-            std::fs::create_dir_all(&stage.instance_dir).map_err(|e| {
-                RestoreError::Other(format!("mkdir {}: {e}", stage.instance_dir.display()))
-            })?;
-            let instance_rootfs = stage.instance_dir.join("rootfs.ext4");
-            stage_full_codec_artifacts(
-                transfer_identity,
-                &stage.config,
-                &stage.snapshot_dir,
-                &instance_rootfs,
-                stage.transfer_scope_id,
-                crate::snapshot_upload::artifact_kind_from_meta(&stage.meta) == ArtifactKind::Full,
-            )
-            .await
+            stage_full_codec_artifacts(transfer_identity, stage, target, node_manager).await
         }
     };
 
@@ -2483,13 +2479,18 @@ async fn run_staging_transfers(
 /// the rootfs into the instance directory.
 async fn stage_full_codec_artifacts(
     identity: RestoreTransferIdentity<'_>,
-    config: &SnapshotUploadConfig,
-    snapshot_dir: &Path,
-    instance_rootfs: &Path,
-    transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
-    include_runtime_state: bool,
+    stage: &RestoreMetadataStaged,
+    target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<(), RestoreError> {
     let sandbox_id = identity.sandbox_id;
+    let config = &stage.config;
+    let snapshot_dir = &stage.snapshot_dir;
+    let instance_rootfs = stage.instance_dir.join("rootfs.ext4");
+    let instance_rootfs = instance_rootfs.as_path();
+    let transfer_scope_id = stage.transfer_scope_id;
+    let include_runtime_state =
+        crate::snapshot_upload::artifact_kind_from_meta(&stage.meta) == ArtifactKind::Full;
     let artifacts = full_codec_artifacts(include_runtime_state);
     let pulls = artifacts
         .into_iter()
@@ -2519,6 +2520,18 @@ async fn stage_full_codec_artifacts(
     }
     pplx_space_common_core::sandbox_storage::validate_rootfs_bytes(rootfs_metadata.len())
         .map_err(RestoreError::RootfsPolicy)?;
+    // Retained instances are root-owned after execution cleanup. Replace them
+    // through their fenced owner only after every source artifact is staged and
+    // validated. Never grant sandbox-manager write access to an active instance.
+    crate::btrfs_via_nodemgr::delete_sandbox_instance(sandbox_id, target, node_manager)
+        .await
+        .map_err(|source| RestoreError::ReplaceInstance { source })?;
+    let instance_dir = instance_rootfs
+        .parent()
+        .ok_or_else(|| RestoreError::Other("restored rootfs has no instance directory".into()))?;
+    std::fs::create_dir_all(instance_dir).map_err(|error| {
+        RestoreError::Other(format!("create restored instance directory: {error}"))
+    })?;
     {
         let span = tracing::info_span!(
             "sbxmgr.start.stage",

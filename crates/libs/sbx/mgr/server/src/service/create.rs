@@ -138,6 +138,21 @@ fn snapshot_memory_file_mib(snapshot_dir: &str) -> Result<Option<u64>, Status> {
     memory_file_mib(&std::path::Path::new(snapshot_dir).join("memory"))
 }
 
+fn restored_guest_memory_mib(
+    captured: Option<pplx_space_common_core::types::MemorySize>,
+    file_mib: Option<u64>,
+) -> Result<Option<u64>, Status> {
+    let captured = captured.map(|size| size.as_mib_ceil());
+    if let (Some(captured), Some(file)) = (captured, file_mib)
+        && captured != file
+    {
+        return Err(Status::failed_precondition(
+            "snapshot memory differs from captured guest allocation",
+        ));
+    }
+    Ok(captured.or(file_mib))
+}
+
 fn base_snapshot_memory_file_mib(snapshot_dir: &str) -> Result<Option<u64>, Status> {
     memory_file_mib(&std::path::Path::new(snapshot_dir).join("snapshot.base"))
 }
@@ -721,8 +736,16 @@ impl SandboxManagerService {
         let snapshot_execution = checkpoint_execution_metadata(&snapshot_dir)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let cpu_budget = restore_cpu_budget(vcpu, snapshot_execution.cpu_budget())?;
-        let metadata_json = activation_metadata_json(sandbox, cpu_budget)?;
+        let captured_memory = snapshot_execution.guest_memory();
         let producer_execution = snapshot_execution.into_execution();
+        if sandbox.execution_metadata.as_ref().is_some_and(|saved| {
+            saved.runtime().kind != producer_execution.runtime().kind
+                || saved.guest() != producer_execution.guest()
+        }) {
+            return Err(Status::failed_precondition(
+                "checkpoint runtime or guest differs from the sandbox binding",
+            ));
+        }
         let requested_execution = start_stage_timeout(
             "restore.select_consumer",
             START_NODE_METADATA_TIMEOUT,
@@ -735,9 +758,10 @@ impl SandboxManagerService {
         )
         .await?;
         let snapshot_memory_mib = ensure_snapshot_memory_allowed(
-            snapshot_memory_file_mib(&snapshot_dir)?,
+            restored_guest_memory_mib(captured_memory, snapshot_memory_file_mib(&snapshot_dir)?)?,
             node_memory_policy.guest_memory_max_mib,
         )?;
+        let metadata_json = activation_metadata_json(sandbox, cpu_budget, captured_memory)?;
         let cgroup_memory_mib = snapshot_memory_mib
             .map(|memory_mib| node_memory_policy.cgroup_memory_mib_for_guest(memory_mib))
             .unwrap_or(node_memory_policy.cgroup_memory_mib);
@@ -904,8 +928,20 @@ impl SandboxManagerService {
         .map_err(|error| activation_cleanup.failure(error))?;
 
         let guest_cid = alloc.slot + 3;
-        let vsock_uds_path = format!("{JAIL_DIR}/firecracker/{id}/root/v.sock");
-        let api_socket_path = format!("{JAIL_DIR}/firecracker/{id}/root/firecracker.sock");
+        let runtime = requested_execution.runtime().kind;
+        let vsock_uds_path = pplx_space_node_runtime_core::control::guest_socket_path(runtime, id)
+            .map_err(|e| activation_cleanup.failure(Status::failed_precondition(e.to_string())))?
+            .display()
+            .to_string();
+        let api_socket_path = pplx_space_node_runtime_core::control::socket_path(
+            runtime,
+            id.parse().map_err(|e| {
+                activation_cleanup.failure(Status::invalid_argument(format!("sandbox id: {e}")))
+            })?,
+        )
+        .map_err(|e| activation_cleanup.failure(Status::failed_precondition(e.to_string())))?
+        .display()
+        .to_string();
 
         // Build minimal VM config for snapshot restore (need network + vsock)
         // Keep Firecracker's block-device defaults. The cache/io-engine variants
@@ -925,6 +961,44 @@ impl SandboxManagerService {
 }}"#,
             alloc.guest_mac, alloc.tap_device, guest_cid
         );
+
+        let vm_config = if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+            let memory_mib = snapshot_memory_mib
+                .and_then(|mib| std::num::NonZeroU64::new(u64::from(mib)))
+                .ok_or_else(|| {
+                    activation_cleanup.failure(Status::failed_precondition(
+                        "CH restore requires recorded guest memory or a nonempty plaintext memory artifact",
+                    ))
+                })?;
+            let cpus = cpu_budget.ok_or_else(|| {
+                activation_cleanup.failure(Status::failed_precondition(
+                    "CH restore requires persisted CPU shape",
+                ))
+            })?;
+            let builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
+            pplx_space_node_runtime_core::boot::configuration(
+                runtime,
+                &pplx_space_node_runtime_core::boot::LinuxBoot {
+                    guest: requested_execution.guest(),
+                    cpus,
+                    memory_mib,
+                    guest_cid: std::num::NonZeroU32::new(guest_cid).ok_or_else(|| {
+                        activation_cleanup.failure(Status::internal("invalid guest CID"))
+                    })?,
+                    tap: &alloc.tap_device,
+                    mac: &alloc.guest_mac,
+                    disk_rate: self.rootfs_rate_limiter(builder, sandbox.disk_io_limits),
+                    network_rate: (!builder).then_some(super::start::NET_RATE_LIMITER),
+                    balloon: None,
+                    huge_pages: self.config.hugepages,
+                    console: false,
+                    builder,
+                },
+            )
+            .map_err(|e| activation_cleanup.failure(Status::failed_precondition(e.to_string())))?
+        } else {
+            vm_config
+        };
 
         // Prepare sandbox after slot allocation so node-manager can derive and
         // enforce the slot UID. If this sandbox was only logically created,

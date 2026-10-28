@@ -142,6 +142,7 @@ fn checkpoint_sidecar_execution_metadata(
 ) -> Result<SnapshotExecutionMetadata, pplx_space_common_core::types::ExecutionMetadataError> {
     Ok(SnapshotExecutionMetadata::new(metadata.execution)?
         .with_cpu_budget(metadata.cpu_budget)
+        .with_guest_memory(metadata.guest_memory)
         .with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned()))
 }
 

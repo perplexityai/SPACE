@@ -1021,6 +1021,27 @@ async fn insert_ready_worker(
     endpoint: &str,
     state_format_version: &str,
 ) -> TestResult {
+    insert_ready_worker_for_runtime(
+        pool,
+        node_id,
+        endpoint,
+        "fc",
+        "1.15.1",
+        "firecracker-snapshot",
+        state_format_version,
+    )
+    .await
+}
+
+async fn insert_ready_worker_for_runtime(
+    pool: &PgPool,
+    node_id: NodeId,
+    endpoint: &str,
+    runtime: &str,
+    version: &str,
+    state_format: &str,
+    state_format_version: &str,
+) -> TestResult {
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state)
          VALUES ($1, '127.0.0.1', 'worker', 'space', 'registered')"
@@ -1052,17 +1073,21 @@ async fn insert_ready_worker(
     sqlx::query(sql!(
         "INSERT INTO node_runtime_installations
              (node_id, runtime, runtime_version)
-         VALUES ($1, 'fc', '1.15.1')"
+         VALUES ($1, $2, $3)"
     ))
     .bind(node_id)
+    .bind(runtime)
+    .bind(version)
     .execute(pool)
     .await?;
     sqlx::query(sql!(
         "INSERT INTO node_runtime_guests
              (node_id, runtime, runtime_version, guest_os, guest_arch)
-         VALUES ($1, 'fc', '1.15.1', 'linux', 'aarch64')"
+         VALUES ($1, $2, $3, 'linux', 'aarch64')"
     ))
     .bind(node_id)
+    .bind(runtime)
+    .bind(version)
     .execute(pool)
     .await?;
     sqlx::query(sql!(
@@ -1070,9 +1095,12 @@ async fn insert_ready_worker(
              node_id, runtime, runtime_version, state_format_name,
              state_format_version, can_create, can_load
          )
-         VALUES ($1, 'fc', '1.15.1', 'firecracker-snapshot', $2, TRUE, TRUE)"
+         VALUES ($1, $2, $3, $4, $5, TRUE, TRUE)"
     ))
     .bind(node_id)
+    .bind(runtime)
+    .bind(version)
+    .bind(state_format)
     .bind(state_format_version)
     .execute(pool)
     .await?;
@@ -4753,3 +4781,5 @@ async fn wake_keeps_generation_observed_during_resident_transition(
     );
     Ok(())
 }
+
+mod runtime_evidence;

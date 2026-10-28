@@ -574,7 +574,6 @@ impl NodeManagerService {
     /// by the resolution a new cold boot runs, under the startup settings.
     async fn verify_environment(&self, reference: EnvironmentReference) -> Verification {
         let resolution = async {
-            self.require_verified_environment_layout().await?;
             self.resolve_new_cold_boot(self.execution_policy.startup(), Some(reference))
                 .await
         };

@@ -3,12 +3,13 @@
 use super::*;
 use pplx_space_common_core::types::{EnvironmentReference, RuntimeKind};
 use pplx_space_node_runtime_core::{
-    artifact_store::managed_release_directory,
+    artifact_store::release_directory_names,
+    authenticated_source::SourcePins,
     catalog::{CompiledEnvironment, compiled_verity_digest},
     proto::{ArtifactIntegrityRequirement, LaunchRuntimeRequest},
     runtime_inventory::host_arch,
 };
-use std::path::{Component, Path};
+use std::path::Path;
 
 impl RuntimeSupervisorService {
     pub(super) async fn launch_standalone_owned(
@@ -46,16 +47,33 @@ impl RuntimeSupervisorService {
         let execution = self
             .check_execution(sandbox_id, &req.execution_id, None, false)
             .await?;
-        // This acknowledgement is contract compatibility, not a fresh-launch
-        // attestation. A resident VM retains the contract under which it started.
+        let config = standalone_config(&req, sandbox_id, reference)
+            .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
         if let Some(pid) = live_runtime_pid(&sandbox_id, "fc.pid")? {
+            let process = launch::ProcessHandle::open(pid)
+                .map_err(|error| Status::unavailable(format!("pin resident runtime: {error}")))?;
+            if process
+                .program_matches("cloud-hypervisor")
+                .map_err(|error| Status::unavailable(error.to_string()))?
+                != Some(true)
+                || process
+                    .cgroup_matches(&config.cgroup)
+                    .map_err(|error| Status::unavailable(error.to_string()))?
+                    != Some(true)
+                || process
+                    .credentials_match(config.uid, config.gid)
+                    .map_err(|error| Status::unavailable(error.to_string()))?
+                    != Some(true)
+            {
+                return Err(Status::failed_precondition(
+                    "resident runtime does not match the requested process contract",
+                ));
+            }
             return Ok(Response::new(LaunchRuntimeResponse {
                 pid,
                 accepted_environment_reference: reference.to_string(),
             }));
         }
-        let config = standalone_config(&req, sandbox_id, reference)
-            .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
         let limits = req.resource_limits.as_ref().ok_or_else(|| {
             Status::invalid_argument("standalone launch requires resource limits")
         })?;
@@ -65,11 +83,11 @@ impl RuntimeSupervisorService {
             CgroupLimits::from_request(limits.vcpu_count, limits.memory_mib, limits.pids_max);
         let budget = limits.cpu_budget().map_err(cgroup_update_error_to_status)?;
         let path = config.executable.clone();
-        let digest = config.executable_digest;
+        let pins = config.executable_source;
         self.execution_io(move |store| {
             // Authenticate before publishing intent. The fresh launcher repeats
             // this check on the descriptor it executes, closing path replacement.
-            crate::verified_launch::open(&path, digest)
+            crate::verified_launch::open_catalog_executable(&path, pins)
                 .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
             if !cgroup::firecracker_is_quiescent(&sandbox_id.to_string())
                 .map_err(|e| Status::unavailable(format!("VM occupancy: {e}")))?
@@ -104,12 +122,15 @@ impl RuntimeSupervisorService {
                     .map_err(Status::internal)?;
             let runtime_process = launch::ProcessHandle::open(runtime_pid)
                 .map_err(|e| Status::unavailable(format!("pin contained runtime: {e}")))?;
-            if !matches!(
-                runtime_process
-                    .sandbox_ownership(&sandbox_id.to_string())
-                    .map_err(|e| Status::unavailable(e.to_string()))?,
-                launch::ProcessOwnership::Owned
-            ) {
+            if runtime_process
+                .cgroup_matches(
+                    &pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(
+                        &sandbox_id.to_string(),
+                    ),
+                )
+                .map_err(|error| Status::unavailable(error.to_string()))?
+                != Some(true)
+            {
                 return Err(Status::failed_precondition(
                     "contained runtime left its sandbox resource domain",
                 ));
@@ -148,6 +169,14 @@ fn standalone_config(
         .iter()
         .find(|e| e.definition().reference() == reference)
         .ok_or_else(|| Status::failed_precondition("unknown compiled environment reference"))?;
+    standalone_config_for_environment(req, sandbox, environment)
+}
+
+fn standalone_config_for_environment(
+    req: &LaunchRuntimeRequest,
+    sandbox: SandboxId,
+    environment: &CompiledEnvironment,
+) -> Result<crate::contained_launcher::Config, Status> {
     let release = environment.release();
     if release.release.kind != RuntimeKind::CloudHypervisor {
         return Err(Status::failed_precondition(
@@ -159,9 +188,11 @@ fn standalone_config(
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| Status::invalid_argument("runtime source has no release directory"))?;
-    let directory = managed_release_directory(&release.release, release.digest());
-    if !canonical_absolute(root)
-        || root.file_name() != Some(std::ffi::OsStr::new(&directory))
+    let directories = release_directory_names(&release.release, release.digest());
+    if pplx_space_common_core::types::NodeSpacePath::parse(root).is_err()
+        || !directories
+            .iter()
+            .any(|directory| root.file_name() == Some(std::ffi::OsStr::new(directory)))
         || binary != root.join("bin/cloud-hypervisor")
     {
         return Err(Status::invalid_argument(
@@ -176,8 +207,13 @@ fn standalone_config(
     let digest = compiled_verity_digest(file.sha256)
         .map_err(|e| Status::failed_precondition(e.to_string()))?
         .ok_or_else(|| Status::failed_precondition("runtime executable has no verity pin"))?;
+    // The generic wire carries a path, but containment only accepts a validated
+    // namespace locator, just like the Firecracker adapter.
+    let network_namespace =
+        pplx_space_common_core::types::NodeSpacePath::parse(&req.network_namespace)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let workspace = Path::new(&req.workspace_root);
-    if !canonical_absolute(workspace) {
+    if pplx_space_common_core::types::NodeSpacePath::parse(workspace).is_err() {
         return Err(Status::invalid_argument(
             "workspace must be an absolute canonical path",
         ));
@@ -195,22 +231,25 @@ fn standalone_config(
     }
     Ok(crate::contained_launcher::Config {
         root,
-        network_namespace: req.network_namespace.clone().into(),
+        registration_directory: pplx_space_common_core::host::linux::paths::sandbox_run_dir(
+            &sandbox.to_string(),
+        )
+        .into(),
+        network_namespace: network_namespace.as_path().to_owned(),
         executable: binary.to_owned(),
-        executable_digest: digest,
+        executable_source: SourcePins {
+            sha256: file.sha256,
+            verity: digest,
+        },
         uid: req.uid,
         gid: req.gid,
         cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(
             &sandbox.to_string(),
         ),
         output: req.console_path.clone().into(),
-        arguments: vec!["--api-socket".into(), "/control.sock".into()],
+        arguments: vec!["--seccomp".into(), "true".into()],
     })
 }
 
-fn canonical_absolute(path: &Path) -> bool {
-    path.is_absolute()
-        && path
-            .components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
-}
+#[cfg(test)]
+mod tests;

@@ -35,7 +35,7 @@ fn unsupported_schema_version_is_rejected() {
 }
 
 #[test]
-fn sandbox_cpu_budget_round_trips_without_changing_legacy_shape() {
+fn sandbox_allocation_round_trips_without_changing_legacy_shape() {
     let legacy = serde_json::to_value(SandboxArtifactMetadata::new(
         SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2").unwrap(),
         ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]),
@@ -43,16 +43,18 @@ fn sandbox_cpu_budget_round_trips_without_changing_legacy_shape() {
         None,
     ))
     .unwrap();
-    for budget in [None, Some(8), Some(0)] {
-        let mut value = legacy.clone();
-        if let Some(budget) = budget {
-            value["cpu_budget"] = budget.into();
-        }
-        let parsed = serde_json::from_value::<SandboxArtifactMetadata>(value.clone());
-        if budget == Some(0) {
-            assert!(parsed.is_err(), "zero is not a CPU allocation");
-        } else {
-            assert_eq!(serde_json::to_value(parsed.unwrap()).unwrap(), value);
+    for (field, positive) in [("cpu_budget", 8u64), ("guest_memory", 4 * 1024 * 1024)] {
+        for budget in [None, Some(positive), Some(0)] {
+            let mut value = legacy.clone();
+            if let Some(budget) = budget {
+                value[field] = budget.into();
+            }
+            let parsed = serde_json::from_value::<SandboxArtifactMetadata>(value.clone());
+            if budget == Some(0) {
+                assert!(parsed.is_err(), "zero is not a valid allocation");
+            } else {
+                assert_eq!(serde_json::to_value(parsed.unwrap()).unwrap(), value);
+            }
         }
     }
 }

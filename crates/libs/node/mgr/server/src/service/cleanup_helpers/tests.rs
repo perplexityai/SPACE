@@ -395,44 +395,46 @@ fn teardown_preserves_backing_files_below_stacked_directory_binds() {
             None::<&str>,
         )
         .unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let jail = directory.path().join("jail");
-        let target = jail.join("root/encsnap");
-        let instance = directory.path().join("instance");
-        let run = directory.path().join("run");
-        let gateway = directory.path().join("gateway");
-        let lower = directory.path().join("lower-volume");
-        let upper = directory.path().join("upper-volume");
-        for path in [&target, &instance, &run, &gateway, &lower, &upper] {
-            std::fs::create_dir_all(path).unwrap();
-        }
-        for volume in [&lower, &upper] {
-            std::fs::write(volume.join("memory"), b"snapshot backing data").unwrap();
-            mount(
-                Some(volume.as_path()),
-                &target,
-                None::<&str>,
-                MsFlags::MS_BIND,
-                None::<&str>,
+        for relative in ["encsnap", "state/encsnap"] {
+            let directory = tempfile::tempdir().unwrap();
+            let jail = directory.path().join("jail");
+            let target = jail.join("root").join(relative);
+            let instance = directory.path().join("instance");
+            let run = directory.path().join("run");
+            let gateway = directory.path().join("gateway");
+            let lower = directory.path().join("lower-volume");
+            let upper = directory.path().join("upper-volume");
+            for path in [&target, &instance, &run, &gateway, &lower, &upper] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            for volume in [&lower, &upper] {
+                std::fs::write(volume.join("memory"), b"snapshot backing data").unwrap();
+                mount(
+                    Some(volume.as_path()),
+                    &target,
+                    None::<&str>,
+                    MsFlags::MS_BIND,
+                    None::<&str>,
+                )
+                .unwrap();
+            }
+            super::cleanup_runtime_artifacts_at(
+                gateway.to_str().unwrap(),
+                run.to_str().unwrap(),
+                jail.to_str().unwrap(),
+                &instance,
+                |path| super::unmount_if_present(path),
+                || (Vec::new(), Vec::new()),
             )
             .unwrap();
+            for volume in [&lower, &upper] {
+                assert_eq!(
+                    std::fs::read(volume.join("memory")).unwrap(),
+                    b"snapshot backing data"
+                );
+            }
+            assert!(!jail.exists());
         }
-        super::cleanup_runtime_artifacts_at(
-            gateway.to_str().unwrap(),
-            run.to_str().unwrap(),
-            jail.to_str().unwrap(),
-            &instance,
-            |path| super::unmount_if_present(path),
-            || (Vec::new(), Vec::new()),
-        )
-        .unwrap();
-        for volume in [&lower, &upper] {
-            assert_eq!(
-                std::fs::read(volume.join("memory")).unwrap(),
-                b"snapshot backing data"
-            );
-        }
-        assert!(!jail.exists());
     })
     .join()
     .unwrap();
@@ -549,37 +551,45 @@ fn jail_cleanup_removes_planted_symlinks_without_following_them() {
         Missing,
         Outside,
     }
-    for target in [Target::Loop, Target::Missing, Target::Outside] {
-        let temp = tempfile::tempdir().unwrap();
-        let jail = temp.path().join("jail");
-        let instance = temp.path().join("instance");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir_all(jail.join("root")).unwrap();
-        std::fs::create_dir_all(&instance).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("memory"), b"retained backing data").unwrap();
-        for name in super::JAIL_BIND_NAMES {
+    for name in super::JAIL_BIND_NAMES {
+        for target in [Target::Loop, Target::Missing, Target::Outside] {
+            let temp = tempfile::tempdir().unwrap();
+            let jail = temp.path().join("jail");
+            let instance = temp.path().join("instance");
+            let outside = temp.path().join("outside");
             let link = jail.join("root").join(name);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(&instance).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("memory"), b"retained backing data").unwrap();
             let destination = match target {
-                Target::Loop => std::path::PathBuf::from(name),
+                Target::Loop => std::path::PathBuf::from(link.file_name().unwrap()),
                 Target::Missing => temp.path().join("absent"),
                 Target::Outside => outside.clone(),
             };
             std::os::unix::fs::symlink(destination, &link).unwrap();
+            super::cleanup_runtime_artifacts_at(
+                temp.path().join("gateway").to_str().unwrap(),
+                temp.path().join("run").to_str().unwrap(),
+                jail.to_str().unwrap(),
+                &instance,
+                |path| {
+                    // No real mounts: exercise link inspection, including children
+                    // under a planted parent link, without requiring mount authority.
+                    if path.starts_with(&link) {
+                        super::unmount_if_present(path)
+                    } else {
+                        Ok(false)
+                    }
+                },
+                || panic!("no encrypted device exists in this fixture"),
+            )
+            .unwrap();
+            assert!(!jail.exists());
+            assert_eq!(
+                std::fs::read(outside.join("memory")).unwrap(),
+                b"retained backing data"
+            );
         }
-        super::cleanup_runtime_artifacts_at(
-            temp.path().join("gateway").to_str().unwrap(),
-            temp.path().join("run").to_str().unwrap(),
-            jail.to_str().unwrap(),
-            &instance,
-            |path| super::unmount_if_present(path),
-            || panic!("no encrypted device exists in this fixture"),
-        )
-        .unwrap();
-        assert!(!jail.exists());
-        assert_eq!(
-            std::fs::read(outside.join("memory")).unwrap(),
-            b"retained backing data"
-        );
     }
 }

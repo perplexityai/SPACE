@@ -376,3 +376,62 @@ fn clone_refuses_a_linked_producer_record() {
     assert!(fixture.open().is_err());
     fixture.outside_untouched();
 }
+
+#[test]
+fn clone_rebinds_disk_identity_without_losing_its_execution_contract() {
+    use pplx_space_common_core::types::{Arch, SandboxId};
+    for environment in
+        pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.supports_memory_state())
+    {
+        for wrong_owner in [false, true] {
+            let fixture = Fixture::new();
+            let donor = SandboxId::new();
+            let target = SandboxId::new();
+            let metadata = SandboxArtifactMetadata::new(
+                if wrong_owner { SandboxId::new() } else { donor },
+                environment.definition().execution_requirements().unwrap(),
+                "seed".parse().unwrap(),
+                None,
+            );
+            std::fs::write(
+                fixture.cache.join("donor/metadata.json"),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            std::fs::rename(
+                fixture.cache.join("donor"),
+                fixture.cache.join(donor.to_string()),
+            )
+            .unwrap();
+            std::fs::rename(
+                fixture.cache.join("target"),
+                fixture.cache.join(target.to_string()),
+            )
+            .unwrap();
+            let tree = CloneTree::open(
+                &fixture.cache,
+                &fixture.run,
+                &donor.to_string(),
+                &target.to_string(),
+                &fixture.identity,
+            );
+            if wrong_owner {
+                assert!(tree.is_err());
+            } else {
+                copy(tree.unwrap()).unwrap();
+                let copied: SandboxArtifactMetadata = serde_json::from_slice(
+                    &std::fs::read(fixture.cache.join(target.to_string()).join("metadata.json"))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(copied.sandbox_id, target);
+                assert_eq!(copied.execution, metadata.execution);
+                assert_eq!(copied.template, metadata.template);
+            }
+            fixture.outside_untouched();
+        }
+    }
+}

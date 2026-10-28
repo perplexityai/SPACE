@@ -260,6 +260,39 @@ pub(super) fn bind_pinned_files(source: &File, target: &File) -> Result<(), Stat
     )
 }
 
+/// Retain a dedicated shared mount in the host. The contained VMM receives a
+/// slave copy, so later encrypted-volume binds propagate inward without giving
+/// the VMM any mount authority or propagating its mounts back to the host.
+#[cfg(target_os = "linux")]
+pub(super) fn shared_state_mount(jail: &File) -> Result<(), Status> {
+    use std::os::unix::fs::MetadataExt;
+    let original = open_bind_directory(jail, "state".as_ref())?;
+    bind_pinned_files(&original, &original)?;
+    let mounted = open_bind_directory(jail, "state".as_ref())?;
+    let before = original.metadata().map_err(path_error)?;
+    let after = mounted.metadata().map_err(path_error)?;
+    if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+        return Err(Status::failed_precondition(
+            "state mount changed during preparation",
+        ));
+    }
+    nix::mount::mount(
+        None::<&str>,
+        PathBuf::from(format!("/proc/self/fd/{}", mounted.as_raw_fd())).as_path(),
+        None::<&str>,
+        nix::mount::MsFlags::MS_SHARED,
+        None::<&str>,
+    )
+    .map_err(path_error)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn shared_state_mount(_jail: &File) -> Result<(), Status> {
+    Err(Status::failed_precondition(
+        "runtime state mounts require Linux",
+    ))
+}
+
 pub(super) fn export_permissions(path: &Path, gid: Option<u32>) -> Result<(), Status> {
     let directory = open_directory(path)?;
     export_directory(&directory, gid, 0, &mut 100_000)

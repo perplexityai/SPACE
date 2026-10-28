@@ -843,6 +843,13 @@ pub(super) mod service_tests {
             .try_acquire_many_owned(MAX_BLOCKING_PROBES as u32)
             .unwrap();
         let id = SandboxId::new();
+        assert!(
+            service
+                .recorded_execution(id.to_string())
+                .await
+                .expect("lifecycle metadata must not compete with diagnostics")
+                .is_none()
+        );
         // Stats supplies the identity even when a sandbox has no live cgroup.
         let mut request = Request::new(InspectSandboxRequest {
             sandbox_id: id.to_string(),

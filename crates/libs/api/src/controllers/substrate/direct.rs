@@ -1609,14 +1609,29 @@ impl DirectSubstrate {
                AND nss.reachable IS TRUE
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
+               AND ($3 = 'fc' OR (
+                    nss.reachable IS TRUE
+                    AND nss.scheduling_status = 'ready'
+                    AND nss.stale_after > NOW()
+                    AND nss.execution_inventory_status = 'complete'
+                    AND nss.execution_inventory_received_at
+                        + (nss.stale_after - nss.observed_at) > NOW()
+                    AND EXISTS (
+                        SELECT 1 FROM node_runtime_guests guest
+                        WHERE guest.node_id = n.id
+                          AND guest.runtime = $3
+                          AND guest.guest_os = nti.guest_os
+                          AND guest.guest_arch = nti.arch
+                    )
+               ))
                AND nti.template_name = $1
                AND ($2::TEXT IS NULL OR nti.content_hash = $2)
-               AND (nti.runtime IS NULL OR nti.runtime = $3)
+               AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
                AND (
-                    NOT EXISTS (
+                    ($3 = 'fc' AND NOT EXISTS (
                         SELECT 1 FROM node_runtime_installations inventory
                         WHERE inventory.node_id = n.id
-                    )
+                    ))
                     OR EXISTS (
                         SELECT 1 FROM node_runtime_installations runtime
                         WHERE runtime.node_id = n.id
@@ -1625,11 +1640,13 @@ impl DirectSubstrate {
                )
                AND (
                     $4::BOOLEAN IS FALSE
-                    OR nti.state_format_name IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1 FROM node_runtime_installations inventory
-                        WHERE inventory.node_id = n.id
-                    )
+                    OR ($3 = 'fc' AND (
+                        nti.state_format_name IS NULL
+                        OR NOT EXISTS (
+                            SELECT 1 FROM node_runtime_installations inventory
+                            WHERE inventory.node_id = n.id
+                        )
+                    ))
                     OR EXISTS (
                         SELECT 1 FROM node_runtime_state_formats state_format
                         WHERE state_format.node_id = n.id
@@ -1690,14 +1707,29 @@ impl DirectSubstrate {
                AND COALESCE(n.state, 'registered') = 'registered'
                AND COALESCE(nss.reachable, TRUE) IS TRUE
                AND COALESCE(nss.scheduling_status, 'ready') NOT IN ('full', 'draining', 'unavailable')
+               AND ($3 = 'fc' OR (
+                    nss.reachable IS TRUE
+                    AND nss.scheduling_status = 'ready'
+                    AND nss.stale_after > NOW()
+                    AND nss.execution_inventory_status = 'complete'
+                    AND nss.execution_inventory_received_at
+                        + (nss.stale_after - nss.observed_at) > NOW()
+                    AND EXISTS (
+                        SELECT 1 FROM node_runtime_guests guest
+                        WHERE guest.node_id = n.id
+                          AND guest.runtime = $3
+                          AND guest.guest_os = nti.guest_os
+                          AND guest.guest_arch = nti.arch
+                    )
+               ))
                AND nti.template_name = $1
                AND ($2::TEXT IS NULL OR nti.content_hash = $2)
-               AND (nti.runtime IS NULL OR nti.runtime = $3)
+               AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
                AND (
-                    NOT EXISTS (
+                    ($3 = 'fc' AND NOT EXISTS (
                         SELECT 1 FROM node_runtime_installations inventory
                         WHERE inventory.node_id = n.id
-                    )
+                    ))
                     OR EXISTS (
                         SELECT 1 FROM node_runtime_installations runtime
                         WHERE runtime.node_id = n.id
@@ -1706,11 +1738,13 @@ impl DirectSubstrate {
                )
                AND (
                     $4::BOOLEAN IS FALSE
-                    OR nti.state_format_name IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1 FROM node_runtime_installations inventory
-                        WHERE inventory.node_id = n.id
-                    )
+                    OR ($3 = 'fc' AND (
+                        nti.state_format_name IS NULL
+                        OR NOT EXISTS (
+                            SELECT 1 FROM node_runtime_installations inventory
+                            WHERE inventory.node_id = n.id
+                        )
+                    ))
                     OR EXISTS (
                         SELECT 1 FROM node_runtime_state_formats state_format
                         WHERE state_format.node_id = n.id
@@ -1788,16 +1822,29 @@ impl DirectSubstrate {
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
                AND (
-                    NOT EXISTS (
+                    ($1 = 'fc' AND NOT EXISTS (
                         SELECT 1 FROM node_runtime_installations inventory
                         WHERE inventory.node_id = n.id
-                    )
+                    ))
                     OR EXISTS (
                         SELECT 1 FROM node_runtime_installations runtime
                         WHERE runtime.node_id = n.id
                           AND runtime.runtime = $1
                     )
                )
+               AND ($1 = 'fc' OR (
+                    nss.reachable IS TRUE
+                    AND nss.scheduling_status = 'ready'
+                    AND nss.stale_after > NOW()
+                    AND nss.execution_inventory_status = 'complete'
+                    AND nss.execution_inventory_received_at
+                        + (nss.stale_after - nss.observed_at) > NOW()
+                    AND EXISTS (
+                        SELECT 1 FROM node_runtime_guests guest
+                        WHERE guest.node_id = n.id
+                          AND guest.runtime = $1
+                    )
+               ))
              ORDER BY random()"
         ))
         .bind(runtime)
@@ -1826,14 +1873,29 @@ impl DirectSubstrate {
                AND nss.reachable IS TRUE
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
+               AND ($3 = 'fc' OR (
+                    nss.reachable IS TRUE
+                    AND nss.scheduling_status = 'ready'
+                    AND nss.stale_after > NOW()
+                    AND nss.execution_inventory_status = 'complete'
+                    AND nss.execution_inventory_received_at
+                        + (nss.stale_after - nss.observed_at) > NOW()
+                    AND EXISTS (
+                        SELECT 1 FROM node_runtime_guests guest
+                        WHERE guest.node_id = n.id
+                          AND guest.runtime = $3
+                          AND guest.guest_os = nti.guest_os
+                          AND guest.guest_arch = nti.arch
+                    )
+               ))
                AND nti.template_name = $1
                AND ($2::TEXT IS NULL OR nti.content_hash = $2)
-               AND (nti.runtime IS NULL OR nti.runtime = $3)
+               AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
                AND (
-                    NOT EXISTS (
+                    ($3 = 'fc' AND NOT EXISTS (
                         SELECT 1 FROM node_runtime_installations inventory
                         WHERE inventory.node_id = n.id
-                    )
+                    ))
                     OR EXISTS (
                         SELECT 1 FROM node_runtime_installations runtime
                         WHERE runtime.node_id = n.id
@@ -2129,6 +2191,12 @@ impl DirectSubstrate {
                AND nss.reachable IS TRUE
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
+               AND (latest_snapshot.runtime = 'fc' OR (
+                    nss.execution_inventory_status = 'complete'
+                    AND nss.execution_inventory_received_at
+                        + (nss.stale_after - nss.observed_at) > NOW()
+                    AND latest_snapshot.execution_metadata IS NOT NULL
+               ))
                AND latest_snapshot.runtime IS NOT NULL
                AND latest_snapshot.guest_os IS NOT NULL
                AND latest_snapshot.guest_arch IS NOT NULL
@@ -2161,7 +2229,7 @@ impl DirectSubstrate {
                                       '[]'::jsonb)
                          ) AS requested(kind text, role text, digest text,
                                         version text, format text)
-                    WHERE requested.kind IS DISTINCT FROM 'kernel'
+                    WHERE (latest_snapshot.runtime <> 'fc' OR requested.kind IS DISTINCT FROM 'kernel')
                       AND NOT EXISTS (
                           SELECT 1
                           FROM node_artifact_components installed
@@ -2242,6 +2310,12 @@ impl DirectSubstrate {
                AND nss.reachable IS TRUE
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
+               AND (latest_snapshot.runtime = 'fc' OR (
+                    nss.execution_inventory_status = 'complete'
+                    AND nss.execution_inventory_received_at
+                        + (nss.stale_after - nss.observed_at) > NOW()
+                    AND latest_snapshot.execution_metadata IS NOT NULL
+               ))
                AND latest_snapshot.runtime IS NOT NULL
                AND latest_snapshot.guest_os IS NOT NULL
                AND latest_snapshot.guest_arch IS NOT NULL
@@ -2285,7 +2359,7 @@ impl DirectSubstrate {
                                       '[]'::jsonb)
                          ) AS requested(kind text, role text, digest text,
                                         version text, format text)
-                    WHERE requested.kind IS DISTINCT FROM 'kernel'
+                    WHERE (latest_snapshot.runtime <> 'fc' OR requested.kind IS DISTINCT FROM 'kernel')
                       AND NOT EXISTS (
                           SELECT 1
                           FROM node_artifact_components installed

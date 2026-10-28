@@ -48,7 +48,7 @@ use super::validation::{
     reject_incompatible_template_spaced_compatibility,
 };
 use super::{
-    CACHE_DIR, DEFAULT_BLOCKING_READY_TIMEOUT_SECS, JAIL_DIR, RUN_DIR, RouteStreamEpochIdentity,
+    CACHE_DIR, DEFAULT_BLOCKING_READY_TIMEOUT_SECS, RUN_DIR, RouteStreamEpochIdentity,
     SandboxManagerService,
 };
 use crate::{
@@ -1868,6 +1868,17 @@ impl SandboxManagerService {
                 .await?;
         }
         let sandbox = start_lookup.sandbox;
+        if let Some(policy) = &start_ctx.activation_auto_lifecycle {
+            let runtime = sandbox
+                .runtime
+                .parse()
+                .map_err(|e| Status::failed_precondition(format!("runtime: {e}")))?;
+            super::validation::validate_runtime_lifecycle_policy(runtime, policy)?;
+            super::validation::validate_execution_lifecycle_policy(
+                sandbox.execution_metadata.as_ref(),
+                policy,
+            )?;
+        }
         let restore_cleanup_id = if checkpoint == SUSPEND_CHECKPOINT {
             self.checkpoint_restore_cleanup_episode_id(&sandbox)?
         } else {
@@ -2185,6 +2196,14 @@ impl SandboxManagerService {
             .balloon
             .for_memory_mib(mem_mib)
             .map_err(|error| activation_cleanup.failure(error))?;
+        pplx_space_node_runtime_core::boot::validate_resources(
+            prepare_source.execution.runtime().kind,
+            balloon.is_some(),
+            self.config.hugepages,
+        )
+        .map_err(|error| {
+            activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+        })?;
         if mem_mib < requested_memory_mib {
             tracing::info!(
                 sandbox_id = %id,
@@ -2312,13 +2331,31 @@ impl SandboxManagerService {
             &boot,
         )
         .map_err(|error| {
-            activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+            use pplx_space_node_runtime_core::boot::BootConfigError;
+            let status = match error {
+                BootConfigError::Json(_) | BootConfigError::UnsupportedRuntime(_) => {
+                    Status::internal(error.to_string())
+                }
+                BootConfigError::Guest(_)
+                | BootConfigError::UnsupportedFeature { .. }
+                | BootConfigError::MemoryOverflow
+                | BootConfigError::Invalid(_) => Status::failed_precondition(error.to_string()),
+            };
+            activation_cleanup.failure(status)
         })?;
 
         // Host-visible paths
         let run_dir = format!("{RUN_DIR}/{id}");
         let log_path = format!("{run_dir}/fc.log");
-        let vsock_uds_path = format!("{JAIL_DIR}/firecracker/{id}/root/v.sock");
+        let vsock_uds_path = pplx_space_node_runtime_core::control::guest_socket_path(
+            prepare_source.execution.runtime().kind,
+            id,
+        )
+        .map_err(|error| {
+            activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+        })?
+        .display()
+        .to_string();
 
         // Node-manager prepares filesystem after slot allocation so UID/GID
         // ownership is derived from the allocated slot. If Create only recorded
@@ -2337,6 +2374,10 @@ impl SandboxManagerService {
                         &sandbox,
                         Some(
                             pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu)
+                                .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                        ),
+                        Some(
+                            pplx_space_common_core::types::MemorySize::mib(u64::from(mem_mib))
                                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
                         ),
                     )?,
@@ -2868,7 +2909,7 @@ pub(super) fn drive_rate_limit_proto(
 
 /// Each direction of a sandbox's network interface: 50 MiB/s and 10000
 /// packets/s, refilled every second.
-const NET_RATE_LIMITER: RateLimiter = RateLimiter {
+pub(super) const NET_RATE_LIMITER: RateLimiter = RateLimiter {
     bandwidth: TokenBucket {
         size: 52_428_800,
         refill_time_ms: 1000,

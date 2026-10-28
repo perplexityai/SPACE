@@ -370,3 +370,99 @@ async fn stop_rpc_admits_nothing_without_a_live_runtime() {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
+    use pplx_space_node_runtime_core::launch::ProcessHandle;
+    for (exited, stale, busy, saturated) in [
+        (false, false, false, false),
+        (false, false, false, true),
+        (true, true, false, false),
+        (true, false, true, false),
+        (true, false, false, false),
+        (true, false, false, true),
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let conn = crate::db::test_conn();
+        let id = insert_row(&conn, SandboxState::Started);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pinned = ProcessHandle::open(child.id()).unwrap();
+        crate::db::update_runtime_fields(
+            &conn,
+            id,
+            crate::db::RuntimeFields {
+                uid: 10000,
+                slot: 1,
+                guest_cid: 3,
+                pid: child.id(),
+                spaced_host_pid: 0,
+                netgtw_pid: 0,
+                vsock_uds_path: "/synthetic/v.sock",
+                api_socket_path: "/synthetic/control.sock",
+                spaced_endpoint_proof: None,
+                space_api_route_identity: Default::default(),
+                route_identity_provenance:
+                    crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
+            },
+        )
+        .unwrap();
+        let service = isolated_service(conn, scratch.path());
+        let mut observed = service.lookup_sandbox(&id.to_string()).unwrap();
+        if stale {
+            observed.node_execution_id =
+                Some(pplx_space_common_core::types::SandboxActivationAttemptId::new());
+        }
+        if exited {
+            child.kill().unwrap();
+            tokio::time::timeout(WAIT, async {
+                while !pinned.has_exited().unwrap() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let fence = if busy {
+            Some(service.cleanup_lock(&id.to_string()).lock_owned().await)
+        } else {
+            None
+        };
+        let permits = if saturated {
+            Some(
+                Arc::clone(&service.cleanup_io)
+                    .acquire_many_owned(service.cleanup_io.available_permits().try_into().unwrap())
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        // Running-process probes and durable exit admission must complete even
+        // while unrelated filesystem cleanups consume every I/O permit.
+        let admission = tokio::time::timeout(WAIT, service.admit_exited_runtime(observed))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permits);
+        drop(fence);
+        assert_eq!(admission.is_some(), exited && !stale && !busy);
+        assert_eq!(
+            service.lookup_sandbox(&id.to_string()).unwrap().state,
+            if exited && !stale && !busy {
+                SandboxState::Stopping
+            } else {
+                SandboxState::Started
+            }
+        );
+        drop(admission);
+        if !exited {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+        shutdown(service).await;
+    }
+}

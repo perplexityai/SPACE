@@ -7,9 +7,10 @@ use std::path::PathBuf;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Config {
     pub root: PathBuf,
+    pub registration_directory: PathBuf,
     pub network_namespace: PathBuf,
     pub executable: PathBuf,
-    pub executable_digest: pplx_space_node_runtime_core::verity::VerityDigest,
+    pub executable_source: pplx_space_node_runtime_core::authenticated_source::SourcePins,
     pub uid: u32,
     pub gid: u32,
     pub cgroup: PathBuf,

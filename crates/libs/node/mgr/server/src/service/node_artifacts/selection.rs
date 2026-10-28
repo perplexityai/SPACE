@@ -35,6 +35,8 @@ impl NodeManagerService {
                 selection::SelectionError::Unavailable(error) => error.into_status(),
                 error => Status::failed_precondition(error.to_string()),
             })?;
+        self.require_verified_environment_layout(selected.execution.runtime().kind)
+            .await?;
         let source = intent.source();
         if source.environment() != Some(definition.reference()) {
             pplx_space_metrics::node_manager::execution_consumer_fallback();

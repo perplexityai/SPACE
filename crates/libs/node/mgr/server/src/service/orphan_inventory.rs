@@ -235,11 +235,29 @@ fn inspect_entry(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 other => other?,
             };
-            if !matches!(
+            let named_runtime = matches!(
                 comm.trim(),
-                "firecracker" | "space-spaced-ho" | "space-netgtw-sv"
-            ) {
-                return Ok(());
+                "firecracker" | "cloud-hyperviso" | "space-spaced-ho" | "space-netgtw-sv"
+            );
+            if !named_runtime {
+                // execveat may leave the descriptor number in comm. Resolve
+                // the executable link without trusting the process's argv.
+                let executable = match std::fs::read_link(entry.path().join("exe")) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    other => other?,
+                };
+                let name = executable.file_name().and_then(|name| name.to_str());
+                if !matches!(
+                    name.map(|name| name.trim_end_matches(" (deleted)")),
+                    Some(
+                        "firecracker"
+                            | "cloud-hypervisor"
+                            | "space-spaced-host-svc"
+                            | "space-netgtw-svc"
+                    )
+                ) {
+                    return Ok(());
+                }
             }
             let cgroup = match read_proc(&entry.path().join("cgroup")) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),

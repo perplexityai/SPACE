@@ -1257,6 +1257,7 @@ db_private_outside_tests! {
 pub struct PeriodicLifecycleRecoveryScan {
     next: i64,
     through: Option<i64>,
+    runtime_exits: bool,
 }
 
 impl Default for PeriodicLifecycleRecoveryScan {
@@ -1264,14 +1265,31 @@ impl Default for PeriodicLifecycleRecoveryScan {
         Self {
             next: i64::MIN,
             through: None,
+            runtime_exits: false,
         }
+    }
+}
+
+impl PeriodicLifecycleRecoveryScan {
+    /// Keep running-process probes from consuming interrupted-operation capacity.
+    pub fn runtime_exits() -> Self {
+        Self {
+            runtime_exits: true,
+            ..Self::default()
+        }
+    }
+
+    fn restart(&mut self) {
+        self.next = i64::MIN;
+        self.through = None;
     }
 }
 
 db_private_outside_tests! {
     /// Bounded discovery, not a complete inventory or authority to mutate a row.
-    /// Examine at most 128 raw rowids and return at most eight successfully decoded
-    /// candidates per tick. Failed decodes do not fill candidate slots, so eligible
+    /// Examine at most 128 raw rowids. Interrupted operations return at most eight
+    /// candidates; cheap process-exit probes can consume that full row window.
+    /// Failed decodes do not fill candidate slots, so eligible
     /// malformed rows can cause up to 128 individual full-row decode attempts.
     /// Advance past malformed/ineligible rows as well as candidates, so a retained
     /// or busy first page cannot starve the rest. Rowid is only a scan position;
@@ -1296,12 +1314,12 @@ db_private_outside_tests! {
         let mut candidates = Vec::new();
         for _ in 0..128 {
             let Some(row) = rows.next()? else {
-                *scan = PeriodicLifecycleRecoveryScan::default();
+                scan.restart();
                 break;
             };
             let rowid: i64 = row.get(0)?;
             if rowid == through {
-                *scan = PeriodicLifecycleRecoveryScan::default();
+                scan.restart();
             } else {
                 // The upper witness is greater, so this cannot overflow.
                 scan.next = rowid + 1;
@@ -1318,9 +1336,10 @@ db_private_outside_tests! {
                 }
             };
             let eligible = match state.parse::<SandboxState>() {
-                Ok(SandboxState::Paused | SandboxState::Resuming | SandboxState::Checkpointing) => true,
+                Ok(SandboxState::Started) => scan.runtime_exits,
+                Ok(SandboxState::Paused | SandboxState::Resuming | SandboxState::Checkpointing) => !scan.runtime_exits,
                 Ok(SandboxState::Suspending) => {
-                    matches!(row.get_ref(3)?, rusqlite::types::ValueRef::Null)
+                    !scan.runtime_exits && matches!(row.get_ref(3)?, rusqlite::types::ValueRef::Null)
                 }
                 _ => false,
             };
@@ -1336,7 +1355,7 @@ db_private_outside_tests! {
                     "skipping undecodable sandbox row during periodic recovery"
                 ),
             }
-            if candidates.len() == 8 {
+            if !scan.runtime_exits && candidates.len() == 8 {
                 break;
             }
         }

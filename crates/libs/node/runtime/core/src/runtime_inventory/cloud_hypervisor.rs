@@ -5,6 +5,9 @@ use super::*;
 pub(super) struct CloudHypervisorDriver;
 
 impl RuntimeDriver for CloudHypervisorDriver {
+    fn restore_requires_boot_components(&self) -> bool {
+        true
+    }
     fn kind(&self) -> RuntimeKind {
         RuntimeKind::CloudHypervisor
     }
@@ -58,6 +61,7 @@ impl RuntimeDriver for CloudHypervisorDriver {
     ) -> Result<Ordering, RuntimeInventoryError> {
         // Installed releases are exact inputs here; replacement preference is
         // owned by the qualification catalog, never inferred from directory names.
+        // This ordering is only for diagnostic listing, not replacement selection.
         let parse = |version: &RuntimeVersion| {
             let text = version.as_str();
             let normalized = if text.split('.').count() == 2 {
@@ -81,12 +85,12 @@ impl RuntimeDriver for CloudHypervisorDriver {
         requested: &ExecutionMetadata,
         mode: ExecutionSelectionMode,
     ) -> Result<bool, RuntimeInventoryError> {
-        Ok(mode != ExecutionSelectionMode::PersistedStateRestore
+        Ok((mode != ExecutionSelectionMode::PersistedStateRestore
+            || installed.state_format.is_some())
             && requested.environment().is_some()
             && installed.runtime.kind == self.kind()
             && installed.runtime == *requested.runtime()
             && installed.guest == requested.guest()
-            && installed.state_format.is_none()
-            && requested.state_format().is_none())
+            && installed.state_format.as_ref() == requested.state_format())
     }
 }

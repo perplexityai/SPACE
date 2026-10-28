@@ -471,3 +471,21 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
         .await
         .unwrap();
 }
+
+#[test]
+fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflict() {
+    use pplx_space_common_core::types::MemorySize;
+    for (captured, file, expected) in [
+        (None, None, Ok(None)),
+        (None, Some(2048), Ok(Some(2048))),
+        (Some(4096), None, Ok(Some(4096))),
+        (Some(4096), Some(4096), Ok(Some(4096))),
+        (Some(4096), Some(2048), Err(tonic::Code::FailedPrecondition)),
+    ] {
+        let captured = captured.map(|mib| MemorySize::mib(mib).unwrap());
+        assert_eq!(
+            super::restored_guest_memory_mib(captured, file).map_err(|e| e.code()),
+            expected
+        );
+    }
+}

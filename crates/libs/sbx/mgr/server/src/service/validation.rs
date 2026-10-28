@@ -300,6 +300,51 @@ pub(super) fn validate_environment_create(
             "requested environment differs from the template binding",
         ));
     }
+    let runtime = execution.runtime().kind;
+    if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+        && (request
+            .sandbox_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+            || request.route_identity.is_some())
+    {
+        return Err(Status::failed_precondition(
+            "selected environment requires qualified cluster placement",
+        ));
+    }
+    let capabilities = runtime.baseline_capabilities();
+    if !capabilities.prewarmed_pool
+        && (is_pool_member(request) || request.boot_mode == crate::proto::BootMode::Pool as i32)
+    {
+        return Err(Status::failed_precondition(
+            "runtime does not support warm pools",
+        ));
+    }
+    if !capabilities.snapshot
+        && (request.snapshots_enabled
+            || request.boot_mode != crate::proto::BootMode::Cold as i32
+            || request.pool_template.is_some())
+    {
+        return Err(Status::failed_precondition(
+            "runtime supports cold creation only",
+        ));
+    }
+    if execution.runtime().kind == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+        && execution.environment().is_none()
+    {
+        return Err(Status::failed_precondition(
+            "standalone runtime requires a bound template",
+        ));
+    }
+    let requested_runtime = request
+        .runtime
+        .parse::<pplx_space_common_core::types::RuntimeKind>()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    if requested_runtime != execution.runtime().kind {
+        return Err(Status::failed_precondition(
+            "requested runtime differs from the template binding",
+        ));
+    }
     let non_default = is_non_default_execution(execution);
     // A selected create always boots cold, so only its snapshots load memory.
     let memory_state = if environment.is_some() {
@@ -457,6 +502,26 @@ pub(crate) fn template_base_snapshot_dir(
     )
 }
 
+fn initial_environment_reference(
+    arch: pplx_space_common_core::types::Arch,
+) -> Option<pplx_space_common_core::types::EnvironmentReference> {
+    use pplx_space_node_runtime_core::catalog::InitialEnvironment;
+    let initial = match InitialEnvironment::for_architecture(arch) {
+        Ok(initial) => initial,
+        Err(error) => {
+            tracing::warn!(%error, "initial environment pins unavailable");
+            return None;
+        }
+    };
+    match initial.definition() {
+        Ok(definition) => Some(definition.reference()),
+        Err(error) => {
+            tracing::warn!(%error, "initial environment definition unavailable");
+            None
+        }
+    }
+}
+
 /// Fleet placement and pool identity must understand a complete binding before
 /// a non-default template can use those paths, independently of snapshot support.
 pub(super) fn is_non_default_execution(
@@ -474,25 +539,57 @@ pub(super) fn requires_cold_creation(
     let Some(reference) = execution.environment() else {
         return false;
     };
-    use pplx_space_common_core::types::{Arch, EnvironmentReference};
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
-    static MEMORY_STATE: std::sync::OnceLock<Vec<EnvironmentReference>> =
-        std::sync::OnceLock::new();
-    let supported = MEMORY_STATE.get_or_init(|| match CompiledEnvironment::for_architecture(Arch::X86_64) {
-        Ok(environments) => environments.into_iter()
-            .filter(|entry| entry.supports_memory_state())
-            .map(|entry| entry.definition().reference())
-            .collect(),
+    match CompiledEnvironment::for_architecture(execution.guest().architecture) {
+        Ok(environments) => !environments.into_iter().any(|entry| {
+            entry.supports_memory_state() && entry.definition().reference() == reference
+        }),
         Err(error) => {
             tracing::warn!(%error, "additional environment catalog unavailable; retaining initial memory-state support");
-            // The initial binding's qualification does not depend on additional pins.
-            pplx_space_node_runtime_core::catalog::initial_environment_reference()
-                .into_iter()
-                .collect()
+            Some(reference) != initial_environment_reference(execution.guest().architecture)
         }
-    });
-    !supported.contains(&reference)
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// Reject timer-driven operations at policy admission, before a sandbox can
+/// become resident with a policy its adapter will never execute.
+pub(super) fn validate_runtime_lifecycle_policy(
+    runtime: pplx_space_common_core::types::RuntimeKind,
+    policy: &pplx_space_common_core::types::AutoLifecyclePolicy,
+) -> Result<(), Status> {
+    let capabilities = runtime.baseline_capabilities();
+    if !capabilities.pause_resume
+        && policy.contains_action(pplx_space_common_core::types::AutoLifecycleIdleAction::Pause)
+    {
+        return Err(Status::failed_precondition(
+            "runtime does not support automatic pause",
+        ));
+    }
+    if !capabilities.snapshot
+        && policy.contains_action(pplx_space_common_core::types::AutoLifecycleIdleAction::Suspend)
+    {
+        return Err(Status::failed_precondition(
+            "runtime does not support automatic suspend",
+        ));
+    }
+    Ok(())
+}
+
+/// Runtime support does not qualify every installed environment for persisted
+/// state. In particular, historical cold-only CH identities remain cold-only.
+pub(super) fn validate_execution_lifecycle_policy(
+    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    policy: &pplx_space_common_core::types::AutoLifecyclePolicy,
+) -> Result<(), Status> {
+    if execution.is_some_and(requires_cold_creation)
+        && policy.contains_action(pplx_space_common_core::types::AutoLifecycleIdleAction::Suspend)
+    {
+        return Err(Status::failed_precondition(
+            "execution environment does not support automatic suspend",
+        ));
+    }
+    Ok(())
+}

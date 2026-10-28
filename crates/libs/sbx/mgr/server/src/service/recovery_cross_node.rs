@@ -2404,8 +2404,10 @@ fn publish_rebound_sandbox_artifact_metadata(
             crate::snapshot_restore::RestoreError::Other(format!(
                 "resolve restored artifact execution metadata: {error}"
             ))
-        })?
-        .into_execution();
+        })?;
+    let cpu_budget = execution.cpu_budget();
+    let guest_memory = execution.guest_memory();
+    let execution = execution.into_execution();
     let template = meta.source.template_id.parse().map_err(|error| {
         crate::snapshot_restore::RestoreError::Other(format!(
             "invalid restored artifact template: {error}"
@@ -2427,7 +2429,9 @@ fn publish_rebound_sandbox_artifact_metadata(
         execution,
         template,
         content_hash,
-    );
+    )
+    .with_cpu_budget(cpu_budget)
+    .with_guest_memory(guest_memory);
     let metadata_path = sandbox_dir.join("metadata.json");
     let bytes = serde_json::to_vec_pretty(&sandbox_metadata).map_err(|error| {
         crate::snapshot_restore::RestoreError::Other(format!(

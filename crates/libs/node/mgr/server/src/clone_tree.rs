@@ -4,7 +4,7 @@
 //! No recursive permission command or caller-controlled pathname reaches root.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -13,6 +13,7 @@ use nix::sys::stat::{Mode, fchmod, mkdirat};
 use nix::unistd::{Gid, fchown};
 
 use crate::proto::CloneDirectoryIdentity;
+use pplx_space_common_core::types::SandboxArtifactMetadata;
 
 const DIRECTORY: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
@@ -26,10 +27,8 @@ pub(crate) struct CloneTree {
     instance: File,
     vmstate: File,
     memory: File,
-    /// The producer of `vmstate` and `memory`, which restore selects its
-    /// consumer from. Older donors have none, which reads as the initial
-    /// environment.
-    runtime: Option<File>,
+    execution: Option<File>,
+    metadata: Option<SandboxArtifactMetadata>,
     run: File,
 }
 
@@ -57,13 +56,41 @@ impl CloneTree {
                 ));
             }
         }
+        let donor_name = donor;
         let donor = directory(&cache, donor)?;
+        let metadata = match regular_file(&donor, "metadata.json") {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                if bytes.len() > 1024 * 1024 {
+                    return Err(io::Error::other("disk execution metadata exceeds 1 MiB"));
+                }
+                let mut metadata: SandboxArtifactMetadata =
+                    serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                if metadata.sandbox_id.to_string() != donor_name {
+                    return Err(io::Error::other("disk metadata names a different donor"));
+                }
+                metadata.sandbox_id = target_name.parse().map_err(io::Error::other)?;
+                Some(metadata)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         let instance = directory(&donor, "instance")?;
         let snapshot = directory(&donor, "snapshot")?;
         let vmstate = regular_file(&snapshot, "vmstate")?;
         let memory = regular_file(&snapshot, "memory")?;
-        let runtime = match regular_file(&snapshot, "runtime.json") {
-            Ok(runtime) => Some(runtime),
+        // Historical Firecracker checkpoints may lack the sidecar. A present
+        // contract must be copied with the pinned state, never silently dropped.
+        let execution = match regular_file(&snapshot, "runtime.json") {
+            Ok(file) => {
+                if file.metadata()?.len() > 1024 * 1024 {
+                    return Err(io::Error::other(
+                        "checkpoint execution metadata exceeds 1 MiB",
+                    ));
+                }
+                Some(file)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
@@ -75,7 +102,8 @@ impl CloneTree {
             instance,
             vmstate,
             memory,
-            runtime,
+            execution,
+            metadata,
             run,
         })
     }
@@ -100,8 +128,15 @@ impl CloneTree {
         let snapshot = create_directory(&self.target, "snapshot")?;
         copy_file(&self.vmstate, &snapshot, "vmstate", cache_gid)?;
         copy_file(&self.memory, &snapshot, "memory", cache_gid)?;
-        if let Some(runtime) = &self.runtime {
-            copy_file(runtime, &snapshot, "runtime.json", cache_gid)?;
+        if let Some(execution) = &self.execution {
+            copy_file(execution, &snapshot, "runtime.json", cache_gid)?;
+        }
+        if let Some(metadata) = &self.metadata {
+            let mut output = new_file(&self.target, "metadata.json")?;
+            let bytes = serde_json::to_vec(metadata).map_err(io::Error::other)?;
+            output.write_all(&bytes)?;
+            permissions(&output, cache_gid, 0o660)?;
+            output.sync_all()?;
         }
         permissions(&snapshot, cache_gid, 0o2775)?;
         let snapshots = create_directory(&self.target, "snapshots")?;
@@ -153,15 +188,19 @@ fn regular_file(parent: &File, name: &str) -> io::Result<File> {
 }
 
 fn copy_file(source: &File, parent: &File, name: &str, gid: u32) -> io::Result<()> {
-    let output = File::from(openat(
+    let output = new_file(parent, name)?;
+    crate::contained_copy::copy_on_descriptors(source, &output, source.metadata()?.len())?;
+    permissions(&output, gid, 0o660)?;
+    output.sync_all()
+}
+
+fn new_file(parent: &File, name: &str) -> io::Result<File> {
+    Ok(File::from(openat(
         parent,
         name,
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::from_bits_truncate(0o600),
-    )?);
-    crate::contained_copy::copy_on_descriptors(source, &output, source.metadata()?.len())?;
-    permissions(&output, gid, 0o660)?;
-    output.sync_all()
+    )?))
 }
 
 fn permissions(file: &File, gid: u32, mode: u32) -> io::Result<()> {

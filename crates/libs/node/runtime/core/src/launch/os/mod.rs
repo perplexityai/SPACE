@@ -8,6 +8,27 @@ pub use linux::*;
 #[cfg(not(target_os = "linux"))]
 pub use other::*;
 
+/// A lifetime witness without signaling authority. The namespace runner must
+/// observe itself across fork, where the signalable handle's self-PID guard
+/// deliberately does not apply.
+pub struct ProcessObserver(ProcessHandle);
+impl ProcessObserver {
+    pub fn current() -> Result<Self, ProcessHandleError> {
+        pin_current_process().map(Self)
+    }
+    pub fn pid(&self) -> u32 {
+        self.0.pid()
+    }
+    pub fn has_exited(&self) -> std::io::Result<bool> {
+        self.0.has_exited()
+    }
+}
+impl From<ProcessHandle> for ProcessObserver {
+    fn from(handle: ProcessHandle) -> Self {
+        Self(handle)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessOwnership {
     Owned,
@@ -59,6 +80,22 @@ impl ProcessHandle {
 
     pub fn program_matches(&self, program: &str) -> std::io::Result<Option<bool>> {
         self.inspect_while_running(process_matches_program(self.pid(), program))
+    }
+
+    /// Match the unified VM cgroup exactly, not a sandbox ID in argv or a
+    /// sibling sidecar cgroup. Discard evidence if this process exits meanwhile.
+    pub fn cgroup_matches(&self, expected: &std::path::Path) -> std::io::Result<Option<bool>> {
+        let expected = expected
+            .strip_prefix("/sys/fs/cgroup")
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let result = std::fs::read_to_string(format!("/proc/{}/cgroup", self.pid())).map(|text| {
+            text.lines().any(|line| {
+                line.strip_prefix("0::").is_some_and(|path| {
+                    std::path::Path::new(path).strip_prefix("/").ok() == Some(expected)
+                })
+            })
+        });
+        self.inspect_while_running(result)
     }
 
     /// Discard inspection results if the pinned process has exited.

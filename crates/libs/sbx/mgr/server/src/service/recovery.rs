@@ -167,6 +167,7 @@ fn quarantine_recovery_no_progress_reason(
         crate::snapshot_restore::RestoreError::CanonicalRootConflict { .. }
         | crate::snapshot_restore::RestoreError::ParentTemplateLookup { .. }
         | crate::snapshot_restore::RestoreError::BtrfsReceive { .. }
+        | crate::snapshot_restore::RestoreError::ReplaceInstance { .. }
         | crate::snapshot_restore::RestoreError::Other(..) => {
             crate::db::QuarantineRecoveryNoProgressReason::OrphanRestoreDeferred
         }
@@ -470,7 +471,7 @@ impl SandboxManagerService {
             Ok(VmState::Paused) => crate::db::PauseFailedRecoveryTarget::Paused,
             Ok(VmState::NotStarted | VmState::Shutdown) => {
                 return self
-                    .quarantine_interrupted_pause(row, "Firecracker reported NotStarted")
+                    .quarantine_interrupted_pause(row, "runtime reported not started or shut down")
                     .await;
             }
             Err(error) => {
@@ -2426,6 +2427,8 @@ impl SandboxManagerService {
         task_tracker.spawn(async move {
             let _guard = guard;
             let mut recovery_cursor = crate::db::PeriodicLifecycleRecoveryScan::default();
+            #[cfg(target_os = "linux")]
+            let mut exit_cursor = crate::db::PeriodicLifecycleRecoveryScan::runtime_exits();
             let mut staging_scan = staging_cleanup::StagingCleanupScan::default();
             let mut node_client = service.node_manager.lazy();
             let mut inventory_scan = super::cache_cleanup::PeriodicInventoryScan::default();
@@ -2471,6 +2474,23 @@ impl SandboxManagerService {
                     continue;
                 }
             };
+            // Separate discovery capacity: a dense healthy inventory must not
+            // postpone interrupted pause/suspend recovery.
+            #[cfg(target_os = "linux")]
+            {
+                let mut cursor = std::mem::replace(&mut exit_cursor, crate::db::PeriodicLifecycleRecoveryScan::runtime_exits());
+                match service.storage(move |db| {
+                    let rows = crate::db::scan::sandbox_pages(db, &mut cursor)
+                        .map_err(|error| Status::internal(format!("runtime exit discovery: {error}")))?;
+                    Ok((cursor, rows))
+                }).await {
+                    Ok((cursor, rows)) => {
+                        exit_cursor = cursor;
+                        service.recover_periodic_resident_operations(rows, &shutdown_token).await;
+                    }
+                    Err(error) => tracing::warn!(%error, "runtime exit discovery failed; will retry"),
+                }
+            }
             let (publications, residents) = candidates.into_iter()
                 .partition(|row| row.state == SandboxState::Suspending);
             service.recover_periodic_resident_operations(residents, &shutdown_token).await;

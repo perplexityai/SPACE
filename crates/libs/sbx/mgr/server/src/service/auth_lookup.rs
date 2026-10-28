@@ -1007,6 +1007,17 @@ impl SandboxManagerService {
         }
 
         validate_v1_policy(&policy).map_err(Status::invalid_argument)?;
+        let runtime = sandbox
+            .runtime
+            .parse()
+            .map_err(|e| Status::failed_precondition(format!("runtime: {e}")))?;
+        super::validation::validate_runtime_lifecycle_policy(runtime, &policy)
+            .map_err(pplx_space_common_grpc::mark_desired_state_apply_terminal)?;
+        super::validation::validate_execution_lifecycle_policy(
+            sandbox.execution_metadata.as_ref(),
+            &policy,
+        )
+        .map_err(pplx_space_common_grpc::mark_desired_state_apply_terminal)?;
         policy.normalize_in_place();
 
         let mut runtime_state = if sandbox.auto_lifecycle == policy {

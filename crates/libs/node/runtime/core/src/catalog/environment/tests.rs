@@ -65,7 +65,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         .map(|entry| entry.definition().reference())
         .collect();
     assert_eq!(references.len(), environments.len());
-    assert_eq!(environments.len(), 4);
+    assert_eq!(environments.len(), 5);
     for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
         ("1.15.1", "6.1.155", "9.0.0", true),
         ("1.17.0", "6.18.44", "12.0.0", true),
@@ -96,7 +96,12 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
     );
     let arm = CompiledEnvironment::for_architecture(Arch::Aarch64).unwrap();
     assert!(arm.is_empty(), "unqualified ARM64 must not be admitted");
-    let ch = CompiledEnvironment::cloud_hypervisor(Arch::Aarch64).unwrap();
+    let ch = CompiledEnvironment::cloud_hypervisor(
+        &RuntimeCatalog::compiled().unwrap(),
+        Arch::Aarch64,
+        false,
+    )
+    .unwrap();
     assert!(!ch.supports_memory_state());
     let policy = crate::selection::ExecutionPolicy::parse(None, None, &arm).unwrap();
     assert!(policy.default_reference().is_none());
@@ -109,6 +114,16 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
     assert_eq!(x86_execution.guest().architecture, Arch::X86_64);
     assert!(x86_execution.state_format().is_none());
     assert_ne!(x86_ch.definition().reference(), ch.definition().reference());
+    assert_eq!(
+        x86_ch.definition().reference().to_string(),
+        "sha256:002536d84a16cadef74e47a9e59072b4eba0c4032cca8a4b2c37354fbe082fad"
+    );
+    let state_ch = &environments[4];
+    assert!(state_ch.supports_memory_state());
+    assert_ne!(
+        state_ch.definition().reference(),
+        x86_ch.definition().reference()
+    );
     let defaults = crate::selection::ExecutionPolicy::parse(None, None, &environments).unwrap();
     assert!(!defaults.allows(x86_ch.definition().reference()));
 }

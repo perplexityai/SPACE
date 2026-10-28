@@ -84,6 +84,35 @@ impl SandboxManagerService {
             if shutdown.is_cancelled() {
                 return;
             }
+            if row.state == SandboxState::Started {
+                // Both adapters use fenced execution identities. Do not run
+                // process-exit recovery on development hosts without pidfds.
+                if !cfg!(target_os = "linux") { return; }
+                let sandbox_id = match row.id.parse() {
+                    Ok(id) => id,
+                    Err(error) => {
+                        tracing::warn!(sandbox_id = %row.id, %error, "invalid runtime recovery identity");
+                        return;
+                    }
+                };
+                match self.admit_exited_runtime(row.clone()).await {
+                    Ok(Some(admission)) => self.schedule_admitted_async_cleanup(
+                        super::cleanup::AsyncCleanupRequest {
+                            sandbox_id,
+                            uuid8: row.uuid8,
+                            keep_filesystem: true,
+                            context: "runtime exit recovery",
+                            completion: crate::db::CleanupCompletion::MarkStopped,
+                            immediate_kill: true,
+                            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                            persist_intent: false,
+                            cleanup_id: None,
+                        }, admission).await,
+                    Ok(None) => {},
+                    Err(error) => tracing::warn!(sandbox_id = %row.id, error = %error.into_status(), "runtime exit recovery deferred; next inventory pass retries"),
+                }
+                return;
+            }
             let prepare_row = row.clone();
             if let Err(error) = self
                 .recover_resident_with_probe(
@@ -189,7 +218,7 @@ impl SandboxManagerService {
                         detail = "startup checkpoint pause has no durable lifecycle origin".into();
                     }
                     Ok(VmState::NotStarted | VmState::Shutdown) => {
-                        detail = "Firecracker reported NotStarted; resident memory is unavailable"
+                        detail = "runtime reported not started or shut down; resident memory is unavailable"
                             .into();
                     }
                     Err(error) if row.state == SandboxState::Paused => {

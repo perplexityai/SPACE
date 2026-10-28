@@ -242,32 +242,31 @@ impl RuntimeInventory {
             .parent()
             .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
         let runtime = (|| {
+            if let Some(runtime) = self.runtimes.iter().find(|entry| {
+                entry.runtime == release.release && self.defaults.contains(&entry.runtime)
+            }) {
+                return Ok(runtime.clone());
+            }
             let release_root = managed_path(
                 store.releases_root(),
                 release_directory_names(&release.release, release.digest()),
             )?;
             let sealed_release_root = ArtifactStore::execution_release_path(cache_parent, release)?;
-            let shared_runtime = self
-                .runtimes
-                .iter()
-                .find(|entry| {
-                    entry.runtime == release.release && self.defaults.contains(&entry.runtime)
-                })
-                .or_else(|| {
-                    // Reuse only a verified managed copy of this exact release.
-                    // External installations share version keys but lack digest evidence.
-                    self.environments
-                        .values()
-                        .filter_map(|entry| entry.runtime.as_ref().ok())
-                        .find(|entry| {
-                            entry.runtime == release.release
-                                && entry.files.paths().all(|path| {
-                                    path.starts_with(&release_root)
-                                        || path.starts_with(&sealed_release_root)
-                                })
-                        })
-                })
-                .cloned();
+            let shared_runtime = {
+                // Reuse only a verified managed copy of this exact release.
+                // External installations share version keys but lack digest evidence.
+                self.environments
+                    .values()
+                    .filter_map(|entry| entry.runtime.as_ref().ok())
+                    .find(|entry| {
+                        entry.runtime == release.release
+                            && entry.files.paths().all(|path| {
+                                path.starts_with(&release_root)
+                                    || path.starts_with(&sealed_release_root)
+                            })
+                    })
+            }
+            .cloned();
             match shared_runtime {
                 Some(runtime) => Ok(runtime),
                 None => runtime_from_source(
@@ -278,6 +277,21 @@ impl RuntimeInventory {
                 ),
             }
         })();
+        // State support belongs to the qualified binding, not the shared
+        // executable: the same CH release also serves historical cold-only
+        // environments. Never mutate the installation reused by another binding.
+        let runtime = runtime.map(|mut runtime| {
+            if runtime.runtime.kind == RuntimeKind::CloudHypervisor {
+                runtime.state_format = environment
+                    .definition()
+                    .descriptor()
+                    .spec()
+                    .compatibility
+                    .state_format()
+                    .cloned();
+            }
+            runtime
+        });
         let runtime = runtime.map_err(|error| {
             tracing::warn!(%error, "environment runtime unavailable");
             let error = self.binding_error(error);
@@ -462,7 +476,15 @@ fn runtime_from_source(
                 return Ok(runtime);
             }
             Err(error) if error.is_unsupported() => {
-                tracing::warn!(integrity = "publication-sha256", %error, "fs-verity unavailable; retaining verified legacy execution protection");
+                tracing::warn!(integrity = "catalog-sha256", %error, "fs-verity unavailable; using catalog SHA-256 authentication");
+                if pin.release.kind == RuntimeKind::CloudHypervisor {
+                    let root = store.stage_catalog_release_at(pin, source.path(), cache_parent)?;
+                    let mut runtime = DRIVERS
+                        .get(pin.release.kind)?
+                        .inspect_installation(root, pin.release.version.clone())?;
+                    runtime.files.integrity = ExecutionSourceIntegrity::CatalogSha256;
+                    return Ok(runtime);
+                }
             }
             Err(error) => return Err(error.into()),
         }
@@ -471,9 +493,11 @@ fn runtime_from_source(
         RuntimeSource::Store(path) => store.verify_managed_release_at(pin, path)?,
         RuntimeSource::Baked(path) => store.verify_release_at(pin, path)?,
     };
-    DRIVERS
+    let mut runtime = DRIVERS
         .get(pin.release.kind)?
-        .inspect_installation(source.path().to_owned(), pin.release.version.clone())
+        .inspect_installation(source.path().to_owned(), pin.release.version.clone())?;
+    runtime.files.integrity = ExecutionSourceIntegrity::CatalogSha256;
+    Ok(runtime)
 }
 
 struct StagedKernel {
@@ -499,7 +523,7 @@ fn kernel_from_source(
                 });
             }
             Err(error) if error.is_unsupported() => {
-                tracing::warn!(integrity = "publication-sha256", %error, "kernel fs-verity unavailable; retaining verified legacy execution protection");
+                tracing::warn!(integrity = "catalog-sha256", %error, "kernel fs-verity unavailable; using catalog SHA-256 authentication");
             }
             Err(error) => return Err(error.into()),
         }
@@ -516,7 +540,7 @@ fn kernel_from_source(
     };
     Ok(StagedKernel {
         path,
-        integrity: ExecutionSourceIntegrity::Legacy,
+        integrity: ExecutionSourceIntegrity::CatalogSha256,
     })
 }
 

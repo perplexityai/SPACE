@@ -79,11 +79,18 @@ pub(super) fn validate_create_request(
     if req.runtime.is_empty() {
         return Err(Status::invalid_argument("runtime is required"));
     }
-    if req.runtime != "fc" {
-        return Err(Status::unimplemented(format!(
-            "unknown runtime: {}",
-            req.runtime
-        )));
+    let runtime: pplx_space_common_core::types::RuntimeKind = req
+        .runtime
+        .parse()
+        .map_err(|e| Status::invalid_argument(format!("runtime: {e}")))?;
+    if !matches!(
+        runtime,
+        pplx_space_common_core::types::RuntimeKind::Firecracker
+            | pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+    ) {
+        return Err(Status::unimplemented(
+            "runtime has no sandbox lifecycle adapter",
+        ));
     }
     validate_create_request_fields(req)
 }
