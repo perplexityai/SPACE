@@ -9,19 +9,26 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TICK: Duration = Duration::from_secs(300);
-const DEFAULT_MAX_RECORDS_PER_TICK: u32 = 5_000;
+const DEFAULT_MAX_RECORDS_PER_BATCH: u32 = 5_000;
+/// Native file mutations take an idempotency record per request, so expired
+/// records can arrive faster than one batch per tick removes them. A tick
+/// keeps deleting while its batches come back full, up to this many, which
+/// bounds a tick's work at 100,000 records of each kind.
+const DEFAULT_MAX_BATCHES_PER_TICK: u32 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerConfig {
     pub tick: Duration,
-    pub max_records_per_tick: u32,
+    pub max_records_per_batch: u32,
+    pub max_batches_per_tick: u32,
 }
 
 impl Default for ReconcilerConfig {
     fn default() -> Self {
         Self {
             tick: DEFAULT_TICK,
-            max_records_per_tick: DEFAULT_MAX_RECORDS_PER_TICK,
+            max_records_per_batch: DEFAULT_MAX_RECORDS_PER_BATCH,
+            max_batches_per_tick: DEFAULT_MAX_BATCHES_PER_TICK,
         }
     }
 }
@@ -70,6 +77,15 @@ impl TickReport {
         self.operations_deleted
             .saturating_add(self.idempotency_records_deleted)
     }
+
+    fn add(&mut self, batch: Self) {
+        self.operations_deleted = self
+            .operations_deleted
+            .saturating_add(batch.operations_deleted);
+        self.idempotency_records_deleted = self
+            .idempotency_records_deleted
+            .saturating_add(batch.idempotency_records_deleted);
+    }
 }
 
 pub struct Reconciler<S> {
@@ -85,15 +101,29 @@ where
         Self { config, sink }
     }
 
+    /// Delete expired records one batch at a time, each in its own
+    /// transaction, until a batch comes back short of
+    /// `max_records_per_batch` or the tick has run `max_batches_per_tick`.
+    /// Whatever is left waits for the next tick.
     pub async fn tick(&self) -> Result<TickReport, PublicOperationStoreError> {
-        let report = self
-            .sink
-            .gc_expired(PublicOperationGcRequest {
-                max_records: self.config.max_records_per_tick,
-                payload_scrub_rules: FEDERATED_OPERATION_PAYLOAD_SCRUB_RULES,
-            })
-            .await?;
-        let report = TickReport::from(report);
+        let batch_size = u64::from(self.config.max_records_per_batch);
+        let mut report = TickReport::default();
+        for _ in 0..self.config.max_batches_per_tick {
+            let batch = TickReport::from(
+                self.sink
+                    .gc_expired(PublicOperationGcRequest {
+                        max_records: self.config.max_records_per_batch,
+                        payload_scrub_rules: FEDERATED_OPERATION_PAYLOAD_SCRUB_RULES,
+                    })
+                    .await?,
+            );
+            report.add(batch);
+            if batch.operations_deleted < batch_size
+                && batch.idempotency_records_deleted < batch_size
+            {
+                break;
+            }
+        }
         if report.total() > 0 {
             tracing::info!(
                 operations_deleted = report.operations_deleted,
@@ -111,7 +141,8 @@ where
 {
     tracing::info!(
         tick_secs = config.tick.as_secs(),
-        max_records_per_tick = config.max_records_per_tick,
+        max_records_per_batch = config.max_records_per_batch,
+        max_batches_per_tick = config.max_batches_per_tick,
         "starting public-operation-retention reconciler"
     );
 

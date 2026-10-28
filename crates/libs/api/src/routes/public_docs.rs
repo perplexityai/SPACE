@@ -591,9 +591,20 @@ fn insert_snapshot_paths(paths: &mut Map<String, Value>) {
 
 /// How `files:write`, `files:write_batch` and `files:rename` treat their
 /// `Idempotency-Key`; the sandbox holds the result it replays.
-const FILE_KEY_REPLAYED: &str = "The `Idempotency-Key` is bound to this request in this sandbox until it has gone unused for ten minutes: the same key with any other path, data or field returns 409 `idempotency_conflict` and changes nothing. A retry of the same request returns the original result if that request completed within the last minute, and otherwise runs again.";
+fn file_key_replayed() -> String {
+    format!(
+        "The `Idempotency-Key` is bound to this request in this sandbox until it has gone unused for {} minutes: the same key with any other path, data or field returns 409 `idempotency_conflict` and changes nothing. A retry of the same request returns the original result if that request completed within the last minute, and otherwise runs again.",
+        crate::public_operations::KEY_BINDING_TTL_MINUTES
+    )
+}
+
 /// How `files:mkdir` and `files:remove` treat their `Idempotency-Key`.
-const FILE_KEY_RERUN: &str = "The `Idempotency-Key` is bound to this request in this sandbox until it has gone unused for ten minutes: the same key with any other path or field returns 409 `idempotency_conflict` and changes nothing. A retry of the same request runs again, which leaves the same result.";
+fn file_key_rerun() -> String {
+    format!(
+        "The `Idempotency-Key` is bound to this request in this sandbox until it has gone unused for {} minutes: the same key with any other path or field returns 409 `idempotency_conflict` and changes nothing. A retry of the same request runs again, which leaves the same result.",
+        crate::public_operations::KEY_BINDING_TTL_MINUTES
+    )
+}
 
 fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_parameter: &Value) {
     paths.insert(
@@ -604,7 +615,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "description": format!(
                     "`data_base64` carries at most 16 MiB of file content. The request body limit covers that payload's base64 and the other fields, plus room for encoders that escape `/` as `\\/` at up to twice the rate of uniformly distributed data. A payload near 16 MiB whose base64 is mostly `/` (long runs of 0xff bytes) can exceed the limit when escaped; send it without escaping `/`, or split it across writes with `append`. Creating a file, or overwriting a regular file that the writing user owns with no other hard links and no access ACL, replaces the destination with a temporary file where it can, which publishes the new content atomically: readers see the previous content (or no file) or the new, never a partial file. A destination that cannot be renamed over (such as a bind mount), a directory that refuses the temporary file, appends and other files are written in place, without that guarantee, and synced before the write is acknowledged. Acknowledgement does not guarantee that a created or overwritten file persists across a sandbox crash, a forced stop or a host failure, and a writeback error can surface after it. An ordinary stop attempts to flush the sandbox's root filesystem first, but proceeds if that attempt fails or times out. No persistence deadline is promised. With `parents` set, missing parent directories of `path` are created first, as `files:mkdir` creates them for the same `user`; without it a missing parent returns 404. The request body is limited to {} bytes, counting any JSON escaping. {}",
                     super::public::WRITE_FILE_BODY_LIMIT_BYTES,
-                    FILE_KEY_REPLAYED
+                    file_key_replayed()
                 ),
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
@@ -629,7 +640,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                     super::public::MAX_FILE_WRITE_BATCH_BYTES,
                     pplx_space_common_core::spaced::MAX_MESSAGE_BYTES,
                     super::public::WRITE_FILE_BATCH_BODY_LIMIT_BYTES,
-                    FILE_KEY_REPLAYED
+                    file_key_replayed()
                 ),
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
@@ -688,7 +699,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
         json!({
             "post": {
                 "summary": "Create a guest directory idempotently",
-                "description": FILE_KEY_RERUN,
+                "description": file_key_rerun(),
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Directory created or already present" },
@@ -704,7 +715,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
         json!({
             "post": {
                 "summary": "Remove a guest file path idempotently",
-                "description": FILE_KEY_RERUN,
+                "description": file_key_rerun(),
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Path removed or already absent" },
@@ -720,7 +731,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
         json!({
             "post": {
                 "summary": "Rename a guest file path",
-                "description": FILE_KEY_REPLAYED,
+                "description": file_key_replayed(),
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Rename result" },
