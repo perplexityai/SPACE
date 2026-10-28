@@ -7,7 +7,6 @@ use sqlx::types::Json;
 use tonic::Status;
 use uuid::Uuid;
 
-use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 #[cfg(test)]
 use pplx_space_common_core::types::NodeRole;
 use pplx_space_common_core::types::{
@@ -26,8 +25,9 @@ use pplx_space_sandbox_portability::{
 };
 
 use crate::node_publish::store::{
-    absent_sandboxes, activity, degraded_observations, failure_episodes, lifecycle_transitions,
-    network_policy, observed_state,
+    absent_sandboxes, activity, degraded_observations, failure_episodes,
+    inventory_reconcile::{self, enqueue as queue_policy_reconcile_refs_for_new_inventory},
+    lifecycle_transitions, network_policy, observed_state,
     quarantine_claims::{self, ClaimedQuarantineProjection},
     quarantine_persistence, sandbox_facet_observations, snapshot_inventory,
     suspend_finalization::{self, SuspendedFinalizationCandidate},
@@ -48,17 +48,6 @@ use crate::proto::PublishedSandboxState;
 use crate::proto::PublishedTemplateState;
 #[cfg(test)]
 use crate::sandbox_quarantine_store;
-
-const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
-ON CONFLICT (node_id, facet, element) DO UPDATE
-SET generation = node_reconcile_queue.generation + 1,
-    requested_at = EXCLUDED.requested_at,
-    next_attempt_at = NOW(),
-    attempts = 0,
-    last_error = '',
-    dead_at = NULL,
-    dead_reason = '',
-    updated_at = NOW()";
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct QuarantineProjectionSqlInput<'a> {
@@ -157,51 +146,6 @@ fn template_policy_reconcile_refs_for_new_templates(
             ]
         })
         .collect()
-}
-
-async fn queue_policy_reconcile_refs_for_new_inventory(
-    conn: &mut sqlx::PgConnection,
-    node_id: NodeId,
-    refs: Vec<(&'static str, String)>,
-    trigger_reason: ReconcileReason,
-) -> Result<(), Status> {
-    if refs.is_empty() {
-        return Ok(());
-    }
-
-    let facets = refs
-        .iter()
-        .map(|(facet, _)| (*facet).to_string())
-        .collect::<Vec<_>>();
-    let elements = refs
-        .iter()
-        .map(|(_, element)| element.clone())
-        .collect::<Vec<_>>();
-    let query = format!(
-        "WITH refs AS (
-             SELECT DISTINCT facet, element
-             FROM UNNEST($2::TEXT[], $3::TEXT[]) AS refs(facet, element)
-         )
-         INSERT INTO node_reconcile_queue (node_id, facet, element, requested_at, updated_at)
-         SELECT $1, facet, element, NOW(), NOW()
-         FROM refs
-         {NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT}",
-    );
-    sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(&facets)
-        .bind(&elements)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            Status::internal(format!("enqueue first-seen inventory reconcile: {err}"))
-        })?;
-
-    enqueue_triggers_conn(conn, [node_id], trigger_reason)
-        .await
-        .map_err(|err| Status::internal(format!("enqueue first-seen inventory trigger: {err}")))?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -395,6 +339,8 @@ pub async fn publish_sandbox_states(
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ApplySandboxClaimsError {
+    #[error(transparent)]
+    InventoryReconcile(#[from] inventory_reconcile::EnqueueInventoryReconcileError),
     #[error(transparent)]
     Absent(#[from] absent_sandboxes::RemoveAbsentSandboxesError),
     #[error(transparent)]

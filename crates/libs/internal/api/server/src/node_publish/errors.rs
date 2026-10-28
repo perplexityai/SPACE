@@ -1,6 +1,7 @@
 use tonic::Status;
 
 use super::store::ApplyPublishError;
+use super::store::inventory_reconcile::EnqueueInventoryReconcileError;
 use super::store::suspend_finalization::FinalizeSuspensionError;
 use super::store::template_components::ReplaceTemplateComponentsError;
 use super::store::template_inventory::UpsertTemplateInventoryError;
@@ -86,6 +87,12 @@ impl From<PruneTemplateCensusError> for Status {
 
 impl From<ObserveTemplatePolicyError> for Status {
     fn from(error: ObserveTemplatePolicyError) -> Self {
+        Self::internal(error.to_string())
+    }
+}
+
+impl From<EnqueueInventoryReconcileError> for Status {
+    fn from(error: EnqueueInventoryReconcileError) -> Self {
         Self::internal(error.to_string())
     }
 }

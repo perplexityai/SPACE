@@ -5,6 +5,7 @@ pub(crate) mod absent_sandboxes;
 pub(crate) mod activity;
 pub(crate) mod degraded_observations;
 pub(crate) mod failure_episodes;
+pub(crate) mod inventory_reconcile;
 pub(crate) mod lifecycle_transitions;
 pub(crate) mod network_policy;
 pub(crate) mod observed_state;
