@@ -1130,3 +1130,23 @@ local answers and capacity rejections.
 `gateway.reserved_dns.upstream_busy.lookup_in_flight` samples only `Busy` that
 reaches Hickory, not sends on closed connections. A send that races the
 connection's exit can still reach Hickory as `Busy`.
+
+## Upload spool files
+
+The data plane stages each `POST /files` octet-stream body, and each multipart
+`file` part, in a spool file in its temporary directory (`TMPDIR`, else
+`/tmp`). Only the data plane's user can read it. The file is removed when the
+request ends, however it ends. Spool file names are reused once their file is
+gone, so the kernel's cached directory entries for them stay bounded by the
+most files staged at once rather than growing with every upload.
+
+Removal logs under the target `pplx_space_data_plane_server::ecw_files`, with
+the spool file's `path`:
+
+- WARN `failed to remove ECW upload spool file`, with `error`: the file may
+  still be on disk, so its name is not reused while the process runs.
+- DEBUG `ECW upload spool file was already removed`: something else removed
+  the file first. Nothing is left on disk, so the name is reused.
+
+A spool file that can't be created logs WARN `failed to create ECW upload spool
+file` under the same target and fails the request with `500`.

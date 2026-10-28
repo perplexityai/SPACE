@@ -33,6 +33,10 @@ struct Slots {
     next: u64,
 }
 
+/// Removal logs under the request guard's module, where spool cleanup has
+/// always logged.
+const LOG_TARGET: &str = concat!(env!("CARGO_CRATE_NAME"), "::ecw_files");
+
 static PROCESS_SPOOL_NAMES: LazyLock<Arc<SpoolNames>> =
     LazyLock::new(|| Arc::new(SpoolNames::in_dir(std::env::temp_dir())));
 
@@ -118,12 +122,25 @@ impl SpoolPath {
 
 impl Drop for SpoolPath {
     fn drop(&mut self) {
+        let path = self.path.display();
         match std::fs::remove_file(&self.path) {
             Ok(()) => self.names.free_slot(self.slot),
+            // Nothing is left under the name, so it can be reused.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    %path,
+                    "ECW upload spool file was already removed"
+                );
                 self.names.free_slot(self.slot);
             }
-            Err(error) => tracing::warn!(%error, "failed to remove ECW upload spool file"),
+            // The file may still be on disk, so the name stays out of use.
+            Err(error) => tracing::warn!(
+                target: LOG_TARGET,
+                %path,
+                %error,
+                "failed to remove ECW upload spool file"
+            ),
         }
     }
 }
