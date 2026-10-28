@@ -1037,13 +1037,18 @@ Template pulls trace `materialize_rootfs` under `pull_in_scope`. Its
 `rootfs.publish`. The uncompressed path uses `rootfs.raw_setup` and
 `hash_rootfs_file`.
 
-Each concurrent stage gets a `rootfs.stage` span with a `stage` of `decode`,
-`compressed_input`, `compressed_hash`, `decoded_hash`, `writer` or `raw_hash`,
-and records `busy_ms`, `recv_wait_ms`, `send_wait_ms`, `wall_ms` and `bytes`
-when it ends, including on error. Counters are taken once per pooled chunk.
-On success only, the decoder also records `read_ms` (inclusive zstd read
-time; `busy_ms` subtracts the nested compressed-input time), and the writer
-records `data_bytes` and `hole_bytes` (logical sparse classification). A
+Each concurrent stage gets its own span: `rootfs.read_compressed` (local
+artifact reads), `rootfs.hash_compressed` (artifact SHA-256),
+`rootfs.zstd_decode`, `rootfs.hash_decoded` (template content hash),
+`rootfs.write_sparse` and, on the uncompressed path, `rootfs.hash_raw`. The
+`stage` attribute repeats the name without the prefix for queries, and hash
+stages set `hash_algorithm`. Each records `busy_ms`, `recv_wait_ms`,
+`send_wait_ms`, `wall_ms` and `bytes` when it ends, including on error.
+Counters are taken once per pooled chunk. On success only, the decoder also
+records `read_ms` (inclusive zstd read time; `busy_ms` subtracts the nested
+compressed-input time), and the writer records `data_bytes`, `hole_bytes`
+(logical sparse classification) and `file_io_ms` (writes, truncates, seeks
+and flushes; the rest of its busy time is zero scanning and buffering). A
 failed stage span carries just the common fields.
 
 The stage with high `busy_ms` and low waits is the limiter. Stage wall times

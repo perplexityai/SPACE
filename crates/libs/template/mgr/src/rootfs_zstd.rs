@@ -39,24 +39,43 @@ struct StageTiming {
     bytes: u64,
 }
 
+/// One concurrent materialization stage. Each gets its own span name so the
+/// trace view reads as the pipeline; `stage` carries the same value for queries.
 enum RootfsStage {
-    Decode,
-    CompressedInput,
-    CompressedHash,
-    DecodedHash,
-    Writer,
-    RawHash,
+    /// Read the compressed artifact from local disk into pooled buffers.
+    ReadCompressed,
+    /// SHA-256 of the compressed artifact, checked against the release.
+    HashCompressed,
+    /// zstd decode into pooled decoded buffers.
+    ZstdDecode,
+    /// Content hash of the decoded image, the template identity.
+    HashDecoded,
+    /// Zero classification and sparse writes to the temp file.
+    WriteSparse,
+    /// Content hash of an uncompressed artifact.
+    HashRaw,
 }
 
 impl RootfsStage {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Decode => "decode",
-            Self::CompressedInput => "compressed_input",
-            Self::CompressedHash => "compressed_hash",
-            Self::DecodedHash => "decoded_hash",
-            Self::Writer => "writer",
-            Self::RawHash => "raw_hash",
+            Self::ReadCompressed => "read_compressed",
+            Self::HashCompressed => "hash_compressed",
+            Self::ZstdDecode => "zstd_decode",
+            Self::HashDecoded => "hash_decoded",
+            Self::WriteSparse => "write_sparse",
+            Self::HashRaw => "hash_raw",
+        }
+    }
+
+    fn span_name(&self) -> &'static str {
+        match self {
+            Self::ReadCompressed => "rootfs.read_compressed",
+            Self::HashCompressed => "rootfs.hash_compressed",
+            Self::ZstdDecode => "rootfs.zstd_decode",
+            Self::HashDecoded => "rootfs.hash_decoded",
+            Self::WriteSparse => "rootfs.write_sparse",
+            Self::HashRaw => "rootfs.hash_raw",
         }
     }
 }
@@ -66,7 +85,9 @@ impl StageTiming {
         Self {
             span: tracing::info_span!(
                 "rootfs.stage",
+                otel.name = stage.span_name(),
                 stage = stage.as_str(),
+                hash_algorithm = tracing::field::Empty,
                 busy_ms = tracing::field::Empty,
                 recv_wait_ms = tracing::field::Empty,
                 send_wait_ms = tracing::field::Empty,
@@ -75,6 +96,7 @@ impl StageTiming {
                 read_ms = tracing::field::Empty,
                 data_bytes = tracing::field::Empty,
                 hole_bytes = tracing::field::Empty,
+                file_io_ms = tracing::field::Empty,
             ),
             started: Instant::now(),
             busy: Stopwatch::new(),
@@ -448,7 +470,7 @@ fn decode_rootfs_chunks(
     free_rx: &Receiver<Vec<u8>>,
     pipeline: MaterializationPipeline,
 ) -> Result<(MaterializationPipeline, u64), RootfsZstdError> {
-    let mut timing = StageTiming::new(RootfsStage::Decode);
+    let mut timing = StageTiming::new(RootfsStage::ZstdDecode);
     let mut read_time = Stopwatch::new();
     loop {
         let Ok(buffer) = timing.recv_wait.time(|| free_rx.recv()) else {
@@ -583,7 +605,8 @@ pub(crate) fn hash_rootfs_file(
     let mut rootfs_size = 0u64;
     let mut rootfs_hasher = ContentHasher::new(algorithm);
     let mut buffer = vec![0u8; 1024 * 1024];
-    let mut timing = StageTiming::new(RootfsStage::RawHash);
+    let mut timing = StageTiming::new(RootfsStage::HashRaw);
+    timing.span.record("hash_algorithm", algorithm.as_str());
     let mut read_time = Stopwatch::new();
     loop {
         let read = read_time
@@ -767,7 +790,7 @@ impl<R: Read> HashedCompressedInput<R> {
             hash_tx: Some(hash_tx),
             free_rx,
             hash_handle: Some(hash_handle),
-            timing: StageTiming::new(RootfsStage::CompressedInput),
+            timing: StageTiming::new(RootfsStage::ReadCompressed),
         })
     }
 
@@ -899,7 +922,8 @@ fn hash_compressed_rootfs_chunks(
     chunk_rx: Receiver<std::sync::Arc<CompressedInputChunk>>,
     free_tx: SyncSender<std::sync::Arc<CompressedInputChunk>>,
 ) -> Result<String, RootfsZstdError> {
-    let mut timing = StageTiming::new(RootfsStage::CompressedHash);
+    let mut timing = StageTiming::new(RootfsStage::HashCompressed);
+    timing.span.record("hash_algorithm", "sha256");
     let mut hasher = sha256_hasher();
     for chunk in timing.recv_wait.time_each(chunk_rx) {
         let bytes = chunk.bytes().map_err(|_| RootfsZstdError::Pipeline {
@@ -919,7 +943,7 @@ fn write_decoded_rootfs_chunks(
     chunk_rx: Receiver<DecodedRootfsChunk>,
     free_tx: SyncSender<Vec<u8>>,
 ) -> Result<SparseRootfsOutput, RootfsZstdError> {
-    let mut timing = StageTiming::new(RootfsStage::Writer);
+    let mut timing = StageTiming::new(RootfsStage::WriteSparse);
     let mut sparse_writer =
         SparseFileWriter::new(output, ROOTFS_SPARSE_BLOCK_BYTES).map_err(|source| {
             RootfsZstdError::Io {
@@ -945,18 +969,21 @@ fn write_decoded_rootfs_chunks(
         timing.bytes = decoded_size;
         let _ = timing.send_wait.time(|| free_tx.send(chunk.into_buffer()));
     }
-    let (output, hole_bytes) = timing
+    let finished = timing
         .busy
-        .time(|| sparse_writer.finish_with_stats())
+        .time(|| sparse_writer.finish_with_report())
         .map_err(|source| RootfsZstdError::Io {
             operation: "finalize sparse rootfs temp",
             path: tmp.display().to_string(),
             source,
         })?;
+    let hole_bytes = finished.hole_bytes;
     timing.span.record("hole_bytes", hole_bytes);
     timing
         .span
         .record("data_bytes", decoded_size.saturating_sub(hole_bytes));
+    timing.record_ms("file_io_ms", finished.file_io);
+    let output = finished.file;
     page_cache::advise_dontneed(&output, &tmp, "write decompressed rootfs output");
     Ok(SparseRootfsOutput { decoded_size })
 }
@@ -966,7 +993,8 @@ fn hash_decoded_rootfs_chunks(
     writer_tx: SyncSender<DecodedRootfsChunk>,
     algorithm: HashAlg,
 ) -> Result<RootfsHashOutput, RootfsZstdError> {
-    let mut timing = StageTiming::new(RootfsStage::DecodedHash);
+    let mut timing = StageTiming::new(RootfsStage::HashDecoded);
+    timing.span.record("hash_algorithm", algorithm.as_str());
     let mut hasher = ContentHasher::new(algorithm);
     let mut decoded_size = 0u64;
     for chunk in timing.recv_wait.time_each(chunk_rx) {

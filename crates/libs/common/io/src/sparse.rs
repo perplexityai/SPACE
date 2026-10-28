@@ -9,6 +9,9 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use pplx_space_stopwatch::Stopwatch;
 
 const DATA_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
@@ -87,8 +90,21 @@ pub struct SparseFileWriter {
     position: u64,
     materialization: SparseMaterialization,
     candidate_observer: Option<Arc<AtomicU64>>,
+    file_io: Stopwatch,
     #[cfg(target_os = "macos")]
     holes: Vec<(u64, u64)>,
+}
+
+/// What [`SparseFileWriter::finish_with_report`] observed.
+#[derive(Debug)]
+pub struct SparseFinish {
+    /// The finished output file.
+    pub file: File,
+    /// Logical bytes classified as holes.
+    pub hole_bytes: u64,
+    /// Time spent in file writes, truncates, seeks and flushes. The rest of
+    /// the writer's time is zero classification and buffering.
+    pub file_io: Duration,
 }
 
 impl SparseFileWriter {
@@ -167,8 +183,20 @@ impl SparseFileWriter {
             position: 0,
             materialization: SparseMaterialization::default(),
             candidate_observer,
+            file_io: Stopwatch::new(),
             #[cfg(target_os = "macos")]
             holes: Vec::new(),
+        })
+    }
+
+    /// Finalizes the output and reports holes and file I/O time.
+    pub fn finish_with_report(mut self) -> std::io::Result<SparseFinish> {
+        self.flush_block()?;
+        self.flush_output()?;
+        Ok(SparseFinish {
+            file: self.inner,
+            hole_bytes: self.candidate_hole_bytes,
+            file_io: self.file_io.elapsed(),
         })
     }
 
@@ -267,7 +295,7 @@ impl SparseFileWriter {
         }
         let offset = self.position;
         let length = self.data.len() as u64;
-        self.inner.write_all(&self.data)?;
+        self.file_io.time(|| self.inner.write_all(&self.data))?;
         self.position = self
             .position
             .checked_add(length)
@@ -296,8 +324,10 @@ impl SparseFileWriter {
         let end = start
             .checked_add(self.pending_hole_bytes)
             .ok_or_else(|| std::io::Error::other("sparse output exceeds u64::MAX"))?;
-        self.inner.set_len(end)?;
-        self.inner.seek(SeekFrom::Start(end))?;
+        self.file_io.time(|| {
+            self.inner.set_len(end)?;
+            self.inner.seek(SeekFrom::Start(end))
+        })?;
         #[cfg(target_os = "macos")]
         self.holes.push((start, self.pending_hole_bytes));
         self.position = end;
@@ -308,7 +338,7 @@ impl SparseFileWriter {
     fn flush_output(&mut self) -> std::io::Result<()> {
         self.flush_data()?;
         self.flush_hole()?;
-        self.inner.flush()?;
+        self.file_io.time(|| self.inner.flush())?;
         #[cfg(target_os = "macos")]
         self.punch_recorded_holes();
         if let Some(observer) = self.candidate_observer.as_ref() {
