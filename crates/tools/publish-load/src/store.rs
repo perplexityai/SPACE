@@ -17,6 +17,9 @@ use uuid::Uuid;
 
 use crate::{Args, Node};
 
+mod policy;
+pub use policy::{seed_policy_failure, verify_policy_observation};
+
 /// Enable statement inspection only after the launcher-owned fixture is open.
 /// PostgreSQL takes extension-catalog locks; no publication rows are touched.
 pub async fn enable_statement_capture(pool: &PgPool) -> Result<()> {

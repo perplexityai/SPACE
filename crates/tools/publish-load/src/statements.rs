@@ -4,7 +4,11 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
+use pplx_space_common_core::types::PolicyAuthority;
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
+use pplx_space_net_common::proto::{
+    EgressDefaultAction, NetworkPolicySource, NetworkPolicyV1, NetworkPolicyVersion,
+};
 use pplx_space_node_api_client::proto::{
     NodeRole, NodeSchedulingStatus, PublishNodeStateRequest, PublishedNodeStatus,
     PublishedTemplateState,
@@ -27,6 +31,8 @@ enum ScenarioKind {
     Templates,
     OrdinarySingle,
     FullInventory,
+    NetworkPolicy,
+    OmittedNetworkPolicy,
     SnapshotInventory,
     ClearSnapshotInventory,
     FailureEvidence,
@@ -162,6 +168,8 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
         full.sandboxes.clone_from(&node.sandboxes);
         scenarios.push(capture(db, &service, ScenarioKind::FullInventory, full).await?);
         for name in [
+            ScenarioKind::NetworkPolicy,
+            ScenarioKind::OmittedNetworkPolicy,
             ScenarioKind::SnapshotInventory,
             ScenarioKind::ClearSnapshotInventory,
             ScenarioKind::FailureEvidence,
@@ -175,6 +183,17 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
                 .context("ordinary sandbox missing")?
                 .clone();
             match name {
+                ScenarioKind::NetworkPolicy => {
+                    sandbox.observed_network_policy = Some(NetworkPolicyV1 {
+                        version: NetworkPolicyVersion::V1.into(),
+                        egress_default_action: EgressDefaultAction::Allow.into(),
+                        ..Default::default()
+                    });
+                    sandbox.observed_network_policy_generation = 7;
+                    sandbox.observed_network_policy_source = NetworkPolicySource::Override.into();
+                    sandbox.observed_network_policy_authority =
+                        PolicyAuthority::Cluster.as_proto_i32();
+                }
                 ScenarioKind::SnapshotInventory => {
                     sandbox.snapshots.push(SnapshotDetail {
                         id: "synthetic-inventory-snapshot".to_owned(),
@@ -192,10 +211,27 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
                 _ => {}
             }
             let sandbox_id = sandbox.sandbox_id.parse()?;
+            let node_id = node.id.parse()?;
+            if matches!(
+                name,
+                ScenarioKind::NetworkPolicy | ScenarioKind::OmittedNetworkPolicy
+            ) {
+                store::seed_policy_failure(&db.pool, node_id, sandbox_id).await?;
+            }
             let mut partial = request(node);
             partial.sandboxes.push(sandbox);
             scenarios.push(capture(db, &service, name, partial).await?);
             match name {
+                ScenarioKind::NetworkPolicy | ScenarioKind::OmittedNetworkPolicy => {
+                    store::verify_policy_observation(
+                        &db.pool,
+                        node_id,
+                        sandbox_id,
+                        7,
+                        matches!(name, ScenarioKind::OmittedNetworkPolicy),
+                    )
+                    .await?;
+                }
                 ScenarioKind::SnapshotInventory => ensure!(
                     store::snapshot_inventory(&db.pool, sandbox_id).await?
                         == [(

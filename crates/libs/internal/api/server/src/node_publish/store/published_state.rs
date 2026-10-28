@@ -37,7 +37,7 @@ use pplx_space_sandbox_portability::{
 
 use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes, lifecycle_transitions,
-    observed_state, sandbox_facet_observations, snapshot_inventory,
+    network_policy, observed_state, sandbox_facet_observations, snapshot_inventory,
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 #[cfg(test)]
@@ -880,6 +880,12 @@ pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     Failed(#[from] lifecycle_transitions::ConvergeFailedError),
     #[error(transparent)]
+    NetworkPolicyAuthority(#[from] network_policy::UpdateAuthorityError),
+    #[error(transparent)]
+    NetworkPolicy(#[from] network_policy::UpsertPolicyError),
+    #[error(transparent)]
+    NetworkPolicyCondition(#[from] network_policy::ClearApplyFailureError),
+    #[error(transparent)]
     FailureEpisodes(#[from] failure_episodes::ReconcileFailureEpisodesError),
     #[error(transparent)]
     SnapshotInventory(#[from] snapshot_inventory::ReplaceSnapshotInventoryError),
@@ -1315,125 +1321,9 @@ pub(crate) async fn publish_validated_sandbox_states(
     .await?;
 
     if publishes_network_policy {
-        sqlx::query(
-            sql!("WITH input AS (
-                 SELECT *
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_generation BIGINT,
-                     observed_network_policy_authority TEXT
-                 )
-             ),
-             publishable AS (
-                 SELECT input.*
-                 FROM input
-                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE (s.id IS NULL OR s.active_node_id = $1)
-                   AND input.observed_network_policy_generation IS NOT NULL
-             )
-             UPDATE sandbox_observed_states sos
-             SET network_policy_authority = publishable.observed_network_policy_authority
-             FROM publishable
-             WHERE sos.sandbox_id = publishable.sandbox_id
-               AND sos.node_id = $1
-               AND sos.network_policy_authority IS DISTINCT FROM publishable.observed_network_policy_authority"),
-        )
-        .bind(node_id)
-        .bind(rows_json.clone())
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            Status::internal(format!("update sandbox observed network policy authority: {err}"))
-        })?;
-
-        sqlx::query(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_json JSONB,
-                     observed_network_policy_generation BIGINT,
-                     observed_network_policy_source TEXT,
-                     observed_network_policy_authority TEXT
-                 )
-             ),
-             publishable AS (
-                 SELECT input.*
-                 FROM input
-                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE s.id IS NULL
-                    OR s.active_node_id = $1
-             )
-             INSERT INTO node_facet_observed_status (
-                 node_id, facet, element, observed_generation, observed_payload,
-                 applied_source, applied_authority, observed_at, updated_at
-             )
-             SELECT
-                 $1,
-                 $3,
-                 'sandbox:' || sandbox_id::text,
-                 observed_network_policy_generation,
-                 observed_network_policy_json,
-                 observed_network_policy_source,
-                 observed_network_policy_authority,
-                 NOW(),
-                 NOW()
-             FROM publishable
-             WHERE observed_network_policy_generation IS NOT NULL
-             ON CONFLICT (node_id, facet, element) DO UPDATE
-             SET observed_generation = EXCLUDED.observed_generation,
-                 observed_payload = EXCLUDED.observed_payload,
-                 applied_source = EXCLUDED.applied_source,
-                 applied_authority = EXCLUDED.applied_authority,
-                 observed_at = EXCLUDED.observed_at,
-                 updated_at = NOW()
-             WHERE (
-                 node_facet_observed_status.observed_generation,
-                 node_facet_observed_status.observed_payload,
-                 node_facet_observed_status.applied_source,
-                 node_facet_observed_status.applied_authority
-             ) IS DISTINCT FROM (
-                 EXCLUDED.observed_generation,
-                 EXCLUDED.observed_payload,
-                 EXCLUDED.applied_source,
-                 EXCLUDED.applied_authority
-             )"
-        ))
-        .bind(node_id)
-        .bind(rows_json.clone())
-        .bind(FACET_NETWORK_POLICY)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| Status::internal(format!("upsert network policy facet status: {err}")))?;
-
-        sqlx::query(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_generation BIGINT
-                 )
-             ),
-             publishable AS (
-                 SELECT input.*
-                 FROM input
-                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE (s.id IS NULL OR s.active_node_id = $1)
-                   AND input.observed_network_policy_generation IS NOT NULL
-             )
-             DELETE FROM node_facet_conditions nfc
-             USING publishable
-             WHERE nfc.node_id = $1
-               AND nfc.facet = $3
-               AND nfc.element = 'sandbox:' || publishable.sandbox_id::text
-               AND nfc.condition_type = 'ApplyFailed'"
-        ))
-        .bind(node_id)
-        .bind(rows_json.clone())
-        .bind(FACET_NETWORK_POLICY)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| Status::internal(format!("clear network policy apply condition: {err}")))?;
+        network_policy::update_authority(conn, node_id, rows_json.clone()).await?;
+        network_policy::upsert(conn, node_id, rows_json.clone()).await?;
+        network_policy::clear_apply_failure(conn, node_id, rows_json.clone()).await?;
     }
 
     snapshot_inventory::replace(conn, &accepted_ids, &snapshot_rows).await?;
