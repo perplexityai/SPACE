@@ -65,6 +65,7 @@ impl RefusedWatch {
                         root: root.clone(),
                         descendants: vec![],
                         skipped: vec![],
+                        skipped_truncated: false,
                     },
                     tokio_util::task::TaskTracker::new(),
                 )
@@ -86,6 +87,7 @@ impl RefusedWatch {
                     std::future::ready(DirectoryAdjustment::Applied)
                 }
             },
+            |_| std::future::ready(true),
             scan_spawner,
         );
         Self {
@@ -209,10 +211,14 @@ fn skipped_directories_track_only_what_a_permission_change_can_recover() {
     skipped.forget(&[root.join("d")]);
     assert!(skipped.take_hits(&metadata(root.join("d"))).is_empty());
 
-    // Past the cap new skips are dropped rather than failing the watch.
+    // Past the cap new skips aren't reported, rather than failing the watch.
+    // The cap counts every reported skip, `a` too while it is walked again,
+    // so the next-to-last one is kept only for recovery, and the last one fits
+    // neither bound.
     skipped.remember((0..=MAX_SKIPPED_DIRECTORIES).map(|index| root.join(index.to_string())));
+    assert_eq!(skipped.unwatched.len(), MAX_SKIPPED_DIRECTORIES);
     assert_eq!(skipped.paths.len(), MAX_SKIPPED_DIRECTORIES);
-    assert!(skipped.overflowed);
+    assert!(skipped.incomplete && skipped.overflowed);
 }
 
 #[cfg(target_os = "linux")]
@@ -247,6 +253,7 @@ async fn a_directory_made_readable_while_its_scan_runs_is_walked_again() {
         })
     };
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (coverage_tx, mut coverage_rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
     spawn_notify_task_with_scanner(
         NotifyTaskConfig {
@@ -260,6 +267,7 @@ async fn a_directory_made_readable_while_its_scan_runs_is_walked_again() {
                     root: root.clone(),
                     descendants: vec![],
                     skipped: vec![],
+                    skipped_truncated: false,
                 },
                 tokio_util::task::TaskTracker::new(),
             )
@@ -272,6 +280,7 @@ async fn a_directory_made_readable_while_its_scan_runs_is_walked_again() {
             async move { event_tx.send(event).is_ok() }
         },
         |_, _, _| std::future::ready(DirectoryAdjustment::Applied),
+        move |change| std::future::ready(coverage_tx.send(change).is_ok()),
         scan_spawner,
     );
     let scan_read = || async {
@@ -329,7 +338,31 @@ async fn a_directory_made_readable_while_its_scan_runs_is_walked_again() {
         watched.is_ok(),
         "`late` is watched after its permissions are restored"
     );
+    // The scan that met `late` reports it a skip, and the walk that registers
+    // it ends the skip, so a consumer rescans what was written meanwhile.
     shutdown.cancel();
+    let mut reported = Vec::new();
+    while let Ok(change) = coverage_rx.try_recv() {
+        reported.extend(
+            change
+                .unwatched
+                .into_iter()
+                .map(|path| (FileEventKind::Unwatched, path)),
+        );
+        reported.extend(
+            change
+                .rewatched
+                .into_iter()
+                .map(|path| (FileEventKind::Rewatched, path)),
+        );
+    }
+    assert_eq!(
+        reported,
+        [
+            (FileEventKind::Unwatched, late.clone()),
+            (FileEventKind::Rewatched, late),
+        ]
+    );
 }
 
 // A recursive watch planned and scanned the way production does it, with a
@@ -402,6 +435,7 @@ impl SettlingWatch {
                     std::future::ready(DirectoryAdjustment::Applied)
                 }
             },
+            |_| std::future::ready(true),
             scan_spawner,
         );
         let watch = Self {
@@ -749,18 +783,18 @@ async fn a_refused_watch_remembers_the_ancestor_that_blocks_it() {
     let ancestor = root.join("a");
     std::fs::create_dir_all(ancestor.join("b/c")).unwrap();
     std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let remembered = refused_with_blocking_ancestors(&root, vec![ancestor.join("b/c")]).await;
+    let remembered = blocking_ancestors(&root, &[ancestor.join("b/c")]).await;
     std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(remembered, vec![ancestor.clone(), ancestor.join("b/c")]);
+    assert_eq!(remembered, vec![ancestor.clone()]);
 
     // A directory refused for its own mode can still be looked up, so only it
     // is remembered, not an ancestor that blocks nothing.
     let locked = root.join("locked");
     std::fs::create_dir(&locked).unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let remembered = refused_with_blocking_ancestors(&root, vec![locked.clone()]).await;
+    let remembered = blocking_ancestors(&root, std::slice::from_ref(&locked)).await;
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(remembered, vec![locked]);
+    assert!(remembered.is_empty());
 }
 
 #[test]
@@ -798,6 +832,7 @@ fn scan_of(candidates: BTreeSet<PathBuf>, rechecks: BTreeSet<PathBuf>) -> Direct
             Ok(DirectoryScanResult {
                 directories: Vec::new(),
                 skipped: Vec::new(),
+                skipped_truncated: false,
                 incomplete: false,
             })
         }),

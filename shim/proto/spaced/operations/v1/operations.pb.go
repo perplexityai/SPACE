@@ -87,6 +87,42 @@ const (
 	FileEventKind_FILE_EVENT_KIND_REMOVED     FileEventKind = 3
 	FileEventKind_FILE_EVENT_KIND_RENAMED     FileEventKind = 4
 	FileEventKind_FILE_EVENT_KIND_CHMOD       FileEventKind = 5
+	// Coverage of a recursive watch, sent whatever include_metadata_events and
+	// the globs select. Neither ends the watch, unlike a lost event, though a
+	// burst of them can overflow a consumer's buffer as any burst can. A
+	// consumer that joins a watch already missing a subtree receives UNWATCHED
+	// for it first. Older guests never send them.
+	//
+	// The directory at path is no longer fully watched: this identity can't
+	// read it, or can't inspect its entries. Nothing under it is watched except
+	// directories the watch had already registered; when the listed directory
+	// is itself watched, only its subdirectories are missing.
+	//
+	// With path "." it names the watch root: this consumer wasn't told about
+	// every skipped directory, or the root turned unreadable. Treat the
+	// consumer's coverage as incomplete until a restated list, described
+	// below, leaves "." out, or the watch ends. When "." came only because one
+	// step's changes didn't fit this consumer, no list is restated for that
+	// alone; the next REWATCHED for "." restates it.
+	// A watch tracks at most 4,096 skipped directories, and one step tells a
+	// consumer about only as many as fit about a quarter of a stream's buffer,
+	// as does a consumer joining.
+	//
+	// UNWATCHED for every current skip, within that bound, also follows a pull
+	// watcher's lost history and REWATCHED for "." below. That list replaces
+	// the per-directory list the consumer was told before.
+	FileEventKind_FILE_EVENT_KIND_UNWATCHED FileEventKind = 6
+	// A directory that was left out is watched again, or it or a directory
+	// above it was removed or renamed away. Changes made under it in between
+	// weren't reported, so rescan it. A directory renamed within the watch that
+	// is still unreadable is reported UNWATCHED at its new path.
+	//
+	// With path "." it asks for a rescan of the whole watch: the root is
+	// readable again, more directories returned at once than fit about a
+	// quarter of a stream's buffer, a returned directory's path can't be
+	// carried exactly, or an incomplete list is complete again. UNWATCHED for
+	// the current skips follows.
+	FileEventKind_FILE_EVENT_KIND_REWATCHED FileEventKind = 7
 )
 
 // Enum value maps for FileEventKind.
@@ -98,6 +134,8 @@ var (
 		3: "FILE_EVENT_KIND_REMOVED",
 		4: "FILE_EVENT_KIND_RENAMED",
 		5: "FILE_EVENT_KIND_CHMOD",
+		6: "FILE_EVENT_KIND_UNWATCHED",
+		7: "FILE_EVENT_KIND_REWATCHED",
 	}
 	FileEventKind_value = map[string]int32{
 		"FILE_EVENT_KIND_UNSPECIFIED": 0,
@@ -106,6 +144,8 @@ var (
 		"FILE_EVENT_KIND_REMOVED":     3,
 		"FILE_EVENT_KIND_RENAMED":     4,
 		"FILE_EVENT_KIND_CHMOD":       5,
+		"FILE_EVENT_KIND_UNWATCHED":   6,
+		"FILE_EVENT_KIND_REWATCHED":   7,
 	}
 )
 
@@ -1457,7 +1497,8 @@ type WatchRequest struct {
 	// such directories. Changes that raise no file event, such as a
 	// security-policy update, don't, and files written while it was left out
 	// aren't reported.
-	// An unreadable root is refused at setup.
+	// An unreadable root is refused at setup. FILE_EVENT_KIND_UNWATCHED and
+	// FILE_EVENT_KIND_REWATCHED report what is left out and when it returns.
 	Recursive             bool     `protobuf:"varint,2,opt,name=recursive,proto3" json:"recursive,omitempty"`
 	IncludeMetadataEvents bool     `protobuf:"varint,3,opt,name=include_metadata_events,json=includeMetadataEvents,proto3" json:"include_metadata_events,omitempty"`
 	IncludeGlobs          []string `protobuf:"bytes,4,rep,name=include_globs,json=includeGlobs,proto3" json:"include_globs,omitempty"`
@@ -2269,9 +2310,32 @@ type GetModifiedFilesResponse struct {
 	RetainedSince     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=retained_since,json=retainedSince,proto3,oneof" json:"retained_since,omitempty"`
 	Cursor            *string                `protobuf:"bytes,4,opt,name=cursor,proto3,oneof" json:"cursor,omitempty"`
 	MonitoringEnabled bool                   `protobuf:"varint,5,opt,name=monitoring_enabled,json=monitoringEnabled,proto3" json:"monitoring_enabled,omitempty"`
-	Overflowed        bool                   `protobuf:"varint,6,opt,name=overflowed,proto3" json:"overflowed,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Rescan everything: changes were lost.
+	Overflowed bool `protobuf:"varint,6,opt,name=overflowed,proto3" json:"overflowed,omitempty"`
+	// Absolute directories that the observed roots don't currently cover, as
+	// FILE_EVENT_KIND_UNWATCHED describes, sorted and capped. Unlike
+	// overflowed, this concerns only these subtrees. A path that was listed
+	// and no longer is was watched again or removed, or a capped list left it
+	// out: rescan it. A skip that ends, however it ends, also sets overflowed
+	// for a query reaching back before it ended, so one that starts and ends
+	// between two queries isn't missed; once the list is truncated, removing a
+	// skip it doesn't name may not. Empty for older guests, which don't report
+	// skips; a watch on one may still have them.
+	UnwatchedPaths []string `protobuf:"bytes,7,rep,name=unwatched_paths,json=unwatchedPaths,proto3" json:"unwatched_paths,omitempty"`
+	// unwatched_paths is incomplete, so a path's absence proves nothing: the
+	// list was capped, a path couldn't be carried exactly, a root skipped more
+	// directories than it reports, or a root turned unreadable. Each cause
+	// clears on its own: a capped list once it fits, a path that couldn't be
+	// carried once its skip ends, and the last two only once a walk of the
+	// root, as when it turns readable again, finishes with every skip and
+	// result it found. A walk some of whose results a directory's removal or
+	// rename made stale doesn't count, and the root may not be walked again,
+	// so those two can leave it set for the rest of the watch. A directory
+	// created or moved in during the walk is reported by a later walk of it or
+	// one of its ancestors, while overflowed is set.
+	UnwatchedPathsTruncated bool `protobuf:"varint,8,opt,name=unwatched_paths_truncated,json=unwatchedPathsTruncated,proto3" json:"unwatched_paths_truncated,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *GetModifiedFilesResponse) Reset() {
@@ -2342,6 +2406,20 @@ func (x *GetModifiedFilesResponse) GetMonitoringEnabled() bool {
 func (x *GetModifiedFilesResponse) GetOverflowed() bool {
 	if x != nil {
 		return x.Overflowed
+	}
+	return false
+}
+
+func (x *GetModifiedFilesResponse) GetUnwatchedPaths() []string {
+	if x != nil {
+		return x.UnwatchedPaths
+	}
+	return nil
+}
+
+func (x *GetModifiedFilesResponse) GetUnwatchedPathsTruncated() bool {
+	if x != nil {
+		return x.UnwatchedPathsTruncated
 	}
 	return false
 }
@@ -4194,7 +4272,7 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x10last_modified_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampH\x00R\x0elastModifiedAt\x88\x01\x01\x12?\n" +
 	"\x05kinds\x18\x03 \x03(\x0e2).space.spaced.operations.v1.FileEventKindR\x05kinds\x12\x12\n" +
 	"\x04root\x18\x04 \x01(\tR\x04rootB\x13\n" +
-	"\x11_last_modified_at\"\x87\x03\n" +
+	"\x11_last_modified_at\"\xec\x03\n" +
 	"\x18GetModifiedFilesResponse\x12>\n" +
 	"\x05files\x18\x01 \x03(\v2(.space.spaced.operations.v1.ModifiedFileR\x05files\x12F\n" +
 	"\x0eobserved_since\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampH\x00R\robservedSince\x88\x01\x01\x12F\n" +
@@ -4203,7 +4281,9 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x12monitoring_enabled\x18\x05 \x01(\bR\x11monitoringEnabled\x12\x1e\n" +
 	"\n" +
 	"overflowed\x18\x06 \x01(\bR\n" +
-	"overflowedB\x11\n" +
+	"overflowed\x12'\n" +
+	"\x0funwatched_paths\x18\a \x03(\tR\x0eunwatchedPaths\x12:\n" +
+	"\x19unwatched_paths_truncated\x18\b \x01(\bR\x17unwatchedPathsTruncatedB\x11\n" +
 	"\x0f_observed_sinceB\x11\n" +
 	"\x0f_retained_sinceB\t\n" +
 	"\a_cursor\"\xd9\x04\n" +
@@ -4349,14 +4429,16 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x0eFILE_TYPE_FILE\x10\x01\x12\x17\n" +
 	"\x13FILE_TYPE_DIRECTORY\x10\x02\x12\x15\n" +
 	"\x11FILE_TYPE_SYMLINK\x10\x03\x12\x13\n" +
-	"\x0fFILE_TYPE_OTHER\x10\x04*\xc0\x01\n" +
+	"\x0fFILE_TYPE_OTHER\x10\x04*\xfe\x01\n" +
 	"\rFileEventKind\x12\x1f\n" +
 	"\x1bFILE_EVENT_KIND_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17FILE_EVENT_KIND_CREATED\x10\x01\x12\x1c\n" +
 	"\x18FILE_EVENT_KIND_MODIFIED\x10\x02\x12\x1b\n" +
 	"\x17FILE_EVENT_KIND_REMOVED\x10\x03\x12\x1b\n" +
 	"\x17FILE_EVENT_KIND_RENAMED\x10\x04\x12\x19\n" +
-	"\x15FILE_EVENT_KIND_CHMOD\x10\x05*\x8e\x02\n" +
+	"\x15FILE_EVENT_KIND_CHMOD\x10\x05\x12\x1d\n" +
+	"\x19FILE_EVENT_KIND_UNWATCHED\x10\x06\x12\x1d\n" +
+	"\x19FILE_EVENT_KIND_REWATCHED\x10\a*\x8e\x02\n" +
 	"\x14LoopbackBridgeStatus\x12&\n" +
 	"\"LOOPBACK_BRIDGE_STATUS_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dLOOPBACK_BRIDGE_STATUS_DIRECT\x10\x01\x12-\n" +

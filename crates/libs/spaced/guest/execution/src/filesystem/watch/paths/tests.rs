@@ -311,3 +311,23 @@ async fn default_roots_require_every_selected_directory() {
     .unwrap_err();
     assert_eq!(error.code(), tonic::Code::NotFound);
 }
+
+#[test]
+fn a_walk_that_finds_more_skips_than_it_keeps_says_so() {
+    let mut skipped = Vec::new();
+    let mut truncated = false;
+    for index in 0..MAX_SKIPPED_DIRECTORIES {
+        record_skip(
+            &mut skipped,
+            &mut truncated,
+            Path::new(&format!("/watched/{index}")),
+        );
+    }
+    // A repeat of the last skip is the same directory, not one more.
+    let last = skipped.last().cloned().unwrap();
+    record_skip(&mut skipped, &mut truncated, &last);
+    assert!(!truncated);
+    record_skip(&mut skipped, &mut truncated, Path::new("/watched/one-more"));
+    assert!(truncated);
+    assert_eq!(skipped.len(), MAX_SKIPPED_DIRECTORIES);
+}

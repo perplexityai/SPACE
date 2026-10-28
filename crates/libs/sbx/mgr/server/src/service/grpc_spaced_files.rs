@@ -1023,29 +1023,7 @@ impl SandboxManagerService {
                 parse_operation_user(operation.user)?,
             )
             .await?;
-        Ok(Response::new(SpacedGetModifiedFilesResponse {
-            files: response
-                .files
-                .into_iter()
-                .map(|file| {
-                    Ok(SpacedModifiedFile {
-                        path: file.path,
-                        root: file.root,
-                        last_modified_at: file.last_modified_at,
-                        kinds: file
-                            .kinds
-                            .into_iter()
-                            .map(file_event_kind_to_spaced)
-                            .collect::<Result<_, Status>>()?,
-                    })
-                })
-                .collect::<Result<_, Status>>()?,
-            observed_since: response.observed_since,
-            retained_since: response.retained_since,
-            cursor: response.cursor,
-            monitoring_enabled: response.monitoring_enabled,
-            overflowed: response.overflowed,
-        }))
+        Ok(Response::new(modified_files_to_spaced(response)?))
     }
 }
 
