@@ -707,6 +707,23 @@ impl ClusterApi for ClusterApiService {
             sqlx::query_as::<_, TemplatePolicyRow>(sql!(
                 "WITH requested AS (
                      SELECT DISTINCT UNNEST($1::TEXT[]) AS template
+                 ),
+                 private_requested AS (
+                     SELECT t.name
+                     FROM requested r
+                     JOIN templates t ON t.name = r.template
+                     WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
+                 ),
+                 placed AS (
+                     SELECT sb.template_id
+                     FROM sandboxes sb
+                     WHERE sb.target_node_id = $3
+                       AND EXISTS (SELECT 1 FROM private_requested)
+                     UNION
+                     SELECT sb.template_id
+                     FROM sandboxes sb
+                     WHERE sb.active_node_id = $3
+                       AND EXISTS (SELECT 1 FROM private_requested)
                  )
                  SELECT r.template,
                         COALESCE(t.network_policy_json, $2::JSONB) AS network_policy_json,
@@ -714,12 +731,7 @@ impl ClusterApi for ClusterApiService {
                  FROM requested r
                  LEFT JOIN templates t ON t.name = r.template
                  WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
-                    OR EXISTS (
-                        SELECT 1
-                        FROM sandboxes sb
-                        WHERE sb.template_id = t.name
-                          AND (sb.active_node_id = $3 OR sb.target_node_id = $3)
-                    )
+                    OR t.name IN (SELECT template_id FROM placed)
                     OR ($4 = 'worker' AND EXISTS (
                         SELECT 1
                         FROM kubernetes_pool_configs pc
@@ -817,6 +829,23 @@ impl ClusterApi for ClusterApiService {
             "WITH requested AS (
                  SELECT DISTINCT UNNEST($1::TEXT[]) AS template
              ),
+             private_requested AS (
+                 SELECT t.name
+                 FROM requested r
+                 JOIN templates t ON t.name = r.template
+                 WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
+             ),
+             placed AS (
+                 SELECT sb.template_id
+                 FROM sandboxes sb
+                 WHERE sb.target_node_id = $2
+                   AND EXISTS (SELECT 1 FROM private_requested)
+                 UNION
+                 SELECT sb.template_id
+                 FROM sandboxes sb
+                 WHERE sb.active_node_id = $2
+                   AND EXISTS (SELECT 1 FROM private_requested)
+             ),
              local_inventory AS (
                  SELECT DISTINCT ON (nti.template_name)
                         nti.template_name,
@@ -839,12 +868,7 @@ impl ClusterApi for ClusterApiService {
              LEFT JOIN local_inventory li ON li.template_name = r.template
              LEFT JOIN templates t ON t.name = r.template
              WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
-                OR EXISTS (
-                    SELECT 1
-                    FROM sandboxes sb
-                    WHERE sb.template_id = t.name
-                      AND (sb.active_node_id = $2 OR sb.target_node_id = $2)
-                )
+                OR t.name IN (SELECT template_id FROM placed)
                 OR ($3 = 'worker' AND EXISTS (
                     SELECT 1
                     FROM kubernetes_pool_configs pc
@@ -933,9 +957,29 @@ impl ClusterApi for ClusterApiService {
         // The one addition is a template the node still holds while it is
         // being retired: the node must hear `present = false` to delete it.
         // Inventory is node-reported, so it never admits a present template.
+        // `placed` reads the node's sandboxes once per request through the
+        // node indexes, and only when a requested template is not generic, so
+        // cost tracks the node's sandboxes rather than templates × table size.
         let rows = sqlx::query_as::<_, TemplateDesiredStateRow>(
             sql!("WITH requested AS (
                  SELECT DISTINCT UNNEST($1::TEXT[]) AS template
+             ),
+             private_requested AS (
+                 SELECT t.name
+                 FROM requested r
+                 JOIN templates t ON t.name = r.template
+                 WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
+             ),
+             placed AS (
+                 SELECT sb.template_id
+                 FROM sandboxes sb
+                 WHERE sb.target_node_id = $3
+                   AND EXISTS (SELECT 1 FROM private_requested)
+                 UNION
+                 SELECT sb.template_id
+                 FROM sandboxes sb
+                 WHERE sb.active_node_id = $3
+                   AND EXISTS (SELECT 1 FROM private_requested)
              ),
              local_inventory AS (
                  SELECT DISTINCT ON (nti.template_name)
@@ -984,12 +1028,7 @@ impl ClusterApi for ClusterApiService {
              LEFT JOIN local_inventory li
                     ON li.template_name = r.template
              WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
-                OR EXISTS (
-                    SELECT 1
-                    FROM sandboxes sb
-                    WHERE sb.template_id = t.name
-                      AND (sb.active_node_id = $3 OR sb.target_node_id = $3)
-                )
+                OR t.name IN (SELECT template_id FROM placed)
                 OR ($2 = 'worker' AND EXISTS (
                     SELECT 1
                     FROM kubernetes_pool_configs pc
