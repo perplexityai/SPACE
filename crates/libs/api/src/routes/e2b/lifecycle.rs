@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::OrgId;
+use pplx_space_common_core::types::{ClientKey, OrgId};
 
 use super::*;
 use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxLifecycle};
@@ -37,6 +37,13 @@ pub(super) fn request_client_id(headers: &HeaderMap) -> Option<String> {
         .and_then(|value| value.to_str().ok())?
         .trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Resolve the request's `X-Client-ID` once to the bounded client key that
+/// activation admission charges and the sandbox pod is labeled with: the id
+/// when it's allowlisted, otherwise `unknown`.
+pub(super) fn request_client_key(state: &AppState, client_id: Option<&str>) -> ClientKey {
+    state.client_concurrency.client_key(client_id)
 }
 
 /// Reserve a per-client concurrency slot for a control-plane-touching
@@ -356,6 +363,7 @@ pub(super) async fn create_sandbox(
             &translated.native,
             SandboxApiMetricIdentity::ecw("create"),
             federated_create,
+            &request_client_key(&state, client_id.as_deref()),
         )
         .await
     {
@@ -920,6 +928,7 @@ pub(super) async fn connect_sandbox_inner(
                 reconnect_identity,
                 SandboxAction::Wake,
                 connect_activation_request(),
+                Some(&request_client_key(&state, client_id.as_deref())),
             )
             .await
         {
@@ -987,6 +996,7 @@ pub(super) async fn connect_sandbox_inner(
                             reconnect_identity,
                             SandboxAction::Wake,
                             None,
+                            Some(&request_client_key(&state, client_id.as_deref())),
                         )
                         .await
                         .map_err(|err| {
@@ -1206,6 +1216,8 @@ pub(super) async fn pause_sandbox_e2b(
         e2b_native_pause_action(),
         SandboxApiMetricIdentity::ecw("pause"),
         Some(ecw_host_pair.host),
+        // A suspend activates nothing.
+        None,
     )
     .await
 }
@@ -1227,6 +1239,7 @@ pub(super) async fn resume_sandbox_e2b(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     federated: Option<Extension<crate::middleware::auth::AuthFederatedOwner>>,
     Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
     body: Option<crate::e2b::E2bJson<SandboxResumeRequestE2b>>,
 ) -> Result<Json<SandboxResponseE2b>, E2bApiError> {
     let request = body.map(|crate::e2b::E2bJson(request)| request);
@@ -1238,6 +1251,7 @@ pub(super) async fn resume_sandbox_e2b(
         update_resuming_sandbox_policy(&state, &scope, &sandbox_id, request).await?;
     }
 
+    let client_key = request_client_key(&state, request_client_id(&headers).as_deref());
     action_sandbox_e2b(
         state,
         scope,
@@ -1245,6 +1259,7 @@ pub(super) async fn resume_sandbox_e2b(
         e2b_native_resume_action(),
         SandboxApiMetricIdentity::ecw("resume"),
         Some(ecw_host_pair.host),
+        Some(&client_key),
     )
     .await
 }
@@ -1291,6 +1306,7 @@ pub(super) async fn action_sandbox_e2b(
     action: SandboxAction,
     metric_identity: SandboxApiMetricIdentity,
     domain: Option<String>,
+    activating_client: Option<&ClientKey>,
 ) -> Result<Json<SandboxResponseE2b>, E2bApiError> {
     let sandbox = fetch_scoped_sandbox(&state, &scope, &sandbox_id).await?;
 
@@ -1307,6 +1323,7 @@ pub(super) async fn action_sandbox_e2b(
             metric_identity,
             action,
             None,
+            activating_client,
         )
         .await
     {

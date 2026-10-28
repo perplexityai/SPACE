@@ -32,7 +32,7 @@ use pplx_space_common_core::types::{OrgId, UserId};
 
 use pplx_space_common_core::kubernetes::SandboxRuntimePodMetadata;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DiskIoLimits, EnvMap, PolicyAuthority, SandboxOwner,
+    AutoLifecyclePolicy, ClientKey, DiskIoLimits, EnvMap, PolicyAuthority, SandboxOwner,
 };
 use pplx_space_net_common::NetworkPolicyV1;
 
@@ -86,11 +86,16 @@ pub(super) struct PerSandboxSetup {
     /// running plaintext pool VM cannot be encrypted at adoption).
     pub volume_encryption: bool,
     pub disk_io_limits: DiskIoLimits,
+    /// The client the create is attributed to, labeled on the pod as
+    /// `space.pplx.net/client-id`.
+    pub client_key: ClientKey,
 }
 
 impl PerSandboxSetup {
     /// Resolve the setup intent from the inputs both create paths carry. This is
     /// the single place the intent is decided.
+    // One argument per setup input, so neither create path can omit one.
+    #[allow(clippy::too_many_arguments)]
     fn resolve(
         actor: &ActorRef,
         process_env: EnvMap,
@@ -99,6 +104,7 @@ impl PerSandboxSetup {
         template_network_policy: &NetworkPolicyV1,
         volume_encryption: bool,
         disk_io_limits: DiskIoLimits,
+        client_key: &ClientKey,
     ) -> Self {
         let effective_policy = network_policy_override
             .cloned()
@@ -117,6 +123,7 @@ impl PerSandboxSetup {
             node_fs: NodeFilesystemSetup::EnsureArtifactDirPermissions,
             volume_encryption,
             disk_io_limits,
+            client_key: client_key.clone(),
         }
     }
 
@@ -131,6 +138,7 @@ impl PerSandboxSetup {
             request.template_network_policy,
             request.volume_encryption,
             request.disk_io_limits,
+            request.client_key,
         )
     }
 
@@ -157,6 +165,7 @@ impl PerSandboxSetup {
             // pool at the API before a claim is ever attempted.
             false,
             claim.disk_io_limits,
+            request.client_key,
         )
     }
 
@@ -181,6 +190,7 @@ impl PerSandboxSetup {
             node_fs,
             volume_encryption,
             disk_io_limits,
+            client_key,
         } = self;
         // Cold create passes process env through the pod/shim create path, not
         // through pod runtime metadata.
@@ -216,6 +226,7 @@ impl PerSandboxSetup {
             authority,
             volume_encryption,
             disk_io_limits,
+            client_key,
         })
     }
 }
@@ -233,6 +244,7 @@ pub(super) struct ColdPodMetadata {
     authority: PolicyAuthority,
     volume_encryption: bool,
     disk_io_limits: DiskIoLimits,
+    client_key: ClientKey,
 }
 
 impl ColdPodMetadata {
@@ -244,6 +256,7 @@ impl ColdPodMetadata {
             sandbox_owner: &self.sandbox_owner,
             user_id: self.user_id,
             org_id: self.org_id,
+            client_key: &self.client_key,
             auto_lifecycle_json: &self.auto_lifecycle_json,
             auto_lifecycle_authority: self.authority,
             network_policy_json: &self.network_policy_json,

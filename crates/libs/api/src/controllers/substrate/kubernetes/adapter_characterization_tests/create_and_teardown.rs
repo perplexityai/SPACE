@@ -185,6 +185,54 @@ async fn cold_create_seeds_the_network_policy_generation_on_the_sandbox_lineage(
     Ok(())
 }
 
+/// A cold create labels its pod with the activating client and records the
+/// key on the execution row, which later rebuilds of the pod read.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_create_attributes_the_pod_and_execution_to_the_activating_client() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    // The pod is recorded, then refused, so the create stops at the POST.
+    let (client, log) = scripted_kube_client(|request| match request.method {
+        Method::POST => kube_status(StatusCode::FORBIDDEN, "Forbidden"),
+        _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+    });
+    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let client_key = pplx_space_common_core::types::ClientKey::allowlisted("background-client")
+        .expect("valid client key");
+
+    let _ = substrate
+        .create_execution(CreateExecutionRequest {
+            client_key: &client_key,
+            ..inputs.create_request(sandbox_id, &template_ref)
+        })
+        .await;
+
+    let posts = requests_matching(&log, &Method::POST);
+    let [pod_create] = posts.as_slice() else {
+        panic!("expected one pod create, got {posts:?}");
+    };
+    let label = pod_create
+        .body
+        .as_ref()
+        .and_then(|pod| pod.pointer("/metadata/labels"))
+        .and_then(|labels| labels.get(pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(label, Some("background-client"));
+    let recorded: Option<String> = sqlx::query_scalar(pplx_space_common_core::sql!(
+        "SELECT activating_client_key
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1 AND generation = 1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(recorded.as_deref(), Some("background-client"));
+    Ok(())
+}
+
 // ── teardown_execution ──────────────────────────────────────────────────────
 
 /// Apiserver for teardown: the pod is live in the reflector, DELETEs succeed.

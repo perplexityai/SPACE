@@ -675,6 +675,7 @@ fn pooled_create_input<'a>(
         federated_owner: None,
         federated_service_grant: None,
         volume_encryption: false,
+        client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
     }
 }
 
@@ -1629,6 +1630,7 @@ async fn postgres_cold_federated_create_is_atomic_with_grant_upsert() -> TestRes
                 Some(&federated_owner),
                 Some(&federated_service_grant),
             ),
+            pplx_space_common_core::types::ClientKey::unknown_ref(),
         )
         .await;
 
@@ -1684,6 +1686,7 @@ async fn postgres_federated_create_denies_api_key_org_specific_template() -> Tes
                 Some(&federated_owner),
                 Some(&federated_service_grant),
             ),
+            pplx_space_common_core::types::ClientKey::unknown_ref(),
         )
         .await;
 
@@ -1733,6 +1736,7 @@ async fn postgres_federated_create_allows_mapped_org_specific_template() -> Test
                 Some(&federated_owner),
                 Some(&federated_service_grant),
             ),
+            pplx_space_common_core::types::ClientKey::unknown_ref(),
         )
         .await;
 
@@ -2925,6 +2929,7 @@ async fn postgres_federated_restore_inserts_restore_ownership() -> TestResult {
                     storage_uri: Some("s3://bucket/snapshot-1"),
                     source_sandbox_id,
                 },
+                client_key: pplx_space_common_core::types::ClientKey::unknown(),
             },
         )
         .await

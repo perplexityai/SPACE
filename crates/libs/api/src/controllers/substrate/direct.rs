@@ -4260,7 +4260,7 @@ impl SubstrateAdapter for DirectSubstrate {
                     sandbox,
                     timeout,
                     Some(activity),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
                 .map_err(ControllerError::from)?;

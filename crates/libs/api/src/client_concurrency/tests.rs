@@ -796,3 +796,52 @@ async fn limiter_observe_mode_never_rejects() -> TestResult {
     let _b = admit(limiter.try_acquire(Operation::Create, Some(&client)).await);
     Ok(())
 }
+
+#[test]
+fn client_key_resolves_only_allowlisted_ids() {
+    use pplx_space_common_core::types::ClientKey as BoundedClientKey;
+    let limiter = |mode: Mode| {
+        ClientConcurrencyLimiter::with_config(
+            ClientConcurrencyConfig {
+                mode,
+                known_clients: known_set(&["foreground_client", "bad id"]),
+                ..env_caps()
+            },
+            FeatureFlagClient::fixed_json([(
+                SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG.key(),
+                serde_json::json!({"overrides": {"newbot": 5}}),
+            )]),
+        )
+    };
+    let enforcing = limiter(Mode::Enforce);
+
+    assert_eq!(
+        enforcing.client_key(Some(" foreground_client ")).as_str(),
+        "foreground_client"
+    );
+    assert_eq!(enforcing.client_key(Some("newbot")).as_str(), "newbot");
+    // Absent, blank, unrecognized, and allowlisted-but-not-a-label-value ids
+    // all collapse to the one shared key, so the label's value set stays
+    // bounded by the allowlist.
+    for shared in [
+        None,
+        Some(""),
+        Some("  "),
+        Some("rand-abc-123"),
+        Some("bad id"),
+    ] {
+        assert_eq!(
+            enforcing.client_key(shared),
+            BoundedClientKey::unknown(),
+            "{shared:?} must resolve to unknown"
+        );
+    }
+
+    // The env master gates the override keys, not the static allowlist.
+    let off = limiter(Mode::Off);
+    assert_eq!(
+        off.client_key(Some("foreground_client")).as_str(),
+        "foreground_client"
+    );
+    assert_eq!(off.client_key(Some("newbot")), BoundedClientKey::unknown());
+}

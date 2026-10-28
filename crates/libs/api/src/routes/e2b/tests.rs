@@ -4324,6 +4324,80 @@ async fn connect_route_rejects_missing_restore_context_and_preserves_recovery_st
     Ok(())
 }
 
+/// The connecting client's allowlisted `X-Client-ID` reaches the restore pod
+/// its wake creates, so the pod is attributed to the client that activated
+/// it rather than to the one that created the sandbox.
+#[cfg(feature = "kubernetes")]
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn connect_route_labels_the_restore_pod_with_the_connecting_client(
+    #[future] missing_pod_suspend_fixture: TestResult<MissingPodSuspendFixture>,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+
+    // Arrange.
+    let fixture = missing_pod_suspend_fixture.await?;
+    let mut state = fixture.app_state.state.clone();
+    // Off: the allowlist still resolves the key, and no slot is reserved.
+    state.client_concurrency = crate::client_concurrency::ClientConcurrencyLimiter::with_config(
+        crate::client_concurrency::ClientConcurrencyConfig {
+            mode: crate::client_concurrency::Mode::Off,
+            known_clients: ["background-client".to_string()].into(),
+            ..Default::default()
+        },
+        pplx_space_feature_flags::FeatureFlagClient::disabled(),
+    );
+    let org = fetch_local_org(&fixture.app_state.pool).await?;
+    let app = e2b_api_routes()
+        .layer(Extension(AuthOrg(org)))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+    let mut request = connect_route_request(
+        fixture.sandbox_id,
+        ConnectRouteRequestShape {
+            label: "empty body",
+            body: None,
+        },
+    )?;
+    request.headers_mut().insert(
+        "x-client-id",
+        header::HeaderValue::from_static("background-client"),
+    );
+
+    // Act.
+    let response = app.oneshot(request).await?;
+
+    // Assert.
+    assert_connect_success_response(
+        response,
+        StatusCode::OK,
+        fixture.sandbox_id,
+        "empty body",
+        "missing pod after a current durable suspend snapshot",
+    )
+    .await?;
+    let pod_creates = fixture
+        .app_state
+        .pod_creates
+        .lock()
+        .expect("capture mutex poisoned");
+    let [pod] = pod_creates.as_slice() else {
+        panic!("expected one restore pod, got {}", pod_creates.len());
+    };
+    assert_eq!(
+        pod.pointer("/metadata/labels")
+            .and_then(|labels| {
+                labels.get(pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL)
+            })
+            .and_then(serde_json::Value::as_str),
+        Some("background-client")
+    );
+
+    Ok(())
+}
+
 #[cfg(feature = "kubernetes")]
 #[rstest]
 #[tokio::test(flavor = "current_thread")]
@@ -4517,7 +4591,7 @@ async fn runtime_client_recovers_missing_suspending_pod(
     fixture
         .app_state
         .substrate
-        .runtime_client(fixture.sandbox_id, RecoveryCharge::Exempt)
+        .runtime_client(fixture.sandbox_id, RecoveryCharge::EXEMPT)
         .await?;
 
     // Assert.

@@ -15,9 +15,9 @@ use crate::controllers::substrate::ExecutionIdentity;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, LocalArtifactId, NodeId,
-    NodeRole, PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxOwner,
-    SandboxTransitionTargetState, SnapshotState, StorageUri, UserId,
+    ArtifactKind, ArtifactOrigin, ClientKey, ExactStorageUri, ExecutionGeneration, LocalArtifactId,
+    NodeId, NodeRole, PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    SandboxOwner, SandboxTransitionTargetState, SnapshotState, StorageUri, UserId,
 };
 use pplx_space_common_svc::types::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use pplx_space_events::{
@@ -333,9 +333,28 @@ pub(super) struct SandboxExecutionRow {
     pub(super) activation_attempt_id:
         Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
+    #[sqlx(try_from = "Option<String>")]
+    pub(super) activating_client_key: StoredClientKey,
+}
+
+/// The decoded `activating_client_key` column; read it through
+/// [`SandboxExecutionRow::activating_client`].
+#[derive(Debug, Clone)]
+pub(super) struct StoredClientKey(ClientKey);
+
+impl From<Option<String>> for StoredClientKey {
+    fn from(value: Option<String>) -> Self {
+        Self(ClientKey::from_stored(value.as_deref()))
+    }
 }
 
 impl SandboxExecutionRow {
+    /// The client this execution's pod is attributed to. A row written before
+    /// the column existed, or by an older writer, reads as `unknown`.
+    pub(super) fn activating_client(&self) -> &ClientKey {
+        &self.activating_client_key.0
+    }
+
     pub(super) fn bootstrap_route_activation_id(&self) -> Option<SandboxActivationAttemptId> {
         // Published route wins; the operation is a fallback only for legacy rows.
         self.route_activation_id.or(self.activation_attempt_id)

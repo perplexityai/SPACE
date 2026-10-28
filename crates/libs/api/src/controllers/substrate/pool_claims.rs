@@ -54,6 +54,9 @@ pub struct PooledExecutionClaimRequest<'a> {
     /// creates bypass the pool until claim-time re-homing can stamp and apply
     /// the flag at adoption.
     pub volume_encryption: bool,
+    /// The client this create is attributed to. Adoption labels the pool pod
+    /// with it as `space.pplx.net/client-id`.
+    pub client_key: &'a pplx_space_common_core::types::ClientKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

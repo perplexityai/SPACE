@@ -21,6 +21,7 @@ pub(crate) use kubernetes_tests::{
     substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
 };
 
+mod activating_client;
 mod native_pod_failover;
 mod substrate_scope;
 
@@ -2864,7 +2865,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::ecw("connect"),
                 &sandbox,
                 Duration::from_secs(2),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await
             .expect_err("missing route acknowledgement must fail dormant access");
@@ -3123,6 +3124,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::ecw("connect"),
                 SandboxAction::Wake,
                 None,
+                None,
             )
             .await?;
 
@@ -3286,7 +3288,7 @@ mod kubernetes_tests {
                     &leader_sandbox,
                     SandboxApiMetricIdentity::ecw("connect"),
                     Duration::from_secs(3),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                     None,
                 )
                 .await
@@ -3304,7 +3306,7 @@ mod kubernetes_tests {
                     &follower_sandbox,
                     SandboxApiMetricIdentity::ecw("connect"),
                     Duration::from_secs(3),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                     None,
                 )
                 .await
@@ -3457,7 +3459,7 @@ mod kubernetes_tests {
                     &access_sandbox,
                     SandboxApiMetricIdentity::native("runtime_client"),
                     Duration::from_secs(5),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                     None,
                 )
                 .await
@@ -3787,7 +3789,7 @@ mod kubernetes_tests {
                     &sandbox,
                     budget,
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
         });
@@ -4020,7 +4022,11 @@ mod kubernetes_tests {
             initial_pod,
             vec![(*source_node).clone()],
         );
-        let recovery_generation = match substrate.store.claim_started_recovery(sandbox_id).await? {
+        let recovery_generation = match substrate
+            .store
+            .claim_started_recovery(sandbox_id, None)
+            .await?
+        {
             StartedRecoveryClaim::ExistingExecution { generation } => generation,
             claim => panic!("expected the tracked execution recovery claim, got {claim:?}"),
         };
@@ -4046,6 +4052,7 @@ mod kubernetes_tests {
                     Some(ActivationAttemptAssignment::new(
                         activation_attempt_id,
                         SandboxTransitionTargetState::Started,
+                        None,
                     )),
                 ),
             ),
@@ -4180,7 +4187,7 @@ mod kubernetes_tests {
         );
         let fallback_recovery_generation = match fallback_substrate
             .store
-            .claim_started_recovery(sandbox_id)
+            .claim_started_recovery(sandbox_id, None)
             .await?
         {
             StartedRecoveryClaim::ExistingExecution { generation } => generation,
@@ -4203,6 +4210,7 @@ mod kubernetes_tests {
                     Some(ActivationAttemptAssignment::new(
                         fallback_attempt_id,
                         SandboxTransitionTargetState::Started,
+                        None,
                     )),
                 ),
             )
@@ -4337,7 +4345,7 @@ mod kubernetes_tests {
                     &owner_sandbox,
                     Duration::from_secs(1),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
         });
@@ -4519,7 +4527,7 @@ mod kubernetes_tests {
                 &stale_sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await?;
 
@@ -4551,7 +4559,7 @@ mod kubernetes_tests {
                 &stale_sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await?;
 
@@ -4585,7 +4593,7 @@ mod kubernetes_tests {
                 &stale_sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await
             .expect_err("restore without a source must fail");
@@ -4624,7 +4632,7 @@ mod kubernetes_tests {
                 },
                 None,
                 pplx_space_common_core::types::SandboxLifecycle::Started,
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await?;
 
@@ -4654,7 +4662,7 @@ mod kubernetes_tests {
                 },
                 None,
                 pplx_space_common_core::types::SandboxLifecycle::Started,
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await
             .expect_err("an unroutable started sandbox must remain a conflict");
@@ -4754,7 +4762,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await?;
         completer.await??;
@@ -4806,7 +4814,7 @@ mod kubernetes_tests {
                 },
                 None,
                 pplx_space_common_core::types::SandboxLifecycle::Started,
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await?;
         completer.await??;
@@ -4834,6 +4842,7 @@ mod kubernetes_tests {
                 sandbox_id,
                 attempt_id,
                 SandboxTransitionTargetState::Started,
+                pplx_space_common_core::types::ClientKey::unknown_ref(),
             )
             .await?;
         let completion = Some(crate::controllers::substrate::ActivationLeaseCompletion {
@@ -4923,6 +4932,7 @@ mod kubernetes_tests {
                     sandbox_id,
                     attempt_id,
                     SandboxTransitionTargetState::Started,
+                    pplx_space_common_core::types::ClientKey::unknown_ref(),
                 )
                 .await?;
 
@@ -4993,6 +5003,7 @@ mod kubernetes_tests {
                 sandbox_id,
                 attempt_id,
                 SandboxTransitionTargetState::Started,
+                pplx_space_common_core::types::ClientKey::unknown_ref(),
             )
             .await?;
         sqlx::query(sql!(
@@ -5082,7 +5093,7 @@ mod kubernetes_tests {
                         blocking: true,
                         ready_timeout: Duration::from_secs(1),
                     },
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
                 .expect_err("no worker Wake can be dispatched");
@@ -5168,7 +5179,7 @@ mod kubernetes_tests {
                     blocking: true,
                     ready_timeout: Duration::from_secs(5),
                 },
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await?;
         completer.await??;
@@ -5207,7 +5218,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_millis(200),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             ),
         )
         .await
@@ -5272,7 +5283,7 @@ mod kubernetes_tests {
                 &stale_restoring,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await
             .expect_err("wake must defer to suspend after refreshing its joined restore");
@@ -5325,7 +5336,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_millis(200),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             ),
         )
         .await
@@ -5381,7 +5392,7 @@ mod kubernetes_tests {
                     &sandbox,
                     Duration::from_secs(60),
                     SandboxApiMetricIdentity::native("wake"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 ),
             ),
         )
@@ -5460,7 +5471,7 @@ mod kubernetes_tests {
                     &first_sandbox,
                     Duration::from_secs(15),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
         });
@@ -5472,7 +5483,7 @@ mod kubernetes_tests {
                     &second_sandbox,
                     Duration::from_millis(800),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
         });
@@ -5553,7 +5564,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(2),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await?;
 
@@ -5598,7 +5609,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(2),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await?;
 
@@ -5640,7 +5651,7 @@ mod kubernetes_tests {
                 sandbox_id,
                 SandboxApiMetricIdentity::native("restoring_access"),
                 Duration::from_secs(5),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await;
 
@@ -5717,7 +5728,7 @@ mod kubernetes_tests {
                 Some(1),
                 tokio::time::Instant::now() + Duration::from_secs(3),
                 SandboxApiMetricIdentity::native("restoring_access"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await;
 
@@ -5862,7 +5873,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await
             .expect_err("injected Kubernetes Pod create failure must reach the caller");
@@ -5938,7 +5949,7 @@ mod kubernetes_tests {
                     &sandbox,
                     Duration::from_secs(5),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
         });
@@ -6027,6 +6038,7 @@ mod kubernetes_tests {
                     Some(&follower_sandbox),
                     SandboxApiMetricIdentity::ecw("restore"),
                     SandboxAction::Restore,
+                    None,
                     None,
                 )
                 .await
@@ -6134,7 +6146,7 @@ mod kubernetes_tests {
                         &sandbox,
                         Duration::from_secs(2),
                         SandboxApiMetricIdentity::ecw("connect"),
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        crate::controllers::substrate::RecoveryCharge::EXEMPT,
                     )
                     .await
             }));
@@ -6241,6 +6253,7 @@ mod kubernetes_tests {
                     Some(&restore_sandbox),
                     SandboxApiMetricIdentity::ecw("restore"),
                     SandboxAction::Restore,
+                    None,
                     None,
                 )
                 .await
@@ -6381,6 +6394,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::native("start"),
                 SandboxAction::Start,
                 None,
+                None,
             )
             .await
             .expect_err("the refreshed cold start must pay admission");
@@ -6424,6 +6438,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::native("start"),
                 SandboxAction::Start,
                 None,
+                None,
             )
             .await
             .expect_err("a restore takeover must pay admission");
@@ -6457,7 +6472,10 @@ mod kubernetes_tests {
         let admission = rejecting_admission(&pool);
         assert!(
             admission
-                .admit_activation(crate::cluster_admission::ClusterActivationClass::Restore)
+                .admit_activation(
+                    crate::cluster_admission::ClusterActivationClass::Restore,
+                    pplx_space_common_core::types::ClientKey::unknown_ref(),
+                )
                 .await
                 .is_err(),
             "the gate must reject direct charges for this test to mean anything"
@@ -6483,6 +6501,7 @@ mod kubernetes_tests {
                 Some(&sandbox),
                 SandboxApiMetricIdentity::ecw("connect"),
                 SandboxAction::Wake,
+                None,
                 None,
             )
             .await?;
@@ -6550,6 +6569,7 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::ecw("connect"),
                 SandboxAction::Wake,
                 None,
+                None,
             )
             .await
             .expect_err("a rejected takeover charge must fail the wake");
@@ -6613,6 +6633,7 @@ mod kubernetes_tests {
                 Some(&sandbox),
                 SandboxApiMetricIdentity::ecw("connect"),
                 SandboxAction::Restore,
+                None,
                 None,
             )
             .await
@@ -6686,7 +6707,7 @@ mod kubernetes_tests {
                     &first_sandbox,
                     SandboxApiMetricIdentity::ecw("spaced"),
                     Duration::from_secs(1),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                     None,
                 )
                 .await
@@ -6709,7 +6730,7 @@ mod kubernetes_tests {
                     &second_sandbox,
                     SandboxApiMetricIdentity::ecw("spaced"),
                     Duration::from_secs(1),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                     None,
                 )
                 .await
@@ -6778,7 +6799,7 @@ mod kubernetes_tests {
                 &sandbox,
                 ExecutionActivityKind::Access,
                 Duration::from_secs(2),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await;
         let state: String = sqlx::query_scalar(
@@ -6852,7 +6873,7 @@ mod kubernetes_tests {
                     &first_sandbox,
                     Duration::from_secs(1),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
         });
@@ -6868,7 +6889,7 @@ mod kubernetes_tests {
                     &second_sandbox,
                     Duration::from_secs(1),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
         });
@@ -6932,7 +6953,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await
             .expect_err("an unobservable pod create must remain retryable");
@@ -7013,7 +7034,7 @@ mod kubernetes_tests {
                     &follower_sandbox,
                     Duration::from_secs(8),
                     SandboxApiMetricIdentity::ecw("connect"),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
         });
@@ -7067,7 +7088,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             ),
         )
         .await?
@@ -7124,7 +7145,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(5),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             ),
         )
         .await?
@@ -7405,6 +7426,8 @@ mod kubernetes_tests {
             create_age_expired: false,
             activation_attempt_id: None,
             route_activation_id: None,
+            activating_client_key:
+                crate::controllers::substrate::kubernetes::store::StoredClientKey::from(None),
         };
         let override_sandbox = Sandbox {
             network_policy_generation: 2,
@@ -7481,6 +7504,8 @@ mod kubernetes_tests {
             create_age_expired: false,
             activation_attempt_id: Some(operation),
             route_activation_id: Some(route),
+            activating_client_key:
+                crate::controllers::substrate::kubernetes::store::StoredClientKey::from(None),
         };
         // Resolved for the sandbox's own org and template, which is what the
         // production resolver does — `sandbox.org_id` is nil here and
@@ -7666,6 +7691,7 @@ mod kubernetes_tests {
                         Some(ActivationAttemptAssignment::new(
                             SandboxActivationAttemptId::new(),
                             SandboxTransitionTargetState::Started,
+                            None,
                         )),
                     ),
                 )
@@ -7930,7 +7956,7 @@ mod kubernetes_tests {
             .expect("inserted sandbox must be visible");
         let recovery_generation = match substrate_with_store(pool.clone())
             .store
-            .claim_started_recovery(sandbox_id)
+            .claim_started_recovery(sandbox_id, None)
             .await?
         {
             StartedRecoveryClaim::ExistingExecution { generation } => generation,
@@ -8092,7 +8118,7 @@ mod kubernetes_tests {
             let error = substrate
                 .runtime_client(
                     sandbox_id,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await
                 .expect_err("unverified prior state must fail closed");
@@ -8280,6 +8306,7 @@ mod kubernetes_tests {
         let assignment = ActivationAttemptAssignment::new(
             SandboxActivationAttemptId::new(),
             SandboxTransitionTargetState::Started,
+            None,
         );
 
         // Act.
@@ -8424,7 +8451,11 @@ mod kubernetes_tests {
                 .clone(),
             ],
         );
-        let recovery_generation = match substrate.store.claim_started_recovery(sandbox_id).await? {
+        let recovery_generation = match substrate
+            .store
+            .claim_started_recovery(sandbox_id, None)
+            .await?
+        {
             StartedRecoveryClaim::CreatedExecution { generation } => generation,
             claim => panic!("expected a fresh recovery execution, got {claim:?}"),
         };
@@ -8444,6 +8475,7 @@ mod kubernetes_tests {
                     Some(ActivationAttemptAssignment::new(
                         SandboxActivationAttemptId::new(),
                         SandboxTransitionTargetState::Started,
+                        None,
                     )),
                 ),
             )
@@ -9358,7 +9390,7 @@ mod kubernetes_tests {
                 &sandbox,
                 Duration::from_secs(1),
                 SandboxApiMetricIdentity::ecw("connect"),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await
             .expect_err("unconfirmed Pod deletion must keep recovery retryable");
@@ -9946,7 +9978,7 @@ mod kubernetes_tests {
                 &sandbox,
                 SandboxApiMetricIdentity::native("runtime_client"),
                 Duration::from_secs(1),
-                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission)),
+                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission), None),
                 None,
             )
             .await
@@ -10010,7 +10042,7 @@ mod kubernetes_tests {
                 &sandbox,
                 SandboxApiMetricIdentity::native("runtime_client"),
                 Duration::from_secs(1),
-                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission)),
+                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission), None),
                 None,
             )
             .await
@@ -10085,7 +10117,7 @@ mod kubernetes_tests {
         let result = substrate
             .runtime_client(
                 sandbox_id,
-                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission)),
+                crate::controllers::substrate::RecoveryCharge::enforce(Some(&admission), None),
             )
             .await;
         let execution_state: String = sqlx::query_scalar(
@@ -11560,6 +11592,7 @@ mod kubernetes_tests {
             wait_until_ready: false,
             volume_encryption: false,
             node_pool: None,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         };
         let executions = |sandbox_id| {
             sqlx::query_as::<_, (i64, bool)>(sql!(
@@ -12113,6 +12146,7 @@ mod kubernetes_tests {
                 template_network_policy: &self.network_policy,
                 template_network_policy_generation: 1,
                 volume_encryption: false,
+                client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
             }
         }
 
@@ -13761,6 +13795,8 @@ mod kubernetes_tests {
             create_age_expired: false,
             activation_attempt_id: None,
             route_activation_id: route_initialized.then(SandboxActivationAttemptId::new),
+            activating_client_key:
+                crate::controllers::substrate::kubernetes::store::StoredClientKey::from(None),
         };
 
         for (name, execution, created, expected) in [

@@ -17,6 +17,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use pplx_space_common_core::env::{env_flag_var, parse_positive_f64_env, valid_positive_f64};
+use pplx_space_common_core::types::ClientKey;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_CLUSTER_RATE_LIMITER_FLAG};
 use pplx_space_metrics::sandbox::admission::{
     AdmissionDecision, AdmissionOperationClass, AdmissionRejectReason,
@@ -329,9 +330,14 @@ impl ClusterSandboxAdmission {
     /// shared bucket is empty. On any Redis error the limiter fails open: the
     /// activation is admitted and a `store_unavailable` decision metric is
     /// emitted rather than returning an error.
+    ///
+    /// `client` is the bounded key of the client that is activating. The
+    /// shared bucket doesn't read it yet; it's carried so per-client admission
+    /// can sit on this path without another signature change.
     pub async fn admit_activation(
         &self,
         class: ClusterActivationClass,
+        client: &ClientKey,
     ) -> Result<(), ClusterAdmissionError> {
         // `false` means admission is disabled or a capacity probe failed —
         // already metered inside `prepare_activation_admission`, which admits
@@ -401,6 +407,7 @@ impl ClusterSandboxAdmission {
                 tracing::warn!(
                     %error,
                     operation_class = %class.metric_class(),
+                    client_key = %client,
                     "cluster activation admission store unavailable; admitting (fail open)"
                 );
                 emit_decision(
@@ -416,13 +423,17 @@ impl ClusterSandboxAdmission {
 }
 
 impl ActivationAdmission for ClusterSandboxAdmission {
-    fn admit(&self, class: ActivationAdmissionClass) -> ActivationAdmissionFuture<'_> {
+    fn admit<'a>(
+        &'a self,
+        class: ActivationAdmissionClass,
+        client: &'a ClientKey,
+    ) -> ActivationAdmissionFuture<'a> {
         let class = match class {
             ActivationAdmissionClass::Cold => ClusterActivationClass::Cold,
             ActivationAdmissionClass::Restore => ClusterActivationClass::Restore,
         };
         Box::pin(async move {
-            self.admit_activation(class).await.map_err(|error| {
+            self.admit_activation(class, client).await.map_err(|error| {
                 let rate_limited = matches!(&error, ClusterAdmissionError::RateLimited { .. });
                 ActivationAdmissionRejection::new(
                     error.to_string(),

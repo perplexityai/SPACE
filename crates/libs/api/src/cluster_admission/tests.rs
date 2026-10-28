@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_common_core::types::{ClientKey, NodeId};
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -223,7 +223,7 @@ async fn capacity_probe_failure_fails_open() {
     let admission = admission(direct_substrate(&pool), enabled_config(), None);
 
     admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await
         .expect("capacity-probe failure must fail open (admit), not reject the create");
 }
@@ -667,7 +667,7 @@ async fn disabled_admission_admits_without_touching_store() -> TestResult {
     // No bucket and no eligible node: a disabled limiter must still admit.
     let admission = admission(direct_substrate(&db.pool), config, None);
     admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await?;
     Ok(())
 }
@@ -680,7 +680,7 @@ async fn empty_cluster_rejects_activation() -> TestResult {
     // Enabled, no start-eligible nodes seeded -> reject before touching Redis.
     let admission = admission(direct_substrate(&db.pool), enabled_config(), None);
     let error = admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await
         .expect_err("empty cluster must reject");
     assert!(
@@ -699,7 +699,7 @@ async fn empty_cluster_rejects_activation() -> TestResult {
     hints.insert(error.retry_after().expect("empty cluster carries a hint"));
     for _ in 0..100 {
         let error = admission
-            .admit_activation(ClusterActivationClass::Cold)
+            .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
             .await
             .expect_err("an empty cluster keeps rejecting");
         hints.insert(error.retry_after().expect("empty cluster carries a hint"));
@@ -722,7 +722,7 @@ async fn fails_open_when_no_redis_configured() -> TestResult {
     // Enabled with an eligible node but no Redis bucket: admit (fail open).
     let admission = admission(direct_substrate(&db.pool), enabled_config(), None);
     admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await?;
     Ok(())
 }
@@ -752,10 +752,10 @@ async fn exhausted_bucket_rate_limits_activation() -> TestResult {
     let admission = admission(direct_substrate(&db.pool), config, Some(bucket));
 
     admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await?;
     let error = admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await
         .expect_err("second activation must be rate limited");
     assert!(
@@ -783,7 +783,7 @@ async fn exhausted_bucket_rate_limits_activation() -> TestResult {
     hints.insert(error.retry_after().expect("rate limit carries a hint"));
     for _ in 0..11 {
         let error = admission
-            .admit_activation(ClusterActivationClass::Cold)
+            .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
             .await
             .expect_err("the drained bucket keeps rate limiting");
         hints.insert(error.retry_after().expect("rate limit carries a hint"));
@@ -841,10 +841,10 @@ async fn with_config_builds_bucket_from_config_redis_url() -> TestResult {
     );
 
     admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await?;
     let error = admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await
         .expect_err("second activation must be rate limited through with_config");
     assert!(

@@ -27,6 +27,7 @@ metadata:
     space.pplx.net/template: seed
   labels:
     app.kubernetes.io/name: space-sandbox
+    space.pplx.net/client-id: example-client
     space.pplx.net/execution-generation: "4"
     space.pplx.net/managed-by: space-api
     space.pplx.net/org-id: 00000000-0000-0000-0000-000000000002

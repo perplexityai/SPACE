@@ -201,7 +201,7 @@ async fn resume_uses_resolved_runtime_without_async_observation() -> TestResult 
         let controller = SandboxController::new(kubernetes(substrate));
         let mut client = controller
             .substrate
-            .runtime_client(id, crate::controllers::substrate::RecoveryCharge::Exempt)
+            .runtime_client(id, crate::controllers::substrate::RecoveryCharge::EXEMPT)
             .await?;
         let request = controller
             .resume_request_with_current_policy(

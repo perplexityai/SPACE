@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{OrgId, SnapshotId, UserId};
+use pplx_space_common_core::types::{ClientKey, OrgId, SnapshotId, UserId};
 
 use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
@@ -242,6 +242,11 @@ pub struct ForkSandboxPayloadV1 {
     source_refreeze_count: u8,
     target_sandbox_id: SandboxId,
     workflow: ForkWorkflowState,
+    /// The requesting client's bounded key, so the executor attributes the
+    /// target's activation to it. Absent in payloads written before this
+    /// field, which read as `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +575,7 @@ impl ForkSandboxPayloadV1 {
             source_refreeze_count: 0,
             target_sandbox_id: SandboxId::new(),
             workflow: ForkWorkflowState::AwaitingSource,
+            client_key: None,
         }
     }
 
@@ -595,6 +601,11 @@ impl ForkSandboxPayloadV1 {
 
     pub fn federated_create(&self) -> Option<&ForkFederatedCreateContext> {
         self.federated_create.as_ref()
+    }
+
+    /// The client the fork target's activation is attributed to.
+    pub fn client_key(&self) -> ClientKey {
+        ClientKey::from_stored(self.client_key.as_deref())
     }
 
     fn set_federated_create(
@@ -892,6 +903,7 @@ pub struct AdmitForkOperation<'a> {
     pub federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     pub federated_service_grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
     pub idempotency_key: &'a IdempotencyKey,
+    pub client_key: &'a ClientKey,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -952,6 +964,7 @@ fn prepare_fork_operation(
         input.ecw_host_domain.to_string(),
         input.hard_deadline,
     );
+    payload.client_key = Some(input.client_key.as_str().to_string());
     match (input.federated_owner, input.federated_service_grant) {
         (Some(owner), Some(service_grant)) => {
             payload.set_federated_create(owner, service_grant);

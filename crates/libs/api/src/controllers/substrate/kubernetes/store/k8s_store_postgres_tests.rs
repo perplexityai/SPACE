@@ -367,7 +367,7 @@ async fn started_recovery_handoff_keeps_generation_when_local_source_is_not_allo
     // Act.
     let outcome = fixture
         .store
-        .replace_started_recovery_execution(sandbox_id, ExecutionGeneration::new(2)?, None)
+        .replace_started_recovery_execution(sandbox_id, ExecutionGeneration::new(2)?, None, None)
         .await?;
 
     // Assert.
@@ -597,7 +597,7 @@ async fn started_recovery_handoff_reports_lost_ownership() -> TestResult {
     // Act.
     let outcome = fixture
         .store
-        .replace_started_recovery_execution(sandbox_id, ExecutionGeneration::new(1)?, None)
+        .replace_started_recovery_execution(sandbox_id, ExecutionGeneration::new(1)?, None, None)
         .await?;
 
     // Assert.
@@ -1172,6 +1172,7 @@ async fn materialization_claim_defers_when_suspend_commits_after_refresh() -> Te
                 SandboxLifecycle::Started,
                 None,
                 None,
+                None,
             )
             .await
     });
@@ -1221,6 +1222,7 @@ async fn split_operation_stopped_start_retry_preserves_route_proof() -> TestResu
             SandboxLifecycle::Stopped,
             None,
             Some((route_a, SandboxTransitionTargetState::Started)),
+            None,
         )
         .await?;
     fixture
@@ -1496,8 +1498,11 @@ async fn started_recovery_does_not_recreate_execution_after_teardown() -> TestRe
     .await?;
 
     let recovery_store = fixture.store.clone();
-    let recovery =
-        tokio::spawn(async move { recovery_store.claim_started_recovery(sandbox_id).await });
+    let recovery = tokio::spawn(async move {
+        recovery_store
+            .claim_started_recovery(sandbox_id, None)
+            .await
+    });
     wait_for_blocked_query(
         &fixture.pool,
         "%SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE%",
@@ -1549,8 +1554,11 @@ async fn started_recovery_maps_concurrent_suspend_to_retryable_deferral() -> Tes
     .await?;
 
     let recovery_store = fixture.store.clone();
-    let recovery =
-        tokio::spawn(async move { recovery_store.claim_started_recovery(sandbox_id).await });
+    let recovery = tokio::spawn(async move {
+        recovery_store
+            .claim_started_recovery(sandbox_id, None)
+            .await
+    });
     wait_for_blocked_query(
         &fixture.pool,
         "%SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE%",
@@ -1660,7 +1668,7 @@ async fn concurrent_claim_loses_to_cleanup_recovery(lifecycle: SandboxLifecycle)
     let claim_store = fixture.store.clone();
     let claim = tokio::spawn(async move {
         claim_store
-            .ensure_active_execution_claim_for_lifecycle(sandbox_id, lifecycle, None, None)
+            .ensure_active_execution_claim_for_lifecycle(sandbox_id, lifecycle, None, None, None)
             .await
     });
     wait_for_blocked_query(
@@ -2323,8 +2331,8 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
     let typed = sandbox_id;
     insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
 
-    let first = fixture.store.claim_started_recovery(typed).await?;
-    let concurrent_create = fixture.store.claim_started_recovery(typed).await?;
+    let first = fixture.store.claim_started_recovery(typed, None).await?;
+    let concurrent_create = fixture.store.claim_started_recovery(typed, None).await?;
     let generation = match first {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
@@ -2375,7 +2383,7 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
             pod_ip: "10.90.0.8".to_string(),
         }
     );
-    let recovery = fixture.store.claim_started_recovery(typed).await?;
+    let recovery = fixture.store.claim_started_recovery(typed, None).await?;
     assert_eq!(
         recovery,
         StartedRecoveryClaim::ExistingExecution { generation }
@@ -2392,7 +2400,7 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
     .await?;
     assert_eq!(state, "recovering");
     assert!(matches!(
-        fixture.store.claim_started_recovery(typed).await?,
+        fixture.store.claim_started_recovery(typed, None).await?,
         StartedRecoveryClaim::InFlight {
             generation: concurrent_generation,
             lease_remaining,
@@ -2418,7 +2426,7 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
         )
         .await?;
     assert_eq!(
-        fixture.store.claim_started_recovery(typed).await?,
+        fixture.store.claim_started_recovery(typed, None).await?,
         StartedRecoveryClaim::ExistingExecution { generation }
     );
 
@@ -2440,7 +2448,7 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
     assert_eq!(state, "running");
 
     assert_eq!(
-        fixture.store.claim_started_recovery(typed).await?,
+        fixture.store.claim_started_recovery(typed, None).await?,
         StartedRecoveryClaim::ExistingExecution { generation }
     );
     fixture
@@ -2455,7 +2463,7 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
         StartedRecoveryObservation::Failed
     );
     assert_eq!(
-        fixture.store.claim_started_recovery(typed).await?,
+        fixture.store.claim_started_recovery(typed, None).await?,
         StartedRecoveryClaim::ExistingExecution { generation }
     );
 
@@ -2476,7 +2484,7 @@ async fn failed_started_recovery_converges_unplaced_sandbox_with_current_snapsho
         None,
     )
     .await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -2529,7 +2537,7 @@ async fn failed_started_recovery_without_current_snapshot_stays_started(
     let sandbox_id = SandboxId::new();
     let typed = sandbox_id;
     insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -2573,7 +2581,7 @@ async fn failed_started_recovery_converges_after_authoritative_pod_absence(
         None,
     )
     .await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -2636,7 +2644,7 @@ async fn started_recovery_claim_on_lost_sandbox_mints_no_execution(
     .execute(&fixture.pool)
     .await?;
 
-    let claim = fixture.store.claim_started_recovery(sandbox_id).await;
+    let claim = fixture.store.claim_started_recovery(sandbox_id, None).await;
     assert!(
         matches!(claim, Err(SubstrateError::Conflict { .. })),
         "a lost sandbox must not be recovered, got {claim:?}"
@@ -2673,7 +2681,7 @@ async fn failed_started_recovery_after_pod_absence_refuses_stale_snapshot(
     .bind(sandbox_id)
     .execute(&fixture.pool)
     .await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -2730,6 +2738,7 @@ async fn failed_started_recovery_after_pod_absence_refuses_stale_snapshot(
                     typed,
                     candidate,
                     SandboxTransitionTargetState::Started,
+                    pplx_space_common_core::types::ClientKey::unknown_ref(),
                 )
                 .await
                 .map(|_| ())
@@ -2761,7 +2770,7 @@ async fn failed_started_recovery_after_pod_absence_refuses_stale_snapshot(
     // A subsequent Started access owns recovery through this bounded lease;
     // it changes the state before assignment, without restoring stale bytes.
     assert_eq!(
-        fixture.store.claim_started_recovery(typed).await?,
+        fixture.store.claim_started_recovery(typed, None).await?,
         StartedRecoveryClaim::ExistingExecution { generation }
     );
     let assigned = fixture
@@ -2799,7 +2808,7 @@ async fn failed_started_recovery_pod_absence_is_fenced_against_late_materializat
         None,
     )
     .await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -2880,7 +2889,7 @@ async fn failed_started_recovery_with_orphaned_snapshot_stays_started(
         .bind(snapshot_id)
         .execute(&fixture.pool)
         .await?;
-        let generation = match fixture.store.claim_started_recovery(typed).await? {
+        let generation = match fixture.store.claim_started_recovery(typed, None).await? {
             StartedRecoveryClaim::CreatedExecution { generation } => generation,
             other => panic!("expected a new execution claim, got {other:?}"),
         };
@@ -2915,13 +2924,19 @@ async fn stale_failed_started_recovery_does_not_converge_newer_execution(
         None,
     )
     .await?;
-    let stale_generation = match fixture.store.claim_started_recovery(typed).await? {
+    let stale_generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
     let successor = fixture
         .store
-        .replace_active_execution_claim_if_generation(typed, stale_generation, "replaced", None)
+        .replace_active_execution_claim_if_generation(
+            typed,
+            stale_generation,
+            "replaced",
+            None,
+            None,
+        )
         .await?
         .expect("active recovery generation should be replaced");
 
@@ -2987,7 +3002,7 @@ async fn failed_started_recovery_follows_owned_successor_generation(
         Some(artifact_id),
     )
     .await?;
-    let initial_generation = match fixture.store.claim_started_recovery(typed).await? {
+    let initial_generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -2998,6 +3013,7 @@ async fn failed_started_recovery_follows_owned_successor_generation(
             SandboxLifecycle::Started,
             None,
             Some((activation_attempt_id, SandboxTransitionTargetState::Started)),
+            None,
         )
         .await?;
     assert_eq!(materialization.row.generation, initial_generation);
@@ -3006,6 +3022,7 @@ async fn failed_started_recovery_follows_owned_successor_generation(
         .replace_started_recovery_execution(
             typed,
             ExecutionGeneration::new(initial_generation)?,
+            None,
             None,
         )
         .await?
@@ -3107,7 +3124,7 @@ async fn failed_started_recovery_without_attempt_does_not_steal_owned_generation
         None,
     )
     .await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -3118,6 +3135,7 @@ async fn failed_started_recovery_without_attempt_does_not_steal_owned_generation
             SandboxLifecycle::Started,
             None,
             Some((activation_attempt_id, SandboxTransitionTargetState::Started)),
+            None,
         )
         .await?;
     assert_eq!(materialization.row.generation, generation);
@@ -3168,7 +3186,7 @@ async fn failed_started_recovery_with_materialized_pod_stays_started(
         None,
     )
     .await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -3210,7 +3228,7 @@ async fn failed_started_recovery_with_node_placement_stays_started(
         None,
     )
     .await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -3264,7 +3282,7 @@ async fn failed_started_recovery_with_routable_pod_stays_started(
         None,
     )
     .await?;
-    let generation = match fixture.store.claim_started_recovery(typed).await? {
+    let generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
@@ -3319,7 +3337,7 @@ async fn stale_creating_started_recovery_claim_is_reclaimed(fixture: &PostgresSt
     .execute(&fixture.pool)
     .await?;
 
-    let reclaimed = fixture.store.claim_started_recovery(typed).await?;
+    let reclaimed = fixture.store.claim_started_recovery(typed, None).await?;
 
     assert_eq!(
         reclaimed,
@@ -3341,13 +3359,19 @@ async fn started_recovery_follows_superseding_execution(fixture: &PostgresStore)
     let sandbox_id = SandboxId::new();
     let typed = sandbox_id;
     insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
-    let first_generation = match fixture.store.claim_started_recovery(typed).await? {
+    let first_generation = match fixture.store.claim_started_recovery(typed, None).await? {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };
     let replacement = fixture
         .store
-        .replace_active_execution_claim_if_generation(typed, first_generation, "replaced", None)
+        .replace_active_execution_claim_if_generation(
+            typed,
+            first_generation,
+            "replaced",
+            None,
+            None,
+        )
         .await?
         .expect("active recovery generation should be replaced");
 
@@ -3419,7 +3443,13 @@ async fn transient_create_dodge_handoff_yields_fresh_claim(fixture: &PostgresSto
     // so a later claim attempt dedupes against it instead of inserting.
     let replaced = fixture
         .store
-        .replace_active_execution_claim_if_generation(typed, first.row.generation, "replaced", None)
+        .replace_active_execution_claim_if_generation(
+            typed,
+            first.row.generation,
+            "replaced",
+            None,
+            None,
+        )
         .await?
         .expect("replacement claim");
     let reacquired = fixture.store.ensure_active_execution_claim(typed).await?;
@@ -3911,6 +3941,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
             SandboxLifecycle::Started,
             None,
             Some((attempt_a, SandboxTransitionTargetState::Started)),
+            None,
         )
         .await?;
     assert_eq!(
@@ -4109,6 +4140,7 @@ async fn activation_attempt_assignment_is_monotonic_after_lease_expiry(
             sandbox_id,
             attempt_a,
             SandboxTransitionTargetState::Started,
+            pplx_space_common_core::types::ClientKey::unknown_ref(),
         )
         .await?;
     sqlx::query(sql!(
@@ -4175,7 +4207,12 @@ async fn completed_activation_cannot_release_a_later_clock_skewed_allocation(
     let route: SandboxActivationAttemptId = "ffffffff-0000-7000-8000-000000000001".parse()?;
     let execution = fixture
         .store
-        .begin_activation_execution_row(sandbox_id, route, SandboxTransitionTargetState::Started)
+        .begin_activation_execution_row(
+            sandbox_id,
+            route,
+            SandboxTransitionTargetState::Started,
+            pplx_space_common_core::types::ClientKey::unknown_ref(),
+        )
         .await?;
     assert!(
         fixture
@@ -4238,6 +4275,7 @@ async fn activation_attempt_assignment_adopts_route_less_legacy_resident_after_a
             sandbox_id,
             legacy_owner,
             SandboxTransitionTargetState::Started,
+            pplx_space_common_core::types::ClientKey::unknown_ref(),
         )
         .await?;
     sqlx::query(sql!(
@@ -4445,7 +4483,12 @@ async fn stale_generation_cannot_complete_or_abandon_reused_attempt(
     let attempt = SandboxActivationAttemptId::new();
     let first = fixture
         .store
-        .begin_activation_execution_row(sandbox_id, attempt, SandboxTransitionTargetState::Started)
+        .begin_activation_execution_row(
+            sandbox_id,
+            attempt,
+            SandboxTransitionTargetState::Started,
+            pplx_space_common_core::types::ClientKey::unknown_ref(),
+        )
         .await?;
     let successor_generation = first.generation + 1;
     sqlx::query(sql!(
@@ -4556,6 +4599,7 @@ async fn replacement_handler_claims_g7_after_lagging_g6_is_replaced(
             handler_a_claim.row.generation,
             "replaced",
             Some((replacement_attempt, SandboxTransitionTargetState::Started)),
+            None,
         )
         .await?
         .expect("handler B should replace the stale generation");
@@ -4590,6 +4634,7 @@ async fn replacement_handler_claims_g7_after_lagging_g6_is_replaced(
             sandbox_id,
             handler_a_claim.row.generation,
             "replaced",
+            None,
             None,
         )
         .await?;
@@ -4731,6 +4776,7 @@ async fn blank_pod_uid_decodes_as_absent_for_active_execution(
             SandboxLifecycle::Started,
             None,
             Some((attempt, SandboxTransitionTargetState::Started)),
+            None,
         )
         .await?;
     assert_eq!(initialized.row.activation_attempt_id, Some(attempt));
@@ -9281,7 +9327,7 @@ async fn a_contended_execution_guard_answers_retryable_not_failed() -> TestResul
     .await?;
 
     let error = store
-        .claim_started_recovery(typed)
+        .claim_started_recovery(typed, None)
         .await
         .expect_err("the guard must abort rather than wait out the held row lock");
     assert!(
@@ -9303,7 +9349,7 @@ async fn a_contended_execution_guard_answers_retryable_not_failed() -> TestResul
     // the bound firing rather than a missing precondition.
     blocker.rollback().await?;
     store
-        .claim_started_recovery(typed)
+        .claim_started_recovery(typed, None)
         .await
         .expect("the same claim succeeds once the row lock is released");
     Ok(())

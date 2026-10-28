@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
+use pplx_space_common_core::types::{ClientKey, OrgId, SandboxId, UserId};
 
 use super::*;
 use crate::controllers::substrate::{
@@ -155,6 +155,7 @@ struct PooledCreateInput<'a> {
     boot_mode: CreateBootMode,
     federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     federated_service_grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
+    client_key: &'a ClientKey,
     /// This create will produce an encrypted sandbox (org enrollment ∧ the
     /// global volume-encryption switch). See the pool bypass in
     /// `try_create_from_pool_with_substrate` for why these cold-create today.
@@ -416,6 +417,9 @@ pub struct RestoreForkDiskAsNewContext<'a> {
     pub operation_id: OperationId,
     pub restore_lease_seconds: u32,
     pub volume_encryption: bool,
+    /// The client that requested the fork, carried in the persisted operation
+    /// payload.
+    pub client_key: ClientKey,
 }
 
 /// Whether the owner org has BYOK (per-sandbox volume encryption) enabled.
@@ -917,6 +921,8 @@ struct SandboxCreateExecutionMode<'a> {
     restore_from: Option<ForkDiskRestore<'a>>,
     restore_operation_id: Option<OperationId>,
     restore_lease_seconds: u32,
+    /// The client this create is attributed to (admission and the pod label).
+    client_key: &'a ClientKey,
 }
 
 fn pool_attempt_resources(pool_shape: Option<PooledExecutionPoolShape>) -> SandboxResources {
@@ -991,6 +997,7 @@ impl SandboxController {
         req: &CreateSandboxRequest,
         metric_identity: SandboxApiMetricIdentity,
         federated: FederatedSandboxCreateContext<'_>,
+        client_key: &ClientKey,
     ) -> Result<SandboxResponse, ControllerError> {
         self.create_with_sandbox_id_inner(
             pool,
@@ -1005,6 +1012,7 @@ impl SandboxController {
                 restore_from: None,
                 restore_operation_id: None,
                 restore_lease_seconds: 0,
+                client_key,
             },
         )
         .await
@@ -1032,6 +1040,8 @@ impl SandboxController {
                 restore_from: None,
                 restore_operation_id: None,
                 restore_lease_seconds: 0,
+                // Native `/v1` creates carry no `X-Client-ID`.
+                client_key: ClientKey::unknown_ref(),
             },
         )
         .await
@@ -1068,6 +1078,8 @@ impl SandboxController {
                 restore_from: None,
                 restore_operation_id: None,
                 restore_lease_seconds: 0,
+                // Native `/v1` creates carry no `X-Client-ID`.
+                client_key: ClientKey::unknown_ref(),
             },
         )
         .await
@@ -1181,6 +1193,7 @@ impl SandboxController {
                 }),
                 restore_operation_id: Some(restore.operation_id),
                 restore_lease_seconds: restore.restore_lease_seconds,
+                client_key: &restore.client_key,
             },
         )
         .await
@@ -1206,6 +1219,7 @@ impl SandboxController {
             restore_from,
             restore_operation_id,
             restore_lease_seconds,
+            client_key,
         } = mode;
         let fork_volume_encryption = restore_from
             .as_ref()
@@ -1349,6 +1363,7 @@ impl SandboxController {
             federated_owner,
             federated_service_grant,
             volume_encryption,
+            client_key,
         };
         // Set when this create was admitted against a warm-pool slot and is
         // building cold instead: the slot's pod used this ID's generation 1.
@@ -1412,8 +1427,11 @@ impl SandboxController {
         )
         .await?;
 
-        self.admit_cluster_activation(crate::cluster_admission::ClusterActivationClass::Cold)
-            .await?;
+        self.admit_cluster_activation(
+            crate::cluster_admission::ClusterActivationClass::Cold,
+            Some(client_key),
+        )
+        .await?;
 
         // Store the resolved hash as the sandbox's immutable build pin; wake and restore
         // keep using it even if a tag moves later.
@@ -1557,6 +1575,7 @@ impl SandboxController {
                 wait_until_ready: req.wait_until_ready,
                 volume_encryption,
                 node_pool: req.node_pool.as_ref(),
+                client_key,
             })
             .await
         {
@@ -1681,7 +1700,10 @@ impl SandboxController {
                             blocking: true,
                             ready_timeout: DEFAULT_BLOCKING_WAIT_TIMEOUT,
                         },
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        // Charged as a cold activation above.
+                        crate::controllers::substrate::RecoveryCharge::exempt(Some(
+                            client_key.clone(),
+                        )),
                     )
                     .await
                 {
@@ -1709,7 +1731,7 @@ impl SandboxController {
                 .substrate
                 .runtime_client(
                     outcome.sandbox_id,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt(Some(client_key.clone())),
                 )
                 .await
             {
@@ -2922,6 +2944,7 @@ fn pooled_execution_claim_request<'a>(
         template_network_policy: input.template_network_policy,
         template_network_policy_generation: input.template_network_policy_generation,
         volume_encryption: input.volume_encryption,
+        client_key: input.client_key,
     }
 }
 

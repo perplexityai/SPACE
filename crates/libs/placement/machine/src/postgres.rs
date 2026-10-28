@@ -202,11 +202,18 @@ impl PostgresPlacementStore {
                 .fetch_one(&mut **tx)
                 .await?;
                 let pod_name = format!("space-sbx-{}-g{}", sandbox.as_uuid().simple(), generation);
+                // No activating client is known here, so the generation
+                // inherits its predecessor's, as the API's claim does.
                 let inserted = sqlx::query_scalar::<_, i64>(sql!(
                     "INSERT INTO sandbox_k8s_executions (
-                         sandbox_id, generation, pod_name, pod_namespace, state, active
+                         sandbox_id, generation, pod_name, pod_namespace, state, active,
+                         activating_client_key
                      )
-                     VALUES ($1, $2, $3, $4, 'creating', TRUE)
+                     VALUES ($1, $2, $3, $4, 'creating', TRUE, (
+                         SELECT activating_client_key FROM sandbox_k8s_executions
+                          WHERE sandbox_id = $1 AND activating_client_key IS NOT NULL
+                          ORDER BY generation DESC LIMIT 1
+                     ))
                      ON CONFLICT DO NOTHING
                      RETURNING generation"
                 ))

@@ -81,6 +81,11 @@ pub const SANDBOX_USER_ANNOTATION: &str = "space.pplx.net/sandbox-user";
 pub const SANDBOX_VOLUME_ENCRYPTION_ANNOTATION: &str = "space.pplx.net/volume-encryption";
 pub const SANDBOX_OWNER_ID_LABEL: &str = "space.pplx.net/user-id";
 pub const SANDBOX_ORG_ID_LABEL: &str = "space.pplx.net/org-id";
+/// The [`crate::types::ClientKey`] of the client that activated the pod's
+/// execution: an allowlisted `X-Client-ID` value or `unknown`. Rendered on
+/// every on-demand and restore pod. A pooled pod has no activating client
+/// until it is adopted; the API then patches the label on, best effort.
+pub const SANDBOX_CLIENT_ID_LABEL: &str = "space.pplx.net/client-id";
 pub const SANDBOX_POOL_SLOT_ID_KEY: &str = "space.pplx.net/pool-slot-id";
 pub const SANDBOX_POOL_CONFIG_ID_KEY: &str = "space.pplx.net/pool-config-id";
 pub const SANDBOX_POOL_ROLE_KEY: &str = "space.pplx.net/pool-role";
@@ -489,6 +494,10 @@ pub struct SandboxRuntimePodMetadata<'a> {
     pub sandbox_owner: &'a SandboxOwner,
     pub user_id: crate::types::UserId,
     pub org_id: crate::types::OrgId,
+    /// Rendered as [`SANDBOX_CLIENT_ID_LABEL`]. The pod is attributed to the
+    /// client that activated this execution, not the one that created the
+    /// sandbox.
+    pub client_key: &'a crate::types::ClientKey,
     pub auto_lifecycle_json: &'a str,
     pub auto_lifecycle_authority: PolicyAuthority,
     pub network_policy_json: &'a str,
@@ -847,6 +856,10 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             runtime.user_id.to_string(),
         );
         labels.insert(SANDBOX_ORG_ID_LABEL.to_string(), runtime.org_id.to_string());
+        labels.insert(
+            SANDBOX_CLIENT_ID_LABEL.to_string(),
+            runtime.client_key.as_str().to_string(),
+        );
     }
     if let Some(pool) = pool {
         labels.insert(

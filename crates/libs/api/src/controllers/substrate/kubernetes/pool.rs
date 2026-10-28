@@ -515,7 +515,7 @@ async fn claim_ready_pool_slot(
 
 pub(super) async fn persist_pooled_execution_claim(
     tx: &mut Transaction<'_, Postgres>,
-    _request: &PooledExecutionClaimRequest<'_>,
+    request: &PooledExecutionClaimRequest<'_>,
     claim: &PooledExecutionClaim,
 ) -> Result<(), ControllerError> {
     let route_activation_id = pooled_route_activation_id(claim)?;
@@ -542,11 +542,13 @@ pub(super) async fn persist_pooled_execution_claim(
     sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (
              sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
-             k8s_node_name, state, active, route_activation_id, pod_materialized_at
+             k8s_node_name, state, active, route_activation_id, pod_materialized_at,
+             activating_client_key
          )
          VALUES (
              $1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7,
-             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
+             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END,
+             $8
          )"
     ))
     .bind(claim.sandbox_id)
@@ -556,6 +558,7 @@ pub(super) async fn persist_pooled_execution_claim(
     .bind(source.pod_ip.as_deref())
     .bind(source.k8s_node_name.as_deref())
     .bind(route_activation_id)
+    .bind(request.client_key.as_str())
     .execute(&mut **tx)
     .await
     .map_err(|err| db_contention_error("failed to bind pool execution", &err))?;

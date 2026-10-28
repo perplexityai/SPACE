@@ -3,13 +3,15 @@
 
 use super::*;
 
-pub(super) const K8S_THROTTLE_DELETE_RETRY_ATTEMPTS: usize = 3;
+pub(super) const K8S_THROTTLE_RETRY_ATTEMPTS: usize = 3;
 
-const K8S_THROTTLE_DELETE_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const K8S_THROTTLE_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
-const K8S_THROTTLE_DELETE_RETRY_MAX_JITTER: Duration = Duration::from_millis(75);
+const K8S_THROTTLE_RETRY_MAX_JITTER: Duration = Duration::from_millis(75);
 
-pub(super) async fn retry_kube_delete_throttling<T, Fut, F>(
+/// Run a Kubernetes pod request, retrying it a few times with jittered
+/// backoff while the apiserver throttles it.
+pub(in crate::controllers::substrate::kubernetes) async fn retry_kube_throttling<T, Fut, F>(
     operation: &'static str,
     mut call: F,
 ) -> Result<T, KubeError>
@@ -23,25 +25,24 @@ where
         match call().await {
             Ok(value) => return Ok(value),
             Err(err)
-                if is_kube_api_throttling_error(&err)
-                    && attempt < K8S_THROTTLE_DELETE_RETRY_ATTEMPTS =>
+                if is_kube_api_throttling_error(&err) && attempt < K8S_THROTTLE_RETRY_ATTEMPTS =>
             {
                 let jitter_ms = rand::rng().random_range(
-                    0..=K8S_THROTTLE_DELETE_RETRY_MAX_JITTER
+                    0..=K8S_THROTTLE_RETRY_MAX_JITTER
                         .as_millis()
                         .try_into()
                         .unwrap_or(u64::MAX),
                 );
-                let delay = K8S_THROTTLE_DELETE_RETRY_BASE_DELAY
+                let delay = K8S_THROTTLE_RETRY_BASE_DELAY
                     * u32::try_from(attempt).unwrap_or(u32::MAX)
                     + Duration::from_millis(jitter_ms);
                 tracing::warn!(
                     operation,
                     attempt,
-                    max_attempts = K8S_THROTTLE_DELETE_RETRY_ATTEMPTS,
+                    max_attempts = K8S_THROTTLE_RETRY_ATTEMPTS,
                     delay_ms = delay.as_millis(),
                     error = %err,
-                    "retrying throttled Kubernetes pod delete"
+                    "retrying throttled Kubernetes pod request"
                 );
                 sleep(delay).await;
             }
@@ -55,7 +56,7 @@ pub(super) async fn delete_sandbox_pod_with_throttle_retry(
     pod_name: &str,
     operation: &'static str,
 ) -> Result<(), KubeError> {
-    retry_kube_delete_throttling(operation, || delete_sandbox_pod(k8s, pod_name)).await
+    retry_kube_throttling(operation, || delete_sandbox_pod(k8s, pod_name)).await
 }
 
 /// Names of this sandbox's live pods from generations **strictly older** than

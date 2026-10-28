@@ -53,6 +53,7 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
         restore_context: Option<StartedRecoveryRestoreContext>,
+        activating_client: Option<&ClientKey>,
     ) -> Result<Option<(SandboxExecutionClaim, StartedRecoveryRestoreSource)>, SubstrateError> {
         let restore_context = match restore_context {
             Some(restore_context) => restore_context,
@@ -93,6 +94,7 @@ impl KubernetesSubstrate {
                 sandbox_id,
                 generation,
                 allowed_local_source.as_deref(),
+                activating_client,
             )
             .await?
         {
@@ -138,7 +140,12 @@ impl KubernetesSubstrate {
             }
         })?;
         let Some((replacement_claim, source)) = self
-            .handoff_started_recovery_execution(sandbox_id, generation, restore_context)
+            .handoff_started_recovery_execution(
+                sandbox_id,
+                generation,
+                restore_context,
+                activation_assignment.and_then(ActivationAttemptAssignment::client),
+            )
             .await?
         else {
             return Ok(false);

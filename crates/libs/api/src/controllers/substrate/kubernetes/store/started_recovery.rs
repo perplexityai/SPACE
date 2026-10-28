@@ -70,9 +70,12 @@ impl K8sStore {
         .transpose()
     }
 
+    /// `activating_client` attributes the execution generation this claim
+    /// inserts when the sandbox has no active one; `None` inherits.
     pub(in crate::controllers::substrate::kubernetes) async fn claim_started_recovery(
         &self,
         sandbox_id: SandboxId,
+        activating_client: Option<&ClientKey>,
     ) -> Result<StartedRecoveryClaim, SubstrateError> {
         if let Some((generation, lease_remaining)) = self.fresh_started_recovery(sandbox_id).await?
         {
@@ -111,7 +114,7 @@ impl K8sStore {
         }
 
         let claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None)
+            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None, activating_client)
             .await?;
         let generation = sqlx::query_scalar::<_, i64>(sql!(
             "UPDATE sandbox_k8s_executions
@@ -275,6 +278,9 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
         allowed_local_source: Option<&str>,
+        // The client of the activation that owns this recovery, which the
+        // successor takes over; `None` inherits the replaced execution's.
+        activating_client: Option<&ClientKey>,
     ) -> Result<StartedRecoveryReplacement, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let mut tx = self
@@ -363,7 +369,7 @@ impl K8sStore {
         }
 
         let mut claim = self
-            .insert_active_execution_claim_in(&mut tx, sandbox_id)
+            .insert_active_execution_claim_in(&mut tx, sandbox_id, activating_client)
             .await?;
         if !claim.created {
             return Err(SubstrateError::Failed {

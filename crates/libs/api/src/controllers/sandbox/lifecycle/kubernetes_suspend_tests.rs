@@ -95,6 +95,7 @@ async fn suspend_keeps_a_wake_that_claimed_after_the_suspend_committed() -> Test
             SandboxApiMetricIdentity::native(SandboxAction::Suspend.as_str()),
             SandboxAction::Suspend,
             None,
+            None,
         )
         .await?;
 

@@ -1080,6 +1080,7 @@ impl ForkSandboxOperationExecutor {
                         &request,
                         SandboxApiMetricIdentity::ecw("fork"),
                         RestoreForkDiskAsNewContext {
+                            client_key: payload.client_key(),
                             volume_encryption: config.volume_encryption,
                             sandbox_id: target_id,
                             federated,

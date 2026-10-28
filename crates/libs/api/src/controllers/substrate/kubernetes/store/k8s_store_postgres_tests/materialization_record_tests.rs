@@ -316,7 +316,11 @@ async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
         None,
     )
     .await?;
-    let generation = match fixture.store.claim_started_recovery(recovered).await? {
+    let generation = match fixture
+        .store
+        .claim_started_recovery(recovered, None)
+        .await?
+    {
         StartedRecoveryClaim::CreatedExecution { generation } => generation,
         other => panic!("expected a new execution claim, got {other:?}"),
     };

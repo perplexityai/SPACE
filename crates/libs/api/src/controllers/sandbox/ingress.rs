@@ -167,6 +167,9 @@ impl AccessBackend for StoredAccess {
                     SandboxApiMetricIdentity::native("ingress"),
                     super::lifecycle::SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
                     None,
+                    // Ingress carries no client identity; the woken execution
+                    // inherits its predecessor's.
+                    None,
                 )
                 .await
                 .map_err(|error| Status::unavailable(error.to_string()))?;

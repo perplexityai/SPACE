@@ -83,6 +83,7 @@ fn new_admission_persists_the_explicit_v1_workflow() -> TestResult {
         federated_owner: None,
         federated_service_grant: None,
         idempotency_key: &idempotency_key,
+        client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
     };
 
     let prepared = prepare_fork_operation(&input)?;
@@ -91,6 +92,41 @@ fn new_admission_persists_the_explicit_v1_workflow() -> TestResult {
     assert_eq!(
         prepared.payload_json.pointer("/payload/workflow/phase"),
         Some(&serde_json::json!("awaiting_source"))
+    );
+    Ok(())
+}
+
+/// The executor runs the fork from the persisted payload, so the requesting
+/// client has to survive it; a payload from before the field reads as
+/// `unknown`.
+#[test]
+fn fork_payload_carries_the_requesting_client_key() -> TestResult {
+    use pplx_space_common_core::types::ClientKey;
+    let idempotency_key = IdempotencyKey::parse("client-key-admission")?;
+    let client_key = ClientKey::allowlisted("background-client").expect("valid client key");
+    let input = AdmitForkOperation {
+        org_id: OrgId::new(),
+        actor_user_id: Some(UserId::new()),
+        source_sandbox_id: SandboxId::new(),
+        request: ForkRequest::from_wire(Some(300), Some(1))?,
+        ecw_host_domain: "e2b.example.test",
+        hard_deadline: Duration::from_secs(240),
+        federated_owner: None,
+        federated_service_grant: None,
+        idempotency_key: &idempotency_key,
+        client_key: &client_key,
+    };
+
+    let mut value = prepare_fork_operation(&input)?.payload_json;
+    assert_eq!(decode_fork_payload(value.clone())?.client_key(), client_key);
+
+    value["payload"]
+        .as_object_mut()
+        .expect("payload object")
+        .remove("client_key");
+    assert_eq!(
+        decode_fork_payload(value)?.client_key(),
+        ClientKey::unknown()
     );
     Ok(())
 }
@@ -517,6 +553,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
                 federated_owner: None,
                 federated_service_grant: None,
                 idempotency_key: &idempotency_key,
+                client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
             },
         ),
     )
@@ -549,6 +586,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &missing_key,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         },
     )
     .await?;
@@ -597,6 +635,7 @@ async fn admission_reuses_matching_request_and_preserves_original_targets() -> T
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         },
     )
     .await?;
@@ -616,6 +655,7 @@ async fn admission_reuses_matching_request_and_preserves_original_targets() -> T
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         },
     )
     .await?;
@@ -656,6 +696,7 @@ async fn admitted_replay_survives_a_missing_source_sandbox() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         },
     )
     .await?;
@@ -684,6 +725,7 @@ async fn admitted_replay_survives_a_missing_source_sandbox() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         },
     )
     .await?;
@@ -715,6 +757,7 @@ async fn admission_rejects_same_key_with_different_request() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         },
     )
     .await?;
@@ -734,6 +777,7 @@ async fn admission_rejects_same_key_with_different_request() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         },
     )
     .await?;

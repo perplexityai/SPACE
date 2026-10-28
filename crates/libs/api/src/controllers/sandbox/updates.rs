@@ -1105,6 +1105,7 @@ impl SandboxController {
                 id,
                 crate::controllers::substrate::RecoveryCharge::enforce(
                     self.cluster_admission.as_ref(),
+                    None,
                 ),
             )
             .await?;

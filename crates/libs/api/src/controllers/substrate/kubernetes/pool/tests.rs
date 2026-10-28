@@ -261,6 +261,7 @@ fn pooled_claim_request<'a>(
         template_network_policy,
         template_network_policy_generation: 1,
         volume_encryption: false,
+        client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
     }
 }
 

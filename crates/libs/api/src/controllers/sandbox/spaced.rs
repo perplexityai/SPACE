@@ -61,6 +61,7 @@ impl SandboxController {
                 sandbox.id,
                 crate::controllers::substrate::RecoveryCharge::enforce(
                     self.cluster_admission.as_ref(),
+                    None,
                 ),
             )
             .await
@@ -96,14 +97,14 @@ impl SandboxController {
                         sandbox,
                         DEFAULT_BLOCKING_WAIT_TIMEOUT,
                         None,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        crate::controllers::substrate::RecoveryCharge::EXEMPT,
                     )
                     .await
                     .map_err(ControllerError::from)?;
                 self.substrate
                     .runtime_client(
                         sandbox.id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        crate::controllers::substrate::RecoveryCharge::EXEMPT,
                     )
                     .await
             }
@@ -702,7 +703,7 @@ pub(crate) async fn connect_spaced_runtime_client(
     )
     .await?;
 
-    let charge = crate::controllers::substrate::RecoveryCharge::enforce(admission);
+    let charge = crate::controllers::substrate::RecoveryCharge::enforce(admission, None);
 
     // The dormant entrypoint charge covers created/stopped/suspended implicit
     // wakes on the initial connect; the non-dormant lost-pod recreate is charged

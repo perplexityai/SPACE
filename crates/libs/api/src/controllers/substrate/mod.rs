@@ -494,6 +494,9 @@ pub struct CreateExecutionRequest<'a> {
     /// PodSpec-only and not persisted, so it applies at create and does not
     /// survive to a later reconcile/restore.
     pub node_pool: Option<&'a NodePoolName>,
+    /// The client this create is attributed to, rendered on the sandbox pod
+    /// as `space.pplx.net/client-id`.
+    pub client_key: &'a pplx_space_common_core::types::ClientKey,
 }
 
 pub struct CreateExecutionOutcome {

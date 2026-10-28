@@ -117,6 +117,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 sandbox_id,
                 requested_attempt_id,
                 SandboxTransitionTargetState::Started,
+                request.client_key,
             )
             .await
         {
@@ -958,6 +959,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
+            charge.client().cloned(),
         );
         let wait = async {
             // Boxed: `ensure_pod_exists` is a large future, and inlining it in
@@ -1621,12 +1623,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         if is_suspended_lifecycle(&sandbox.lifecycle) {
             Self::should_allow_access_recovery(sandbox, activity)?;
             return self
-                .wake_and_dial_once_started(
-                    sandbox,
-                    timeout,
-                    metric_identity,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                )
+                .wake_and_dial_once_started(sandbox, timeout, metric_identity, charge.paid())
                 .await;
         }
 

@@ -758,6 +758,8 @@ impl SandboxLifecycleOperationExecutor {
                 SandboxApiMetricIdentity::native(payload.action.as_str()),
                 controller_action,
                 None,
+                // Native `/v1` lifecycle operations carry no `X-Client-ID`.
+                None,
             )
             .await?;
         let updated = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;

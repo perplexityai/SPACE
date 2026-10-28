@@ -152,6 +152,9 @@ impl KubernetesSubstrate {
             sandbox_owner,
             user_id: sandbox.user_id,
             org_id: sandbox.org_id,
+            // The row is the label's source of truth, so a rebuilt pod keeps
+            // the client its execution was inserted for.
+            client_key: execution.activating_client(),
             auto_lifecycle_json,
             auto_lifecycle_authority: PolicyAuthority::Cluster,
             network_policy_json,

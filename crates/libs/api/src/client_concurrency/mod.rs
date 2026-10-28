@@ -538,6 +538,34 @@ impl ClientConcurrencyLimiter {
         )
     }
 
+    /// Resolve an `X-Client-ID` value to the bounded key that activation
+    /// admission and the `space.pplx.net/client-id` pod label carry.
+    ///
+    /// Same allowlist as this limiter's buckets (`known_clients` plus the
+    /// Eppo `overrides` keys): an allowlisted id is its own key, and anything
+    /// else is `unknown`. It doesn't depend on the limiter's runtime gate, so
+    /// a request is attributed the same way whether or not slots are being
+    /// tracked. The override keys follow the same env master as the caps they
+    /// carry: under `off` they aren't read, and only `known_clients` allowlists.
+    pub fn client_key(&self, client_id: Option<&str>) -> pplx_space_common_core::types::ClientKey {
+        use pplx_space_common_core::types::ClientKey as BoundedClientKey;
+        // No id can't be allowlisted, so skip the flag read.
+        if ClientKey::normalize(client_id).is_none() {
+            return BoundedClientKey::unknown();
+        }
+        let overrides = self.quota_overrides();
+        match ClientKey::classify(client_id, &self.inner.config, overrides.as_ref()) {
+            ClientKey::Client(id) => BoundedClientKey::allowlisted(&id).unwrap_or_else(|| {
+                tracing::warn!(
+                    client_id = %id,
+                    "allowlisted client id isn't a Kubernetes label value; attributing it to `unknown`"
+                );
+                BoundedClientKey::unknown()
+            }),
+            ClientKey::Unspecified => BoundedClientKey::unknown(),
+        }
+    }
+
     /// Attempt to reserve a cluster-wide concurrency slot for `operation` on
     /// behalf of the client identified by `client_id` (the `X-Client-ID` header
     /// value, if any).

@@ -972,6 +972,7 @@ async fn direct_create_rejects_node_pool_placement() -> TestResult {
             wait_until_ready: true,
             volume_encryption: false,
             node_pool: Some(&node_pool),
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         })
         .await;
     let error = match result {
@@ -2688,6 +2689,7 @@ async fn direct_create_receipt_failure_deletes_node_local_sandbox() -> TestResul
             wait_until_ready: true,
             volume_encryption: false,
             node_pool: None,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         })
         .await;
 
@@ -2765,6 +2767,7 @@ async fn direct_create_identity_preparation_failure_deletes_node_local_sandbox()
             wait_until_ready: false,
             volume_encryption: false,
             node_pool: None,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         })
         .await;
 
@@ -2838,6 +2841,7 @@ async fn two_step_direct_create_initializes_identity_for_initial_start() -> Test
             wait_until_ready: false,
             volume_encryption: false,
             node_pool: None,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         })
         .await?;
 
@@ -2942,6 +2946,7 @@ impl DirectCreateFixture {
                 request,
                 pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
                 crate::controllers::sandbox::FederatedSandboxCreateContext::new(None, None),
+                pplx_space_common_core::types::ClientKey::unknown_ref(),
             )
             .await
     }
@@ -3145,7 +3150,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
                         blocking: true,
                         ready_timeout: Duration::from_secs(5),
                     },
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::EXEMPT,
                 )
                 .await?;
         }
@@ -3204,7 +3209,7 @@ async fn direct_start_persists_complete_route_identity_receipt() -> TestResult {
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::EXEMPT,
         )
         .await?;
 
@@ -3766,7 +3771,7 @@ async fn direct_start_rejects_wrong_worker_receipt_and_clears_stale_identity() -
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::EXEMPT,
         )
         .await
         .expect_err("a receipt for another worker must fail closed");
@@ -3920,6 +3925,7 @@ async fn pooled_claim_persists_route_receipt_after_api_sandbox_insert() -> TestR
         template_network_policy: &policy,
         template_network_policy_generation: 1,
         volume_encryption: false,
+        client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
     };
     let mut transaction = fixture.pool.begin().await?;
 
@@ -4050,7 +4056,7 @@ async fn cross_node_restore_handles_candidate_failures(
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::EXEMPT,
         )
         .await;
     if !alternate_support {
@@ -4206,7 +4212,7 @@ async fn cross_node_restore_retains_source_after_receipt_persistence_failure() -
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::EXEMPT,
         )
         .await
         .expect_err("mismatched destination receipt must fail closed");
@@ -4486,7 +4492,7 @@ async fn implicit_access_wake_honors_the_workers_effective_policy() -> TestResul
                 &sandbox,
                 ExecutionActivityKind::Access,
                 Duration::from_secs(5),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::EXEMPT,
             )
             .await;
 
@@ -4536,7 +4542,7 @@ async fn implicit_access_wake_refuses_when_the_cluster_policy_denies_it() -> Tes
             &sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(5),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::EXEMPT,
         )
         .await
     {
@@ -4581,6 +4587,7 @@ async fn pooled_claim_checks_capability_before_adopting_and_retains_its_generati
         template_network_policy: &network,
         template_network_policy_generation: 1,
         volume_encryption: false,
+        client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
     };
     for supported in [false, true] {
         let node = NodeId::new();
@@ -4708,7 +4715,7 @@ async fn wake_reserves_fresh_identity_when_observed_resident_retires() -> TestRe
             &sandbox,
             Duration::from_secs(5),
             None,
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::EXEMPT,
         )
         .await?;
     let running = state.get(&sandbox_id.to_string()).await?;
@@ -4769,7 +4776,7 @@ async fn wake_keeps_generation_observed_during_resident_transition(
             &sandbox,
             Duration::from_secs(5),
             Some(ExecutionActivityKind::Access),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::EXEMPT,
         )
         .await?;
     let resumed = state.get(&sandbox_id.to_string()).await?;

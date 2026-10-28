@@ -86,7 +86,11 @@ async fn failed_recovery_reverts_only_a_started_row() -> TestResult {
             None,
         )
         .await?;
-        let generation = match fixture.store.claim_started_recovery(sandbox_id).await? {
+        let generation = match fixture
+            .store
+            .claim_started_recovery(sandbox_id, None)
+            .await?
+        {
             StartedRecoveryClaim::CreatedExecution { generation } => generation,
             other => return Err(format!("{lifecycle}: expected a new claim, got {other:?}").into()),
         };
@@ -168,7 +172,11 @@ async fn failed_recovery_revert_keeps_only_a_backed_marker() -> TestResult {
             backed.then_some(artifact),
         )
         .await?;
-        let generation = match fixture.store.claim_started_recovery(sandbox_id).await? {
+        let generation = match fixture
+            .store
+            .claim_started_recovery(sandbox_id, None)
+            .await?
+        {
             StartedRecoveryClaim::CreatedExecution { generation } => generation,
             other => return Err(format!("{case}: expected a new claim, got {other:?}").into()),
         };

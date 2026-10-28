@@ -575,6 +575,7 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
             sandbox_id,
             owner_attempt,
             SandboxTransitionTargetState::Started,
+            pplx_space_common_core::types::ClientKey::unknown_ref(),
         )
         .await?;
     *pod_name.lock().unwrap() = Some(owner.pod_name.clone());

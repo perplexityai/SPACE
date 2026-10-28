@@ -200,6 +200,7 @@ impl KubernetesSubstrate {
             // apply to the already-booted pod.
             volume_encryption: _,
             disk_io_limits: _,
+            client_key,
         } = setup;
         // The pool pod's user_id/org_id annotations carry the pool's identity;
         // adoption conveys the adopter's identity through the owner update below
@@ -353,20 +354,28 @@ impl KubernetesSubstrate {
             ));
         }
 
-        // Patch the pod annotation with the explicit override so that if sbx-mgr
-        // ever restarts and re-reads the pod spec, the shim passes the correct
-        // policy to sbx-mgr's Create.
+        // One best-effort, fire-and-forget metadata patch for the pool pod.
         //
-        // K8s pool pods have no network-policy annotation at creation time (the
-        // pool pod builder uses SandboxPodRequest::Pooled which omits the runtime
-        // annotation block). Only write the annotation for an explicit override;
-        // leave it absent for template inheritance so a future shim Create sees nil
-        // NetworkPolicy → sbx-mgr inherits the template default rather than locking
-        // in the current template value as a per-sandbox override. This is
-        // best-effort and fire-and-forget — sbx-mgr's DB already holds the correct
-        // policy from the preceding set_sandbox_network_policy call.
+        // Label: the pool pod was built with no activating client
+        // (`SandboxPodRequest::Pooled` renders no runtime labels), so label it
+        // with the adopter's for per-client pod counts. The execution row
+        // already holds the key, so a pod rebuilt for this sandbox later is
+        // labeled from there; the label is attribution, not a correctness input.
+        //
+        // Annotation: with an explicit override, record it so that if sbx-mgr
+        // ever restarts and re-reads the pod spec, the shim passes the correct
+        // policy to sbx-mgr's Create. K8s pool pods have no network-policy
+        // annotation at creation time (the pool pod builder uses
+        // SandboxPodRequest::Pooled which omits the runtime annotation block).
+        // Only write the annotation for an explicit override; leave it absent for
+        // template inheritance so a future shim Create sees nil NetworkPolicy →
+        // sbx-mgr inherits the template default rather than locking in the
+        // current template value as a per-sandbox override. sbx-mgr's DB already
+        // holds the correct policy from the preceding set_sandbox_network_policy
+        // call.
+        use pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL;
+        let mut annotations = None;
         if let Some(override_policy) = override_policy.as_ref() {
-            use kube::api::{Patch, PatchParams};
             match serde_json::to_string(override_policy) {
                 Err(err) => {
                     tracing::warn!(
@@ -384,34 +393,48 @@ impl KubernetesSubstrate {
                     );
                 }
                 Ok(policy_json) => {
-                    let patch = serde_json::json!({
-                        "metadata": {
-                            "annotations": {
-                                SANDBOX_NETWORK_POLICY_ANNOTATION: policy_json,
-                                SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION: network_policy_generation.to_string(),
-                                SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION: authority.to_string(),
-                            }
-                        }
-                    });
-                    let pods: Api<Pod> =
-                        Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
-                    let pod_name = claim.pod_name.clone();
-                    let sandbox_id_bg = sandbox_id;
-                    tokio::spawn(async move {
-                        if let Err(err) = pods
-                            .patch(&pod_name, &PatchParams::default(), &Patch::Merge(&patch))
-                            .await
-                        {
-                            tracing::warn!(
-                                sandbox_id = %sandbox_id_bg,
-                                pod_name = %pod_name,
-                                %err,
-                                "pool adoption: failed to update pod network policy annotation"
-                            );
-                        }
-                    });
+                    annotations = Some(serde_json::json!({
+                        SANDBOX_NETWORK_POLICY_ANNOTATION: policy_json,
+                        SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION: network_policy_generation.to_string(),
+                        SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION: authority.to_string(),
+                    }));
                 }
             }
+        }
+        {
+            use kube::api::{Patch, PatchParams};
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(
+                "labels".to_string(),
+                serde_json::json!({ SANDBOX_CLIENT_ID_LABEL: client_key.as_str() }),
+            );
+            if let Some(annotations) = annotations {
+                metadata.insert("annotations".to_string(), annotations);
+            }
+            let patch = serde_json::json!({ "metadata": metadata });
+            let pods: Api<Pod> =
+                Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
+            let pod_name = claim.pod_name.clone();
+            // Retried while throttled: a pod the patch misses keeps no label,
+            // since nothing re-applies it until the pod is rebuilt.
+            tokio::spawn(async move {
+                let params = PatchParams::default();
+                let patch = Patch::Merge(&patch);
+                if let Err(err) =
+                    crate::controllers::substrate::kubernetes::pod_ops::retry_kube_throttling(
+                        "pool_adoption_metadata_patch",
+                        || pods.patch(&pod_name, &params, &patch),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        pod_name = %pod_name,
+                        %err,
+                        "pool adoption: failed to patch pod client label and network policy annotation"
+                    );
+                }
+            });
         }
 
         // Step: auto-lifecycle. Set before any wake so the idle policy is live

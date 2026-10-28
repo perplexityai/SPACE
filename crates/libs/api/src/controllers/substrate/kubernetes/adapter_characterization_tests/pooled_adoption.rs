@@ -4,14 +4,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use pplx_space_common_core::types::PodUid;
 use pplx_space_sbx_mgr_client::proto as sbx;
 use prost::Message as _;
 
 use super::super::scripted_test_doubles::{
-    CallObserver, ScriptedReply, ScriptedWorker, ScriptedWorkerConfig, kube_status,
-    scripted_kube_client, start_scripted_worker,
+    CallObserver, ScriptedReply, ScriptedWorker, ScriptedWorkerConfig, kube_status, pod_path,
+    requests_matching, scripted_kube_client, start_scripted_worker,
 };
 use super::super::tests::{
     insert_test_sandbox_row, substrate_with_store_client_proxy_port_and_pod,
@@ -92,6 +92,7 @@ impl PooledInputs {
             template_network_policy: &self.create.template_policy,
             template_network_policy_generation: 7,
             volume_encryption: false,
+            client_key: pplx_space_common_core::types::ClientKey::unknown_ref(),
         }
     }
 
@@ -252,6 +253,57 @@ async fn pooled_adoption_applies_per_sandbox_setup_before_route_adoption() -> Te
         lifecycle.authority,
         pplx_space_net_common::proto::PolicyAuthority::Cluster as i32
     );
+    Ok(())
+}
+
+/// A pool pod is built with no activating client, so adoption labels it with
+/// the adopter's. The patch is fire-and-forget, so the test waits for it.
+#[tokio::test(flavor = "current_thread")]
+async fn pooled_adoption_labels_the_pod_with_the_adopting_client() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let inputs = PooledInputs::new();
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new(inputs.accepted())).await?;
+    let (kube, log) = scripted_kube_client(|_| kube_status(StatusCode::OK, "Success"));
+    let mut substrate = substrate_without_store(&worker);
+    substrate.k8s.client = kube;
+    let client_key = pplx_space_common_core::types::ClientKey::allowlisted("background-client")
+        .expect("valid client key");
+
+    substrate
+        .prepare_pooled_execution(
+            SandboxApiMetricIdentity::native("create"),
+            &PooledExecutionClaimRequest {
+                client_key: &client_key,
+                ..inputs.request()
+            },
+            &inputs.claim,
+            &inputs.create.auto_lifecycle,
+            false,
+            Duration::from_secs(10),
+        )
+        .await?;
+
+    let patch = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(patch) = requests_matching(&log, &Method::PATCH)
+                .into_iter()
+                .find(|request| request.path == pod_path(POOLED_POD_NAME))
+            {
+                break patch;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let label = patch
+        .body
+        .as_ref()
+        .and_then(|body| body.pointer("/metadata/labels"))
+        .and_then(|labels| labels.get(pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(label, Some("background-client"));
     Ok(())
 }
 

@@ -1242,6 +1242,7 @@ impl SandboxController {
                 DEFAULT_BLOCKING_WAIT_TIMEOUT,
                 crate::controllers::substrate::RecoveryCharge::enforce(
                     self.cluster_admission.as_ref(),
+                    None,
                 ),
             )
             .await

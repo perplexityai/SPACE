@@ -13,7 +13,10 @@ use pplx_space_events::{
 };
 use pplx_space_public_api::PublicErrorCode;
 
-use super::{AppState, E2bApiError, MatchedEcwHost, acquire_client_slot, request_client_id};
+use super::{
+    AppState, E2bApiError, MatchedEcwHost, acquire_client_slot, request_client_id,
+    request_client_key,
+};
 use crate::e2b::schema::SandboxForkRequestE2b;
 use crate::fork_operations::{
     AdmitForkOperation, AdmitForkOperationError, ForkAvailabilityConfig, ForkRequest,
@@ -230,6 +233,7 @@ pub(super) async fn fork_sandbox(
                                 federated_owner,
                                 federated_service_grant: federated_service_grant.as_ref(),
                                 idempotency_key: &idempotency_key,
+                                client_key: &request_client_key(&state, client_id.as_deref()),
                             },
                         )
                         .await

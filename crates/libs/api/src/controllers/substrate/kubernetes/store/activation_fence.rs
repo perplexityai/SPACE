@@ -9,6 +9,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
+        activating_client: &ClientKey,
     ) -> Result<SandboxExecutionRow, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let mut tx = self
@@ -26,6 +27,7 @@ impl K8sStore {
                 &mut tx,
                 sandbox_id,
                 Some((activation_attempt_id, target_state)),
+                Some(activating_client),
             )
             .await?;
         tx.commit()

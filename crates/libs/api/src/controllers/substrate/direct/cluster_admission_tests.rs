@@ -4,7 +4,7 @@
 //! last-known-worker fallback. Kubernetes counts schedulable nodes from its
 //! node cache instead.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_common_core::types::{ClientKey, NodeId};
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_test_env::TestResult;
@@ -54,7 +54,7 @@ async fn stale_heartbeat_direct_worker_is_not_empty_cluster() -> TestResult {
         FeatureFlagClient::disabled(),
     );
     admission
-        .admit_activation(ClusterActivationClass::Cold)
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
         .await?;
     Ok(())
 }

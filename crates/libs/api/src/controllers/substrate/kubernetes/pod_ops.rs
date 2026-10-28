@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{ClientKey, NodeId, SandboxId};
 
 use super::support::*;
 use super::*;
@@ -32,10 +32,9 @@ mod started_recovery;
 mod wake;
 mod worker_clients;
 use delete::delete_sandbox_pod_with_throttle_retry;
+pub(super) use delete::retry_kube_throttling;
 #[cfg(test)]
-use delete::{
-    K8S_THROTTLE_DELETE_RETRY_ATTEMPTS, lingering_sandbox_pod_names, retry_kube_delete_throttling,
-};
+use delete::{K8S_THROTTLE_RETRY_ATTEMPTS, lingering_sandbox_pod_names};
 #[cfg(test)]
 use ensure_pod::restore_placement_sample;
 #[cfg(test)]
@@ -191,6 +190,9 @@ impl StartedRecoveryOwnership {
 pub(super) struct ActivationAttemptAssignment {
     requested_id: SandboxActivationAttemptId,
     target_state: SandboxTransitionTargetState,
+    /// The client a generation this attempt inserts is attributed to. `None`
+    /// inherits the predecessor's client.
+    client: Option<ClientKey>,
     assigned: std::sync::Arc<std::sync::Mutex<Option<(SandboxActivationAttemptId, i64)>>>,
 }
 
@@ -198,12 +200,18 @@ impl ActivationAttemptAssignment {
     pub(super) fn new(
         requested_id: SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
+        client: Option<ClientKey>,
     ) -> Self {
         Self {
             requested_id,
             target_state,
+            client,
             assigned: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn client(&self) -> Option<&ClientKey> {
+        self.client.as_ref()
     }
 
     fn request(&self) -> (SandboxActivationAttemptId, SandboxTransitionTargetState) {

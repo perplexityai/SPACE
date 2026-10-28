@@ -58,7 +58,7 @@ impl K8sStore {
                     NULLIF(BTRIM(pod_uid), '') IS NOT NULL AS pod_materialized,
                     state,
                     updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
-                    activation_attempt_id, route_activation_id
+                    activation_attempt_id, route_activation_id, activating_client_key
              FROM sandbox_k8s_executions
              WHERE sandbox_id = $1 AND active"
         ))
@@ -69,10 +69,16 @@ impl K8sStore {
         .db_context("failed to query active Kubernetes execution row")
     }
 
+    /// Insert the next generation's active row. `activating_client` is the
+    /// client the new execution is attributed to; `None` copies the latest
+    /// prior generation's recorded key, so a reconciler-driven successor keeps
+    /// the attribution of the activation it replaces. A NULL key (a row an
+    /// older writer inserted) is skipped rather than inherited.
     pub(super) async fn insert_active_execution_claim_in(
         &self,
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
+        activating_client: Option<&ClientKey>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let generation = sqlx::query_scalar::<_, i64>(sql!(
@@ -88,18 +94,24 @@ impl K8sStore {
 
         let row = sqlx::query_as::<_, SandboxExecutionRow>(sql!(
             "INSERT INTO sandbox_k8s_executions (
-                 sandbox_id, generation, pod_name, pod_namespace, state, active
+                 sandbox_id, generation, pod_name, pod_namespace, state, active,
+                 activating_client_key
              )
-             VALUES ($1, $2, $3, $4, 'creating', TRUE)
+             VALUES ($1, $2, $3, $4, 'creating', TRUE, COALESCE($5, (
+                 SELECT activating_client_key FROM sandbox_k8s_executions
+                  WHERE sandbox_id = $1 AND activating_client_key IS NOT NULL
+                  ORDER BY generation DESC LIMIT 1
+             )))
              ON CONFLICT DO NOTHING
              RETURNING generation, pod_name, FALSE AS pod_materialized, state,
                        FALSE AS create_age_expired, activation_attempt_id,
-                       route_activation_id"
+                       route_activation_id, activating_client_key"
         ))
         .bind(sandbox_uuid)
         .bind(generation)
         .bind(&pod_name)
         .bind(&self.namespace)
+        .bind(activating_client.map(ClientKey::as_str))
         .fetch_optional(&mut *conn)
         .await
         .db_context("failed to insert Kubernetes execution row")?;
@@ -674,7 +686,7 @@ impl K8sStore {
         }
 
         let claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None)
+            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None, None)
             .await?;
 
         tx.commit()
@@ -715,6 +727,7 @@ impl K8sStore {
             pplx_space_common_core::types::SandboxActivationAttemptId,
             SandboxTransitionTargetState,
         )>,
+        activating_client: Option<&ClientKey>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
         let mut tx = self
             .pool
@@ -760,7 +773,12 @@ impl K8sStore {
             }
         }
         let claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, activation_attempt)
+            .ensure_active_execution_claim_in(
+                &mut tx,
+                sandbox_id,
+                activation_attempt,
+                activating_client,
+            )
             .await?;
 
         tx.commit()
@@ -772,6 +790,10 @@ impl K8sStore {
         Ok(claim)
     }
 
+    /// Reuse the active row or insert the next generation. An existing row
+    /// keeps the client it was inserted for; `activating_client` only
+    /// attributes a newly inserted one (see
+    /// [`Self::insert_active_execution_claim_in`]).
     pub(super) async fn ensure_active_execution_claim_in(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -780,6 +802,7 @@ impl K8sStore {
             pplx_space_common_core::types::SandboxActivationAttemptId,
             SandboxTransitionTargetState,
         )>,
+        activating_client: Option<&ClientKey>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let mut claim = match self.active_execution_row(&mut *tx, sandbox_uuid).await? {
@@ -789,7 +812,7 @@ impl K8sStore {
                 route_publication: None,
             },
             None => {
-                self.insert_active_execution_claim_in(&mut *tx, sandbox_id)
+                self.insert_active_execution_claim_in(&mut *tx, sandbox_id, activating_client)
                     .await?
             }
         };
@@ -822,6 +845,7 @@ impl K8sStore {
         generation: i64,
         state: &str,
         activation_attempt: Option<(SandboxActivationAttemptId, SandboxTransitionTargetState)>,
+        activating_client: Option<&ClientKey>,
     ) -> Result<Option<SandboxExecutionClaim>, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let mut tx = self
@@ -863,7 +887,12 @@ impl K8sStore {
         }
 
         let mut claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, activation_attempt)
+            .ensure_active_execution_claim_in(
+                &mut tx,
+                sandbox_id,
+                activation_attempt,
+                activating_client,
+            )
             .await?;
         if recovery_in_flight {
             let marked = sqlx::query(sql!(

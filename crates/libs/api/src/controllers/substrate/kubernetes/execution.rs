@@ -7,7 +7,7 @@ use super::*;
 use crate::controllers::substrate::{ActivationOptions, RecoveryCharge};
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{
-    SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
+    ClientKey, SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
 };
 use pplx_space_common_work_coalescer::{
     JoinError as CoalesceJoinError, Role as CoalesceRole, WorkOutcome,
@@ -212,7 +212,8 @@ struct RestoreClaimHandling {
     preclaimed: Option<RestoreClaim>,
     cleanup_on_failure: bool,
     /// Deferred activation charge the claim-winner pays. Preclaimed callers
-    /// pass [`RecoveryCharge::Exempt`]: their claim was charged upstream.
+    /// pass an exempt charge for the client their claim was charged to
+    /// upstream.
     charge: RecoveryCharge,
 }
 
@@ -253,11 +254,12 @@ struct PreparedWakeDrive {
 }
 
 impl RestoreClaimHandling {
-    fn preclaimed_with_cleanup(claim: RestoreClaim) -> Self {
+    /// `charge` is the one the claim was already charged with.
+    fn preclaimed_with_cleanup(claim: RestoreClaim, charge: &RecoveryCharge) -> Self {
         Self {
             preclaimed: Some(claim),
             cleanup_on_failure: true,
-            charge: RecoveryCharge::Exempt,
+            charge: charge.paid(),
         }
     }
 
@@ -478,7 +480,7 @@ impl KubernetesSubstrate {
                     .await
             }
             // Unreachable as written: only the evacuation claim produces this
-            // variant, and evacuation restores are `RecoveryCharge::Exempt`,
+            // variant, and evacuation restores are `RecoveryCharge::EXEMPT`,
             // so no deferred charge can reject one. If it ever is, leaving
             // the row `restoring` is the release, for the reason
             // `RestoreClaim::FreshFromStopped` gives.
@@ -558,8 +560,13 @@ impl KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
         timeout: Duration,
+        activating_client: Option<&ClientKey>,
     ) -> Result<StartedRecoveryClaimOutcome, SubstrateError> {
-        let claim = match self.store.claim_started_recovery(sandbox_id).await {
+        let claim = match self
+            .store
+            .claim_started_recovery(sandbox_id, activating_client)
+            .await
+        {
             Ok(claim) => claim,
             Err(error @ SubstrateError::Conflict { .. }) => {
                 return match self.suspended_or_restoring_sandbox(sandbox_id).await? {
@@ -880,7 +887,7 @@ impl KubernetesSubstrate {
             metric_identity,
             None,
             WakeTarget::started(None),
-            RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
+            RestoreClaimHandling::preclaimed_with_cleanup(restore_claim, &charge),
         )
         .await
         .map_err(ControllerError::from)?;
@@ -1012,7 +1019,7 @@ impl KubernetesSubstrate {
         let started_recovery = if should_join_started_recovery(lifecycle, SandboxLifecycle::Started)
         {
             match self
-                .claim_or_join_started_recovery(sandbox_id, timeout)
+                .claim_or_join_started_recovery(sandbox_id, timeout, charge.client())
                 .await
                 .map_err(ControllerError::from)?
             {
@@ -1057,6 +1064,7 @@ impl KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
+            charge.client().cloned(),
         );
         let wait = async {
             // Boxed: `ensure_pod_exists` is a large future; inlining it here
@@ -1187,7 +1195,7 @@ impl KubernetesSubstrate {
                     Some(generation),
                     join_deadline,
                     metric_identity,
-                    RecoveryCharge::Exempt,
+                    charge.paid(),
                 )
                 .await;
         }
@@ -1235,7 +1243,9 @@ impl KubernetesSubstrate {
             options,
             Some(placement),
             target_state,
-            RecoveryCharge::Exempt,
+            // An evacuation has no activating client: the successor inherits
+            // the evacuated execution's.
+            RecoveryCharge::EXEMPT,
         )
         .await
         .map(|_| ())
@@ -1346,7 +1356,7 @@ impl KubernetesSubstrate {
                 metric_identity,
                 evacuation_placement,
                 WakeTarget::Explicit(target_state),
-                RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
+                RestoreClaimHandling::preclaimed_with_cleanup(restore_claim, &charge),
             )
             .await?;
         Ok(activation.completion)
@@ -1792,7 +1802,7 @@ impl KubernetesSubstrate {
         let lifecycle = parse_sandbox_lifecycle(&sandbox.lifecycle)?;
         let started_recovery = if should_join_started_recovery(lifecycle, target_state) {
             match self
-                .claim_or_join_started_recovery(sandbox_id, timeout)
+                .claim_or_join_started_recovery(sandbox_id, timeout, charge.client())
                 .await?
             {
                 StartedRecoveryClaimOutcome::Owned(ownership) => Some(ownership),
@@ -1853,6 +1863,7 @@ impl KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             restore_transition_target_state(target_state)?,
+            charge.client().cloned(),
         );
         // Error variants alone cannot prove whether runtime work exists. Keep
         // dispatch evidence outside the timed future so outer cancellation,

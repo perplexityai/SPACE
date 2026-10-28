@@ -255,6 +255,9 @@ impl KubernetesSubstrate {
                 activation_attempt
                     .as_ref()
                     .map(ActivationAttemptAssignment::request),
+                activation_attempt
+                    .as_ref()
+                    .and_then(ActivationAttemptAssignment::client),
             )
             .await?;
         if let Some(activation_attempt) = activation_attempt.as_ref()
@@ -651,6 +654,9 @@ impl KubernetesSubstrate {
                     activation_attempt
                         .as_ref()
                         .map(ActivationAttemptAssignment::request),
+                    activation_attempt
+                        .as_ref()
+                        .and_then(ActivationAttemptAssignment::client),
                 )
                 .await?
             else {
@@ -779,6 +785,9 @@ impl KubernetesSubstrate {
                                 activation_attempt
                                     .as_ref()
                                     .map(ActivationAttemptAssignment::request),
+                                activation_attempt
+                                    .as_ref()
+                                    .and_then(ActivationAttemptAssignment::client),
                             )
                             .await?
                         else {
