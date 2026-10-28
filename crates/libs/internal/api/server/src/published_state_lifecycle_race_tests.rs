@@ -15,6 +15,7 @@ use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Transaction};
 
 use super::publish_sandbox_states;
+use crate::node_publish::plan::lifecycle::FailedClaim;
 use crate::node_publish::store::lifecycle_transitions::converge_failed;
 use crate::proto::PublishedSandboxState;
 
@@ -169,11 +170,9 @@ async fn failed_projection_decides_on_the_row_committed_while_it_waits() -> Test
         let waiter_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
             .fetch_one(&mut *projection_tx)
             .await?;
-        let rows_json = Json(serde_json::json!([
-            { "sandbox_id": sandbox_id.to_string(), "status": "failed" }
-        ]));
+        let claims = [FailedClaim { sandbox_id }];
         let projection = tokio::spawn(async move {
-            let moved = converge_failed(&mut projection_tx, node_id, &rows_json).await?;
+            let moved = converge_failed(&mut projection_tx, node_id, &claims).await?;
             projection_tx.commit().await?;
             TestResult::<Vec<_>>::Ok(moved)
         });

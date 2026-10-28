@@ -507,8 +507,15 @@ pub(crate) async fn publish_validated_sandbox_states(
         .filter(|row| row.assigned_to_node && row.first_seen)
         .map(|row| row.sandbox_id)
         .collect::<Vec<_>>();
-    sandbox_application::converge_lifecycles(conn, node_id, &rows_json, &mut post_commit_events)
-        .await?;
+    sandbox_application::converge_lifecycles(
+        conn,
+        node_id,
+        &rows_json,
+        &plan.stopped,
+        &plan.failed,
+        &mut post_commit_events,
+    )
+    .await?;
     sandbox_application::project_quarantine(conn, node_id, quarantine_inputs).await?;
     sandbox_application::recover_pause_failed(conn, node_id, &rows_json, &mut post_commit_events)
         .await?;

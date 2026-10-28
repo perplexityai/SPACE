@@ -2277,15 +2277,21 @@ async fn publishing_owned_stopped_sandbox_promotes_central_lifecycle() -> TestRe
     insert_active_sandbox_with_managed_by(&db.pool, sandbox_id, node_id, "suspended", "space")
         .await?;
 
+    let healthy_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, healthy_id, node_id, "started").await?;
     let mut conn = db.pool.acquire().await?;
     let accepted = publish_sandbox_states(
         &mut conn,
         node_id,
-        &[published_sandbox_state(sandbox_id, "stopped")],
+        &[
+            published_sandbox_state(healthy_id, "started"),
+            published_sandbox_state(sandbox_id, "stopped"),
+        ],
     )
     .await?;
 
-    assert_eq!(accepted.accepted, 1);
+    assert_eq!(accepted.accepted, 2);
+    assert_eq!(sandbox_lifecycle(&db.pool, healthy_id).await?, "started");
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopped");
     Ok(())
 }
@@ -2519,11 +2525,21 @@ async fn publishing_owned_failed_sandbox_marks_central_lifecycle_failed() -> Tes
     insert_ready_worker_node(&db.pool, node_id).await?;
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
 
+    let healthy_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, healthy_id, node_id, "started").await?;
     let mut conn = db.pool.acquire().await?;
-    let accepted =
-        publish_sandbox_states(&mut conn, node_id, &[failed_sandbox_state(sandbox_id)]).await?;
+    let accepted = publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[
+            published_sandbox_state(healthy_id, "started"),
+            failed_sandbox_state(sandbox_id),
+        ],
+    )
+    .await?;
 
-    assert_eq!(accepted.accepted, 1);
+    assert_eq!(accepted.accepted, 2);
+    assert_eq!(sandbox_lifecycle(&db.pool, healthy_id).await?, "started");
     let (sandbox_lifecycle, observed_status, failure_reason) =
         sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT s.lifecycle, sos.status, sos.failure_reason

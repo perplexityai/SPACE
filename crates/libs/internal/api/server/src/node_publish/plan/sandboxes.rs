@@ -1,7 +1,8 @@
 use pplx_space_common_core::types::{
-    SandboxId, SandboxQuarantineReasonCode, SandboxTransitionReceipt,
+    SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode, SandboxTransitionReceipt,
 };
 
+use super::lifecycle::{FailedClaim, StoppedClaim};
 use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::node_publish::validate::{
     failure_episode::FailureEpisodeClaim,
@@ -26,6 +27,8 @@ pub(crate) struct ObservedClaim {
 pub(crate) struct SandboxPlan {
     pub(crate) absent_ids: Vec<SandboxId>,
     pub(crate) observations: Vec<ObservedClaim>,
+    pub(crate) stopped: Vec<StoppedClaim>,
+    pub(crate) failed: Vec<FailedClaim>,
     pub(crate) state_only: Vec<DegradedSandboxClaim>,
     pub(crate) failure_episodes: Vec<FailureEpisodeClaim>,
     pub(crate) snapshots: Vec<SnapshotClaim>,
@@ -39,6 +42,8 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
         let mut plan = Self {
             absent_ids: inventory.absent_ids,
             observations: Vec::with_capacity(inventory.observations.len()),
+            stopped: Vec::new(),
+            failed: Vec::new(),
             state_only: inventory.state_only.into_iter().map(Into::into).collect(),
             failure_episodes: inventory.failure_episodes,
             snapshots: Vec::new(),
@@ -47,6 +52,15 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             publishes_network_policy: false,
         };
         for claim in inventory.observations {
+            match claim.observation.reported_lifecycle() {
+                Some(SandboxLifecycle::Stopped) => plan.stopped.push(StoppedClaim {
+                    sandbox_id: claim.observation.sandbox_id(),
+                }),
+                Some(SandboxLifecycle::Failed) => plan.failed.push(FailedClaim {
+                    sandbox_id: claim.observation.sandbox_id(),
+                }),
+                _ => {}
+            }
             plan.publishes_network_policy |= claim.observation.publishes_network_policy();
             plan.observations.push(ObservedClaim {
                 observation: claim.observation,

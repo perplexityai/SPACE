@@ -1,6 +1,6 @@
 use pplx_space_common_core::types::{
-    PolicyAuthority, SandboxId, SandboxQuarantineReasonCode, SandboxTransitionReceipt, SemVer,
-    SemVerParseError,
+    PolicyAuthority, SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode,
+    SandboxTransitionReceipt, SemVer, SemVerParseError,
 };
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicySource};
 use time::format_description::well_known::Rfc3339;
@@ -76,6 +76,16 @@ pub(crate) struct ValidatedSandboxObservation {
 }
 
 impl ValidatedSandboxObservation {
+    pub(crate) fn sandbox_id(&self) -> SandboxId {
+        self.sandbox_id
+    }
+
+    pub(crate) fn reported_lifecycle(&self) -> Option<SandboxLifecycle> {
+        self.status
+            .as_ref()
+            .and_then(PublishedSandboxStatus::lifecycle)
+    }
+
     pub(crate) fn parse(
         sandbox_id: SandboxId,
         state: &PublishedSandboxState,

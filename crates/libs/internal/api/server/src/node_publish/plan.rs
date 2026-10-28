@@ -16,6 +16,7 @@ use super::validate::{
 };
 use sandboxes::SandboxPlan;
 
+pub(crate) mod lifecycle;
 pub(crate) mod sandboxes;
 
 /// Ownership of the checked claims moves into the plan without payload clones.

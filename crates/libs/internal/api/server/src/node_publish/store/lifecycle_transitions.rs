@@ -1,3 +1,4 @@
+use crate::node_publish::plan::lifecycle::{FailedClaim, StoppedClaim};
 use pplx_space_common_core::{
     sql,
     types::{NodeId, SandboxId, SandboxTransitionReceiptKind, SubstrateKind},
@@ -86,8 +87,11 @@ pub(crate) async fn converge_restored(
 pub(crate) async fn converge_stopped(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[StoppedClaim],
 ) -> Result<Vec<SandboxId>, ConvergeStoppedError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
              SELECT sandbox_id, status
@@ -112,7 +116,7 @@ pub(crate) async fn converge_stopped(
          RETURNING s.id"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(claims))
     .fetch_all(&mut *conn)
     .await
     .map_err(ConvergeStoppedError::Update)
@@ -132,8 +136,11 @@ pub(crate) async fn converge_stopped(
 pub(crate) async fn converge_failed(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[FailedClaim],
 ) -> Result<Vec<(SandboxId, String)>, ConvergeFailedError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
         "WITH input AS (
              SELECT sandbox_id, status
@@ -165,7 +172,7 @@ pub(crate) async fn converge_failed(
          RETURNING s.id, claimed.lifecycle"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(claims))
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)
     .await
