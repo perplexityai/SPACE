@@ -964,15 +964,9 @@ pub(super) struct SpoolFiles {
 impl SpoolFiles {
     #[cfg(test)]
     pub(super) fn in_dir(dir: std::path::PathBuf) -> Self {
-        Self::with_names(Arc::new(SpoolNames::in_dir(dir)))
-    }
-
-    /// Spools under `names`, shared with every other request that uses them.
-    #[cfg(test)]
-    fn with_names(names: Arc<SpoolNames>) -> Self {
         Self {
             paths: Vec::new(),
-            names: Some(names),
+            names: Some(Arc::new(SpoolNames::in_dir(dir))),
         }
     }
 

@@ -972,41 +972,38 @@ fn spool_files_are_readable_only_by_their_owner() {
     assert_eq!(format!("{:o}", mode & 0o777), "600");
 }
 
-#[tokio::test]
-async fn spool_file_names_are_reused_only_once_their_file_is_gone() {
+#[test]
+fn spool_file_names_are_reused_only_once_their_file_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let names = Arc::new(SpoolNames::in_dir(dir.path().to_path_buf()));
-    let stage = || async {
-        let mut spool = SpoolFiles::with_names(Arc::clone(&names));
-        let upload = spool.create().await.unwrap();
-        let staged = upload.finish().await.unwrap();
-        (spool, staged.path)
-    };
+    let create = || names.create().unwrap().1;
 
-    let (first, first_path) = stage().await;
+    let first = create();
     // A name in use isn't handed out again.
-    let (second, second_path) = stage().await;
-    assert_ne!(first_path, second_path);
+    let second = create();
+    assert_ne!(first.path(), second.path());
+    let used = [first.path().to_path_buf(), second.path().to_path_buf()];
+    // Each path removes its file and frees its name as it drops.
     drop((first, second));
-    wait_for_empty_spool_dir(dir.path()).await;
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
-    // Later requests take the names back rather than new ones.
-    let (third, third_path) = stage().await;
+    // Later files take the names back rather than new ones.
+    let third = create();
     assert!(
-        [&first_path, &second_path].contains(&&third_path),
-        "{third_path:?} is a new name"
+        used.contains(&third.path().to_path_buf()),
+        "{third:?} has a new name"
     );
     drop(third);
-    wait_for_empty_spool_dir(dir.path()).await;
 
     // A file still on disk under a free name is skipped, not overwritten.
-    std::fs::write(&first_path, b"left behind").unwrap();
-    std::fs::write(&second_path, b"left behind").unwrap();
-    let (fourth, fourth_path) = stage().await;
-    assert!(![&first_path, &second_path].contains(&&fourth_path));
-    assert_eq!(std::fs::read(&first_path).unwrap(), b"left behind");
-    assert_eq!(std::fs::read(&second_path).unwrap(), b"left behind");
-    drop(fourth);
+    for path in &used {
+        std::fs::write(path, b"left behind").unwrap();
+    }
+    let fourth = create();
+    assert!(!used.contains(&fourth.path().to_path_buf()));
+    for path in &used {
+        assert_eq!(std::fs::read(path).unwrap(), b"left behind");
+    }
 }
 
 #[tokio::test]
