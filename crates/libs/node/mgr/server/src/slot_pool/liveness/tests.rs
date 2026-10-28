@@ -96,6 +96,13 @@ struct FakeHost {
     proc_root: PathBuf,
 }
 
+/// A thread's ID, `State` and namespace; an exited thread has none.
+type FakeThread<'a> = (u32, &'a str, Option<&'a str>);
+
+const VM_CGROUP: &str = "0::/space/sandbox-a\n";
+const SIDECAR_CGROUP: &str = "0::/space/sbx-sandbox-a/gateway\n";
+const OTHER_CGROUP: &str = "0::/kubepods/pod-a/container-a\n";
+
 impl FakeHost {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -117,19 +124,22 @@ impl FakeHost {
         (metadata.dev(), metadata.ino())
     }
 
-    /// A process running as `uid` whose threads sit in the named namespaces;
-    /// `None` is a thread that has exited.
-    fn process(&self, pid: u32, state: &str, uid: u32, threads: &[(u32, Option<&str>)]) {
+    /// A process running as `uid` in `cgroup`. Its leader is the thread
+    /// whose ID is `pid`.
+    fn process(&self, pid: u32, uid: u32, cgroup: &str, threads: &[FakeThread<'_>]) {
         let process = self.proc_root().join(pid.to_string());
         std::fs::create_dir_all(&process).unwrap();
-        std::fs::write(
-            process.join("status"),
-            format!("State:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
-        )
-        .unwrap();
-        for (tid, namespace) in threads {
+        let state = |state: &str| format!("State:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
+        let leader = threads
+            .iter()
+            .find(|(tid, ..)| *tid == pid)
+            .map_or("S", |(_, state, _)| state);
+        std::fs::write(process.join("status"), state(leader)).unwrap();
+        std::fs::write(process.join("cgroup"), cgroup).unwrap();
+        for (tid, thread_state, namespace) in threads {
             let task = process.join("task").join(tid.to_string());
             std::fs::create_dir_all(&task).unwrap();
+            std::fs::write(task.join("status"), state(thread_state)).unwrap();
             if let Some(namespace) = namespace {
                 self.namespace(namespace);
                 std::fs::create_dir_all(task.join("ns")).unwrap();
@@ -147,7 +157,10 @@ impl FakeHost {
         SlotHost {
             proc_root: &self.proc_root,
             namespace: Ok(namespace),
-            sandbox_cgroup_pids: Ok(vec![]),
+            sandbox_cgroups: Ok(vec![CgroupMembers {
+                populated: true,
+                pids: vec![20],
+            }]),
         }
     }
 }
@@ -170,15 +183,31 @@ fn released_and_successor() -> (SlotInfo, SlotInfo) {
     (released, successor)
 }
 
+fn gateway_uid(info: &SlotInfo) -> u32 {
+    pplx_space_common_core::host::linux::gateway::gateway_uid(
+        pplx_space_common_core::types::LinuxUid::new(info.sandbox_uid),
+    )
+    .unwrap()
+    .get()
+}
+
 /// A host with node-manager, the successor's VM and an exited process.
 fn host_with_successor_running(successor: &SlotInfo) -> FakeHost {
     let host = FakeHost::new();
-    host.process(10, "S", 0, &[(10, Some("host-ns")), (11, Some("host-ns"))]);
+    host.process(
+        10,
+        0,
+        OTHER_CGROUP,
+        &[(10, "S", Some("host-ns")), (11, "S", Some("host-ns"))],
+    );
     host.process(
         20,
-        "S",
         successor.sandbox_uid,
-        &[(20, Some("successor-ns")), (21, Some("successor-ns"))],
+        VM_CGROUP,
+        &[
+            (20, "S", Some("successor-ns")),
+            (21, "S", Some("successor-ns")),
+        ],
     );
     std::fs::create_dir_all(host.proc_root().join("30")).unwrap();
     host
@@ -190,33 +219,36 @@ fn released_slot_is_live_while_any_thread_remains_in_its_namespace() {
     use LeaseLiveness::Live;
     let (released, successor) = released_and_successor();
     let host = host_with_successor_running(&successor);
-    let slot_ns = host.namespace("slot-ns");
-    let view = host.view(Some(slot_ns));
-    assert_eq!(
-        released_lease_runtime_with(&released, &successor, &view),
-        None
-    );
+    let view = host.view(Some(host.namespace("slot-ns")));
+    assert_eq!(released_lease_runtime_with(&released, &view), None);
 
-    // A root jailer that has joined the namespace but not yet dropped to the
-    // slot's UID, here from a thread other than its leader.
-    host.process(40, "S", 0, &[(40, Some("host-ns")), (41, Some("slot-ns"))]);
+    // A root jailer that has called `setns`, from a thread other than its
+    // leader, before it drops to the slot's UID.
+    host.process(
+        40,
+        0,
+        OTHER_CGROUP,
+        &[(40, "S", Some("host-ns")), (41, "S", Some("slot-ns"))],
+    );
     assert_eq!(
-        released_lease_runtime_with(&released, &successor, &view),
+        released_lease_runtime_with(&released, &view),
         RuntimeBlocker::new(Live, NetnsMember, Some(40))
     );
     host.remove(40);
 
     // vCPU threads still tearing the guest down after their leader exited.
-    host.process(50, "Z", 0, &[(50, None), (51, Some("slot-ns"))]);
+    host.process(
+        50,
+        0,
+        VM_CGROUP,
+        &[(50, "Z", None), (51, "S", Some("slot-ns"))],
+    );
     assert_eq!(
-        released_lease_runtime_with(&released, &successor, &view),
+        released_lease_runtime_with(&released, &view),
         RuntimeBlocker::new(Live, NetnsMember, Some(50))
     );
     host.remove(50);
-    assert_eq!(
-        released_lease_runtime_with(&released, &successor, &view),
-        None
-    );
+    assert_eq!(released_lease_runtime_with(&released, &view), None);
 }
 
 #[test]
@@ -227,31 +259,52 @@ fn released_slot_without_its_namespace_mount_is_judged_by_its_uids() {
     let host = host_with_successor_running(&successor);
     // An earlier attempt of the reset deleted the mount, then failed.
     let view = host.view(None);
-    assert_eq!(
-        released_lease_runtime_with(&released, &successor, &view),
-        None
-    );
+    assert_eq!(released_lease_runtime_with(&released, &view), None);
 
-    // A process left in the now-anonymous namespace still runs as the slot's
-    // VM or gateway UID.
-    let gateway_uid = pplx_space_common_core::host::linux::gateway::gateway_uid(
-        pplx_space_common_core::types::LinuxUid::new(released.sandbox_uid),
-    )
-    .unwrap()
-    .get();
-    for uid in [released.sandbox_uid, gateway_uid] {
-        host.process(60, "S", uid, &[(60, Some("anonymous-ns"))]);
+    // The released lease's VM or gateway, left in the now-anonymous
+    // namespace, runs as its slot's UID in the sandbox's cgroups.
+    for (uid, cgroup) in [
+        (released.sandbox_uid, VM_CGROUP),
+        (gateway_uid(&released), SIDECAR_CGROUP),
+    ] {
+        host.process(60, uid, cgroup, &[(60, "S", Some("anonymous-ns"))]);
         assert_eq!(
-            released_lease_runtime_with(&released, &successor, &view),
+            released_lease_runtime_with(&released, &view),
             RuntimeBlocker::new(Live, SlotUid, Some(60))
         );
         host.remove(60);
     }
 
+    // Any other workload on the host may run at a UID in the slot range.
+    host.process(
+        61,
+        released.sandbox_uid,
+        OTHER_CGROUP,
+        &[(61, "S", Some("pod-ns"))],
+    );
+    assert_eq!(released_lease_runtime_with(&released, &view), None);
+    host.remove(61);
+
+    // An exited, unreaped process is not a survivor, unless one of its
+    // threads still runs.
+    host.process(62, released.sandbox_uid, VM_CGROUP, &[(62, "Z", None)]);
+    assert_eq!(released_lease_runtime_with(&released, &view), None);
+    host.process(
+        62,
+        released.sandbox_uid,
+        VM_CGROUP,
+        &[(62, "Z", None), (63, "S", Some("anonymous-ns"))],
+    );
+    assert_eq!(
+        released_lease_runtime_with(&released, &view),
+        RuntimeBlocker::new(Live, SlotUid, Some(62))
+    );
+    host.remove(62);
+
     // A process whose credentials cannot be read is not proof of absence.
     std::fs::create_dir_all(host.proc_root().join("70/status")).unwrap();
     assert_eq!(
-        released_lease_runtime_with(&released, &successor, &view),
+        released_lease_runtime_with(&released, &view),
         RuntimeBlocker::new(Unknown, ProcessUnreadable, Some(70))
     );
     host.remove(70);
@@ -261,7 +314,7 @@ fn released_slot_without_its_namespace_mount_is_judged_by_its_uids() {
         ..host.view(None)
     };
     assert_eq!(
-        released_lease_runtime_with(&released, &successor, &unverifiable),
+        released_lease_runtime_with(&released, &unverifiable),
         RuntimeBlocker::new(Unknown, NetnsUnverifiable, None)
     );
 }
@@ -273,23 +326,31 @@ fn released_slot_is_never_gone_without_a_complete_pid_view() {
     let (released, successor) = released_and_successor();
     let host = host_with_successor_running(&successor);
     let slot_ns = host.namespace("slot-ns");
-    for sandbox_cgroup_pids in [
+    let members = |populated, pids| Ok(vec![CgroupMembers { populated, pids }]);
+    let empty = SlotHost {
+        sandbox_cgroups: members(false, vec![]),
+        ..host.view(Some(slot_ns))
+    };
+    assert_eq!(released_lease_runtime_with(&released, &empty), None);
+    for sandbox_cgroups in [
         // The kernel lists a cgroup member outside this PID namespace as 0.
-        Ok(vec![20, 0]),
+        members(true, vec![20, 0]),
+        // It skips an exiting leader, which can still hold the namespace.
+        members(true, vec![]),
         Err(std::io::ErrorKind::PermissionDenied.into()),
     ] {
         let view = SlotHost {
-            sandbox_cgroup_pids,
+            sandbox_cgroups,
             ..host.view(Some(slot_ns))
         };
         assert_eq!(
-            released_lease_runtime_with(&released, &successor, &view),
+            released_lease_runtime_with(&released, &view),
             RuntimeBlocker::new(Unknown, PidNamespaceIncomplete, None)
         );
         // A member it can see is still decisive.
-        host.process(40, "S", 0, &[(40, Some("slot-ns"))]);
+        host.process(40, 0, OTHER_CGROUP, &[(40, "S", Some("slot-ns"))]);
         assert_eq!(
-            released_lease_runtime_with(&released, &successor, &view),
+            released_lease_runtime_with(&released, &view),
             RuntimeBlocker::new(Live, NetnsMember, Some(40))
         );
         host.remove(40);
@@ -297,38 +358,36 @@ fn released_slot_is_never_gone_without_a_complete_pid_view() {
 }
 
 #[test]
-fn released_lease_still_waits_for_its_own_tracked_pid() {
+fn a_tracked_pid_counts_only_while_it_is_the_released_slots_process() {
     use EvidenceSource::TrackedPid;
     use LeaseLiveness::Live;
     let (released, successor) = released_and_successor();
     let host = host_with_successor_running(&successor);
-    // A sidecar of the released lease, outside any SPACE namespace. Above
-    // the kernel's PID limit, so it is never this test's own PID.
-    let sidecar = 4_194_305;
-    host.process(sidecar, "S", 0, &[(sidecar, Some("host-ns"))]);
-    std::fs::write(
-        host.proc_root().join(format!("{sidecar}/cgroup")),
-        "0::/space/sbx-sandbox-a\n",
-    )
-    .unwrap();
+    let view = host.view(Some(host.namespace("slot-ns")));
     let tracked = SlotInfo {
-        pid: Some(sidecar),
+        pid: Some(80),
         ..released.clone()
     };
-    let view = host.view(Some(host.namespace("slot-ns")));
-    assert_eq!(
-        released_lease_runtime_with(&tracked, &successor, &view),
-        RuntimeBlocker::new(Live, TrackedPid, Some(sidecar))
+    // The released lease's gateway, outside any SPACE namespace.
+    host.process(
+        80,
+        gateway_uid(&released),
+        SIDECAR_CGROUP,
+        &[(80, "S", Some("host-ns"))],
     );
-    // Unless the successor now tracks that PID as its own.
-    let successor_owns_pid = SlotInfo {
-        pid: tracked.pid,
-        ..successor.clone()
-    };
     assert_eq!(
-        released_lease_runtime_with(&tracked, &successor_owns_pid, &view),
-        None
+        released_lease_runtime_with(&tracked, &view),
+        RuntimeBlocker::new(Live, TrackedPid, Some(80))
     );
+    // The successor's Firecracker has since been given the same PID.
+    host.remove(80);
+    host.process(
+        80,
+        successor.sandbox_uid,
+        VM_CGROUP,
+        &[(80, "S", Some("successor-ns"))],
+    );
+    assert_eq!(released_lease_runtime_with(&tracked, &view), None);
 }
 
 #[test]

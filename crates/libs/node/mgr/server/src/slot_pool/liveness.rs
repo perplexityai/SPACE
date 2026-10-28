@@ -128,9 +128,9 @@ pub(super) fn released_lease_runtime(
     info: &SlotInfo,
     successor: Option<&SlotInfo>,
 ) -> Option<RuntimeBlocker> {
-    let Some(successor) = successor.filter(|successor| successor.slot != info.slot) else {
+    if successor.is_none_or(|successor| successor.slot == info.slot) {
         return lease_runtime(info);
-    };
+    }
     #[cfg(test)]
     if let Some(evidence) = test_runtime_evidence(&info.sandbox_id) {
         return evidence.slot;
@@ -139,9 +139,9 @@ pub(super) fn released_lease_runtime(
     let host = SlotHost {
         proc_root,
         namespace: mounted_namespace(proc_root, Path::new(&NetId::from_slot(info.slot).ns_path())),
-        sandbox_cgroup_pids: sandbox_cgroup_pids(&info.sandbox_id),
+        sandbox_cgroups: sandbox_cgroups(&info.sandbox_id),
     };
-    released_lease_runtime_with(info, successor, &host)
+    released_lease_runtime_with(info, &host)
 }
 
 /// The host state a released lease is judged by once its sandbox runs again
@@ -151,18 +151,35 @@ pub(super) struct SlotHost<'a> {
     /// Identity of the namespace mounted at the slot's path, or `None` when
     /// no namespace is mounted there.
     pub(super) namespace: std::io::Result<Option<NamespaceId>>,
-    /// PIDs in the sandbox's VM and sidecar cgroups, as this PID namespace
-    /// sees them. The kernel lists a task it cannot map here as `0`.
-    pub(super) sandbox_cgroup_pids: std::io::Result<Vec<u32>>,
+    /// The sandbox's VM and sidecar cgroups that exist.
+    pub(super) sandbox_cgroups: std::io::Result<Vec<CgroupMembers>>,
+}
+
+/// One cgroup's occupancy, and the PIDs its subtree lists as this PID
+/// namespace sees them. The kernel lists a task it cannot map here as `0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CgroupMembers {
+    pub(super) populated: bool,
+    pub(super) pids: Vec<u32>,
 }
 
 /// Device and inode that identify a namespace, shared by its bind mount and
 /// every member's `/proc/<pid>/task/<tid>/ns/net`.
 pub(super) type NamespaceId = (u64, u64);
 
-/// Every task of the released lease runs under one of its slot's UIDs or,
-/// for a jailer before it drops privileges, inside its slot's namespace.
-/// Both are slot-scoped, so the successor's runtime matches neither.
+/// What makes a process the released lease's rather than the successor's.
+struct ReleasedSlot<'a> {
+    sandbox_id: &'a str,
+    namespace: Option<NamespaceId>,
+    /// The released slot's VM and gateway UIDs.
+    uids: [Option<u32>; 2],
+}
+
+/// The released lease's Firecracker and sidecars run as its slot's VM or
+/// gateway UID, inside the sandbox's cgroups. A jailer runs as root outside
+/// the slot's namespace until it calls `setns`, then inside it until it
+/// drops to the VM UID. The successor's processes run as another slot's UID
+/// in another namespace, so they match neither.
 ///
 /// The namespace mount is gone once an earlier attempt of this reset got
 /// past this check and deleted it, then failed later in teardown. A process
@@ -170,36 +187,40 @@ pub(super) type NamespaceId = (u64, u64);
 /// then the evidence that remains.
 pub(super) fn released_lease_runtime_with(
     info: &SlotInfo,
-    successor: &SlotInfo,
     host: &SlotHost<'_>,
 ) -> Option<RuntimeBlocker> {
     use EvidenceSource::{NetnsUnverifiable, PidNamespaceIncomplete};
     use LeaseLiveness::Unknown;
-    // A recycled PID that now belongs to the successor is not this lease's.
-    let tracked = if info.pid.is_some() && successor.pid == info.pid {
-        None
-    } else {
-        tracked_pid_runtime(host.proc_root, info)
-    };
     // A node-manager without the host's PID namespace sees none of the
-    // runtime's tasks, and would find every slot clean.
-    let pid_view = match &host.sandbox_cgroup_pids {
-        Ok(pids) if !pids.contains(&0) => None,
+    // runtime's tasks, and would find every slot clean. A populated cgroup
+    // that lists no task can hide one that is exiting.
+    let pid_view = match &host.sandbox_cgroups {
+        Ok(cgroups)
+            if cgroups.iter().all(|cgroup| {
+                !cgroup.pids.contains(&0) && (!cgroup.populated || !cgroup.pids.is_empty())
+            }) =>
+        {
+            None
+        }
         _ => RuntimeBlocker::new(Unknown, PidNamespaceIncomplete, None),
     };
     let (namespace, unverifiable) = match &host.namespace {
         Ok(namespace) => (*namespace, None),
         Err(_) => (None, RuntimeBlocker::new(Unknown, NetnsUnverifiable, None)),
     };
-    let uids = [
-        Some(info.sandbox_uid),
-        pplx_space_common_core::host::linux::gateway::gateway_uid(
-            pplx_space_common_core::types::LinuxUid::new(info.sandbox_uid),
-        )
-        .map(|uid| uid.get()),
-    ];
-    let processes = slot_processes(host.proc_root, namespace, &uids);
-    RuntimeBlocker::first([tracked, pid_view, unverifiable, processes])
+    let slot = ReleasedSlot {
+        sandbox_id: &info.sandbox_id,
+        namespace,
+        uids: [
+            Some(info.sandbox_uid),
+            pplx_space_common_core::host::linux::gateway::gateway_uid(
+                pplx_space_common_core::types::LinuxUid::new(info.sandbox_uid),
+            )
+            .map(|uid| uid.get()),
+        ],
+    };
+    let processes = slot_processes(host.proc_root, &slot, info.pid);
+    RuntimeBlocker::first([pid_view, unverifiable, processes])
 }
 
 /// Identity of the namespace bind-mounted at `netns_path`. A path that is
@@ -216,34 +237,86 @@ fn mounted_namespace(proc_root: &Path, netns_path: &Path) -> std::io::Result<Opt
     }
 }
 
-fn sandbox_cgroup_pids(sandbox_id: &str) -> std::io::Result<Vec<u32>> {
-    let mut pids = Vec::new();
-    for listed in [
-        crate::cgroup::vm_cgroup_process_ids(sandbox_id),
-        crate::cgroup::sidecar_cgroup_process_ids(sandbox_id),
+fn sandbox_cgroups(sandbox_id: &str) -> std::io::Result<Vec<CgroupMembers>> {
+    let typed = sandbox_id
+        .parse::<SandboxId>()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let mut cgroups = Vec::new();
+    for path in [
+        pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(sandbox_id),
+        PathBuf::from(crate::cgroup::sidecar_cgroup_path(&typed)),
     ] {
-        match listed {
-            Ok(listed) => pids.extend(listed),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        let events = match std::fs::read_to_string(path.join("cgroup.events")) {
+            Ok(events) => events,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.exists() => {
+                continue;
+            }
             Err(error) => return Err(error),
-        }
+        };
+        let populated = match events
+            .lines()
+            .find_map(|line| line.strip_prefix("populated "))
+        {
+            Some("0") => false,
+            Some("1") => true,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing or invalid cgroup populated field",
+                ));
+            }
+        };
+        let mut pids = Vec::new();
+        subtree_pids(&path, &mut pids)?;
+        cgroups.push(CgroupMembers { populated, pids });
     }
-    Ok(pids)
+    Ok(cgroups)
 }
 
-/// The first process running as one of `uids` or with any thread inside
-/// `namespace`, else the first process that could not be read.
+/// `cgroup.procs` lists only a cgroup's own tasks; `populated` covers its
+/// descendants too.
+fn subtree_pids(cgroup: &Path, pids: &mut Vec<u32>) -> std::io::Result<()> {
+    for line in std::fs::read_to_string(cgroup.join("cgroup.procs"))?.lines() {
+        pids.push(line.trim().parse().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid cgroup.procs entry",
+            )
+        })?);
+    }
+    for entry in std::fs::read_dir(cgroup)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            match subtree_pids(&entry.path(), pids) {
+                // A child cgroup removed while this walk read it.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                result => result?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first process of the released lease, starting with its tracked PID,
+/// else the first process that could not be read.
 fn slot_processes(
     proc_root: &Path,
-    namespace: Option<NamespaceId>,
-    uids: &[Option<u32>],
+    slot: &ReleasedSlot<'_>,
+    tracked: Option<u32>,
 ) -> Option<RuntimeBlocker> {
-    use EvidenceSource::{NetnsMember, ProcessUnreadable, SlotUid};
+    use EvidenceSource::{ProcessUnreadable, TrackedPid};
     use LeaseLiveness::{Live, Unknown};
+    let mut unreadable = None;
+    if let Some(pid) = tracked {
+        match lease_process(&proc_root.join(pid.to_string()), slot) {
+            Ok(Some(_)) => return RuntimeBlocker::new(Live, TrackedPid, Some(pid)),
+            Ok(None) => {}
+            Err(_) => unreadable = RuntimeBlocker::new(Unknown, ProcessUnreadable, Some(pid)),
+        }
+    }
     let Ok(entries) = std::fs::read_dir(proc_root) else {
         return RuntimeBlocker::new(Unknown, ProcessUnreadable, None);
     };
-    let mut unreadable = None;
     for entry in entries {
         let Ok(entry) = entry else {
             return RuntimeBlocker::new(Unknown, ProcessUnreadable, None);
@@ -253,23 +326,11 @@ fn slot_processes(
             .to_str()
             .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
             .and_then(|name| name.parse::<u32>().ok())
+            .filter(|pid| Some(*pid) != tracked)
         else {
             continue;
         };
-        let process = entry.path();
-        let evidence = match process_uids(&process) {
-            Ok(Some(process_uids)) if process_uids.iter().any(|uid| uids.contains(&Some(*uid))) => {
-                Ok(Some(SlotUid))
-            }
-            Ok(Some(_)) => match namespace {
-                Some(namespace) => tasks_in_namespace(&process, namespace)
-                    .map(|member| member.then_some(NetnsMember)),
-                None => Ok(None),
-            },
-            Ok(None) => Ok(None),
-            Err(error) => Err(error),
-        };
-        match evidence {
+        match lease_process(&entry.path(), slot) {
             Ok(Some(source)) => return RuntimeBlocker::new(Live, source, Some(pid)),
             Ok(None) => {}
             Err(_) => {
@@ -281,18 +342,43 @@ fn slot_processes(
     unreadable
 }
 
-/// Real, effective, saved and filesystem UIDs, or `None` once it has exited.
-fn process_uids(process: &Path) -> std::io::Result<Option<[u32; 4]>> {
-    let status = match std::fs::read_to_string(process.join("status")) {
-        Ok(status) => status,
-        // ESRCH: it was reaped between the open and the read.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ESRCH) =>
-        {
-            return Ok(None);
+/// Whether `process` belongs to the released lease, and by which evidence.
+fn lease_process(
+    process: &Path,
+    slot: &ReleasedSlot<'_>,
+) -> std::io::Result<Option<EvidenceSource>> {
+    let Some(status) = process_status(process)? else {
+        return Ok(None);
+    };
+    if status
+        .uids
+        .iter()
+        .any(|uid| slot.uids.contains(&Some(*uid)))
+        && in_sandbox_cgroup_unless_exited(process, slot.sandbox_id)?
+        && (status.live || has_live_thread(process)?)
+    {
+        return Ok(Some(EvidenceSource::SlotUid));
+    }
+    // A task leaves its namespaces as it exits, so only live threads match.
+    match slot.namespace {
+        Some(namespace) if tasks_in_namespace(process, namespace)? => {
+            Ok(Some(EvidenceSource::NetnsMember))
         }
-        Err(error) => return Err(error),
+        _ => Ok(None),
+    }
+}
+
+/// A process's `status`, or `None` once it has been reaped.
+struct ProcessStatus {
+    /// Whether the thread-group leader has not exited.
+    live: bool,
+    /// Real, effective, saved and filesystem UIDs.
+    uids: [u32; 4],
+}
+
+fn process_status(process: &Path) -> std::io::Result<Option<ProcessStatus>> {
+    let Some(status) = read_unless_exited(&process.join("status"))? else {
+        return Ok(None);
     };
     let mut uids = status
         .lines()
@@ -306,7 +392,65 @@ fn process_uids(process: &Path) -> std::io::Result<Option<[u32; 4]>> {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid Uid line")
         })?;
     }
-    Ok(Some(parsed))
+    Ok(Some(ProcessStatus {
+        live: state_is_live(&status),
+        uids: parsed,
+    }))
+}
+
+fn state_is_live(status: &str) -> bool {
+    !matches!(
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("State:"))
+            .and_then(|value| value.split_whitespace().next()),
+        Some("Z" | "X" | "x")
+    )
+}
+
+/// `None` when the task has exited: ENOENT once it is reaped, ESRCH when
+/// that happened between the open and the read.
+fn read_unless_exited(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn in_sandbox_cgroup_unless_exited(process: &Path, sandbox_id: &str) -> std::io::Result<bool> {
+    match in_sandbox_cgroup(process, sandbox_id) {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(false)
+        }
+        result => result,
+    }
+}
+
+/// Whether any thread of an exited leader is still running, as a VM's vCPU
+/// threads can while they tear the guest down.
+fn has_live_thread(process: &Path) -> std::io::Result<bool> {
+    let tasks = match std::fs::read_dir(process.join("task")) {
+        Ok(tasks) => tasks,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for task in tasks {
+        if read_unless_exited(&task?.path().join("status"))?
+            .is_some_and(|status| state_is_live(&status))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether any thread of `process` is in `namespace`. Namespaces are per
@@ -407,6 +551,7 @@ fn pid_liveness(proc_root: &Path, pid: Option<u32>, sandbox_id: &str) -> LeaseLi
         sandbox_id,
     ))
 }
+
 fn process_owns_sandbox(proc_dir: &Path, sandbox_id: &str) -> std::io::Result<bool> {
     match read_process_ownership(proc_dir, sandbox_id) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -442,6 +587,20 @@ fn read_process_ownership(proc_dir: &Path, sandbox_id: &str) -> std::io::Result<
     if sandbox_id.is_empty() {
         return Ok(true);
     }
+    if in_sandbox_cgroup(proc_dir, sandbox_id)? {
+        return Ok(true);
+    }
+    // Retain the legacy launcher ownership marker, but match whole argv
+    // tokens rather than substrings. Read failure remains unknown evidence.
+    let cmdline = std::fs::read(proc_dir.join("cmdline"))?;
+    Ok(cmdline
+        .split(|byte| *byte == 0)
+        .any(|arg| arg == sandbox_id.as_bytes()))
+}
+
+/// Whether the process is in the sandbox's VM cgroup (`space/<id>`) or its
+/// sidecar cgroup (`space/sbx-<id>`), at any depth below either.
+fn in_sandbox_cgroup(proc_dir: &Path, sandbox_id: &str) -> std::io::Result<bool> {
     let cgroups = std::fs::read_to_string(proc_dir.join("cgroup"))?;
     let sidecar = format!("sbx-{sandbox_id}");
     let mut parsed = false;
@@ -470,12 +629,7 @@ fn read_process_ownership(proc_dir: &Path, sandbox_id: &str) -> std::io::Result<
             "invalid process cgroup membership",
         ));
     }
-    // Retain the legacy launcher ownership marker, but match whole argv
-    // tokens rather than substrings. Read failure remains unknown evidence.
-    let cmdline = std::fs::read(proc_dir.join("cmdline"))?;
-    Ok(cmdline
-        .split(|byte| *byte == 0)
-        .any(|arg| arg == sandbox_id.as_bytes()))
+    Ok(false)
 }
 
 pub(super) fn lease_may_be_live(info: &SlotInfo) -> bool {
