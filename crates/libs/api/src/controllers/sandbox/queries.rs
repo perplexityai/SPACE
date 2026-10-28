@@ -120,28 +120,22 @@ async fn persist_created_sandbox_shape(
     let memory_mib = i32::try_from(memory).map_err(|_| invalid())?;
     // This guarded transition owns the fill: a replaced execution cannot
     // overwrite the allocation of the sandbox that now occupies the same ID.
-    let filled = sqlx::query(sql!(
-        "UPDATE sandboxes s
-         SET vcpu = COALESCE(s.vcpu, $7), memory_mib = COALESCE(s.memory_mib, $8)
-         FROM sandbox_k8s_executions e
-         WHERE s.id = $1 AND s.active_node_id = $2
-           AND s.lifecycle IN ('creating', 'started')
-           AND e.sandbox_id = s.id AND e.active
-           AND e.generation = $3 AND e.pod_name = $4 AND e.pod_uid = $5
-           AND COALESCE(e.activation_attempt_id, e.route_activation_id) = $6"
-    ))
-    .bind(sandbox_id)
-    .bind(node_id)
-    .bind(generation)
-    .bind(&binding.execution_object_id)
-    .bind(pod_uid)
-    .bind(attempt.as_uuid())
-    .bind(vcpu)
-    .bind(memory_mib)
-    .execute(pool)
+    let filled = pplx_space_sandbox_store::runtime_shape::fill_created(
+        pool,
+        &pplx_space_sandbox_store::runtime_shape::CreatedAllocation {
+            sandbox_id,
+            node_id,
+            generation,
+            pod_name: &binding.execution_object_id,
+            pod_uid,
+            activation_attempt_id: attempt,
+            vcpu,
+            memory_mib,
+        },
+    )
     .await
     .map_err(|error| internal_error("persist created sandbox allocation", error))?;
-    if filled.rows_affected() != 1 {
+    if !filled {
         return Err(ControllerError::internal(
             "created sandbox allocation lost its execution fence",
         ));

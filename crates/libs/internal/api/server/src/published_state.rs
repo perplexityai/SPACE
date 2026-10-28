@@ -2635,32 +2635,9 @@ pub async fn publish_sandbox_states(
     // Fill omitted shape before publishing readiness in this transaction. A
     // template's current defaults are not evidence about an existing runtime;
     // only the node holding this exact activation can supply the allocation.
-    sqlx::query(sql!(
-        "UPDATE sandboxes s
-         SET vcpu = COALESCE(s.vcpu, input.actual_vcpu),
-             memory_mib = COALESCE(s.memory_mib, input.actual_memory_mib)
-         FROM jsonb_to_recordset($2::jsonb) AS input(
-             sandbox_id UUID, status TEXT, execution_generation BIGINT,
-             pod_uid TEXT, activation_attempt_id UUID,
-             actual_vcpu INTEGER, actual_memory_mib INTEGER
-         ), sandbox_k8s_executions e
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1 AND s.managed_by = $3
-           AND s.lifecycle IN ('creating', 'restoring', 'started', 'paused')
-           AND (s.vcpu IS NULL OR s.memory_mib IS NULL)
-           AND input.status IN ('started', 'paused')
-           AND input.actual_vcpu > 0 AND input.actual_memory_mib > 0
-           AND e.sandbox_id = s.id AND e.active
-           AND e.generation = input.execution_generation
-           AND e.pod_uid = input.pod_uid
-           AND COALESCE(e.activation_attempt_id, e.route_activation_id) = input.activation_attempt_id"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(SubstrateKind::Kubernetes)
-    .execute(&mut *conn)
-    .await
-    .map_err(|error| Status::internal(format!("publish runtime allocation: {error}")))?;
+    pplx_space_sandbox_store::runtime_shape::fill_published(&mut *conn, node_id, rows_json.clone())
+        .await
+        .map_err(|error| Status::internal(format!("publish runtime allocation: {error}")))?;
 
     sqlx::query(sql!(
         "WITH input AS (
