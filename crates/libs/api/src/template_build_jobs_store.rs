@@ -265,7 +265,7 @@ impl TemplateBuildJobsStore {
         .fetch_optional(&mut *tx)
         .await?
         {
-            if owner != Some(org_id) {
+            if owner.is_some_and(|owner| owner != org_id) {
                 return Err(TemplateBuildJobsStoreError::OwnershipConflict);
             }
             if desired_state != TemplateDesiredState::Present.as_str() {
