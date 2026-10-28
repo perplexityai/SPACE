@@ -42,11 +42,31 @@ pub(crate) struct ValidatedSandboxInventory {
 pub(crate) struct LegacySandboxInput {
     pub(crate) absent_ids: Vec<SandboxId>,
     pub(crate) rows: Vec<serde_json::Value>,
-    pub(crate) state_only: BTreeMap<SandboxId, serde_json::Value>,
+    pub(crate) state_only: Vec<DegradedSandboxClaim>,
     pub(crate) failure_episode_rows: Vec<FailureEpisodeClaim>,
     pub(crate) snapshot_rows: Vec<serde_json::Value>,
     pub(crate) quarantine_inputs: Vec<QuarantineClaim>,
     pub(crate) publishes_network_policy: bool,
+}
+
+/// Presence and optional status survive when a rich observation is unusable.
+#[derive(Debug)]
+pub(crate) struct DegradedSandboxClaim {
+    sandbox_id: SandboxId,
+    status: Option<PublishedSandboxStatus>,
+}
+
+impl DegradedSandboxClaim {
+    pub(crate) fn sandbox_id(&self) -> SandboxId {
+        self.sandbox_id
+    }
+
+    pub(crate) fn legacy_row(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sandbox_id": self.sandbox_id,
+            "status": self.status.as_ref().map(PublishedSandboxStatus::as_str),
+        })
+    }
 }
 
 impl ValidatedSandboxInventory {
@@ -116,15 +136,7 @@ impl ValidatedSandboxInventory {
             state_only: self
                 .state_only
                 .into_iter()
-                .map(|(sandbox_id, status)| {
-                    (
-                        sandbox_id,
-                        serde_json::json!({
-                            "sandbox_id": sandbox_id,
-                            "status": status.as_ref().map(PublishedSandboxStatus::as_str),
-                        }),
-                    )
-                })
+                .map(|(sandbox_id, status)| DegradedSandboxClaim { sandbox_id, status })
                 .collect(),
             failure_episode_rows: self.failure_episodes,
             snapshot_rows: Vec::new(),

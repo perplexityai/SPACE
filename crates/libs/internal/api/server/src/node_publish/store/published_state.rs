@@ -36,7 +36,7 @@ use pplx_space_sandbox_portability::{
     suspended_projection_lifecycle_eligible,
 };
 
-use crate::node_publish::store::{absent_sandboxes, failure_episodes};
+use crate::node_publish::store::{absent_sandboxes, degraded_observations, failure_episodes};
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 #[cfg(test)]
 use crate::node_publish::validate::quarantine::{
@@ -44,7 +44,7 @@ use crate::node_publish::validate::quarantine::{
 };
 use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
 use crate::node_publish::validate::sandbox_inventory::{
-    LegacySandboxInput, ValidatedSandboxInventory,
+    DegradedSandboxClaim, LegacySandboxInput, ValidatedSandboxInventory,
 };
 use crate::node_publish::validate::templates::ValidatedTemplateInventory;
 use crate::proto::PublishedSandboxState;
@@ -996,51 +996,10 @@ pub(crate) async fn publish_validated_sandbox_states(
         .await
         .map_err(|error| Status::internal(error.to_string()))?;
 
-    if !state_only.is_empty() {
-        let result = sqlx::query_scalar::<_, SandboxId>(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     status TEXT
-                 )
-             ),
-             publishable AS (
-                 SELECT input.*
-                 FROM input
-                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-                 LEFT JOIN sandbox_direct_route_identities direct_route
-                   ON direct_route.sandbox_id = s.id
-                 WHERE s.id IS NULL
-                    OR COALESCE(direct_route.current_node_id, s.active_node_id) = $1
-             )
-             INSERT INTO sandbox_observed_states (
-                 sandbox_id, node_id, status, snapshots_enabled,
-                 missing_publish_count, observed_at, updated_at
-             )
-             SELECT sandbox_id, $1, status, FALSE, 0, NOW(), NOW()
-             FROM publishable
-             ON CONFLICT (sandbox_id) DO UPDATE
-             SET node_id = EXCLUDED.node_id,
-                 status = COALESCE(EXCLUDED.status, sandbox_observed_states.status),
-                 missing_publish_count = 0,
-                 observed_at = EXCLUDED.observed_at,
-                 updated_at = NOW()
-             RETURNING sandbox_id"
-        ))
-        .bind(node_id)
-        .bind(Json(serde_json::Value::Array(
-            state_only.values().cloned().collect(),
-        )))
-        .fetch_all(&mut *conn)
+    let degraded_accepted = degraded_observations::upsert(&mut *conn, node_id, &state_only)
         .await
-        .map_err(|err| {
-            Status::internal(format!(
-                "write degraded published sandbox observed state: {err}"
-            ))
-        })?;
-        accepted = accepted.saturating_add(usize_to_u64(result.len()));
-    }
+        .map_err(|error| Status::internal(error.to_string()))?;
+    accepted = accepted.saturating_add(degraded_accepted);
 
     failure_episodes::reconcile(&mut *conn, node_id, &failure_episode_rows)
         .await
@@ -1051,7 +1010,10 @@ pub(crate) async fn publish_validated_sandbox_states(
             accepted,
             post_commit_events,
             post_commit_state_convergence,
-            state_only_sandbox_ids: state_only.keys().copied().collect(),
+            state_only_sandbox_ids: state_only
+                .iter()
+                .map(DegradedSandboxClaim::sandbox_id)
+                .collect(),
         });
     }
 
@@ -2019,7 +1981,10 @@ pub(crate) async fn publish_validated_sandbox_states(
         accepted,
         post_commit_events,
         post_commit_state_convergence,
-        state_only_sandbox_ids: state_only.into_keys().collect(),
+        state_only_sandbox_ids: state_only
+            .iter()
+            .map(DegradedSandboxClaim::sandbox_id)
+            .collect(),
     })
 }
 

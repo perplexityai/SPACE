@@ -26,6 +26,10 @@ enum ScenarioKind {
     Templates,
     OrdinarySingle,
     FullInventory,
+    FailureEvidence,
+    ClearFailureEvidence,
+    Degraded,
+    Absent,
     Stopped,
     RestoreCompleted,
     SuspendCompleted,
@@ -154,6 +158,29 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
         full.sandbox_inventory_complete = true;
         full.sandboxes.clone_from(&node.sandboxes);
         scenarios.push(capture(db, &service, ScenarioKind::FullInventory, full).await?);
+        for name in [
+            ScenarioKind::FailureEvidence,
+            ScenarioKind::ClearFailureEvidence,
+            ScenarioKind::Degraded,
+            ScenarioKind::Absent,
+        ] {
+            let mut sandbox = node
+                .sandboxes
+                .get(1)
+                .context("ordinary sandbox missing")?
+                .clone();
+            match name {
+                ScenarioKind::FailureEvidence => {
+                    sandbox.status = Some("failed".to_owned());
+                }
+                ScenarioKind::Degraded => sandbox.state_degraded = true,
+                ScenarioKind::Absent => sandbox.present = false,
+                _ => {}
+            }
+            let mut partial = request(node);
+            partial.sandboxes.push(sandbox);
+            scenarios.push(capture(db, &service, name, partial).await?);
+        }
         for (node, name) in nodes.iter().zip([
             ScenarioKind::Stopped,
             ScenarioKind::RestoreCompleted,

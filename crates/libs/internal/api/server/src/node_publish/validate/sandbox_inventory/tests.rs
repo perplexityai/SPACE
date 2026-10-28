@@ -47,9 +47,10 @@ fn duplicate_resolution_precedes_field_validation_and_preserves_absence() {
     );
     assert_eq!(input.state_only.len(), 1);
     assert_eq!(
-        input.state_only[&SandboxId::from_uuid(uuid::Uuid::from_u128(2))]["status"],
-        "Failed"
+        input.state_only[0].sandbox_id(),
+        SandboxId::from_uuid(uuid::Uuid::from_u128(2))
     );
+    assert_eq!(input.state_only[0].legacy_row()["status"], "Failed");
     assert_eq!(input.failure_episode_rows.len(), 2);
     assert_eq!(
         input.failure_episode_rows[0].legacy_row()["state_degraded"],
@@ -110,10 +111,7 @@ fn incomplete_rich_evidence_drops_only_its_own_snapshots_policy_and_quarantine_c
         assert!(input.quarantine_inputs.is_empty(), "{rejection}");
         assert!(!input.publishes_network_policy, "{rejection}");
         assert_eq!(input.state_only.len(), 1, "{rejection}");
-        assert_eq!(
-            input.state_only[&SandboxId::from_uuid(uuid::Uuid::from_u128(2))]["status"],
-            "QuArAnTiNeD"
-        );
+        assert_eq!(input.state_only[0].legacy_row()["status"], "QuArAnTiNeD");
         assert_eq!(
             input.failure_episode_rows[1].legacy_row()["state_degraded"],
             true

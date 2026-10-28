@@ -1,8 +1,9 @@
 # Publication statement equivalence
 
-`publish-statements` captures the real service's SQL-call multiset for ten
+`publish-statements` captures the real service's SQL-call multiset for fourteen
 synthetic scenarios. It checks empty, node-status, template, ordinary-single,
-full-inventory, stopped, restore-completed, suspend-completed,
+full-inventory, failure evidence and its clearing, degraded and explicitly absent
+observations, stopped, restore-completed, suspend-completed,
 activation-rollback, and pause-failed-recovery publications.
 
 The database is freshly seeded with the same five transition fixtures used by
