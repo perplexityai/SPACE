@@ -126,7 +126,8 @@ async fn publish_with_status(
     observation: Option<&ExecutionInventoryObservation>,
     legacy: Option<&NodeExecutionInventory>,
 ) -> Result<(), Status> {
-    let prepared = prepare(tx, node_id, validated_report(observation, legacy)?)
+    let report = validated_report(observation, legacy)?;
+    let prepared = prepare(tx, node_id, report.as_ref())
         .await
         .map_err(ApplyPublishError::from)?;
     let outcome = publish(tx, prepared)
@@ -257,15 +258,16 @@ async fn empty_publications_serialize_until_status_receipt_commits() -> TestResu
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
     let empty = complete(NodeExecutionInventory::default());
+    let report = validated_report(Some(&empty), None)?;
     let mut first = db.pool.begin().await?;
     // No status or artifact rows are needed to serialize a replacement.
-    let prepared = prepare(&mut first, node_id, validated_report(Some(&empty), None)?).await?;
+    let prepared = prepare(&mut first, node_id, report.as_ref()).await?;
     let outcome = publish(&mut first, prepared).await?;
     let mut second = db.pool.begin().await?;
     sqlx::query(sql!("SET LOCAL lock_timeout = '20ms'"))
         .execute(&mut *second)
         .await?;
-    let result = prepare(&mut second, node_id, validated_report(Some(&empty), None)?).await;
+    let result = prepare(&mut second, node_id, report.as_ref()).await;
     let error = match result {
         Err(error) => error,
         Ok(_) => panic!("concurrent empty publication did not wait for the node lock"),

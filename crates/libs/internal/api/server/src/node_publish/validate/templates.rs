@@ -41,11 +41,11 @@ impl ValidatedTemplateInventory {
         })
     }
 
-    pub(crate) fn into_legacy_rows(self) -> (Vec<String>, Vec<serde_json::Value>) {
+    pub(crate) fn legacy_rows(&self) -> (Vec<&str>, Vec<serde_json::Value>) {
         (
             self.absent_templates
-                .into_iter()
-                .map(PublishedTemplateName::into_string)
+                .iter()
+                .map(PublishedTemplateName::as_str)
                 .collect(),
             self.claims.iter().map(TemplateClaim::legacy_row).collect(),
         )

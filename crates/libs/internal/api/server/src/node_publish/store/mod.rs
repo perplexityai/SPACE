@@ -68,7 +68,7 @@ pub(crate) enum ApplyPublishError {
 /// publication write. A successful commit is required to produce an outcome.
 pub(crate) async fn apply(
     pool: &PgPool,
-    plan: PublishPlan,
+    plan: &PublishPlan,
 ) -> Result<PublishOutcome, ApplyPublishError> {
     let PublishPlan {
         origin,
@@ -87,7 +87,7 @@ pub(crate) async fn apply(
     let sandbox_inventory_complete = sandbox_census.claimed_complete();
     let template_inventory_complete = template_census.is_some();
     for diagnostic in census_diagnostics {
-        diagnostic.emit(&origin);
+        diagnostic.emit(origin);
     }
 
     let mut tx = pool.begin().await.map_err(ApplyPublishError::Begin)?;
@@ -99,11 +99,12 @@ pub(crate) async fn apply(
             .then(std::time::Instant::now);
 
     let execution_observation =
-        crate::execution_observation::prepare(&mut tx, origin.id, execution_observation).await?;
+        crate::execution_observation::prepare(&mut tx, origin.id, execution_observation.as_ref())
+            .await?;
     let templates_accepted =
         publish_validated_template_states(&mut tx, origin.id, templates).await?;
     let sandbox_publication =
-        publish_validated_sandbox_states(&mut tx, origin.id, &sandboxes).await?;
+        publish_validated_sandbox_states(&mut tx, origin.id, sandboxes).await?;
     let execution_observation =
         crate::execution_observation::publish(&mut tx, execution_observation).await?;
     // Produce the census-freshness verdict from the branch that prunes,
@@ -139,7 +140,7 @@ pub(crate) async fn apply(
     .await?
     {
         PendingLocalBackupCensus::Report(report) => {
-            Ok(node_local_backup_pending::reconcile(&mut tx, origin.id, &report).await?)
+            Ok(node_local_backup_pending::reconcile(&mut tx, origin.id, report).await?)
         }
         PendingLocalBackupCensus::Declined(outcome) => Err(outcome),
     };
@@ -168,8 +169,8 @@ pub(crate) async fn apply(
     upsert_node_status_from_publish(
         &mut tx,
         origin.id,
-        reported_window,
-        node_status,
+        *reported_window,
+        node_status.as_ref(),
         inventory_prune,
         local_backup_report,
         execution_observation,
@@ -190,14 +191,14 @@ pub(crate) async fn apply(
         );
     }
     Ok(PublishOutcome {
-        origin,
+        origin: origin.clone(),
         sandbox_inventory_complete,
         template_inventory_complete,
         templates_accepted,
         sandbox_publication,
         inventory_prune,
         delete_consumption,
-        auto_lifecycle_delete_completions_received,
+        auto_lifecycle_delete_completions_received: *auto_lifecycle_delete_completions_received,
         reported_count,
         backup_queue,
     })

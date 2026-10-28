@@ -189,9 +189,9 @@ pub(super) enum ReconcilePendingBackupError {
 
 /// What one publication is allowed to do to the node's mirror.
 #[derive(Debug)]
-pub(super) enum PendingLocalBackupCensus {
+pub(super) enum PendingLocalBackupCensus<'a> {
     /// Set-replace the node's rows against this report and advance the gate.
-    Report(ParsedPendingLocalBackups),
+    Report(&'a ParsedPendingLocalBackups),
     /// Leave the rows exactly as the last census left them. The gate is a
     /// separate decision made by the caller: a publication that could not
     /// have mirrored preserves it, one that claimed a complete inventory and
@@ -267,14 +267,14 @@ pub(super) enum PendingLocalBackupCensus {
 ///
 /// The extra read costs a statement only on publications that actually carry
 /// a degraded observation, which is not the steady state.
-pub(super) async fn decide(
+pub(super) async fn decide<'a>(
     conn: &mut sqlx::PgConnection,
-    pending_local_backups: PendingBackupReport,
+    pending_local_backups: &'a PendingBackupReport,
     inventory_prune: SandboxInventoryPrune,
     state_only_sandbox_ids: &BTreeSet<SandboxId>,
     node_id: NodeId,
-) -> Result<PendingLocalBackupCensus, DecidePendingBackupError> {
-    let Some(reported) = pending_local_backups.into_parsed() else {
+) -> Result<PendingLocalBackupCensus<'a>, DecidePendingBackupError> {
+    let Some(reported) = pending_local_backups.parsed() else {
         return Ok(PendingLocalBackupCensus::Declined(
             LocalBackupQueueOutcome::NoReport,
         ));
@@ -298,7 +298,7 @@ pub(super) async fn decide(
         }
     };
     if let Some(sandbox_id) =
-        undescribed_artifact_owner(conn, state_only_sandbox_ids, &report, node_id).await?
+        undescribed_artifact_owner(conn, state_only_sandbox_ids, report, node_id).await?
     {
         tracing::warn!(
             %node_id,

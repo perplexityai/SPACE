@@ -150,7 +150,8 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
 
     let mut tx = db.pool.begin().await?;
     let report = ValidatedReport::try_from_report(Report::Legacy(&inventory))?;
-    let observation = crate::execution_observation::prepare(&mut tx, node_id, Some(report)).await?;
+    let observation =
+        crate::execution_observation::prepare(&mut tx, node_id, Some(&report)).await?;
     crate::execution_observation::publish(&mut tx, observation).await?;
     tx.commit().await?;
     let mut conn = db.pool.acquire().await?;

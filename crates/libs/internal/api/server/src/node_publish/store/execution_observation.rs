@@ -58,19 +58,19 @@ impl InventoryStatus {
 /// Holds decoded evidence after acquiring this publication's node lock.
 /// Construct before census writes; consume before the status upsert.
 #[derive(Debug)]
-pub(super) struct PreparedObservation {
+pub(super) struct PreparedObservation<'a> {
     node_id: NodeId,
-    report: ValidatedReport,
+    report: &'a ValidatedReport,
 }
 
 /// Lock the registered node before inventory writes, including empty censuses.
 /// Omitted evidence acquires no lock; a missing registration is distinct from
 /// an unavailable inventory and must not create a new node.
-pub(super) async fn prepare(
+pub(super) async fn prepare<'a>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     node_id: NodeId,
-    report: Option<ValidatedReport>,
-) -> Result<Option<PreparedObservation>, PrepareExecutionObservationError> {
+    report: Option<&'a ValidatedReport>,
+) -> Result<Option<PreparedObservation<'a>>, PrepareExecutionObservationError> {
     let Some(report) = report else {
         return Ok(None);
     };
@@ -88,18 +88,18 @@ pub(super) async fn prepare(
     Ok(Some(PreparedObservation { node_id, report }))
 }
 
-pub(super) struct PublishedExecutionObservation {
+pub(super) struct PublishedExecutionObservation<'a> {
     pub status: InventoryStatus,
-    pub policy: Option<pplx_space_common_core::types::ExecutionPolicyObservation>,
+    pub policy: Option<&'a pplx_space_common_core::types::ExecutionPolicyObservation>,
 }
 
 /// Apply inventory evidence under the node lock acquired by `prepare`.
 /// Omitted or unavailable evidence preserves inventory rows; a complete empty
 /// census replaces the inventory. Unchanged rows are a successful outcome.
-pub(super) async fn publish(
+pub(super) async fn publish<'a>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    prepared: Option<PreparedObservation>,
-) -> Result<Option<PublishedExecutionObservation>, PublishExecutionInventoryError> {
+    prepared: Option<PreparedObservation<'a>>,
+) -> Result<Option<PublishedExecutionObservation<'a>>, PublishExecutionInventoryError> {
     let Some(PreparedObservation { node_id, report }) = prepared else {
         return Ok(None);
     };
@@ -111,7 +111,7 @@ pub(super) async fn publish(
     let policy = if let Some(ExecutionInventoryEvidence { inventory, policy }) = evidence {
         publish_inventory(tx, node_id, inventory).await?;
         match policy {
-            Ok(policy) => policy,
+            Ok(policy) => policy.as_ref(),
             Err(error) => {
                 tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");
                 None
@@ -130,9 +130,9 @@ pub(super) async fn publish(
 async fn publish_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    inventory: ValidatedExecutionInventory,
+    inventory: &ValidatedExecutionInventory,
 ) -> Result<(), PublishExecutionInventoryError> {
-    let (runtime_rows, component_rows) = inventory.into_legacy_rows();
+    let (runtime_rows, component_rows) = inventory.legacy_rows();
     let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
     let component_rows = Json(serde_json::Value::Array(component_rows));
     sqlx::query(sql!(

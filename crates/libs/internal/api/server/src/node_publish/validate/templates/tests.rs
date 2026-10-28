@@ -152,12 +152,12 @@ fn template_batch_preserves_absence_duplicate_declarations_and_identity_preceden
         cache_size_bytes: Some(u64::MAX),
         ..template()
     };
-    let (absences, rows) = ValidatedTemplateInventory::try_from_proto(
+    let inventory = ValidatedTemplateInventory::try_from_proto(
         NodeRole::Builder,
         &[absent.clone(), template(), template()],
     )
-    .unwrap()
-    .into_legacy_rows();
+    .unwrap();
+    let (absences, rows) = inventory.legacy_rows();
     assert_eq!(absences, ["synthetic-template"]);
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0], rows[1]);

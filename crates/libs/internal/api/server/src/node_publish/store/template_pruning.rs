@@ -23,7 +23,7 @@ pub(crate) enum PruneTemplateCensusError {
 pub(crate) async fn remove_absent(
     conn: &mut PgConnection,
     node_id: NodeId,
-    absent_templates: &[String],
+    absent_templates: &[&str],
 ) -> Result<u64, RemoveAbsentTemplatesError> {
     if absent_templates.is_empty() {
         return Ok(0);

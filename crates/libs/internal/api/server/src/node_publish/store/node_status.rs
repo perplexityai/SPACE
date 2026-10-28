@@ -246,10 +246,10 @@ pub(super) async fn upsert_node_status_from_publish(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     reported_window: Option<std::time::Duration>,
-    node_status: Option<ValidatedNodeStatus>,
+    node_status: Option<&ValidatedNodeStatus>,
     inventory_prune: SandboxInventoryPrune,
     local_backup_report: LocalBackupInventoryReport,
-    execution_observation: Option<crate::execution_observation::PublishedExecutionObservation>,
+    execution_observation: Option<crate::execution_observation::PublishedExecutionObservation<'_>>,
 ) -> Result<(), UpsertPublishedNodeStatusError> {
     let (
         scheduling_status,
@@ -265,7 +265,7 @@ pub(super) async fn upsert_node_status_from_publish(
     ) = match node_status {
         Some(status) => (
             Some(status.scheduling_status_label()),
-            Some(status.scheduling_reason),
+            Some(status.scheduling_reason.as_str()),
             Some(status.network_slots_ready),
             Some(status.network_pool_min_ready),
             Some(status.network_slots_degraded),
@@ -273,7 +273,7 @@ pub(super) async fn upsert_node_status_from_publish(
             Some(status.network_slots_total),
             Some(status.network_slots_leased),
             Some(status.network_pool_max_slots),
-            status.node_ctl,
+            status.node_ctl.as_ref(),
         ),
         None => (None, None, None, None, None, None, None, None, None, None),
     };

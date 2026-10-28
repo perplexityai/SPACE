@@ -20,7 +20,7 @@ impl ClusterApiService {
         role_intent.validate_authenticated_role(origin.role)?;
         let publish = ValidatedPublish::try_from_proto(origin, request.into_inner())?;
         let plan = PublishPlan::from(publish);
-        let outcome = store::apply(&self.pool, plan).await?;
+        let outcome = store::apply(&self.pool, &plan).await?;
         Ok(Response::new(outcome.emit_post_commit()))
     }
 }

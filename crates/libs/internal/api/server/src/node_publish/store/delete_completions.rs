@@ -202,7 +202,7 @@ async fn consume_auto_lifecycle_delete_completions(
     completions: &[AutoLifecycleDeleteCompletion],
 ) -> Result<AutoLifecycleDeleteConsumption, Status> {
     let completions = ValidatedDeleteCompletions::from_proto(completions);
-    consume_validated_auto_lifecycle_delete_completions(tx, origin_node_id, completions)
+    consume_validated_auto_lifecycle_delete_completions(tx, origin_node_id, &completions)
         .await
         .map_err(crate::node_publish::store::ApplyPublishError::from)
         .map_err(Status::from)
@@ -213,7 +213,7 @@ async fn consume_auto_lifecycle_delete_completions(
 pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
     tx: &mut Transaction<'_, Postgres>,
     origin_node_id: NodeId,
-    completions: ValidatedDeleteCompletions,
+    completions: &ValidatedDeleteCompletions,
 ) -> Result<AutoLifecycleDeleteConsumption, ConsumeDeleteCompletionsError> {
     for diagnostic in &completions.diagnostics {
         diagnostic.emit(origin_node_id);
@@ -227,10 +227,12 @@ pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
         ..
     } = completions;
     let mut consumption = AutoLifecycleDeleteConsumption {
-        acknowledged_receipt_ids,
-        deferred_by_batch_limit,
-        deferred_by_request_limit,
-        completion_metrics,
+        // These bounded response accumulators grow during application; the
+        // selected claims and their diagnostics remain borrowed from the plan.
+        acknowledged_receipt_ids: acknowledged_receipt_ids.clone(),
+        deferred_by_batch_limit: *deferred_by_batch_limit,
+        deferred_by_request_limit: *deferred_by_request_limit,
+        completion_metrics: completion_metrics.clone(),
         ..Default::default()
     };
     if selected.is_empty() {
@@ -266,7 +268,7 @@ pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
         // Keeping the savepoint disposition and the bookkeeping in one match is
         // what makes a new outcome variant a compile error rather than a silent
         // rollback.
-        match apply_receipt(&mut receipt_tx, origin_node_id, &completion).await? {
+        match apply_receipt(&mut receipt_tx, origin_node_id, completion).await? {
             ReceiptOutcome::Applied { from_lifecycle } => {
                 // Releasing the savepoint promotes the delete and its row locks
                 // to the publication transaction.
@@ -291,11 +293,11 @@ pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
             }
             ReceiptOutcome::AcknowledgedNoop(reason) => {
                 discard_receipt_scope(receipt_tx).await?;
-                acknowledge_noop(&mut consumption, &completion, origin_node_id, reason);
+                acknowledge_noop(&mut consumption, completion, origin_node_id, reason);
             }
             ReceiptOutcome::Deferred(reason) => {
                 discard_receipt_scope(receipt_tx).await?;
-                defer_completion(&mut consumption, &completion, reason);
+                defer_completion(&mut consumption, completion, reason);
             }
         }
     }

@@ -154,7 +154,7 @@ async fn publish_template_states(
     states: &[PublishedTemplateState],
 ) -> Result<u64, Status> {
     let inventory = ValidatedTemplateInventory::try_from_proto(publisher_role, states)?;
-    publish_validated_template_states(conn, node_id, inventory)
+    publish_validated_template_states(conn, node_id, &inventory)
         .await
         .map_err(Status::from)
 }
@@ -179,9 +179,9 @@ pub(crate) enum ApplyTemplateClaimsError {
 pub(crate) async fn publish_validated_template_states(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    inventory: ValidatedTemplateInventory,
+    inventory: &ValidatedTemplateInventory,
 ) -> Result<u64, ApplyTemplateClaimsError> {
-    let (absent_templates, rows) = inventory.into_legacy_rows();
+    let (absent_templates, rows) = inventory.legacy_rows();
     let mut accepted = template_pruning::remove_absent(conn, node_id, &absent_templates).await?;
 
     if rows.is_empty() {
