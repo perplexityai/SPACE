@@ -22,112 +22,7 @@ pub(crate) struct AcceptedSandboxPublishRow {
     pub(crate) status_changed: bool,
 }
 
-struct ObservedStateComparableColumn {
-    stored: &'static str,
-    incoming: &'static str,
-    excluded: &'static str,
-}
-
-const OBSERVED_STATE_COMPARABLE_COLUMNS: &[ObservedStateComparableColumn] = &[
-    ObservedStateComparableColumn {
-        stored: "node_id",
-        incoming: "$1",
-        excluded: "{source}.node_id",
-    },
-    observed_state_column("status"),
-    observed_state_column("runtime"),
-    observed_state_column("spaced_version"),
-    observed_state_column("runtime_version"),
-    observed_state_column("guest_os"),
-    observed_state_column("guest_arch"),
-    observed_state_column("state_format_name"),
-    observed_state_column("state_format_version"),
-    observed_state_column("execution_metadata"),
-    observed_state_column("pid"),
-    observed_state_column("namespace"),
-    observed_state_column("uptime"),
-    observed_state_column("sandbox_owner"),
-    observed_state_column("sandbox_user"),
-    observed_state_column("image_hash"),
-    ObservedStateComparableColumn {
-        stored: "snapshots_enabled",
-        incoming: "COALESCE({source}.snapshots_enabled, FALSE)",
-        excluded: "{source}.snapshots_enabled",
-    },
-    observed_state_column("template"),
-    observed_state_column("pool_template"),
-    observed_state_column("failure_reason"),
-    observed_state_column("observed_created_at"),
-    observed_state_column("network_tx_bytes"),
-    observed_state_column("network_rx_bytes"),
-    ObservedStateComparableColumn {
-        stored: "disk_usage_bytes",
-        incoming: "COALESCE({source}.disk_usage_bytes, observed_current.disk_usage_bytes)",
-        excluded: "COALESCE({source}.disk_usage_bytes, sandbox_observed_states.disk_usage_bytes)",
-    },
-    observed_state_column("auto_lifecycle_authority"),
-    ObservedStateComparableColumn {
-        stored: "missing_publish_count",
-        incoming: "0",
-        excluded: "0",
-    },
-];
-
-const fn observed_state_column(column: &'static str) -> ObservedStateComparableColumn {
-    ObservedStateComparableColumn {
-        stored: column,
-        incoming: "{source}.{column}",
-        excluded: "{source}.{column}",
-    }
-}
-
-fn observed_state_stored_tuple(source: &str) -> String {
-    observed_state_tuple(
-        OBSERVED_STATE_COMPARABLE_COLUMNS
-            .iter()
-            .map(|column| format!("{source}.{}", column.stored)),
-    )
-}
-
-fn observed_state_incoming_tuple(source: &str) -> String {
-    observed_state_tuple(
-        OBSERVED_STATE_COMPARABLE_COLUMNS
-            .iter()
-            .map(|column| render_observed_state_expression(column.incoming, source, column.stored)),
-    )
-}
-
-fn observed_state_excluded_tuple() -> String {
-    observed_state_tuple(
-        OBSERVED_STATE_COMPARABLE_COLUMNS.iter().map(|column| {
-            render_observed_state_expression(column.excluded, "EXCLUDED", column.stored)
-        }),
-    )
-}
-
-fn observed_state_tuple(expressions: impl Iterator<Item = String>) -> String {
-    format!(
-        "({})",
-        expressions.collect::<Vec<_>>().join(",\n                 ")
-    )
-}
-
-fn render_observed_state_expression(template: &str, source: &str, column: &str) -> String {
-    template
-        .replace("{source}", source)
-        .replace("{column}", column)
-}
-
-/// Accept observations for unknown sandboxes or the current publisher, using
-/// Direct route ownership when present. Conflict handling locks observation
-/// rows even for no-op updates, without explicit sandbox locks. Unchanged observations
-/// remain accepted, and an empty result means no input passed the owner guard.
-pub(crate) async fn upsert(
-    conn: &mut PgConnection,
-    node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
-) -> Result<Vec<AcceptedSandboxPublishRow>, UpsertObservedStateError> {
-    let observed_state_write_sql = format!(
+const UPSERT_OBSERVED_STATE_SQL: &str =
         "WITH input AS (
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -189,7 +84,59 @@ pub(crate) async fn upsert(
              FROM publishable
              LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id
              WHERE observed_current.sandbox_id IS NULL
-                OR {prefilter_current} IS DISTINCT FROM {prefilter_incoming}
+                OR (observed_current.node_id,
+                    observed_current.status,
+                    observed_current.runtime,
+                    observed_current.spaced_version,
+                    observed_current.runtime_version,
+                    observed_current.guest_os,
+                    observed_current.guest_arch,
+                    observed_current.state_format_name,
+                    observed_current.state_format_version,
+                    observed_current.execution_metadata,
+                    observed_current.pid,
+                    observed_current.namespace,
+                    observed_current.uptime,
+                    observed_current.sandbox_owner,
+                    observed_current.sandbox_user,
+                    observed_current.image_hash,
+                    observed_current.snapshots_enabled,
+                    observed_current.template,
+                    observed_current.pool_template,
+                    observed_current.failure_reason,
+                    observed_current.observed_created_at,
+                    observed_current.network_tx_bytes,
+                    observed_current.network_rx_bytes,
+                    observed_current.disk_usage_bytes,
+                    observed_current.auto_lifecycle_authority,
+                    observed_current.missing_publish_count)
+                   IS DISTINCT FROM
+                   ($1,
+                    publishable.status,
+                    publishable.runtime,
+                    publishable.spaced_version,
+                    publishable.runtime_version,
+                    publishable.guest_os,
+                    publishable.guest_arch,
+                    publishable.state_format_name,
+                    publishable.state_format_version,
+                    publishable.execution_metadata,
+                    publishable.pid,
+                    publishable.namespace,
+                    publishable.uptime,
+                    publishable.sandbox_owner,
+                    publishable.sandbox_user,
+                    publishable.image_hash,
+                    COALESCE(publishable.snapshots_enabled, FALSE),
+                    publishable.template,
+                    publishable.pool_template,
+                    publishable.failure_reason,
+                    publishable.observed_created_at,
+                    publishable.network_tx_bytes,
+                    publishable.network_rx_bytes,
+                    COALESCE(publishable.disk_usage_bytes, observed_current.disk_usage_bytes),
+                    publishable.auto_lifecycle_authority,
+                    0)
          ),
          upserted AS (
              INSERT INTO sandbox_observed_states (
@@ -264,7 +211,59 @@ pub(crate) async fn upsert(
                  missing_publish_count = 0,
                  observed_at = EXCLUDED.observed_at,
                  updated_at = NOW()
-            WHERE {conflict_current} IS DISTINCT FROM {conflict_excluded}
+            WHERE (sandbox_observed_states.node_id,
+                   sandbox_observed_states.status,
+                   sandbox_observed_states.runtime,
+                   sandbox_observed_states.spaced_version,
+                   sandbox_observed_states.runtime_version,
+                   sandbox_observed_states.guest_os,
+                   sandbox_observed_states.guest_arch,
+                   sandbox_observed_states.state_format_name,
+                   sandbox_observed_states.state_format_version,
+                   sandbox_observed_states.execution_metadata,
+                   sandbox_observed_states.pid,
+                   sandbox_observed_states.namespace,
+                   sandbox_observed_states.uptime,
+                   sandbox_observed_states.sandbox_owner,
+                   sandbox_observed_states.sandbox_user,
+                   sandbox_observed_states.image_hash,
+                   sandbox_observed_states.snapshots_enabled,
+                   sandbox_observed_states.template,
+                   sandbox_observed_states.pool_template,
+                   sandbox_observed_states.failure_reason,
+                   sandbox_observed_states.observed_created_at,
+                   sandbox_observed_states.network_tx_bytes,
+                   sandbox_observed_states.network_rx_bytes,
+                   sandbox_observed_states.disk_usage_bytes,
+                   sandbox_observed_states.auto_lifecycle_authority,
+                   sandbox_observed_states.missing_publish_count)
+                  IS DISTINCT FROM
+                  (EXCLUDED.node_id,
+                   EXCLUDED.status,
+                   EXCLUDED.runtime,
+                   EXCLUDED.spaced_version,
+                   EXCLUDED.runtime_version,
+                   EXCLUDED.guest_os,
+                   EXCLUDED.guest_arch,
+                   EXCLUDED.state_format_name,
+                   EXCLUDED.state_format_version,
+                   EXCLUDED.execution_metadata,
+                   EXCLUDED.pid,
+                   EXCLUDED.namespace,
+                   EXCLUDED.uptime,
+                   EXCLUDED.sandbox_owner,
+                   EXCLUDED.sandbox_user,
+                   EXCLUDED.image_hash,
+                   EXCLUDED.snapshots_enabled,
+                   EXCLUDED.template,
+                   EXCLUDED.pool_template,
+                   EXCLUDED.failure_reason,
+                   EXCLUDED.observed_created_at,
+                   EXCLUDED.network_tx_bytes,
+                   EXCLUDED.network_rx_bytes,
+                   COALESCE(EXCLUDED.disk_usage_bytes, sandbox_observed_states.disk_usage_bytes),
+                   EXCLUDED.auto_lifecycle_authority,
+                   0)
             RETURNING sandbox_id, (xmax = 0) AS inserted
         )
          SELECT publishable.sandbox_id,
@@ -283,14 +282,19 @@ pub(crate) async fn upsert(
                     AS status_changed
          FROM publishable
          LEFT JOIN upserted ON upserted.sandbox_id = publishable.sandbox_id
-         LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id",
-        prefilter_current = observed_state_stored_tuple("observed_current"),
-        prefilter_incoming = observed_state_incoming_tuple("publishable"),
-        conflict_current = observed_state_stored_tuple("sandbox_observed_states"),
-        conflict_excluded = observed_state_excluded_tuple(),
-    );
+         LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id";
+
+/// Accept observations for unknown sandboxes or the current publisher, using
+/// Direct route ownership when present. Conflict handling locks observation
+/// rows even for no-op updates, without explicit sandbox locks. Unchanged observations
+/// remain accepted, and an empty result means no input passed the owner guard.
+pub(crate) async fn upsert(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+    rows_json: Json<serde_json::Value>,
+) -> Result<Vec<AcceptedSandboxPublishRow>, UpsertObservedStateError> {
     sqlx::query_as::<_, AcceptedSandboxPublishRow>(sqlx::AssertSqlSafe(sql!(
-        observed_state_write_sql.as_str(),
+        UPSERT_OBSERVED_STATE_SQL
     )))
     .bind(node_id)
     .bind(rows_json)
