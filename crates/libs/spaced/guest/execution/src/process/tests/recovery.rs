@@ -121,7 +121,7 @@ async fn recovery_start_refuses_invalid_forms_and_stale_lifetimes_without_a_laun
             }
             _ => {
                 service.configure_process_recovery(None).await.unwrap();
-                tonic::Code::FailedPrecondition
+                tonic::Code::Unavailable
             }
         };
         assert_eq!(
@@ -197,7 +197,20 @@ async fn recovery_snapshot_barrier_settles_cancelled_start_before_disabling() {
     let disabling = service.configure_process_recovery(None);
     tokio::pin!(disabling);
     assert!(futures_util::poll!(&mut disabling).is_pending());
+    let slots = service.inner.process_payload_slots.available_permits();
+    let (refusal, remaining) = {
+        let refused = failure(&service, request.clone());
+        tokio::pin!(refused);
+        (
+            futures_util::poll!(&mut refused),
+            service.inner.process_payload_slots.available_permits(),
+        )
+    };
     placement.release();
+    assert!(
+        matches!(refusal, std::task::Poll::Ready(status) if status.code() == tonic::Code::Unavailable)
+    );
+    assert_eq!(remaining, slots);
     tokio::time::timeout(Duration::from_secs(5), &mut disabling)
         .await
         .unwrap()

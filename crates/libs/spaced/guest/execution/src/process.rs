@@ -313,9 +313,17 @@ impl Process for ExecutionService {
         // Recovery binding precedes account lookup and mutable launch defaults.
         let mut ingress = ingress;
         let recovery = if request.recovery.is_some() {
+            // A queued activation update must not turn requests into payload-holding waiters.
+            let activation = self
+                .inner
+                .recovery
+                .launches
+                .clone()
+                .try_read_owned()
+                .map_err(|_| Status::unavailable("process recovery is temporarily unavailable"))?;
             let permit = crate::payload::acquire(
                 &self.inner.process_payload_slots,
-                4,
+                pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
                 pplx_space_metrics::payload::Budget::GuestProcess,
                 ingress.take(),
             )?;
@@ -328,6 +336,10 @@ impl Process for ExecutionService {
                     let fence =
                         pplx_space_spaced_guest_protocol::recovery::validate_start(&request)?
                             .expect("recovery envelope present");
+                    validate_process_tag(request.tag.clone())?;
+                    if let Some(pty) = &request.pty {
+                        pty_winsize(pty.size)?;
+                    }
                     let binding = crate::recovery::binding(&request);
                     Ok::<_, Status>((request, fence, binding))
                 })
@@ -335,7 +347,6 @@ impl Process for ExecutionService {
                 .map_err(|_| Status::internal("recovery start validation task failed"))??;
             request = returned;
             ingress = Some(permit);
-            let activation = self.inner.recovery.launches.clone().read_owned().await;
             self.inner.recovery.check(fence)?;
             let key = require_idempotency_key(request.idempotency_key.clone(), "process_start")?;
             let lookup = self.inner.idempotency.reserve_bound(key, binding).await?;

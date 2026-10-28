@@ -26,10 +26,19 @@ impl RequestBinding {
     }
 }
 
-/// Hash the supplied wire values, sorting only the unordered environment map.
+/// Hash supplied values with canonical UUIDs and a sorted environment map.
 /// Prost preserves optional-field presence. Mutable launch defaults are excluded.
 pub(super) fn binding(request: &StartRequest) -> RequestBinding {
     let mut canonical = request.clone();
+    if let Some(recovery) = canonical.recovery.as_mut() {
+        recovery.expected_instance_id = ProcessRecoveryToken::parse(&recovery.expected_instance_id)
+            .expect("validated instance")
+            .to_string();
+        recovery.expected_activation_id =
+            ProcessRecoveryToken::parse(&recovery.expected_activation_id)
+                .expect("validated activation")
+                .to_string();
+    }
     let environment = std::mem::take(&mut canonical.env);
     let mut environment: Vec<_> = environment.into_iter().collect();
     environment.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -64,17 +73,19 @@ impl RecoveryState {
         if self.instance != fence.instance {
             return Err(Status::failed_precondition("execution engine restarted"));
         }
-        if *self
+        match *self
             .activation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            != Some(fence.activation)
         {
-            return Err(Status::failed_precondition(
-                "execution activation changed or recovery is disabled",
-            ));
+            None => Err(Status::unavailable(
+                "process recovery is temporarily unavailable",
+            )),
+            Some(current) if current != fence.activation => {
+                Err(Status::failed_precondition("execution activation changed"))
+            }
+            Some(_) => Ok(()),
         }
-        Ok(())
     }
 }
 

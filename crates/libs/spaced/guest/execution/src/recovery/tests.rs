@@ -18,6 +18,15 @@ fn binding_covers_supplied_launch_values_but_not_environment_map_order() {
     let mut reordered = request.clone();
     reordered.env = [("B".into(), "2".into()), ("A".into(), "1".into())].into();
     assert_eq!(binding(&reordered), original);
+    let mut equivalent = request.clone();
+    let fence = equivalent.recovery.as_mut().unwrap();
+    fence.expected_instance_id = fence.expected_instance_id.to_uppercase();
+    fence.expected_activation_id = fence.expected_activation_id.to_uppercase();
+    assert_eq!(
+        binding(&equivalent),
+        original,
+        "UUID spelling is not identity"
+    );
     let variations: &[fn(&mut StartRequest)] = &[
         |r| r.cwd = Some("/".into()),
         |r| {
