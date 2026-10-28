@@ -24,6 +24,13 @@ use time::OffsetDateTime;
 use tonic::Status;
 use uuid::Uuid;
 
+#[path = "quarantine_errors.rs"]
+mod errors;
+pub(super) use errors::{
+    ApplyActivationRollbacksError, ConsumeActivationReceiptsError, RecordQuarantineRecoveryError,
+    RecoverPauseFailedError, SelectActivationRollbacksError, SelectSuspendedProjectionsError,
+};
+
 const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     sandbox_id UUID,
     status TEXT,
@@ -349,7 +356,7 @@ pub(super) async fn consume_activation_completion_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
-) -> Result<Vec<SandboxId>, Status> {
+) -> Result<Vec<SandboxId>, ConsumeActivationReceiptsError> {
     let query = format!(
         "WITH input AS (
              SELECT *
@@ -404,9 +411,7 @@ pub(super) async fn consume_activation_completion_receipts(
         .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
         .fetch_all(conn)
         .await
-        .map_err(|error| {
-            Status::internal(format!("consume activation completion receipts: {error}"))
-        })
+        .map_err(ConsumeActivationReceiptsError::Consume)
 }
 
 /// Lock only rollback receipts that still own the active central execution.
@@ -417,7 +422,7 @@ pub(super) async fn select_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
-) -> Result<Vec<ActivationRollbackCandidate>, Status> {
+) -> Result<Vec<ActivationRollbackCandidate>, SelectActivationRollbacksError> {
     type CandidateRow = (
         SandboxId,
         SandboxCleanupEpisodeId,
@@ -460,9 +465,7 @@ pub(super) async fn select_activation_rollback_candidates(
         .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
         .fetch_all(&mut *conn)
         .await
-        .map_err(|error| {
-            Status::internal(format!("select activation rollback receipts: {error}"))
-        })?;
+        .map_err(SelectActivationRollbacksError::Select)?;
 
     rows.into_iter()
         .map(
@@ -481,15 +484,11 @@ pub(super) async fn select_activation_rollback_candidates(
                     receipt_id,
                     execution_generation,
                     activation_attempt_id,
-                    target_state: target_state.parse().map_err(|error| {
-                        Status::internal(format!(
-                            "parse activation rollback target for {sandbox_id}: {error}"
-                        ))
+                    target_state: target_state.parse().map_err(|source| {
+                        SelectActivationRollbacksError::Target { sandbox_id, source }
                     })?,
-                    reason_code: reason_code.parse().map_err(|error| {
-                        Status::internal(format!(
-                            "parse activation rollback reason for {sandbox_id}: {error}"
-                        ))
+                    reason_code: reason_code.parse().map_err(|source| {
+                        SelectActivationRollbacksError::Reason { sandbox_id, source }
                     })?,
                     prior_lifecycle,
                     failure_message,
@@ -507,7 +506,7 @@ pub(super) async fn apply_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     candidates: Vec<ActivationRollbackCandidate>,
-) -> Result<Vec<ActivationRollbackCandidate>, Status> {
+) -> Result<Vec<ActivationRollbackCandidate>, ApplyActivationRollbacksError> {
     let mut applied = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let execution_state = if candidate.target_state == SandboxTransitionTargetState::Suspended {
@@ -533,7 +532,7 @@ pub(super) async fn apply_activation_rollback_candidates(
         .bind(candidate.activation_attempt_id)
         .execute(&mut *conn)
         .await
-        .map_err(|error| Status::internal(format!("retire rollback execution: {error}")))?;
+        .map_err(ApplyActivationRollbacksError::RetireExecution)?;
         if retired.rows_affected() == 0 {
             continue;
         }
@@ -553,7 +552,7 @@ pub(super) async fn apply_activation_rollback_candidates(
         .bind(candidate.sandbox_id)
         .execute(&mut *conn)
         .await
-        .map_err(|error| Status::internal(format!("invalidate rollback port state: {error}")))?;
+        .map_err(ApplyActivationRollbacksError::InvalidatePorts)?;
         let converged = sqlx::query(sql!(
             "UPDATE sandboxes
                 SET lifecycle = $3,
@@ -571,12 +570,11 @@ pub(super) async fn apply_activation_rollback_candidates(
         .bind(candidate.target_state.as_str())
         .execute(&mut *conn)
         .await
-        .map_err(|error| Status::internal(format!("converge activation rollback: {error}")))?;
+        .map_err(ApplyActivationRollbacksError::Converge)?;
         if converged.rows_affected() != 1 {
-            return Err(Status::aborted(format!(
-                "activation rollback receipt {} lost sandbox ownership",
-                candidate.receipt_id
-            )));
+            return Err(ApplyActivationRollbacksError::LostOwnership(
+                candidate.receipt_id,
+            ));
         }
         applied.push(candidate);
     }
@@ -590,7 +588,7 @@ pub(super) async fn recover_pause_failed_from_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
-) -> Result<Vec<PauseFailedQuarantineRecovery>, Status> {
+) -> Result<Vec<PauseFailedQuarantineRecovery>, RecoverPauseFailedError> {
     let quarantine_source = SandboxQuarantineSource::SbxManager.as_str();
     let quarantine_reason = SandboxQuarantineReasonCode::PauseFailed.as_str();
     let candidates: Vec<(Uuid, Uuid, String)> = sqlx::query_as(sql!(
@@ -614,19 +612,17 @@ pub(super) async fn recover_pause_failed_from_inventory(
     .bind(quarantine_reason)
     .fetch_all(&mut *conn)
     .await
-    .map_err(|error| {
-        Status::internal(format!(
-            "select pause-failed quarantine recoveries: {error}"
-        ))
-    })?;
+    .map_err(RecoverPauseFailedError::Select)?;
 
     let mut recoveries = Vec::with_capacity(candidates.len());
     for (sandbox_id, quarantine_id, target_state) in candidates {
-        let target_state = target_state.parse().map_err(|error| {
-            Status::internal(format!(
-                "parse pause-failed quarantine recovery target for {sandbox_id}: {error}"
-            ))
-        })?;
+        let target_state =
+            target_state
+                .parse()
+                .map_err(|source| RecoverPauseFailedError::Target {
+                    sandbox_id: SandboxId::from_uuid(sandbox_id),
+                    source,
+                })?;
         let action = match target_state {
             SandboxTransitionTargetState::Started => {
                 SandboxQuarantineHistoryAction::RecoveredToStarted
@@ -635,9 +631,7 @@ pub(super) async fn recover_pause_failed_from_inventory(
                 SandboxQuarantineHistoryAction::RecoveredToPaused
             }
             _ => {
-                return Err(Status::internal(format!(
-                    "unsupported node-reported quarantine recovery target {target_state}"
-                )));
+                return Err(RecoverPauseFailedError::UnsupportedTarget(target_state));
             }
         };
         let recovered = sqlx::query_scalar::<_, Uuid>(sql!(
@@ -707,11 +701,11 @@ pub(super) async fn recover_pause_failed_from_inventory(
         .bind(node_id.to_string())
         .fetch_optional(&mut *conn)
         .await
-        .map_err(|error| Status::internal(format!("record node quarantine recovery: {error}")))?;
+        .map_err(RecoverPauseFailedError::Record)?;
         if recovered != Some(sandbox_id) {
-            return Err(Status::aborted(format!(
-                "pause-failed recovery CAS failed for {sandbox_id}"
-            )));
+            return Err(RecoverPauseFailedError::LostOwnership(
+                SandboxId::from_uuid(sandbox_id),
+            ));
         }
 
         recoveries.push(PauseFailedQuarantineRecovery {
@@ -728,7 +722,7 @@ pub(super) async fn select_suspended_projection_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
-) -> Result<Vec<SuspendedProjectionCandidate>, Status> {
+) -> Result<Vec<SuspendedProjectionCandidate>, SelectSuspendedProjectionsError> {
     let eligibility = started_suspend_revert_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
@@ -890,9 +884,7 @@ pub(super) async fn select_suspended_projection_candidates(
         .bind(SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact.as_str())
         .fetch_all(&mut *conn)
         .await
-        .map_err(|error| {
-            Status::internal(format!("select suspended projection candidates: {error}"))
-        })?;
+        .map_err(SelectSuspendedProjectionsError::Select)?;
 
     rows.into_iter()
         .map(
@@ -918,21 +910,15 @@ pub(super) async fn select_suspended_projection_candidates(
                     (None, None, None) => None,
                     (Some(id), Some(kind), Some(origin)) => Some(PublishedSuspendArtifact {
                         id: LocalArtifactId::from_uuid(id),
-                        kind: kind.parse().map_err(|error| {
-                            Status::internal(format!(
-                                "parse suspended projection artifact kind for {sandbox_id}: {error}"
-                            ))
+                        kind: kind.parse().map_err(|source| {
+                            SelectSuspendedProjectionsError::ArtifactKind { sandbox_id, source }
                         })?,
-                        origin: origin.parse().map_err(|error| {
-                            Status::internal(format!(
-                                "parse suspended projection artifact origin for {sandbox_id}: {error}"
-                            ))
+                        origin: origin.parse().map_err(|source| {
+                            SelectSuspendedProjectionsError::ArtifactOrigin { sandbox_id, source }
                         })?,
                     }),
                     _ => {
-                        return Err(Status::internal(format!(
-                            "suspended projection candidate {sandbox_id} has a partial published artifact"
-                        )));
+                        return Err(SelectSuspendedProjectionsError::PartialArtifact(sandbox_id));
                     }
                 };
                 let published_execution_identity = match (
@@ -943,45 +929,36 @@ pub(super) async fn select_suspended_projection_candidates(
                     (None, None, None) => None,
                     (Some(generation), Some(pod_uid), Some(pod_uid_was_missing)) => {
                         Some(PublishedExecutionIdentity {
-                        generation: ExecutionGeneration::new(generation).map_err(|error| {
-                            Status::internal(format!(
-                                "parse suspended projection generation for {sandbox_id}: {error}"
-                            ))
-                        })?,
-                        pod_uid: PodUid::parse(pod_uid).map_err(|error| {
-                            Status::internal(format!(
-                                "parse suspended projection pod UID for {sandbox_id}: {error}"
-                            ))
-                        })?,
-                        pod_uid_was_missing,
-                    })
+                            generation: ExecutionGeneration::new(generation).map_err(|source| {
+                                SelectSuspendedProjectionsError::Generation { sandbox_id, source }
+                            })?,
+                            pod_uid: PodUid::parse(pod_uid).map_err(|source| {
+                                SelectSuspendedProjectionsError::PodUid { sandbox_id, source }
+                            })?,
+                            pod_uid_was_missing,
+                        })
                     }
                     _ => {
-                        return Err(Status::internal(format!(
-                            "suspended projection candidate {sandbox_id} has a partial execution identity"
-                        )));
+                        return Err(SelectSuspendedProjectionsError::PartialExecutionIdentity(
+                            sandbox_id,
+                        ));
                     }
                 };
                 let recovery = match (reason, receipt_id) {
                     (None, None) => None,
                     (Some(reason), Some(receipt_id)) => Some(QuarantineRecoveryCandidate {
-                        quarantine_id: quarantine_id.ok_or_else(|| {
-                            Status::internal(format!(
-                                "quarantine recovery candidate {sandbox_id} has no episode"
-                            ))
-                        })?,
-                        reason_code: reason.parse().map_err(|error| {
-                            Status::internal(format!(
-                                "parse quarantine recovery reason for {sandbox_id}: {error}"
-                            ))
+                        quarantine_id: quarantine_id
+                            .ok_or(SelectSuspendedProjectionsError::MissingEpisode(sandbox_id))?,
+                        reason_code: reason.parse().map_err(|source| {
+                            SelectSuspendedProjectionsError::RecoveryReason { sandbox_id, source }
                         })?,
                         receipt_id,
                         prior_lifecycle,
                     }),
                     _ => {
-                        return Err(Status::internal(format!(
-                            "quarantine recovery candidate {sandbox_id} has a partial receipt"
-                        )));
+                        return Err(SelectSuspendedProjectionsError::PartialRecoveryReceipt(
+                            sandbox_id,
+                        ));
                     }
                 };
                 Ok(SuspendedProjectionCandidate {
@@ -1003,7 +980,7 @@ pub(super) async fn record_quarantine_recovery(
     node_id: NodeId,
     sandbox_id: SandboxId,
     recovery: &QuarantineRecoveryCandidate,
-) -> Result<(), Status> {
+) -> Result<(), RecordQuarantineRecoveryError> {
     let history_id = recovery.receipt_id.as_uuid();
     let quarantine_id = recovery.quarantine_id;
     let inserted = sqlx::query(sql!(
@@ -1032,12 +1009,13 @@ pub(super) async fn record_quarantine_recovery(
     .bind(SandboxQuarantineSource::SbxManager.as_str())
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("record quarantine recovery: {error}")))?
+    .map_err(RecordQuarantineRecoveryError::Record)?
     .rows_affected();
     if inserted != 1 {
-        return Err(Status::aborted(format!(
-            "quarantine recovery history CAS affected {inserted} rows for {sandbox_id}"
-        )));
+        return Err(RecordQuarantineRecoveryError::HistoryCas {
+            sandbox_id,
+            rows: inserted,
+        });
     }
     let removed = sqlx::query(sql!(
         "DELETE FROM sandbox_quarantine_state
@@ -1047,12 +1025,13 @@ pub(super) async fn record_quarantine_recovery(
     .bind(quarantine_id)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("retire quarantine recovery: {error}")))?
+    .map_err(RecordQuarantineRecoveryError::Retire)?
     .rows_affected();
     if removed != 1 {
-        return Err(Status::aborted(format!(
-            "quarantine recovery retirement CAS affected {removed} rows for {sandbox_id}"
-        )));
+        return Err(RecordQuarantineRecoveryError::RetirementCas {
+            sandbox_id,
+            rows: removed,
+        });
     }
     Ok(())
 }

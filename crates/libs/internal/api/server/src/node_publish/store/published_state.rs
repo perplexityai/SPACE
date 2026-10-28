@@ -980,6 +980,20 @@ pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     FailureEpisodes(#[from] failure_episodes::ReconcileFailureEpisodesError),
     #[error(transparent)]
+    ActivationCompletion(#[from] crate::sandbox_quarantine_store::ConsumeActivationReceiptsError),
+    #[error(transparent)]
+    ActivationRollbackSelection(
+        #[from] crate::sandbox_quarantine_store::SelectActivationRollbacksError,
+    ),
+    #[error(transparent)]
+    ActivationRollback(#[from] crate::sandbox_quarantine_store::ApplyActivationRollbacksError),
+    #[error(transparent)]
+    PauseRecovery(#[from] crate::sandbox_quarantine_store::RecoverPauseFailedError),
+    #[error(transparent)]
+    SuspendedProjection(#[from] crate::sandbox_quarantine_store::SelectSuspendedProjectionsError),
+    #[error(transparent)]
+    RecoveryHistory(#[from] crate::sandbox_quarantine_store::RecordQuarantineRecoveryError),
+    #[error(transparent)]
     Legacy(#[from] Status),
 }
 
@@ -2066,7 +2080,7 @@ async fn project_node_published_suspended_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
-) -> Result<SuspendedProjectionOutcome, Status> {
+) -> Result<SuspendedProjectionOutcome, ApplySandboxClaimsError> {
     let candidates = crate::sandbox_quarantine_store::select_suspended_projection_candidates(
         conn, node_id, rows_json,
     )
