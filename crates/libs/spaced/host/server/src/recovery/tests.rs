@@ -241,18 +241,36 @@ async fn activation_requires_current_host_barrier_and_launch_bound_epoch() {
                     .unwrap()
                     .barrier
                     .to_string();
-                if memory_snapshot {
-                    Meta::prepare_suspend(&first, Request::new(proto::PrepareSuspendRequest {}))
+                let rearm = first
+                    .inner
+                    .process_recovery
+                    .as_ref()
+                    .unwrap()
+                    .acquire()
+                    .unwrap();
+                let mut flushing = Box::pin(async {
+                    if memory_snapshot {
+                        Meta::prepare_suspend(
+                            &first,
+                            Request::new(proto::PrepareSuspendRequest {}),
+                        )
                         .await
                         .unwrap();
-                } else {
-                    Meta::flush_guest_filesystems(
-                        &first,
-                        Request::new(proto::FlushGuestFilesystemsRequest {}),
-                    )
-                    .await
-                    .unwrap();
-                }
+                    } else {
+                        Meta::flush_guest_filesystems(
+                            &first,
+                            Request::new(proto::FlushGuestFilesystemsRequest {}),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+                assert!(
+                    futures_util::poll!(&mut flushing).is_pending(),
+                    "flush queues behind rearm"
+                );
+                drop(rearm);
+                flushing.await;
                 assert!(guest.info().activation_id.is_none());
                 assert_eq!(
                     resume(&first, &previous).await.unwrap_err().code(),

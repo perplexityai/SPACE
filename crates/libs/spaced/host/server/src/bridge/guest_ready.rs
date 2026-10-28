@@ -102,9 +102,9 @@ impl SpacedHostService {
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let guest_uptime = validate_optional_duration("guest_uptime", response.guest_uptime)?;
         // Invalid discovery must not change ordinary guest readiness.
-        let process_execution = response.process_execution.filter(|info| {
-            uuid::Uuid::parse_str(&info.instance_id).is_ok()
-        });
+        let process_execution = response
+            .process_execution
+            .filter(|info| uuid::Uuid::parse_str(&info.instance_id).is_ok());
         Ok(Some(GuestReadySnapshot {
             process_execution,
             process_recovery_barrier_id: response

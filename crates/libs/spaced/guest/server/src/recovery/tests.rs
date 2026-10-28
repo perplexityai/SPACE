@@ -51,19 +51,24 @@ async fn snapshot_preparation_invalidates_delayed_activation_even_when_flush_fai
             ..request.clone()
         };
         let execution = service.inner.execution.clone();
-        let result = service
-            .flush_with_recovery_barrier(move || {
-                assert!(
-                    execution.process_execution_info().activation_id.is_none(),
-                    "quiesce before flushing"
-                );
-                if fail_flush {
-                    Err(Status::internal("synthetic flush failure"))
-                } else {
-                    Ok(())
-                }
-            })
-            .await;
+        let rearm = service.inner.process_recovery.acquire().unwrap();
+        let mut flushing = Box::pin(service.flush_with_recovery_barrier(move || {
+            assert!(
+                execution.process_execution_info().activation_id.is_none(),
+                "quiesce before flushing"
+            );
+            if fail_flush {
+                Err(Status::internal("synthetic flush failure"))
+            } else {
+                Ok(())
+            }
+        }));
+        assert!(
+            futures_util::poll!(&mut flushing).is_pending(),
+            "flush waits for the admitted rearm"
+        );
+        drop(rearm);
+        let result = flushing.await;
         assert_eq!(result.is_err(), fail_flush);
         assert_eq!(
             service.activate_recovery(delayed).await.unwrap_err().code(),

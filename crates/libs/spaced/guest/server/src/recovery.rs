@@ -46,6 +46,15 @@ impl RecoveryLifecycle {
                 Status::resource_exhausted("guest recovery lifecycle operation in progress")
             })
     }
+    async fn acquire_flush(&self) -> Result<OwnedSemaphorePermit, Status> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.transaction.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Status::unavailable("recovery activation has not settled"))?
+        .map_err(|_| Status::unavailable("recovery lifecycle is closed"))
+    }
 }
 
 impl SpacedGuestService {
@@ -94,7 +103,7 @@ impl SpacedGuestService {
         flush: impl FnOnce() -> Result<(), Status> + Send + 'static,
     ) -> Result<(), Status> {
         let lifecycle = &self.inner.process_recovery;
-        let transaction = lifecycle.acquire()?;
+        let transaction = lifecycle.acquire_flush().await?;
         let active = {
             let mut gate = lifecycle
                 .gate

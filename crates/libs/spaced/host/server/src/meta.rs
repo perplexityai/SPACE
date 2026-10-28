@@ -164,11 +164,10 @@ impl Meta for SpacedHostService {
         &self,
         request: Request<FlushGuestFilesystemsRequest>,
     ) -> Result<Response<FlushGuestFilesystemsResponse>, Status> {
-        let _recovery = self.quiesce_recovery()?;
-        let timeout = RetryContext::with_timeout(Duration::from_secs(180))
-            .with_grpc_timeout_metadata(request.metadata())
-            .remaining()
-            .unwrap_or(Duration::ZERO);
+        let context = RetryContext::with_timeout(Duration::from_secs(180))
+            .with_grpc_timeout_metadata(request.metadata());
+        let _recovery = self.quiesce_recovery().await?;
+        let timeout = context.remaining().unwrap_or(Duration::ZERO);
         self.call_bridge_guest_once(
             "bridge_guest_flush_filesystems",
             BridgeGuestOperationBudget::FilesystemFlush(timeout),
@@ -190,11 +189,10 @@ impl Meta for SpacedHostService {
         &self,
         request: Request<PrepareSuspendRequest>,
     ) -> Result<Response<PrepareSuspendResponse>, Status> {
-        let _recovery = self.quiesce_recovery()?;
-        let timeout = RetryContext::with_timeout(Duration::from_secs(180))
-            .with_grpc_timeout_metadata(request.metadata())
-            .remaining()
-            .unwrap_or(Duration::ZERO);
+        let context = RetryContext::with_timeout(Duration::from_secs(180))
+            .with_grpc_timeout_metadata(request.metadata());
+        let _recovery = self.quiesce_recovery().await?;
+        let timeout = context.remaining().unwrap_or(Duration::ZERO);
         self.clear_guest_ready();
         self.clear_all_bridge_guest_clients().await;
         let flush_result = self

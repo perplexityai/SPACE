@@ -20,7 +20,9 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        let recovery = pplx_space_spaced_common::recovery::validate_start(operation)?.is_some();
+        let fence = pplx_space_spaced_common::recovery::validate_start(operation)?;
+        self.require_resident_recovery(&req.sandbox_id, &route_auth, fence)?;
+        let recovery = fence.is_some();
         if !recovery && operation.command.is_empty() {
             return Err(Status::invalid_argument("command is required"));
         }
@@ -148,11 +150,16 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+        let handle = pplx_space_spaced_common::recovery::validate_handle(
             &operation.process_id,
             operation.recovery.as_ref(),
-        )?
-        .is_some();
+        )?;
+        self.require_resident_recovery(
+            &req.sandbox_id,
+            &route_auth,
+            handle.as_ref().map(|handle| handle.fence),
+        )?;
+        let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
@@ -252,11 +259,16 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+        let handle = pplx_space_spaced_common::recovery::validate_handle(
             &operation.process_id,
             operation.recovery.as_ref(),
-        )?
-        .is_some();
+        )?;
+        self.require_resident_recovery(
+            &req.sandbox_id,
+            &route_auth,
+            handle.as_ref().map(|handle| handle.fence),
+        )?;
+        let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
@@ -306,11 +318,16 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+        let handle = pplx_space_spaced_common::recovery::validate_handle(
             &operation.process_id,
             operation.recovery.as_ref(),
-        )?
-        .is_some();
+        )?;
+        self.require_resident_recovery(
+            &req.sandbox_id,
+            &route_auth,
+            handle.as_ref().map(|handle| handle.fence),
+        )?;
+        let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
@@ -356,11 +373,16 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+        let handle = pplx_space_spaced_common::recovery::validate_handle(
             &operation.process_id,
             operation.recovery.as_ref(),
-        )?
-        .is_some();
+        )?;
+        self.require_resident_recovery(
+            &req.sandbox_id,
+            &route_auth,
+            handle.as_ref().map(|handle| handle.fence),
+        )?;
+        let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
@@ -404,11 +426,16 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
-        let recovery = pplx_space_spaced_common::recovery::validate_handle(
+        let handle = pplx_space_spaced_common::recovery::validate_handle(
             &operation.process_id,
             operation.recovery.as_ref(),
-        )?
-        .is_some();
+        )?;
+        self.require_resident_recovery(
+            &req.sandbox_id,
+            &route_auth,
+            handle.as_ref().map(|handle| handle.fence),
+        )?;
+        let recovery = handle.is_some();
         if !recovery && operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }

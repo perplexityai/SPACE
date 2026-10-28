@@ -11,7 +11,66 @@ struct RecoveryActivation {
     _capture: crate::auto_lifecycle::LifecycleMutexGuard,
 }
 
+/// Recovery is optional on the legacy readiness path. A failed or stalled rearm
+/// must not invalidate the readiness observation already obtained from the host.
+async fn best_effort_recovery_ready(
+    mut observed: WaitReadyResponse,
+    budget: Duration,
+    rearm: impl std::future::Future<Output = Result<WaitReadyResponse, Status>>,
+) -> WaitReadyResponse {
+    if observed.process_recovery_barrier_id.is_none() {
+        return observed;
+    }
+    if let Ok(Ok(ready)) = tokio::time::timeout(budget, rearm).await {
+        return ready;
+    }
+    if let Some(info) = observed.process_execution.as_mut() {
+        info.activation_id = None;
+        info.capabilities.retain(|capability| {
+            capability == pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume.as_str()
+        });
+    }
+    observed
+}
+
 impl SandboxManagerService {
+    pub(super) async fn legacy_recovery_ready(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        authorization: Option<&SpaceApiBridgeRouteAuthorization>,
+        policy: SpacedEndpointProofPolicy,
+        timeout: Duration,
+    ) -> Result<WaitReadyResponse, Status> {
+        let started = tokio::time::Instant::now();
+        let client = self
+            .connect_spaced_host_with_policy(sandbox, policy)
+            .await?;
+        let observed = client.wait_ready(timeout).await?;
+        let budget = timeout
+            .saturating_sub(started.elapsed())
+            .min(Duration::from_millis(100));
+        Ok(best_effort_recovery_ready(observed, budget, async {
+            self.recovery_ready(sandbox, authorization, policy, budget)
+                .await
+                .map(|(_, ready)| ready)
+        })
+        .await)
+    }
+
+    pub(super) fn require_resident_recovery(
+        &self,
+        sandbox_id: &str,
+        authorization: &SpaceApiBridgeRouteAuthorization,
+        fence: Option<pplx_space_spaced_common::recovery::RecoveryFence>,
+    ) -> Result<(), Status> {
+        let Some(fence) = fence else {
+            return Ok(());
+        };
+        let sandbox = self.lookup_sandbox(sandbox_id)?;
+        authorization.authorize_sandbox(&sandbox)?;
+        resident_recovery_fence(&sandbox, fence)
+    }
+
     async fn recovery_activation_scope(
         &self,
         sandbox_id: &str,
@@ -99,6 +158,27 @@ impl SandboxManagerService {
         .await
         .map(|(client, _)| client)
     }
+}
+
+fn resident_recovery_fence(
+    sandbox: &crate::db::SandboxRow,
+    fence: pplx_space_spaced_common::recovery::RecoveryFence,
+) -> Result<(), Status> {
+    use pplx_space_spaced_common::recovery::RecoveryReason;
+    match sandbox.state {
+        SandboxState::Started | SandboxState::Paused => {}
+        SandboxState::Suspended | SandboxState::Stopped => {
+            return Err(RecoveryReason::ActivationChanged.into_status());
+        }
+        _ => return Err(RecoveryReason::TemporarilyUnavailable.into_status()),
+    }
+    let current = sandbox
+        .node_execution_id
+        .ok_or_else(|| RecoveryReason::TemporarilyUnavailable.into_status())?;
+    if current.to_string() != fence.activation.to_string() {
+        return Err(RecoveryReason::ActivationChanged.into_status());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

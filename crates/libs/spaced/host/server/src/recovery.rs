@@ -46,6 +46,15 @@ impl RecoveryLifecycle {
                 Status::resource_exhausted("host recovery lifecycle operation in progress")
             })
     }
+    async fn acquire_flush(&self) -> Result<OwnedSemaphorePermit, Status> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.transaction.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Status::unavailable("recovery activation has not settled"))?
+        .map_err(|_| Status::unavailable("recovery lifecycle is closed"))
+    }
 }
 
 impl SpacedHostService {
@@ -73,7 +82,10 @@ impl SpacedHostService {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match gate.phase {
             Phase::Active => Ok(()),
-            Phase::Quiesced => Err(Status::unavailable("process recovery is quiesced")),
+            Phase::Quiesced => Err(
+                pplx_space_spaced_common::recovery::RecoveryReason::TemporarilyUnavailable
+                    .into_status(),
+            ),
         }
     }
 
@@ -125,11 +137,11 @@ impl SpacedHostService {
         }
     }
 
-    pub(super) fn quiesce_recovery(&self) -> Result<Option<OwnedSemaphorePermit>, Status> {
+    pub(super) async fn quiesce_recovery(&self) -> Result<Option<OwnedSemaphorePermit>, Status> {
         let Some(lifecycle) = &self.inner.process_recovery else {
             return Ok(None);
         };
-        let transaction = lifecycle.acquire()?;
+        let transaction = lifecycle.acquire_flush().await?;
         {
             let mut gate = lifecycle
                 .gate

@@ -108,8 +108,8 @@ impl SandboxManagerService {
         };
         let timeout = proto_duration_to_std(req.timeout)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCKING_READY_TIMEOUT_SECS as u64));
-        let (_, response) = self
-            .recovery_ready(
+        let response = self
+            .legacy_recovery_ready(
                 &sandbox,
                 route_auth.as_ref(),
                 endpoint_proof_policy,

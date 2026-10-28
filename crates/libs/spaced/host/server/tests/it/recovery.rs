@@ -244,6 +244,90 @@ async fn recovery_envelopes_survive_real_host_and_guest_transports() {
 
     #[cfg(target_os = "linux")]
     {
+        // One byte proves that the write reached the child; the remaining input
+        // exceeds the pipe capacity while the child stops reading.
+        let mut blocked = request.clone();
+        blocked.process_id = Some("blocked-input".into());
+        blocked.idempotency_key = Some("blocked-input".into());
+        blocked.recovery.as_mut().unwrap().command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "dd bs=1 count=1 of=/dev/null 2>/dev/null; printf blocked; sleep 60".into(),
+        ];
+        let blocked = self::handle(&started(&client, blocked).await, &epoch.to_string());
+        let pending_input = proto::SendInputRequest {
+            recovery: Some(sequenced(&blocked, 1)),
+            data: vec![b'x'; 2 * 1024 * 1024],
+            process_id: String::new(),
+        };
+        let writer = client.clone();
+        let retry = pending_input.clone();
+        let writing = AbortOnDropHandle::new(tokio::spawn(async move {
+            writer.recovery_send_input(pending_input).await
+        }));
+        let mut events = client
+            .recovery_connect_process(proto::ConnectProcessRequest {
+                recovery: Some(blocked.clone()),
+                output_cursor: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"blocked") {
+                let event = events.message().await.unwrap().expect("child remains live");
+                if let Some(proto::process_event::Event::Stdout(output)) = event.event {
+                    bytes.extend(output.data);
+                }
+            }
+        })
+        .await
+        .expect("child consumed the first byte");
+        drop(events);
+        assert!(!writing.is_finished());
+        client
+            .prepare_suspend(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let interrupted = tokio::time::timeout(Duration::from_secs(5), writing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            RecoveryReason::from_status(&interrupted),
+            Some(RecoveryReason::InputOutcomeUncertain)
+        );
+        activate(&client).await;
+        let replay = client.recovery_send_input(retry).await.unwrap_err();
+        assert_eq!(replay.code(), interrupted.code());
+        assert_eq!(
+            RecoveryReason::from_status(&replay),
+            RecoveryReason::from_status(&interrupted)
+        );
+        assert!(
+            interrupted
+                .metadata()
+                .get("space-process-input-written")
+                .is_some()
+        );
+        assert_eq!(
+            replay.metadata().get("space-process-input-written"),
+            interrupted.metadata().get("space-process-input-written")
+        );
+        // A version-one fenced kill is the escape hatch for an ordered stream
+        // whose next sequence cannot pass its pending owner.
+        client
+            .recovery_send_signal(proto::SendSignalRequest {
+                recovery: Some(blocked.clone()),
+                signal: 9,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        output(&client, blocked).await;
+
         // The real preparation RPC quiesces without deleting process receipts.
         client
             .prepare_suspend(Duration::from_secs(5))

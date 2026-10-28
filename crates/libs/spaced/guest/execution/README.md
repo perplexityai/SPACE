@@ -344,7 +344,17 @@ exclusion. Node-manager supplies the current execution identity at host launch;
 restore changes it, while a sidecar restart or resident pause/resume retains it.
 Older peers and hosts without activation configuration do not advertise support.
 An older service sees no legacy command and rejects the request before launching.
-Legacy calls keep their existing defaults.
+Legacy calls keep their existing defaults. Ordinary readiness observes the guest
+first, then gives recovery rearming at most 100 ms of the remaining budget. A
+busy snapshot lock or failed rearm removes recovery capabilities from that
+response without failing readiness. Snapshot preparation waits briefly for a
+concurrent rearm rather than refusing solely because it holds the lifecycle
+permit.
+
+Recovery requests validate the external activation before waking a resident
+paused sandbox. They never restore a suspended sandbox on behalf of an old
+handle: restore must complete first, followed by fresh discovery. A quiesced
+activation is temporarily unavailable, not evidence of a new lifetime.
 
 ## Fenced process handles
 
