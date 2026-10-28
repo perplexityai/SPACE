@@ -4,6 +4,7 @@
 //! SQL and publication diagnostics stay at their existing call sites until the
 //! complete validated publication can replace the legacy input boundary.
 
+pub(crate) mod execution_inventory;
 pub(crate) mod fields;
 pub(crate) mod node_status;
 pub(crate) mod quarantine;

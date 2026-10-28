@@ -1,16 +1,12 @@
 //! Decode publication evidence without treating omission or collection failure
 //! as an empty inventory. Existing placement projections remain unchanged.
 
-use pplx_space_common_core::{
-    sql,
-    types::{
-        ArtifactComponentMetadata, GuestPlatform, NodeId, RuntimeIdentity, StateFormatIdentity,
-    },
-};
+use pplx_space_common_core::{sql, types::NodeId};
 use pplx_space_execution_common::proto::NodeExecutionInventory;
 use sqlx::types::Json;
 use tonic::Status;
 
+use crate::node_publish::validate::execution_inventory::ValidatedExecutionInventory;
 use crate::proto::{ExecutionInventoryObservation, execution_inventory_observation::Outcome};
 
 /// The outcome recorded only when the surrounding publication commits.
@@ -147,79 +143,8 @@ async fn publish_inventory(
     node_id: NodeId,
     inventory: &pplx_space_execution_common::proto::NodeExecutionInventory,
 ) -> Result<(), Status> {
-    let mut runtime_rows = Vec::with_capacity(inventory.runtimes.len());
-    for installation in &inventory.runtimes {
-        let runtime = installation
-            .runtime
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("runtime installation is missing identity"))
-            .and_then(|runtime| {
-                RuntimeIdentity::try_from(runtime)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))
-            })?;
-        let guests = installation
-            .supported_guests
-            .iter()
-            .map(|guest| {
-                GuestPlatform::try_from(guest)
-                    .map(|guest| {
-                        serde_json::json!({
-                            "guest_os": guest.os.as_str(),
-                            "guest_arch": guest.architecture.as_str(),
-                        })
-                    })
-                    .map_err(|error| Status::invalid_argument(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let state_formats = installation
-            .state_formats
-            .iter()
-            .map(|capability| {
-                let identity = capability.identity.as_ref().ok_or_else(|| {
-                    Status::invalid_argument("state format capability is missing identity")
-                })?;
-                let identity = StateFormatIdentity::try_from(identity)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                Ok(serde_json::json!({
-                    "state_format_name": identity.format.as_str(),
-                    "state_format_version": identity.version.as_str(),
-                    "can_create": capability.can_create,
-                    "can_load": capability.can_load,
-                }))
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        runtime_rows.push(serde_json::json!({
-            "runtime": runtime.kind.alias(),
-            "runtime_version": runtime.version.as_str(),
-            "guests": guests,
-            "state_formats": state_formats,
-        }));
-    }
-
-    let component_rows = inventory
-        .components
-        .iter()
-        .map(|installation| {
-            let component = installation.component.as_ref().ok_or_else(|| {
-                Status::invalid_argument("artifact component installation is missing component")
-            })?;
-            let component = ArtifactComponentMetadata::try_from(component)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            Ok(serde_json::json!({
-                "kind": component.kind.as_str(),
-                "role_key": component.role.as_ref().map_or("", |role| role.as_str()),
-                "version_key": component.version.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "digest_key": component.digest.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "format_key": component.format.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "version": component.version.as_ref().map(ToString::to_string),
-                "digest": component.digest.as_ref().map(ToString::to_string),
-                "format": component.format.as_ref().map(ToString::to_string),
-                "default_for_new": installation.default_for_new,
-                "legacy_default": installation.legacy_default,
-            }))
-        })
-        .collect::<Result<Vec<_>, Status>>()?;
-
+    let (runtime_rows, component_rows) =
+        ValidatedExecutionInventory::try_from_proto(inventory)?.into_legacy_rows();
     let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
     let component_rows = Json(serde_json::Value::Array(component_rows));
     sqlx::query(sql!(
