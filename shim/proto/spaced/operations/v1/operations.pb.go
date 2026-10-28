@@ -2342,7 +2342,7 @@ type ProcessExecutionInfo struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Changes when the execution service is constructed again, not on reconnect.
 	InstanceId string `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
-	// Unknown names may be ignored. Absence does not establish support.
+	// Unknown names may be ignored. Absence means unsupported.
 	Capabilities  []string `protobuf:"bytes,2,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
