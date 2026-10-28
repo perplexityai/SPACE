@@ -127,16 +127,10 @@ fn reject_quarantine_recovery_plan(
     Status::failed_precondition(message)
 }
 
-/// The recovery snapshot lookup, differing between the two policies only in which
-/// currency predicate selects the row.
-///
-/// One builder rather than two copies of the same twelve-line SELECT: a column
-/// added to the projection has to reach both, and both decode into the same
-/// `RecoverySnapshotRow`, so a miss is a runtime Postgres decode error on the
-/// rarely-taken pre-quarantine arm rather than a compile error. Built once — every
-/// input is a literal, so rebuilding it per request only allocated.
-fn recovery_snapshot_query(predicate: &str) -> String {
-    format!(
+/// The exact-artifact lookup: the snapshot must name the artifact the node holds.
+static EXACT_ARTIFACT_SNAPSHOT_QUERY: LazyLock<String> = LazyLock::new(|| {
+    let current = quarantine_recovery_suspend_snapshot_current("current_sandbox", "snapshot");
+    sql!(format!(
         "SELECT snapshot.id AS snapshot_id,
                 snapshot.local_artifact_id,
                 location.storage_connection_string AS storage_uri,
@@ -147,25 +141,31 @@ fn recovery_snapshot_query(predicate: &str) -> String {
            JOIN sandboxes current_sandbox
              ON current_sandbox.id = snapshot.sandbox_id
           WHERE current_sandbox.id = $1
-            AND {predicate}
+            AND snapshot.local_artifact_id = $2 AND {current}
           ORDER BY snapshot.timestamp DESC
           LIMIT 1"
-    )
-}
-
-/// The exact-artifact lookup: the snapshot must name the artifact the node holds.
-static EXACT_ARTIFACT_SNAPSHOT_QUERY: LazyLock<String> = LazyLock::new(|| {
-    let current = quarantine_recovery_suspend_snapshot_current("current_sandbox", "snapshot");
-    sql!(
-        recovery_snapshot_query(&format!("snapshot.local_artifact_id = $2 AND {current}")).as_str()
-    )
+    ))
 });
 
 /// The pre-quarantine fallback: the newest suspend snapshot from before the
 /// episode was entered, which only `OrphanedSandboxRowMissing`'s policy admits.
 static PRE_QUARANTINE_SNAPSHOT_QUERY: LazyLock<String> = LazyLock::new(|| {
     let current = pre_quarantine_suspend_snapshot_current("current_sandbox", "snapshot", "$2");
-    sql!(recovery_snapshot_query(&current).as_str())
+    sql!(format!(
+        "SELECT snapshot.id AS snapshot_id,
+                snapshot.local_artifact_id,
+                location.storage_connection_string AS storage_uri,
+                snapshot.size_bytes
+           FROM snapshots snapshot
+           JOIN snapshot_storage_locations location
+             ON location.snapshot_id = snapshot.id
+           JOIN sandboxes current_sandbox
+             ON current_sandbox.id = snapshot.sandbox_id
+          WHERE current_sandbox.id = $1
+            AND {current}
+          ORDER BY snapshot.timestamp DESC
+          LIMIT 1"
+    ))
 });
 
 /// The one message every rejection that turns on node ownership returns.

@@ -2,10 +2,6 @@ use pplx_space_common_core::{
     sql,
     types::{NodeId, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction},
 };
-use pplx_space_common_svc::sql::sandbox_quarantine::{
-    quarantine_history_insert_columns, quarantine_state_conflict_assignments,
-    quarantine_state_insert_columns,
-};
 use sqlx::{PgConnection, types::Json};
 
 #[derive(Debug, thiserror::Error)]
@@ -28,10 +24,12 @@ pub(crate) async fn record_state(
     node_id: NodeId,
     updated_json: Json<serde_json::Value>,
 ) -> Result<bool, RecordStateError> {
-    let state_columns = quarantine_state_insert_columns();
-    let state_conflict_assignments = quarantine_state_conflict_assignments();
-    let query = format!(
-        "INSERT INTO sandbox_quarantine_state ({state_columns})
+    let result = sqlx::query(sql!(
+        "INSERT INTO sandbox_quarantine_state (
+                         sandbox_id, quarantine_id, entered_at, updated_at,
+                         entered_from_lifecycle, source, reason_code, reason_message,
+                         evidence, next_action, last_observed_node_id
+                     )
                      SELECT
                          input.sandbox_id,
                          input.quarantine_id,
@@ -52,16 +50,31 @@ pub(crate) async fn record_state(
                          reason_code TEXT,
                          quarantine_id UUID
                      )
-                     ON CONFLICT (sandbox_id) DO UPDATE SET {state_conflict_assignments}",
-    );
-    let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-        .bind(node_id.to_string())
-        .bind(updated_json)
-        .execute(&mut *conn)
-        .await
-        .map_err(RecordStateError::Upsert)?;
+                     ON CONFLICT (sandbox_id) DO UPDATE SET
+                         quarantine_id = EXCLUDED.quarantine_id,
+                         entered_at = EXCLUDED.entered_at,
+                         updated_at = EXCLUDED.updated_at,
+                         entered_from_lifecycle = EXCLUDED.entered_from_lifecycle,
+                         source = EXCLUDED.source,
+                         reason_code = EXCLUDED.reason_code,
+                         reason_message = EXCLUDED.reason_message,
+                         evidence = EXCLUDED.evidence,
+                         next_action = EXCLUDED.next_action,
+                         next_action_after = NULL,
+                         next_action_owner = NULL,
+                         attempt_count = 0,
+                         claim_token = NULL,
+                         claim_expires_at = NULL,
+                         last_error = NULL,
+                         last_observed_node_id = EXCLUDED.last_observed_node_id",
+    ))
+    .bind(node_id)
+    .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
+    .bind(node_id.to_string())
+    .bind(updated_json)
+    .execute(&mut *conn)
+    .await
+    .map_err(RecordStateError::Upsert)?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -73,9 +86,11 @@ pub(crate) async fn record_history(
     node_id: NodeId,
     updated_json: Json<serde_json::Value>,
 ) -> Result<bool, RecordHistoryError> {
-    let history_columns = quarantine_history_insert_columns();
-    let query = format!(
-        "INSERT INTO sandbox_quarantine_history ({history_columns})
+    let result = sqlx::query(sql!(
+        "INSERT INTO sandbox_quarantine_history (
+                         id, quarantine_id, sandbox_id, occurred_at, source,
+                         action, reason_code, message, next_action, evidence
+                     )
                      SELECT
                          input.history_id,
                          input.quarantine_id,
@@ -95,14 +110,13 @@ pub(crate) async fn record_history(
                          quarantine_id UUID,
                          history_id UUID
                      )",
-    );
-    let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id.to_string())
-        .bind(SandboxQuarantineHistoryAction::EnteredQuarantine.as_str())
-        .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-        .bind(updated_json)
-        .execute(&mut *conn)
-        .await
-        .map_err(RecordHistoryError::Insert)?;
+    ))
+    .bind(node_id.to_string())
+    .bind(SandboxQuarantineHistoryAction::EnteredQuarantine.as_str())
+    .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
+    .bind(updated_json)
+    .execute(&mut *conn)
+    .await
+    .map_err(RecordHistoryError::Insert)?;
     Ok(result.rows_affected() > 0)
 }
