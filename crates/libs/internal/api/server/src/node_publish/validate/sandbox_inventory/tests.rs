@@ -106,8 +106,14 @@ fn incomplete_rich_evidence_drops_only_its_own_snapshots_policy_and_quarantine_c
         .into_legacy_input();
         assert_eq!(input.rows.len(), 2, "{rejection}");
         assert_eq!(input.snapshot_rows.len(), 2, "{rejection}");
-        assert_eq!(input.snapshot_rows[0]["snapshot_id"], "keep-earlier");
-        assert_eq!(input.snapshot_rows[1]["snapshot_id"], "keep-later");
+        assert_eq!(
+            input.snapshot_rows[0].legacy_row()["snapshot_id"],
+            "keep-earlier"
+        );
+        assert_eq!(
+            input.snapshot_rows[1].legacy_row()["snapshot_id"],
+            "keep-later"
+        );
         assert!(input.quarantine_inputs.is_empty(), "{rejection}");
         assert!(!input.publishes_network_policy, "{rejection}");
         assert_eq!(input.state_only.len(), 1, "{rejection}");

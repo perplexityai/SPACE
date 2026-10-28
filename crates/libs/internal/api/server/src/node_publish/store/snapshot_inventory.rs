@@ -1,6 +1,8 @@
 use pplx_space_common_core::{sql, types::SandboxId};
 use sqlx::{PgConnection, types::Json};
 
+use crate::node_publish::validate::snapshots::SnapshotClaim;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReplaceSnapshotInventoryError {
     #[error("prune absent published sandbox snapshots: {0}")]
@@ -16,7 +18,7 @@ pub(crate) enum ReplaceSnapshotInventoryError {
 pub(crate) async fn replace(
     conn: &mut PgConnection,
     sandbox_ids: &[SandboxId],
-    snapshot_rows: &[serde_json::Value],
+    snapshot_rows: &[SnapshotClaim],
 ) -> Result<(), ReplaceSnapshotInventoryError> {
     if sandbox_ids.is_empty() {
         return Ok(());
@@ -24,12 +26,7 @@ pub(crate) async fn replace(
 
     let snapshot_ids_payload = snapshot_rows
         .iter()
-        .map(|row| {
-            serde_json::json!({
-                "sandbox_id": row.get("sandbox_id").cloned().unwrap_or(serde_json::Value::Null),
-                "snapshot_id": row.get("snapshot_id").cloned().unwrap_or(serde_json::Value::Null),
-            })
-        })
+        .map(SnapshotClaim::legacy_key)
         .collect::<Vec<_>>();
     sqlx::query(sql!(
         "WITH scope AS (
@@ -62,6 +59,10 @@ pub(crate) async fn replace(
         return Ok(());
     }
 
+    let snapshot_rows = snapshot_rows
+        .iter()
+        .map(SnapshotClaim::legacy_row)
+        .collect::<Vec<_>>();
     sqlx::query(sql!(
         "WITH scope AS (
              SELECT UNNEST($1::UUID[]) AS sandbox_id

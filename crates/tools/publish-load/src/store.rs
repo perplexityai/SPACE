@@ -63,14 +63,34 @@ pub async fn statement_calls(pool: &PgPool) -> Result<BTreeMap<String, i64>> {
     Ok(calls)
 }
 
-/// Read descriptions in the fixture's accepted sandbox scope, without row locks.
-/// Used after publication to check snapshot insertion and explicit clearing.
+/// Persisted snapshot description, including opaque node-supplied metadata.
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+pub struct SnapshotInventoryRow {
+    pub snapshot_id: String,
+    pub snapshot_type: String,
+    pub state: String,
+    pub timestamp: Option<String>,
+    pub source_node_id: Option<String>,
+    pub label: Option<String>,
+    pub retention_tier: Option<String>,
+    pub vcpu: i32,
+    pub memory_mib: i32,
+    pub size_bytes: i64,
+    pub template_id: Option<String>,
+    pub content_hash: Option<String>,
+    pub locations: serde_json::Value,
+}
+
+/// Read descriptions in the fixture's sandbox scope without row locks.
+/// Excludes server-assigned observation times; an empty scope returns no rows.
 pub async fn snapshot_inventory(
     pool: &PgPool,
     sandbox_id: SandboxId,
-) -> Result<Vec<(String, String, String, i64)>> {
+) -> Result<Vec<SnapshotInventoryRow>> {
     Ok(sqlx::query_as(sql!(
-        "SELECT snapshot_id, type, state, size_bytes
+        "SELECT snapshot_id, type AS snapshot_type, state, timestamp,
+                source_node_id, label, retention_tier, vcpu, memory_mib,
+                size_bytes, template_id, content_hash, locations
          FROM sandbox_snapshot_inventory
          WHERE sandbox_id = $1
          ORDER BY snapshot_id"

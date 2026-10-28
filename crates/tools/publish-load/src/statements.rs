@@ -14,7 +14,7 @@ use pplx_space_node_api_client::proto::{
     PublishedTemplateState,
 };
 use pplx_space_publish_load::{Args, Node, service::LocalService, store};
-use pplx_space_sbx_mgr_client::proto::{SnapshotDetail, SnapshotType};
+use pplx_space_sbx_mgr_client::proto::{SnapshotDetail, SnapshotLocation, SnapshotType};
 use pplx_space_state_reconciliation::NetworkPolicyTarget;
 use serde::Serialize;
 
@@ -299,10 +299,35 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
                 }
                 ScenarioKind::SnapshotInventory => {
                     sandbox.snapshots.push(SnapshotDetail {
-                        id: "synthetic-inventory-snapshot".to_owned(),
+                        id: "synthetic inventory/description".to_owned(),
                         r#type: SnapshotType::Disk.into(),
-                        state: "ready".to_owned(),
+                        state: "legacy-state".to_owned(),
+                        timestamp: Some("legacy-capture-time".to_owned()),
+                        source_node_id: Some("legacy-origin".to_owned()),
+                        label: Some("synthetic label".to_owned()),
+                        retention_tier: Some("manual".to_owned()),
+                        vcpu: 2,
+                        memory_mib: 512,
                         size_bytes: Some(4096),
+                        template_id: Some("captured-template".to_owned()),
+                        content_hash: Some("captured-content".to_owned()),
+                        locations: vec![
+                            SnapshotLocation {
+                                location_type: "node".to_owned(),
+                                node_id: Some(node.id.clone()),
+                                node_address: Some("snapshot-node.example.test".to_owned()),
+                                state: "available".to_owned(),
+                                size_bytes: 4096,
+                                ..Default::default()
+                            },
+                            SnapshotLocation {
+                                location_type: "future-location".to_owned(),
+                                volume_id: Some("synthetic-volume".to_owned()),
+                                state: "future-state".to_owned(),
+                                size_bytes: u64::MAX,
+                                ..Default::default()
+                            },
+                        ],
                         ..Default::default()
                     });
                 }
@@ -342,12 +367,38 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
                 }
                 ScenarioKind::SnapshotInventory => ensure!(
                     store::snapshot_inventory(&db.pool, sandbox_id).await?
-                        == [(
-                            "synthetic-inventory-snapshot".to_owned(),
-                            "disk".to_owned(),
-                            "ready".to_owned(),
-                            4096,
-                        )],
+                        == [store::SnapshotInventoryRow {
+                            snapshot_id: "synthetic inventory/description".to_owned(),
+                            snapshot_type: "disk".to_owned(),
+                            state: "legacy-state".to_owned(),
+                            timestamp: Some("legacy-capture-time".to_owned()),
+                            source_node_id: Some("legacy-origin".to_owned()),
+                            label: Some("synthetic label".to_owned()),
+                            retention_tier: Some("manual".to_owned()),
+                            vcpu: 2,
+                            memory_mib: 512,
+                            size_bytes: 4096,
+                            template_id: Some("captured-template".to_owned()),
+                            content_hash: Some("captured-content".to_owned()),
+                            locations: serde_json::json!([
+                                {
+                                    "location_type": "node",
+                                    "node_id": node.id,
+                                    "node_address": "snapshot-node.example.test",
+                                    "volume_id": null,
+                                    "state": "available",
+                                    "size_bytes": 4096,
+                                },
+                                {
+                                    "location_type": "future-location",
+                                    "node_id": null,
+                                    "node_address": null,
+                                    "volume_id": "synthetic-volume",
+                                    "state": "future-state",
+                                    "size_bytes": u64::MAX,
+                                },
+                            ]),
+                        }],
                     "snapshot description did not persist"
                 ),
                 ScenarioKind::ClearSnapshotInventory => ensure!(

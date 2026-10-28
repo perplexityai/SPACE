@@ -11,7 +11,7 @@ use super::quarantine_claim::QuarantineClaim;
 use super::receipts;
 use super::sandbox_observation::ValidatedSandboxObservation;
 use super::sandbox_status::PublishedSandboxStatus;
-use super::snapshots::snapshot_json;
+use super::snapshots::SnapshotClaim;
 use crate::metadata::parse_sandbox_id;
 use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::proto::PublishedSandboxState;
@@ -22,9 +22,7 @@ struct ObservedSandboxClaim {
     receipt: Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
     recovery: QuarantineRecoveryProjectionState,
     quarantine: Option<QuarantineClaim>,
-    // Snapshot IDs and descriptive labels are open legacy metadata. Only their
-    // numeric bounds are rejected; do not reinterpret them as central UUIDs.
-    snapshots: Vec<serde_json::Value>,
+    snapshots: Vec<SnapshotClaim>,
 }
 
 /// A batch of node claims, without database decisions or generated identifiers.
@@ -44,7 +42,7 @@ pub(crate) struct LegacySandboxInput {
     pub(crate) rows: Vec<serde_json::Value>,
     pub(crate) state_only: Vec<DegradedSandboxClaim>,
     pub(crate) failure_episode_rows: Vec<FailureEpisodeClaim>,
-    pub(crate) snapshot_rows: Vec<serde_json::Value>,
+    pub(crate) snapshot_rows: Vec<SnapshotClaim>,
     pub(crate) quarantine_inputs: Vec<QuarantineClaim>,
     pub(crate) publishes_network_policy: bool,
 }
@@ -212,7 +210,7 @@ fn parse_observed(
     let snapshots = state
         .snapshots
         .iter()
-        .map(|snapshot| snapshot_json(sandbox_id, snapshot))
+        .map(|snapshot| SnapshotClaim::try_from_proto(sandbox_id, snapshot))
         .collect::<Result<_, _>>()?;
     // No part of a rich observation survives a malformed snapshot. Keep all
     // fields local until the whole observation can be accepted atomically.
