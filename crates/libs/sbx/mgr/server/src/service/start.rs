@@ -14,8 +14,8 @@ use super::activation_support::{
 use super::cleanup_support::{ActivationCleanupSpec, read_node_execution_fence};
 use super::create::StartFromCheckpointLaunch;
 use super::create_support::{
-    CheckpointRestoreRetryAction, GUEST_GATEWAY, GUEST_IP, RestoredSnapshotProvenance,
-    RuntimeActivatedEvent, SUSPEND_CHECKPOINT, admit_warm_start, checkpoint_restore_retry_action,
+    CheckpointRestoreRetryAction, RestoredSnapshotProvenance, RuntimeActivatedEvent,
+    SUSPEND_CHECKPOINT, admit_warm_start, checkpoint_restore_retry_action,
     checkpoint_start_response_for_existing_started_sandbox, emit_runtime_activated_event,
     guest_console_logs_enabled, resolve_template_paths_for_start,
     stage_base_snapshot_runtime_metadata, template_runtime_defaults_for_sandbox_start,
@@ -55,9 +55,6 @@ use crate::{
     db::CleanupCompletion,
     proto::{StartRequest, StartResponse},
     state::SandboxState,
-};
-use pplx_space_common_core::guest::linux::network::{
-    IPV4_NETMASK as GUEST_NETMASK, PRIMARY_INTERFACE as GUEST_NETWORK_INTERFACE,
 };
 use pplx_space_common_core::types::{
     SandboxCleanupEpisodeId, SandboxId, SandboxOwnerKind, SandboxQuarantineReasonCode,
@@ -2281,101 +2278,42 @@ impl SandboxManagerService {
         )
         .map_err(|error| activation_cleanup.failure(error))?;
 
-        // Build VM config with chroot-relative paths (jailer makes chroot root = /)
-        let guest_cid = alloc.slot + 3;
+        // The runtime adapter owns device names and configuration syntax.
         let vcpu_default = template_defaults.vcpu.unwrap_or(2);
         let vcpu = optional_positive_or_default("vcpu", req_vcpu, vcpu_default)
             .map_err(|error| activation_cleanup.failure(error))?;
-        let nr_uarts = if guest_console_logs_enabled() {
-            "1"
-        } else {
-            "0"
-        };
-        let console_args = if guest_console_logs_enabled() {
-            " console=ttyS0 systemd.log_target=console systemd.log_level=info"
-        } else {
-            ""
-        };
-        let clocksource_args = if cfg!(target_arch = "x86_64") {
-            " clocksource=kvm-clock"
-        } else {
-            ""
-        };
         let is_builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
-        let runtime_boot_args = if is_builder {
-            format!(
-                " {}",
-                pplx_space_common_core::types::TEMPLATE_RUNTIME_BUILD_MASK
-            )
-        } else {
-            String::new()
+        let guest_cid = alloc.slot.checked_add(3).ok_or_else(|| {
+            activation_cleanup.failure(Status::internal("allocated guest CID overflows"))
+        })?;
+        let boot = pplx_space_node_runtime_core::boot::LinuxBoot {
+            guest: prepare_source.execution.guest(),
+            cpus: pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu).map_err(
+                |error| activation_cleanup.failure(Status::invalid_argument(error.to_string())),
+            )?,
+            memory_mib: std::num::NonZeroU64::new(u64::from(mem_mib)).ok_or_else(|| {
+                activation_cleanup
+                    .failure(Status::invalid_argument("guest memory must be positive"))
+            })?,
+            guest_cid: std::num::NonZeroU32::new(guest_cid).ok_or_else(|| {
+                activation_cleanup.failure(Status::internal("allocated guest CID is zero"))
+            })?,
+            tap: &alloc.tap_device,
+            mac: &alloc.guest_mac,
+            disk_rate: self.rootfs_rate_limiter(is_builder, sandbox.disk_io_limits),
+            network_rate: (!is_builder).then_some(NET_RATE_LIMITER),
+            balloon,
+            huge_pages: self.config.hugepages,
+            console: guest_console_logs_enabled(),
+            builder: is_builder,
         };
-        // This only applies on cold boot. Restored sandboxes inherit the
-        // kernel state captured in their snapshot, so templates/base snapshots
-        // must be rebuilt to roll out boot-arg changes.
-        let boot_args = format!(
-            "reboot=k panic=1 pci=off rw root=/dev/vda{runtime_boot_args}{clocksource_args} transparent_hugepage=never 8250.nr_uarts={nr_uarts}{console_args} ip={GUEST_IP}::{GUEST_GATEWAY}:{GUEST_NETMASK}:instance:{GUEST_NETWORK_INTERFACE}:off",
-            clocksource_args = clocksource_args,
-            nr_uarts = nr_uarts,
-            console_args = console_args,
-        );
-        // Build-manager VMs retain their existing rate-limiter exemption. All
-        // other sandboxes use the immutable assignment stored on their row.
-        let disk_rate_limiter = firecracker_rate_limiter_field(
-            "rate_limiter",
-            self.rootfs_rate_limiter(is_builder, sandbox.disk_io_limits)
-                .as_ref(),
-        );
-        let net_rate_limiters = if is_builder {
-            String::new()
-        } else {
-            format!(
-                "{}{}",
-                firecracker_rate_limiter_field("rx_rate_limiter", Some(&NET_RATE_LIMITER)),
-                firecracker_rate_limiter_field("tx_rate_limiter", Some(&NET_RATE_LIMITER)),
-            )
-        };
-
-        let huge_pages = if self.config.hugepages {
-            r#",
-    "huge_pages": "2M""#
-                .to_string()
-        } else {
-            String::new()
-        };
-
-        let vm_config = format!(
-            r#"{{
-  "boot-source": {{
-    "kernel_image_path": "/vmlinux.bin",
-    "boot_args": "{boot_args}"
-  }},
-  "drives": [{{
-    "drive_id": "rootfs",
-    "path_on_host": "/rootfs.ext4",
-    "is_root_device": true,
-    "is_read_only": false{disk_rate_limiter}
-  }}],
-  "machine-config": {{
-    "vcpu_count": {vcpu},
-    "mem_size_mib": {mem_mib},
-    "smt": false{huge_pages}
-  }},
-  "network-interfaces": [{{
-    "iface_id": "{guest_network_interface}",
-    "guest_mac": "{guest_mac}",
-    "host_dev_name": "{tap_device}"{net_rate_limiters}
-  }}],
-  "vsock": {{
-    "guest_cid": {guest_cid},
-    "uds_path": "/v.sock"
-  }}{balloon}
-}}"#,
-            balloon = firecracker_balloon_field(balloon),
-            guest_network_interface = GUEST_NETWORK_INTERFACE,
-            guest_mac = alloc.guest_mac,
-            tap_device = alloc.tap_device,
-        );
+        let vm_config = pplx_space_node_runtime_core::boot::configuration(
+            prepare_source.execution.runtime().kind,
+            &boot,
+        )
+        .map_err(|error| {
+            activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+        })?;
 
         // Host-visible paths
         let run_dir = format!("{RUN_DIR}/{id}");
@@ -2940,30 +2878,6 @@ const NET_RATE_LIMITER: RateLimiter = RateLimiter {
         refill_time_ms: 1000,
     },
 };
-
-/// `name`'s entry in the VM configuration's JSON, following the previous
-/// field; nothing without a limiter.
-fn firecracker_rate_limiter_field(name: &str, limiter: Option<&RateLimiter>) -> String {
-    limiter.map_or_else(String::new, |limiter| {
-        format!(
-            ",\n    \"{name}\": {}",
-            pplx_space_node_runtime_core::fc_api::rate_limiter_json(limiter)
-        )
-    })
-}
-
-/// The top-level `balloon` member of a cold-boot VM configuration, or nothing
-/// at all when the template has no balloon so the configuration is unchanged.
-fn firecracker_balloon_field(
-    balloon: Option<pplx_space_common_core::types::BalloonConfig>,
-) -> String {
-    balloon.map_or_else(String::new, |balloon| {
-        format!(
-            ",\n  \"balloon\": {}",
-            pplx_space_node_runtime_core::fc_api::balloon_json(balloon)
-        )
-    })
-}
 
 fn memory_policy_lookup_error(error: Status) -> Status {
     Status::new(
