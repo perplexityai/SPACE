@@ -1,6 +1,7 @@
 use super::*;
 use crate::ClusterApiService;
 use crate::node_publish::validate::fields::published_artifact_origin;
+use crate::node_publish::validate::templates::template_state_row;
 use crate::proto::cluster_api_server::ClusterApi;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{

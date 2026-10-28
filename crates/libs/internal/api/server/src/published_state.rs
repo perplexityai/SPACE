@@ -47,11 +47,9 @@ use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
 use crate::node_publish::validate::sandbox_inventory::{
     LegacySandboxInput, ValidatedSandboxInventory,
 };
-use crate::node_publish::validate::templates::template_state_row;
+use crate::node_publish::validate::templates::ValidatedTemplateInventory;
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
 use crate::sandbox_quarantine_store;
-
-use super::trimmed_required;
 
 const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
 ON CONFLICT (node_id, facet, element) DO UPDATE
@@ -360,19 +358,19 @@ pub async fn publish_template_states(
     publisher_role: NodeRole,
     states: &[PublishedTemplateState],
 ) -> Result<u64, Status> {
-    let include_template_metadata = publisher_role == NodeRole::Builder;
-    let mut absent_templates = Vec::new();
-    let mut rows = Vec::new();
+    let inventory = ValidatedTemplateInventory::try_from_proto(publisher_role, states)?;
+    publish_validated_template_states(conn, node_id, inventory).await
+}
 
-    for state in states {
-        let template = trimmed_required(&state.template, "template")?;
-        if !state.present {
-            absent_templates.push(template);
-            continue;
-        }
-        rows.push(template_state_row(state, include_template_metadata)?);
-    }
-
+/// Apply checked template evidence on the caller's connection. This phase uses
+/// ordinary write locks in statement order, with no separate transaction or
+/// explicit row-lock query. Zero matching inventory rows is a normal outcome.
+pub(crate) async fn publish_validated_template_states(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    inventory: ValidatedTemplateInventory,
+) -> Result<u64, Status> {
+    let (absent_templates, rows) = inventory.into_legacy_rows();
     let mut accepted = 0_u64;
     if !absent_templates.is_empty() {
         let result = sqlx::query(sql!(

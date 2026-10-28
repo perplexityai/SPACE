@@ -144,3 +144,34 @@ fn execution_metadata_accepts_matching_legacy_runtime_aliases() {
         assert_eq!(row["arch"], "x86_64");
     }
 }
+
+#[test]
+fn template_batch_preserves_absence_duplicate_declarations_and_identity_precedence() {
+    let absent = PublishedTemplateState {
+        present: false,
+        cache_size_bytes: Some(u64::MAX),
+        ..template()
+    };
+    let (absences, rows) = ValidatedTemplateInventory::try_from_proto(
+        NodeRole::Builder,
+        &[absent.clone(), template(), template()],
+    )
+    .unwrap()
+    .into_legacy_rows();
+    assert_eq!(absences, ["synthetic-template"]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], rows[1]);
+    for present in [false, true] {
+        let error = ValidatedTemplateInventory::try_from_proto(
+            NodeRole::Builder,
+            &[PublishedTemplateState {
+                template: " \t".to_owned(),
+                present,
+                ..absent.clone()
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(error.message(), "template must not be empty");
+    }
+}
