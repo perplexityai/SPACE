@@ -1,5 +1,6 @@
 [package]
 name = "pplx-space-publish-load"
+default-run = "publish-load"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +15,10 @@ workspace = true
 [[bin]]
 name = "publish-load"
 path = "src/main.rs"
+
+[[bin]]
+name = "publish-statements"
+path = "src/statements.rs"
 
 [dependencies]
 anyhow = { workspace = true }

@@ -1,5 +1,6 @@
 //! Synthetic fixture writes and outcome checks; never targets a shared database.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -15,6 +16,43 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{Args, Node};
+
+/// Enable statement inspection only after the launcher-owned fixture is open.
+/// PostgreSQL takes extension-catalog locks; no publication rows are touched.
+pub async fn enable_statement_capture(pool: &PgPool) -> Result<()> {
+    sqlx::query(sql!("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Read service-role calls without resetting shared statistics. The locator
+/// comment is diagnostic only; SQL text and call multiplicity are preserved.
+/// This inspection takes no publication row locks and does not modify rows.
+pub async fn statement_calls(pool: &PgPool) -> Result<BTreeMap<String, i64>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(sql!(
+        "SELECT query, calls FROM pg_stat_statements
+         WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND userid = (SELECT oid FROM pg_roles WHERE rolname = $1)"
+    ))
+    .bind("space_user")
+    .fetch_all(pool)
+    .await?;
+    let mut calls = BTreeMap::new();
+    for (query, count) in rows {
+        let sql = match query.strip_prefix("/*pplx_space_") {
+            Some(comment) => {
+                let (_, sql) = comment
+                    .split_once("*/ ")
+                    .context("unterminated SQL locator")?;
+                sql
+            }
+            None => &query,
+        };
+        *calls.entry(sql.to_owned()).or_insert(0) += count;
+    }
+    Ok(calls)
+}
 
 /// Prove the URL points to the launcher-owned cluster before fixture creation
 /// or cluster-wide role bootstrap. A user-supplied URL alone is insufficient.
