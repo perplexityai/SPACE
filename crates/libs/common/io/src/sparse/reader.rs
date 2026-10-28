@@ -1,25 +1,15 @@
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek};
 
-#[derive(Debug)]
-enum Extent {
-    Unknown,
-    Data(u64),
-    Hole(u64),
-    Plain,
-}
-
-#[derive(Clone, Copy)]
-enum Boundary {
-    Data,
-    Hole,
-}
+use super::extent::{Boundary, Extent, next_extent_with, seek_boundary};
 
 /// Reads an immutable regular file's logical bytes, synthesizing zeros for holes.
 ///
 /// Unsupported hole seeking falls back to ordinary reads at the current logical
-/// offset. Other I/O errors propagate. The reader owns the file cursor and uses
-/// only the caller's buffer; it does not collect an extent map or buffer the file.
+/// offset. Extent queries require the `sparse-read` feature (also enabled by
+/// `reflink`); without it, reads use the ordinary path. Other I/O errors propagate.
+/// The reader starts at the file cursor but subsequent reads are independent of
+/// it. It uses only the caller's buffer, without collecting an extent map.
 /// Callers must keep the file unchanged for the duration of the read, just as
 /// when hashing it with ordinary reads. Length changes are detected, but this
 /// does not provide a snapshot against concurrent writes of the same length.
@@ -28,7 +18,7 @@ pub struct SparseFileReader {
     file: File,
     length: u64,
     position: u64,
-    extent: Extent,
+    extent: Option<Extent>,
 }
 
 impl SparseFileReader {
@@ -45,11 +35,12 @@ impl SparseFileReader {
             file,
             length: metadata.len(),
             position,
-            extent: Extent::Unknown,
+            extent: None,
         })
     }
 
-    /// Borrows the file for metadata and cache advice, without moving its cursor.
+    /// Borrows the file for metadata and cache advice. Cursor changes through
+    /// this handle do not affect the reader's logical position.
     pub fn file(&self) -> &File {
         &self.file
     }
@@ -64,35 +55,6 @@ impl SparseFileReader {
         Ok(())
     }
 
-    fn next_extent(
-        &self,
-        seek: &mut impl FnMut(&File, u64, Boundary) -> io::Result<u64>,
-    ) -> io::Result<Extent> {
-        let data = match seek(&self.file, self.position, Boundary::Data) {
-            Ok(offset) => offset,
-            // ENXIO means there is no more data, not an unsupported operation.
-            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => self.length,
-            Err(error) => return Err(error),
-        };
-        if data < self.position || data > self.length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "data extent outside the remaining file",
-            ));
-        }
-        if data > self.position {
-            return Ok(Extent::Hole(data));
-        }
-        let hole = seek(&self.file, self.position, Boundary::Hole)?;
-        if hole <= self.position || hole > self.length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "hole extent does not advance within the file",
-            ));
-        }
-        Ok(Extent::Data(hole))
-    }
-
     fn read_with(
         &mut self,
         buffer: &mut [u8],
@@ -105,33 +67,29 @@ impl SparseFileReader {
             self.check_length()?;
             return Ok(0);
         }
-        if matches!(self.extent, Extent::Unknown) {
+        if self.extent.is_none() {
             self.check_length()?;
-            let extent = match self.next_extent(&mut seek) {
-                Ok(extent) => extent,
-                Err(error) if unsupported(&error) => Extent::Plain,
-                Err(error) => return Err(error),
-            };
-            // Probing either boundary can move the descriptor, including before
-            // an unsupported SEEK_HOLE. Resume at our logical offset, never the
-            // last probed boundary.
-            self.file.seek(SeekFrom::Start(self.position))?;
-            self.extent = extent;
+            self.extent = Some(next_extent_with(
+                &self.file,
+                self.position,
+                self.length,
+                &mut seek,
+            )?);
         }
         let end = match self.extent {
-            Extent::Data(end) | Extent::Hole(end) => end,
-            Extent::Plain | Extent::Unknown => self.length,
+            Some(Extent::Data(end) | Extent::Hole(end)) => end,
+            Some(Extent::Unsupported) | None => self.length,
         };
         let count = usize::try_from((end - self.position).min(buffer.len() as u64))
             .map_err(|_| io::Error::other("sparse read exceeds buffer size"))?;
         let buffer = buffer
             .get_mut(..count)
             .ok_or_else(|| io::Error::other("sparse read exceeds buffer size"))?;
-        let read = if matches!(self.extent, Extent::Hole(_)) {
+        let read = if matches!(self.extent, Some(Extent::Hole(_))) {
             buffer.fill(0);
             count
         } else {
-            let read = self.file.read(buffer)?;
+            let read = read_at(&self.file, buffer, self.position)?;
             if read == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -141,8 +99,8 @@ impl SparseFileReader {
             read
         };
         self.position += read as u64;
-        if self.position == end && !matches!(self.extent, Extent::Plain) {
-            self.extent = Extent::Unknown;
+        if self.position == end && !matches!(self.extent, Some(Extent::Unsupported)) {
+            self.extent = None;
         }
         Ok(read)
     }
@@ -154,36 +112,23 @@ impl Read for SparseFileReader {
     }
 }
 
-fn unsupported(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::Unsupported
-        || matches!(
-            error.raw_os_error(),
-            Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS | libc::ENOTTY)
-        )
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn seek_boundary(file: &File, offset: u64, boundary: Boundary) -> io::Result<u64> {
-    use std::os::fd::AsRawFd;
-
-    let offset = libc::off_t::try_from(offset)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset exceeds off_t"))?;
-    let whence = match boundary {
-        Boundary::Data => libc::SEEK_DATA,
-        Boundary::Hole => libc::SEEK_HOLE,
-    };
-    // SAFETY: the reader owns a valid descriptor and passes a checked offset.
-    let result = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result.cast_unsigned())
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buffer, offset)
     }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn seek_boundary(_file: &File, _offset: u64, _boundary: Boundary) -> io::Result<u64> {
-    Err(io::ErrorKind::Unsupported.into())
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buffer, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut file = file;
+        file.seek(io::SeekFrom::Start(offset))?;
+        file.read(buffer)
+    }
 }
 
 #[cfg(test)]

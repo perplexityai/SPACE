@@ -12,6 +12,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) mod extent;
 mod reader;
 pub use reader::SparseFileReader;
 

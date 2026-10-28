@@ -11,7 +11,8 @@ publish.workspace = true
 workspace = true
 
 [features]
-reflink = ["dep:rustix", "dep:tempfile"]
+sparse-read = ["dep:rustix"]
+reflink = ["sparse-read", "dep:tempfile"]
 
 [dependencies]
 aead-stream = { workspace = true, features = ["alloc"] }

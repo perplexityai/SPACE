@@ -1,5 +1,5 @@
 use super::*;
-use std::io::Write;
+use std::io::{SeekFrom, Write};
 
 fn fixture(length: usize, writes: &[(u64, &[u8])]) -> File {
     let mut file = tempfile::tempfile().unwrap();
@@ -41,6 +41,8 @@ fn sparse_reader_matches_ordinary_reads() {
                     break;
                 }
                 actual.extend_from_slice(&buffer[..read]);
+                // Borrowed handles may move the cursor between reads.
+                reader.file().seek(SeekFrom::End(0)).unwrap();
             }
             assert_eq!(actual, expected, "length {length}, start {start}");
             assert_eq!(reader.read(&mut buffer).unwrap(), 0);
@@ -78,6 +80,7 @@ fn unsupported_boundary_seeking_resumes_without_losing_or_repeating_bytes() {
                     break;
                 }
                 actual.extend_from_slice(&buffer[..n]);
+                reader.file().seek(SeekFrom::End(0)).unwrap();
             }
             assert_eq!(actual, bytes, "errno {errno}, boundary {fail_at}");
         }

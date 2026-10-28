@@ -6,6 +6,8 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use crate::sparse::extent::{Extent, next_extent};
+
 /// Reject a filesystem that cannot honor an explicit NoCoW request. Callers
 /// may pass a directory descriptor to validate their cache before accepting work.
 pub fn validate_nocow_filesystem(file: &File) -> io::Result<()> {
@@ -182,29 +184,17 @@ fn sparse_copy(src: &File, dst: &File, len: u64) -> io::Result<()> {
     let mut buf = vec![0u8; 1024 * 1024];
     let mut offset: u64 = 0;
     while offset < len {
-        let data_start = match rustix::fs::seek(src, rustix::fs::SeekFrom::Data(offset))
-            .map_err(io::Error::from)
-        {
-            Ok(data_start) => data_start,
-            // No data at or after `offset`: the rest of the file is a hole.
-            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => break,
-            // Filesystem can't seek holes: copy the remainder as data.
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::EINVAL) | Some(libc::ENOTSUP) | Some(libc::ENOTTY)
-                ) =>
-            {
+        match next_extent(src, offset, len)? {
+            Extent::Hole(end) => offset = end,
+            Extent::Data(end) => {
+                copy_segment(src, dst, offset, end, &mut buf)?;
+                offset = end;
+            }
+            Extent::Unsupported => {
                 copy_segment(src, dst, offset, len, &mut buf)?;
                 break;
             }
-            Err(e) => return Err(e),
-        };
-        // A hole always follows data: filesystems report an implicit hole at
-        // EOF, so this cannot fail with ENXIO after a successful SEEK_DATA.
-        let hole_start = rustix::fs::seek(src, rustix::fs::SeekFrom::Hole(data_start))?;
-        copy_segment(src, dst, data_start, hole_start, &mut buf)?;
-        offset = hole_start;
+        }
     }
     Ok(())
 }

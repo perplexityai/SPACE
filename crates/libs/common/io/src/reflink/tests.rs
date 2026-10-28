@@ -82,3 +82,38 @@ fn nocow_preparation_clones_shared_extents_and_rejects_aliases() {
         assert_eq!(std::fs::read(&destination).unwrap(), vec![7; 8192]);
     }
 }
+
+#[test]
+fn sparse_copy_preserves_bytes_and_holes() {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    for (len, writes) in [
+        (0, vec![]),
+        (128 * 1024, vec![]),
+        (8192, vec![(0, vec![7; 8192])]),
+        (
+            256 * 1024,
+            vec![(8192, b"first".to_vec()), (131072, b"last".to_vec())],
+        ),
+    ] {
+        let source = tempfile::tempfile().unwrap();
+        source.set_len(len).unwrap();
+        for (offset, bytes) in writes {
+            source.write_all_at(&bytes, offset).unwrap();
+        }
+        let destination = tempfile::tempfile().unwrap();
+        // Call the byte-copy path directly so reflink support cannot bypass it.
+        sparse_copy(&source, &destination, len).unwrap();
+        assert_eq!(destination.metadata().unwrap().len(), len);
+        let mut expected = vec![0; len as usize];
+        let mut actual = vec![0; len as usize];
+        source.read_exact_at(&mut expected, 0).unwrap();
+        destination.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, expected);
+        if len > 0 && matches!(next_extent(&source, 0, len).unwrap(), Extent::Hole(_)) {
+            // Only demand sparse allocation when the filesystem reports holes.
+            assert!(destination.metadata().unwrap().blocks() * 512 < len);
+        }
+    }
+}
