@@ -6,6 +6,7 @@
 
 pub(crate) mod execution_inventory;
 pub(crate) mod execution_observation;
+pub(crate) mod failure_episode;
 pub(crate) mod fields;
 pub(crate) mod node_role;
 pub(crate) mod node_status;
@@ -14,5 +15,6 @@ pub(crate) mod quarantine_claim;
 pub(crate) mod receipts;
 pub(crate) mod sandbox_identity;
 pub(crate) mod sandbox_metadata;
+pub(crate) mod sandbox_status;
 pub(crate) mod snapshots;
 pub(crate) mod templates;

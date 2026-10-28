@@ -1,10 +1,11 @@
 //! Node-authored hold evidence, not a decision about the current database row.
 
 use pplx_space_common_core::types::{
-    SandboxId, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+    SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     SandboxQuarantineVocabularyParseError,
 };
 
+use super::sandbox_status::PublishedSandboxStatus;
 use crate::metadata::optional_trimmed;
 use crate::proto::PublishedSandboxState;
 
@@ -32,8 +33,8 @@ impl QuarantineClaim {
     pub(crate) fn from_proto(sandbox_id: SandboxId, state: &PublishedSandboxState) -> Option<Self> {
         if !state.present
             || state.state_degraded
-            || !optional_trimmed(state.status.as_deref())
-                .is_some_and(|status| status.eq_ignore_ascii_case("quarantined"))
+            || !PublishedSandboxStatus::from_proto(state.status.as_deref())
+                .is_some_and(|status| status.lifecycle() == Some(SandboxLifecycle::Quarantined))
         {
             return None;
         }

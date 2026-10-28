@@ -11,10 +11,9 @@ use uuid::Uuid;
 
 use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::{
-    ArtifactKind, ExecutionGeneration, NodeRole, PodUid, SandboxActivationAttemptId, SandboxId,
-    SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SemVer,
+    ArtifactKind, NodeRole, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
+    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+    SandboxTransitionReceipt, SandboxTransitionReceiptKind, SandboxTransitionTargetState, SemVer,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -40,6 +39,7 @@ use pplx_space_sandbox_portability::{
     suspended_projection_lifecycle_eligible,
 };
 
+use crate::node_publish::validate::failure_episode::FailureEpisodeClaim;
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 use crate::node_publish::validate::fields::{
     execution_projection, non_zero_u64_to_i64, proto_timestamp_to_rfc3339, u32_to_i32, u64_to_i64,
@@ -1017,28 +1017,6 @@ fn published_spaced_version(
     }
 }
 
-fn failure_episode_input(
-    sandbox_id: SandboxId,
-    state: &PublishedSandboxState,
-    state_degraded: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "sandbox_id": sandbox_id,
-        "status": optional_trimmed(state.status.as_deref()),
-        "state_degraded": state_degraded,
-        "execution_generation": state
-            .execution_generation
-            .and_then(|generation| ExecutionGeneration::new(generation).ok())
-            .map(ExecutionGeneration::get),
-        "pod_uid": optional_trimmed(state.pod_uid.as_deref())
-            .and_then(|pod_uid| PodUid::parse(pod_uid).ok())
-            .map(|pod_uid| pod_uid.to_string()),
-        "activation_attempt_id": optional_trimmed(state.activation_attempt_id.as_deref())
-            .and_then(|attempt| attempt.parse::<SandboxActivationAttemptId>().ok())
-            .map(|attempt| attempt.to_string()),
-    })
-}
-
 /// Deletes the stopped Direct sandboxes a node reported absent, and detaches
 /// their snapshots' storage locations.
 ///
@@ -1159,7 +1137,7 @@ pub async fn publish_sandbox_states(
             continue;
         }
         if state.state_degraded {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, true));
+            failure_episode_rows.push(FailureEpisodeClaim::from_proto(sandbox_uuid, state, true));
             state_only.insert(
                 sandbox_uuid,
                 serde_json::json!({
@@ -1395,7 +1373,7 @@ pub async fn publish_sandbox_states(
             Ok(())
         })();
         if let Err(error) = parse_result {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, true));
+            failure_episode_rows.push(FailureEpisodeClaim::from_proto(sandbox_uuid, state, true));
             rows.truncate(row_count);
             snapshot_rows.truncate(snapshot_count);
             quarantine_inputs.truncate(quarantine_count);
@@ -1421,7 +1399,7 @@ pub async fn publish_sandbox_states(
                 }),
             );
         } else {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, false));
+            failure_episode_rows.push(FailureEpisodeClaim::from_proto(sandbox_uuid, state, false));
             publishes_network_policy |= row_publishes_network_policy;
         }
     }
@@ -1568,7 +1546,12 @@ pub async fn publish_sandbox_states(
         accepted = accepted.saturating_add(usize_to_u64(result.len()));
     }
 
-    let failure_episode_rows_json = Json(serde_json::Value::Array(failure_episode_rows));
+    let failure_episode_rows_json = Json(serde_json::Value::Array(
+        failure_episode_rows
+            .iter()
+            .map(FailureEpisodeClaim::legacy_row)
+            .collect(),
+    ));
     sqlx::query(sql!(
         "INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_payload, observed_at, updated_at
