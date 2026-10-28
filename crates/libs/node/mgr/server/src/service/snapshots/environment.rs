@@ -1,9 +1,8 @@
 //! Capture admission keeps an environment's restore requirement on the node.
 
 use super::super::*;
-use pplx_space_common_core::types::{EnvironmentReference, SandboxArtifactMetadata};
+use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
-use std::io::Read;
 
 use super::super::node_artifacts::PolicyScope;
 
@@ -39,43 +38,7 @@ impl NodeManagerService {
                 ExecutionSelectionMode::PersistedStateRestore,
             )?;
         }
-        let execution = self
-            .off_runtime("inspect snapshot execution", move || {
-                let directory_path = PathBuf::from(format!("{CACHE_DIR}/{sandbox_id}"));
-                match std::fs::symlink_metadata(directory_path.join("metadata.json")) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(error) => {
-                        return Err(Status::failed_precondition(format!(
-                            "inspect snapshot execution: {error}"
-                        )));
-                    }
-                    Ok(_) => {}
-                }
-                let directory = trusted_paths::open_directory(&directory_path)?;
-                let file = trusted_paths::open_regular_file(&directory, "metadata.json".as_ref())?;
-                let mut bytes = Vec::new();
-                file.take(1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| {
-                        Status::failed_precondition(format!("read snapshot execution: {error}"))
-                    })?;
-                if bytes.len() > 1024 * 1024 {
-                    return Err(Status::failed_precondition(
-                        "snapshot execution metadata exceeds 1 MiB",
-                    ));
-                }
-                let metadata: SandboxArtifactMetadata =
-                    serde_json::from_slice(&bytes).map_err(|error| {
-                        Status::failed_precondition(format!("invalid snapshot execution: {error}"))
-                    })?;
-                if metadata.sandbox_id.to_string() != sandbox_id {
-                    return Err(Status::failed_precondition(
-                        "snapshot environment differs from the running sandbox",
-                    ));
-                }
-                Ok(Some(metadata.execution))
-            })
-            .await?;
+        let execution = self.recorded_execution(sandbox_id.clone()).await?;
         let Some(execution) = execution else {
             return if reference.is_some() {
                 Err(Status::failed_precondition(

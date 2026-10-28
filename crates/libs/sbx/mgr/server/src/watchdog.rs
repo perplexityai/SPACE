@@ -2791,7 +2791,7 @@ fn pause_failed_recovery_target(
     match firecracker_state {
         VmState::Running => Some(crate::db::PauseFailedRecoveryTarget::Started),
         VmState::Paused => Some(crate::db::PauseFailedRecoveryTarget::Paused),
-        VmState::NotStarted => None,
+        VmState::NotStarted | VmState::Shutdown => None,
     }
 }
 

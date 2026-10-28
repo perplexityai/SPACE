@@ -206,26 +206,27 @@ impl NodeManagerService {
             .sandbox_id
             .parse::<SandboxId>()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let api_socket = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
-        let state = tokio::time::timeout(
-            FIRECRACKER_VM_STATE_TIMEOUT,
-            crate::fc_api::FcApiClient::new(api_socket).get_vm_state(),
-        )
-        .await
-        .map_err(|_| Status::deadline_exceeded("Firecracker VM-state probe timed out"))?
-        .map_err(|error| {
-            Status::unavailable(format!("Firecracker VM-state probe failed: {error}"))
-        })?;
+        let execution = self.recorded_execution(sandbox_id.to_string()).await?;
+        // Pre-metadata historical sandboxes are Firecracker. New adapters must
+        // persist their execution before launch; missing evidence cannot select CH.
+        let runtime = execution.as_ref().map_or(
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            |execution| execution.runtime().kind,
+        );
+        let socket = pplx_space_node_runtime_core::control::socket_path(runtime, sandbox_id)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let control = pplx_space_node_runtime_core::control::connect(runtime, socket)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let state = tokio::time::timeout(FIRECRACKER_VM_STATE_TIMEOUT, control.state())
+            .await
+            .map_err(|_| Status::deadline_exceeded("runtime state probe timed out"))?
+            .map_err(|error| Status::unavailable(format!("runtime state probe failed: {error}")))?;
+        use pplx_space_node_runtime_core::vm_state::VmState;
         let state = match state {
-            pplx_space_node_runtime_core::fc_api::FirecrackerVmState::NotStarted => {
-                crate::proto::VmState::NotStarted
-            }
-            pplx_space_node_runtime_core::fc_api::FirecrackerVmState::Running => {
-                crate::proto::VmState::Running
-            }
-            pplx_space_node_runtime_core::fc_api::FirecrackerVmState::Paused => {
-                crate::proto::VmState::Paused
-            }
+            VmState::NotStarted => crate::proto::VmState::NotStarted,
+            VmState::Running => crate::proto::VmState::Running,
+            VmState::Paused => crate::proto::VmState::Paused,
+            VmState::Shutdown => crate::proto::VmState::Shutdown,
         };
         Ok(Response::new(GetVmStateResponse {
             state: state.into(),

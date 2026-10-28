@@ -15360,13 +15360,14 @@ pub(crate) mod service_tests {
     #[tokio::test(start_paused = true)]
     async fn paused_recovery_never_claims_lost_memory_was_resumed() {
         use crate::runtime_reconciliation::VmStateObservation as Observation;
-        use VmState::{NotStarted, Paused, Running};
+        use VmState::{NotStarted, Paused, Running, Shutdown};
         // None = absent, Some(false) = resolving symlink, Some(true) = ELOOP.
         for pid_witness in [None, Some(false), Some(true)] {
             for (observations, stays_paused) in [
                 (vec![Some(Paused); 3], true),
                 (vec![Some(Running); 3], false),
                 (vec![Some(NotStarted); 3], false),
+                (vec![Some(Shutdown); 3], false),
                 (vec![None; 3], pid_witness.is_some()),
                 (
                     vec![Some(Running), Some(Paused), Some(Running)],

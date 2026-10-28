@@ -2994,7 +2994,7 @@ impl BeforeStopFlush {
         match state {
             Some(VmState::Running) | None => Self::Flush,
             Some(VmState::Paused) => Self::ResumeThenFlush,
-            Some(VmState::NotStarted) => Self::NotRunning,
+            Some(VmState::NotStarted | VmState::Shutdown) => Self::NotRunning,
         }
     }
 }
