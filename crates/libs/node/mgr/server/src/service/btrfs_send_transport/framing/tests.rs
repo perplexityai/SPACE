@@ -175,7 +175,10 @@ fn header_lookalikes_do_not_use_up_the_partial_stream_budget() {
 fn the_search_stops_after_its_partial_stream_budget() {
     let cut = STREAM.len() / 2;
     for (count, expected) in [
-        (MAX_PARTIAL_STREAMS - 1, Some(((MAX_PARTIAL_STREAMS - 1) * cut) as u64)),
+        (
+            MAX_PARTIAL_STREAMS - 1,
+            Some(((MAX_PARTIAL_STREAMS - 1) * cut) as u64),
+        ),
         (MAX_PARTIAL_STREAMS, None),
     ] {
         let restarted = [STREAM[..cut].repeat(count).as_slice(), STREAM].concat();
