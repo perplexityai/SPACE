@@ -57,6 +57,8 @@ pub struct TemplateMgrRunConfig {
 pub enum RunTemplateMgrError {
     #[error("invalid template hash configuration: {0}")]
     TemplateHash(#[source] crate::TemplateHashConfigError),
+    #[error("SPACE_TEMPLATE_LOOKUP_ENFORCEMENT must be true or false")]
+    LookupEnforcement,
     #[error("invalid template rootfs backing policy: {0}")]
     RootfsBacking(#[source] crate::RootfsBackingConfigError),
     #[error("template cache cannot honor the rootfs backing policy: {0}")]
@@ -108,6 +110,19 @@ async fn run_service(
     shutdown_token: CancellationToken,
     service_mutex: &mut Option<ServiceMutex>,
 ) -> Result<(), RunTemplateMgrError> {
+    let enforce_lookup_scope = match std::env::var("SPACE_TEMPLATE_LOOKUP_ENFORCEMENT") {
+        Ok(value) => value
+            .parse::<bool>()
+            .map_err(|_| RunTemplateMgrError::LookupEnforcement)?,
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(RunTemplateMgrError::LookupEnforcement);
+        }
+    };
+    tracing::info!(
+        enforce_lookup_scope,
+        "template lookup enforcement configuration"
+    );
     let health_server = LocalHealthServer::spawn_optional(
         config.health_socket_path.as_deref(),
         pplx_space_common_svc::UnixSocketOptions::new(0o660),
@@ -184,7 +199,8 @@ async fn run_service(
     let service = TemplateManagerService::new(conn)
         .map_err(RunTemplateMgrError::InitializeService)?
         .with_rootfs_backing_policy(backing_policy)
-        .with_production_hash_algorithm(production_hash_algorithm);
+        .with_production_hash_algorithm(production_hash_algorithm)
+        .with_lookup_enforcement(enforce_lookup_scope);
 
     // Re-arm any durable background jobs that were in flight (i.e.
     // `status='running'`) when the previous tmplmgr exited. Without

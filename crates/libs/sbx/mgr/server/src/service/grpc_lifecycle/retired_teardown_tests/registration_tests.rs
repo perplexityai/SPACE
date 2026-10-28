@@ -466,6 +466,15 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
                 .unwrap();
                 let (service, _dispatched) = service_recording_cleanup(conn);
 
+                // Exercise the request's registration before a background upload
+                // can persist the refusal as an untyped terminal job failure.
+                assert!(
+                    service
+                        .snapshot_upload_worker
+                        .yield_for_restart(Duration::ZERO)
+                        .await
+                );
+
                 let result = service
                     .enqueue_artifact_backup(internal_request(
                         crate::proto::EnqueueArtifactBackupRequest {

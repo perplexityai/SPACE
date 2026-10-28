@@ -366,6 +366,7 @@ const ALLOW_TEMPLATE_SNAPSHOT_POLICY_OPERATOR: &[UdsPeerPrincipal] = &[
 
 #[derive(Clone)]
 pub struct TemplateManagerService {
+    enforce_lookup_scope: bool,
     db: Arc<Mutex<rusqlite::Connection>>,
     artifact_store: TemplateArtifactStore,
     production_hash_algorithm: HashAlg,
@@ -1539,6 +1540,7 @@ impl TemplateManagerService {
         let db = Arc::new(Mutex::new(conn));
         let background_worker = crate::background_jobs::build_worker(Arc::clone(&db));
         Ok(Self {
+            enforce_lookup_scope: false,
             db,
             artifact_store: TemplateArtifactStore::default(),
             production_hash_algorithm: crate::content_hash::DEFAULT_PRODUCTION_ALGORITHM,
@@ -1558,6 +1560,11 @@ impl TemplateManagerService {
 
     pub(crate) fn with_production_hash_algorithm(mut self, algorithm: HashAlg) -> Self {
         self.production_hash_algorithm = algorithm;
+        self
+    }
+
+    pub(crate) fn with_lookup_enforcement(mut self, enabled: bool) -> Self {
+        self.enforce_lookup_scope = enabled;
         self
     }
 

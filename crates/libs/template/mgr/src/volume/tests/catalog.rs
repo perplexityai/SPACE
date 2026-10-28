@@ -57,7 +57,7 @@ impl Catalog {
                 template_name: TEMPLATE.into(),
                 runtime: "fc".into(),
                 hash: format!("sha256:{}", "a".repeat(64)),
-                tags: vec!["latest".into()],
+                tags: vec!["latest".into(), "stable".into()],
                 org_id,
                 ..Default::default()
             }))
@@ -184,8 +184,11 @@ async fn assert_pull_outcome(visibility: TemplateVisibility, trigger: PullTrigge
     Ok(())
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
+async fn catalog_receipts_preserve_legacy_org_checks(
+    #[values(false, true)] enforced: bool,
+) -> TestResult {
     use pplx_space_common_svc::template_lookup::TemplateLookupScope;
     use pplx_space_node_api_client::proto::{
         FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
@@ -211,7 +214,11 @@ async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
                     });
                     metadata(request.metadata_mut());
                     if let Some(scope) = scope {
-                        scope.attach(&mut request);
+                        if enforced {
+                            scope.request_authorization(&mut request);
+                        } else {
+                            scope.attach(&mut request);
+                        }
                     }
                     client.find_template_release_by_hash(request).await
                 } else {
@@ -224,7 +231,11 @@ async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
                     });
                     metadata(request.metadata_mut());
                     if let Some(scope) = scope {
-                        scope.attach(&mut request);
+                        if enforced {
+                            scope.request_authorization(&mut request);
+                        } else {
+                            scope.attach(&mut request);
+                        }
                     }
                     client.find_template_release(request).await
                 };
@@ -234,6 +245,9 @@ async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
                     let response = result?;
                     assert_eq!(response.get_ref().release.as_ref().unwrap().hash, digest);
                     assert_eq!(response.get_ref().authorized_org_id.as_deref(), Some(owner));
+                    if let Some(scope) = scope {
+                        assert_eq!(scope.require_authorization(&response).is_ok(), enforced);
+                    }
                     assert_eq!(
                         response
                             .metadata()

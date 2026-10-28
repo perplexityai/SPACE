@@ -983,7 +983,8 @@ async fn find_release(
     } = spec;
     let generic_only = trigger.is_prefetch();
     let result =
-        find_release_with_requirement(name, req_hash, req_tag, None, generic_only, scope).await;
+        find_release_with_requirement(name, req_hash, req_tag, None, generic_only, scope, false)
+            .await;
     let result_label = match &result {
         Ok(_) => "ok",
         Err(FindReleaseError::NotFound) => "not_found",
@@ -1024,6 +1025,7 @@ fn classify_find_release_status(status: Status) -> FindReleaseError {
 /// An immutable release resolved by ClusterApi, authorized when caller-scoped.
 /// `visibility` is advisory prefetch metadata, not authorization evidence.
 pub(crate) struct ResolvedRelease {
+    pub(crate) authorized_org: Option<OrgId>,
     pub(crate) hash: String,
     pub(crate) storage_uris: Vec<String>,
     pub(crate) visibility: TemplateVisibility,
@@ -1052,7 +1054,26 @@ pub(crate) async fn find_release_in_scope(
     caller_org: Option<OrgId>,
     scope: Option<TemplateLookupScope>,
 ) -> Result<ResolvedRelease, FindReleaseError> {
-    find_release_with_requirement(name, req_hash, req_tag, caller_org, false, scope).await
+    find_release_with_requirement(name, req_hash, req_tag, caller_org, false, scope, false).await
+}
+
+pub(crate) async fn find_authorized_release(
+    name: &str,
+    req_hash: &str,
+    req_tag: &str,
+    caller_org: Option<OrgId>,
+    scope: TemplateLookupScope,
+) -> Result<ResolvedRelease, FindReleaseError> {
+    find_release_with_requirement(
+        name,
+        req_hash,
+        req_tag,
+        caller_org,
+        false,
+        Some(scope),
+        true,
+    )
+    .await
 }
 
 async fn find_release_with_requirement(
@@ -1062,6 +1083,7 @@ async fn find_release_with_requirement(
     caller_org: Option<OrgId>,
     generic_only: bool,
     scope: Option<TemplateLookupScope>,
+    authorize: bool,
 ) -> Result<ResolvedRelease, FindReleaseError> {
     let mut client = connect_cluster_api_from_env().await.map_err(|error| {
         warn!(error = %error, "cluster api connect failed");
@@ -1084,7 +1106,11 @@ async fn find_release_with_requirement(
             hash: hash.clone(),
         });
         if let Some(scope) = scope {
-            scope.attach(&mut request);
+            if authorize {
+                scope.request_authorization(&mut request);
+            } else {
+                scope.attach(&mut request);
+            }
         }
         match client.find_template_release_by_hash(request).await {
             Ok(r) => r,
@@ -1116,7 +1142,11 @@ async fn find_release_with_requirement(
             tag: tag.clone(),
         });
         if let Some(scope) = scope {
-            scope.attach(&mut request);
+            if authorize {
+                scope.request_authorization(&mut request);
+            } else {
+                scope.attach(&mut request);
+            }
         }
         match client.find_template_release(request).await {
             Ok(r) => r,
@@ -1132,12 +1162,27 @@ async fn find_release_with_requirement(
     };
 
     if let Some(scope) = scope {
-        scope
-            .observe_response(&resp)
-            .map_err(FindReleaseError::Status)?;
+        if authorize {
+            scope.require_authorization(&resp)
+        } else {
+            scope.observe_response(&resp)
+        }
+        .map_err(FindReleaseError::Status)?;
     }
     let resp = resp.into_inner();
-    parse_release_response(name, req_hash, caller_org, generic_only, resp)
+    let authorized_org = if authorize && matches!(scope, Some(TemplateLookupScope::Sandbox { .. }))
+    {
+        Some(
+            resp.authorized_org_id
+                .as_deref()
+                .ok_or(FindReleaseError::InvalidResponse)?
+                .parse::<OrgId>()
+                .map_err(|_| FindReleaseError::InvalidResponse)?,
+        )
+    } else {
+        caller_org
+    };
+    parse_release_response(name, req_hash, authorized_org, generic_only, resp)
 }
 
 fn parse_release_response(
@@ -1187,6 +1232,7 @@ fn parse_release_response(
         );
     }
     Ok(ResolvedRelease {
+        authorized_org: caller_org,
         hash: hash.to_string(),
         storage_uris,
         visibility,
