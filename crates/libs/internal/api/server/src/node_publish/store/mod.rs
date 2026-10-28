@@ -1,6 +1,8 @@
 use sqlx::PgPool;
 use tonic::Status;
 
+pub(crate) mod failure_episodes;
+
 use crate::auto_lifecycle_delete_completions::consume_validated_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
 use crate::node_publish::outcome::PublishOutcome;
