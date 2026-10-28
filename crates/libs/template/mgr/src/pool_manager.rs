@@ -32,15 +32,15 @@ pub(crate) enum PoolError {
 
 type PoolResult<T> = Result<T, PoolError>;
 
-/// The content hash a pool refill names, so sandbox-manager doesn't resolve
+/// The build a pool refill names, so sandbox-manager doesn't resolve
 /// the template's latest, which can be another environment's. `None` when no
 /// build is cached at all: sandbox-manager's lookup then pulls the latest
 /// release. A refill uses the build, as the lookup it replaces recorded, so
 /// it advances the build's LRU; a failed touch only costs LRU accuracy.
-pub(crate) fn pool_refill_hash(
+pub(crate) fn pool_refill_build(
     conn: &rusqlite::Connection,
     template: &str,
-) -> PoolResult<Option<String>> {
+) -> PoolResult<Option<crate::db::BuildRow>> {
     if let Some(build) = pool_base_build(conn, template)? {
         if let Err(error) = crate::db::touch_build(
             conn,
@@ -50,7 +50,7 @@ pub(crate) fn pool_refill_hash(
         ) {
             eprintln!("[pool-manager] {template}: could not touch pool build LRU: {error}");
         }
-        return Ok(Some(build.content_hash));
+        return Ok(Some(build));
     }
     if crate::db::list_build_partitions(conn, template)?.is_empty() {
         return Ok(None);
@@ -319,18 +319,40 @@ pub(crate) async fn create_from_base(
     vcpu: u32,
     memory_mib: u32,
 ) -> PoolResult<String> {
-    let content_hash = {
+    let build = {
         let db = Arc::clone(&db);
         let template = template.clone();
         tokio::task::spawn_blocking(move || {
             let conn = db
                 .lock()
                 .map_err(|_| crate::db::mutex_poison_error("pool base build lookup"))?;
-            pool_refill_hash(&conn, &template)
+            pool_refill_build(&conn, &template)
         })
         .await??
     };
-    match do_create_from_base(&template, content_hash, from_snapshot, vcpu, memory_mib).await {
+    let (content_hash, runtime) = match build {
+        Some(build) => {
+            let runtime = build
+                .runtime
+                .parse::<pplx_space_common_core::types::RuntimeKind>()
+                .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+            (Some(build.content_hash), runtime)
+        }
+        None => (
+            None,
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+        ),
+    };
+    match do_create_from_base(
+        &template,
+        content_hash,
+        runtime,
+        from_snapshot,
+        vcpu,
+        memory_mib,
+    )
+    .await
+    {
         Ok(id) => {
             crate::node_state_sync::mark_template_dirty(&db, &template);
             Ok(id)
@@ -345,6 +367,7 @@ pub(crate) async fn create_from_base(
 async fn do_create_from_base(
     template: &str,
     content_hash: Option<String>,
+    runtime: pplx_space_common_core::types::RuntimeKind,
     from_snapshot: bool,
     vcpu: u32,
     memory_mib: u32,
@@ -358,7 +381,7 @@ async fn do_create_from_base(
             environment: None,
             template: template.to_string(),
             owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
-            runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),
+            runtime: runtime.alias().into(),
             snapshots_enabled: false,
             autostart: false,
             pool_template: Some(template.to_string()),

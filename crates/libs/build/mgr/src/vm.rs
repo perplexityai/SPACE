@@ -8,6 +8,26 @@ pub(crate) const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths
 /// Fixed guest IP — same for every sandbox, isolation via namespace NAT.
 pub(crate) const GUEST_IP: &str = "169.254.0.21";
 
+/// Linux build guests need the exit event their VMM implements. Firecracker
+/// exits on reset; Cloud Hypervisor handles reset by rebooting the guest and
+/// requires power-off to exit. Resolve this before creating the build sandbox.
+/// Flush first; the detached delay lets SSH acknowledge the request, and
+/// confirmed Stop remains the barrier before copying the rootfs.
+pub(crate) fn guest_exit_command(
+    runtime: pplx_space_common_core::types::RuntimeKind,
+) -> Result<&'static str, super::BuildError> {
+    use pplx_space_common_core::types::RuntimeKind;
+    match runtime {
+        RuntimeKind::Firecracker => Ok(
+            "nohup sh -c 'sync; echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true; if [ -w /proc/sysrq-trigger ]; then echo s > /proc/sysrq-trigger; echo u > /proc/sysrq-trigger; sleep 1; echo b > /proc/sysrq-trigger; else reboot -f; fi' >/dev/null 2>&1 </dev/null &",
+        ),
+        RuntimeKind::CloudHypervisor => {
+            Ok("nohup sh -c 'sync; sleep 1; exec poweroff -f' >/dev/null 2>&1 </dev/null &")
+        }
+        RuntimeKind::Gvisor => Err(super::BuildError::UnsupportedGuestExit(runtime)),
+    }
+}
+
 /// Observe graceful exit in the host's PID namespace. This is only a grace
 /// window: acknowledged Stop remains the barrier before copying the rootfs.
 pub(crate) async fn wait_for_exit(

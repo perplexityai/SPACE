@@ -62,6 +62,11 @@ pub enum RuntimeKind {
 pub struct RuntimeKindParseError(String);
 
 impl RuntimeKind {
+    /// All runtime kinds, including kinds without a qualified node adapter.
+    pub const fn all() -> [Self; 3] {
+        [Self::Firecracker, Self::CloudHypervisor, Self::Gvisor]
+    }
+
     /// Returns the canonical full runtime identifier.
     ///
     /// # Examples

@@ -22,3 +22,26 @@ fn scratch_output_permission_targets_skip_registered_digest_dirs() {
         ]
     );
 }
+
+#[tokio::test]
+async fn installed_guest_versions_come_from_both_binaries_not_the_builder() {
+    let directory = tempfile::tempdir().unwrap();
+    for (service_version, expected) in [("9.4.2", Some("9.4.2")), ("9.4.3", None)] {
+        for (name, version) in [("spaced", "9.4.2"), ("spaced-svc", service_version)] {
+            let path = directory.path().join(name);
+            fs::write(
+                &path,
+                format!("#!/bin/sh\nprintf '%s\\n' '{name} {version}'\n"),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            installed_guest_binary_version(directory.path())
+                .await
+                .ok()
+                .as_deref(),
+            expected
+        );
+    }
+}

@@ -711,16 +711,9 @@ fn bundled_recipe_steps_use_only_known_keys() {
         .join("../../../..")
         .canonicalize()
         .expect("repo root should resolve");
-    let recipe_dir = repo_root.join("templates/firecracker/recipes");
     let mut unknown = Vec::new();
     let mut checked = 0usize;
-    for entry in std::fs::read_dir(&recipe_dir)
-        .unwrap_or_else(|err| panic!("read {}: {err}", recipe_dir.display()))
-    {
-        let path = entry.expect("recipe dir entry should read").path();
-        if path.extension().is_none_or(|ext| ext != "toml") {
-            continue;
-        }
+    for path in bundled_recipe_paths(&repo_root) {
         let contents = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
         let document = contents
@@ -764,11 +757,8 @@ fn bundled_recipes() -> Vec<(std::path::PathBuf, TomlRecipe)> {
         .join("../../../..")
         .canonicalize()
         .expect("repo root should resolve");
-    let recipe_dir = repo_root.join("templates/firecracker/recipes");
-    let mut recipes: Vec<_> = std::fs::read_dir(&recipe_dir)
-        .unwrap_or_else(|err| panic!("read {}: {err}", recipe_dir.display()))
-        .map(|entry| entry.expect("recipe dir entry should read").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+    let mut recipes: Vec<_> = bundled_recipe_paths(&repo_root)
+        .into_iter()
         .map(|path| {
             let contents = std::fs::read_to_string(&path)
                 .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
@@ -1242,4 +1232,21 @@ fn proto_steps_validate_environment_names_before_execution() {
         assert!(!format!("{error:?}").contains("secret-value"));
         assert!(!format!("{error:?}").contains("TOKEN"));
     }
+}
+
+fn bundled_recipe_paths(root: &Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(root.join("templates"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("recipes"))
+        .filter(|directory| directory.is_dir())
+        .flat_map(|directory| {
+            std::fs::read_dir(&directory)
+                .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "toml")
+                })
+        })
+        .collect()
 }

@@ -2295,10 +2295,14 @@ fn template_refresh_preserves_nocow_and_timestamps() {
 }
 
 #[rstest::rstest]
-#[case::default(None)]
-#[case::sha256_override(Some(HashAlg::Sha256))]
+#[case::default(None, false)]
+#[case::sha256_override(Some(HashAlg::Sha256), false)]
+#[case::cloud_hypervisor(None, true)]
 #[tokio::test]
-async fn register_template_uses_producer_algorithm(#[case] override_algorithm: Option<HashAlg>) {
+async fn register_template_uses_producer_algorithm(
+    #[case] override_algorithm: Option<HashAlg>,
+    #[case] cloud_hypervisor: bool,
+) {
     let (fixture, sha256, bytes) = expanded_test_rootfs_setup();
     let expected = match override_algorithm {
         None | Some(HashAlg::Blake3) => format!("blake3:{}", blake3::hash(&bytes)),
@@ -2310,6 +2314,34 @@ async fn register_template_uses_producer_algorithm(#[case] override_algorithm: O
     std::fs::create_dir_all(&source).unwrap();
     for file in [TEMPLATE_ROOTFS_FILE, "metadata.json"] {
         std::fs::copy(fixture.path().join(file), source.join(file)).unwrap();
+    }
+    if cloud_hypervisor {
+        use pplx_space_common_core::types::{
+            Arch, ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity,
+            RuntimeKind, TemplateMetadata,
+        };
+        let mut metadata = TemplateMetadata::default();
+        metadata.set_execution_metadata(
+            ExecutionMetadata::new(
+                RuntimeIdentity {
+                    kind: RuntimeKind::CloudHypervisor,
+                    version: "54.0".parse().unwrap(),
+                },
+                GuestPlatform {
+                    os: GuestOperatingSystem::Linux,
+                    architecture: Arch::X86_64,
+                },
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        metadata.arch = Some("x86_64".into());
+        std::fs::write(
+            source.join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
     }
     let mut service =
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
@@ -2361,4 +2393,8 @@ async fn register_template_uses_producer_algorithm(#[case] override_algorithm: O
     .unwrap()
     .expect("registered identity must be persisted");
     assert_eq!(build.content_hash, expected);
+    if cloud_hypervisor {
+        assert_eq!(manifest.runtime, "ch");
+        assert_eq!(build.runtime, "ch");
+    }
 }

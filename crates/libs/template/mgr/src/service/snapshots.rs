@@ -55,13 +55,10 @@ pub(super) fn base_snapshot_create_request(
     content_hash: &str,
     partition: crate::db::TemplateCachePartition,
     snapshot_rootfs_size_mb: Option<u32>,
+    runtime: pplx_space_common_core::types::RuntimeKind,
 ) -> pplx_space_sbx_mgr_client::proto::CreateRequest {
     let (environment, template, runtime) = match partition.environment() {
-        None => (
-            None,
-            template_name.to_string(),
-            RUNTIME_FIRECRACKER_ALIAS.to_string(),
-        ),
+        None => (None, template_name.to_string(), runtime.alias().to_string()),
         Some(environment) => (
             Some(pplx_space_sbx_mgr_client::proto::EnvironmentCreateInput {
                 reference: environment.to_string(),
@@ -355,6 +352,26 @@ impl TemplateManagerService {
                     ))
                 })?;
 
+        let runtime = {
+            let db = Arc::clone(&self.db);
+            let name = template_name.to_owned();
+            let hash = content_hash.to_owned();
+            tokio::task::spawn_blocking(move || {
+                let conn = db
+                    .lock()
+                    .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+                let build = crate::db::get_build(&conn, &name, &hash, partition)
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .ok_or_else(|| Status::not_found("base snapshot template build disappeared"))?;
+                build
+                    .runtime
+                    .parse::<pplx_space_common_core::types::RuntimeKind>()
+                    .map_err(|error| Status::failed_precondition(error.to_string()))
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??
+        };
+
         let mut sbx_client = pplx_space_sbx_mgr_client::connect()
             .await
             .map_err(|e| Status::internal(format!("cannot connect to sbx-manager: {e}")))?;
@@ -369,6 +386,7 @@ impl TemplateManagerService {
                 content_hash,
                 partition,
                 snapshot_rootfs_size_mb,
+                runtime,
             ))
             .await
             .map_err(|e| Status::internal(format!("sbx create: {e}")))?;

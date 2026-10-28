@@ -64,20 +64,12 @@ use ssh::SshSession;
 use vm::TEMPLATE_DIR;
 
 const UBUNTU_APT_MIRROR_ENV: &str = "SPACE_UBUNTU_APT_MIRROR";
-/// Foreground, *blocking* flush run over SSH before the guest is torn down.
-/// `sync` returns only after buffered writes are committed, so the build's last
-/// filesystem mutations — notably the e2b start_cmd systemd unit + its
-/// `space.target.wants` enable symlink, which is the final recipe step — are
-/// durably on disk before the VM dies. Without this, the backgrounded sysrq
-/// reboot below can race in-flight writeback, and the finalize `e2fsck` journal
-/// recovery then discards the uncommitted tail — silently dropping the last
-/// step from the published rootfs (intermittent / non-deterministic). Two syncs
-/// for the traditional belt-and-suspenders flush.
+/// Foreground flush before terminating the build VM. Wait for it before
+/// requesting guest exit so the last recipe step reaches the backing disk.
+/// Sysrq sync starts writeback asynchronously; immediate reset can race it.
+/// Subsequent e2fsck journal recovery can then discard the final recipe write,
+/// even when the guest command itself returned success.
 const GUEST_FLUSH_CMD: &str = "sync; sync";
-/// Backgrounded power-off via sysrq, issued only after `GUEST_FLUSH_CMD` has
-/// returned. The durability barrier is the prior blocking `sync`, not the
-/// `sleep` here.
-const GUEST_EXIT_CMD: &str = "nohup sh -c 'sync; echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true; if [ -w /proc/sysrq-trigger ]; then echo s > /proc/sysrq-trigger; echo u > /proc/sysrq-trigger; sleep 1; echo b > /proc/sysrq-trigger; else reboot -f; fi' >/dev/null 2>&1 </dev/null &";
 
 const SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -201,6 +193,8 @@ struct GuestRuntimeMetadata {
 pub enum BuildError {
     #[error(transparent)]
     ExecutionBinding(#[from] BuildExecutionBindingError),
+    #[error("no guest exit strategy for build runtime {0}")]
+    UnsupportedGuestExit(pplx_space_common_core::types::RuntimeKind),
     #[error(transparent)]
     Environment(#[from] BuildEnvironmentError),
     #[error(transparent)]
@@ -262,6 +256,7 @@ impl BuildError {
                 TemplateBuildErrorKind::StorageAdmission
             }
             Self::ExecutionBinding(_)
+            | Self::UnsupportedGuestExit(_)
             | Self::RootfsReservation(_)
             | Self::InvalidSpacedVersion { .. }
             | Self::InvalidSandboxId(_)
@@ -808,6 +803,10 @@ impl TemplateBuilder {
             ))?;
         let execution_binding =
             BuildExecutionBinding::for_base(self.environment, base_execution).await?;
+        let guest_exit_command = vm::guest_exit_command(execution_binding.as_ref().map_or(
+            base_execution.runtime().kind,
+            BuildExecutionBinding::runtime_kind,
+        ))?;
 
         println!("  Resolved base: {}", resolved_base.resolved_reference);
         if !std::path::Path::new(&resolved_base.rootfs_path).exists() {
@@ -817,15 +816,13 @@ impl TemplateBuilder {
             )));
         }
 
-        let oci_inputs = oci_image
-            .map(|reference| {
-                Ok::<_, BuildError>((
-                    reference,
-                    current_guest_runtime_metadata()?,
-                    scratch_guest_bin_dir()?,
-                ))
-            })
-            .transpose()?;
+        let oci_inputs = if let Some(reference) = oci_image {
+            let binaries = scratch_guest_bin_dir()?;
+            let metadata = current_guest_runtime_metadata(&binaries).await?;
+            Some((reference, metadata, binaries))
+        } else {
+            None
+        };
 
         // Each build job writes into its own staging dir under the template's
         // name dir; template-manager consumes the dir at registration.
@@ -1079,7 +1076,7 @@ impl TemplateBuilder {
         println!("Shutting down build VM...");
         build_phase(template_id, BuildPhase::ShutdownGuest, async {
             // Flush the guest filesystem to disk and WAIT for it before issuing
-            // the (backgrounded) power-off. This is the durability barrier that
+            // the backgrounded guest exit. This is the durability barrier that
             // guarantees the build's final recipe step survives the snapshot —
             // see GUEST_FLUSH_CMD. Best-effort: if the flush call fails we still
             // attempt the exit, but log it since a failed flush is exactly the
@@ -1088,7 +1085,7 @@ impl TemplateBuilder {
                 tracing::warn!(error = %e, "guest pre-shutdown sync failed; last write may not be durable");
                 eprintln!("Guest pre-shutdown sync failed: {e}");
             }
-            if let Err(e) = ssh.exec(GUEST_EXIT_CMD, "root", &StepEnvironment::default()) {
+            if let Err(e) = ssh.exec(guest_exit_command, "root", &StepEnvironment::default()) {
                 tracing::warn!(error = %e, "guest exit request failed; force cleanup may be needed");
                 eprintln!("Guest exit request failed, force cleaning: {e}");
             }
@@ -1114,15 +1111,8 @@ impl TemplateBuilder {
         })
         .await
         {
-            if runtime_build.requires_durable_stop() {
-                delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime stop failed").await;
-                return Err(error);
-            }
-            tracing::warn!(
-                sandbox_id = %sandbox_id,
-                error = %error,
-                "sandbox stop failed before rootfs copy; continuing with best-effort copy"
-            );
+            delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime stop failed").await;
+            return Err(error);
         }
 
         // For runtime-bearing images, confirmed Stop proves the runtime cgroups
@@ -1394,7 +1384,7 @@ impl TemplateBuilder {
             return Err(BuildError::message("scratch recipe origin is required"));
         };
         let guest_bin_dir = scratch_guest_bin_dir()?;
-        let spaced_version = detect_spaced_version()?;
+        let spaced_version = guest_binary_version(&guest_bin_dir).await?;
         let workspace_cargo_toml = scratch_workspace_cargo_toml();
         let cache_dir = format!(
             "{}/builds/seed-cache",
@@ -1784,7 +1774,7 @@ fn scratch_guest_bin_dir() -> Result<PathBuf, BuildError> {
     }
 
     Err(BuildError::message(
-        "could not locate spaced/spaced-svc in the sibling data/spaced artifact directory",
+        "could not locate spaced/spaced-svc in the packaged or node data/spaced artifact directory",
     ))
 }
 
@@ -1796,6 +1786,9 @@ fn scratch_guest_bin_candidates(exe_path: &Path) -> Vec<PathBuf> {
                 .map(|parent| parent.join(SCRATCH_GUEST_ARTIFACT_SUBDIR))
         })
         .into_iter()
+        // Packaged artifacts take precedence. Direct deployments keep guest
+        // assets outside the content-addressed service executable directory.
+        .chain([PathBuf::from("/space/data/spaced")])
         .collect()
 }
 
@@ -1809,8 +1802,57 @@ fn detect_spaced_version() -> Result<String, BuildError> {
     Ok(env!("CARGO_PKG_VERSION").to_string())
 }
 
-fn current_guest_runtime_metadata() -> Result<GuestRuntimeMetadata, BuildError> {
-    let spaced_version = detect_spaced_version()?;
+// Packaged binaries share the builder's release. Node-installed fallback assets
+// are deployed independently, so their own versions must supply the metadata.
+async fn guest_binary_version(binaries: &Path) -> Result<String, BuildError> {
+    if binaries != Path::new("/space/data/spaced") {
+        return detect_spaced_version();
+    }
+    installed_guest_binary_version(binaries).await
+}
+
+async fn installed_guest_binary_version(binaries: &Path) -> Result<String, BuildError> {
+    let mut version = None;
+    for name in ["spaced", "spaced-svc"] {
+        let mut command = tokio::process::Command::new(binaries.join(name));
+        command.arg("--version").kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+            .await
+            .map_err(|_| BuildError::message(format!("{name} version query timed out")))?
+            .map_err(|source| BuildError::Io {
+                operation: "read installed guest binary version",
+                source,
+            })?;
+        let text = std::str::from_utf8(&output.stdout)
+            .map_err(|error| BuildError::message(format!("invalid {name} version: {error}")))?;
+        let fields = text.split_whitespace().collect::<Vec<_>>();
+        let [reported_name, reported_version] = fields.as_slice() else {
+            return Err(BuildError::message(format!(
+                "{name} did not report its version"
+            )));
+        };
+        if !output.status.success() || *reported_name != name {
+            return Err(BuildError::message(format!(
+                "{name} did not report its version"
+            )));
+        }
+        if version
+            .as_deref()
+            .is_some_and(|previous| previous != *reported_version)
+        {
+            return Err(BuildError::message(
+                "installed spaced and spaced-svc versions differ",
+            ));
+        }
+        version = Some((*reported_version).to_owned());
+    }
+    version.ok_or_else(|| BuildError::message("missing installed guest version"))
+}
+
+async fn current_guest_runtime_metadata(
+    binaries: &Path,
+) -> Result<GuestRuntimeMetadata, BuildError> {
+    let spaced_version = guest_binary_version(binaries).await?;
     let spaced_compatibility_family =
         pplx_space_spaced_common::spaced_compatibility_family_for_version(&spaced_version)
             .map_err(|source| BuildError::InvalidSpacedVersion {

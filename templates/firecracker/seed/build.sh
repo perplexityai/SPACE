@@ -30,6 +30,11 @@
 #   ./build.sh --id seed --deploy --host my-other-node
 set -euo pipefail
 
+if [[ "${SPACE_SEED_RUNTIME:-firecracker}" != firecracker ]]; then
+  echo "ERROR: this standalone helper builds Firecracker seeds; use space-buildmgr with a qualified environment for other runtimes" >&2
+  exit 1
+fi
+
 cd "$(dirname "$0")"
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"

@@ -396,12 +396,19 @@ fn base_snapshot_capture_boots_a_twin_under_its_environment() {
         &hash(),
         TemplateCachePartition::Legacy,
         Some(4),
+        pplx_space_common_core::types::RuntimeKind::Firecracker,
     );
     assert_eq!(legacy.environment, None);
     assert_eq!(legacy.template, NAME);
     assert_eq!(legacy.runtime, RUNTIME_FIRECRACKER_ALIAS);
 
-    let twin = snapshots::base_snapshot_create_request(NAME, &hash(), twin(), Some(4));
+    let twin = snapshots::base_snapshot_create_request(
+        NAME,
+        &hash(),
+        twin(),
+        Some(4),
+        pplx_space_common_core::types::RuntimeKind::Firecracker,
+    );
     let input = twin
         .environment
         .expect("twin capture selects its environment");

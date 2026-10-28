@@ -225,13 +225,14 @@ fn a_partition_s_latest_build_skips_rows_bound_elsewhere() {
 #[test]
 fn pool_refills_name_the_legacy_build_or_refuse() {
     let conn = test_conn();
-    assert_eq!(
-        crate::pool_manager::pool_refill_hash(&conn, NAME).unwrap(),
-        None
+    assert!(
+        crate::pool_manager::pool_refill_build(&conn, NAME)
+            .unwrap()
+            .is_none()
     );
     upsert(&conn, Some(other()), twin(), "2026-10-01T00:00:00Z").unwrap();
     assert!(matches!(
-        crate::pool_manager::pool_refill_hash(&conn, NAME),
+        crate::pool_manager::pool_refill_build(&conn, NAME),
         Err(crate::pool_manager::PoolError::NoPoolBuild)
     ));
     upsert(
@@ -242,7 +243,9 @@ fn pool_refills_name_the_legacy_build_or_refuse() {
     )
     .unwrap();
     assert_eq!(
-        crate::pool_manager::pool_refill_hash(&conn, NAME).unwrap(),
+        crate::pool_manager::pool_refill_build(&conn, NAME)
+            .unwrap()
+            .map(|build| build.content_hash),
         Some(HASH.to_string())
     );
 }
