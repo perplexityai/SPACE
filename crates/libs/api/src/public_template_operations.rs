@@ -126,7 +126,8 @@ impl DeleteTemplateOperationExecutor {
                 terminal_error_code: None,
                 terminal_error_json: None,
                 retry_after: Some(TEMPLATE_DELETE_RETRY_AFTER),
-                requeue_reason: PublicOperationRequeueReason::TransientFailure,
+                // Node cleanup is asynchronous progress, not a failed attempt.
+                requeue_reason: PublicOperationRequeueReason::WorkflowProgress,
             });
         }
 
