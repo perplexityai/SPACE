@@ -20,7 +20,7 @@ use tonic::{Code, Status};
 const RECONCILE_BUDGET: Duration = Duration::from_secs(30);
 /// Separate from the install budget, so a slow install pass can't hold up a block.
 const POLICY_BUDGET: Duration = Duration::from_secs(10);
-const MAX_ENVIRONMENTS: usize = 32;
+const MAX_ENVIRONMENTS: usize = pplx_space_node_api_client::MAX_RECIPE_ENVIRONMENTS;
 const SUBMISSION_CONCURRENCY: usize = 4;
 
 mod operations;
@@ -148,8 +148,11 @@ async fn install(
     state: &Provisioning,
     deadline: tokio::time::Instant,
 ) -> Result<(), ProvisioningError> {
+    // An absent recipe assigns nothing this call; unlike an empty one, it
+    // doesn't withdraw earlier intent. Keep the memo whole, as a failed fetch
+    // does: a backoff still holds, and a job that fails meanwhile is observed
+    // by the next recipe's poll rather than forgotten and resubmitted.
     let Some(recipe) = recipe else {
-        state.retain(&[]);
         return Ok(());
     };
     if recipe.required_environments.is_empty() {

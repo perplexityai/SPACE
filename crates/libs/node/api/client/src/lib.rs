@@ -53,6 +53,9 @@ pub const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_NODE_CTL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const NODE_API_DRAINING_MESSAGE: &str = "node-api draining";
+/// Most environments one `RuntimeProvisioningRecipe` may list. node-ctl
+/// refuses a larger recipe whole, installing none of it.
+pub const MAX_RECIPE_ENVIRONMENTS: usize = 32;
 /// HTTP/2 connection window for a node-api connection that carries many
 /// callers' streams at once: 16 default-sized (2 MiB) stream windows, so
 /// concurrent calls share a larger buffer. It bounds the response data one

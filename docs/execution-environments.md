@@ -1370,14 +1370,74 @@ paths or artifact hashes; the response's separate `execution_policy` field
 to node-manager, and installation never reads it. The cluster authenticates the registered node by the
 existing origin check before answering.
 
-The current cluster handler returns no recipe. A recipe store and producer must
-be connected before deployment can request installations; this endpoint does not
-implicitly commission E0. Older cluster services return `Unimplemented`, which
-node-ctl also treats as no recipe. Other fetch errors remain visible failures,
-including a cluster execution policy the cluster API can't read while
-`SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED` is on: that fails the whole
-call, recipe included.
-Neither absence nor an empty recipe uninstalls anything.
+While `SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED` is on, the cluster
+API assigns workers and builders in the provisioning cohort a recipe of every
+environment in the `runtime_environments` catalog that isn't retired, read
+through the catalog store in
+`crates/libs/execution/runtime-environment-catalog-store`. Each row is an
+environment a node build has published as certified, and an operator retires
+one by setting `retired_at`. Nothing records node publishes in the catalog yet,
+so until that writer lands an enabled cohort receives an empty recipe and
+installs nothing. The recipe ignores execution policy: an environment
+with no state, or a blocked one, stays installed, so a later policy change finds
+it already in place. That's what lets a 0-day on an already-certified
+environment be answered with a policy change rather than a download. An empty
+catalog assigns an empty recipe. Cluster nodes run no microVMs and get no
+recipe.
+
+The recipe setting is separate from
+`SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED`, so installing environments
+and enforcing the policy are enabled and rolled back independently. node-ctl
+installs a recipe on every tick with no gate of its own, so the cohort is what
+paces a cluster's first installs and bounds the blast radius of an install-path
+bug, a checksum mismatch or an upstream outage. A node is in it when
+`SPACE_INTERNAL_API_RUNTIME_PROVISIONING_CANARY_NODES` lists it, by the name it
+reports or its node ID, or when a stable hash of its node ID falls below
+`SPACE_INTERNAL_API_RUNTIME_PROVISIONING_PERCENT`. Every replica and binary
+computes the same hash, so a node keeps its place as the percentage grows. Bring
+a cluster on with canary nodes, then a small percentage, then 100. On Kind, the
+`runtimeDesiredState` values of the `space-internal-api-local` chart set both
+this cohort and the execution policy setting. A node that
+leaves the cohort only stops receiving new installs: installs already submitted
+to runtime-manager carry on, and nothing is removed. Each replica logs the
+recipe setting and cohort it read at startup, and replicas can disagree while
+they change, so a node admitted by the new values but not the old ones can get a
+recipe on some calls and not others until the rollout finishes.
+
+With the recipe setting off, or for a node outside the cohort, the response
+carries no recipe, so this endpoint never implicitly commissions E0. Older cluster services
+return `Unimplemented`, which node-ctl also treats as no recipe. Other fetch
+errors remain visible failures, including a cluster execution policy the cluster
+API can't read while `SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED` is on,
+which fails the whole call. A catalog it can't read only omits the recipe from
+that response and logs the error, so a catalog problem never withholds the
+policy served alongside it. The catalog read runs on its own pool of two
+database connections with a 500 ms statement timeout, opened only while the
+recipe setting is on, so a blocked `runtime_environments` read holds none of the
+connections the policy and node authentication reads use. It can still delay the
+response before the recipe is omitted: by at most the statement timeout while a
+connection is free, and by up to the pool's acquire timeout
+(`POSTGRES_POOL_ACQUIRE_TIMEOUT_SECS`, 5 s by default) more while both are busy.
+Neither absence nor an empty recipe uninstalls anything. An absent recipe also
+leaves a node's pending installs and their backoffs as they were; an empty one
+clears them.
+
+The catalog is cluster-wide, so a node whose build doesn't certify a listed
+environment, an older build during a rollout or an aarch64 node, reports it as
+unsupported and installs the rest. Its runtime-provisioning facet then reports an
+error on every tick until the build certifies the environment or it's retired,
+so expect that on such nodes before alerting on the facet.
+
+A recipe lists at most 32 environments (`MAX_RECIPE_ENVIRONMENTS` in the node API
+client). The limit counts every listed environment, including ones the node
+can't run, such as another architecture's, so it applies to the whole unretired
+catalog. While the catalog is over it, the cluster API omits the recipe, still
+serves the policy, and logs an error on every call, so no node installs anything
+new until environments are retired. Retire them before the catalog passes it.
+
+A change to the catalog or the policy reaches nodes on their next periodic tick.
+Its writer is where a `RUNTIME_PROVISIONING` reconcile trigger belongs, enqueued
+in the same transaction, to reach them within trigger latency instead.
 
 Node-ctl validates the complete recipe's size, reference syntax and uniqueness
 before submitting work. It expands host-supported compiled environments into
@@ -1393,7 +1453,8 @@ API with at most four simultaneous polling/submission calls. The entire pass has
 a shared 30-second deadline; timeout errors identify the stage that exhausted it.
 
 Accepted jobs are durable in rtmgr. Node-ctl remembers their IDs and polls them on
-later ticks rather than submitting again. Pending downloads are normal progress,
+later ticks rather than submitting again. A job rtmgr no longer knows has expired
+without an observed failure, so node-ctl submits it afresh at once. Pending downloads are normal progress,
 not facet failures. Terminal failures and successful jobs whose bytes remain
 unverified are reported, with five minutes of backoff before a fresh submission.
 A success response gets one subsequent inventory pass to observe publication.

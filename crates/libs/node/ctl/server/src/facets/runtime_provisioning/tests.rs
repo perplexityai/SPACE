@@ -257,6 +257,8 @@ struct FakeManager {
     submission_error: Mutex<Option<Code>>,
     jobs: Mutex<Vec<runtime::Operation>>,
     poll_error: Mutex<Option<Code>>,
+    /// A job ID whose poll replies with an empty operation ID.
+    blank_polled_id: Mutex<Option<String>>,
 }
 
 impl ArtifactManager for FakeManager {
@@ -286,13 +288,18 @@ impl ArtifactManager for FakeManager {
         if let Some(code) = *self.poll_error.lock().unwrap() {
             return Err(Status::new(code, "synthetic polling error"));
         }
-        self.jobs
+        let mut operation = self
+            .jobs
             .lock()
             .unwrap()
             .iter()
             .find(|job| job.operation_id == id)
             .cloned()
-            .ok_or_else(|| Status::not_found("job missing"))
+            .ok_or_else(|| Status::not_found("job missing"))?;
+        if self.blank_polled_id.lock().unwrap().as_deref() == Some(id.as_str()) {
+            operation.operation_id.clear();
+        }
+        Ok(operation)
     }
 }
 
@@ -413,6 +420,56 @@ async fn terminal_failures_are_observed_and_retries_wait_for_backoff() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_absent_recipe_keeps_backoffs_and_an_empty_one_clears_them() {
+    let plan = InstallationPlan::new(recipe(&["e0"]), host(), catalog()).unwrap();
+    let deadline = || tokio::time::Instant::now() + RECONCILE_BUDGET;
+    for (assigned, retried) in [(None, false), (Some(recipe(&[])), true)] {
+        let manager = FakeManager {
+            submission_error: Mutex::new(Some(Code::FailedPrecondition)),
+            ..Default::default()
+        };
+        let state = Provisioning::default();
+        assert!(matches!(
+            tick(&plan, &manager, &state).await,
+            Err(ProvisioningError::Blocked { failed: 2, .. })
+        ));
+        install(assigned, &state, deadline()).await.unwrap();
+        assert!(matches!(
+            tick(&plan, &manager, &state).await,
+            Err(ProvisioningError::Blocked { failed: 2, .. })
+        ));
+        let submissions = if retried { 4 } else { 2 };
+        assert_eq!(manager.submitted.lock().unwrap().len(), submissions);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_job_that_fails_while_the_recipe_is_absent_still_backs_off() {
+    let plan = InstallationPlan::new(recipe(&["e0"]), host(), catalog()).unwrap();
+    let manager = FakeManager::default();
+    let state = Provisioning::default();
+    assert_eq!(
+        tick(&plan, &manager, &state).await.unwrap(),
+        Progress::Installing { missing: 2 }
+    );
+    install(None, &state, tokio::time::Instant::now() + RECONCILE_BUDGET)
+        .await
+        .unwrap();
+    for job in manager.jobs.lock().unwrap().iter_mut() {
+        job.state = runtime::OperationState::Failed as i32;
+        job.error = Some("synthetic failure while no recipe was assigned".into());
+    }
+    // The failure is observed on the kept job, then held for the backoff.
+    for _ in 0..2 {
+        assert!(matches!(
+            tick(&plan, &manager, &state).await,
+            Err(ProvisioningError::Blocked { failed: 2, .. })
+        ));
+    }
+    assert_eq!(manager.submitted.lock().unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn unsupported_entries_do_not_block_known_dependencies_or_claim_convergence() {
     let mut requested = recipe(&["e0"]);
@@ -489,7 +546,7 @@ fn installed_evidence_requires_exact_managed_bytes_and_a_valid_status() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn polling_preserves_active_jobs_and_retries_missing_jobs_after_backoff() {
+async fn polling_preserves_active_jobs_and_resubmits_expired_ones() {
     let plan = InstallationPlan::new(recipe(&["e0"]), host(), catalog()).unwrap();
     let manager = FakeManager::default();
     let state = Provisioning::default();
@@ -502,17 +559,14 @@ async fn polling_preserves_active_jobs_and_retries_missing_jobs_after_backoff() 
     *manager.poll_error.lock().unwrap() = None;
     tick(&plan, &manager, &state).await.unwrap();
     assert_eq!(manager.submitted.lock().unwrap().len(), 2);
+    // An expired job observed no failure, so it's resubmitted at once.
     *manager.poll_error.lock().unwrap() = Some(Code::NotFound);
-    assert!(matches!(
-        tick(&plan, &manager, &state).await,
-        Err(ProvisioningError::Blocked { failed: 2, .. })
-    ));
+    assert_eq!(
+        tick(&plan, &manager, &state).await.unwrap(),
+        Progress::Installing { missing: 2 }
+    );
+    assert_eq!(manager.submitted.lock().unwrap().len(), 4);
     *manager.poll_error.lock().unwrap() = None;
-    assert!(matches!(
-        tick(&plan, &manager, &state).await,
-        Err(ProvisioningError::Blocked { failed: 2, .. })
-    ));
-    tokio::time::advance(operations::RETRY_BACKOFF).await;
     tick(&plan, &manager, &state).await.unwrap();
     assert_eq!(manager.submitted.lock().unwrap().len(), 4);
 }
@@ -538,7 +592,9 @@ async fn operation_identity_and_action_are_checked_on_every_poll() {
             match corruption {
                 Corruption::Identity => jobs[0].identity = jobs[1].identity.clone(),
                 Corruption::Action => jobs[0].action = runtime::ArtifactAction::Uninstall as i32,
-                Corruption::EmptyId => jobs[0].operation_id.clear(),
+                Corruption::EmptyId => {
+                    *manager.blank_polled_id.lock().unwrap() = Some(jobs[0].operation_id.clone());
+                }
             }
         }
         assert!(matches!(

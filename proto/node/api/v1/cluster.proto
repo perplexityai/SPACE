@@ -1325,11 +1325,20 @@ message RuntimeProvisioningRecipe {
   // Immutable compiled environment references, not names, paths or new hashes.
   // Nodes validate the complete set before submitting any installation.
   // Omission never authorizes removal. Empty means no required installations.
+  // At most 32 entries (MAX_RECIPE_ENVIRONMENTS in the node API client); nodes
+  // refuse a larger recipe whole, and cluster APIs never send one.
   repeated string required_environments = 1;
 }
 
 message GetNodeRuntimeDesiredStateResponse {
   // Absent means no recipe is assigned; it is not an empty applied recipe.
+  // Cluster APIs assign one only with
+  // SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED on, and only to
+  // worker and builder nodes in the configured cohort: every environment in
+  // the cluster catalog that isn't retired, whatever its execution policy
+  // state. An empty catalog assigns an empty recipe. A catalog that can't be
+  // read, or that lists more than 32, omits the recipe from that response,
+  // without failing the call.
   RuntimeProvisioningRecipe recipe = 1;
   // Absent while the cluster API runs with
   // SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED off, the default, and from
