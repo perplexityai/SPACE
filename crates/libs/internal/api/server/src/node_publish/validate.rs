@@ -4,6 +4,7 @@
 //! SQL and publication diagnostics stay at their existing call sites until the
 //! complete validated publication can replace the legacy input boundary.
 
+pub(crate) mod census;
 pub(crate) mod delete_completions;
 pub(crate) mod execution_inventory;
 pub(crate) mod execution_observation;
