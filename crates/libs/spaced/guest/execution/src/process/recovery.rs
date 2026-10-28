@@ -47,7 +47,13 @@ impl ExecutionService {
         let (id, expected, activation) = match address {
             ProcessAddress::Legacy(id) => (id, None, None),
             ProcessAddress::Recovery(handle) => {
-                let activation = self.inner.recovery.launches.clone().read_owned().await;
+                let activation = self
+                    .inner
+                    .recovery
+                    .launches
+                    .clone()
+                    .try_read_owned()
+                    .map_err(|_| RecoveryReason::TemporarilyUnavailable.into_status())?;
                 self.inner.recovery.check(handle.fence)?;
                 (
                     handle.process_id,

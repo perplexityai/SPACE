@@ -59,6 +59,15 @@ async fn recovery_start_replays_before_id_collision_or_mutable_defaults() {
         .unwrap();
     request.env = HashMap::from([("B".into(), "two".into()), ("A".into(), "one".into())]);
     assert_eq!(events(&service, request.clone()).await, first);
+    let mut legacy = request.clone();
+    legacy.command = legacy.recovery.take().unwrap().command;
+    legacy.process_id = None;
+    assert_eq!(
+        pplx_space_spaced_guest_protocol::recovery::RecoveryReason::from_status(
+            &failure(&service, legacy).await
+        ),
+        Some(pplx_space_spaced_guest_protocol::recovery::RecoveryReason::StartModeMismatch),
+    );
     for mut changed in [request.clone(), request.clone(), request.clone()]
         .into_iter()
         .enumerate()

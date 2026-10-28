@@ -15,6 +15,13 @@ pub(super) enum RequestBinding {
 }
 
 impl RequestBinding {
+    pub(super) fn expired_status(self) -> Status {
+        match self {
+            Self::Legacy => Status::failed_precondition("idempotency_key expired"),
+            Self::Recovery(_) => RecoveryReason::StartKeyExpired.into_status(),
+        }
+    }
+
     pub(super) fn require_match(self, supplied: Self) -> Result<(), Status> {
         match (self, supplied) {
             (Self::Legacy, Self::Legacy) => Ok(()),
@@ -22,9 +29,7 @@ impl RequestBinding {
             (Self::Recovery(_), Self::Recovery(_)) => Err(Status::invalid_argument(
                 "idempotency_key is bound to a different start request",
             )),
-            _ => Err(Status::failed_precondition(
-                "idempotency_key belongs to a different start mode",
-            )),
+            _ => Err(RecoveryReason::StartModeMismatch.into_status()),
         }
     }
 }
@@ -81,9 +86,7 @@ impl RecoveryState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
-            None => Err(Status::unavailable(
-                "process recovery is temporarily unavailable",
-            )),
+            None => Err(RecoveryReason::TemporarilyUnavailable.into_status()),
             Some(current) if current != fence.activation => {
                 Err(RecoveryReason::ActivationChanged.into_status())
             }

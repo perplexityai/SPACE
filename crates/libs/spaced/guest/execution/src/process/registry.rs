@@ -262,24 +262,31 @@ impl ProcessRegistry {
                 Err(TryAcquireError::NoPermits) => {}
             }
 
-            let completed = self
-                .records
-                .iter()
-                .filter_map(|entry| {
-                    entry
-                        .record()?
-                        .journal
-                        .completed_at()
-                        .map(|completed_at| (entry.key().clone(), completed_at))
-                })
-                .min_by_key(|(_, completed_at)| *completed_at);
-            let Some((process_id, _)) = completed else {
+            let completed =
+                self.records
+                    .iter()
+                    .filter_map(|entry| {
+                        let record = entry.record()?;
+                        record.journal.completed_at().map(|completed_at| {
+                            (entry.key().clone(), Arc::clone(record), completed_at)
+                        })
+                    })
+                    .min_by_key(|(_, _, completed_at)| *completed_at);
+            let Some((process_id, record, _)) = completed else {
                 return Err(crate::refused(Status::resource_exhausted(
                     PROCESS_CAPACITY_MESSAGE,
                 )));
             };
-            self.records.remove(&process_id);
+            self.remove_if_current(&process_id, &record);
         }
+    }
+
+    pub(super) fn remove_if_current(&self, id: &ProcessId, record: &Arc<ProcessRecord>) {
+        self.records.remove_if(id, |_, entry| {
+            entry
+                .record()
+                .is_some_and(|current| Arc::ptr_eq(current, record))
+        });
     }
 
     pub(super) fn get_record(&self, process_id: &ProcessId) -> Option<Arc<ProcessRecord>> {
@@ -288,7 +295,7 @@ impl ProcessRegistry {
             .get(process_id)
             .and_then(|entry| entry.record().cloned())?;
         if record.journal.is_expired(self.retention.completed) {
-            self.records.remove(process_id);
+            self.remove_if_current(process_id, &record);
             return None;
         }
         Some(record)
@@ -389,7 +396,7 @@ impl ProcessRegistry {
             .filter_map(|entry| {
                 let record = entry.record()?;
                 if record.journal.is_expired(self.retention.completed) {
-                    expired.push(entry.key().clone());
+                    expired.push((entry.key().clone(), Arc::clone(record)));
                     return None;
                 }
                 let Some((exit, ended_at)) = record.journal.ended() else {
@@ -412,8 +419,8 @@ impl ProcessRegistry {
                 })
             })
             .collect();
-        for process_id in expired {
-            self.records.remove(&process_id);
+        for (process_id, record) in expired {
+            self.remove_if_current(&process_id, &record);
         }
         listed
     }

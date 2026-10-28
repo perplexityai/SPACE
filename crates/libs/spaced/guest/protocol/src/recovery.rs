@@ -6,6 +6,7 @@ use pplx_space_common_core::types::{
 use tonic::Status;
 
 pub const START_CONTRACT_VERSION: u32 = 1;
+pub const CONTROL_CONTRACT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryFence {
@@ -69,6 +70,9 @@ pub enum RecoveryReason {
     EngineRestarted,
     ActivationChanged,
     ProcessReplaced,
+    TemporarilyUnavailable,
+    StartModeMismatch,
+    StartKeyExpired,
 }
 
 impl RecoveryReason {
@@ -78,16 +82,26 @@ impl RecoveryReason {
             Self::EngineRestarted => "engine_restarted",
             Self::ActivationChanged => "activation_changed",
             Self::ProcessReplaced => "process_replaced",
+            Self::TemporarilyUnavailable => "temporarily_unavailable",
+            Self::StartModeMismatch => "start_mode_mismatch",
+            Self::StartKeyExpired => "start_key_expired",
         }
     }
     pub fn into_status(self) -> Status {
         let message = match self {
             Self::UnsupportedContract => "unsupported process recovery contract version",
             Self::EngineRestarted => "execution engine restarted",
-            Self::ActivationChanged => "execution activation changed or recovery is disabled",
+            Self::ActivationChanged => "execution activation changed",
             Self::ProcessReplaced => "process incarnation changed",
+            Self::TemporarilyUnavailable => "process recovery is temporarily unavailable",
+            Self::StartModeMismatch => "idempotency_key belongs to a different start mode",
+            Self::StartKeyExpired => "idempotency_key expired",
         };
-        let mut status = Status::failed_precondition(message);
+        let mut status = if self == Self::TemporarilyUnavailable {
+            Status::unavailable(message)
+        } else {
+            Status::failed_precondition(message)
+        };
         status.metadata_mut().insert(
             RECOVERY_REASON_METADATA_KEY,
             tonic::metadata::MetadataValue::from_static(self.as_str()),
@@ -120,6 +134,9 @@ impl std::str::FromStr for RecoveryReason {
             "engine_restarted" => Self::EngineRestarted,
             "activation_changed" => Self::ActivationChanged,
             "process_replaced" => Self::ProcessReplaced,
+            "temporarily_unavailable" => Self::TemporarilyUnavailable,
+            "start_mode_mismatch" => Self::StartModeMismatch,
+            "start_key_expired" => Self::StartKeyExpired,
             _ => return Err(ParseRecoveryReason),
         })
     }
@@ -143,7 +160,7 @@ pub fn validate_handle(
     let Some(recovery) = recovery else {
         return Ok(None);
     };
-    if recovery.contract_version != 1 {
+    if recovery.contract_version != CONTROL_CONTRACT_VERSION {
         return Err(RecoveryReason::UnsupportedContract.into_status());
     }
     if !legacy_id.is_empty() {

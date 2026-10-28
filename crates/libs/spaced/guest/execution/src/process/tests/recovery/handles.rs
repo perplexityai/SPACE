@@ -102,6 +102,8 @@ async fn fenced_pipe_controls_and_completed_reconnect_use_the_original_record() 
     .unwrap();
     assert_eq!(output(&service, handle.clone()).await, b"one copy\n");
     assert_eq!(output(&service, handle.clone()).await, b"one copy\n");
+    let id = ProcessId::parse(&handle.process_id).unwrap();
+    let original = service.inner.processes.get_record(&id).unwrap();
     // Reusing an ID never turns an old handle into control of its replacement.
     service
         .inner
@@ -120,6 +122,11 @@ async fn fenced_pipe_controls_and_completed_reconnect_use_the_original_record() 
         ..Default::default()
     };
     events(&service, replacement).await;
+    service.inner.processes.remove_if_current(&id, &original);
+    assert!(
+        service.inner.processes.get_record(&id).is_some(),
+        "stale cleanup must preserve a replacement"
+    );
     let error = connect(&service, handle).await.err().unwrap();
     assert_eq!(
         RecoveryReason::from_status(&error),

@@ -322,7 +322,7 @@ impl Process for ExecutionService {
                 .launches
                 .clone()
                 .try_read_owned()
-                .map_err(|_| Status::unavailable("process recovery is temporarily unavailable"))?;
+                .map_err(|_| pplx_space_spaced_guest_protocol::recovery::RecoveryReason::TemporarilyUnavailable.into_status())?;
             let permit = crate::payload::acquire(
                 &self.inner.process_payload_slots,
                 pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
