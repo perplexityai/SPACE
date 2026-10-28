@@ -12,6 +12,7 @@ pub(crate) mod quarantine_claims;
 pub(crate) mod quarantine_persistence;
 pub(crate) mod ready_suspend;
 pub(crate) mod sandbox_facet_observations;
+pub(crate) mod sandbox_input;
 pub(crate) mod snapshot_inventory;
 pub(crate) mod suspend_finalization;
 pub(crate) mod template_components;
@@ -22,7 +23,7 @@ pub(crate) mod template_pruning;
 use crate::auto_lifecycle_delete_completions::consume_validated_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
 use crate::node_publish::outcome::PublishOutcome;
-use crate::node_publish::validate::ValidatedPublish;
+use crate::node_publish::plan::PublishPlan;
 use crate::published_state::{
     ApplySandboxClaimsError, ApplyTemplateClaimsError, publish_validated_sandbox_states,
     publish_validated_template_states,
@@ -67,9 +68,9 @@ pub(crate) enum ApplyPublishError {
 /// publication write. A successful commit is required to produce an outcome.
 pub(crate) async fn apply(
     pool: &PgPool,
-    publish: ValidatedPublish,
+    plan: PublishPlan,
 ) -> Result<PublishOutcome, ApplyPublishError> {
-    let ValidatedPublish {
+    let PublishPlan {
         origin,
         reported_window,
         node_status,
@@ -82,7 +83,7 @@ pub(crate) async fn apply(
         pending_local_backups,
         delete_completions,
         delete_completions_received: auto_lifecycle_delete_completions_received,
-    } = publish;
+    } = plan;
     let sandbox_inventory_complete = sandbox_census.claimed_complete();
     let template_inventory_complete = template_census.is_some();
     for diagnostic in census_diagnostics {
@@ -102,7 +103,7 @@ pub(crate) async fn apply(
     let templates_accepted =
         publish_validated_template_states(&mut tx, origin.id, templates).await?;
     let sandbox_publication =
-        publish_validated_sandbox_states(&mut tx, origin.id, sandboxes).await?;
+        publish_validated_sandbox_states(&mut tx, origin.id, &sandboxes).await?;
     let execution_observation =
         crate::execution_observation::publish(&mut tx, execution_observation).await?;
     // Produce the census-freshness verdict from the branch that prunes,

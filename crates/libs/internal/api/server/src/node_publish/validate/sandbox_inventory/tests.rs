@@ -1,4 +1,6 @@
 use super::*;
+use crate::node_publish::plan::sandboxes::SandboxPlan;
+use crate::node_publish::store::sandbox_input::LegacySandboxInput;
 use pplx_space_sbx_mgr_client::proto::SnapshotDetail;
 
 fn state(id: u128) -> PublishedSandboxState {
@@ -12,7 +14,7 @@ fn state(id: u128) -> PublishedSandboxState {
 
 #[test]
 fn duplicate_resolution_precedes_field_validation_and_preserves_absence() {
-    let input = ValidatedSandboxInventory::from_proto(&[
+    let plan = SandboxPlan::from(ValidatedSandboxInventory::from_proto(&[
         PublishedSandboxState {
             pid: Some(u32::MAX),
             ..state(1)
@@ -36,8 +38,8 @@ fn duplicate_resolution_precedes_field_validation_and_preserves_absence() {
             status: Some(" StArTeD ".to_owned()),
             ..state(1)
         },
-    ])
-    .into_legacy_input();
+    ]));
+    let input = LegacySandboxInput::from(&plan);
     assert_eq!(input.rows.len(), 1);
     assert_eq!(input.rows[0]["sandbox_id"], state(1).sandbox_id);
     assert_eq!(input.rows[0]["status"], "StArTeD");
@@ -86,7 +88,7 @@ fn incomplete_rich_evidence_drops_only_its_own_snapshots_policy_and_quarantine_c
             "explicitly-degraded" => rejected.state_degraded = true,
             _ => unreachable!(),
         }
-        let input = ValidatedSandboxInventory::from_proto(&[
+        let plan = SandboxPlan::from(ValidatedSandboxInventory::from_proto(&[
             PublishedSandboxState {
                 snapshots: vec![SnapshotDetail {
                     id: "keep-later".to_owned(),
@@ -102,8 +104,8 @@ fn incomplete_rich_evidence_drops_only_its_own_snapshots_policy_and_quarantine_c
                 }],
                 ..state(1)
             },
-        ])
-        .into_legacy_input();
+        ]));
+        let input = LegacySandboxInput::from(&plan);
         assert_eq!(input.rows.len(), 2, "{rejection}");
         assert_eq!(input.snapshot_rows.len(), 2, "{rejection}");
         assert_eq!(

@@ -17,34 +17,23 @@ use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::proto::PublishedSandboxState;
 
 #[derive(Debug)]
-struct ObservedSandboxClaim {
-    observation: ValidatedSandboxObservation,
-    receipt: Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
-    recovery: QuarantineRecoveryProjectionState,
-    quarantine: Option<QuarantineClaim>,
-    snapshots: Vec<SnapshotClaim>,
+pub(in crate::node_publish) struct ObservedSandboxClaim {
+    pub(in crate::node_publish) observation: ValidatedSandboxObservation,
+    pub(in crate::node_publish) receipt:
+        Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
+    pub(in crate::node_publish) recovery: QuarantineRecoveryProjectionState,
+    pub(in crate::node_publish) quarantine: Option<QuarantineClaim>,
+    pub(in crate::node_publish) snapshots: Vec<SnapshotClaim>,
 }
 
 /// A batch of node claims, without database decisions or generated identifiers.
 #[derive(Debug, Default)]
 pub(crate) struct ValidatedSandboxInventory {
-    absent_ids: Vec<SandboxId>,
-    observations: Vec<ObservedSandboxClaim>,
-    state_only: BTreeMap<SandboxId, Option<PublishedSandboxStatus>>,
-    failure_episodes: Vec<FailureEpisodeClaim>,
-    diagnostics: Vec<SandboxDiagnostic>,
-}
-
-/// Persistence encoding for the existing statements, not guarded row changes.
-#[derive(Debug)]
-pub(crate) struct LegacySandboxInput {
-    pub(crate) absent_ids: Vec<SandboxId>,
-    pub(crate) rows: Vec<serde_json::Value>,
-    pub(crate) state_only: Vec<DegradedSandboxClaim>,
-    pub(crate) failure_episode_rows: Vec<FailureEpisodeClaim>,
-    pub(crate) snapshot_rows: Vec<SnapshotClaim>,
-    pub(crate) quarantine_inputs: Vec<QuarantineClaim>,
-    pub(crate) publishes_network_policy: bool,
+    pub(in crate::node_publish) absent_ids: Vec<SandboxId>,
+    pub(in crate::node_publish) observations: Vec<ObservedSandboxClaim>,
+    pub(in crate::node_publish) state_only: BTreeMap<SandboxId, Option<PublishedSandboxStatus>>,
+    pub(in crate::node_publish) failure_episodes: Vec<FailureEpisodeClaim>,
+    pub(in crate::node_publish) diagnostics: Vec<SandboxDiagnostic>,
 }
 
 /// Presence and optional status survive when a rich observation is unusable.
@@ -64,6 +53,12 @@ impl DegradedSandboxClaim {
             "sandbox_id": self.sandbox_id,
             "status": self.status.as_ref().map(PublishedSandboxStatus::as_str),
         })
+    }
+}
+
+impl From<(SandboxId, Option<PublishedSandboxStatus>)> for DegradedSandboxClaim {
+    fn from((sandbox_id, status): (SandboxId, Option<PublishedSandboxStatus>)) -> Self {
+        Self { sandbox_id, status }
     }
 }
 
@@ -121,44 +116,6 @@ impl ValidatedSandboxInventory {
             }
         }
         inventory
-    }
-
-    pub(crate) fn diagnostics(&self) -> &[SandboxDiagnostic] {
-        &self.diagnostics
-    }
-
-    pub(crate) fn into_legacy_input(self) -> LegacySandboxInput {
-        let mut input = LegacySandboxInput {
-            absent_ids: self.absent_ids,
-            rows: Vec::with_capacity(self.observations.len()),
-            state_only: self
-                .state_only
-                .into_iter()
-                .map(|(sandbox_id, status)| DegradedSandboxClaim { sandbox_id, status })
-                .collect(),
-            failure_episode_rows: self.failure_episodes,
-            snapshot_rows: Vec::new(),
-            quarantine_inputs: Vec::new(),
-            publishes_network_policy: false,
-        };
-        for claim in self.observations {
-            let (recovery, recovery_degraded) = match &claim.recovery {
-                QuarantineRecoveryProjectionState::Absent => (None, false),
-                QuarantineRecoveryProjectionState::Degraded => (None, true),
-                QuarantineRecoveryProjectionState::Observed(observation) => {
-                    (Some(observation), false)
-                }
-            };
-            input.publishes_network_policy |= claim.observation.publishes_network_policy();
-            input.rows.push(claim.observation.legacy_row(
-                claim.receipt.as_ref(),
-                recovery,
-                recovery_degraded,
-            ));
-            input.snapshot_rows.extend(claim.snapshots);
-            input.quarantine_inputs.extend(claim.quarantine);
-        }
-        input
     }
 }
 

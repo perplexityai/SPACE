@@ -48,9 +48,11 @@ compatible with these requests and replies.
 
 The API records desired state in PostgreSQL. Controllers and worker services reconcile the running system with that state, so an accepted request is not a readiness signal.
 
-Node publications parse their evidence before opening the publication
-transaction. The [publication store](../crates/libs/internal/api/server/src/node_publish/store/mod.rs)
-applies that evidence with the existing database guards and row-lock order,
+Node publications parse their evidence and build a typed claim plan before
+opening the publication transaction. The plan groups sandbox observations,
+snapshots, quarantine claims and failure evidence; it does not decide final
+database row changes. The [publication store](../crates/libs/internal/api/server/src/node_publish/store/mod.rs)
+applies those claims with the existing database guards and row-lock order,
 replaces the pending-backup set before stamping its freshness, and evaluates
 delete receipts after sandbox, execution, pruning, and node-status writes.
 All phases share one transaction; only a successful commit produces the outcome

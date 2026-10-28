@@ -3,5 +3,6 @@
 pub(crate) mod diagnostics;
 mod errors;
 pub(crate) mod outcome;
+pub(crate) mod plan;
 pub(crate) mod store;
 pub(crate) mod validate;

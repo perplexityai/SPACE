@@ -1,4 +1,5 @@
 use super::*;
+use crate::node_publish::plan::PublishPlan;
 use crate::node_publish::store;
 use crate::node_publish::validate::ValidatedPublish;
 use crate::node_publish::validate::node_role::PublicationRoleIntent;
@@ -18,7 +19,8 @@ impl ClusterApiService {
             .await?;
         role_intent.validate_authenticated_role(origin.role)?;
         let publish = ValidatedPublish::try_from_proto(origin, request.into_inner())?;
-        let outcome = store::apply(&self.pool, publish).await?;
+        let plan = PublishPlan::from(publish);
+        let outcome = store::apply(&self.pool, plan).await?;
         Ok(Response::new(outcome.emit_post_commit()))
     }
 }

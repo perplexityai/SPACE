@@ -20,6 +20,8 @@ use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 
+use crate::node_publish::plan::sandboxes::SandboxPlan;
+use crate::node_publish::store::sandbox_input::LegacySandboxInput;
 use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes,
     inventory_reconcile::{self, enqueue as queue_policy_reconcile_refs_for_new_inventory},
@@ -36,7 +38,7 @@ use crate::node_publish::validate::quarantine::{
 };
 use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
 use crate::node_publish::validate::sandbox_inventory::{
-    DegradedSandboxClaim, LegacySandboxInput, ValidatedSandboxInventory,
+    DegradedSandboxClaim, ValidatedSandboxInventory,
 };
 use crate::node_publish::validate::templates::ValidatedTemplateInventory;
 use crate::proto::PublishedSandboxState;
@@ -344,7 +346,8 @@ pub async fn publish_sandbox_states(
     states: &[PublishedSandboxState],
 ) -> Result<SandboxPublicationOutcome, Status> {
     let inventory = ValidatedSandboxInventory::from_proto(states);
-    publish_validated_sandbox_states(conn, node_id, inventory)
+    let plan = SandboxPlan::from(inventory);
+    publish_validated_sandbox_states(conn, node_id, &plan)
         .await
         .map_err(Status::from)
 }
@@ -425,9 +428,9 @@ pub(crate) enum ApplySandboxClaimsError {
 pub(crate) async fn publish_validated_sandbox_states(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    inventory: ValidatedSandboxInventory,
+    plan: &SandboxPlan,
 ) -> Result<SandboxPublicationOutcome, ApplySandboxClaimsError> {
-    for diagnostic in inventory.diagnostics() {
+    for diagnostic in &plan.diagnostics {
         diagnostic.emit(node_id);
     }
     let LegacySandboxInput {
@@ -438,16 +441,16 @@ pub(crate) async fn publish_validated_sandbox_states(
         snapshot_rows,
         quarantine_inputs,
         publishes_network_policy,
-    } = inventory.into_legacy_input();
+    } = LegacySandboxInput::from(plan);
     let mut post_commit_events = Vec::new();
     let mut post_commit_state_convergence = Vec::new();
 
-    let mut accepted = absent_sandboxes::remove(&mut *conn, node_id, &absent_ids).await?;
+    let mut accepted = absent_sandboxes::remove(&mut *conn, node_id, absent_ids).await?;
 
-    let degraded_accepted = degraded_observations::upsert(&mut *conn, node_id, &state_only).await?;
+    let degraded_accepted = degraded_observations::upsert(&mut *conn, node_id, state_only).await?;
     accepted = accepted.saturating_add(degraded_accepted);
 
-    failure_episodes::reconcile(&mut *conn, node_id, &failure_episode_rows).await?;
+    failure_episodes::reconcile(&mut *conn, node_id, failure_episode_rows).await?;
 
     if rows.is_empty() {
         return Ok(SandboxPublicationOutcome {
@@ -692,7 +695,7 @@ pub(crate) async fn publish_validated_sandbox_states(
         network_policy::clear_apply_failure(conn, node_id, rows_json.clone()).await?;
     }
 
-    snapshot_inventory::replace(conn, &accepted_ids, &snapshot_rows).await?;
+    snapshot_inventory::replace(conn, &accepted_ids, snapshot_rows).await?;
     accepted = accepted.saturating_add(usize_to_u64(accepted_ids.len()));
     Ok(SandboxPublicationOutcome {
         accepted,

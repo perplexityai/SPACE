@@ -14,9 +14,10 @@
 //! a deployment that needs private wiring can supply its own `main` against
 //! this library without copying any of the service.
 //!
-//! Node publication parses evidence in `node_publish::validate` and applies it
-//! through `node_publish::store` in one transaction. The committed outcome owns
-//! the post-commit events and response.
+//! Node publication parses evidence in `node_publish::validate`, groups typed
+//! claims in `node_publish::plan`, and applies them through `node_publish::store`
+//! in one transaction. Only the store evaluates lifecycle guards; the committed
+//! outcome owns the post-commit events and response.
 pub use pplx_space_common_svc::auth;
 pub use pplx_space_node_api_client::proto;
 
