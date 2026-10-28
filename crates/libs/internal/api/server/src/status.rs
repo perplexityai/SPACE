@@ -461,32 +461,9 @@ pub(super) async fn upsert_node_status_from_publish(
     Ok(())
 }
 
-pub(super) fn db_role_from_proto(role: i32) -> Result<SpaceNodeRole, Status> {
-    if role == ProtoNodeRole::Worker as i32 {
-        Ok(SpaceNodeRole::Worker)
-    } else if role == ProtoNodeRole::Builder as i32 {
-        Ok(SpaceNodeRole::Builder)
-    } else if role == ProtoNodeRole::Cluster as i32 {
-        Ok(SpaceNodeRole::Cluster)
-    } else {
-        Err(Status::invalid_argument(format!(
-            "unknown node role {role}"
-        )))
-    }
-}
-
-pub(super) fn optional_db_role_from_proto(
-    role: Option<i32>,
-) -> Result<Option<SpaceNodeRole>, Status> {
-    role.map(db_role_from_proto).transpose()
-}
-
-pub(super) fn db_role_from_proto_or_default(
-    role: Option<i32>,
-    default: SpaceNodeRole,
-) -> Result<SpaceNodeRole, Status> {
-    optional_db_role_from_proto(role).map(|role| role.unwrap_or(default))
-}
+pub(super) use crate::node_publish::validate::node_role::{
+    db_role_from_proto, db_role_from_proto_or_default, optional_db_role_from_proto,
+};
 
 pub(super) fn proto_role_from_db(role: &str) -> Result<i32, Status> {
     let role = SpaceNodeRole::parse(role).map_err(|error| {
