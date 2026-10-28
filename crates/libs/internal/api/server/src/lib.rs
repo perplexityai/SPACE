@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Cluster control-plane gRPC API (`ClusterApi`) backed by the Postgres
 //! cluster-state SSOT. Extracted from `pplx-space-node-api-server` (the former
 //! `--role cluster` surface of `space-node-api-svc`).
