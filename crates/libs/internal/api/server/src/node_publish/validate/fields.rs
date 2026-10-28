@@ -1,8 +1,10 @@
-use pplx_space_common_core::types::{ArtifactOrigin, ExecutionMetadata};
+use pplx_space_common_core::types::{ArtifactOrigin, ExecutionMetadata, RuntimeKind};
 use time::format_description::well_known::Rfc3339;
 use tonic::Status;
 
+#[derive(Debug)]
 pub(crate) struct ExecutionProjection {
+    runtime_kind: RuntimeKind,
     pub(crate) runtime: String,
     pub(crate) runtime_version: String,
     pub(crate) guest_os: String,
@@ -11,6 +13,12 @@ pub(crate) struct ExecutionProjection {
     pub(crate) state_format_version: Option<String>,
     pub(crate) metadata: serde_json::Value,
     pub(crate) components: Vec<ArtifactComponentProjection>,
+}
+
+impl ExecutionProjection {
+    pub(crate) fn runtime_kind(&self) -> RuntimeKind {
+        self.runtime_kind
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -44,6 +52,7 @@ fn projection_from_execution(execution: ExecutionMetadata) -> Result<ExecutionPr
         })
         .collect();
     Ok(ExecutionProjection {
+        runtime_kind: execution.runtime().kind,
         runtime: execution.runtime().kind.alias().to_string(),
         runtime_version: execution.runtime().version.to_string(),
         guest_os: execution.guest().os.to_string(),

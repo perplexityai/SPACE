@@ -11,10 +11,10 @@ use uuid::Uuid;
 
 use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::{
-    ArtifactKind, ExecutionGeneration, NodeRole, PodUid, PolicyAuthority, RuntimeKind,
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptKind, SandboxTransitionTargetState, SemVer,
+    ArtifactKind, ExecutionGeneration, NodeRole, PodUid, SandboxActivationAttemptId, SandboxId,
+    SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SemVer,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -49,6 +49,7 @@ use crate::node_publish::validate::quarantine::{
 };
 use crate::node_publish::validate::receipts::{self, PublishedTransitionReceiptError};
 use crate::node_publish::validate::sandbox_identity::SandboxIdentityEvidence;
+use crate::node_publish::validate::sandbox_metadata::{PublishedRuntimeLabel, policy_authority};
 use crate::node_publish::validate::snapshots::snapshot_json;
 use crate::node_publish::validate::templates::template_state_row;
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
@@ -1276,27 +1277,18 @@ pub async fn publish_sandbox_states(
             let execution = execution_projection(state.execution.as_ref())?;
             let spaced_version =
                 published_spaced_version(node_id, sandbox_uuid, state.spaced_version.as_deref());
-            if let Some(execution) = execution.as_ref()
-                && let Some(runtime) = optional_trimmed(state.runtime.as_deref())
-            {
-                let runtime = RuntimeKind::parse(&runtime)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                let execution_runtime = RuntimeKind::parse(&execution.runtime)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                if runtime != execution_runtime {
-                    return Err(Status::invalid_argument(
-                        "published sandbox runtime disagrees with execution metadata",
-                    ));
-                }
-            }
+            let runtime = PublishedRuntimeLabel::try_from_proto(
+                state.runtime.as_deref(),
+                execution.as_ref(),
+            )?;
             let identity =
                 SandboxIdentityEvidence::try_from_proto(state, transition_receipt.as_ref())?;
             let mut row = serde_json::json!({
                 "sandbox_id": sandbox_uuid,
                 "status": optional_trimmed(state.status.as_deref()),
                 "template": optional_trimmed(state.template.as_deref()),
-                "runtime": optional_trimmed(state.runtime.as_deref())
-                    .or_else(|| execution.as_ref().map(|execution| execution.runtime.clone())),
+                "runtime": runtime.as_ref().map(PublishedRuntimeLabel::as_str)
+                    .or_else(|| execution.as_ref().map(|execution| execution.runtime.as_str())),
                 "spaced_version": spaced_version.as_ref().map(ToString::to_string),
                 "runtime_version": execution.as_ref().map(|execution| execution.runtime_version.clone()),
                 "guest_os": execution.as_ref().map(|execution| execution.guest_os.clone()),
@@ -1338,16 +1330,12 @@ pub async fn publish_sandbox_states(
                 "observed_network_policy_source": network_policy_source_str(
                     state.observed_network_policy_source,
                 ),
-                "observed_network_policy_authority": PolicyAuthority::from_optional_proto(
+                "observed_network_policy_authority": policy_authority(
                     state.observed_network_policy_authority,
-                )
-                .map(|authority| authority.map(|authority| authority.as_str()))
-                .map_err(|error| Status::invalid_argument(error.to_string()))?,
-                "auto_lifecycle_authority": PolicyAuthority::from_optional_proto(
+                )?.map(|authority| authority.as_str()),
+                "auto_lifecycle_authority": policy_authority(
                     state.auto_lifecycle_authority,
-                )
-                .map(|authority| authority.map(|authority| authority.as_str()))
-                .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                )?.map(|authority| authority.as_str()),
                 "quarantine_reason_code": optional_trimmed(state.quarantine_reason_code.as_deref()),
                 "transition_receipt_id": transition_receipt.map(|receipt| receipt.id().as_uuid()),
                 "transition_receipt_kind": transition_receipt.map(|receipt| receipt.kind().as_str()),
