@@ -1,4 +1,6 @@
-use pplx_space_common_core::types::{Arch, AutoLifecyclePolicy, PolicyAuthority, RuntimeKind};
+use pplx_space_common_core::types::{
+    Arch, AutoLifecyclePolicy, NodeRole, PolicyAuthority, RuntimeKind,
+};
 use pplx_space_template_mgr_client::proto::SnapshotInfo;
 use tonic::Status;
 
@@ -8,6 +10,43 @@ use super::fields::{
 };
 use crate::proto::PublishedTemplateState;
 use crate::{optional_trimmed, proto_network_policy_to_common, trimmed_required};
+
+/// Checked template publication input. Labels retain the legacy inventory
+/// grammar, which is intentionally broader than template-creation path names.
+#[derive(Debug)]
+pub(crate) struct ValidatedTemplateInventory {
+    absent_templates: Vec<String>,
+    rows: Vec<serde_json::Value>,
+}
+
+impl ValidatedTemplateInventory {
+    pub(crate) fn try_from_proto(
+        publisher_role: NodeRole,
+        states: &[PublishedTemplateState],
+    ) -> Result<Self, Status> {
+        let include_template_metadata = publisher_role == NodeRole::Builder;
+        let mut absent_templates = Vec::new();
+        let mut rows = Vec::new();
+        for state in states {
+            // Identity rejection precedes optional metadata rejection, even for
+            // an absence claim. Do not deduplicate conflicting declarations.
+            let template = trimmed_required(&state.template, "template")?;
+            if !state.present {
+                absent_templates.push(template);
+                continue;
+            }
+            rows.push(template_state_row(state, include_template_metadata)?);
+        }
+        Ok(Self {
+            absent_templates,
+            rows,
+        })
+    }
+
+    pub(crate) fn into_legacy_rows(self) -> (Vec<String>, Vec<serde_json::Value>) {
+        (self.absent_templates, self.rows)
+    }
+}
 
 pub(crate) fn template_state_row(
     state: &PublishedTemplateState,
