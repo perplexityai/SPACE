@@ -605,16 +605,21 @@ async fn quarantine_recovery_observation_is_validated_stored_and_cleared() -> Te
     let local_quarantine_id = Uuid::now_v7();
     insert_ready_worker_node(&db.pool, node_id).await?;
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "restoring").await?;
+    let neighbor_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, neighbor_id, node_id, "started").await?;
     sqlx::query(
         "INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_generation, observed_payload,
              observed_at, updated_at
          )
-         VALUES ($1, $2, $3, 42, '{\"other\": {\"value\": 1}}'::JSONB, NOW(), NOW())",
+         VALUES ($1, $2, $3, 42, '{\"other\": {\"value\": 1}}'::JSONB, NOW(), NOW()),
+                ($1, $2, $4, 42, $5::JSONB, NOW(), NOW())",
     )
     .bind(node_id)
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(sandbox_id.to_string())
+    .bind(neighbor_id.to_string())
+    .bind(serde_json::json!({"quarantine_recovery": {"attempt_count": 1}}))
     .execute(&db.pool)
     .await?;
 
@@ -639,8 +644,27 @@ async fn quarantine_recovery_observation_is_validated_stored_and_cleared() -> Te
         },
     );
     let mut conn = db.pool.acquire().await?;
-    publish_sandbox_states(&mut conn, node_id, &[state.clone()]).await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[
+            state.clone(),
+            published_sandbox_state(neighbor_id, "started"),
+        ],
+    )
+    .await?;
     drop(conn);
+    let neighbor_has_recovery: bool = sqlx::query_scalar(
+        "SELECT observed_payload ? 'quarantine_recovery'
+         FROM node_facet_observed_status
+         WHERE node_id = $1 AND facet = $2 AND element = $3",
+    )
+    .bind(node_id)
+    .bind(FACET_SANDBOX_DESIRED_STATE)
+    .bind(neighbor_id.to_string())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(!neighbor_has_recovery);
 
     let (payload, observed_generation, first_observed_at, first_updated_at): (
         serde_json::Value,

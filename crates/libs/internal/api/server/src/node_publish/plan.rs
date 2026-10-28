@@ -18,6 +18,7 @@ use sandboxes::SandboxPlan;
 
 pub(crate) mod activation;
 pub(crate) mod lifecycle;
+pub(crate) mod recovery_observation;
 pub(crate) mod sandboxes;
 pub(crate) mod suspended;
 

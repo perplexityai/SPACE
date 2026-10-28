@@ -5,6 +5,10 @@ use pplx_space_common_core::{
 use pplx_space_common_svc::types::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use sqlx::{PgConnection, types::Json};
 
+use crate::node_publish::plan::recovery_observation::{
+    ClearRecoveryObservationClaim, RecoveryObservationClaim,
+};
+
 const QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS: i64 = 60 * 60;
 
 #[derive(Debug, thiserror::Error)]
@@ -100,8 +104,24 @@ pub(crate) async fn upsert_suspend_handoff(
 pub(crate) async fn reconcile_quarantine_recovery(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    observations: &[RecoveryObservationClaim],
+    clears: &[ClearRecoveryObservationClaim],
 ) -> Result<bool, ReconcileRecoveryObservationError> {
+    let written = upsert_quarantine_recovery(conn, node_id, observations).await?;
+    let cleared = clear_quarantine_recovery(conn, node_id, clears).await?;
+    Ok(written || cleared)
+}
+
+/// Update only supplied evidence, under the facet-row write lock. Identical
+/// evidence remains unchanged until its heartbeat; false means no row changed.
+async fn upsert_quarantine_recovery(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+    claims: &[RecoveryObservationClaim],
+) -> Result<bool, ReconcileRecoveryObservationError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
     let written = sqlx::query(sql!(
         "WITH input AS (
              SELECT sandbox_id, quarantine_recovery_payload,
@@ -145,12 +165,25 @@ pub(crate) async fn reconcile_quarantine_recovery(
                < NOW() - make_interval(secs => $4::BIGINT)"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(claims))
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
     .execute(&mut *conn)
     .await
     .map_err(ReconcileRecoveryObservationError::Upsert)?;
+    Ok(written.rows_affected() != 0)
+}
+
+/// Clear only explicitly omitted evidence, locking matching facet rows. Missing
+/// keys are a no-op, and a degraded report cannot enter this claim slice.
+async fn clear_quarantine_recovery(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+    claims: &[ClearRecoveryObservationClaim],
+) -> Result<bool, ReconcileRecoveryObservationError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
     let cleared = sqlx::query(sql!(
         "WITH input AS (
              SELECT sandbox_id, quarantine_recovery_payload,
@@ -179,10 +212,10 @@ pub(crate) async fn reconcile_quarantine_recovery(
            AND observed.observed_payload ? 'quarantine_recovery'"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(claims))
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .execute(&mut *conn)
     .await
     .map_err(ReconcileRecoveryObservationError::Clear)?;
-    Ok(written.rows_affected() != 0 || cleared.rows_affected() != 0)
+    Ok(cleared.rows_affected() != 0)
 }

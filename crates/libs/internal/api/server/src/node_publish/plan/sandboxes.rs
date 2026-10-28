@@ -5,6 +5,7 @@ use pplx_space_common_core::types::{
 
 use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
 use super::lifecycle::{FailedClaim, RestoreClaim, StoppedClaim};
+use super::recovery_observation::{ClearRecoveryObservationClaim, RecoveryObservationClaim};
 use super::suspended::SuspendedClaim;
 use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::node_publish::validate::{
@@ -36,6 +37,8 @@ pub(crate) struct SandboxPlan {
     pub(crate) failed: Vec<FailedClaim>,
     pub(crate) activation_completions: Vec<ActivationCompletionClaim>,
     pub(crate) activation_rollbacks: Vec<ActivationRollbackClaim>,
+    pub(crate) recovery_observations: Vec<RecoveryObservationClaim>,
+    pub(crate) clear_recovery_observations: Vec<ClearRecoveryObservationClaim>,
     pub(crate) state_only: Vec<DegradedSandboxClaim>,
     pub(crate) failure_episodes: Vec<FailureEpisodeClaim>,
     pub(crate) snapshots: Vec<SnapshotClaim>,
@@ -55,6 +58,8 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             failed: Vec::new(),
             activation_completions: Vec::new(),
             activation_rollbacks: Vec::new(),
+            recovery_observations: Vec::new(),
+            clear_recovery_observations: Vec::new(),
             state_only: inventory.state_only.into_iter().map(Into::into).collect(),
             failure_episodes: inventory.failure_episodes,
             snapshots: Vec::new(),
@@ -63,6 +68,21 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             publishes_network_policy: false,
         };
         for claim in inventory.observations {
+            match &claim.recovery {
+                QuarantineRecoveryProjectionState::Observed(observation) => {
+                    plan.recovery_observations.push(RecoveryObservationClaim {
+                        sandbox_id: claim.observation.sandbox_id(),
+                        observation: observation.clone(),
+                    });
+                }
+                QuarantineRecoveryProjectionState::Absent => {
+                    plan.clear_recovery_observations
+                        .push(ClearRecoveryObservationClaim {
+                            sandbox_id: claim.observation.sandbox_id(),
+                        });
+                }
+                QuarantineRecoveryProjectionState::Degraded => {}
+            }
             if let Some(receipt) = claim.receipt.as_ref() {
                 match receipt.kind() {
                     SandboxTransitionReceiptKind::ActivationCompleted => {

@@ -500,7 +500,13 @@ pub(crate) async fn publish_validated_sandbox_states(
             changed_at: row.state_changed_at?,
         })
     }));
-    sandbox_facet_observations::reconcile_quarantine_recovery(conn, node_id, &rows_json).await?;
+    sandbox_facet_observations::reconcile_quarantine_recovery(
+        conn,
+        node_id,
+        &plan.recovery_observations,
+        &plan.clear_recovery_observations,
+    )
+    .await?;
     activity::update(conn, node_id, &rows_json).await?;
 
     let first_seen_sandbox_ids = accepted_rows
