@@ -10,6 +10,7 @@ use pplx_space_node_api_client::proto::{
     PublishedTemplateState,
 };
 use pplx_space_publish_load::{Args, Node, service::LocalService, store};
+use pplx_space_sbx_mgr_client::proto::{SnapshotDetail, SnapshotType};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -26,6 +27,8 @@ enum ScenarioKind {
     Templates,
     OrdinarySingle,
     FullInventory,
+    SnapshotInventory,
+    ClearSnapshotInventory,
     FailureEvidence,
     ClearFailureEvidence,
     Degraded,
@@ -159,6 +162,8 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
         full.sandboxes.clone_from(&node.sandboxes);
         scenarios.push(capture(db, &service, ScenarioKind::FullInventory, full).await?);
         for name in [
+            ScenarioKind::SnapshotInventory,
+            ScenarioKind::ClearSnapshotInventory,
             ScenarioKind::FailureEvidence,
             ScenarioKind::ClearFailureEvidence,
             ScenarioKind::Degraded,
@@ -170,6 +175,15 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
                 .context("ordinary sandbox missing")?
                 .clone();
             match name {
+                ScenarioKind::SnapshotInventory => {
+                    sandbox.snapshots.push(SnapshotDetail {
+                        id: "synthetic-inventory-snapshot".to_owned(),
+                        r#type: SnapshotType::Disk.into(),
+                        state: "ready".to_owned(),
+                        size_bytes: Some(4096),
+                        ..Default::default()
+                    });
+                }
                 ScenarioKind::FailureEvidence => {
                     sandbox.status = Some("failed".to_owned());
                 }
@@ -177,9 +191,29 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
                 ScenarioKind::Absent => sandbox.present = false,
                 _ => {}
             }
+            let sandbox_id = sandbox.sandbox_id.parse()?;
             let mut partial = request(node);
             partial.sandboxes.push(sandbox);
             scenarios.push(capture(db, &service, name, partial).await?);
+            match name {
+                ScenarioKind::SnapshotInventory => ensure!(
+                    store::snapshot_inventory(&db.pool, sandbox_id).await?
+                        == [(
+                            "synthetic-inventory-snapshot".to_owned(),
+                            "disk".to_owned(),
+                            "ready".to_owned(),
+                            4096,
+                        )],
+                    "snapshot description did not persist"
+                ),
+                ScenarioKind::ClearSnapshotInventory => ensure!(
+                    store::snapshot_inventory(&db.pool, sandbox_id)
+                        .await?
+                        .is_empty(),
+                    "empty snapshot report did not clear its accepted scope"
+                ),
+                _ => {}
+            }
         }
         for (node, name) in nodes.iter().zip([
             ScenarioKind::Stopped,

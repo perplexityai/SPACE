@@ -1,8 +1,9 @@
 # Publication statement equivalence
 
-`publish-statements` captures the real service's SQL-call multiset for fourteen
+`publish-statements` captures the real service's SQL-call multiset for sixteen
 synthetic scenarios. It checks empty, node-status, template, ordinary-single,
-full-inventory, failure evidence and its clearing, degraded and explicitly absent
+full-inventory, snapshot inventory and its clearing, failure evidence and its
+clearing, degraded and explicitly absent
 observations, stopped, restore-completed, suspend-completed,
 activation-rollback, and pause-failed-recovery publications.
 
@@ -11,7 +12,9 @@ the CPU workload. Each scenario subtracts service-role `pg_stat_statements`
 call counts immediately before and after its RPC. It preserves exact SQL text
 and multiplicity, removing only the leading Rust locator comment. A scenario
 fails if acceptance changes, counters regress, or a seeded rare transition
-does not complete. This is component integration evidence, not a deployed smoke.
+does not complete. Snapshot scenarios also check that the reported description
+persists and that an explicit empty report clears its accepted scope.
+This is component integration evidence, not a deployed smoke.
 
 ## Run and compare
 

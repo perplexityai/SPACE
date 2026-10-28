@@ -4,6 +4,7 @@ use tonic::Status;
 pub(crate) mod absent_sandboxes;
 pub(crate) mod degraded_observations;
 pub(crate) mod failure_episodes;
+pub(crate) mod snapshot_inventory;
 
 use crate::auto_lifecycle_delete_completions::consume_validated_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};

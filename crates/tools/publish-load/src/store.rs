@@ -54,6 +54,23 @@ pub async fn statement_calls(pool: &PgPool) -> Result<BTreeMap<String, i64>> {
     Ok(calls)
 }
 
+/// Read descriptions in the fixture's accepted sandbox scope, without row locks.
+/// Used after publication to check snapshot insertion and explicit clearing.
+pub async fn snapshot_inventory(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<Vec<(String, String, String, i64)>> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT snapshot_id, type, state, size_bytes
+         FROM sandbox_snapshot_inventory
+         WHERE sandbox_id = $1
+         ORDER BY snapshot_id"
+    ))
+    .bind(sandbox_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Prove the URL points to the launcher-owned cluster before fixture creation
 /// or cluster-wide role bootstrap. A user-supplied URL alone is insufficient.
 pub async fn verify_owned_cluster() -> Result<()> {
