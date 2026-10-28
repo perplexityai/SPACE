@@ -1649,20 +1649,6 @@ async fn refresh_register_existing_expanded_build_preserves_rootfs_bytes(
         std::fs::read(temp.path().join("manifest.json")).unwrap(),
         manifest_bytes
     );
-    let error = service
-        .refresh_register_existing_expanded_build(
-            "register-refresh-test",
-            &content_hash,
-            temp.path().to_str().unwrap(),
-            Some(br#"{"disk_size_mb":8}"#),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::AlreadyExists);
-    assert_eq!(
-        std::fs::read(temp.path().join("metadata.json")).unwrap(),
-        br#"{"disk_size_mb":4}"#
-    );
     let conn = service.db.lock().unwrap();
     let build = crate::db::get_build(
         &conn,
@@ -2398,22 +2384,6 @@ async fn register_template_uses_producer_algorithm(
     let manifest: pplx_space_common_core::types::TemplateManifest =
         serde_json::from_slice(&std::fs::read(published.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest.content_hash, expected);
-    assert_eq!(
-        manifest.files[TEMPLATE_ROOTFS_FILE].size,
-        Some(bytes.len() as u64)
-    );
-    let decoded = zstd::stream::decode_all(
-        std::fs::File::open(published.join(TEMPLATE_ROOTFS_ZSTD_FILE)).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        decoded, bytes,
-        "transport must preserve the compact artifact"
-    );
-    let metadata: pplx_space_common_core::types::TemplateMetadata =
-        serde_json::from_slice(&std::fs::read(published.join("metadata.json")).unwrap()).unwrap();
-    assert_eq!(metadata.runtime_defaults().2, Some(32));
-
     let build = crate::db::get_build(
         &service.db.lock().unwrap(),
         name,

@@ -1,14 +1,19 @@
-//! Sparse file output for zero-heavy decoded artifacts.
+//! Sparse file I/O for zero-heavy artifacts.
 //!
 //! The writer preserves the logical byte stream while replacing complete
 //! all-zero blocks with filesystem holes. Callers choose the classification
 //! block size: small blocks retain more holes, while larger blocks reduce the
 //! CPU cost of scanning and buffering large filesystem images.
+//! The reader synthesizes zeros for holes without changing the logical byte
+//! stream, falling back to ordinary reads when extent queries are unsupported.
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+mod reader;
+pub use reader::SparseFileReader;
 
 const DATA_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 

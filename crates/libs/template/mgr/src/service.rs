@@ -2387,8 +2387,8 @@ impl TemplateManagerService {
 
     /// Register-time refresh for a digest_dir that already exists.
     ///
-    /// Verifies the local-cache invariant — the digest of `rootfs.ext4`
-    /// must equal its immutable `content_hash` — and refuses to
+    /// Verifies the local-cache invariant — `sha256(digest_dir/rootfs.ext4)`
+    /// must equal the canonical expanded `content_hash` — and refuses to
     /// mutate the rootfs. Optionally updates `metadata.json` if the incoming
     /// bytes differ; `manifest.json` is left alone because it was written from
     /// this hash by a prior register.
@@ -2432,23 +2432,6 @@ impl TemplateManagerService {
             })?;
             validate_retained_environment_binding(&manifest, &incoming)?;
             let metadata_path = digest_path.join("metadata.json");
-            let retained = match std::fs::read(&metadata_path) {
-                Ok(bytes) => serde_json::from_slice::<
-                    pplx_space_common_core::types::TemplateMetadata,
-                >(&bytes)
-                .map_err(|error| Status::data_loss(format!("parse retained metadata: {error}")))?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
-                Err(error) => {
-                    return Err(Status::internal(format!("read retained metadata: {error}")));
-                }
-            };
-            // Base snapshots are keyed by content, CPU and memory, not disk
-            // capacity. A metadata refresh must not reinterpret those snapshots.
-            if retained.runtime_defaults().2 != incoming.runtime_defaults().2 {
-                return Err(Status::already_exists(
-                    "rootfs digest already has a different runtime disk capacity; use a new template name",
-                ));
-            }
             if !template_file_replacement_is_unchanged(&metadata_path, Some(bytes))? {
                 std::fs::write(&metadata_path, bytes).map_err(|error| {
                     Status::internal(format!("write {}: {error}", metadata_path.display()))

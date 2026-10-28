@@ -854,7 +854,7 @@ impl NodeManagerService {
         let snapshots_dir = cache_paths.snapshots_dir;
 
         // Resolve template paths inline (validation only, cheap). Template
-        // manager returns immutable artifact bytes; only the sandbox copy is resized.
+        // manager is responsible for returning a runtime-ready rootfs.
         let template_owned = template.map(|s| s.to_string());
         let master_rootfs = if template.is_some() {
             let template_dir = req.template_dir.as_deref().unwrap_or("");
@@ -863,16 +863,12 @@ impl NodeManagerService {
         } else {
             None
         };
-        let rootfs_size_mb = match master_rootfs.as_ref() {
-            Some(master) => template_rootfs_size_mb(Path::new(master), req.rootfs_size_mb)?,
-            None => req.rootfs_size_mb,
-        };
         let prepared_rootfs = super::prepared_rootfs::validate_ready_handoff(
             std::path::Path::new(&cache_dir),
             std::path::Path::new(&rootfs_path),
-            rootfs_size_mb,
+            req.rootfs_size_mb,
         )?;
-        if rootfs_size_mb.is_some() && master_rootfs.is_none() && !prepared_rootfs {
+        if req.rootfs_size_mb.is_some() && master_rootfs.is_none() && !prepared_rootfs {
             return Err(Status::invalid_argument(
                 "rootfs_size_mb requires a template rootfs",
             ));
@@ -880,10 +876,13 @@ impl NodeManagerService {
         let disk_reservation = if prepared_rootfs {
             None
         } else {
-            Some(self.disk_admission.reserve(
-                crate::disk_admission::DiskAllocationOperation::PrepareSandbox,
-                rootfs_size_mb.map(|mib| u64::from(mib).saturating_mul(1024 * 1024)),
-            )?)
+            Some(
+                self.disk_admission.reserve(
+                    crate::disk_admission::DiskAllocationOperation::PrepareSandbox,
+                    req.rootfs_size_mb
+                        .map(|mib| u64::from(mib).saturating_mul(1024 * 1024)),
+                )?,
+            )
         };
 
         // Move all blocking host work (btrfs, cp --reflink, chown -R, chgrp,
@@ -899,6 +898,7 @@ impl NodeManagerService {
             pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
         let sandbox_metadata = sandbox_metadata.clone();
         let vm_config_json = req.vm_config_json.clone();
+        let rootfs_size_mb = req.rootfs_size_mb;
         self.run_owned_preparation(
             ownership,
             disk_reservation,
@@ -1107,42 +1107,6 @@ fn protected_launch_environment(
         )),
         None => Ok(None),
     }
-}
-
-/// Explicit sandbox capacity takes precedence over the template runtime default.
-fn template_rootfs_size_mb(master: &Path, requested: Option<u32>) -> Result<Option<u32>, Status> {
-    let size = if let Some(size) = requested {
-        Some(size)
-    } else {
-        let directory = super::trusted_paths::open_directory(
-            master
-                .parent()
-                .ok_or_else(|| Status::internal("template rootfs has no parent"))?,
-        )?;
-        match nix::sys::stat::fstatat(
-            &directory,
-            "metadata.json",
-            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
-            Err(nix::errno::Errno::ENOENT) => return Ok(None),
-            Err(error) => {
-                return Err(Status::failed_precondition(format!(
-                    "stat template metadata: {error}"
-                )));
-            }
-            Ok(_) => {}
-        }
-        let file = super::trusted_paths::open_regular_file(&directory, "metadata.json".as_ref())?;
-        let metadata: pplx_space_common_core::types::TemplateMetadata =
-            serde_json::from_reader(file).map_err(|error| {
-                Status::failed_precondition(format!("read template metadata: {error}"))
-            })?;
-        metadata.runtime_defaults().2
-    };
-    if let Some(size) = size {
-        validate_rootfs_mib(size).map_err(|error| Status::invalid_argument(error.to_string()))?;
-    }
-    Ok(size)
 }
 
 fn resize_ext4_rootfs(rootfs_path: &str, rootfs_size_mb: u32) -> Result<(), Status> {

@@ -362,32 +362,17 @@ async fn materialize_uncompressed_imported_rootfs(
         )));
     }
 
-    let artifact_hash =
-        if content_hash_algorithm(expected_rootfs_hash)? == content_hash_algorithm(content_hash)? {
-            actual_rootfs_hash
-        } else {
-            compute_template_file_hash(
-                rootfs_path.to_path_buf(),
-                content_hash_algorithm(content_hash)?,
-                "compute imported artifact identity",
-            )
-            .await?
-        };
-    // Legacy streams may carry a compact source whose advertised identity is
-    // the expanded filesystem. Current artifacts already hash to their identity.
-    if artifact_hash != content_hash {
-        expand_template_rootfs(template_id, content_hash, staging_dir, "local_import").await?;
-        let expanded_hash = compute_template_file_hash(
-            rootfs_path.to_path_buf(),
-            content_hash_algorithm(content_hash)?,
-            "compute expanded rootfs hash",
-        )
-        .await?;
-        if expanded_hash != content_hash {
-            return Err(Status::data_loss(format!(
-                "expanded rootfs hash mismatch: expected {content_hash}, got {expanded_hash}"
-            )));
-        }
+    expand_template_rootfs(template_id, content_hash, staging_dir, "local_import").await?;
+    let expanded_hash = compute_template_file_hash(
+        rootfs_path.to_path_buf(),
+        content_hash_algorithm(content_hash)?,
+        "compute expanded rootfs hash",
+    )
+    .await?;
+    if expanded_hash != content_hash {
+        return Err(Status::data_loss(format!(
+            "expanded rootfs hash mismatch: expected {content_hash}, got {expanded_hash}"
+        )));
     }
     generate_template_compressed_rootfs(template_id, content_hash, staging_dir, "local_import")
         .await?;

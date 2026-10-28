@@ -559,17 +559,14 @@ impl TemplateManagerService {
         let empty_manifest = pplx_space_common_core::types::TemplateManifest::default();
         let arch = template_arch(&metadata, &empty_manifest);
 
-        // The artifact identity covers compact filesystem bytes, not writable
-        // capacity. Node-manager grows the sandbox copy before booting it.
-        crate::rootfs_cache::validate_runtime_capacity(staging_path)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        expand_template_rootfs(template_id, "pending", &staging_dir, "register").await?;
         let content_hash = compute_template_file_hash(
             rootfs_path.clone(),
             self.production_hash_algorithm,
-            "hash template rootfs",
+            "hash expanded rootfs",
         )
         .await?;
-        let rootfs_size = std::fs::metadata(&rootfs_path)
+        let expanded_size = std::fs::metadata(&rootfs_path)
             .map(|m| m.len())
             .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
 
@@ -585,7 +582,7 @@ impl TemplateManagerService {
         .display()
         .to_string();
 
-        // If a build with this same artifact hash already exists,
+        // If a build with this same expanded hash already exists,
         // drop the staging copy and short-circuit to a metadata refresh.
         // The register staging is no longer needed; the guard reaps it on drop.
         if std::path::Path::new(&digest_dir).exists() {
@@ -616,7 +613,7 @@ impl TemplateManagerService {
             template_id,
             &content_hash,
             &metadata,
-            rootfs_size,
+            expanded_size,
             None,
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -679,7 +676,7 @@ impl TemplateManagerService {
                     manifest_json: &manifest_str,
                     runtime: &runtime,
                     arch: &arch,
-                    artifact_size_bytes: rootfs_size,
+                    artifact_size_bytes: expanded_size,
                     state: "ready",
                 },
             )?;

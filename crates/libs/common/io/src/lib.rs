@@ -9,7 +9,8 @@
 //! depending on vol-mgr.
 //!
 //! The [`fs`] module provides streaming AES-256-GCM file/byte encryption,
-//! while [`sparse`] provides a byte-oriented sparse-file writer. The crate
+//! while [`sparse`] provides readers and writers that preserve sparse files'
+//! logical bytes. The crate
 //! deliberately holds **no** BYOK/snapshot domain policy (which key, which
 //! artifacts should be sparse, which AAD, where in S3): callers provide those
 //! decisions and compose the shared mechanics.

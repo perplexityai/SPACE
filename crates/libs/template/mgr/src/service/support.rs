@@ -41,7 +41,8 @@ pub(super) fn compute_content_hash(
 ) -> std::io::Result<String> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(rootfs_path)?;
+    let mut file =
+        pplx_space_common_io::sparse::SparseFileReader::new(std::fs::File::open(rootfs_path)?)?;
     let mut hasher = crate::content_hash::ContentHasher::new(algorithm);
     let mut buf = vec![0u8; 512 * 1024]; // 512KB read buffer
     loop {
@@ -58,7 +59,11 @@ pub(super) fn compute_content_hash(
         hasher.update(bytes);
     }
 
-    page_cache::advise_dontneed(&file, Path::new(rootfs_path), "hash template file input");
+    page_cache::advise_dontneed(
+        file.file(),
+        Path::new(rootfs_path),
+        "hash template file input",
+    );
     Ok(hasher.finish().to_string())
 }
 

@@ -10,7 +10,7 @@ use pplx_space_common_core::types::{
     Digest, DigestParseError, HashAlg, TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_FILE,
     TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
-use pplx_space_common_io::sparse::SparseFileWriter;
+use pplx_space_common_io::sparse::{SparseFileReader, SparseFileWriter};
 use pplx_space_common_svc::page_cache;
 use sha2::{Digest as _, Sha256};
 
@@ -222,12 +222,16 @@ pub(crate) fn compress_rootfs(
             operation: "configure compressor workers",
             source,
         })?;
-    let mut reader = BufReader::new(input);
+    let mut reader = SparseFileReader::new(input).map_err(|source| RootfsZstdError::Io {
+        operation: "open sparse rootfs reader",
+        path: rootfs_path.display().to_string(),
+        source,
+    })?;
     std::io::copy(&mut reader, &mut encoder).map_err(|source| RootfsZstdError::Zstd {
         operation: "compress rootfs",
         source,
     })?;
-    page_cache::advise_dontneed(reader.get_ref(), rootfs_path, "compress rootfs input");
+    page_cache::advise_dontneed(reader.file(), rootfs_path, "compress rootfs input");
     let mut digesting_output = encoder.finish().map_err(|source| RootfsZstdError::Zstd {
         operation: "finish compressor",
         source,
