@@ -21,6 +21,7 @@ pub use node_info::ClusterNodeInfoService;
 mod data_plane_sessions;
 pub mod ingress_activation;
 mod node_inventory;
+mod node_publish;
 mod route_identity;
 mod run;
 mod runtime_desired_state;

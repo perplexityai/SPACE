@@ -12,11 +12,11 @@ use uuid::Uuid;
 use crate::metadata::artifact_kind_from_proto;
 use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::{
-    Arch, ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration,
-    ExecutionMetadata, LocalArtifactId, NodeRole, PodUid, PolicyAuthority, RuntimeKind,
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    Arch, ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, LocalArtifactId,
+    NodeRole, PodUid, PolicyAuthority, RuntimeKind, SandboxActivationAttemptId, SandboxId,
+    SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
+    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState, SemVer,
 };
 use pplx_space_common_svc::{
@@ -42,11 +42,17 @@ use pplx_space_sandbox_portability::{
     started_suspend_revert_eligibility, stopped_artifact_durable, suspended_k8s_finalization_sql,
     suspended_projection_lifecycle_eligible,
 };
-use pplx_space_sbx_mgr_client::proto::{
-    QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
-};
+use pplx_space_sbx_mgr_client::proto::{SnapshotDetail, SnapshotType};
 use pplx_space_template_mgr_client::proto::SnapshotInfo;
 
+pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
+use crate::node_publish::validate::fields::{
+    execution_projection, non_zero_u64_to_i64, optional_u32_to_i32_when, optional_u64_to_i64_when,
+    proto_timestamp, proto_timestamp_to_rfc3339, published_artifact_origin, u32_to_i32, u64_to_i64,
+};
+use crate::node_publish::validate::quarantine::{
+    QuarantineRecoveryProjectionState, quarantine_recovery_projection,
+};
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
 use crate::sandbox_quarantine_store;
 
@@ -345,26 +351,6 @@ fn render_observed_state_expression(template: &str, source: &str, column: &str) 
         .replace("{column}", column)
 }
 
-pub(crate) struct ExecutionProjection {
-    pub(crate) runtime: String,
-    pub(crate) runtime_version: String,
-    pub(crate) guest_os: String,
-    pub(crate) guest_arch: String,
-    pub(crate) state_format_name: Option<String>,
-    pub(crate) state_format_version: Option<String>,
-    pub(crate) metadata: serde_json::Value,
-    pub(crate) components: Vec<ArtifactComponentProjection>,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct ArtifactComponentProjection {
-    pub(crate) kind: String,
-    pub(crate) role_key: String,
-    pub(crate) version: Option<String>,
-    pub(crate) digest: Option<String>,
-    pub(crate) format: Option<String>,
-}
-
 #[derive(Clone, Debug)]
 struct QuarantineProjectionInput {
     sandbox_id: SandboxId,
@@ -434,164 +420,6 @@ impl ClaimedQuarantineProjection {
     }
 }
 
-fn projection_from_execution(execution: ExecutionMetadata) -> Result<ExecutionProjection, Status> {
-    let state_format_name = execution
-        .state_format()
-        .map(|state_format| state_format.format.to_string());
-    let state_format_version = execution
-        .state_format()
-        .map(|state_format| state_format.version.to_string());
-    let components = execution
-        .components()
-        .iter()
-        .map(|component| ArtifactComponentProjection {
-            kind: component.kind.as_str().to_string(),
-            role_key: component
-                .role
-                .as_ref()
-                .map_or_else(String::new, ToString::to_string),
-            version: component.version.as_ref().map(ToString::to_string),
-            digest: component.digest.as_ref().map(ToString::to_string),
-            format: component.format.as_ref().map(ToString::to_string),
-        })
-        .collect();
-    Ok(ExecutionProjection {
-        runtime: execution.runtime().kind.alias().to_string(),
-        runtime_version: execution.runtime().version.to_string(),
-        guest_os: execution.guest().os.to_string(),
-        guest_arch: execution.guest().architecture.to_string(),
-        state_format_name,
-        state_format_version,
-        metadata: serde_json::to_value(&execution)
-            .map_err(|error| Status::internal(format!("serialize execution metadata: {error}")))?,
-        components,
-    })
-}
-
-fn execution_projection(
-    execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
-) -> Result<Option<ExecutionProjection>, Status> {
-    let Some(execution) = execution else {
-        return Ok(None);
-    };
-    let execution = ExecutionMetadata::try_from(execution)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    projection_from_execution(execution).map(Some)
-}
-
-fn proto_timestamp_to_rfc3339(
-    timestamp: &prost_types::Timestamp,
-    field: &str,
-) -> Result<String, Status> {
-    proto_timestamp(timestamp, field)?
-        .format(&Rfc3339)
-        .map_err(|error| Status::internal(format!("format {field}: {error}")))
-}
-
-fn proto_timestamp(
-    timestamp: &prost_types::Timestamp,
-    field: &str,
-) -> Result<time::OffsetDateTime, Status> {
-    let nanos = u32::try_from(timestamp.nanos)
-        .ok()
-        .filter(|nanos| *nanos < 1_000_000_000)
-        .ok_or_else(|| Status::invalid_argument(format!("{field} has invalid nanos")))?;
-    time::OffsetDateTime::from_unix_timestamp(timestamp.seconds)
-        .map_err(|error| Status::invalid_argument(format!("{field} is out of range: {error}")))?
-        .replace_nanosecond(nanos)
-        .map_err(|error| Status::invalid_argument(format!("{field} is invalid: {error}")))
-}
-
-#[derive(Clone, Debug)]
-struct QuarantineRecoveryProjection {
-    schema_version: u32,
-    local_quarantine_id: Uuid,
-    observed_owner: QuarantineRecoveryObservedOwner,
-    attempt_count: i64,
-    next_attempt_at: Option<String>,
-}
-
-enum QuarantineRecoveryProjectionState {
-    Absent,
-    Degraded,
-    Observed(QuarantineRecoveryProjection),
-}
-
-impl QuarantineRecoveryProjection {
-    fn observed_owner_name(&self) -> &'static str {
-        match self.observed_owner {
-            QuarantineRecoveryObservedOwner::Unspecified => "unspecified",
-            QuarantineRecoveryObservedOwner::LegacyRecovery => "legacy_recovery",
-        }
-    }
-}
-
-fn quarantine_recovery_projection(
-    state: &PublishedSandboxState,
-) -> Result<QuarantineRecoveryProjectionState, Status> {
-    let Some(observation) = state.quarantine_recovery.as_ref() else {
-        return Ok(QuarantineRecoveryProjectionState::Absent);
-    };
-    if observation.degraded {
-        return Ok(QuarantineRecoveryProjectionState::Degraded);
-    };
-    if observation.schema_version == 0 {
-        return Err(Status::invalid_argument(format!(
-            "unsupported quarantine recovery observation schema version {}",
-            observation.schema_version
-        )));
-    }
-    let local_quarantine_id = optional_trimmed(Some(&observation.local_quarantine_id))
-        .ok_or_else(|| Status::invalid_argument("local_quarantine_id is required"))?
-        .parse::<Uuid>()
-        .map_err(|error| {
-            Status::invalid_argument(format!("invalid local_quarantine_id: {error}"))
-        })?;
-    // Owner is descriptive evidence, not authority. Preserve the episode and
-    // scheduling facts when a newer publisher sends an owner this release does
-    // not know; rollout safety is better served by an explicit unspecified
-    // owner than by freezing the entire prior observation as degraded.
-    let observed_owner = QuarantineRecoveryObservedOwner::try_from(observation.observed_owner)
-        .unwrap_or(QuarantineRecoveryObservedOwner::Unspecified);
-    let next_attempt_at = observation
-        .next_attempt_at
-        .as_ref()
-        .map(|timestamp| {
-            if timestamp.seconds < 0 {
-                return Err(Status::invalid_argument(
-                    "quarantine_next_attempt_at is negative",
-                ));
-            }
-            proto_timestamp_to_rfc3339(timestamp, "quarantine_next_attempt_at")
-        })
-        .transpose()?;
-    Ok(QuarantineRecoveryProjectionState::Observed(
-        QuarantineRecoveryProjection {
-            schema_version: observation.schema_version,
-            local_quarantine_id,
-            observed_owner,
-            attempt_count: i64::from(observation.attempt_count),
-            next_attempt_at,
-        },
-    ))
-}
-
-/// Execution metadata is required: the node-side senders (spaced and the
-/// sbx-mgr durable upload worker) have always populated it, and the former
-/// mixed-version backfill forced an expensive template/inventory arch
-/// resolution onto every suspend/backup begin. A caller that omits it gets
-/// a loud `INVALID_ARGUMENT` instead of a silently backfilled identity.
-pub(crate) fn snapshot_execution_metadata(
-    execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, Status> {
-    let execution =
-        execution.ok_or_else(|| Status::invalid_argument("execution metadata is required"))?;
-    let execution = ExecutionMetadata::try_from(execution)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    pplx_space_common_core::types::SnapshotExecutionMetadata::new(execution)
-        .map_err(|error| Status::invalid_argument(error.to_string()))
-}
-
 /// Longest prefix of an invalid capture host CPU that reaches the log. The
 /// value is node-supplied and the begin request isn't authorized yet when it's
 /// parsed, so the log carries a bounded prefix, not the whole string.
@@ -631,50 +459,8 @@ pub(crate) fn capture_host_cpu(
         .ok()
 }
 
-fn u64_to_i64(value: u64, field: &str) -> Result<i64, Status> {
-    i64::try_from(value)
-        .map_err(|error| Status::invalid_argument(format!("{field} exceeds i64::MAX: {error}")))
-}
-
-fn u32_to_i32(value: u32, field: &str) -> Result<i32, Status> {
-    i32::try_from(value)
-        .map_err(|error| Status::invalid_argument(format!("{field} exceeds i32::MAX: {error}")))
-}
-
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn non_zero_u64_to_i64(value: u64, field: &str) -> Result<Option<i64>, Status> {
-    if value == 0 {
-        Ok(None)
-    } else {
-        u64_to_i64(value, field).map(Some)
-    }
-}
-
-fn optional_u64_to_i64_when(
-    include: bool,
-    value: Option<u64>,
-    field: &str,
-) -> Result<Option<i64>, Status> {
-    if include {
-        value.map(|value| u64_to_i64(value, field)).transpose()
-    } else {
-        Ok(None)
-    }
-}
-
-fn optional_u32_to_i32_when(
-    include: bool,
-    value: Option<u32>,
-    field: &str,
-) -> Result<Option<i32>, Status> {
-    if include {
-        value.map(|value| u32_to_i32(value, field)).transpose()
-    } else {
-        Ok(None)
-    }
 }
 
 fn network_policy_source_str(source: i32) -> Option<&'static str> {
@@ -1503,22 +1289,6 @@ fn published_spaced_version(
             );
             None
         }
-    }
-}
-
-fn published_artifact_origin(raw: i32) -> Result<ArtifactOrigin, Status> {
-    match pplx_space_sbx_mgr_client::proto::ArtifactOrigin::try_from(raw) {
-        Ok(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop) => Ok(ArtifactOrigin::Stop),
-        Ok(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend) => {
-            Ok(ArtifactOrigin::Suspend)
-        }
-        Ok(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Snapshot) => {
-            Ok(ArtifactOrigin::Snapshot)
-        }
-        Ok(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork) => Ok(ArtifactOrigin::Fork),
-        _ => Err(Status::invalid_argument(
-            "current_local_artifact_origin must be STOP, SUSPEND, SNAPSHOT, or FORK",
-        )),
     }
 }
 
