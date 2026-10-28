@@ -152,8 +152,11 @@ impl RuntimeControl for Client {
     }
     fn restore_state(&self, workspace: StateWorkspace, memory_bytes: u64) -> ControlFuture<'_, ()> {
         Box::pin(async move {
+            // The plaintext restore workspace stays with the execution, so its
+            // private memory clone can back guest RAM until the VMM exits.
+            // Keep encrypted restores on the separately qualified eager path.
             self.request(Method::PUT, "/api/v1/vm.restore", Bytes::from_static(match workspace {
-                StateWorkspace::Plain => br#"{"source_url":"file:///state/restore","prefault":false,"memory_restore_mode":"Copy","resume":false}"#,
+                StateWorkspace::Plain => br#"{"source_url":"file:///state/restore","prefault":false,"memory_restore_mode":"CopyOnWrite","resume":false}"#,
                 StateWorkspace::Encrypted => br#"{"source_url":"file:///state/encsnap/restore","prefault":false,"memory_restore_mode":"Copy","resume":false}"#,
             }), super::memory_state_timeout(memory_bytes)).await?;
             Ok(())

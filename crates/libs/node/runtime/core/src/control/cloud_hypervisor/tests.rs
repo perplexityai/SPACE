@@ -221,7 +221,7 @@ async fn state_operations_use_fixed_workspaces_and_do_not_replay_refusals() {
         (
             3,
             "vm.restore",
-            r#"{"source_url":"file:///state/restore","prefault":false,"memory_restore_mode":"Copy","resume":false}"#,
+            r#"{"source_url":"file:///state/restore","prefault":false,"memory_restore_mode":"CopyOnWrite","resume":false}"#,
         ),
         (
             4,
