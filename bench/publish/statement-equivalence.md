@@ -66,6 +66,12 @@ The row comparator uses the same explicit run-local normalization as the CPU
 workload exports, including server-time order rather than independent clock
 values. It requires every captured scenario and table to agree after that
 normalization; a missing row or changed non-normalized field fails comparison.
+Server-created quarantine episode UUIDs are named by sandbox and first-seen
+episode order, consistently across all captured scenarios. Only UUIDv7 episodes
+identified by the server-authored quarantine-entry history are eligible;
+seeded IDs, receipt IDs, and opaque JSON are not rewritten. Replacing an episode,
+breaking its state/history reference, or changing history multiplicity still
+changes the comparison.
 It does not compare wall-clock intervals except the node-status freshness
 deadline, and it does not export tables outside the documented nine-table set.
 

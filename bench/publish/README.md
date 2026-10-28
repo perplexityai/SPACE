@@ -128,11 +128,14 @@ python3 scripts/compare-publish-rows.py /tmp/base/run-1 /tmp/head/run-1 \
 The comparator requires identical fields, row multiplicities, counters, lifecycle
 values, ownership, generation fences, receipts, and activity-clock offsets.
 Execution surrogate IDs and generated history IDs are keyed by logical identity;
+server-created quarantine episode IDs are keyed by sandbox and episode order.
+Episode aliases remain consistent across per-scenario captures, including their
+state/history references, so replacing a previously observed episode differs;
 deterministic receipt IDs remain literal. Server-generated timestamps retain
 their equality and ordering within each node; the status deadline retains its
 exact offset from `observed_at`. Nothing is silently dropped, including nulls.
-Normalization is restricted to explicitly named timestamp columns and surrogate
-primary keys. Other text and nested JSON remain literal, even when a string
+Normalization is restricted to explicitly named timestamp and generated-identifier
+columns. Other text and nested JSON remain literal, even when a string
 looks like a timestamp or happens to equal a generated identifier.
 This is normalized row equivalence, not byte equality of independent wall clocks,
 and does not prove identical elapsed time between server writes. Raw exports

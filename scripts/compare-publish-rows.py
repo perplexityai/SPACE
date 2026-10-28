@@ -72,8 +72,41 @@ def node_scope(table: str, row: dict[str, Any]) -> str:
     return str(UUID(int=UUID(sandbox).int & ~((1 << 24) - 1)))
 
 
+def episode_aliases(
+    captures: list[dict[str, list[dict[str, Any]]]], seed: int
+) -> dict[str, str]:
+    """Alias only server-created episodes, retaining identity across captures."""
+    aliases: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    counts: dict[str, int] = defaultdict(int)
+    for tables in captures:
+        history = tables["sandbox_quarantine_history"]
+        for row in sorted(history, key=lambda row: (row["sandbox_id"], row["occurred_at"], row["id"])):
+            if (
+                row["source"] != "node_state_publish"
+                or row["action"] != "entered_quarantine"
+                or row["reason_code"] != "node_published_quarantined"
+            ):
+                continue
+            episode = row["quarantine_id"]
+            identifier = UUID(episode)
+            seeded = identifier.int >> 96 == seed and (identifier.int >> 64) & 0xffffffff == 0x7000
+            if seeded or identifier.version != 7:
+                continue
+            sandbox = row["sandbox_id"]
+            if episode in aliases:
+                if owners[episode] != sandbox:
+                    raise ValueError("a generated quarantine episode has multiple sandbox owners")
+                continue
+            aliases[episode] = f"episode:{sandbox}:{counts[sandbox]}"
+            owners[episode] = sandbox
+            counts[sandbox] += 1
+    return aliases
+
+
 def canonicalize_tables(
-    tables: dict[str, list[dict[str, Any]]], seed: int, activity_epoch_seconds: int
+    tables: dict[str, list[dict[str, Any]]], seed: int, activity_epoch_seconds: int,
+    episodes: dict[str, str],
 ) -> dict[str, Any]:
     if set(tables) != set(TABLES):
         raise ValueError("publish-owned table set differs")
@@ -89,6 +122,7 @@ def canonicalize_tables(
             key = [row[name] for name in (
                 "sandbox_id", "quarantine_id", "source", "action", "reason_code", "attempt_count"
             )]
+            key[1] = episodes.get(key[1], key[1])
             generated[row["id"]] = "history:" + json.dumps(key)
 
     times: dict[str, set[int]] = defaultdict(set)
@@ -124,6 +158,10 @@ def canonicalize_tables(
                 "sandbox_k8s_executions", "sandbox_quarantine_history",
             }:
                 result[column] = generated.get(value, value)
+            elif column == "quarantine_id" and table in {
+                "sandbox_quarantine_state", "sandbox_quarantine_history",
+            }:
+                result[column] = episodes.get(value, value)
         return result
 
     result: dict[str, Any] = {}
@@ -138,7 +176,10 @@ def canonicalize_tables(
 def canonicalize(directory: Path) -> dict[str, Any]:
     report = json.loads((directory / "report.json").read_text())
     tables = {table: json.loads((directory / f"{table}.json").read_text()) for table in TABLES}
-    result = canonicalize_tables(tables, report["seed"], report["activity_epoch_seconds"])
+    result = canonicalize_tables(
+        tables, report["seed"], report["activity_epoch_seconds"],
+        episode_aliases([tables], report["seed"]),
+    )
     result["workload"] = {key: report[key] for key in (
         "seed", "nodes", "sandboxes_per_node", "simulated_minutes", "time_scale", "publishes"
     )}
@@ -149,13 +190,16 @@ def canonicalize_scenarios(path: Path) -> dict[str, Any]:
     report = json.loads(path.read_text())
     if report["schema"] != 1 or not report["scenarios"]:
         raise ValueError("unsupported or empty scenario report")
+    episodes = episode_aliases(
+        [scenario["rows"] for scenario in report["scenarios"]], report["seed"]
+    )
     scenarios: dict[str, Any] = {}
     for scenario in report["scenarios"]:
         name = scenario["name"]
         if name in scenarios:
             raise ValueError(f"duplicate scenario: {name}")
         scenarios[name] = canonicalize_tables(
-            scenario["rows"], report["seed"], report["activity_epoch_seconds"]
+            scenario["rows"], report["seed"], report["activity_epoch_seconds"], episodes
         )
     return {"seed": report["seed"], "scenarios": scenarios}
 
