@@ -7,6 +7,7 @@ use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
 use super::activity::ActivityClaim;
 use super::failure_episode::FailureEpisodePlan;
 use super::lifecycle::{FailedClaim, PauseFailedRecoveryClaim, RestoreClaim, StoppedClaim};
+use super::network_policy::NetworkPolicyPlan;
 use super::recovery_observation::{ClearRecoveryObservationClaim, RecoveryObservationClaim};
 use super::suspend_handoff::SuspendHandoffClaim;
 use super::suspended::SuspendedClaim;
@@ -49,7 +50,7 @@ pub(crate) struct SandboxPlan {
     pub(crate) snapshots: Vec<SnapshotClaim>,
     pub(crate) quarantine: Vec<QuarantineClaim>,
     pub(crate) diagnostics: Vec<SandboxDiagnostic>,
-    pub(crate) publishes_network_policy: bool,
+    pub(crate) network_policy: NetworkPolicyPlan,
 }
 
 impl From<ValidatedSandboxInventory> for SandboxPlan {
@@ -73,9 +74,9 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             snapshots: Vec::new(),
             quarantine: Vec::new(),
             diagnostics: inventory.diagnostics,
-            publishes_network_policy: false,
+            network_policy: NetworkPolicyPlan::default(),
         };
-        for claim in inventory.observations {
+        for mut claim in inventory.observations {
             plan.activities
                 .extend(ActivityClaim::from_observation(&claim.observation));
             plan.suspend_handoffs
@@ -138,7 +139,7 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
                 }),
                 _ => {}
             }
-            plan.publishes_network_policy |= claim.observation.publishes_network_policy();
+            plan.network_policy.observe(&mut claim.observation);
             plan.observations.push(ObservedClaim {
                 observation: claim.observation,
                 receipt: claim.receipt,

@@ -1,6 +1,11 @@
 use pplx_space_common_core::{sql, types::NodeId};
 use pplx_space_common_svc::types::FACET_NETWORK_POLICY;
+use pplx_space_net_common::proto::NetworkPolicySource;
 use sqlx::{PgConnection, types::Json};
+
+use crate::node_publish::plan::network_policy::{
+    ClearPolicyFailureClaim, NetworkPolicyObservation, PolicyAuthorityClaim,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UpdateAuthorityError {
@@ -26,25 +31,22 @@ pub(crate) enum ClearApplyFailureError {
 pub(crate) async fn update_authority(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[PolicyAuthorityClaim],
 ) -> Result<bool, UpdateAuthorityError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
     let result = sqlx::query(
         sql!("WITH input AS (
-                 SELECT sandbox_id, observed_network_policy_generation,
-                        observed_network_policy_authority
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_generation BIGINT,
-                     observed_network_policy_authority TEXT
-                 )
+                 SELECT sandbox_id, observed_network_policy_authority
+                 FROM UNNEST($2::UUID[], $3::TEXT[])
+                     AS input(sandbox_id, observed_network_policy_authority)
              ),
              publishable AS (
-                 SELECT input.sandbox_id, input.observed_network_policy_generation,
-                        input.observed_network_policy_authority
+                 SELECT input.sandbox_id, input.observed_network_policy_authority
                  FROM input
                  LEFT JOIN sandboxes s ON s.id = input.sandbox_id
                  WHERE (s.id IS NULL OR s.active_node_id = $1)
-                   AND input.observed_network_policy_generation IS NOT NULL
              )
              UPDATE sandbox_observed_states sos
              SET network_policy_authority = publishable.observed_network_policy_authority
@@ -54,7 +56,8 @@ pub(crate) async fn update_authority(
                AND sos.network_policy_authority IS DISTINCT FROM publishable.observed_network_policy_authority"),
     )
     .bind(node_id)
-    .bind(rows_json)
+    .bind(claims.iter().map(|claim| claim.sandbox_id).collect::<Vec<_>>())
+    .bind(claims.iter().map(|claim| claim.authority.map(|authority| authority.as_str())).collect::<Vec<_>>())
     .execute(&mut *conn)
     .await
     .map_err(UpdateAuthorityError::Update)?;
@@ -67,20 +70,20 @@ pub(crate) async fn update_authority(
 pub(crate) async fn upsert(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[NetworkPolicyObservation],
 ) -> Result<bool, UpsertPolicyError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
     let result = sqlx::query(sql!(
         "WITH input AS (
                  SELECT sandbox_id, observed_network_policy_json,
                         observed_network_policy_generation,
                         observed_network_policy_source, observed_network_policy_authority
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_json JSONB,
-                     observed_network_policy_generation BIGINT,
-                     observed_network_policy_source TEXT,
-                     observed_network_policy_authority TEXT
-                 )
+                 FROM UNNEST($2::UUID[], $4::JSONB[], $5::BIGINT[], $6::TEXT[], $7::TEXT[])
+                     AS input(sandbox_id, observed_network_policy_json,
+                              observed_network_policy_generation,
+                              observed_network_policy_source, observed_network_policy_authority)
              ),
              publishable AS (
                  SELECT input.sandbox_id, input.observed_network_policy_json,
@@ -107,7 +110,6 @@ pub(crate) async fn upsert(
                  NOW(),
                  NOW()
              FROM publishable
-             WHERE observed_network_policy_generation IS NOT NULL
              ON CONFLICT (node_id, facet, element) DO UPDATE
              SET observed_generation = EXCLUDED.observed_generation,
                  observed_payload = EXCLUDED.observed_payload,
@@ -128,8 +130,41 @@ pub(crate) async fn upsert(
              )"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
     .bind(FACET_NETWORK_POLICY)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.policy.as_ref().map(Json))
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.generation)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| match claim.source {
+                NetworkPolicySource::Template => Some("template"),
+                NetworkPolicySource::Override => Some("override"),
+                NetworkPolicySource::Unspecified => None,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.authority.map(|authority| authority.as_str()))
+            .collect::<Vec<_>>(),
+    )
     .execute(&mut *conn)
     .await
     .map_err(UpsertPolicyError::Upsert)?;
@@ -142,22 +177,21 @@ pub(crate) async fn upsert(
 pub(crate) async fn clear_apply_failure(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[ClearPolicyFailureClaim],
 ) -> Result<bool, ClearApplyFailureError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
     let result = sqlx::query(sql!(
         "WITH input AS (
-                 SELECT sandbox_id, observed_network_policy_generation
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_generation BIGINT
-                 )
+                 SELECT sandbox_id
+                 FROM UNNEST($2::UUID[]) AS input(sandbox_id)
              ),
              publishable AS (
-                 SELECT input.sandbox_id, input.observed_network_policy_generation
+                 SELECT input.sandbox_id
                  FROM input
                  LEFT JOIN sandboxes s ON s.id = input.sandbox_id
                  WHERE (s.id IS NULL OR s.active_node_id = $1)
-                   AND input.observed_network_policy_generation IS NOT NULL
              )
              DELETE FROM node_facet_conditions nfc
              USING publishable
@@ -167,7 +201,12 @@ pub(crate) async fn clear_apply_failure(
                AND nfc.condition_type = 'ApplyFailed'"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
     .bind(FACET_NETWORK_POLICY)
     .execute(&mut *conn)
     .await

@@ -72,10 +72,10 @@ pub(crate) struct ValidatedSandboxObservation {
     network_tx_bytes: Option<i64>,
     network_rx_bytes: Option<i64>,
     disk_usage_bytes: Option<i64>,
-    network_policy: Option<NetworkPolicyV1>,
-    network_policy_generation: Option<i64>,
-    network_policy_source: NetworkPolicySource,
-    network_policy_authority: Option<PolicyAuthority>,
+    pub(in crate::node_publish) network_policy: Option<NetworkPolicyV1>,
+    pub(in crate::node_publish) network_policy_generation: Option<i64>,
+    pub(in crate::node_publish) network_policy_source: NetworkPolicySource,
+    pub(in crate::node_publish) network_policy_authority: Option<PolicyAuthority>,
     auto_lifecycle_authority: Option<PolicyAuthority>,
 }
 
@@ -228,10 +228,6 @@ impl ValidatedSandboxObservation {
         })
     }
 
-    pub(crate) fn publishes_network_policy(&self) -> bool {
-        self.network_policy_generation.is_some()
-    }
-
     pub(crate) fn legacy_row(
         &self,
         receipt: Option<&SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
@@ -249,11 +245,6 @@ impl ValidatedSandboxObservation {
                 "next_attempt_at": observation.next_attempt_at.as_deref(),
             })
         });
-        let policy_source = match self.network_policy_source {
-            NetworkPolicySource::Template => Some("template"),
-            NetworkPolicySource::Override => Some("override"),
-            NetworkPolicySource::Unspecified => None,
-        };
         serde_json::json!({
             "sandbox_id": self.sandbox_id,
             "status": self.status.as_ref().map(PublishedSandboxStatus::as_str),
@@ -284,10 +275,6 @@ impl ValidatedSandboxObservation {
             "network_tx_bytes": self.network_tx_bytes,
             "network_rx_bytes": self.network_rx_bytes,
             "disk_usage_bytes": self.disk_usage_bytes,
-            "observed_network_policy_json": self.network_policy,
-            "observed_network_policy_generation": self.network_policy_generation,
-            "observed_network_policy_source": policy_source,
-            "observed_network_policy_authority": self.network_policy_authority.map(|authority| authority.as_str()),
             "auto_lifecycle_authority": self.auto_lifecycle_authority.map(|authority| authority.as_str()),
             "quarantine_reason_code": self.quarantine_reason_code,
             "transition_receipt_id": receipt.map(|receipt| receipt.id().as_uuid()),

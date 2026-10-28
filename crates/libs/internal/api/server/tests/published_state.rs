@@ -1422,15 +1422,37 @@ async fn inventory_publish_preserves_existing_network_policy_projection() -> Tes
     insert_ready_worker_node(&db.pool, node_id).await?;
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
     let element = NetworkPolicyTarget::sandbox(sandbox_id).as_element_string();
+    let neighbor_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, neighbor_id, node_id, "started").await?;
+    let neighbor_element = NetworkPolicyTarget::sandbox(neighbor_id).as_element_string();
 
     let mut conn = db.pool.acquire().await?;
     publish_sandbox_states(
         &mut conn,
         node_id,
-        &[published_sandbox_state_with_network_policy(sandbox_id, 7)],
+        &[
+            published_sandbox_state_with_network_policy(sandbox_id, 7),
+            published_sandbox_state_with_network_policy(neighbor_id, 8),
+        ],
     )
     .await?;
     drop(conn);
+
+    sqlx::query(sql!(
+        "INSERT INTO node_facet_conditions (
+             node_id, facet, element, condition_type, condition_status, last_transition_at
+         )
+         SELECT node_id, facet, element, $4, $5, NOW()
+         FROM node_facet_observed_status
+         WHERE node_id = $1 AND facet = $2 AND element = ANY($3::TEXT[])"
+    ))
+    .bind(node_id)
+    .bind(FACET_NETWORK_POLICY)
+    .bind([element.as_str(), neighbor_element.as_str()])
+    .bind("ApplyFailed")
+    .bind("True")
+    .execute(&db.pool)
+    .await?;
 
     sqlx::query(
         "UPDATE node_facet_observed_status
@@ -1446,10 +1468,12 @@ async fn inventory_publish_preserves_existing_network_policy_projection() -> Tes
     .await?;
 
     let mut conn = db.pool.acquire().await?;
+    let mut neighbor = published_sandbox_state(neighbor_id, "started");
+    neighbor.observed_network_policy_generation = 9;
     publish_sandbox_states(
         &mut conn,
         node_id,
-        &[published_sandbox_state(sandbox_id, "started")],
+        &[published_sandbox_state(sandbox_id, "started"), neighbor],
     )
     .await?;
     drop(conn);
@@ -1477,6 +1501,39 @@ async fn inventory_publish_preserves_existing_network_policy_projection() -> Tes
         "inventory publish should not rewrite policy facet updated_at, got {updated_at}"
     );
     assert_eq!(observed_authority.as_deref(), Some("cluster"));
+    let neighbor_policy: (
+        Option<i64>,
+        Option<serde_json::Value>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(sql!(
+        "SELECT observed_generation, observed_payload, applied_source, applied_authority
+             FROM node_facet_observed_status
+             WHERE node_id = $1 AND facet = $2 AND element = $3"
+    ))
+    .bind(node_id)
+    .bind(FACET_NETWORK_POLICY)
+    .bind(&neighbor_element)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(neighbor_policy, (Some(9), None, None, None));
+    let neighbor_authority: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT network_policy_authority FROM sandbox_observed_states WHERE sandbox_id = $1"
+    ))
+    .bind(neighbor_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(neighbor_authority, None);
+    let remaining_failures: Vec<String> = sqlx::query_scalar(sql!(
+        "SELECT element FROM node_facet_conditions
+         WHERE node_id = $1 AND facet = $2 AND condition_type = $3"
+    ))
+    .bind(node_id)
+    .bind(FACET_NETWORK_POLICY)
+    .bind("ApplyFailed")
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(remaining_failures, [element]);
     Ok(())
 }
 

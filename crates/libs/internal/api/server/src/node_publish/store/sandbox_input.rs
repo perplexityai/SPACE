@@ -15,7 +15,6 @@ pub(crate) struct LegacySandboxInput<'a> {
     pub(crate) state_only: &'a [DegradedSandboxClaim],
     pub(crate) snapshot_rows: &'a [SnapshotClaim],
     pub(crate) quarantine_inputs: &'a [QuarantineClaim],
-    pub(crate) publishes_network_policy: bool,
 }
 
 impl<'a> From<&'a SandboxPlan> for LegacySandboxInput<'a> {
@@ -26,7 +25,6 @@ impl<'a> From<&'a SandboxPlan> for LegacySandboxInput<'a> {
             state_only: &plan.state_only,
             snapshot_rows: &plan.snapshots,
             quarantine_inputs: &plan.quarantine,
-            publishes_network_policy: plan.publishes_network_policy,
         }
     }
 }

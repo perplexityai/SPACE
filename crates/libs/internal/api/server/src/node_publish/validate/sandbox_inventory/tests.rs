@@ -117,7 +117,7 @@ fn incomplete_rich_evidence_drops_only_its_own_snapshots_policy_and_quarantine_c
             "keep-later"
         );
         assert!(input.quarantine_inputs.is_empty(), "{rejection}");
-        assert!(!input.publishes_network_policy, "{rejection}");
+        assert!(plan.network_policy.observations.is_empty(), "{rejection}");
         assert_eq!(input.state_only.len(), 1, "{rejection}");
         assert_eq!(
             input.state_only[0].status().map(|status| status.as_str()),

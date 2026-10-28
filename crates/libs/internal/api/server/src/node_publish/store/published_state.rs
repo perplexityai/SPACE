@@ -443,7 +443,6 @@ pub(crate) async fn publish_validated_sandbox_states(
         state_only,
         snapshot_rows,
         quarantine_inputs,
-        publishes_network_policy,
     } = LegacySandboxInput::from(plan);
     let mut post_commit_events = Vec::new();
     let mut post_commit_state_convergence = Vec::new();
@@ -538,11 +537,9 @@ pub(crate) async fn publish_validated_sandbox_states(
     )
     .await?;
 
-    if publishes_network_policy {
-        network_policy::update_authority(conn, node_id, &rows_json).await?;
-        network_policy::upsert(conn, node_id, &rows_json).await?;
-        network_policy::clear_apply_failure(conn, node_id, &rows_json).await?;
-    }
+    network_policy::update_authority(conn, node_id, &plan.network_policy.authorities).await?;
+    network_policy::upsert(conn, node_id, &plan.network_policy.observations).await?;
+    network_policy::clear_apply_failure(conn, node_id, &plan.network_policy.clear_failures).await?;
 
     snapshot_inventory::replace(conn, &accepted_ids, snapshot_rows).await?;
     accepted = accepted.saturating_add(usize_to_u64(accepted_ids.len()));

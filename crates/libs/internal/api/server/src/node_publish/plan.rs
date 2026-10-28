@@ -20,6 +20,7 @@ pub(crate) mod activation;
 pub(crate) mod activity;
 pub(crate) mod failure_episode;
 pub(crate) mod lifecycle;
+pub(crate) mod network_policy;
 pub(crate) mod recovery_observation;
 pub(crate) mod sandboxes;
 pub(crate) mod suspend_handoff;
