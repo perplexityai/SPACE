@@ -961,6 +961,17 @@ async fn wait_for_empty_spool_dir(dir: &std::path::Path) {
     panic!("spool files were not removed: {dir:?}");
 }
 
+#[test]
+fn spool_files_are_readable_only_by_their_owner() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let names = Arc::new(SpoolNames::in_dir(dir.path().to_path_buf()));
+    let (_file, path) = names.create().unwrap();
+    let mode = std::fs::metadata(path.path()).unwrap().permissions().mode();
+    assert_eq!(format!("{:o}", mode & 0o777), "600");
+}
+
 #[tokio::test]
 async fn spool_file_names_are_reused_only_once_their_file_is_gone() {
     let dir = tempfile::tempdir().unwrap();

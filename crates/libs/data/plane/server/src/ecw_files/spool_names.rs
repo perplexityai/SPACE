@@ -10,6 +10,7 @@
 use std::{
     fs::{File, OpenOptions},
     io,
+    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, PoisonError},
 };
@@ -61,6 +62,8 @@ impl SpoolNames {
                 .read(true)
                 .write(true)
                 .create_new(true)
+                // Spooled uploads hold user content: owner-only.
+                .mode(0o600)
                 .open(&path)
             {
                 Ok(file) => {
