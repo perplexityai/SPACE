@@ -952,7 +952,9 @@ fn completed_lifecycle_target_state(
 /// queued `:wake` whose user is deleted before it runs is recognized here too,
 /// and refused if the policy forbids a command wake; no caller remains to want
 /// it. A controller without this check runs it as the plain `:wake` the
-/// policy allowed at enqueue.
+/// policy allowed at enqueue. A caller's `:wake` joins the system's wake only
+/// while it is queued, giving it that caller as its actor, so the claim that
+/// takes it reads that actor and it runs as their `:wake`.
 fn is_implicit_command_wake(
     operation: &ClaimedPublicOperation,
     action: SandboxLifecycleAction,

@@ -939,19 +939,22 @@ async fn enqueue_lifecycle_operation(
         rollback,
     }
     .into_json();
-    let result = admission
-        .create(CreatePublicOperation {
-            org_id,
-            actor_user_id: Some(actor_user_id),
-            api_product: ApiProduct::Native,
-            kind: action.operation_kind(),
-            target_type: Some(OperationTargetType::Sandbox),
-            target_id: Some(&sandbox_id_string),
-            payload_json,
-            idempotency: Some(idempotency),
-            traceparent: crate::public_operations::request_traceparent(),
-        })
-        .await?;
+    let input = CreatePublicOperation {
+        org_id,
+        actor_user_id: Some(actor_user_id),
+        api_product: ApiProduct::Native,
+        kind: action.operation_kind(),
+        target_type: Some(OperationTargetType::Sandbox),
+        target_id: Some(&sandbox_id_string),
+        payload_json,
+        idempotency: Some(idempotency),
+        traceparent: crate::public_operations::request_traceparent(),
+    };
+    let result = if action == SandboxLifecycleAction::Wake {
+        admission.create_or_join_active_wake(input).await?
+    } else {
+        admission.create(input).await?
+    };
 
     let response = match result {
         CreatePublicOperationResult::Created(operation_id) => SandboxOperationResponse {

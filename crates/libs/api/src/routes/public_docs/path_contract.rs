@@ -674,7 +674,7 @@ fn lifecycle_action(action: SandboxLifecycleAction) -> Option<LifecycleAction> {
         SandboxLifecycleAction::Wake => (
             WAKE_SANDBOX,
             "Wake a sandbox",
-            "Returns a sandbox to running by whichever path is valid for its current state: start, resume, or restore. Use this when the caller does not need to know which.",
+            "Returns a sandbox to running by whichever path is valid for its current state: start, resume, or restore. Use this when the caller does not need to know which. When a wake for the sandbox is already pending, with nothing else for the sandbox queued after it, the response names that operation instead of queuing another if it is the caller's own, queued or running, or one a command or process session queued that has not started and no other caller has joined.",
         ),
         SandboxLifecycleAction::Kill => (
             KILL_SANDBOX,

@@ -138,6 +138,10 @@ fn command_admission_follows_lifecycle_and_wake_policy() {
 /// branches on.
 mod not_running {
     use super::*;
+    use crate::public_operations::{
+        ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
+        CreatePublicOperationResult,
+    };
     use axum::{
         Router,
         body::Body,
@@ -147,6 +151,7 @@ mod not_running {
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db,
     };
+    use pplx_space_public_api::{OperationKind, OperationTargetType, RequestFingerprint};
     use serde_json::{Value, json};
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -385,19 +390,399 @@ mod not_running {
         .await?)
     }
 
+    /// `POST /v1/sandboxes/{sandbox_id}:{action}` with `key`: the 202's
+    /// operation id.
+    async fn lifecycle(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+        action: &str,
+        key: &str,
+    ) -> TestDbResult<Uuid> {
+        lifecycle_as(fixture, KEY, sandbox_id, action, key).await
+    }
+
+    /// [`lifecycle`] authenticated with the API key `bearer`.
+    async fn lifecycle_as(
+        fixture: &Fixture,
+        bearer: &str,
+        sandbox_id: PublicSandboxId,
+        action: &str,
+        key: &str,
+    ) -> TestDbResult<Uuid> {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/sandboxes/{sandbox_id}:{action}"))
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("idempotency-key", key)
+            .body(Body::empty())?;
+        let response = fixture.app.clone().oneshot(request).await?;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        let body: Value = serde_json::from_slice(&body)?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{action}: {body}");
+        Ok(body["operation_id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("op_")?.parse().ok())
+            .unwrap_or_else(|| panic!("{action}: {body}")))
+    }
+
+    /// The wake operations for `sandbox_id` in the dispatcher's order: id,
+    /// actor.
+    async fn wake_ids(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+    ) -> TestDbResult<Vec<(Uuid, Option<Uuid>)>> {
+        Ok(sqlx::query_as(sql!(
+            "SELECT operation_id, actor_user_id
+               FROM public_operations
+              WHERE kind = 'wake_sandbox' AND target_id = $1
+              ORDER BY requested_at, operation_id"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_all(&fixture.db.pool)
+        .await?)
+    }
+
+    async fn succeed(fixture: &Fixture, operation_id: Uuid) -> TestDbResult<()> {
+        sqlx::query(sql!(
+            "UPDATE public_operations
+                SET state = 'succeeded', completed_at = NOW()
+              WHERE operation_id = $1"
+        ))
+        .bind(operation_id)
+        .execute(&fixture.db.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wake_after_a_command_joins_the_command_wake() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        let (status, _, body) = command(&fixture, sandbox_id, "commands").await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let [(wake, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
+            panic!("one system wake");
+        };
+
+        // The joined wake becomes the caller's, so it runs as their `:wake`
+        // and their owner scope can read it.
+        let key = Uuid::now_v7().to_string();
+        assert_eq!(lifecycle(&fixture, sandbox_id, "wake", &key).await?, wake);
+        let joined = vec![(wake, Some(SEED_USER_ID))];
+        assert_eq!(wake_ids(&fixture, sandbox_id).await?, joined);
+
+        // A reconnecting client repeats both requests with new keys.
+        let (status, _, body) = command(&fixture, sandbox_id, "process-sessions").await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let key = Uuid::now_v7().to_string();
+        assert_eq!(lifecycle(&fixture, sandbox_id, "wake", &key).await?, wake);
+        assert_eq!(wake_ids(&fixture, sandbox_id).await?, joined);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replayed_wake_answers_with_the_wake_it_joined() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        command(&fixture, sandbox_id, "commands").await?;
+        let key = Uuid::now_v7().to_string();
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &key).await?;
+        assert_eq!(
+            wake_ids(&fixture, sandbox_id).await?,
+            vec![(wake, Some(SEED_USER_ID))]
+        );
+
+        // Nothing remains to join, so only the key can answer the replay.
+        succeed(&fixture, wake).await?;
+        assert_eq!(lifecycle(&fixture, sandbox_id, "wake", &key).await?, wake);
+        assert_eq!(wake_ids(&fixture, sandbox_id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_join_under_a_recorded_key_answers_from_the_record() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        command(&fixture, sandbox_id, "commands").await?;
+        let key = Uuid::now_v7().to_string();
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &key).await?;
+
+        // The route answers a recorded key before it joins anything; a
+        // caller of the store that does not still gets the record's answer.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("idempotency-key", key.parse()?);
+        let key = crate::routes::public::sandboxes::idempotency_key(&headers)
+            .map_err(|_| "idempotency key")?;
+        let fingerprint = RequestFingerprint::parse("0".repeat(64))?;
+        let idempotency = CreatePublicOperationIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new(
+                pplx_space_public_api::routes::WAKE_SANDBOX.path(),
+            ),
+            key: &key,
+            request_fingerprint: &fingerprint,
+        };
+        let org_id = OrgId::from_uuid(SEED_ORG_ID);
+        let target_id = sandbox_id.to_string();
+        let result = PublicOperationStore::new(fixture.db.pool.clone())
+            .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+            .await?
+            .create_or_join_active_wake(CreatePublicOperation {
+                org_id,
+                actor_user_id: Some(UserId::from_uuid(SEED_USER_ID)),
+                api_product: ApiProduct::Native,
+                kind: OperationKind::WakeSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(&target_id),
+                payload_json: json!({}),
+                idempotency: Some(idempotency.clone()),
+                traceparent: None,
+            })
+            .await?;
+        let CreatePublicOperationResult::IdempotencyConflict {
+            operation_id: Some(recorded),
+            ..
+        } = result
+        else {
+            panic!("a conflict with the recorded wake: {result:?}");
+        };
+        assert_eq!(recorded.as_uuid(), wake);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wake_after_the_wake_it_would_join_finished_queues_its_own() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        command(&fixture, sandbox_id, "commands").await?;
+        let [(system, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
+            panic!("one system wake");
+        };
+        succeed(&fixture, system).await?;
+
+        let key = Uuid::now_v7().to_string();
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &key).await?;
+        assert_eq!(
+            wake_ids(&fixture, sandbox_id).await?,
+            vec![(system, None), (wake, Some(SEED_USER_ID))]
+        );
+
+        // Nor does the caller's own wake, once it finished.
+        succeed(&fixture, wake).await?;
+        let key = Uuid::now_v7().to_string();
+        let next = lifecycle(&fixture, sandbox_id, "wake", &key).await?;
+        assert_eq!(
+            wake_ids(&fixture, sandbox_id).await?,
+            vec![
+                (system, None),
+                (wake, Some(SEED_USER_ID)),
+                (next, Some(SEED_USER_ID))
+            ]
+        );
+        Ok(())
+    }
+
+    /// Take `operation_id` as the dispatcher's claim does, in `tx`.
+    async fn claim(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        operation_id: Uuid,
+    ) -> TestDbResult<()> {
+        sqlx::query(sql!(
+            "UPDATE public_operations
+                SET state = 'running', claim_token = 'test-claim', attempts = attempts + 1,
+                    claimed_at = NOW(), started_at = NOW()
+              WHERE operation_id = $1"
+        ))
+        .bind(operation_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wake_does_not_join_a_command_wake_already_claimed() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        command(&fixture, sandbox_id, "commands").await?;
+        let [(system, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
+            panic!("one system wake");
+        };
+        let mut tx = fixture.db.pool.begin().await?;
+        claim(&mut tx, system).await?;
+        tx.commit().await?;
+
+        // Its attempt runs by the actor its claim read: a command wake, which
+        // the policy could still refuse, so this `:wake` must not be answered
+        // with it.
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        let queued = vec![(system, None), (wake, Some(SEED_USER_ID))];
+        assert_eq!(wake_ids(&fixture, sandbox_id).await?, queued);
+
+        // A reconnect during that attempt joins the caller's own wake.
+        command(&fixture, sandbox_id, "commands").await?;
+        let again = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        assert_eq!(again, wake);
+        assert_eq!(wake_ids(&fixture, sandbox_id).await?, queued);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wake_overtaken_by_the_claim_of_the_command_wake_queues_its_own() -> TestDbResult<()>
+    {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        command(&fixture, sandbox_id, "commands").await?;
+        let [(system, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
+            panic!("one system wake");
+        };
+
+        // A claim in flight: the `:wake` still sees the wake queued, then
+        // waits on its row to hand it over, and the claim commits first. Both
+        // connections are outside the pool the route uses.
+        use sqlx::{Connection, PgConnection};
+        let mut claimant = PgConnection::connect(&fixture.db.database_url).await?;
+        let mut observer = PgConnection::connect(&fixture.db.database_url).await?;
+        let mut tx = claimant.begin().await?;
+        claim(&mut tx, system).await?;
+        let key = Uuid::now_v7().to_string();
+        let commit_once_waited = async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !sqlx::query_scalar::<_, bool>(sql!(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                          WHERE datname = current_database()
+                            AND wait_event_type = 'Lock'
+                            AND query LIKE '%SET actor_user_id%')"
+                ))
+                .fetch_one(&mut observer)
+                .await?
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                TestDbResult::Ok(())
+            })
+            .await??;
+            tx.commit().await?;
+            TestDbResult::Ok(())
+        };
+        let (wake, ()) = tokio::try_join!(
+            lifecycle(&fixture, sandbox_id, "wake", &key),
+            commit_once_waited
+        )?;
+        assert_eq!(
+            wake_ids(&fixture, sandbox_id).await?,
+            vec![(system, None), (wake, Some(SEED_USER_ID))]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wake_never_joins_another_users_wake() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let other_user = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
+             VALUES ($1, $2, 'unused', 'Other Caller', $3, 'member')"
+        ))
+        .bind(other_user)
+        .bind(format!("other-{other_user}@space.invalid"))
+        .bind(SEED_ORG_ID)
+        .execute(&fixture.db.pool)
+        .await?;
+        const OTHER_KEY: &str = "native-command-admission-other-key";
+        sqlx::query(sql!(
+            "INSERT INTO api_keys (id, org_id, name, key_hash, created_by, allowed_surfaces)
+             VALUES ($1, $2, 'native-command-admission-other', $3, $4, ARRAY['native'])"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(SEED_ORG_ID)
+        .bind(crate::auth::hash_token(OTHER_KEY))
+        .bind(other_user)
+        .execute(&fixture.db.pool)
+        .await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        command(&fixture, sandbox_id, "commands").await?;
+        let [(system, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
+            panic!("one system wake");
+        };
+
+        // The first caller to join the system's wake owns it, so the next
+        // caller's owner scope could not read it.
+        let key = Uuid::now_v7().to_string();
+        let joined = lifecycle_as(&fixture, OTHER_KEY, sandbox_id, "wake", &key).await?;
+        assert_eq!(joined, system);
+        let key = Uuid::now_v7().to_string();
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &key).await?;
+        assert_eq!(
+            wake_ids(&fixture, sandbox_id).await?,
+            vec![(system, Some(other_user)), (wake, Some(SEED_USER_ID))]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wake_never_joins_an_admin_force_wake() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        // A force-wake the caller sent through the admin API.
+        let target_id = sandbox_id.to_string();
+        let admin = PublicOperationStore::new(fixture.db.pool.clone())
+            .create_operation(CreatePublicOperation {
+                org_id: OrgId::from_uuid(SEED_ORG_ID),
+                actor_user_id: Some(UserId::from_uuid(SEED_USER_ID)),
+                api_product: ApiProduct::Admin,
+                kind: OperationKind::WakeSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(&target_id),
+                payload_json: SandboxLifecycleOperationPayload {
+                    sandbox_id,
+                    action: SandboxLifecycleAction::Wake,
+                    rollback: None,
+                }
+                .into_json(),
+                idempotency: None,
+                traceparent: None,
+            })
+            .await?;
+        let CreatePublicOperationResult::Created(admin) = admin else {
+            panic!("admin wake created: {admin:?}");
+        };
+
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        assert_ne!(wake, admin.as_uuid());
+        assert_eq!(wake_ids(&fixture, sandbox_id).await?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wake_behind_a_queued_suspend_queues_its_own() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        command(&fixture, sandbox_id, "commands").await?;
+        lifecycle(&fixture, sandbox_id, "suspend", &Uuid::now_v7().to_string()).await?;
+
+        // Joining the command's wake would run it before the suspend and
+        // leave the sandbox suspended.
+        lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        let caller = Some(SEED_USER_ID);
+        assert_eq!(
+            queue(&fixture, sandbox_id).await?,
+            vec![
+                ("wake_sandbox".to_string(), None),
+                ("suspend_sandbox".to_string(), caller),
+                ("wake_sandbox".to_string(), caller),
+            ]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_command_behind_a_queued_suspend_queues_its_own_wake() -> TestDbResult<()> {
         let fixture = fixture().await?;
         let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
         for action in ["wake", "suspend"] {
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri(format!("/v1/sandboxes/{sandbox_id}:{action}"))
-                .header("authorization", format!("Bearer {KEY}"))
-                .header("idempotency-key", Uuid::now_v7().to_string())
-                .body(Body::empty())?;
-            let response = fixture.app.clone().oneshot(request).await?;
-            assert_eq!(response.status(), StatusCode::ACCEPTED, "{action}");
+            lifecycle(&fixture, sandbox_id, action, &Uuid::now_v7().to_string()).await?;
         }
         let caller = Some(SEED_USER_ID);
 

@@ -627,7 +627,9 @@ impl PublicOperationStore {
     /// queued or running wake joins, whoever asked for it, so many commands on
     /// one sandbox at rest share a single operation, unless another operation
     /// for the sandbox, such as a `:suspend`, is queued after it: then a new
-    /// wake is queued behind that one.
+    /// wake is queued behind that one. A caller's `:wake` joins it by the same
+    /// rule while it is still queued
+    /// ([`PublicOperationAdmission::create_or_join_active_wake`]).
     pub async fn create_or_join_active_sandbox_wake(
         &self,
         org_id: OrgId,
@@ -657,19 +659,8 @@ impl PublicOperationStore {
         payload_json: serde_json::Value,
         traceparent: Option<String>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
-        // Deletes keep the lock key they always had.
-        let lock_key = if kind == OperationKind::DeleteSandbox {
-            format!("{org_id}:{target_id}")
-        } else {
-            format!("{org_id}:{target_id}:{}", kind.as_str())
-        };
         let mut tx = self.pool.begin().await?;
-        sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
-        ))
-        .bind(lock_key)
-        .execute(&mut *tx)
-        .await?;
+        lock_active_sandbox_operation(&mut tx, org_id, kind, target_id).await?;
         let existing = if kind == OperationKind::DeleteSandbox {
             sqlx::query_scalar::<_, Uuid>(sql!(
                 "SELECT operation_id
@@ -688,41 +679,9 @@ impl PublicOperationStore {
             .fetch_optional(&mut *tx)
             .await?
         } else {
-            // Join only an operation nothing else for the sandbox is queued
-            // behind, in the dispatcher's order: a wake ahead of a `:suspend`
-            // leaves the sandbox at rest, so this caller's wake is queued
-            // after that instead. Only committed operations are seen: other
-            // kinds never take this lock, so a `:suspend` still uncommitted
-            // here is missed, this caller joins the earlier wake, and the
-            // suspend then sorts after it, so the command finds the sandbox
-            // at rest.
-            sqlx::query_scalar::<_, Uuid>(sql!(
-                "SELECT active.operation_id
-                   FROM public_operations active
-                  WHERE active.org_id = $1
-                    AND active.kind = $3
-                    AND active.target_type = 'sandbox'
-                    AND active.target_id = $2
-                    AND active.state IN ('queued', 'running')
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM public_operations later
-                         WHERE later.org_id = active.org_id
-                           AND later.target_type = 'sandbox'
-                           AND later.target_id = active.target_id
-                           AND later.kind <> active.kind
-                           AND later.state IN ('queued', 'running')
-                           AND (later.requested_at, later.operation_id)
-                               > (active.requested_at, active.operation_id)
-                    )
-                  ORDER BY active.requested_at, active.operation_id
-                  LIMIT 1"
-            ))
-            .bind(org_id)
-            .bind(target_id)
-            .bind(kind.as_str())
-            .fetch_optional(&mut *tx)
-            .await?
+            joinable_active_sandbox_operation(&mut tx, org_id, kind, target_id, None)
+                .await?
+                .map(|joinable| joinable.operation_id)
         };
         if let Some(operation_id) = existing {
             tx.commit().await?;
@@ -1185,6 +1144,102 @@ impl PublicOperationAdmission {
             );
         }
         Ok(result)
+    }
+
+    /// [`Self::create`] for a caller's `:wake`, except that it joins a wake
+    /// for the sandbox with nothing else for the sandbox queued behind it, as
+    /// [`PublicOperationStore::create_or_join_active_sandbox_wake`] does: the
+    /// caller's own wake, queued or running, or the system's while it is still
+    /// queued. A `:wake` sent after a command then shares the command's wake,
+    /// as one sent before it already did.
+    ///
+    /// A joined system wake becomes the caller's, so the claim that takes it
+    /// reads them as its actor and runs it as their `:wake`, not as a command
+    /// wake under the sandbox's wake policy, and their owner scope can read
+    /// it. One already claimed is not joined: its attempt runs by the actor
+    /// its claim read, and a policy narrowed since the command could refuse it.
+    /// The hand-over locks the row and re-checks that the wake is still
+    /// queued, so of a claim and a hand-over that race, whichever commits
+    /// second sees the other; a hand-over that loses queues the caller's own
+    /// wake instead.
+    ///
+    /// The caller's key records the joined wake, so a replay answers with it.
+    /// A key this admission did not observe missing goes through
+    /// [`Self::create`], which answers the replay or the conflict.
+    pub(crate) async fn create_or_join_active_wake(
+        mut self,
+        input: CreatePublicOperation<'_>,
+    ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+        let request = (
+            input.kind,
+            input.target_id,
+            input.actor_user_id,
+            input.idempotency.as_ref(),
+        );
+        debug_assert!(
+            matches!(
+                request,
+                (OperationKind::WakeSandbox, Some(_), Some(_), Some(_))
+            ),
+            "only a caller's keyed sandbox wake can join one"
+        );
+        let (OperationKind::WakeSandbox, Some(target_id), Some(actor_user_id), Some(idempotency)) =
+            request
+        else {
+            return self.create(input).await;
+        };
+        if !matches!(self.observation, ObservePublicOperationIdempotency::Missing) {
+            return self.create(input).await;
+        }
+        lock_active_sandbox_operation(&mut self.tx, input.org_id, input.kind, target_id).await?;
+        let Some(joinable) = joinable_active_sandbox_operation(
+            &mut self.tx,
+            input.org_id,
+            input.kind,
+            target_id,
+            Some(actor_user_id),
+        )
+        .await?
+        else {
+            return self.create(input).await;
+        };
+        if joinable.system {
+            let handed_over = sqlx::query_scalar::<_, Uuid>(sql!(
+                "UPDATE public_operations
+                    SET actor_user_id = $2, updated_at = NOW()
+                  WHERE operation_id = $1
+                    AND actor_user_id IS NULL
+                    AND state = 'queued'
+                  RETURNING operation_id"
+            ))
+            .bind(joinable.operation_id)
+            .bind(actor_user_id)
+            .fetch_optional(&mut *self.tx)
+            .await?;
+            if handed_over.is_none() {
+                return self.create(input).await;
+            }
+        }
+        let operation_id = OperationId::from_uuid(joinable.operation_id);
+        delete_expired_idempotency_record_tx(
+            &mut self.tx,
+            input.org_id,
+            input.api_product,
+            idempotency.method,
+            idempotency.path_template,
+            idempotency.key,
+        )
+        .await?;
+        insert_idempotency_record_tx(
+            &mut self.tx,
+            input.org_id,
+            input.api_product,
+            idempotency,
+            operation_id,
+        )
+        .await?;
+        self.tx.commit().await?;
+        Ok(CreatePublicOperationResult::Existing(operation_id))
     }
 
     pub async fn finish(self) -> Result<(), PublicOperationStoreError> {
@@ -1722,33 +1777,13 @@ pub async fn create_operation_tx(
     }
 
     if let Some(idempotency) = input.idempotency.as_ref() {
-        sqlx::query(sql!(
-            "INSERT INTO public_idempotency_records (
-                 id,
-                 org_id,
-                 api_product,
-                 method,
-                 path_template,
-                 idempotency_key,
-                 request_fingerprint,
-                 operation_id,
-                 expires_at
-             )
-             VALUES (
-                 $1, $2, $3, $4, $5, $6, $7, $8,
-                 NOW() + ($9::TEXT || ' hours')::INTERVAL
-             )"
-        ))
-        .bind(Uuid::now_v7())
-        .bind(input.org_id)
-        .bind(input.api_product.as_str())
-        .bind(idempotency.method.as_str())
-        .bind(idempotency.path_template.as_str())
-        .bind(idempotency.key.as_str())
-        .bind(idempotency.request_fingerprint.as_str())
-        .bind(operation_id.as_uuid())
-        .bind(DEFAULT_IDEMPOTENCY_TTL_HOURS.to_string())
-        .execute(&mut **tx)
+        insert_idempotency_record_tx(
+            tx,
+            input.org_id,
+            input.api_product,
+            idempotency,
+            operation_id,
+        )
         .await?;
     }
 
@@ -1905,6 +1940,129 @@ async fn superseding_delete_tx(
     .fetch_optional(&mut **tx)
     .await?;
     Ok(delete.map(OperationId::from_uuid))
+}
+
+async fn insert_idempotency_record_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    api_product: ApiProduct,
+    idempotency: &CreatePublicOperationIdempotency<'_>,
+    operation_id: OperationId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "INSERT INTO public_idempotency_records (
+             id,
+             org_id,
+             api_product,
+             method,
+             path_template,
+             idempotency_key,
+             request_fingerprint,
+             operation_id,
+             expires_at
+         )
+         VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8,
+             NOW() + ($9::TEXT || ' hours')::INTERVAL
+         )"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(org_id)
+    .bind(api_product.as_str())
+    .bind(idempotency.method.as_str())
+    .bind(idempotency.path_template.as_str())
+    .bind(idempotency.key.as_str())
+    .bind(idempotency.request_fingerprint.as_str())
+    .bind(operation_id.as_uuid())
+    .bind(DEFAULT_IDEMPOTENCY_TTL_HOURS.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Serialize creating or joining the active `kind` operation for one sandbox.
+/// Deletes keep the lock key they always had.
+async fn lock_active_sandbox_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    kind: OperationKind,
+    target_id: &str,
+) -> Result<(), sqlx::Error> {
+    let lock_key = if kind == OperationKind::DeleteSandbox {
+        format!("{org_id}:{target_id}")
+    } else {
+        format!("{org_id}:{target_id}:{}", kind.as_str())
+    };
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    ))
+    .bind(lock_key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// An active operation [`joinable_active_sandbox_operation`] found.
+struct JoinableOperation {
+    operation_id: Uuid,
+    /// No actor: the system's, as a command or process session queues it.
+    system: bool,
+}
+
+/// The queued or running `kind` operation on a sandbox that a new request
+/// joins, under [`lock_active_sandbox_operation`]. Only one that nothing else
+/// for the sandbox is queued behind, in the dispatcher's order: a wake ahead
+/// of a `:suspend` leaves the sandbox at rest, so the new wake is queued after
+/// that instead. Only committed operations are seen: other kinds never take
+/// this lock, so a `:suspend` still uncommitted here is missed, the new
+/// request joins the earlier wake, and the suspend then sorts after it, so a
+/// command finds the sandbox at rest. The system (`joiner` `None`) joins any
+/// such operation. A caller joins only a native one: their own, or the
+/// system's while it is still queued (see
+/// [`PublicOperationAdmission::create_or_join_active_wake`]).
+async fn joinable_active_sandbox_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    kind: OperationKind,
+    target_id: &str,
+    joiner: Option<UserId>,
+) -> Result<Option<JoinableOperation>, sqlx::Error> {
+    let joinable = sqlx::query_as::<_, (Uuid, bool)>(sql!(
+        "SELECT active.operation_id, active.actor_user_id IS NULL
+           FROM public_operations active
+          WHERE active.org_id = $1
+            AND active.kind = $3
+            AND active.target_type = 'sandbox'
+            AND active.target_id = $2
+            AND active.state IN ('queued', 'running')
+            AND ($4::UUID IS NULL
+                 OR (active.api_product = 'native'
+                     AND (active.actor_user_id = $4
+                          OR (active.actor_user_id IS NULL AND active.state = 'queued'))))
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM public_operations later
+                 WHERE later.org_id = active.org_id
+                   AND later.target_type = 'sandbox'
+                   AND later.target_id = active.target_id
+                   AND later.kind <> active.kind
+                   AND later.state IN ('queued', 'running')
+                   AND (later.requested_at, later.operation_id)
+                       > (active.requested_at, active.operation_id)
+            )
+          ORDER BY active.requested_at, active.operation_id
+          LIMIT 1"
+    ))
+    .bind(org_id)
+    .bind(target_id)
+    .bind(kind.as_str())
+    .bind(joiner)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(joinable.map(|(operation_id, system)| JoinableOperation {
+        operation_id,
+        system,
+    }))
 }
 
 fn new_claim_token() -> String {
