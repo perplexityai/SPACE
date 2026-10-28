@@ -111,9 +111,14 @@ impl ClusterApiService {
         // declined: the two outcomes this publication can have, held in one
         // value so the gate stamp below and the metric after the commit cannot
         // come to disagree about which one happened.
+        let pending_local_backups =
+            crate::node_publish::validate::pending_backup::PendingBackupReport::from_proto(
+                request.pending_local_backups.as_ref(),
+            );
+        let reported_count = pending_local_backups.reported_count();
         let backup_queue = match node_local_backup_pending::decide(
             &mut tx,
-            request.pending_local_backups.as_ref(),
+            pending_local_backups,
             inventory_prune,
             &sandbox_publication.state_only_sandbox_ids,
             origin.id,
@@ -241,10 +246,7 @@ impl ClusterApiService {
             // the outcome rather than a bool, so a node whose report is
             // declined every tick — and whose gate therefore never advances —
             // says *why* without a second lookup.
-            pending_local_backups_reported = request
-                .pending_local_backups
-                .as_ref()
-                .map(|report| report.pending.len()),
+            pending_local_backups_reported = reported_count,
             local_backup_queue_outcome = %backup_queue_outcome,
             local_backup_queue_depth = mirrored.map(|queue| queue.depth),
             local_backup_queue_unknown_sandboxes = mirrored.map(|queue| queue.unknown_sandboxes),
