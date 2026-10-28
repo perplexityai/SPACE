@@ -461,14 +461,14 @@ fn decode_rootfs_chunks(
                 operation: "reuse full decode buffer",
             }));
         }
-        let input_before = decoder.get_ref().timing.total();
+        let input_before = decoder.get_ref().input_elapsed();
         let (result, read) = measure(|| read_decoded_rootfs_chunk(decoder, buffer));
         read_time.add(read);
         // zstd reads include input I/O and compressed-hash backpressure.
         // Attribute those to compressed_input instead of calling them decode.
         timing
             .busy
-            .add(read.saturating_sub(decoder.get_ref().timing.total() - input_before));
+            .add(read.saturating_sub(decoder.get_ref().input_elapsed() - input_before));
         let chunk = match result {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
@@ -733,6 +733,13 @@ struct HashedCompressedInput<R> {
     free_rx: Receiver<std::sync::Arc<CompressedInputChunk>>,
     hash_handle: Option<thread::JoinHandle<Result<String, RootfsZstdError>>>,
     timing: StageTiming,
+}
+
+impl<R> HashedCompressedInput<R> {
+    /// Time spent reading input and waiting on the compressed-hash stage.
+    fn input_elapsed(&self) -> Duration {
+        self.timing.total()
+    }
 }
 
 impl<R: Read> HashedCompressedInput<R> {

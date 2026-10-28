@@ -1042,9 +1042,10 @@ Each concurrent stage gets a `rootfs.stage` span with a `stage` of `decode`,
 `compressed_input`, `compressed_hash`, `decoded_hash`, `writer` or `raw_hash`,
 and records `busy_ms`, `recv_wait_ms`, `send_wait_ms`, `wall_ms` and `bytes`
 when it ends, including on error. Counters are taken once per pooled chunk.
-The decoder also records `read_ms` (inclusive zstd read time; `busy_ms`
-subtracts the nested compressed-input time), and the writer records
-`data_bytes` and `hole_bytes` (logical sparse classification).
+On success only, the decoder also records `read_ms` (inclusive zstd read
+time; `busy_ms` subtracts the nested compressed-input time), and the writer
+records `data_bytes` and `hole_bytes` (logical sparse classification). A
+failed stage span carries just the common fields.
 
 The stage with high `busy_ms` and low waits is the limiter. Stage wall times
 overlap and must not be added, and busy is elapsed time, not CPU time.
