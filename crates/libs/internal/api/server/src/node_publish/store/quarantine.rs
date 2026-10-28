@@ -22,7 +22,6 @@ use pplx_space_sandbox_portability::{
     quarantine_recovery_suspend_snapshot_current, started_suspend_revert_eligibility,
     suspended_projection_lifecycle_eligible_with_node_evidence,
 };
-use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 use tonic::Status;
@@ -30,6 +29,8 @@ use uuid::Uuid;
 
 #[path = "quarantine_errors.rs"]
 mod errors;
+#[path = "suspended_bindings.rs"]
+mod suspended_bindings;
 pub(super) use errors::{
     ApplyActivationRollbacksError, ConsumeActivationReceiptsError, RecordQuarantineRecoveryError,
     RecoverPauseFailedError, SelectActivationRollbacksError, SelectSuspendedProjectionsError,
@@ -809,12 +810,11 @@ static SELECT_SUSPENDED_PROJECTIONS: LazyLock<String> = LazyLock::new(|| {
     );
     sql!(format!(
         "WITH input AS (
-             SELECT published.sandbox_id, published.status, published.transition_receipt_id,
+             SELECT published.sandbox_id, $18::TEXT AS status, published.transition_receipt_id,
                     published.transition_receipt_kind, published.transition_receipt_target_state,
                     published.transition_receipt_execution_generation,
                     published.transition_receipt_reason_code,
                     published.transition_receipt_recovery_policy,
-                    published.transition_receipt_activation_attempt_id, published.failure_reason,
                     published.current_local_artifact_id, published.current_local_artifact_kind,
                     published.current_local_artifact_origin, published.execution_generation,
                     published.pod_uid,
@@ -825,22 +825,16 @@ static SELECT_SUSPENDED_PROJECTIONS: LazyLock<String> = LazyLock::new(|| {
                           FROM sandbox_quarantine_history consumed
                          WHERE consumed.id = published.transition_receipt_id
                     ) AS has_unconsumed_recovery_receipt
-               FROM jsonb_to_recordset($2::jsonb) AS published(
-                   sandbox_id UUID,
-                   status TEXT,
-                   transition_receipt_id UUID,
-                   transition_receipt_kind TEXT,
-                   transition_receipt_target_state TEXT,
-                   transition_receipt_execution_generation BIGINT,
-                   transition_receipt_reason_code TEXT,
-                   transition_receipt_recovery_policy TEXT,
-                   transition_receipt_activation_attempt_id UUID,
-                   failure_reason TEXT,
-                   current_local_artifact_id UUID,
-                   current_local_artifact_kind TEXT,
-                   current_local_artifact_origin TEXT,
-                   execution_generation BIGINT,
-                   pod_uid TEXT
+               FROM UNNEST(
+                   $2::UUID[], $7::UUID[], $8::TEXT[], $9::TEXT[],
+                   $10::BIGINT[], $11::TEXT[], $12::TEXT[], $13::UUID[],
+                   $14::TEXT[], $15::TEXT[], $16::BIGINT[], $17::TEXT[]
+               ) AS published(
+                   sandbox_id, transition_receipt_id, transition_receipt_kind,
+                   transition_receipt_target_state, transition_receipt_execution_generation,
+                   transition_receipt_reason_code, transition_receipt_recovery_policy,
+                   current_local_artifact_id, current_local_artifact_kind,
+                   current_local_artifact_origin, execution_generation, pod_uid
                )
          )
          SELECT s.id,
@@ -960,6 +954,7 @@ pub(super) async fn select_suspended_projection_candidates(
     if claims.is_empty() {
         return Ok(Vec::new());
     }
+    let input = suspended_bindings::SuspendedBindings::from(claims);
     type CandidateRow = (
         SandboxId,
         bool,
@@ -977,11 +972,23 @@ pub(super) async fn select_suspended_projection_candidates(
     let rows: Vec<CandidateRow> =
         sqlx::query_as(sqlx::AssertSqlSafe(SELECT_SUSPENDED_PROJECTIONS.as_str()))
             .bind(node_id)
-            .bind(Json(claims))
+            .bind(input.ids)
             .bind(SandboxTransitionReceiptKind::QuarantineRecovery.as_str())
             .bind(SandboxQuarantineSource::SbxManager.as_str())
             .bind(SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact.as_str())
             .bind(SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact.as_str())
+            .bind(input.receipts)
+            .bind(input.receipt_kinds)
+            .bind(input.targets)
+            .bind(input.receipt_generations)
+            .bind(input.reasons)
+            .bind(input.policies)
+            .bind(input.artifacts)
+            .bind(input.artifact_kinds)
+            .bind(input.artifact_origins)
+            .bind(input.generations)
+            .bind(input.pod_uids)
+            .bind(SandboxLifecycle::Suspended.as_str())
             .fetch_all(&mut *conn)
             .await
             .map_err(SelectSuspendedProjectionsError::Select)?;
