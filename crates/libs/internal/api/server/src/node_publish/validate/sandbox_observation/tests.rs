@@ -18,15 +18,27 @@ fn invalid_optional_version_is_omitted_without_changing_valid_observation_fields
     let observation = ValidatedSandboxObservation::parse(sandbox_id, &state, None)
         .observation
         .unwrap();
-    let row = observation.legacy_row(None, None, false);
-    assert_eq!(row["status"], "StArTeD");
-    assert_eq!(row["runtime"], "future-runtime");
-    assert_eq!(row["sandbox_owner"], "sample-owner");
-    assert_eq!(row["sandbox_user"], "sample-owner");
-    assert_eq!(row["network_tx_bytes"], 0);
-    assert_eq!(row["network_rx_bytes"], serde_json::Value::Null);
-    assert_eq!(row["last_access_at"], "1970-01-01T00:00:00.000000007Z");
-    assert_eq!(row["spaced_version"], serde_json::Value::Null);
+    assert_eq!(
+        observation.status().map(PublishedSandboxStatus::as_str),
+        Some("StArTeD")
+    );
+    assert_eq!(
+        observation
+            .runtime
+            .as_ref()
+            .map(PublishedRuntimeLabel::as_str),
+        Some("future-runtime")
+    );
+    assert_eq!(observation.owner.as_deref(), Some("sample-owner"));
+    assert_eq!(observation.network_tx_bytes, Some(0));
+    assert_eq!(observation.network_rx_bytes, None);
+    assert_eq!(
+        observation
+            .last_access_at()
+            .map(PublishedActivityTimestamp::as_str),
+        Some("1970-01-01T00:00:00.000000007Z")
+    );
+    assert_eq!(observation.spaced_version, None);
 }
 
 #[test]

@@ -1,6 +1,5 @@
 use super::*;
 use crate::node_publish::plan::sandboxes::SandboxPlan;
-use crate::node_publish::store::sandbox_input::LegacySandboxInput;
 use pplx_space_sbx_mgr_client::proto::SnapshotDetail;
 
 fn state(id: u128) -> PublishedSandboxState {
@@ -43,21 +42,29 @@ fn duplicate_resolution_precedes_field_validation_and_preserves_absence() {
     assert!(!inventory.failure_episodes[0].state_degraded);
     assert!(inventory.failure_episodes[1].state_degraded);
     let plan = SandboxPlan::from(inventory);
-    let input = LegacySandboxInput::from(&plan);
-    assert_eq!(input.rows.len(), 1);
-    assert_eq!(input.rows[0]["sandbox_id"], state(1).sandbox_id);
-    assert_eq!(input.rows[0]["status"], "StArTeD");
+    assert_eq!(plan.observations.len(), 1);
     assert_eq!(
-        input.absent_ids,
+        plan.observations[0].sandbox_id,
+        SandboxId::from_uuid(uuid::Uuid::from_u128(1))
+    );
+    assert_eq!(
+        plan.observations[0]
+            .status
+            .as_ref()
+            .map(|status| status.as_str()),
+        Some("StArTeD")
+    );
+    assert_eq!(
+        plan.absent_ids,
         [SandboxId::from_uuid(uuid::Uuid::from_u128(3))]
     );
-    assert_eq!(input.state_only.len(), 1);
+    assert_eq!(plan.state_only.len(), 1);
     assert_eq!(
-        input.state_only[0].sandbox_id(),
+        plan.state_only[0].sandbox_id(),
         SandboxId::from_uuid(uuid::Uuid::from_u128(2))
     );
     assert_eq!(
-        input.state_only[0].status().map(|status| status.as_str()),
+        plan.state_only[0].status().map(|status| status.as_str()),
         Some("Failed")
     );
 }
@@ -105,22 +112,18 @@ fn incomplete_rich_evidence_drops_only_its_own_snapshots_policy_and_quarantine_c
         ]);
         assert!(inventory.failure_episodes[1].state_degraded, "{rejection}");
         let plan = SandboxPlan::from(inventory);
-        let input = LegacySandboxInput::from(&plan);
-        assert_eq!(input.rows.len(), 2, "{rejection}");
-        assert_eq!(input.snapshot_rows.len(), 2, "{rejection}");
+        assert_eq!(plan.observations.len(), 2, "{rejection}");
+        assert_eq!(plan.snapshots.len(), 2, "{rejection}");
         assert_eq!(
-            input.snapshot_rows[0].legacy_row()["snapshot_id"],
+            plan.snapshots[0].legacy_row()["snapshot_id"],
             "keep-earlier"
         );
-        assert_eq!(
-            input.snapshot_rows[1].legacy_row()["snapshot_id"],
-            "keep-later"
-        );
-        assert!(input.quarantine_inputs.is_empty(), "{rejection}");
+        assert_eq!(plan.snapshots[1].legacy_row()["snapshot_id"], "keep-later");
+        assert!(plan.quarantine.is_empty(), "{rejection}");
         assert!(plan.network_policy.observations.is_empty(), "{rejection}");
-        assert_eq!(input.state_only.len(), 1, "{rejection}");
+        assert_eq!(plan.state_only.len(), 1, "{rejection}");
         assert_eq!(
-            input.state_only[0].status().map(|status| status.as_str()),
+            plan.state_only[0].status().map(|status| status.as_str()),
             Some("QuArAnTiNeD")
         );
     }

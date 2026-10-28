@@ -1039,6 +1039,8 @@ async fn publish_updates_observed_state_without_writing_component_rows() -> Test
     let sandbox_id = SandboxId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
+    let neighbor_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, neighbor_id, node_id, "started").await?;
 
     let mut initial = published_sandbox_state(sandbox_id, "started");
     initial.execution = Some((&test_execution()).into());
@@ -1048,6 +1050,9 @@ async fn publish_updates_observed_state_without_writing_component_rows() -> Test
     drop(conn);
 
     let mut suspended = published_sandbox_state(sandbox_id, "suspended");
+    suspended.owner = Some("sample-owner".to_owned());
+    suspended.pid = Some(42);
+    suspended.network_tx_bytes = Some(123);
     suspended.execution = Some(
         (&ExecutionMetadata::initial_firecracker(
             Arch::Aarch64,
@@ -1061,9 +1066,13 @@ async fn publish_updates_observed_state_without_writing_component_rows() -> Test
         ))
             .into(),
     );
+    let mut neighbor = published_sandbox_state(neighbor_id, "started");
+    neighbor.status = None;
+    neighbor.runtime = None;
+    neighbor.network_tx_bytes = Some(0);
     let mut conn = db.pool.acquire().await?;
-    let accepted = publish_sandbox_states(&mut conn, node_id, &[suspended]).await?;
-    assert_eq!(accepted.accepted, 1);
+    let accepted = publish_sandbox_states(&mut conn, node_id, &[neighbor, suspended]).await?;
+    assert_eq!(accepted.accepted, 2);
     drop(conn);
 
     let (status, guest_arch, execution_metadata): (String, String, serde_json::Value) =
@@ -1078,6 +1087,32 @@ async fn publish_updates_observed_state_without_writing_component_rows() -> Test
     assert_eq!(status, "suspended");
     assert_eq!(guest_arch, "aarch64");
     assert_ne!(execution_metadata, serde_json::Value::Null);
+    let scalars: (Option<String>, Option<String>, Option<i32>, Option<i64>) = sqlx::query_as(sql!(
+        "SELECT sandbox_owner, sandbox_user, pid, network_tx_bytes
+             FROM sandbox_observed_states WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        scalars,
+        (
+            Some("sample-owner".to_owned()),
+            Some("sample-owner".to_owned()),
+            Some(42),
+            Some(123)
+        )
+    );
+    let neighbor_row: (bool, Option<i64>) = sqlx::query_as(sql!(
+        "SELECT status IS NULL AND runtime IS NULL
+                    AND execution_metadata IS NULL AND pid IS NULL,
+                network_tx_bytes
+         FROM sandbox_observed_states WHERE sandbox_id = $1"
+    ))
+    .bind(neighbor_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(neighbor_row, (true, Some(0)));
 
     // The retired per-component projection must stay unwritten even when the
     // publish payload carries execution components; component facts travel in

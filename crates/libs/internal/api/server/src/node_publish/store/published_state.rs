@@ -22,7 +22,6 @@ use pplx_space_events::{
 
 use crate::node_publish::plan::sandboxes::SandboxPlan;
 use crate::node_publish::plan::suspended::SuspendedClaim;
-use crate::node_publish::store::sandbox_input::LegacySandboxInput;
 use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes,
     inventory_reconcile::{self, enqueue as queue_policy_reconcile_refs_for_new_inventory},
@@ -437,17 +436,11 @@ pub(crate) async fn publish_validated_sandbox_states(
     for diagnostic in &plan.diagnostics {
         diagnostic.emit(node_id);
     }
-    let LegacySandboxInput {
-        absent_ids,
-        rows,
-        state_only,
-        snapshot_rows,
-        quarantine_inputs,
-    } = LegacySandboxInput::from(plan);
+    let state_only = &plan.state_only;
     let mut post_commit_events = Vec::new();
     let mut post_commit_state_convergence = Vec::new();
 
-    let mut accepted = absent_sandboxes::remove(&mut *conn, node_id, absent_ids).await?;
+    let mut accepted = absent_sandboxes::remove(&mut *conn, node_id, &plan.absent_ids).await?;
 
     let degraded_accepted = degraded_observations::upsert(&mut *conn, node_id, state_only).await?;
     accepted = accepted.saturating_add(degraded_accepted);
@@ -460,7 +453,7 @@ pub(crate) async fn publish_validated_sandbox_states(
     )
     .await?;
 
-    if rows.is_empty() {
+    if plan.observations.is_empty() {
         return Ok(SandboxPublicationOutcome {
             accepted,
             post_commit_events,
@@ -472,8 +465,7 @@ pub(crate) async fn publish_validated_sandbox_states(
         });
     }
 
-    let rows_json = Json(serde_json::Value::Array(rows));
-    let accepted_rows = observed_state::upsert(conn, node_id, &rows_json).await?;
+    let accepted_rows = observed_state::upsert(conn, node_id, &plan.observations).await?;
 
     let inserted_count = accepted_rows.iter().filter(|row| row.inserted).count();
     let updated_count = accepted_rows.iter().filter(|row| row.updated).count();
@@ -520,7 +512,7 @@ pub(crate) async fn publish_validated_sandbox_states(
         .map(|row| row.sandbox_id)
         .collect::<Vec<_>>();
     sandbox_application::converge_lifecycles(conn, node_id, plan, &mut post_commit_events).await?;
-    sandbox_application::project_quarantine(conn, node_id, quarantine_inputs).await?;
+    sandbox_application::project_quarantine(conn, node_id, &plan.quarantine).await?;
     sandbox_application::recover_pause_failed(
         conn,
         node_id,
@@ -541,7 +533,7 @@ pub(crate) async fn publish_validated_sandbox_states(
     network_policy::upsert(conn, node_id, &plan.network_policy.observations).await?;
     network_policy::clear_apply_failure(conn, node_id, &plan.network_policy.clear_failures).await?;
 
-    snapshot_inventory::replace(conn, &accepted_ids, snapshot_rows).await?;
+    snapshot_inventory::replace(conn, &accepted_ids, &plan.snapshots).await?;
     accepted = accepted.saturating_add(usize_to_u64(accepted_ids.len()));
     Ok(SandboxPublicationOutcome {
         accepted,

@@ -10,7 +10,6 @@ use super::fields::{
     ExecutionProjection, execution_projection, non_zero_u64_to_i64, proto_timestamp_to_rfc3339,
     u32_to_i32, u64_to_i64,
 };
-use super::quarantine::QuarantineRecoveryProjection;
 use super::sandbox_identity::SandboxIdentityEvidence;
 use super::sandbox_metadata::{PublishedRuntimeLabel, policy_authority};
 use super::sandbox_status::PublishedSandboxStatus;
@@ -47,36 +46,35 @@ pub(crate) struct ObservationValidation {
 /// Parsed observation evidence; none of these fields decides a guarded transition.
 #[derive(Debug)]
 pub(crate) struct ValidatedSandboxObservation {
-    sandbox_id: SandboxId,
-    status: Option<PublishedSandboxStatus>,
-    runtime: Option<PublishedRuntimeLabel>,
-    spaced_version: Option<SemVer>,
-    execution: Option<ExecutionProjection>,
+    pub(in crate::node_publish) sandbox_id: SandboxId,
+    pub(in crate::node_publish) status: Option<PublishedSandboxStatus>,
+    pub(in crate::node_publish) runtime: Option<PublishedRuntimeLabel>,
+    pub(in crate::node_publish) spaced_version: Option<SemVer>,
+    pub(in crate::node_publish) execution: Option<ExecutionProjection>,
     identity: SandboxIdentityEvidence,
-    state_changed_at: Option<PublishedActivityTimestamp>,
-    pid: Option<i32>,
+    pub(in crate::node_publish) state_changed_at: Option<PublishedActivityTimestamp>,
+    pub(in crate::node_publish) pid: Option<i32>,
     // These annotations are open legacy text, not lifecycle or execution authority.
-    template: Option<String>,
-    namespace: Option<String>,
-    uptime: Option<String>,
-    owner: Option<String>,
-    image_hash: Option<String>,
-    pool_template: Option<String>,
-    failure_reason: Option<String>,
-    observed_created_at: Option<String>,
-    quarantine_reason_code: Option<String>,
-    snapshots_enabled: bool,
+    pub(in crate::node_publish) template: Option<String>,
+    pub(in crate::node_publish) namespace: Option<String>,
+    pub(in crate::node_publish) uptime: Option<String>,
+    pub(in crate::node_publish) owner: Option<String>,
+    pub(in crate::node_publish) image_hash: Option<String>,
+    pub(in crate::node_publish) pool_template: Option<String>,
+    pub(in crate::node_publish) failure_reason: Option<String>,
+    pub(in crate::node_publish) observed_created_at: Option<String>,
+    pub(in crate::node_publish) snapshots_enabled: bool,
     last_used_at: Option<PublishedActivityTimestamp>,
     last_access_at: Option<PublishedActivityTimestamp>,
     last_command_at: Option<PublishedActivityTimestamp>,
-    network_tx_bytes: Option<i64>,
-    network_rx_bytes: Option<i64>,
-    disk_usage_bytes: Option<i64>,
+    pub(in crate::node_publish) network_tx_bytes: Option<i64>,
+    pub(in crate::node_publish) network_rx_bytes: Option<i64>,
+    pub(in crate::node_publish) disk_usage_bytes: Option<i64>,
     pub(in crate::node_publish) network_policy: Option<NetworkPolicyV1>,
     pub(in crate::node_publish) network_policy_generation: Option<i64>,
     pub(in crate::node_publish) network_policy_source: NetworkPolicySource,
     pub(in crate::node_publish) network_policy_authority: Option<PolicyAuthority>,
-    auto_lifecycle_authority: Option<PolicyAuthority>,
+    pub(in crate::node_publish) auto_lifecycle_authority: Option<PolicyAuthority>,
 }
 
 impl ValidatedSandboxObservation {
@@ -176,7 +174,6 @@ impl ValidatedSandboxObservation {
             pool_template: optional_trimmed(state.pool_template.as_deref()),
             failure_reason: optional_trimmed(state.failure_reason.as_deref()),
             observed_created_at: optional_trimmed(state.created_at.as_deref()),
-            quarantine_reason_code: optional_trimmed(state.quarantine_reason_code.as_deref()),
             snapshots_enabled: state.snapshots_enabled,
             last_used_at: PublishedActivityTimestamp::parse(
                 state.last_used_at.as_ref(),
@@ -225,76 +222,6 @@ impl ValidatedSandboxObservation {
                 })
                 .transpose()?,
             identity,
-        })
-    }
-
-    pub(crate) fn legacy_row(
-        &self,
-        receipt: Option<&SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
-        recovery: Option<&QuarantineRecoveryProjection>,
-        recovery_degraded: bool,
-    ) -> serde_json::Value {
-        let execution = self.execution.as_ref();
-        let artifact = self.identity.current_local_artifact();
-        let recovery = recovery.map(|observation| {
-            serde_json::json!({
-                "schema_version": observation.schema_version,
-                "local_quarantine_id": observation.local_quarantine_id,
-                "observed_owner": observation.observed_owner_name(),
-                "attempt_count": observation.attempt_count,
-                "next_attempt_at": observation.next_attempt_at.as_deref(),
-            })
-        });
-        serde_json::json!({
-            "sandbox_id": self.sandbox_id,
-            "status": self.status.as_ref().map(PublishedSandboxStatus::as_str),
-            "template": self.template,
-            "runtime": self.runtime.as_ref().map(PublishedRuntimeLabel::as_str)
-                .or_else(|| execution.map(|execution| execution.runtime.as_str())),
-            "spaced_version": self.spaced_version.as_ref().map(ToString::to_string),
-            "runtime_version": execution.map(|execution| &execution.runtime_version),
-            "guest_os": execution.map(|execution| &execution.guest_os),
-            "guest_arch": execution.map(|execution| &execution.guest_arch),
-            "state_format_name": execution.and_then(|execution| execution.state_format_name.as_deref()),
-            "state_format_version": execution.and_then(|execution| execution.state_format_version.as_deref()),
-            "execution_metadata": execution.map(|execution| &execution.metadata),
-            "execution_components": execution.map(|execution| execution.components.as_slice()).unwrap_or_default(),
-            "pid": self.pid,
-            "namespace": self.namespace,
-            "uptime": self.uptime,
-            "sandbox_owner": self.owner,
-            "sandbox_user": self.owner,
-            "image_hash": self.image_hash,
-            "snapshots_enabled": self.snapshots_enabled,
-            "pool_template": self.pool_template,
-            "failure_reason": self.failure_reason,
-            "observed_created_at": self.observed_created_at,
-            "last_used_at": self.last_used_at,
-            "last_access_at": self.last_access_at,
-            "last_command_at": self.last_command_at,
-            "network_tx_bytes": self.network_tx_bytes,
-            "network_rx_bytes": self.network_rx_bytes,
-            "disk_usage_bytes": self.disk_usage_bytes,
-            "auto_lifecycle_authority": self.auto_lifecycle_authority.map(|authority| authority.as_str()),
-            "quarantine_reason_code": self.quarantine_reason_code,
-            "transition_receipt_id": receipt.map(|receipt| receipt.id().as_uuid()),
-            "transition_receipt_kind": receipt.map(|receipt| receipt.kind().as_str()),
-            "transition_receipt_target_state": receipt.map(|receipt| receipt.target_state().as_str()),
-            "transition_receipt_execution_generation": receipt.map(|receipt| receipt.execution_generation().get()),
-            "transition_receipt_reason_code": receipt.and_then(|receipt| receipt.reason_code().map(|reason| reason.as_str())),
-            "transition_receipt_activation_attempt_id": receipt.and_then(|receipt| receipt.activation_attempt_id().map(|id| id.as_uuid())),
-            "quarantine_recovery_payload": recovery,
-            "quarantine_recovery_observation_degraded": recovery_degraded,
-            "transition_receipt_recovery_policy": receipt
-                .and_then(|receipt| receipt.reason_code().copied())
-                .and_then(|reason| reason.automatic_recovery_policy())
-                .map(|policy| policy.to_string()),
-            "current_local_artifact_id": artifact.map(|artifact| artifact.id().to_string()),
-            "current_local_artifact_kind": artifact.map(|artifact| artifact.kind().to_string()),
-            "current_local_artifact_origin": artifact.map(|artifact| artifact.origin().to_string()),
-            "state_changed_at": self.state_changed_at,
-            "execution_generation": self.identity.execution_generation().map(|generation| generation.get()),
-            "pod_uid": self.identity.pod_uid().map(ToString::to_string),
         })
     }
 }

@@ -1,13 +1,11 @@
-use pplx_space_common_core::types::{
-    SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode, SandboxTransitionReceipt,
-    SandboxTransitionReceiptKind,
-};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SandboxTransitionReceiptKind};
 
 use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
 use super::activity::ActivityClaim;
 use super::failure_episode::FailureEpisodePlan;
 use super::lifecycle::{FailedClaim, PauseFailedRecoveryClaim, RestoreClaim, StoppedClaim};
 use super::network_policy::NetworkPolicyPlan;
+use super::observed_state::ObservedStateClaim;
 use super::recovery_observation::{ClearRecoveryObservationClaim, RecoveryObservationClaim};
 use super::suspend_handoff::SuspendHandoffClaim;
 use super::suspended::SuspendedClaim;
@@ -16,24 +14,15 @@ use crate::node_publish::validate::{
     quarantine::QuarantineRecoveryProjectionState,
     quarantine_claim::QuarantineClaim,
     sandbox_inventory::{DegradedSandboxClaim, ValidatedSandboxInventory},
-    sandbox_observation::ValidatedSandboxObservation,
     snapshots::SnapshotClaim,
 };
-
-/// An observation and its optional fencing evidence, not a lifecycle decision.
-#[derive(Debug)]
-pub(crate) struct ObservedClaim {
-    pub(crate) observation: ValidatedSandboxObservation,
-    pub(crate) receipt: Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
-    pub(crate) recovery: QuarantineRecoveryProjectionState,
-}
 
 /// Per-concern evidence in the canonical order chosen by validation.
 /// Absent and degraded observations remain distinct from rich observations.
 #[derive(Debug)]
 pub(crate) struct SandboxPlan {
     pub(crate) absent_ids: Vec<SandboxId>,
-    pub(crate) observations: Vec<ObservedClaim>,
+    pub(crate) observations: Vec<ObservedStateClaim>,
     pub(crate) activities: Vec<ActivityClaim>,
     pub(crate) suspend_handoffs: Vec<SuspendHandoffClaim>,
     pub(crate) restored: Vec<RestoreClaim>,
@@ -140,11 +129,7 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
                 _ => {}
             }
             plan.network_policy.observe(&mut claim.observation);
-            plan.observations.push(ObservedClaim {
-                observation: claim.observation,
-                receipt: claim.receipt,
-                recovery: claim.recovery,
-            });
+            plan.observations.push(claim.observation.into());
             plan.snapshots.extend(claim.snapshots);
             plan.quarantine.extend(claim.quarantine);
         }

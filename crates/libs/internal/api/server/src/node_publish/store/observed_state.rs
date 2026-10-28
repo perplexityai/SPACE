@@ -4,6 +4,8 @@ use pplx_space_common_core::{
 };
 use sqlx::{PgConnection, types::Json};
 
+use crate::node_publish::plan::observed_state::ObservedStateClaim;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UpsertObservedStateError {
     #[error("write published sandbox observed state: {0}")]
@@ -27,44 +29,23 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
              SELECT sandbox_id, status, state_changed_at, template, runtime,
                     spaced_version, runtime_version, guest_os, guest_arch,
                     state_format_name, state_format_version, execution_metadata,
-                    execution_components, pid, namespace, uptime, sandbox_owner,
-                    sandbox_user, image_hash, snapshots_enabled, pool_template,
+                    pid, namespace, uptime, sandbox_owner,
+                    sandbox_owner AS sandbox_user, image_hash, snapshots_enabled, pool_template,
                     failure_reason, observed_created_at, network_tx_bytes,
-                    network_rx_bytes, disk_usage_bytes, observed_network_policy_json,
-                    observed_network_policy_generation, observed_network_policy_source,
-                    observed_network_policy_authority, auto_lifecycle_authority
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT,
-                 state_changed_at TIMESTAMPTZ,
-                 template TEXT,
-                 runtime TEXT,
-                 spaced_version TEXT,
-                 runtime_version TEXT,
-                 guest_os TEXT,
-                 guest_arch TEXT,
-                 state_format_name TEXT,
-                 state_format_version TEXT,
-                 execution_metadata JSONB,
-                 execution_components JSONB,
-                 pid INTEGER,
-                 namespace TEXT,
-                 uptime TEXT,
-                 sandbox_owner TEXT,
-                 sandbox_user TEXT,
-                 image_hash TEXT,
-                 snapshots_enabled BOOLEAN,
-                 pool_template TEXT,
-                 failure_reason TEXT,
-                 observed_created_at TEXT,
-                 network_tx_bytes BIGINT,
-                 network_rx_bytes BIGINT,
-                 disk_usage_bytes BIGINT,
-                 observed_network_policy_json JSONB,
-                 observed_network_policy_generation BIGINT,
-                 observed_network_policy_source TEXT,
-                 observed_network_policy_authority TEXT,
-                 auto_lifecycle_authority TEXT
+                    network_rx_bytes, disk_usage_bytes, auto_lifecycle_authority
+             FROM UNNEST(
+                 $2::UUID[], $3::TEXT[], $4::TEXT[]::TIMESTAMPTZ[],
+                 $5::TEXT[], $6::TEXT[], $7::TEXT[], $8::TEXT[], $9::TEXT[],
+                 $10::TEXT[], $11::TEXT[], $12::TEXT[], $13::JSONB[], $14::INTEGER[],
+                 $15::TEXT[], $16::TEXT[], $17::TEXT[], $18::TEXT[], $19::BOOLEAN[],
+                 $20::TEXT[], $21::TEXT[], $22::TEXT[],
+                 $23::BIGINT[], $24::BIGINT[], $25::BIGINT[], $26::TEXT[]
+             ) AS input(
+                 sandbox_id, status, state_changed_at, template, runtime, spaced_version,
+                 runtime_version, guest_os, guest_arch, state_format_name, state_format_version,
+                 execution_metadata, pid, namespace, uptime, sandbox_owner, image_hash,
+                 snapshots_enabled, pool_template, failure_reason, observed_created_at,
+                 network_tx_bytes, network_rx_bytes, disk_usage_bytes, auto_lifecycle_authority
              )
          ),
          publishable AS (
@@ -72,13 +53,11 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                     input.template, input.runtime, input.spaced_version,
                     input.runtime_version, input.guest_os, input.guest_arch,
                     input.state_format_name, input.state_format_version,
-                    input.execution_metadata, input.execution_components,
+                    input.execution_metadata,
                     input.pid, input.namespace, input.uptime, input.sandbox_owner,
                     input.sandbox_user, input.image_hash, input.snapshots_enabled,
                     input.pool_template, input.failure_reason, input.observed_created_at,
                     input.network_tx_bytes, input.network_rx_bytes, input.disk_usage_bytes,
-                    input.observed_network_policy_json, input.observed_network_policy_generation,
-                    input.observed_network_policy_source, input.observed_network_policy_authority,
                     input.auto_lifecycle_authority,
                     s.id IS NOT NULL AS assigned_to_node
              FROM input
@@ -95,7 +74,7 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                     sos.disk_usage_bytes, sos.pool_template, sos.failure_reason,
                     sos.observed_created_at, sos.network_tx_bytes, sos.network_rx_bytes,
                     sos.observed_at, sos.updated_at, sos.missing_publish_count,
-                    sos.template, sos.network_policy_authority, sos.auto_lifecycle_authority,
+                    sos.template, sos.auto_lifecycle_authority,
                     sos.runtime_version, sos.guest_os, sos.guest_arch,
                     sos.state_format_name, sos.state_format_version,
                     sos.execution_metadata, sos.spaced_version
@@ -112,16 +91,13 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                     publishable.template, publishable.runtime, publishable.spaced_version,
                     publishable.runtime_version, publishable.guest_os, publishable.guest_arch,
                     publishable.state_format_name, publishable.state_format_version,
-                    publishable.execution_metadata, publishable.execution_components,
+                    publishable.execution_metadata,
                     publishable.pid, publishable.namespace, publishable.uptime,
                     publishable.sandbox_owner, publishable.sandbox_user, publishable.image_hash,
                     publishable.snapshots_enabled, publishable.pool_template,
                     publishable.failure_reason, publishable.observed_created_at,
                     publishable.network_tx_bytes, publishable.network_rx_bytes,
-                    publishable.disk_usage_bytes, publishable.observed_network_policy_json,
-                    publishable.observed_network_policy_generation,
-                    publishable.observed_network_policy_source,
-                    publishable.observed_network_policy_authority,
+                    publishable.disk_usage_bytes,
                     publishable.auto_lifecycle_authority, publishable.assigned_to_node
              FROM publishable
              LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id
@@ -334,11 +310,84 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
 pub(crate) async fn upsert(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[ObservedStateClaim],
 ) -> Result<Vec<AcceptedSandboxPublishRow>, UpsertObservedStateError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Every array visits the same claims in the same order, including NULLs.
+    macro_rules! column {
+        ($value:expr) => {
+            claims.iter().map($value).collect::<Vec<_>>()
+        };
+    }
     sqlx::query_as::<_, AcceptedSandboxPublishRow>(UPSERT_OBSERVED_STATE_SQL)
         .bind(node_id)
-        .bind(rows_json)
+        .bind(column!(|claim| claim.sandbox_id))
+        .bind(column!(|claim| claim
+            .status
+            .as_ref()
+            .map(|status| status.as_str())))
+        .bind(column!(|claim| claim
+            .state_changed_at
+            .as_ref()
+            .map(|time| time.as_str())))
+        .bind(column!(|claim| claim.template.as_deref()))
+        .bind(column!(|claim| {
+            // The explicit report wins; execution metadata supplies only a fallback.
+            claim
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.as_str())
+                .or_else(|| {
+                    claim
+                        .execution
+                        .as_ref()
+                        .map(|execution| execution.runtime.alias())
+                })
+        }))
+        .bind(column!(|claim| claim
+            .spaced_version
+            .as_ref()
+            .map(ToString::to_string)))
+        .bind(column!(|claim| claim
+            .execution
+            .as_ref()
+            .map(|execution| execution.runtime_version.as_str())))
+        .bind(column!(|claim| claim
+            .execution
+            .as_ref()
+            .map(|execution| execution.guest_os.as_str())))
+        .bind(column!(|claim| claim
+            .execution
+            .as_ref()
+            .map(|execution| execution.guest_arch.as_str())))
+        .bind(column!(|claim| claim
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.state_format_name.as_deref())))
+        .bind(column!(|claim| claim.execution.as_ref().and_then(
+            |execution| execution.state_format_version.as_deref()
+        )))
+        .bind(column!(|claim| claim
+            .execution
+            .as_ref()
+            .map(|execution| Json(&execution.metadata))))
+        .bind(column!(|claim| claim.pid))
+        .bind(column!(|claim| claim.namespace.as_deref()))
+        .bind(column!(|claim| claim.uptime.as_deref()))
+        .bind(column!(|claim| claim.owner.as_deref()))
+        .bind(column!(|claim| claim.image_hash.as_deref()))
+        .bind(column!(|claim| claim.snapshots_enabled))
+        .bind(column!(|claim| claim.pool_template.as_deref()))
+        .bind(column!(|claim| claim.failure_reason.as_deref()))
+        .bind(column!(|claim| claim.observed_created_at.as_deref()))
+        .bind(column!(|claim| claim.network_tx_bytes))
+        .bind(column!(|claim| claim.network_rx_bytes))
+        .bind(column!(|claim| claim.disk_usage_bytes))
+        .bind(column!(|claim| claim
+            .auto_lifecycle_authority
+            .map(|authority| authority.as_str())))
         .fetch_all(&mut *conn)
         .await
         .map_err(UpsertObservedStateError::Upsert)
