@@ -7,6 +7,12 @@
 //! Tags are phase, attempt=first|retry, and result=ok|error. First-attempt errors
 //! divided by all first attempts measure initial reliability independently of
 //! recovery. Dropped futures have no completed outcome; empty maps are skipped.
+//!
+//! `sandbox.worker.teardown_suspend.backup_refusal_replayed` counts teardown
+//! drives that rejoined a refused backup upload of their own generation's
+//! capture instead of starting a new attempt, tagged by `reason`. A teardown
+//! that keeps replaying keeps its pod terminating, and wakes of its sandbox
+//! wait on that pod; the drive's log line names the sandbox.
 
 use std::{fmt, str::FromStr, time::Instant};
 

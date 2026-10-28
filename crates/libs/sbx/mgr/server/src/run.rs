@@ -986,6 +986,7 @@ pub async fn run(
     service.start_sandbox_eviction(shutdown_token.child_token(), &task_tracker);
     service.start_snapshot_upload_maintenance(shutdown_token.child_token(), &task_tracker);
     service.start_runtime_upgrade_recovery(shutdown_token.child_token(), &task_tracker);
+    service.start_teardown_suspend_resumer(shutdown_token.child_token(), &task_tracker);
     task_tracker.spawn(
         snapshot_upload_worker
             .clone()

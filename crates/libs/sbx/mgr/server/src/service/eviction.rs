@@ -222,12 +222,14 @@ impl SandboxManagerService {
                 .teardown()
                 .running_for(execution_generation)
                 .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?;
-            let holds_capture = crate::db::read::sandbox(&db, sandbox_id)
-                .map_err(|error| Status::internal(format!("sandbox lookup: {error}")))?
-                .is_some_and(|row| {
-                    row.state == crate::state::SandboxState::Suspending
-                        && row.current_local_artifact_id == Some(staged_artifact)
-                });
+            let row = crate::db::read::sandbox(&db, sandbox_id)
+                .map_err(|error| Status::internal(format!("sandbox lookup: {error}")))?;
+            let pins_capture = row
+                .as_ref()
+                .is_some_and(|row| row.current_local_artifact_id == Some(staged_artifact));
+            let in_state = |state| row.as_ref().is_some_and(|row| row.state == state);
+            let holds_capture = pins_capture && in_state(crate::state::SandboxState::Suspending);
+            let held_suspended = pins_capture && in_state(crate::state::SandboxState::Suspended);
             let awaiting_backup = if running && holds_capture {
                 crate::db::read::sandbox_view(&db, sandbox_id)
                     .artifacts()
@@ -236,9 +238,13 @@ impl SandboxManagerService {
             } else {
                 Vec::new()
             };
-            Ok((running && holds_capture, awaiting_backup))
+            Ok((
+                running && holds_capture,
+                running && held_suspended,
+                awaiting_backup,
+            ))
         });
-        let (claimable, awaiting_backup) = match claimable {
+        let (claimable, held_suspended, awaiting_backup) = match claimable {
             Ok(checks) => checks,
             Err(status) => {
                 tracing::warn!(sandbox_id, %execution_generation, error = %status.message(),
@@ -246,6 +252,20 @@ impl SandboxManagerService {
                 return Err(status);
             }
         };
+        // A row startup recovery marked `suspended` still pins the refused
+        // capture, which a later wake could restore from on this node, so its
+        // teardown is held, not released, until the cluster admits it.
+        if held_suspended {
+            tracing::info!(
+                sandbox_id,
+                %execution_generation,
+                %staged_artifact,
+                "not releasing a retired execution's teardown: its suspended row holds the capture",
+            );
+            return Err(Status::failed_precondition(
+                "a suspended row's teardown is held until the cluster admits its capture",
+            ));
+        }
         if !claimable {
             tracing::info!(
                 sandbox_id,

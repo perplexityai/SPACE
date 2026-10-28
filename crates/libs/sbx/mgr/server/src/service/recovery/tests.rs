@@ -3575,6 +3575,7 @@ fn requested_cleanup_discovery_yields_to_an_intent_recorded_after_listing() {
         &db,
         listed,
         CleanupRecoveryAuthority::RequestedOnly,
+        &|_| true,
     )
     .unwrap();
 

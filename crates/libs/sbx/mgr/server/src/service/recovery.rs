@@ -318,9 +318,10 @@ impl SandboxManagerService {
         .map_err(StartupRecoveryError::WorkerTask)??;
         let service = self.clone();
         let cleanup_targets = tokio::task::spawn_blocking(move || {
-            Self::recover_required_cleanup_targets(
+            Self::recover_required_cleanup_targets_with(
                 &service.db,
                 super::recovery::CleanupRecoveryAuthority::Startup,
+                &*service.sandbox_runtime_live,
             )
         })
         .await
@@ -2094,9 +2095,23 @@ impl SandboxManagerService {
         });
     }
 
+    /// [`Self::recover_required_cleanup_targets_with`] for runtimes that are
+    /// all still live.
+    #[cfg(test)]
     pub(super) fn recover_required_cleanup_targets(
         db: &crate::db::SharedConnection,
         authority: CleanupRecoveryAuthority,
+    ) -> Result<Vec<CleanupRecoveryTarget>, StartupRecoveryError> {
+        Self::recover_required_cleanup_targets_with(db, authority, &|_| true)
+    }
+
+    /// The cleanup targets `authority` recovers from every row.
+    /// `runtime_live` says whether a sandbox's runtime is still running; only
+    /// startup asks it, for a `suspending` row an active teardown owns.
+    pub(super) fn recover_required_cleanup_targets_with(
+        db: &crate::db::SharedConnection,
+        authority: CleanupRecoveryAuthority,
+        runtime_live: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<CleanupRecoveryTarget>, StartupRecoveryError> {
         let rows = {
             let db = db
@@ -2105,7 +2120,7 @@ impl SandboxManagerService {
             crate::db::scan::all_sandboxes(&db, crate::db::scan::SkipUndecodableRows)?
         };
 
-        Self::recover_required_cleanup_targets_from_rows(db, rows, authority)
+        Self::recover_required_cleanup_targets_from_rows(db, rows, authority, runtime_live)
     }
 
     fn recover_required_cleanup_targets_for_ids(
@@ -2135,10 +2150,12 @@ impl SandboxManagerService {
                 .collect()
         };
 
+        // Requested-only recovery never asks whether a runtime is live.
         Self::recover_required_cleanup_targets_from_rows(
             db,
             rows,
             CleanupRecoveryAuthority::RequestedOnly,
+            &|_| true,
         )
     }
 
@@ -2194,6 +2211,7 @@ impl SandboxManagerService {
         db: &crate::db::SharedConnection,
         rows: Vec<crate::db::SandboxRow>,
         authority: CleanupRecoveryAuthority,
+        runtime_live: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<CleanupRecoveryTarget>, StartupRecoveryError> {
         let mut targets = Vec::new();
         for row in rows {
@@ -2311,7 +2329,27 @@ impl SandboxManagerService {
                 continue;
             }
             let cleanup_intent = match authority {
-                CleanupRecoveryAuthority::Startup => row.cleanup_intent_for_startup_recovery(),
+                CleanupRecoveryAuthority::Startup => {
+                    // A filesystem probe, so it runs before the database lock
+                    // is taken. It's taken for every `suspending` row, since
+                    // ownership is only known under the lock, and read only
+                    // for one an active teardown owns.
+                    let live = row.state == SandboxState::Suspending && runtime_live(&row.id);
+                    let intent = {
+                        let db = db
+                            .lock()
+                            .map_err(|_| StartupRecoveryError::DatabaseMutexPoisoned)?;
+                        crate::db::startup_cleanup_intent(&db, &row, || live)
+                    };
+                    match intent {
+                        Ok(intent) => intent,
+                        Err(error) => {
+                            tracing::warn!(sandbox_id = %row.id, %error,
+                                "failed to read the row's teardown before startup cleanup; leaving the row for a later startup");
+                            continue;
+                        }
+                    }
+                }
                 CleanupRecoveryAuthority::RequestedOnly => {
                     // State alone is authoritative for teardown states entered
                     // under the cleanup fence and the settled legacy cleanup
@@ -2346,15 +2384,32 @@ impl SandboxManagerService {
             let Some((keep_filesystem, completion)) = cleanup_intent else {
                 continue;
             };
-            let must_persist_intent = !completion.owns_row_intent(&row);
+            // A `suspending` row's intent follows from its state, but the
+            // store's startup pass left this one for discovery to settle (see
+            // `startup_cleanup_intent`). Persist it as that pass does for
+            // every other row, so a cleanup that doesn't finish is retried by
+            // the periodic reconciler, not only by the next startup.
+            let must_persist_intent = !completion.owns_row_intent(&row)
+                || (authority == CleanupRecoveryAuthority::Startup
+                    && row.state == SandboxState::Suspending);
             if must_persist_intent {
                 let db = db
                     .lock()
                     .map_err(|_| StartupRecoveryError::DatabaseMutexPoisoned)?;
-                let reason = row
-                    .failure_reason
-                    .as_deref()
-                    .unwrap_or("cleanup reconciliation required");
+                // The store's startup pass records why a transient row needs
+                // cleanup; this row's own `failure_reason` may be a refused
+                // teardown backup's marker, which isn't why.
+                let startup_reason;
+                let reason = if authority == CleanupRecoveryAuthority::Startup
+                    && row.state == SandboxState::Suspending
+                {
+                    startup_reason = crate::db::startup_transient_cleanup_reason(row.state);
+                    startup_reason.as_str()
+                } else {
+                    row.failure_reason
+                        .as_deref()
+                        .unwrap_or("cleanup reconciliation required")
+                };
                 let persisted = match authority {
                     CleanupRecoveryAuthority::Startup => crate::db::mark_cleanup_required(
                         &db,

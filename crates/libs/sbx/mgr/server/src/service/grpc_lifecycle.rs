@@ -423,6 +423,16 @@ enum TeardownBackupOrigin {
     /// registered nothing, that attempt carries no generation, since the
     /// capture may hold the sandbox's latest state and a refusal couldn't
     /// release a row that isn't `suspending`.
+    ///
+    /// A row startup recovery marked `suspended` under this teardown looks
+    /// the same, but its capture is this execution's own: its capture record,
+    /// or the upload that registered it, names this generation. Such a
+    /// backup is treated as [`Self::Captured`], so every attempt registers
+    /// under the generation (see
+    /// [`SandboxManagerService::ensure_teardown_suspend_backup`]). A capture
+    /// taken before capture records existed, whose upload the job store has
+    /// since pruned, carries no such evidence and registers unfenced, as an
+    /// earlier suspend's capture would.
     PreviouslySuspended,
 }
 

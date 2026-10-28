@@ -650,6 +650,24 @@ class PendingBackupControl(Protocol):
         ...
 
 
+class TeardownRestartControl(PendingBackupControl, Protocol):
+    """Kind-only operations for restarting sandbox-manager under an in-flight teardown suspend.
+
+    Uploads are held with the pending-backup scenario's object store fault, so
+    the suspend's teardown stays `suspending` on its node while the restart
+    runs. The observable is the node's own sandbox row, read through the
+    product's `space-sbxmgr list`.
+    """
+
+    def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
+        """Delete that node service's pod and wait for its Ready replacement on the same node."""
+        ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+        ...
+
+
 @dataclass(frozen=True)
 class ReconcileQueueRef:
     """One `node_reconcile_queue` row: its node, facet and whether it is a dead letter."""

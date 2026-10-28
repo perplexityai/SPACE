@@ -26,6 +26,7 @@ from space_smoke.capabilities import (
     NodeFenceControl,
     NodeSelectorExtrasControl,
     PendingBackupControl,
+    TeardownRestartControl,
     OrphanedRestorePodGcControl,
     ReconcileQueueGcControl,
     TemplateBuildControl,
@@ -103,6 +104,7 @@ from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
+from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.drain_gate import DrainGateAssertions
@@ -2856,6 +2858,23 @@ class KindEcw(Ecw):
                 self, self._pending_backup_control, self._context.scope
             )
         return self._pending_backup_assertions
+
+    _teardown_restart_control: TeardownRestartControl | None = None
+    _teardown_restart_assertions: TeardownRestartAssertions | None = None
+
+    @property
+    def teardown_restart(self) -> TeardownRestartAssertions:
+        """Privileged assertions for a sandbox-manager restart under a teardown suspend."""
+
+        if self._teardown_restart_control is None:
+            raise SmokeConfigurationError(
+                "teardown restart control is only available on the kind backend"
+            )
+        if self._teardown_restart_assertions is None:
+            self._teardown_restart_assertions = TeardownRestartAssertions(
+                self, self._teardown_restart_control, self.pending_backup
+            )
+        return self._teardown_restart_assertions
 
     _orphaned_restore_pod_gc_control: OrphanedRestorePodGcControl | None = None
     _orphaned_restore_pod_gc_assertions: OrphanedRestorePodGcAssertions | None = None

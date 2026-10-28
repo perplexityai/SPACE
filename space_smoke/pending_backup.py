@@ -60,6 +60,14 @@ class PendingBackupAssertions:
         self._operation_id: str | None = None
         self._node_name: str | None = None
 
+    @property
+    def node_name(self) -> str:
+        """The worker the suspended sandbox ran on, read by `suspend_async()`."""
+
+        if self._node_name is None:
+            raise RuntimeError("suspend_async() must run first")
+        return self._node_name
+
     def block_uploads(self, *, timeout: float = 120) -> None:
         """Scale the object store to zero; the scale-back is armed before the write."""
 

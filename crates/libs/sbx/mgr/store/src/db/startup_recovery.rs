@@ -202,6 +202,52 @@ db_private_outside_tests! {
     }
 }
 
+/// Why startup recovery marked a transient row for cleanup. Both startup
+/// passes record it, so a row reads the same whichever pass marked it.
+pub fn startup_transient_cleanup_reason(state: SandboxState) -> String {
+    format!("startup recovery: sandbox was left in transient state '{state}'")
+}
+
+/// The `(keep_filesystem, completion)` cleanup that startup recovery owes
+/// `row`, if any: [`cleanup_intent_for_startup_recovery`], except that a
+/// `suspending` row whose runtime is still live under an active
+/// teardown-suspend job is left to that job. The job backs up the staged
+/// capture, then finalizes the runtime. Marking the row `suspended` instead
+/// would retire the runtime while the job, and the pod waiting on it, still
+/// wait for the backup. `runtime_live` is asked only for such a row; a
+/// runtime that's gone, as after a host reboot, leaves the job nothing to
+/// finalize, so the row is marked `suspended`, as before.
+///
+/// A teardown job that doesn't decode, or a second active one, can't drive
+/// the row, so the row is finished as if no teardown owned it.
+pub fn startup_cleanup_intent(
+    conn: &Connection,
+    row: &SandboxRow,
+    runtime_live: impl FnOnce() -> bool,
+) -> Result<Option<(bool, CleanupCompletion)>> {
+    let intent = cleanup_intent_for_startup_recovery(row);
+    if !matches!(intent, Some((_, CleanupCompletion::MarkSuspended))) {
+        return Ok(intent);
+    }
+    let owned = match teardown_owns_suspending_row(conn, row) {
+        Ok(owned) => owned,
+        Err(error) if is_row_decode_error(error.raw()) => {
+            tracing::warn!(
+                sandbox_id = %row.id,
+                error = %describe_error(&error),
+                "finishing a suspending row whose teardown job doesn't decode as if no \
+                 teardown owned it"
+            );
+            false
+        }
+        Err(error) => return Err(error),
+    };
+    if owned && runtime_live() {
+        return Ok(None);
+    }
+    Ok(intent)
+}
+
 /// On startup: reconcile interrupted DB states to a safe local outcome.
 /// Also check Started sandboxes for dead PIDs.
 pub fn recover_interrupted_startup_states(
@@ -277,6 +323,11 @@ pub fn recover_interrupted_startup_states(
                 continue;
             }
 
+            // This pass can't see the runtime, so it leaves a teardown-owned
+            // row as if the runtime were live. Startup cleanup discovery, which
+            // runs after it and can probe the runtime, marks the row suspended
+            // when the runtime is gone.
+            let intent = startup_cleanup_intent(conn, &row, || true)?;
             if matches!(
                 row.state,
                 SandboxState::Pausing | SandboxState::Resuming | SandboxState::Checkpointing
@@ -289,18 +340,13 @@ pub fn recover_interrupted_startup_states(
                     previous_state: row.state,
                     outcome: StartupRecoveryOutcome::Deferred,
                 });
-            } else if let Some((keep_filesystem, completion)) =
-                cleanup_intent_for_startup_recovery(&row)
-            {
+            } else if let Some((keep_filesystem, completion)) = intent {
                 mark_cleanup_required(
                     conn,
                     &row.id,
                     keep_filesystem,
                     completion,
-                    &format!(
-                        "startup recovery: sandbox was left in transient state '{}'",
-                        row.state
-                    ),
+                    &startup_transient_cleanup_reason(row.state),
                 )?;
                 recovered.push(StartupRecoveryRecord {
                     id: row.id,

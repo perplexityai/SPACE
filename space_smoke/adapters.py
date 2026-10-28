@@ -5420,6 +5420,23 @@ ON CONFLICT (key_hash) DO NOTHING;
                 )
             time.sleep(5)
 
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+
+        # The short id is hex only, so it needs no quoting in the script.
+        script = _NODE_SANDBOX_STATE_SCRIPT.replace(
+            "__SHORT_ID__", _sql_uuid(sandbox_id)[-8:]
+        ).replace("__STATES__", "|".join(_SANDBOX_MANAGER_ROW_STATES))
+        result = self._node_shell_exec(node_name, script, timeout=60)
+        if result.returncode == 3:
+            return None
+        state = _require_ok(result, f"read sandbox {sandbox_id}'s row on {node_name}").strip()
+        if state not in _SANDBOX_MANAGER_ROW_STATES:
+            raise RuntimeError(
+                f"sandbox {sandbox_id}'s row on {node_name} has no recognizable state: {state!r}"
+            )
+        return state
+
     def startup_recovery_log(self, node_name: str) -> list[str]:
         pod = self._node_service_pod(node_name, NODE_TEMPLATE_MANAGER)
         # Oldest attempt first: a failed startup restarts the container, and
@@ -6726,6 +6743,38 @@ done
 echo "committed prepared rootfs was not observed on the accepting builder" >&2
 exit 1
 """
+
+# Prints the state cell of the sandbox whose listed short id is __SHORT_ID__
+# (the canonical id's last eight characters), or exits 3 without such a row,
+# so a failed listing (any other exit, under `set -e`) is never read as "no
+# row". The list's cells are separated by `┆`.
+_NODE_SANDBOX_STATE_SCRIPT = r"""set -eu
+sandboxes="$(/space/bin/space-sbxmgr list)"
+row="$(printf '%s\n' "$sandboxes" | grep -F '__SHORT_ID__' || true)"
+[ -n "$row" ] || exit 3
+printf '%s\n' "$row" | grep -oE '┆ *(__STATES__) *┆' | head -n 1 | tr -d '┆ '
+"""
+
+_SANDBOX_MANAGER_ROW_STATES = (
+    "cleanup_required",
+    "cleanup_failed",
+    "checkpointing",
+    "quarantined",
+    "suspending",
+    "suspended",
+    "restoring",
+    "creating",
+    "starting",
+    "stopping",
+    "deleting",
+    "resuming",
+    "pausing",
+    "created",
+    "started",
+    "stopped",
+    "paused",
+    "failed",
+)
 
 # Exits 0 while the builder@local sandbox holding a committed prepared rootfs is
 # listed before or in its run (the build's RUN steps run in it), and 3 when

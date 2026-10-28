@@ -324,6 +324,181 @@ async fn eviction_reupload_of_a_refused_capture_keeps_its_execution_generation()
     .await;
 }
 
+/// A teardown's own capture on a row startup recovery marked `suspended`
+/// never registers unfenced. Every new attempt the drive starts registers
+/// under the teardown's generation whenever the capture's record or its
+/// earlier upload names that generation: after a retriable failure, and after
+/// the refused upload is pruned. The control plane, which superseded the
+/// generation, refuses it each time. A capture with no such evidence, as an
+/// earlier node-local suspend's has, still registers unfenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_suspended_teardown_capture_never_registers_unfenced() {
+    with_cluster_api(RETIRING, async || {
+        for (recorded, upload_retained, fenced) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let refused = refused_teardown_with(|staged| {
+                serde_json::to_string(&bound_upload_payload(staged)).unwrap()
+            })
+            .await;
+            let service = &refused.service;
+            let sandbox_id = refused.sandbox_id.to_string();
+            let snapshot_dir =
+                crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+                    &service.cache_root().join(&sandbox_id),
+                );
+            stage_refused_capture(&refused, &snapshot_dir, recorded, upload_retained);
+            {
+                let db = service.db.lock().unwrap();
+                // Startup recovery marked the row suspended with the capture
+                // still pinned, and its teardown still running.
+                db.execute(
+                    "UPDATE sandboxes SET state = 'suspended', failure_reason = NULL WHERE id = ?1",
+                    [&sandbox_id],
+                )
+                .unwrap();
+                // A retained upload that failed retriably gets a new attempt.
+                db.execute(
+                    "UPDATE jobs SET error_kind = 'retriable' WHERE dedup_key = ?1",
+                    [refused.staged.to_string()],
+                )
+                .unwrap();
+            }
+            let row = crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+                .unwrap()
+                .unwrap();
+            let artifact = crate::db::LocalArtifactRow {
+                local_artifact_id: refused.staged,
+                sandbox_id: sandbox_id.clone(),
+                artifact_kind: ArtifactKind::Full,
+                artifact_origin: ArtifactOrigin::Suspend,
+                snapshot_name: None,
+                local_path: snapshot_dir.to_str().unwrap().to_string(),
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                service.ensure_teardown_suspend_backup(
+                    &row,
+                    TeardownSuspendBackup {
+                        execution_generation: generation(GENERATION),
+                        artifact: &artifact,
+                        format: SuspendSnapshotFormat::Full,
+                        origin: super::super::TeardownBackupOrigin::PreviouslySuspended,
+                    },
+                ),
+            )
+            .await;
+            let staged = refused.staged.to_string();
+            let admitted = admitted_registrations()
+                .iter()
+                .any(|line| line.contains(&staged));
+            assert_eq!(
+                admitted, !fenced,
+                "recorded {recorded}, upload retained {upload_retained}: {result:?}"
+            );
+            if fenced {
+                result
+                    .expect("a refused registration answers at once")
+                    .expect_err("a refused registration can't make the suspend durable");
+            }
+            drain(service).await;
+        }
+    })
+    .await;
+}
+
+/// Evidence that can't be read can't vouch for a previously-suspended
+/// capture's generation. A drive that would start a new attempt for it fails
+/// rather than register it unfenced, and the stub admits nothing. A drive
+/// that joins an upload already registered still joins it: joining registers
+/// nothing new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_capture_record_registers_nothing_but_an_upload_still_joins() {
+    with_cluster_api(RETIRING, async || {
+        for joins_completed_upload in [false, true] {
+            let refused = refused_teardown_with(|staged| {
+                serde_json::to_string(&bound_upload_payload(staged)).unwrap()
+            })
+            .await;
+            let service = &refused.service;
+            let sandbox_id = refused.sandbox_id.to_string();
+            let snapshot_dir =
+                crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+                    &service.cache_root().join(&sandbox_id),
+                );
+            stage_refused_capture(&refused, &snapshot_dir, false, joins_completed_upload);
+            {
+                let db = service.db.lock().unwrap();
+                db.execute(
+                    "UPDATE sandboxes SET state = 'suspended', failure_reason = NULL WHERE id = ?1",
+                    [&sandbox_id],
+                )
+                .unwrap();
+                if joins_completed_upload {
+                    // An upload that completed, whose payload no longer
+                    // decodes.
+                    db.execute(
+                        "UPDATE jobs SET status = 'completed', error_kind = NULL, error = NULL,
+                                payload = 'not a payload'
+                          WHERE dedup_key = ?1",
+                        [refused.staged.to_string()],
+                    )
+                    .unwrap();
+                }
+            }
+            if !joins_completed_upload {
+                std::fs::write(
+                    snapshot_dir.join(crate::capture_record::CAPTURE_RECORD_FILENAME),
+                    b"not a record",
+                )
+                .unwrap();
+            }
+            let row = crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+                .unwrap()
+                .unwrap();
+            let artifact = crate::db::LocalArtifactRow {
+                local_artifact_id: refused.staged,
+                sandbox_id: sandbox_id.clone(),
+                artifact_kind: ArtifactKind::Full,
+                artifact_origin: ArtifactOrigin::Suspend,
+                snapshot_name: None,
+                local_path: snapshot_dir.to_str().unwrap().to_string(),
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                service.ensure_teardown_suspend_backup(
+                    &row,
+                    TeardownSuspendBackup {
+                        execution_generation: generation(GENERATION),
+                        artifact: &artifact,
+                        format: SuspendSnapshotFormat::Full,
+                        origin: super::super::TeardownBackupOrigin::PreviouslySuspended,
+                    },
+                ),
+            )
+            .await
+            .expect("the drive answers at once");
+            let staged = refused.staged.to_string();
+            assert!(
+                !admitted_registrations()
+                    .iter()
+                    .any(|line| line.contains(&staged)),
+                "joins a completed upload {joins_completed_upload}: {result:?}"
+            );
+            if joins_completed_upload {
+                result.expect("the drive joins the completed upload");
+            } else {
+                let error = result.expect_err("an unvouched capture starts no attempt");
+                assert_eq!(error.code(), tonic::Code::Internal, "{error:?}");
+            }
+            drain(service).await;
+        }
+    })
+    .await;
+}
+
 /// A capture whose earlier upload was admitted stays bound to the execution
 /// that took it: the re-request carries that generation, and the node passes
 /// on whatever the control plane answers. (The control plane admits it, since

@@ -8,6 +8,7 @@ const TEARDOWN_BACKUP_FAILED_ARTIFACT_METADATA: &str =
     "x-space-teardown-backup-failed-artifact-bin";
 const TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA: &str =
     "x-space-teardown-backup-superseded-generation";
+const TEARDOWN_BACKUP_DRIVE_VERDICT_METADATA: &str = "x-space-teardown-backup-drive-verdict";
 
 pub(in crate::service::grpc_lifecycle) fn teardown_artifact_backup_status(
     error: ArtifactBackupSubmissionError,
@@ -60,6 +61,73 @@ pub(super) fn teardown_backup_superseded_generation(
         .ok()?
         .parse()
         .ok()
+}
+
+/// `status`, carrying the verdict the drive got when it re-asked the cluster
+/// about a refused upload it then rejoined, so the settle needn't ask again.
+pub(in crate::service::grpc_lifecycle) fn teardown_backup_verdict_status(
+    status: Status,
+    verdict: crate::snapshot_upload_jobs::RegistrationProbe,
+) -> Status {
+    use crate::snapshot_upload_jobs::RegistrationProbe;
+    let label = match verdict {
+        RegistrationProbe::Superseded(generation) => {
+            return teardown_backup_superseded_status(status, generation);
+        }
+        RegistrationProbe::Admitted => "admitted",
+        RegistrationProbe::NotSuperseded => "not_superseded",
+        RegistrationProbe::Unanswered => "unanswered",
+    };
+    let mut status = status;
+    status.metadata_mut().insert(
+        TEARDOWN_BACKUP_DRIVE_VERDICT_METADATA,
+        tonic::metadata::MetadataValue::from_static(label),
+    );
+    status
+}
+
+/// The verdict on a teardown backup's refusal that reached the settle with
+/// the drive's error: a refusal the drive met directly, or one it re-asked
+/// about (see [`teardown_backup_verdict_status`]).
+pub(in crate::service::grpc_lifecycle) fn teardown_backup_drive_verdict(
+    status: &Status,
+) -> Option<crate::snapshot_upload_jobs::RegistrationProbe> {
+    use crate::snapshot_upload_jobs::RegistrationProbe;
+    if let Some(generation) = teardown_backup_superseded_generation(status) {
+        return Some(RegistrationProbe::Superseded(generation));
+    }
+    match status
+        .metadata()
+        .get(TEARDOWN_BACKUP_DRIVE_VERDICT_METADATA)?
+        .to_str()
+        .ok()?
+    {
+        "admitted" => Some(RegistrationProbe::Admitted),
+        "not_superseded" => Some(RegistrationProbe::NotSuperseded),
+        "unanswered" => Some(RegistrationProbe::Unanswered),
+        _ => None,
+    }
+}
+
+/// Count and log a drive that rejoined the refused upload `job_id` after
+/// re-asking the cluster, which answered `verdict`. An admission only gets
+/// here when the drive couldn't clear the row's marker to start a new upload.
+pub(super) fn record_refusal_replay(
+    sandbox_id: &str,
+    job_id: &JobId,
+    verdict: crate::snapshot_upload_jobs::RegistrationProbe,
+) {
+    use crate::snapshot_upload_jobs::RegistrationProbe;
+    use pplx_space_metrics::sandbox::worker::TeardownBackupRefusalReplay;
+    let reason = match verdict {
+        RegistrationProbe::Superseded(_) => TeardownBackupRefusalReplay::Superseded,
+        RegistrationProbe::Admitted => TeardownBackupRefusalReplay::AdmittedNotCleared,
+        RegistrationProbe::NotSuperseded => TeardownBackupRefusalReplay::NotSuperseded,
+        RegistrationProbe::Unanswered => TeardownBackupRefusalReplay::Unanswered,
+    };
+    pplx_space_metrics::sandbox::worker::teardown_suspend_backup_refusal_replayed(reason);
+    tracing::info!(target: super::LOG_TARGET, sandbox_id, %job_id, reason = reason.as_str(),
+        "rejoining a refused teardown backup without a new upload");
 }
 
 // The shared publication path returns tonic Status. Keep backup provenance on
@@ -196,8 +264,9 @@ impl SandboxManagerService {
     /// refusal the cluster no longer makes, so a cluster-deleted report can't
     /// reclaim the artifact under its new upload. Whether the caller may start
     /// that upload: not when the clear failed, which leaves any marker for the
-    /// next drive to retry, or when the row no longer stages the artifact as
-    /// `suspending`, as after a cluster-deleted eviction claimed it.
+    /// next drive to retry, or when the row no longer holds the artifact as
+    /// `suspending` or `suspended`, as after a cluster-deleted eviction
+    /// claimed it.
     pub(super) fn clear_teardown_suspend_backup_permanent_failure(
         &self,
         sandbox_id: &str,
@@ -234,19 +303,24 @@ impl SandboxManagerService {
     /// `None`. A refusal names a retired execution or rejects the artifact, and
     /// only the first can stop holding. The recorded scope doesn't say which,
     /// so re-asking tells them apart.
+    ///
+    /// The refused upload's payload, not the backup's origin, decides: a row
+    /// startup recovery marked `suspended` under a running teardown takes the
+    /// previously-suspended arm, yet its refused upload registered this
+    /// generation's own capture. An admission starts a new attempt only when
+    /// that attempt registers under this generation, as it does once the
+    /// capture's record or the refused upload names it (see
+    /// `ensure_teardown_suspend_backup`), so the fence that admitted the probe
+    /// runs on it too.
     pub(super) async fn teardown_backup_refusal_verdict(
         &self,
         backup: &TeardownSuspendBackup<'_>,
         job: &pplx_space_common_jobs::Job,
     ) -> Option<crate::snapshot_upload_jobs::RegistrationProbe> {
-        // The new attempt an admission starts registers under this generation,
-        // so the fence that admitted the probe runs on it too.
-        if backup.registration_generation() != Some(backup.execution_generation)
-            || !matches!(
-                job.failure,
-                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
-            )
-        {
+        if !matches!(
+            job.failure,
+            Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+        ) {
             return None;
         }
         let payload = teardown_backup_payload_of(job, backup.execution_generation)?;

@@ -6,7 +6,7 @@ use pplx_space_common_core::types::SandboxId;
 
 use crate::db::auto_lifecycle_delete_receipts::RouteIdentityAdoptionMetadata;
 use crate::db::inventory_read::InventoryReadError;
-use crate::db::{CleanupCompletion, Connection, Result, SandboxEraseSafety, SandboxRow};
+use crate::db::{Connection, Result, SandboxEraseSafety, SandboxRow};
 
 /// The sandbox's whole row, `None` without one.
 ///
@@ -56,12 +56,6 @@ impl SandboxRow {
     /// a cleanup intent, so it may be retried from its source.
     pub fn is_retryable_interrupted_restore(&self) -> bool {
         crate::db::sandbox_is_retryable_interrupted_restore(self)
-    }
-
-    /// The `(keep_filesystem, completion)` cleanup that startup recovery owes
-    /// this row, if any.
-    pub fn cleanup_intent_for_startup_recovery(&self) -> Option<(bool, CleanupCompletion)> {
-        crate::db::cleanup_intent_for_startup_recovery(self)
     }
 
     /// Whether erasing this row and its filesystem would drop unpublished

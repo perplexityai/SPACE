@@ -374,6 +374,110 @@ pub(super) fn active_teardown_suspend_operation(
         .map_err(Error::from)
 }
 
+/// Whether an active teardown-suspend job owns its `suspending` row's
+/// completion: it's `running`, for the generation the row's runtime belongs
+/// to. That's the job a poll resumes, and the one the resumer drives (see
+/// [`teardown_owned_suspending_rows`]), so startup leaves only such a row to
+/// its teardown (see [`startup_cleanup_intent`]).
+fn teardown_job_owns_row(
+    status: TeardownSuspendOperationStatus,
+    job_generation: ExecutionGeneration,
+    route_generation: Option<ExecutionGeneration>,
+) -> bool {
+    status == TeardownSuspendOperationStatus::Running && route_generation == Some(job_generation)
+}
+
+/// Whether `row` is `suspending` under one active teardown-suspend job that
+/// owns its completion (see [`teardown_job_owns_row`]). More than one active
+/// job, or one that doesn't decode, fails the read.
+pub(super) fn teardown_owns_suspending_row(conn: &Connection, row: &SandboxRow) -> Result<bool> {
+    if row.state != SandboxState::Suspending {
+        return Ok(false);
+    }
+    Ok(
+        active_teardown_suspend_operation(conn, &row.id)?.is_some_and(|operation| {
+            teardown_job_owns_row(
+                operation.status,
+                operation.execution_generation,
+                row.space_api_route_identity.execution_generation,
+            )
+        }),
+    )
+}
+
+/// A `suspending` row an active teardown-suspend job owns, with the job's
+/// execution generation (see [`teardown_owned_suspending_rows`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeardownOwnedSuspendingRow {
+    pub sandbox_id: String,
+    pub execution_generation: ExecutionGeneration,
+}
+
+/// Every `suspending` row under exactly one active teardown-suspend job, in id
+/// order, when that job is `running` for the generation the row's runtime
+/// belongs to: the job a poll would resume. A row whose job doesn't decode, or
+/// that has more than one active job, is skipped, as is a `pending` job or one
+/// for another generation, which no poll would resume either.
+pub(crate) fn teardown_owned_suspending_rows(
+    conn: &Connection,
+) -> Result<Vec<TeardownOwnedSuspendingRow>> {
+    let mut statement = conn.prepare(sql!(
+        "SELECT s.id, j.payload, j.status, s.space_api_route_execution_generation
+           FROM sandboxes AS s
+           JOIN jobs AS j ON j.subject_id = s.id
+          WHERE s.state = 'suspending'
+            AND j.kind = ?1
+            AND j.status IN ('pending', 'running')
+          ORDER BY s.id, j.created_at, j.job_id"
+    ))?;
+    let jobs = statement
+        .query_map(params![TEARDOWN_SUSPEND_JOB_KIND], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Count each row's active jobs before decoding any: a row with two is
+    // ambiguous even when one of them doesn't decode.
+    let mut by_row: std::collections::BTreeMap<String, Vec<_>> = Default::default();
+    for (sandbox_id, job) in jobs {
+        by_row.entry(sandbox_id).or_default().push(job);
+    }
+    let mut owned = Vec::new();
+    for (sandbox_id, mut jobs) in by_row {
+        let (payload, status, route_generation) = match jobs.pop() {
+            Some(job) if jobs.is_empty() => job,
+            _ => continue,
+        };
+        let status = TeardownSuspendOperationStatus::from_str(&status).ok();
+        let route_generation =
+            route_generation.and_then(|value| ExecutionGeneration::new(value).ok());
+        match serde_json::from_str::<TeardownSuspendJobPayload>(&payload) {
+            Ok(payload)
+                if status.is_some_and(|status| {
+                    teardown_job_owns_row(status, payload.execution_generation, route_generation)
+                }) =>
+            {
+                owned.push(TeardownOwnedSuspendingRow {
+                    sandbox_id,
+                    execution_generation: payload.execution_generation,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%sandbox_id, %error,
+                    "skipping a suspending row whose teardown job doesn't decode");
+            }
+        }
+    }
+    Ok(owned)
+}
+
 db_private_outside_tests! {
     fn latest_teardown_suspend_operation(
         conn: &Connection,

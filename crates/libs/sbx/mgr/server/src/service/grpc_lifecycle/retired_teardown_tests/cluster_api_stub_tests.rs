@@ -2,6 +2,39 @@
 
 use super::*;
 
+/// The environment variable naming the file the stub, serving in the parent
+/// process, appends each admitted registration's local artifact id to. The
+/// child that runs the test reads it with [`admitted_registrations`].
+const ADMITTED_REGISTRATIONS_ENV: &str = "SPACE_TEST_ADMITTED_ARTIFACT_BACKUPS";
+
+/// The file the parent's stub records admitted registrations in.
+static ADMITTED_REGISTRATIONS: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// The local artifact ids of every registration the stub admitted, a probe
+/// that registers nothing aside. Admitting one is what lets a backup proceed.
+pub(super) fn admitted_registrations() -> Vec<String> {
+    let path = std::env::var_os(ADMITTED_REGISTRATIONS_ENV)
+        .expect("admitted registrations are recorded only under with_cluster_api");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn record_admitted_registration(local_artifact_id: &str) {
+    use std::io::Write as _;
+    let path = ADMITTED_REGISTRATIONS.lock().unwrap().clone();
+    if let Some(path) = path {
+        // One write per line: concurrent registrations append to the same
+        // file, and an append this small lands whole.
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(format!("{local_artifact_id}\n").as_bytes())
+            .unwrap();
+    }
+}
+
 /// A cluster-api stub. Its `BeginArtifactBackup` refuses every
 /// generation-bound registration as superseded and admits the rest, or, when
 /// `unavailable`, answers every registration `UNAVAILABLE`. Its
@@ -144,14 +177,19 @@ impl tonic::server::UnaryService<pplx_space_node_api_client::proto::BeginArtifac
                     ExecutionGeneration::new(generation).unwrap(),
                 ),
             ),
-            None => Ok(tonic::Response::new(Self::Response {
-                local_artifact_id: request.local_artifact_id,
-                backup_attempt_id: request.backup_attempt_id,
-                fence_verdict_only: request.fence_verdict_only && !self.predates_verdicts,
-                generation_fence_admitted: request.execution_generation.is_some()
-                    && !self.admits_unfenced
-                    && !self.predates_verdicts,
-            })),
+            None => {
+                if !request.fence_verdict_only {
+                    record_admitted_registration(&request.local_artifact_id);
+                }
+                Ok(tonic::Response::new(Self::Response {
+                    local_artifact_id: request.local_artifact_id,
+                    backup_attempt_id: request.backup_attempt_id,
+                    fence_verdict_only: request.fence_verdict_only && !self.predates_verdicts,
+                    generation_fence_admitted: request.execution_generation.is_some()
+                        && !self.admits_unfenced
+                        && !self.predates_verdicts,
+                }))
+            }
         })
     }
 }
@@ -233,7 +271,13 @@ pub(in crate::service::grpc_lifecycle) async fn with_cluster_api<S>(
     );
     let token = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(token.path(), "synthetic-backup-test-token").unwrap();
+    let admitted = tempfile::NamedTempFile::new().unwrap();
+    *ADMITTED_REGISTRATIONS.lock().unwrap() = Some(admitted.path().to_path_buf());
     let child = pplx_space_test_env::enter_test_process(&[
+        (
+            ADMITTED_REGISTRATIONS_ENV,
+            Some(admitted.path().as_os_str()),
+        ),
         ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("1"))),
         (
             pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,

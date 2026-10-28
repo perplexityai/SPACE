@@ -1251,10 +1251,10 @@ impl SandboxManagerService {
     /// drive treats as its own (a restart mid-teardown leaves it in cleanup).
     /// A recorded capture registers under its generation whatever its row's
     /// state, a suspended one included: the bytes are that execution's. A
-    /// suspended row's unrecorded artifact belongs to an earlier node-local
-    /// suspend: its upload is the earlier attempt, and without one (no
-    /// destination when it suspended) it stays unfenced.
-    fn capture_execution_generation(
+    /// suspended row's unrecorded artifact is taken for an earlier node-local
+    /// suspend's: its upload is the earlier attempt, and without one (no
+    /// destination when it suspended, or the job pruned) it stays unfenced.
+    pub(super) fn capture_execution_generation(
         &self,
         sandbox: &crate::db::SandboxRow,
         artifact: &crate::db::LocalArtifactRow,

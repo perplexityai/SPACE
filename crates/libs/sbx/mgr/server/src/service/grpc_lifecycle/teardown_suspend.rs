@@ -11,6 +11,10 @@ const LOG_TARGET: &str = module_path!();
 
 pub(super) use self::backup_refusal::teardown_artifact_backup_status;
 use self::backup_refusal::*;
+#[cfg(test)]
+pub(super) use self::backup_refusal::{
+    teardown_backup_drive_verdict, teardown_backup_verdict_status,
+};
 
 pub(in crate::service) const SUSPEND_TRIGGER_METADATA: &str = "x-space-suspend-trigger";
 
@@ -103,6 +107,11 @@ pub(in crate::service) fn teardown_suspend_event_trigger(
         Some(_) => Err(Status::invalid_argument("unknown suspend trigger metadata")),
     }
 }
+
+/// How often the resumer looks for a `suspending` row's teardown no poll
+/// drives (see [`SandboxManagerService::start_teardown_suspend_resumer`]).
+/// Each drive still keeps its own retry pacing.
+const TEARDOWN_SUSPEND_RESUME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How a terminal local state affects a generation suspend request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,6 +529,89 @@ impl SandboxManagerService {
         Err(Status::failed_precondition(reason.as_str()))
     }
 
+    /// Resume, every [`TEARDOWN_SUSPEND_RESUME_INTERVAL`], the teardown of a
+    /// `suspending` row no poll drives (see
+    /// [`Self::resume_teardown_suspend_drivers`]). The first pass runs at once,
+    /// so a restart's deferred rows resume as soon as startup recovery ends.
+    pub fn start_teardown_suspend_resumer(
+        &self,
+        shutdown_token: tokio_util::sync::CancellationToken,
+        task_tracker: &tokio_util::task::TaskTracker,
+    ) {
+        let service = self.clone();
+        task_tracker.spawn(async move {
+            // The resumer is the only owner of a row whose pod no longer
+            // polls, so its exit before shutdown drains the manager.
+            let _guard = service.critical_task_guard("teardown suspend resumer", &shutdown_token);
+            let mut interval = tokio::time::interval(TEARDOWN_SUSPEND_RESUME_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => return,
+                    _ = interval.tick() => {
+                        service.resume_teardown_suspend_drivers();
+                    }
+                }
+            }
+        });
+    }
+
+    /// Resume the teardown-suspend driver of every `suspending` row an active
+    /// teardown job owns. Startup leaves such
+    /// a row, its runtime still live, to that job (see
+    /// `crate::db::startup_cleanup_intent`), and nothing else starts a driver
+    /// but the shim's `PrepareTeardownSuspend` poll. A pod force-deleted while
+    /// sandbox-manager was down never polls again, and without this the row
+    /// would keep its runtime resident with no owner. A driver admitted here
+    /// runs as one the poll admitted would, under the same retry pacing, so a
+    /// later poll joins it and a row whose retry isn't due yet waits for a
+    /// later pass.
+    ///
+    /// Returns the rows whose driver now runs, started here or already.
+    pub(crate) fn resume_teardown_suspend_drivers(&self) -> Vec<SandboxId> {
+        let rows = match self.db_conn().and_then(|db| {
+            crate::db::scan::teardown_owned_suspending(&db)
+                .map_err(|error| Status::internal(format!("db error: {error}")))
+        }) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(error = %error.message(),
+                    "cannot list suspending rows to resume their teardowns; their next poll will");
+                return Vec::new();
+            }
+        };
+        rows.into_iter()
+            .filter_map(|row| match row.sandbox_id.parse::<SandboxId>() {
+                Ok(sandbox_id) => Some((sandbox_id, row.execution_generation)),
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %row.sandbox_id, %error,
+                        "skipping a suspending row with an invalid id");
+                    None
+                }
+            })
+            .filter_map(|(sandbox_id, execution_generation)| {
+                let admission = self.spawn_teardown_suspend_driver(
+                    sandbox_id,
+                    execution_generation,
+                    SandboxEventTrigger::System,
+                );
+                if admission == TeardownSuspendDriverAdmission::Started {
+                    tracing::info!(%sandbox_id, %execution_generation,
+                        "resumed the teardown of a suspending row no poll had driven");
+                } else {
+                    tracing::debug!(%sandbox_id, %execution_generation,
+                        admission = admission.as_str(), "suspending row's teardown not resumed");
+                }
+                matches!(
+                    admission,
+                    TeardownSuspendDriverAdmission::Started
+                        | TeardownSuspendDriverAdmission::Existing
+                )
+                .then_some(sandbox_id)
+            })
+            .collect()
+    }
+
     pub(in crate::service) fn spawn_teardown_suspend_driver(
         &self,
         sandbox_id: SandboxId,
@@ -637,6 +729,38 @@ impl SandboxManagerService {
             .await
     }
 
+    /// The cluster's verdict on the backup refusal a teardown-suspend drive
+    /// failed with, or `NotSuperseded` when it didn't fail on one.
+    ///
+    /// A sandbox that still exists can have refused the backup because the
+    /// cluster retired this execution. A refusal the drive met directly, or
+    /// re-asked about before rejoining it, carries that verdict, unless the
+    /// re-ask went unanswered: the settle asks once more rather than wait a
+    /// retry for a cluster that may have answered since. A permanent job
+    /// failure no longer says so, so ask again with the upload's own
+    /// idempotent registration.
+    async fn teardown_drive_refusal_verdict(
+        &self,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        error: &Status,
+    ) -> crate::snapshot_upload_jobs::RegistrationProbe {
+        use crate::snapshot_upload_jobs::RegistrationProbe;
+        let Some(failed_artifact) = teardown_failed_backup_artifact(error) else {
+            return RegistrationProbe::NotSuperseded;
+        };
+        if let Some(verdict) = teardown_backup_drive_verdict(error)
+            && verdict != RegistrationProbe::Unanswered
+        {
+            return verdict;
+        }
+        match self.teardown_backup_payload_bound_to(execution_generation, failed_artifact) {
+            Some(payload) => {
+                crate::snapshot_upload_jobs::prepared_begin_refused_as_superseded(&payload).await
+            }
+            None => RegistrationProbe::NotSuperseded,
+        }
+    }
+
     /// Settle a teardown-suspend drive's outcome: a backup refusal is checked
     /// against the cluster, which may have retired this execution, before
     /// the failure is recorded.
@@ -649,6 +773,9 @@ impl SandboxManagerService {
         let Err(error) = &result else {
             return result;
         };
+        let verdict = self
+            .teardown_drive_refusal_verdict(execution_generation, error)
+            .await;
         // Registration can also return NotFound for its source node. Confirm
         // sandbox absence with the sandbox-only lookup before making this final.
         // Legacy persisted failures have no typed reason, so verify every
@@ -662,27 +789,11 @@ impl SandboxManagerService {
         } else {
             None
         };
-        // A sandbox that still exists can have refused the backup because the
-        // cluster retired this execution. A refusal the drive met directly
-        // carries that verdict. A permanent job failure no longer says so, so
-        // ask again with the upload's own idempotent registration. Use the
-        // verdict even when the lookup reported the row missing: that lookup
-        // only finds a sandbox placed on this node, so a node the sandbox has
-        // moved off sees it as missing, while registration looks the sandbox
-        // up wherever it is placed.
+        // Use the verdict even when the lookup reported the row missing: that
+        // lookup only finds a sandbox placed on this node, so a node the
+        // sandbox has moved off sees it as missing, while registration looks
+        // the sandbox up wherever it is placed.
         use crate::snapshot_upload_jobs::RegistrationProbe;
-        let verdict = match teardown_backup_superseded_generation(error) {
-            Some(generation) => RegistrationProbe::Superseded(generation),
-            None => match failed_artifact.and_then(|staged| {
-                self.teardown_backup_payload_bound_to(execution_generation, staged)
-            }) {
-                Some(payload) => {
-                    crate::snapshot_upload_jobs::prepared_begin_refused_as_superseded(&payload)
-                        .await
-                }
-                None => RegistrationProbe::NotSuperseded,
-            },
-        };
         let mut release = None;
         let mut backup_lookup = backup_lookup;
         match verdict {
@@ -702,7 +813,7 @@ impl SandboxManagerService {
             // A verdict about another generation, or an admission, still
             // proves the row exists. An admitted refusal of the artifact is
             // the next drive's to register again (see
-            // `ensure_teardown_suspend_backup`).
+            // `ensure_teardown_suspend_backup`), in either arm.
             RegistrationProbe::Superseded(_) | RegistrationProbe::Admitted => backup_lookup = None,
             RegistrationProbe::NotSuperseded => {}
         }
@@ -1138,7 +1249,7 @@ impl SandboxManagerService {
     pub(super) async fn ensure_teardown_suspend_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
-        backup: TeardownSuspendBackup<'_>,
+        mut backup: TeardownSuspendBackup<'_>,
     ) -> Result<(), Status> {
         let persisted_job = self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
@@ -1159,43 +1270,81 @@ impl SandboxManagerService {
         {
             return self.verify_teardown_suspend_backup_ownership(sandbox, &backup);
         }
-        let mut superseded = None;
+        // A previously-suspended backup is this execution's own capture when
+        // the capture's record, or the upload that registered it, names this
+        // generation: a row startup recovery marked `suspended` behind its
+        // running teardown. Every new attempt of such a capture registers under
+        // the generation, so the fence that refused it keeps refusing it,
+        // whether the attempt follows a retriable failure, an admission, or
+        // the refused upload's pruning. A capture an earlier execution took
+        // keeps registering unfenced (see `TeardownBackupOrigin`). A record or
+        // upload that can't be read can't vouch for its generation: the drive
+        // still joins an upload already registered, which registers nothing
+        // new, but refuses to start an unfenced attempt, as eviction's
+        // re-upload does, rather than risk registering a superseded capture.
+        let mut unvouched = None;
+        if backup.origin == TeardownBackupOrigin::PreviouslySuspended {
+            match self.capture_execution_generation(
+                sandbox,
+                backup.artifact,
+                persisted_job.as_ref(),
+            ) {
+                Ok(generation) if generation == Some(backup.execution_generation) => {
+                    backup.origin = TeardownBackupOrigin::Captured;
+                }
+                Ok(_) => {}
+                Err(error) => unvouched = Some(error),
+            }
+        }
+        // The verdict a rejoined refusal leaves with, so the settle needn't
+        // ask the cluster again.
+        let mut verdict = None;
         let joined = match persisted_job {
             Some(job) => match self.teardown_use_of_upload(&backup, &job)? {
                 KeyedUploadUse::Join => {
+                    use crate::snapshot_upload_jobs::RegistrationProbe;
                     match self.teardown_backup_refusal_verdict(&backup, &job).await {
                         // The cluster refused this execution's registration, and
                         // its fence now admits it: a supersession lapsed when
                         // every execution that superseded this one ended
                         // without running. Rejoining would replay the stale
                         // refusal on every drive and hold the runtime, and the
-                        // pod the next wake waits on, for good.
-                        Some(crate::snapshot_upload_jobs::RegistrationProbe::Admitted)
-                            if self.clear_teardown_suspend_backup_permanent_failure(
-                                &sandbox.id,
-                                backup.artifact.local_artifact_id,
-                            ) =>
+                        // pod the next wake waits on, for good. The refusal
+                        // clears only when the new attempt will register
+                        // under this generation, so the fence that admitted
+                        // the probe decides it too; otherwise the drive
+                        // rejoins, and the refusal stands.
+                        Some(RegistrationProbe::Admitted)
+                            if backup.registration_generation()
+                                == Some(backup.execution_generation)
+                                && self.clear_teardown_suspend_backup_permanent_failure(
+                                    &sandbox.id,
+                                    backup.artifact.local_artifact_id,
+                                ) =>
                         {
                             tracing::info!(sandbox_id = %sandbox.id, job_id = %job.job_id,
                                 "the cluster now admits a teardown backup it refused; \
                                  starting a new upload");
                             None
                         }
-                        // Carry a standing verdict to the settle, which then
-                        // needn't ask again.
-                        Some(crate::snapshot_upload_jobs::RegistrationProbe::Superseded(
-                            generation,
-                        )) => {
-                            superseded = Some(generation);
+                        probe => {
+                            if let Some(probe) = probe {
+                                record_refusal_replay(&sandbox.id, &job.job_id, probe);
+                                verdict = Some(probe);
+                            }
                             Some(job.job_id)
                         }
-                        _ => Some(job.job_id),
                     }
                 }
                 KeyedUploadUse::NewAttempt => None,
             },
             None => None,
         };
+        if joined.is_none()
+            && let Some(error) = unvouched
+        {
+            return Err(error);
+        }
         let submission = async {
             match joined {
                 Some(job_id) => Ok(job_id),
@@ -1249,8 +1398,8 @@ impl SandboxManagerService {
                 Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
             ) {
                 error = teardown_backup_failure_status(error, backup.artifact.local_artifact_id);
-                if let Some(generation) = superseded {
-                    error = teardown_backup_superseded_status(error, generation);
+                if let Some(verdict) = verdict {
+                    error = teardown_backup_verdict_status(error, verdict);
                 }
             }
             return Err(error);

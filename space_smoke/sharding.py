@@ -91,6 +91,9 @@ _DURATION_SECONDS = {
         "local.restarted_btrfs_send_is_rejected_and_retried": 36,
         "local.retention_claim_finish_forward": 65,
         "local.retention_restore_source_guard": 50,
+        # One Kind bench run: 79 s, of which the sandbox-manager restart takes
+        # about 10 s and the row-hold window 30 s.
+        "local.sandbox_manager_restart_leaves_teardown_suspend_to_its_teardown": 80,
         # Kind bench runs (otel), probes concurrent: 21-23 s.
         "local.sandbox_network_isolation_holds": 21,
         # Otel-mode Kind runs with the chart's 60 s reaper idle: 80-88 s.

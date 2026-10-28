@@ -372,6 +372,12 @@ pub fn begin_activation_with_route_evidence(
 /// `updated_at` on every poll and hold the row permanently inside the
 /// cluster-deleted eviction's quiescence window — the one thing that can
 /// reclaim it.
+///
+/// Only a `suspending` row needs the marker: an ordinary eviction can reclaim
+/// a `suspended` one. Its clear,
+/// [`clear_teardown_suspend_backup_permanently_failed`], also accepts a
+/// `suspended` row that still pins the artifact, as startup recovery can leave
+/// one under a running teardown, with the marker cleared.
 pub fn mark_teardown_suspend_backup_permanently_failed(
     conn: &Connection,
     id: &str,
@@ -396,10 +402,10 @@ pub fn mark_teardown_suspend_backup_permanently_failed(
 pub enum TeardownBackupMarkerClear {
     /// The row carried the marker for the artifact, and no longer does.
     Cleared,
-    /// The row still stages the artifact as `suspending`, without the marker.
+    /// The row still holds the artifact, without the marker.
     Unmarked,
-    /// The row is gone, has left `suspending`, or stages another artifact:
-    /// a cluster-deleted eviction may have claimed it.
+    /// The row is gone, is neither `suspending` nor `suspended`, or holds
+    /// another artifact: a cluster-deleted eviction may have claimed it.
     MovedOn,
 }
 
@@ -407,7 +413,13 @@ pub enum TeardownBackupMarkerClear {
 /// [`mark_teardown_suspend_backup_permanently_failed`] stamped for
 /// `staged_artifact`, once the cluster admits the backup it refused: the
 /// suspend can publish again. The check and the clear share one transaction,
-/// so a cluster-deleted eviction's claim lands before or after both.
+/// so a cluster-deleted eviction's claim of a `suspending` row lands before or
+/// after both. A `suspended` row's eviction doesn't read the marker.
+///
+/// A `suspended` row pinning the artifact still holds it: startup cleanup
+/// recovery can retire the runtime of a `suspending` row and mark it
+/// `suspended` while its teardown still waits on the refused backup. Only the
+/// capture on disk is needed for the new upload.
 pub fn clear_teardown_suspend_backup_permanently_failed(
     conn: &Connection,
     id: &str,
@@ -420,7 +432,7 @@ pub fn clear_teardown_suspend_backup_permanently_failed(
          SET failure_reason = NULL,
              updated_at = ?1
          WHERE id = ?2
-           AND state = 'suspending'
+           AND state IN ('suspending', 'suspended')
            AND current_local_artifact_id = ?3
            AND failure_reason = ?4",
         params![now()?, id, staged_artifact.to_string(), marker],
@@ -430,7 +442,9 @@ pub fn clear_teardown_suspend_backup_permanently_failed(
     } else if tx.query_row(
         "SELECT EXISTS (
              SELECT 1 FROM sandboxes
-             WHERE id = ?1 AND state = 'suspending' AND current_local_artifact_id = ?2
+             WHERE id = ?1
+               AND state IN ('suspending', 'suspended')
+               AND current_local_artifact_id = ?2
          )",
         params![id, staged_artifact.to_string()],
         |row| row.get::<_, bool>(0),
