@@ -135,6 +135,19 @@ async fn publish_inventory(
     let (runtime_rows, component_rows) = inventory.legacy_rows();
     let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
     let component_rows = Json(serde_json::Value::Array(component_rows));
+    prune_installations(conn, node_id, &runtime_rows, &component_rows).await?;
+    upsert_runtime_inventory(conn, node_id, runtime_rows).await?;
+    upsert_component_inventory(conn, node_id, component_rows).await
+}
+
+/// Prune omitted installations under the caller's node lock.
+/// Empty censuses still delete previous rows; zero deletions is normal.
+async fn prune_installations(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    runtime_rows: &Json<serde_json::Value>,
+    component_rows: &Json<serde_json::Value>,
+) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "DELETE FROM node_runtime_installations installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -145,7 +158,7 @@ async fn publish_inventory(
          )"
     ))
     .bind(node_id)
-    .bind(&runtime_rows)
+    .bind(runtime_rows)
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::ReplaceRuntimes)?;
@@ -161,11 +174,20 @@ async fn publish_inventory(
          )"
     ))
     .bind(node_id)
-    .bind(&component_rows)
+    .bind(component_rows)
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::ReplaceComponents)?;
+    Ok(())
+}
 
+/// Replace retained runtime capabilities under the caller's node lock.
+/// Conflict handling retains existing installations and locks changed rows.
+async fn upsert_runtime_inventory(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    runtime_rows: Json<serde_json::Value>,
+) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
@@ -276,7 +298,16 @@ async fn publish_inventory(
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::InsertFormats)?;
+    Ok(())
+}
 
+/// Write component descriptions after runtime replacement on the same connection.
+/// Conflicts lock component rows; unchanged descriptions remain successful.
+async fn upsert_component_inventory(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    component_rows: Json<serde_json::Value>,
+) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(

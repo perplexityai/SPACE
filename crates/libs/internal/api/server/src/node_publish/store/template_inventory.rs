@@ -9,17 +9,8 @@ pub(crate) enum UpsertTemplateInventoryError {
     Upsert(#[source] sqlx::Error),
 }
 
-/// Accept only inventory for registered templates, writing changed observations.
-/// Conflict handling locks node-inventory rows even for no-op updates, without
-/// explicit template-row locks. Empty means no input named a known template;
-/// accepted unchanged rows remain in the result with their change flag false.
-pub(crate) async fn upsert(
-    conn: &mut PgConnection,
-    node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
-) -> Result<Vec<AcceptedTemplateInventoryRow>, UpsertTemplateInventoryError> {
-    sqlx::query_as::<_, AcceptedTemplateInventoryRow>(sql!(
-        "WITH input AS (
+const UPSERT_TEMPLATE_INVENTORY: &str = sql!(
+    "WITH input AS (
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  template_name TEXT,
@@ -224,10 +215,21 @@ pub(crate) async fn upsert(
                 ) AS first_seen,
                 accepted.desired_state
          FROM accepted"
-    ))
-    .bind(node_id)
-    .bind(rows_json)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(UpsertTemplateInventoryError::Upsert)
+);
+
+/// Accept only inventory for registered templates, writing changed observations.
+/// Conflict handling locks node-inventory rows even for no-op updates, without
+/// explicit template-row locks. Empty means no input named a known template;
+/// accepted unchanged rows remain in the result with their change flag false.
+pub(crate) async fn upsert(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+    rows_json: Json<serde_json::Value>,
+) -> Result<Vec<AcceptedTemplateInventoryRow>, UpsertTemplateInventoryError> {
+    sqlx::query_as::<_, AcceptedTemplateInventoryRow>(UPSERT_TEMPLATE_INVENTORY)
+        .bind(node_id)
+        .bind(rows_json)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(UpsertTemplateInventoryError::Upsert)
 }
