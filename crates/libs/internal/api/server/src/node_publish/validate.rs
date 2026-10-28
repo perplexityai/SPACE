@@ -7,6 +7,7 @@
 pub(crate) mod execution_inventory;
 pub(crate) mod execution_observation;
 pub(crate) mod fields;
+pub(crate) mod node_role;
 pub(crate) mod node_status;
 pub(crate) mod quarantine;
 pub(crate) mod receipts;
