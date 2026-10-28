@@ -189,7 +189,7 @@ async fn cancellation_and_invalid_recovered_payloads_cannot_start_a_copy() {
 }
 
 #[test]
-fn copy_credential_rejections_are_terminal_but_transient_failures_retry() {
+fn storage_credential_rejections_are_terminal_but_transient_failures_retry() {
     let directory = tempfile::tempdir().unwrap();
     let endpoint = format!(
         "unix://{}/credential-manager.sock",
@@ -253,6 +253,23 @@ fn copy_credential_rejections_are_terminal_but_transient_failures_retry() {
             );
             assert_eq!(store.copies.load(Ordering::SeqCst), 0);
             assert!(store.destination.lock().unwrap().is_none());
+
+            let local_path = directory.path().join("snapshot.luks");
+            let mut pull = super::super::tests::test_job("pull");
+            pull.payload =
+                serde_json::to_string(&super::super::tests::verified_payload(&local_path)).unwrap();
+            let error = executor
+                .execute(&pull, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                matches!(
+                    error,
+                    JobError::Permanent(_) | JobError::PermanentWithReason { .. }
+                ),
+                permanent,
+                "{code:?}: a pull for a deleted subject must release its restore promptly; {error}"
+            );
         }
         shutdown.cancel();
         server.await.unwrap();

@@ -48,7 +48,7 @@ impl StorageAccess {
     }
 }
 
-/// Retains authority rejection codes so copy jobs can distinguish permanent
+/// Retains authority rejection codes so jobs can distinguish permanent
 /// policy failures from transient credential-service failures.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageCredentialError {
@@ -68,15 +68,13 @@ pub async fn exchange_credentials(
     is_prefix: bool,
     subject: &SubjectId,
     access: StorageAccess,
-) -> Result<ObjectCredentials, Status> {
+) -> Result<ObjectCredentials, StorageCredentialError> {
     let resource = if is_prefix {
         format!("arn:aws:s3:::{bucket}/{key}/*")
     } else {
         format!("arn:aws:s3:::{bucket}/{key}")
     };
-    request_credentials(storage_request(resource, subject, access))
-        .await
-        .map_err(|error| Status::internal(error.to_string()))
+    request_credentials(storage_request(resource, subject, access)).await
 }
 
 pub async fn exchange_copy_credentials(

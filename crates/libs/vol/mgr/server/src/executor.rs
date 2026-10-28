@@ -26,7 +26,9 @@ use crate::artifact::ArtifactEntryRole;
 use crate::codec_admission::{
     CodecAdmission, CodecAdmissionClosed, CodecPermit, CodecPriority, CodecSlot,
 };
-use crate::credentials::{StorageAccess, UnwrapDekError, exchange_credentials, unwrap_dek};
+use crate::credentials::{
+    StorageAccess, StorageCredentialError, UnwrapDekError, exchange_credentials, unwrap_dek,
+};
 use crate::crypto::{self, CryptoError, decrypted_sibling, encrypted_sibling};
 use dashmap::DashMap;
 use pplx_space_common_core::types::{
@@ -1402,6 +1404,31 @@ impl ArtifactPayload {
     }
 }
 
+/// Maps a credential-authority rejection to a permanent job failure; asking
+/// again cannot succeed once the authority refused the subject or resource,
+/// for example after the sandbox was deleted. Connection and service
+/// failures stay retriable.
+fn classify_storage_credentials(context: &str, error: StorageCredentialError) -> JobError {
+    let reason = match &error {
+        StorageCredentialError::Exchange(status) => match status.code() {
+            tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::Unimplemented => Some(JobFailureReason::InvalidInput),
+            tonic::Code::NotFound => Some(JobFailureReason::NotFound),
+            tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                Some(JobFailureReason::PermissionDenied)
+            }
+            _ => None,
+        },
+        StorageCredentialError::Connect(_) | StorageCredentialError::UnexpectedPayload => None,
+    };
+    let message = format!("{context}: {error}");
+    match reason {
+        Some(reason) => JobError::permanent_with_reason(reason, message),
+        None => JobError::retriable(message),
+    }
+}
+
 impl TransferExecutor {
     /// Execute a single-file `push`/`pull` job — one [`TransferPayload`],
     /// one S3 object, always plaintext. (Encryption is a property of an
@@ -1451,7 +1478,9 @@ impl TransferExecutor {
             Some(creds) => creds.clone(),
             None => exchange_credentials(&uri.bucket, &uri.key_prefix, false, &subject, access)
                 .await
-                .map_err(|e| JobError::Retriable(format!("credential exchange failed: {e}")))?,
+                .map_err(|error| {
+                    classify_storage_credentials("credential exchange failed", error)
+                })?,
         };
 
         let target = ObjectTarget {
@@ -1600,7 +1629,9 @@ impl TransferExecutor {
                 };
                 let creds = exchange_credentials(&uri.bucket, &prefix, true, &subject, access)
                     .await
-                    .map_err(|e| JobError::Retriable(format!("credential exchange failed: {e}")))?;
+                    .map_err(|error| {
+                        classify_storage_credentials("credential exchange failed", error)
+                    })?;
                 creds_by_bucket.insert(uri.bucket.clone(), creds);
             }
         }

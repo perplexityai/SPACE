@@ -1055,7 +1055,7 @@ fn sparse_shadow_advice_warning_omits_sensitive_path() {
     );
 }
 
-fn verified_payload(local_path: &Path) -> TransferPayload {
+pub(super) fn verified_payload(local_path: &Path) -> TransferPayload {
     TransferPayload {
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
