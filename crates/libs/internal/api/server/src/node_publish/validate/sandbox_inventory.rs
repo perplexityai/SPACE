@@ -48,11 +48,8 @@ impl DegradedSandboxClaim {
         self.sandbox_id
     }
 
-    pub(crate) fn legacy_row(&self) -> serde_json::Value {
-        serde_json::json!({
-            "sandbox_id": self.sandbox_id,
-            "status": self.status.as_ref().map(PublishedSandboxStatus::as_str),
-        })
+    pub(crate) fn status(&self) -> Option<&PublishedSandboxStatus> {
+        self.status.as_ref()
     }
 }
 

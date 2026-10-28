@@ -2,7 +2,7 @@ use pplx_space_common_core::{
     sql,
     types::{NodeId, SandboxId},
 };
-use sqlx::{PgConnection, types::Json};
+use sqlx::PgConnection;
 
 use crate::node_publish::validate::sandbox_inventory::DegradedSandboxClaim;
 
@@ -26,10 +26,7 @@ pub(crate) async fn upsert(
     let accepted = sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
                  SELECT sandbox_id, status
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     status TEXT
-                 )
+                 FROM UNNEST($2::UUID[], $3::TEXT[]) AS input(sandbox_id, status)
              ),
              publishable AS (
                  SELECT input.sandbox_id, input.status
@@ -55,12 +52,18 @@ pub(crate) async fn upsert(
              RETURNING sandbox_id"
     ))
     .bind(node_id)
-    .bind(Json(serde_json::Value::Array(
+    .bind(
         claims
             .iter()
-            .map(DegradedSandboxClaim::legacy_row)
-            .collect(),
-    )))
+            .map(DegradedSandboxClaim::sandbox_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.status().map(|status| status.as_str()))
+            .collect::<Vec<_>>(),
+    )
     .fetch_all(&mut *conn)
     .await
     .map_err(UpsertDegradedObservationsError::Write)?;

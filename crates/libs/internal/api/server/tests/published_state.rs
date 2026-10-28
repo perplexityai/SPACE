@@ -3586,6 +3586,14 @@ async fn degraded_publication_updates_presence_and_state_without_erasing_richer_
     };
     let outcome = publish_sandbox_states(&mut conn, node_id, &[degraded]).await?;
     assert_eq!(outcome.accepted, 1);
+    let without_status = PublishedSandboxState {
+        sandbox_id: sandbox_id.to_string(),
+        present: true,
+        state_degraded: true,
+        ..PublishedSandboxState::default()
+    };
+    let outcome = publish_sandbox_states(&mut conn, node_id, &[without_status]).await?;
+    assert_eq!(outcome.accepted, 1);
 
     let observed =
         sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, bool, i32)>(
