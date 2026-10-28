@@ -1,0 +1,154 @@
+{
+  "protocol": "one discarded warmup, three measured runs, fresh fixture databases",
+  "workload": {
+    "seed": 42,
+    "nodes": 50,
+    "sandboxes_per_node": 160,
+    "simulated_minutes": 10,
+    "time_scale": 1.0,
+    "publishes": 10000
+  },
+  "standard_workload": true,
+  "driver_command": [
+    "target/dev-release/publish-load",
+    "--service-bin",
+    "target/dev-release/space-internal-api-svc",
+    "--migrator-bin",
+    "target/dev-release/space-db-migrator",
+    "--nodes",
+    "50",
+    "--sandboxes-per-node",
+    "160",
+    "--minutes",
+    "10",
+    "--seed",
+    "42",
+    "--time-scale",
+    "1"
+  ],
+  "cpu_affinity": {
+    "driver_and_service": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "postgres": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "metrics": {
+    "postgres_cpu_ms_per_publish": {
+      "runs": [
+        3.3890000000000002,
+        3.478,
+        3.469
+      ],
+      "median": 3.469,
+      "spread_percent": 2.5655808590371856
+    },
+    "service_cpu_ms_per_publish": {
+      "runs": [
+        1.052,
+        1.067,
+        1.062
+      ],
+      "median": 1.062,
+      "spread_percent": 1.4124293785310642
+    },
+    "statements_per_publish": {
+      "runs": [
+        14.466,
+        14.466,
+        14.466
+      ],
+      "median": 14.466,
+      "spread_percent": 0.0
+    },
+    "exec_ms_per_publish": {
+      "runs": [
+        0.9206527119000028,
+        0.9276034005999998,
+        0.9293215465999995
+      ],
+      "median": 0.9276034005999998,
+      "spread_percent": 0.9345410651135552
+    },
+    "plan_ms_per_publish": {
+      "runs": [
+        0.2833187393999998,
+        0.3563525467000002,
+        0.3537038954
+      ],
+      "median": 0.3537038954,
+      "spread_percent": 20.64829034958952
+    },
+    "rows_per_publish": {
+      "runs": [
+        14.871,
+        14.871,
+        14.871
+      ],
+      "median": 14.871,
+      "spread_percent": 0.0
+    },
+    "shared_blks_hit_per_publish": {
+      "runs": [
+        407.1133,
+        401.0046,
+        401.1451
+      ],
+      "median": 401.1451,
+      "spread_percent": 1.5228155597563073
+    },
+    "wal_bytes_per_publish": {
+      "runs": [
+        15084.4225,
+        14527.0256,
+        14523.7363
+      ],
+      "median": 14527.0256,
+      "spread_percent": 3.859607709371697
+    },
+    "rpc_p50_ms": {
+      "runs": [
+        3.192736,
+        3.310363,
+        3.3001609999999997
+      ],
+      "median": 3.3001609999999997,
+      "spread_percent": 3.5642806517621457
+    },
+    "rpc_p99_ms": {
+      "runs": [
+        55.140930999999995,
+        49.832305,
+        50.240432
+      ],
+      "median": 50.240432,
+      "spread_percent": 10.566441785373176
+    },
+    "transaction_p50_ms": {
+      "runs": [
+        2.6874770000000003,
+        2.750314,
+        2.736308
+      ],
+      "median": 2.736308,
+      "spread_percent": 2.2964154620020696
+    },
+    "transaction_p99_ms": {
+      "runs": [
+        54.221654,
+        48.855476,
+        49.194277
+      ],
+      "median": 49.194277,
+      "spread_percent": 10.908134700302636
+    }
+  },
+  "headline_spread_below_5_percent": true
+}
