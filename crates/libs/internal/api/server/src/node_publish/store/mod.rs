@@ -2,6 +2,7 @@ use sqlx::PgPool;
 use tonic::Status;
 
 pub(crate) mod absent_sandboxes;
+pub(crate) mod activity;
 pub(crate) mod degraded_observations;
 pub(crate) mod failure_episodes;
 pub(crate) mod sandbox_facet_observations;

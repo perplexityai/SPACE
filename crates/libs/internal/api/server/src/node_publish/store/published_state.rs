@@ -36,8 +36,8 @@ use pplx_space_sandbox_portability::{
 };
 
 use crate::node_publish::store::{
-    absent_sandboxes, degraded_observations, failure_episodes, sandbox_facet_observations,
-    snapshot_inventory,
+    absent_sandboxes, activity, degraded_observations, failure_episodes,
+    sandbox_facet_observations, snapshot_inventory,
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 #[cfg(test)]
@@ -978,6 +978,8 @@ pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     Degraded(#[from] degraded_observations::UpsertDegradedObservationsError),
     #[error(transparent)]
+    Activity(#[from] activity::UpdateActivityError),
+    #[error(transparent)]
     FailureEpisodes(#[from] failure_episodes::ReconcileFailureEpisodesError),
     #[error(transparent)]
     SnapshotInventory(#[from] snapshot_inventory::ReplaceSnapshotInventoryError),
@@ -1248,97 +1250,7 @@ pub(crate) async fn publish_validated_sandbox_states(
     }));
     sandbox_facet_observations::reconcile_quarantine_recovery(conn, node_id, rows_json.clone())
         .await?;
-    sqlx::query(sql!(
-        "WITH input AS (
-         SELECT *
-         FROM jsonb_to_recordset($2::jsonb) AS input(
-             sandbox_id UUID,
-             last_used_at TIMESTAMPTZ,
-             last_access_at TIMESTAMPTZ,
-             last_command_at TIMESTAMPTZ
-         )
-     ),
-     activity AS (
-         SELECT input.sandbox_id,
-                input.last_access_at,
-                input.last_command_at,
-                (
-                    SELECT MAX(value)
-                    FROM (
-                        VALUES
-                            (input.last_used_at),
-                            (input.last_access_at),
-                            (input.last_command_at)
-                    ) AS timestamps(value)
-                ) AS last_used_at
-         FROM input
-     ),
-     publishable AS (
-         SELECT activity.*
-         FROM activity
-         JOIN sandboxes s ON s.id = activity.sandbox_id
-         WHERE s.active_node_id = $1
-           AND activity.last_used_at IS NOT NULL
-     )
-     UPDATE sandboxes s
-     SET last_access_at = CASE
-             WHEN publishable.last_access_at IS NOT NULL
-              AND (
-                  s.last_access_at IS NULL
-                  OR s.last_access_at < publishable.last_access_at - INTERVAL '1 minute'
-              )
-             THEN publishable.last_access_at
-             ELSE s.last_access_at
-         END,
-         last_command_at = CASE
-             WHEN publishable.last_command_at IS NOT NULL
-              AND (
-                  s.last_command_at IS NULL
-                  OR s.last_command_at < publishable.last_command_at - INTERVAL '1 minute'
-              )
-             THEN publishable.last_command_at
-             ELSE s.last_command_at
-         END,
-         last_used_at = CASE
-             WHEN publishable.last_used_at IS NOT NULL
-              AND (
-                  s.last_used_at IS NULL
-                  OR s.last_used_at < publishable.last_used_at - INTERVAL '1 minute'
-              )
-             THEN publishable.last_used_at
-             ELSE s.last_used_at
-         END
-     FROM publishable
-     WHERE s.id = publishable.sandbox_id
-       AND (
-           (
-               publishable.last_access_at IS NOT NULL
-               AND (
-                   s.last_access_at IS NULL
-                   OR s.last_access_at < publishable.last_access_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               publishable.last_command_at IS NOT NULL
-               AND (
-                   s.last_command_at IS NULL
-                   OR s.last_command_at < publishable.last_command_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               publishable.last_used_at IS NOT NULL
-               AND (
-                   s.last_used_at IS NULL
-                   OR s.last_used_at < publishable.last_used_at - INTERVAL '1 minute'
-               )
-           )
-       )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("update sandbox last_used_at from publish: {err}")))?;
+    activity::update(conn, node_id, rows_json.clone()).await?;
 
     let first_seen_sandbox_ids = accepted_rows
         .iter()
