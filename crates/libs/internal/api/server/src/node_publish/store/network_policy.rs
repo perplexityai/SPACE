@@ -30,7 +30,8 @@ pub(crate) async fn update_authority(
 ) -> Result<bool, UpdateAuthorityError> {
     let result = sqlx::query(
         sql!("WITH input AS (
-                 SELECT *
+                 SELECT sandbox_id, observed_network_policy_generation,
+                        observed_network_policy_authority
                  FROM jsonb_to_recordset($2::jsonb) AS input(
                      sandbox_id UUID,
                      observed_network_policy_generation BIGINT,
@@ -38,7 +39,8 @@ pub(crate) async fn update_authority(
                  )
              ),
              publishable AS (
-                 SELECT input.*
+                 SELECT input.sandbox_id, input.observed_network_policy_generation,
+                        input.observed_network_policy_authority
                  FROM input
                  LEFT JOIN sandboxes s ON s.id = input.sandbox_id
                  WHERE (s.id IS NULL OR s.active_node_id = $1)
@@ -69,7 +71,9 @@ pub(crate) async fn upsert(
 ) -> Result<bool, UpsertPolicyError> {
     let result = sqlx::query(sql!(
         "WITH input AS (
-                 SELECT *
+                 SELECT sandbox_id, observed_network_policy_json,
+                        observed_network_policy_generation,
+                        observed_network_policy_source, observed_network_policy_authority
                  FROM jsonb_to_recordset($2::jsonb) AS input(
                      sandbox_id UUID,
                      observed_network_policy_json JSONB,
@@ -79,7 +83,10 @@ pub(crate) async fn upsert(
                  )
              ),
              publishable AS (
-                 SELECT input.*
+                 SELECT input.sandbox_id, input.observed_network_policy_json,
+                        input.observed_network_policy_generation,
+                        input.observed_network_policy_source,
+                        input.observed_network_policy_authority
                  FROM input
                  LEFT JOIN sandboxes s ON s.id = input.sandbox_id
                  WHERE s.id IS NULL
@@ -139,14 +146,14 @@ pub(crate) async fn clear_apply_failure(
 ) -> Result<bool, ClearApplyFailureError> {
     let result = sqlx::query(sql!(
         "WITH input AS (
-                 SELECT *
+                 SELECT sandbox_id, observed_network_policy_generation
                  FROM jsonb_to_recordset($2::jsonb) AS input(
                      sandbox_id UUID,
                      observed_network_policy_generation BIGINT
                  )
              ),
              publishable AS (
-                 SELECT input.*
+                 SELECT input.sandbox_id, input.observed_network_policy_generation
                  FROM input
                  LEFT JOIN sandboxes s ON s.id = input.sandbox_id
                  WHERE (s.id IS NULL OR s.active_node_id = $1)

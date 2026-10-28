@@ -76,7 +76,7 @@ pub(crate) async fn prune_census(
         .collect::<Vec<_>>();
     sqlx::query(sql!(
         "WITH present AS (
-             SELECT *
+             SELECT template_name, content_hash
              FROM UNNEST($2::TEXT[], $3::TEXT[]) AS present(template_name, content_hash)
          ),
          removed AS (

@@ -24,7 +24,15 @@ pub(crate) struct AcceptedSandboxPublishRow {
 
 const UPSERT_OBSERVED_STATE_SQL: &str =
         "WITH input AS (
-             SELECT *
+             SELECT sandbox_id, status, state_changed_at, template, runtime,
+                    spaced_version, runtime_version, guest_os, guest_arch,
+                    state_format_name, state_format_version, execution_metadata,
+                    execution_components, pid, namespace, uptime, sandbox_owner,
+                    sandbox_user, image_hash, snapshots_enabled, pool_template,
+                    failure_reason, observed_created_at, network_tx_bytes,
+                    network_rx_bytes, disk_usage_bytes, observed_network_policy_json,
+                    observed_network_policy_generation, observed_network_policy_source,
+                    observed_network_policy_authority, auto_lifecycle_authority
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
                  status TEXT,
@@ -60,7 +68,18 @@ const UPSERT_OBSERVED_STATE_SQL: &str =
              )
          ),
          publishable AS (
-             SELECT input.*,
+             SELECT input.sandbox_id, input.status, input.state_changed_at,
+                    input.template, input.runtime, input.spaced_version,
+                    input.runtime_version, input.guest_os, input.guest_arch,
+                    input.state_format_name, input.state_format_version,
+                    input.execution_metadata, input.execution_components,
+                    input.pid, input.namespace, input.uptime, input.sandbox_owner,
+                    input.sandbox_user, input.image_hash, input.snapshots_enabled,
+                    input.pool_template, input.failure_reason, input.observed_created_at,
+                    input.network_tx_bytes, input.network_rx_bytes, input.disk_usage_bytes,
+                    input.observed_network_policy_json, input.observed_network_policy_generation,
+                    input.observed_network_policy_source, input.observed_network_policy_authority,
+                    input.auto_lifecycle_authority,
                     s.id IS NOT NULL AS assigned_to_node
              FROM input
              LEFT JOIN sandboxes s ON s.id = input.sandbox_id
@@ -70,7 +89,16 @@ const UPSERT_OBSERVED_STATE_SQL: &str =
                 OR COALESCE(direct_route.current_node_id, s.active_node_id) = $1
          ),
          observed_current AS MATERIALIZED (
-             SELECT sos.*
+             SELECT sos.sandbox_id, sos.node_id, sos.status, sos.runtime,
+                    sos.pid, sos.namespace, sos.uptime, sos.sandbox_user,
+                    sos.sandbox_owner, sos.image_hash, sos.snapshots_enabled,
+                    sos.disk_usage_bytes, sos.pool_template, sos.failure_reason,
+                    sos.observed_created_at, sos.network_tx_bytes, sos.network_rx_bytes,
+                    sos.observed_at, sos.updated_at, sos.missing_publish_count,
+                    sos.template, sos.network_policy_authority, sos.auto_lifecycle_authority,
+                    sos.runtime_version, sos.guest_os, sos.guest_arch,
+                    sos.state_format_name, sos.state_format_version,
+                    sos.execution_metadata, sos.spaced_version
              FROM sandbox_observed_states sos
              JOIN publishable ON publishable.sandbox_id = sos.sandbox_id
          ),
@@ -80,7 +108,21 @@ const UPSERT_OBSERVED_STATE_SQL: &str =
              WHERE node_id = $1
          ),
          changed_or_missing AS MATERIALIZED (
-             SELECT publishable.*
+             SELECT publishable.sandbox_id, publishable.status, publishable.state_changed_at,
+                    publishable.template, publishable.runtime, publishable.spaced_version,
+                    publishable.runtime_version, publishable.guest_os, publishable.guest_arch,
+                    publishable.state_format_name, publishable.state_format_version,
+                    publishable.execution_metadata, publishable.execution_components,
+                    publishable.pid, publishable.namespace, publishable.uptime,
+                    publishable.sandbox_owner, publishable.sandbox_user, publishable.image_hash,
+                    publishable.snapshots_enabled, publishable.pool_template,
+                    publishable.failure_reason, publishable.observed_created_at,
+                    publishable.network_tx_bytes, publishable.network_rx_bytes,
+                    publishable.disk_usage_bytes, publishable.observed_network_policy_json,
+                    publishable.observed_network_policy_generation,
+                    publishable.observed_network_policy_source,
+                    publishable.observed_network_policy_authority,
+                    publishable.auto_lifecycle_authority, publishable.assigned_to_node
              FROM publishable
              LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id
              WHERE observed_current.sandbox_id IS NULL

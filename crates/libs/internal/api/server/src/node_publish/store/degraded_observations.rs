@@ -25,14 +25,14 @@ pub(crate) async fn upsert(
     }
     let accepted = sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
-                 SELECT *
+                 SELECT sandbox_id, status
                  FROM jsonb_to_recordset($2::jsonb) AS input(
                      sandbox_id UUID,
                      status TEXT
                  )
              ),
              publishable AS (
-                 SELECT input.*
+                 SELECT input.sandbox_id, input.status
                  FROM input
                  LEFT JOIN sandboxes s ON s.id = input.sandbox_id
                  LEFT JOIN sandbox_direct_route_identities direct_route

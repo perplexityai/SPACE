@@ -21,7 +21,8 @@ pub(crate) async fn observe(
 ) -> Result<(), ObserveTemplatePolicyError> {
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT *
+             SELECT template_name, network_policy_json,
+                    network_policy_generation, network_policy_authority
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  template_name TEXT,
                  network_policy_json JSONB,
@@ -77,7 +78,7 @@ pub(crate) async fn observe(
 
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT *
+             SELECT template_name, network_policy_generation
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  template_name TEXT,
                  network_policy_generation BIGINT

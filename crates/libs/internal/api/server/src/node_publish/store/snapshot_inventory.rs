@@ -33,7 +33,7 @@ pub(crate) async fn replace(
              SELECT UNNEST($1::UUID[]) AS sandbox_id
          ),
          incoming AS (
-             SELECT *
+             SELECT sandbox_id, snapshot_id
              FROM jsonb_to_recordset($2::jsonb) AS incoming(
                  sandbox_id UUID,
                  snapshot_id TEXT
@@ -68,7 +68,9 @@ pub(crate) async fn replace(
              SELECT UNNEST($1::UUID[]) AS sandbox_id
          ),
          input AS (
-             SELECT *
+             SELECT sandbox_id, snapshot_id, type, state, timestamp, source_node_id,
+                    label, retention_tier, vcpu, memory_mib, size_bytes, template_id,
+                    content_hash, locations
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
                  snapshot_id TEXT,

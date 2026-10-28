@@ -11,7 +11,15 @@ pub(crate) enum UpsertTemplateInventoryError {
 
 const UPSERT_TEMPLATE_INVENTORY: &str = sql!(
     "WITH input AS (
-             SELECT *
+             SELECT template_name, content_hash, runtime, arch, runtime_version,
+                    guest_os, state_format_name, state_format_version,
+                    execution_metadata, execution_components, built_at,
+                    artifact_size_bytes, cache_size_bytes, has_base_snapshot,
+                    base_snapshot_size_bytes, pool_target, pool_current,
+                    pool_pending, pool_sandbox_ids, snapshots,
+                    default_auto_lifecycle_json, default_auto_lifecycle_authority,
+                    network_policy_authority, ensure_base_snapshot, snapshot_vcpu,
+                    snapshot_memory_mib, vcpu, memory_mib, disk_size_mb
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  template_name TEXT,
                  content_hash TEXT,

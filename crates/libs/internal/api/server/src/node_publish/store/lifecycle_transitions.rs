@@ -44,7 +44,7 @@ pub(crate) async fn converge_restored(
         pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
     let restored_convergence_query = format!(
         "WITH input AS (
-             SELECT *
+             SELECT sandbox_id, status, transition_receipt_kind
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
                  status TEXT,
@@ -85,7 +85,7 @@ pub(crate) async fn converge_stopped(
 ) -> Result<Vec<SandboxId>, ConvergeStoppedError> {
     sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
-             SELECT *
+             SELECT sandbox_id, status
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
                  status TEXT
@@ -131,7 +131,7 @@ pub(crate) async fn converge_failed(
 ) -> Result<Vec<(SandboxId, String)>, ConvergeFailedError> {
     let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
         "WITH input AS (
-             SELECT *
+             SELECT sandbox_id, status
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
                  status TEXT

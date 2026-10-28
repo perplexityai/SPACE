@@ -341,7 +341,12 @@ pub(super) async fn consume_activation_completion_receipts(
 ) -> Result<Vec<SandboxId>, ConsumeActivationReceiptsError> {
     sqlx::query_scalar(sql!(
         "WITH input AS (
-             SELECT *
+             SELECT sandbox_id, status, transition_receipt_id, transition_receipt_kind,
+                    transition_receipt_target_state, transition_receipt_execution_generation,
+                    transition_receipt_reason_code, transition_receipt_recovery_policy,
+                    transition_receipt_activation_attempt_id, failure_reason,
+                    current_local_artifact_id, current_local_artifact_kind,
+                    current_local_artifact_origin, execution_generation, pod_uid
                FROM jsonb_to_recordset($2::jsonb) AS published(
                    sandbox_id UUID,
                    status TEXT,
@@ -755,7 +760,15 @@ static SELECT_SUSPENDED_PROJECTIONS: LazyLock<String> = LazyLock::new(|| {
     );
     sql!(format!(
         "WITH input AS (
-             SELECT published.*,
+             SELECT published.sandbox_id, published.status, published.transition_receipt_id,
+                    published.transition_receipt_kind, published.transition_receipt_target_state,
+                    published.transition_receipt_execution_generation,
+                    published.transition_receipt_reason_code,
+                    published.transition_receipt_recovery_policy,
+                    published.transition_receipt_activation_attempt_id, published.failure_reason,
+                    published.current_local_artifact_id, published.current_local_artifact_kind,
+                    published.current_local_artifact_origin, published.execution_generation,
+                    published.pod_uid,
                     published.transition_receipt_kind = $3
                     AND published.transition_receipt_id IS NOT NULL
                     AND NOT EXISTS (

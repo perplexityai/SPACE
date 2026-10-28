@@ -34,7 +34,10 @@ static FINALIZE_SUSPENSION: LazyLock<String> = LazyLock::new(|| {
     );
     sql!(format!(
         "WITH candidate AS (
-             SELECT *
+             SELECT id, clear_marker, published_artifact_id,
+                    published_artifact_kind, published_artifact_origin,
+                    published_execution_generation, published_pod_uid,
+                    published_pod_uid_was_missing
                FROM UNNEST(
                    $1::UUID[], $2::BOOL[], $3::UUID[], $4::TEXT[], $5::TEXT[],
                    $6::BIGINT[], $7::TEXT[], $8::BOOL[]
@@ -62,7 +65,10 @@ static FINALIZE_SUSPENSION: LazyLock<String> = LazyLock::new(|| {
              RETURNING e.sandbox_id
          ),
          eligible_candidate AS (
-             SELECT candidate.*
+             SELECT candidate.id, candidate.clear_marker, candidate.published_artifact_id,
+                    candidate.published_artifact_kind, candidate.published_artifact_origin,
+                    candidate.published_execution_generation, candidate.published_pod_uid,
+                    candidate.published_pod_uid_was_missing
                FROM candidate
               WHERE candidate.published_artifact_id IS NULL
                  OR EXISTS (

@@ -32,7 +32,10 @@ pub(crate) async fn upsert_suspend_handoff(
 ) -> Result<bool, UpsertSuspendHandoffError> {
     let result = sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::JSONB) AS input(
+             SELECT sandbox_id, status, execution_generation, pod_uid,
+                    current_local_artifact_id, current_local_artifact_kind,
+                    current_local_artifact_origin
+             FROM jsonb_to_recordset($2::JSONB) AS input(
                  sandbox_id UUID, status TEXT, execution_generation BIGINT,
                  pod_uid TEXT, current_local_artifact_id UUID,
                  current_local_artifact_kind TEXT, current_local_artifact_origin TEXT
@@ -101,7 +104,8 @@ pub(crate) async fn reconcile_quarantine_recovery(
 ) -> Result<bool, ReconcileRecoveryObservationError> {
     let written = sqlx::query(sql!(
         "WITH input AS (
-             SELECT *
+             SELECT sandbox_id, quarantine_recovery_payload,
+                    quarantine_recovery_observation_degraded
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
                  quarantine_recovery_payload JSONB,
@@ -109,7 +113,8 @@ pub(crate) async fn reconcile_quarantine_recovery(
              )
          ),
          publishable AS (
-             SELECT input.*
+             SELECT input.sandbox_id, input.quarantine_recovery_payload,
+                    input.quarantine_recovery_observation_degraded
              FROM input
              WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
                AND input.quarantine_recovery_payload IS NOT NULL
@@ -148,7 +153,8 @@ pub(crate) async fn reconcile_quarantine_recovery(
     .map_err(ReconcileRecoveryObservationError::Upsert)?;
     let cleared = sqlx::query(sql!(
         "WITH input AS (
-             SELECT *
+             SELECT sandbox_id, quarantine_recovery_payload,
+                    quarantine_recovery_observation_degraded
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
                  quarantine_recovery_payload JSONB,

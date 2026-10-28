@@ -190,7 +190,8 @@ async fn upsert_runtime_inventory(
 ) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
+             SELECT runtime, runtime_version, guests, state_formats
+             FROM jsonb_to_recordset($2::jsonb) AS input(
                  runtime TEXT, runtime_version TEXT, guests JSONB, state_formats JSONB
              )
          )
@@ -224,7 +225,8 @@ async fn upsert_runtime_inventory(
     .map_err(PublishExecutionInventoryError::PruneGuests)?;
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
+             SELECT runtime, runtime_version, guests
+             FROM jsonb_to_recordset($2::jsonb) AS input(
                  runtime TEXT, runtime_version TEXT, guests JSONB
              )
          )
@@ -264,7 +266,8 @@ async fn upsert_runtime_inventory(
     .map_err(PublishExecutionInventoryError::PruneFormats)?;
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
+             SELECT runtime, runtime_version, state_formats
+             FROM jsonb_to_recordset($2::jsonb) AS input(
                  runtime TEXT, runtime_version TEXT, state_formats JSONB
              )
          )
@@ -310,7 +313,9 @@ async fn upsert_component_inventory(
 ) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
+             SELECT kind, role_key, version_key, digest_key, format_key,
+                    version, digest, format, default_for_new, legacy_default
+             FROM jsonb_to_recordset($2::jsonb) AS input(
                  kind TEXT, role_key TEXT, version_key TEXT, digest_key TEXT,
                  format_key TEXT, version TEXT, digest TEXT, format TEXT,
                  default_for_new BOOLEAN, legacy_default BOOLEAN

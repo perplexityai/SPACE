@@ -28,7 +28,7 @@ pub(crate) async fn replace(
              )
          ),
          input AS (
-             SELECT *
+             SELECT template_name, content_hash, execution_components
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  template_name TEXT,
                  content_hash TEXT,
@@ -71,7 +71,7 @@ pub(crate) async fn replace(
     .map_err(ReplaceTemplateComponentsError::Prune)?;
     sqlx::query(
         sql!("WITH input AS (
-             SELECT *
+             SELECT template_name, content_hash, execution_components
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  template_name TEXT,
                  content_hash TEXT,

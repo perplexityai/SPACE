@@ -18,7 +18,7 @@ pub(crate) async fn update(
 ) -> Result<bool, UpdateActivityError> {
     let result = sqlx::query(sql!(
         "WITH input AS (
-         SELECT *
+         SELECT sandbox_id, last_used_at, last_access_at, last_command_at
          FROM jsonb_to_recordset($2::jsonb) AS input(
              sandbox_id UUID,
              last_used_at TIMESTAMPTZ,
@@ -42,7 +42,8 @@ pub(crate) async fn update(
          FROM input
      ),
      publishable AS (
-         SELECT activity.*
+         SELECT activity.sandbox_id, activity.last_access_at,
+                activity.last_command_at, activity.last_used_at
          FROM activity
          JOIN sandboxes s ON s.id = activity.sandbox_id
          WHERE s.active_node_id = $1
