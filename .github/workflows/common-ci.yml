@@ -801,6 +801,9 @@ jobs:
           SPACE_CI_CARGO_REGISTRY: ${{ runner.temp }}/cargo-home/registry
         run: |
           set -euo pipefail
+          # The opted-in encrypted btrfs fixtures need both device-mapper targets.
+          sudo modprobe dm_snapshot
+          sudo modprobe dm_crypt
           docker_args=(
             --rm
             --user root
