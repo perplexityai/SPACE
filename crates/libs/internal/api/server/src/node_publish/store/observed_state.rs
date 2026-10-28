@@ -22,7 +22,7 @@ pub(crate) struct AcceptedSandboxPublishRow {
     pub(crate) status_changed: bool,
 }
 
-const UPSERT_OBSERVED_STATE_SQL: &str =
+const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
         "WITH input AS (
              SELECT sandbox_id, status, state_changed_at, template, runtime,
                     spaced_version, runtime_version, guest_os, guest_arch,
@@ -324,7 +324,8 @@ const UPSERT_OBSERVED_STATE_SQL: &str =
                     AS status_changed
          FROM publishable
          LEFT JOIN upserted ON upserted.sandbox_id = publishable.sandbox_id
-         LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id";
+         LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id"
+);
 
 /// Accept observations for unknown sandboxes or the current publisher, using
 /// Direct route ownership when present. Conflict handling locks observation
@@ -333,14 +334,12 @@ const UPSERT_OBSERVED_STATE_SQL: &str =
 pub(crate) async fn upsert(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<AcceptedSandboxPublishRow>, UpsertObservedStateError> {
-    sqlx::query_as::<_, AcceptedSandboxPublishRow>(sqlx::AssertSqlSafe(sql!(
-        UPSERT_OBSERVED_STATE_SQL
-    )))
-    .bind(node_id)
-    .bind(rows_json)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(UpsertObservedStateError::Upsert)
+    sqlx::query_as::<_, AcceptedSandboxPublishRow>(UPSERT_OBSERVED_STATE_SQL)
+        .bind(node_id)
+        .bind(rows_json)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(UpsertObservedStateError::Upsert)
 }

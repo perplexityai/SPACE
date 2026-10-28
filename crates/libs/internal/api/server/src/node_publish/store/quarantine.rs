@@ -337,7 +337,7 @@ pub(super) async fn get_quarantine_recovery_plan(
 pub(super) async fn consume_activation_completion_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<SandboxId>, ConsumeActivationReceiptsError> {
     sqlx::query_scalar(sql!(
         "WITH input AS (
@@ -423,7 +423,7 @@ pub(super) async fn consume_activation_completion_receipts(
 pub(super) async fn select_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<ActivationRollbackCandidate>, SelectActivationRollbacksError> {
     type CandidateRow = (
         SandboxId,
@@ -604,7 +604,7 @@ pub(super) async fn apply_activation_rollback_candidates(
 pub(super) async fn recover_pause_failed_from_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<PauseFailedQuarantineRecovery>, RecoverPauseFailedError> {
     let quarantine_source = SandboxQuarantineSource::SbxManager.as_str();
     let quarantine_reason = SandboxQuarantineReasonCode::PauseFailed.as_str();
@@ -906,7 +906,7 @@ static SELECT_SUSPENDED_PROJECTIONS: LazyLock<String> = LazyLock::new(|| {
 pub(super) async fn select_suspended_projection_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<SuspendedProjectionCandidate>, SelectSuspendedProjectionsError> {
     type CandidateRow = (
         SandboxId,

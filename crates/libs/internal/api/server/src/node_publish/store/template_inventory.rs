@@ -232,7 +232,7 @@ const UPSERT_TEMPLATE_INVENTORY: &str = sql!(
 pub(crate) async fn upsert(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<AcceptedTemplateInventoryRow>, UpsertTemplateInventoryError> {
     sqlx::query_as::<_, AcceptedTemplateInventoryRow>(UPSERT_TEMPLATE_INVENTORY)
         .bind(node_id)

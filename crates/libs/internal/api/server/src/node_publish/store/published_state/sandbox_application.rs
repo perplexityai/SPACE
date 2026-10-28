@@ -15,8 +15,7 @@ pub(super) async fn converge_lifecycles(
     rows_json: &Json<serde_json::Value>,
     post_commit_events: &mut Vec<PostCommitSandboxEvent>,
 ) -> Result<(), ApplySandboxClaimsError> {
-    let restored_ids =
-        lifecycle_transitions::converge_restored(conn, node_id, rows_json.clone()).await?;
+    let restored_ids = lifecycle_transitions::converge_restored(conn, node_id, rows_json).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &restored_ids,
@@ -25,18 +24,11 @@ pub(super) async fn converge_lifecycles(
         "started",
     );
 
-    sandbox_quarantine_store::consume_activation_completion_receipts(
-        conn,
-        node_id,
-        rows_json.clone(),
-    )
-    .await?;
-    let rollback_candidates = sandbox_quarantine_store::select_activation_rollback_candidates(
-        conn,
-        node_id,
-        rows_json.clone(),
-    )
-    .await?;
+    sandbox_quarantine_store::consume_activation_completion_receipts(conn, node_id, rows_json)
+        .await?;
+    let rollback_candidates =
+        sandbox_quarantine_store::select_activation_rollback_candidates(conn, node_id, rows_json)
+            .await?;
     let applied_rollbacks = sandbox_quarantine_store::apply_activation_rollback_candidates(
         conn,
         node_id,
@@ -55,7 +47,7 @@ pub(super) async fn converge_lifecycles(
     }));
 
     let suspended_projection =
-        project_node_published_suspended_sandboxes(conn, node_id, rows_json.clone()).await?;
+        project_node_published_suspended_sandboxes(conn, node_id, rows_json).await?;
     let recovered_ids = suspended_projection
         .recoveries
         .iter()
@@ -85,8 +77,7 @@ pub(super) async fn converge_lifecycles(
         },
     ));
 
-    let stopped_ids =
-        lifecycle_transitions::converge_stopped(conn, node_id, rows_json.clone()).await?;
+    let stopped_ids = lifecycle_transitions::converge_stopped(conn, node_id, rows_json).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &stopped_ids,
@@ -94,8 +85,7 @@ pub(super) async fn converge_lifecycles(
         None,
         "stopped",
     );
-    let failed_sandboxes =
-        lifecycle_transitions::converge_failed(conn, node_id, rows_json.clone()).await?;
+    let failed_sandboxes = lifecycle_transitions::converge_failed(conn, node_id, rows_json).await?;
     emit_node_published_state_events(
         node_id,
         &failed_sandboxes,
@@ -130,8 +120,7 @@ pub(super) async fn project_quarantine(
             serde_json::to_value(&quarantine_sql_inputs)
                 .map_err(EncodeQuarantineInputError::Input)?,
         );
-        let claimed =
-            quarantine_claims::select(conn, node_id, quarantine_rows_json.clone()).await?;
+        let claimed = quarantine_claims::select(conn, node_id, quarantine_rows_json).await?;
         if !claimed.is_empty() {
             let claimed_sql = claimed
                 .iter()
@@ -140,7 +129,7 @@ pub(super) async fn project_quarantine(
             let claimed_json = Json(
                 serde_json::to_value(&claimed_sql).map_err(EncodeQuarantineInputError::Claimed)?,
             );
-            let updated_ids = quarantine_claims::apply(conn, node_id, claimed_json.clone()).await?;
+            let updated_ids = quarantine_claims::apply(conn, node_id, claimed_json).await?;
             let updated_ids = updated_ids.into_iter().collect::<BTreeSet<_>>();
             let updated = claimed
                 .into_iter()
@@ -155,8 +144,8 @@ pub(super) async fn project_quarantine(
                     serde_json::to_value(&updated_sql)
                         .map_err(EncodeQuarantineInputError::Updated)?,
                 );
-                quarantine_persistence::record_state(conn, node_id, updated_json.clone()).await?;
-                quarantine_persistence::record_history(conn, node_id, updated_json).await?;
+                quarantine_persistence::record_state(conn, node_id, &updated_json).await?;
+                quarantine_persistence::record_history(conn, node_id, &updated_json).await?;
                 quarantined_sandboxes = updated
                     .iter()
                     .map(|row| (row.sandbox_id, row.from_lifecycle.clone()))
@@ -186,7 +175,7 @@ pub(super) async fn project_quarantine(
 pub(super) async fn recover_pause_failed(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
     post_commit_events: &mut Vec<PostCommitSandboxEvent>,
 ) -> Result<(), ApplySandboxClaimsError> {
     let recoveries =

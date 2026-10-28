@@ -14,7 +14,7 @@ pub(crate) enum UpdateActivityError {
 pub(crate) async fn update(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<bool, UpdateActivityError> {
     let result = sqlx::query(sql!(
         "WITH input AS (

@@ -173,7 +173,7 @@ async fn failed_projection_decides_on_the_row_committed_while_it_waits() -> Test
             { "sandbox_id": sandbox_id.to_string(), "status": "failed" }
         ]));
         let projection = tokio::spawn(async move {
-            let moved = converge_failed(&mut projection_tx, node_id, rows_json).await?;
+            let moved = converge_failed(&mut projection_tx, node_id, &rows_json).await?;
             projection_tx.commit().await?;
             TestResult::<Vec<_>>::Ok(moved)
         });

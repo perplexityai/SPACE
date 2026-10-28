@@ -26,7 +26,7 @@ pub(crate) enum ClearApplyFailureError {
 pub(crate) async fn update_authority(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<bool, UpdateAuthorityError> {
     let result = sqlx::query(
         sql!("WITH input AS (
@@ -67,7 +67,7 @@ pub(crate) async fn update_authority(
 pub(crate) async fn upsert(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<bool, UpsertPolicyError> {
     let result = sqlx::query(sql!(
         "WITH input AS (
@@ -142,7 +142,7 @@ pub(crate) async fn upsert(
 pub(crate) async fn clear_apply_failure(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<bool, ClearApplyFailureError> {
     let result = sqlx::query(sql!(
         "WITH input AS (

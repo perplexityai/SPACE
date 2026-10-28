@@ -30,7 +30,7 @@ pub(crate) enum ConvergeFailedError {
 pub(crate) async fn converge_restored(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<SandboxId>, ConvergeRestoredError> {
     // Publishing `started` proves the node-local runtime finished, but for
     // Kubernetes sandboxes the control plane also needs a routable active
@@ -81,7 +81,7 @@ pub(crate) async fn converge_restored(
 pub(crate) async fn converge_stopped(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<SandboxId>, ConvergeStoppedError> {
     sqlx::query_scalar::<_, SandboxId>(sql!(
         "WITH input AS (
@@ -127,7 +127,7 @@ pub(crate) async fn converge_stopped(
 pub(crate) async fn converge_failed(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<Vec<(SandboxId, String)>, ConvergeFailedError> {
     let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
         "WITH input AS (

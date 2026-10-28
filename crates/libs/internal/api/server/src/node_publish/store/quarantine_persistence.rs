@@ -22,7 +22,7 @@ pub(crate) enum RecordHistoryError {
 pub(crate) async fn record_state(
     conn: &mut PgConnection,
     node_id: NodeId,
-    updated_json: Json<serde_json::Value>,
+    updated_json: &Json<serde_json::Value>,
 ) -> Result<bool, RecordStateError> {
     let result = sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_state (
@@ -84,7 +84,7 @@ pub(crate) async fn record_state(
 pub(crate) async fn record_history(
     conn: &mut PgConnection,
     node_id: NodeId,
-    updated_json: Json<serde_json::Value>,
+    updated_json: &Json<serde_json::Value>,
 ) -> Result<bool, RecordHistoryError> {
     let result = sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_history (

@@ -192,9 +192,9 @@ pub(crate) async fn publish_validated_template_states(
     }
 
     let rows_json = Json(serde_json::Value::Array(rows));
-    let accepted_rows = template_inventory::upsert(conn, node_id, rows_json.clone()).await?;
+    let accepted_rows = template_inventory::upsert(conn, node_id, &rows_json).await?;
 
-    template_components::replace(conn, node_id, rows_json.clone()).await?;
+    template_components::replace(conn, node_id, &rows_json).await?;
 
     // Node publication deliberately never writes `template_releases`. Release
     // rows are fleet-shared, and any per-node write to them (even a guarded
@@ -468,7 +468,7 @@ pub(crate) async fn publish_validated_sandbox_states(
     }
 
     let rows_json = Json(serde_json::Value::Array(rows));
-    let accepted_rows = observed_state::upsert(conn, node_id, rows_json.clone()).await?;
+    let accepted_rows = observed_state::upsert(conn, node_id, &rows_json).await?;
 
     let inserted_count = accepted_rows.iter().filter(|row| row.inserted).count();
     let updated_count = accepted_rows.iter().filter(|row| row.updated).count();
@@ -488,7 +488,7 @@ pub(crate) async fn publish_validated_sandbox_states(
         .iter()
         .map(|row| row.sandbox_id)
         .collect::<Vec<_>>();
-    sandbox_facet_observations::upsert_suspend_handoff(conn, node_id, rows_json.clone()).await?;
+    sandbox_facet_observations::upsert_suspend_handoff(conn, node_id, &rows_json).await?;
 
     post_commit_state_convergence.extend(accepted_rows.iter().filter_map(|row| {
         if !row.status_changed {
@@ -499,9 +499,8 @@ pub(crate) async fn publish_validated_sandbox_states(
             changed_at: row.state_changed_at?,
         })
     }));
-    sandbox_facet_observations::reconcile_quarantine_recovery(conn, node_id, rows_json.clone())
-        .await?;
-    activity::update(conn, node_id, rows_json.clone()).await?;
+    sandbox_facet_observations::reconcile_quarantine_recovery(conn, node_id, &rows_json).await?;
+    activity::update(conn, node_id, &rows_json).await?;
 
     let first_seen_sandbox_ids = accepted_rows
         .iter()
@@ -511,13 +510,8 @@ pub(crate) async fn publish_validated_sandbox_states(
     sandbox_application::converge_lifecycles(conn, node_id, &rows_json, &mut post_commit_events)
         .await?;
     sandbox_application::project_quarantine(conn, node_id, quarantine_inputs).await?;
-    sandbox_application::recover_pause_failed(
-        conn,
-        node_id,
-        rows_json.clone(),
-        &mut post_commit_events,
-    )
-    .await?;
+    sandbox_application::recover_pause_failed(conn, node_id, &rows_json, &mut post_commit_events)
+        .await?;
 
     queue_policy_reconcile_refs_for_new_inventory(
         conn,
@@ -528,9 +522,9 @@ pub(crate) async fn publish_validated_sandbox_states(
     .await?;
 
     if publishes_network_policy {
-        network_policy::update_authority(conn, node_id, rows_json.clone()).await?;
-        network_policy::upsert(conn, node_id, rows_json.clone()).await?;
-        network_policy::clear_apply_failure(conn, node_id, rows_json.clone()).await?;
+        network_policy::update_authority(conn, node_id, &rows_json).await?;
+        network_policy::upsert(conn, node_id, &rows_json).await?;
+        network_policy::clear_apply_failure(conn, node_id, &rows_json).await?;
     }
 
     snapshot_inventory::replace(conn, &accepted_ids, snapshot_rows).await?;
@@ -557,7 +551,7 @@ struct SuspendedProjectionOutcome {
 async fn project_node_published_suspended_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<SuspendedProjectionOutcome, ApplySandboxClaimsError> {
     let candidates = crate::sandbox_quarantine_store::select_suspended_projection_candidates(
         conn, node_id, rows_json,

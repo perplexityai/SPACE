@@ -70,7 +70,7 @@ pub(crate) async fn observe(
          )"
     ))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .bind(FACET_NETWORK_POLICY)
     .execute(&mut *conn)
     .await
@@ -97,7 +97,7 @@ pub(crate) async fn observe(
            )"
     ))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .bind(FACET_NETWORK_POLICY)
     .execute(&mut *conn)
     .await

@@ -200,7 +200,7 @@ async fn upsert_runtime_inventory(
          ON CONFLICT (node_id, runtime, runtime_version) DO NOTHING"
     ))
     .bind(node_id)
-    .bind(runtime_rows.clone())
+    .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::InsertRuntimes)?;
@@ -242,7 +242,7 @@ async fn upsert_runtime_inventory(
          ON CONFLICT (node_id, runtime, runtime_version, guest_os, guest_arch) DO NOTHING"
     ))
     .bind(node_id)
-    .bind(runtime_rows.clone())
+    .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::InsertGuests)?;

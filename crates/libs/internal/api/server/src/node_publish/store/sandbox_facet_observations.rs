@@ -28,7 +28,7 @@ pub(crate) enum ReconcileRecoveryObservationError {
 pub(crate) async fn upsert_suspend_handoff(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<bool, UpsertSuspendHandoffError> {
     let result = sqlx::query(sql!(
         "WITH input AS (
@@ -100,7 +100,7 @@ pub(crate) async fn upsert_suspend_handoff(
 pub(crate) async fn reconcile_quarantine_recovery(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<bool, ReconcileRecoveryObservationError> {
     let written = sqlx::query(sql!(
         "WITH input AS (
@@ -145,7 +145,7 @@ pub(crate) async fn reconcile_quarantine_recovery(
                < NOW() - make_interval(secs => $4::BIGINT)"
     ))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
     .execute(&mut *conn)

@@ -72,7 +72,7 @@ pub(crate) async fn reconcile(
                IS DISTINCT FROM EXCLUDED.observed_payload -> $4::TEXT"
     ))
     .bind(node_id)
-    .bind(rows.clone())
+    .bind(&rows)
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(SANDBOX_FAILURE_EPISODE_KEY)
     .bind(SANDBOX_FAILURE_EXECUTION_GENERATION_KEY)

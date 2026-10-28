@@ -17,7 +17,7 @@ pub(crate) enum ReplaceTemplateComponentsError {
 pub(crate) async fn replace(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows_json: &Json<serde_json::Value>,
 ) -> Result<(), ReplaceTemplateComponentsError> {
     sqlx::query(sql!(
         "WITH scope AS (
@@ -65,7 +65,7 @@ pub(crate) async fn replace(
            )"
     ))
     .bind(node_id)
-    .bind(rows_json.clone())
+    .bind(rows_json)
     .execute(&mut *conn)
     .await
     .map_err(ReplaceTemplateComponentsError::Prune)?;
