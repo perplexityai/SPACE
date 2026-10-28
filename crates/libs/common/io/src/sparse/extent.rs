@@ -68,10 +68,17 @@ fn probe(
 
 fn unsupported(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Unsupported
-        || matches!(
-            error.raw_os_error(),
-            Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS | libc::ENOTTY)
-        )
+        || error.raw_os_error().is_some_and(|errno| {
+            // ENOTSUP and EOPNOTSUPP are aliases on Linux, but differ on macOS.
+            [
+                libc::EINVAL,
+                libc::ENOTSUP,
+                libc::EOPNOTSUPP,
+                libc::ENOSYS,
+                libc::ENOTTY,
+            ]
+            .contains(&errno)
+        })
 }
 
 #[cfg(all(feature = "sparse-read", any(target_os = "linux", target_os = "macos")))]

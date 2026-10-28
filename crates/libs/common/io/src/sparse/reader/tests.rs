@@ -53,7 +53,13 @@ fn sparse_reader_matches_ordinary_reads() {
 #[test]
 fn unsupported_boundary_seeking_resumes_without_losing_or_repeating_bytes() {
     let bytes: Vec<u8> = (0u8..251).cycle().take(257).collect();
-    for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS, libc::ENOTTY] {
+    for errno in [
+        libc::EINVAL,
+        libc::ENOTSUP,
+        libc::EOPNOTSUPP,
+        libc::ENOSYS,
+        libc::ENOTTY,
+    ] {
         // Exercise fallback before probing data, after consuming data, and
         // after SEEK_DATA succeeds but SEEK_HOLE moves the cursor and fails.
         for fail_at in [1, 2, 3, 4] {
