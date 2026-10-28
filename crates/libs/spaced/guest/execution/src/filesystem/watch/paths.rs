@@ -84,6 +84,7 @@ pub(super) struct WatchRegistrationPlan {
     pub(super) descendants: Vec<PathBuf>,
     /// Where the walk gave up for lack of permission; see [`WatchDirectoryWalk`].
     pub(super) skipped: Vec<PathBuf>,
+    pub(super) skipped_truncated: bool,
 }
 
 impl WatchRegistrationPlan {
@@ -129,6 +130,7 @@ pub(super) async fn plan_watch_registration(
             root: root.to_path_buf(),
             descendants: Vec::new(),
             skipped: Vec::new(),
+            skipped_truncated: false,
         });
     }
     let scan_slot = try_acquire_watch_directory_scan_slot(scan_slots)?;
@@ -140,6 +142,7 @@ pub(super) async fn plan_watch_registration(
             let WatchDirectoryWalk {
                 mut directories,
                 skipped,
+                skipped_truncated,
             } = collect_watch_directories(&root, &root, &filter)?;
             // Required-root traversal always puts the root first.
             debug_assert_eq!(directories.first(), Some(&root));
@@ -148,6 +151,7 @@ pub(super) async fn plan_watch_registration(
                 root,
                 descendants: directories,
                 skipped,
+                skipped_truncated,
             })
         })
         .await
@@ -167,6 +171,8 @@ pub(super) struct WatchDirectoryWalk {
     /// permission change on one of these is what brings the hidden part of
     /// the tree back. At most [`MAX_SKIPPED_DIRECTORIES`] per walk.
     pub(super) skipped: Vec<PathBuf>,
+    /// More were found than `skipped` holds.
+    pub(super) skipped_truncated: bool,
 }
 
 pub(super) fn collect_watch_directories(
@@ -208,6 +214,7 @@ fn walk_watch_directories(
 ) -> Result<Option<WatchDirectoryWalk>, Status> {
     let mut directories = Vec::new();
     let mut skipped = Vec::new();
+    let mut skipped_truncated = false;
     let mut vanished = 0_usize;
     let mut stack = vec![start.to_path_buf()];
     while let Some(path) = stack.pop() {
@@ -222,7 +229,11 @@ fn walk_watch_directories(
                 // searchable: usually the parent this walk listed, but an
                 // ancestor can lose search permission after the listing.
                 if is_permission_denied(&error) {
-                    record_skip(&mut skipped, &blocking_ancestor(root, &path));
+                    record_skip(
+                        &mut skipped,
+                        &mut skipped_truncated,
+                        &blocking_ancestor(root, &path),
+                    );
                 } else {
                     vanished = vanished.saturating_add(1);
                 }
@@ -253,7 +264,7 @@ fn walk_watch_directories(
                 // watched, so it takes no budget; keep the live directories
                 // collected from other branches.
                 if is_permission_denied(&error) {
-                    record_skip(&mut skipped, &path);
+                    record_skip(&mut skipped, &mut skipped_truncated, &path);
                 } else {
                     vanished = vanished.saturating_add(1);
                 }
@@ -285,7 +296,7 @@ fn walk_watch_directories(
                     // The listed directory is the one a permission change
                     // must reach, not each entry it hides.
                     if is_permission_denied(&error) {
-                        record_skip(&mut skipped, &path);
+                        record_skip(&mut skipped, &mut skipped_truncated, &path);
                     } else {
                         vanished = vanished.saturating_add(1);
                     }
@@ -321,6 +332,7 @@ fn walk_watch_directories(
     Ok(Some(WatchDirectoryWalk {
         directories,
         skipped,
+        skipped_truncated,
     }))
 }
 
@@ -342,10 +354,14 @@ pub(super) fn blocking_ancestor(root: &Path, path: &Path) -> PathBuf {
 
 // Refusals usually come in runs from one directory, so comparing with the last
 // entry keeps one entry per directory without a set.
-fn record_skip(skipped: &mut Vec<PathBuf>, path: &Path) {
-    if skipped.len() < MAX_SKIPPED_DIRECTORIES && skipped.last().map(PathBuf::as_path) != Some(path)
-    {
+fn record_skip(skipped: &mut Vec<PathBuf>, truncated: &mut bool, path: &Path) {
+    if skipped.last().map(PathBuf::as_path) == Some(path) {
+        return;
+    }
+    if skipped.len() < MAX_SKIPPED_DIRECTORIES {
         skipped.push(path.to_path_buf());
+    } else {
+        *truncated = true;
     }
 }
 

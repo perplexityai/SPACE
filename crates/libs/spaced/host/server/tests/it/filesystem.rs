@@ -446,6 +446,60 @@ async fn watch_relays_to_guest_bridge() {
 }
 
 #[tokio::test]
+async fn modified_files_relay_unwatched_paths_capped_and_validated() {
+    use crate::mock_bridge_guest::{MockBridgeGuest, start_mock_bridge_guest_with_service};
+
+    let path = |index: usize| format!("/tmp/test-dir/private-{index:03}");
+    let many = |index: usize| format!("/tmp/test-dir/many-{index:04}");
+    // A path past the cap, or one that isn't an absolute guest path, is left
+    // out and flagged rather than failing the query.
+    let cases = [
+        (vec![path(0)], vec![path(0)], false),
+        (
+            (0..257).map(path).collect(),
+            (0..256).map(path).collect(),
+            true,
+        ),
+        // Far past the cap, the list is cut before it's sorted.
+        (
+            (0..1_100).map(many).collect(),
+            (0..256).map(many).collect(),
+            true,
+        ),
+        (
+            vec!["/tmp/bad\npath".to_string(), path(1)],
+            vec![path(1)],
+            true,
+        ),
+        (vec!["tmp/relative".to_string()], vec![], true),
+    ];
+    for (unwatched_paths, relayed, truncated) in cases {
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let bridge_guest_socket = temp_dir.path().join("spaced-bridge-guest.sock");
+        let bridge_task = start_mock_bridge_guest_with_service(
+            bridge_guest_socket.clone(),
+            MockBridgeGuest {
+                unwatched_paths,
+                ..Default::default()
+            },
+        )
+        .await;
+        let fixture = HostFixture::start(Some(bridge_guest_socket)).await;
+        let client = fixture.client().await;
+
+        let response = client
+            .get_modified_files_as_user(None, None, None, None)
+            .await
+            .expect("modified files response");
+        assert_eq!(response.unwatched_paths, relayed);
+        assert_eq!(response.unwatched_paths_truncated, truncated);
+
+        fixture.stop().await;
+        bridge_task.abort();
+    }
+}
+
+#[tokio::test]
 async fn lost_mutation_replies_are_not_replayed_by_host_or_client() {
     use crate::mock_bridge_guest::{MockBridgeGuest, start_mock_bridge_guest_with_service};
     use std::sync::{

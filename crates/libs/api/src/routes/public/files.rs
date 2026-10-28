@@ -30,9 +30,10 @@ use pplx_space_public_api::{
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     SpacedDisableFileChangesRequest, SpacedEnableFileChangesRequest, SpacedFileEventKind,
-    SpacedFileInfo, SpacedFileType, SpacedGetModifiedFilesRequest, SpacedMkdirRequest,
-    SpacedReadRequest, SpacedRemoveRequest, SpacedRenameRequest, SpacedWriteBatchEntry,
-    SpacedWriteBatchRequest, SpacedWriteOpen, SpacedWriteRequest, spaced_write_request,
+    SpacedFileInfo, SpacedFileType, SpacedGetModifiedFilesRequest, SpacedGetModifiedFilesResponse,
+    SpacedMkdirRequest, SpacedReadRequest, SpacedRemoveRequest, SpacedRenameRequest,
+    SpacedWriteBatchEntry, SpacedWriteBatchRequest, SpacedWriteOpen, SpacedWriteRequest,
+    spaced_write_request,
 };
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -646,6 +647,10 @@ pub async fn modified_files(
         )
         .await
         .map_err(controller_error)?;
+    Ok(Json(public_modified_files(response)))
+}
+
+fn public_modified_files(response: SpacedGetModifiedFilesResponse) -> FileModifiedResponse {
     let files = response
         .files
         .into_iter()
@@ -656,14 +661,16 @@ pub async fn modified_files(
             kinds: file.kinds.into_iter().map(public_file_event_kind).collect(),
         })
         .collect();
-    Ok(Json(FileModifiedResponse {
+    FileModifiedResponse {
         files,
         observed_since: response.observed_since.and_then(timestamp_to_rfc3339),
         retained_since: response.retained_since.and_then(timestamp_to_rfc3339),
         cursor: response.cursor,
         monitoring_enabled: response.monitoring_enabled,
         overflowed: response.overflowed,
-    }))
+        unwatched_paths: response.unwatched_paths,
+        unwatched_paths_truncated: response.unwatched_paths_truncated,
+    }
 }
 
 async fn ensure_sandbox_owner(
@@ -1081,6 +1088,8 @@ fn public_file_event_kind(kind: i32) -> FileEventKind {
         Ok(SpacedFileEventKind::Removed) => FileEventKind::Removed,
         Ok(SpacedFileEventKind::Renamed) => FileEventKind::Renamed,
         Ok(SpacedFileEventKind::Chmod) => FileEventKind::Chmod,
+        Ok(SpacedFileEventKind::Unwatched) => FileEventKind::Unwatched,
+        Ok(SpacedFileEventKind::Rewatched) => FileEventKind::Rewatched,
         Ok(SpacedFileEventKind::Unspecified) | Err(_) => FileEventKind::Unknown,
     }
 }

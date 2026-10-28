@@ -861,6 +861,7 @@ impl FilesystemHandle {
             cursor: None,
             monitoring_enabled: false,
             overflowed: true,
+            ..Default::default()
         })
     }
 

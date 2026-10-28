@@ -3695,10 +3695,13 @@ fn file_events_map_to_native_data_plane_frames() {
             kind: FileEventKind::Modified,
         }
     );
-    assert_eq!(
-        file_event_kind(SpacedFileEventKind::Unspecified as i32),
-        FileEventKind::Unknown
-    );
+    for (kind, public) in [
+        (SpacedFileEventKind::Unwatched, FileEventKind::Unwatched),
+        (SpacedFileEventKind::Rewatched, FileEventKind::Rewatched),
+        (SpacedFileEventKind::Unspecified, FileEventKind::Unknown),
+    ] {
+        assert_eq!(file_event_kind(kind as i32), public);
+    }
 }
 
 #[test]

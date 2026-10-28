@@ -639,6 +639,23 @@ fn public_response_types_ignore_additive_fields() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn modified_files_from_an_older_server_cover_everything() {
+    let decoded: FileModifiedResponse = serde_json::from_value(serde_json::json!({
+        "files": [],
+        "observed_since": null,
+        "retained_since": null,
+        "cursor": null,
+        "monitoring_enabled": true,
+        "overflowed": false
+    }))
+    .unwrap();
+
+    assert!(decoded.unwatched_paths.is_empty());
+    assert!(!decoded.unwatched_paths_truncated);
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn data_plane_server_frame_accepts_unknown_future_type() {
     let decoded: DataPlaneServerFrame = serde_json::from_value(serde_json::json!({
         "type": "future_event",

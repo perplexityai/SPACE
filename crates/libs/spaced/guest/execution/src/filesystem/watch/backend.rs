@@ -24,9 +24,10 @@ use super::paths::{
 };
 use super::state::DirectoryAdjustment;
 use super::{MAX_SKIPPED_DIRECTORIES, MAX_WATCHED_DIRECTORIES};
+pub(super) use skipped::CoverageChange;
 use skipped::{
-    SkippedDirectories, is_metadata_change, queue_verification, requeue_invalidated,
-    walked_rechecks,
+    SkippedDirectories, is_metadata_change, queue_verification, report_coverage,
+    requeue_invalidated, walked_rechecks,
 };
 
 // Losing a raw event makes the watch incomplete, so overflow terminates the
@@ -59,6 +60,8 @@ struct DirectoryScanResult {
     directories: Vec<PathBuf>,
     /// Where the scan gave up for lack of permission.
     skipped: Vec<PathBuf>,
+    /// More were found than `skipped` holds.
+    skipped_truncated: bool,
     incomplete: bool,
 }
 
@@ -175,6 +178,9 @@ pub(super) struct RegisteredWatch {
     raw_overflow_notify: Arc<Notify>,
     directories: Vec<PathBuf>,
     skipped: Vec<PathBuf>,
+    skipped_truncated: bool,
+    /// Ancestors blocking refused descendants; see [`blocking_ancestors`].
+    blocking_ancestors: Vec<PathBuf>,
 }
 
 impl RegisteredWatch {
@@ -200,6 +206,7 @@ impl RegisteredWatch {
             root,
             descendants,
             mut skipped,
+            skipped_truncated,
         } = plan;
         let slot = WATCH_BACKEND_SLOTS
             .clone()
@@ -251,6 +258,7 @@ impl RegisteredWatch {
                 let mut directories = Vec::with_capacity(planned_directories);
                 directories.push(root.clone());
                 let mut refused = 0_usize;
+                let mut blocking_ancestors = Vec::new();
                 for path in descendants {
                     match watcher.watch(&path, RecursiveMode::NonRecursive) {
                         Ok(()) => directories.push(path),
@@ -261,7 +269,7 @@ impl RegisteredWatch {
                         Err(error) => match notify_io_error(error) {
                             Ok(io_error) if is_permission_denied(&io_error) => {
                                 refused = refused.saturating_add(1);
-                                skipped.extend(refusal_blocker(&root, &path));
+                                blocking_ancestors.extend(refusal_blocker(&root, &path));
                                 skipped.push(path);
                             }
                             Ok(io_error) if skippable_descendant_error(&io_error) => {}
@@ -291,6 +299,8 @@ impl RegisteredWatch {
                     raw_overflow_notify,
                     directories,
                     skipped,
+                    skipped_truncated,
+                    blocking_ancestors,
                 })
             })
             .await
@@ -309,22 +319,28 @@ pub(super) struct NotifyTaskConfig {
 }
 
 /// `scan_slots` is the owning manager's directory-scan budget.
-pub(super) fn spawn_notify_task<F, Fut, D, DFut>(
+/// `on_coverage` receives each net change to the directories the watch
+/// skipped; like `on_event`, it returns false once nothing consumes it.
+pub(super) fn spawn_notify_task<F, Fut, D, DFut, C, CFut>(
     config: NotifyTaskConfig,
     scan_slots: Arc<tokio::sync::Semaphore>,
     on_event: F,
     adjust_directories: D,
+    on_coverage: C,
 ) where
     F: FnMut(Result<WatchEvent, Status>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = bool> + Send + 'static,
     D: FnMut(usize, usize, Option<bool>) -> DFut + Send + 'static,
     DFut: std::future::Future<Output = DirectoryAdjustment> + Send + 'static,
+    C: FnMut(CoverageChange) -> CFut + Send + 'static,
+    CFut: std::future::Future<Output = bool> + Send + 'static,
 {
     let scanner_tasks = config.tasks.clone();
     spawn_notify_task_with_scanner(
         config,
         on_event,
         adjust_directories,
+        on_coverage,
         Arc::new(move |root, filter, candidates| {
             let scan_slots = Arc::clone(&scan_slots);
             let tasks = scanner_tasks.clone();
@@ -347,16 +363,19 @@ pub(super) fn spawn_notify_task<F, Fut, D, DFut>(
     )
 }
 
-fn spawn_notify_task_with_scanner<F, Fut, D, DFut>(
+fn spawn_notify_task_with_scanner<F, Fut, D, DFut, C, CFut>(
     config: NotifyTaskConfig,
     mut on_event: F,
     mut adjust_directories: D,
+    mut on_coverage: C,
     scan_spawner: DirectoryScanSpawner,
 ) where
     F: FnMut(Result<WatchEvent, Status>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = bool> + Send + 'static,
     D: FnMut(usize, usize, Option<bool>) -> DFut + Send + 'static,
     DFut: std::future::Future<Output = DirectoryAdjustment> + Send + 'static,
+    C: FnMut(CoverageChange) -> CFut + Send + 'static,
+    CFut: std::future::Future<Output = bool> + Send + 'static,
 {
     let NotifyTaskConfig {
         tasks,
@@ -374,13 +393,22 @@ fn spawn_notify_task_with_scanner<F, Fut, D, DFut>(
         raw_overflow_notify,
         directories: initial_directories,
         skipped: initial_skipped,
+        skipped_truncated: initial_skipped_truncated,
+        blocking_ancestors: initial_blocking_ancestors,
     } = registration;
 
     tasks.spawn(async move {
         let mut watcher = watcher;
         let mut registered_directories: HashSet<PathBuf> = initial_directories.into_iter().collect();
-        let mut skipped_directories = SkippedDirectories::default();
+        let mut skipped_directories = SkippedDirectories::for_root(root.clone());
         skipped_directories.remember(initial_skipped);
+        skipped_directories.remember_for_recovery(initial_blocking_ancestors);
+        if initial_skipped_truncated {
+            skipped_directories.note_truncated();
+        }
+        if !report_coverage(&root, &mut skipped_directories, &mut on_coverage).await {
+            return;
+        }
         let mut pending_directory_discovery = PendingDirectoryDiscovery::default();
         let mut directory_scan: Option<DirectoryScan> = None;
         if recursive {
@@ -434,10 +462,18 @@ fn spawn_notify_task_with_scanner<F, Fut, D, DFut>(
                         shutdown.cancel();
                         break;
                     }
+                    // A walk whose results a removal or rename made stale
+                    // drops them; one that dropped any is partial.
+                    let invalidated = |path: &PathBuf| has_ancestor_in(path, &scan.invalidated_roots);
+                    let mut dropped_results = has_ancestor_in(&root, &scan.invalidated_roots);
                     let directories = scan_result
                         .directories
                         .into_iter()
-                        .filter(|path| !has_ancestor_in(path, &scan.invalidated_roots))
+                        .filter(|path| {
+                            let stale = invalidated(path);
+                            dropped_results |= stale;
+                            !stale
+                        })
                         .collect::<Vec<_>>();
                     let walked_rechecks = walked_rechecks(&scan.rechecks, &scan_result.skipped);
                     // A skip the scan saw may already be stale: a permission
@@ -445,7 +481,11 @@ fn spawn_notify_task_with_scanner<F, Fut, D, DFut>(
                     let (recheck, still_skipped): (Vec<_>, Vec<_>) = scan_result
                         .skipped
                         .into_iter()
-                        .filter(|path| !has_ancestor_in(path, &scan.invalidated_roots))
+                        .filter(|path| {
+                            let stale = invalidated(path);
+                            dropped_results |= stale;
+                            !stale
+                        })
                         .partition(|path| scan.changed_since_scan(path));
                     if !requeue_invalidated(
                         &mut pending_directory_discovery,
@@ -460,6 +500,55 @@ fn spawn_notify_task_with_scanner<F, Fut, D, DFut>(
                         break;
                     }
                     let verify = directories.iter().filter(|path| !registered_directories.contains(*path)).cloned().collect::<Vec<_>>();
+                    // A listed directory whose entries were refused is watched
+                    // while skipped, so it is never newly registered. A walk
+                    // that inspects all its entries ends the skip. When the
+                    // walk's own list of skips was cut short, it can't tell
+                    // whether it did, so the skip is kept for its next
+                    // permission change instead of being dropped: a recheck
+                    // that got here has already left the recovery set.
+                    let refused = recheck
+                        .iter()
+                        .chain(&still_skipped)
+                        .cloned()
+                        .collect::<HashSet<_>>();
+                    let walked_clean = directories
+                        .iter()
+                        .filter(|path| {
+                            skipped_directories.unwatched.contains(*path)
+                                && registered_directories.contains(*path)
+                                && !refused.contains(*path)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    // The root's own walk is never hidden by truncation: its
+                    // refusal is recorded first and sorts first. So a clean
+                    // root walk ends its skip, and REWATCHED for "." follows.
+                    let walked_clean = if scan_result.skipped_truncated {
+                        let (root_clean, rest): (Vec<_>, Vec<_>) =
+                            walked_clean.into_iter().partition(|path| *path == root);
+                        skipped_directories.remember_for_recovery(rest);
+                        root_clean
+                    } else {
+                        walked_clean
+                    };
+                    // A walk of the root that wasn't refused, kept every skip
+                    // it met and kept all its results has listed them all.
+                    // A rename or removal that dropped none of them leaves it
+                    // whole; a directory it moved in is a pending candidate,
+                    // reported by its own walk while the root is
+                    // discovering. Anything this step
+                    // can't report after it, including a directory whose
+                    // registration fails or the walk's own truncation below,
+                    // marks the list incomplete again; checking the latter
+                    // here just spares a clear that's undone at once.
+                    if scan.candidate_roots.contains(&root)
+                        && !dropped_results
+                        && !scan_result.skipped_truncated
+                        && !refused.contains(&root)
+                    {
+                        skipped_directories.note_complete();
+                    }
                     match apply_discovered_directories(
                         &root,
                         &mut watcher,
@@ -492,14 +581,34 @@ fn spawn_notify_task_with_scanner<F, Fut, D, DFut>(
                         .into_iter()
                         .filter(|path| registered_directories.contains(path))
                         .collect::<Vec<_>>();
-                    skipped_directories.forget(&verify);
+                    // A newly watched directory the walk also refused, such as
+                    // one whose entries can't be inspected, stays a skip. One
+                    // this walk registered ends its skip even when the walk's
+                    // list of skips was cut short, which UNWATCHED for "."
+                    // reports: left listed, nothing would end it.
+                    let watched = verify
+                        .iter()
+                        .filter(|path| !refused.contains(*path))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    skipped_directories.forget(&watched);
+                    skipped_directories.forget(&walked_clean);
                     if !queue_verification(&mut pending_directory_discovery, verify, &scan.candidate_roots, &walked_rechecks) {
                         let _ = on_event(Err(Status::resource_exhausted("file watcher directory discovery buffer overflowed"))).await;
                         shutdown.cancel();
                         break;
                     }
                     skipped_directories.remember(still_skipped);
+                    if scan_result.skipped_truncated {
+                        skipped_directories.note_truncated();
+                    }
+                    // A recheck is a skip until a walk registers it, whether it
+                    // is queued or waits its turn.
+                    skipped_directories.report(recheck.iter().cloned());
                     skipped_directories.defer(pending_directory_discovery.extend_best_effort(recheck));
+                    if !report_coverage(&root, &mut skipped_directories, &mut on_coverage).await {
+                        break;
+                    }
                     // Discovery is under way while candidates are pending,
                     // including the verification of what a recheck brought
                     // back. A recheck alone, which may find nothing, doesn't
@@ -614,6 +723,10 @@ fn spawn_notify_task_with_scanner<F, Fut, D, DFut>(
                         }
                     }
                     if !receiver_open {
+                        break;
+                    }
+                    // After the removals that ended them are reported.
+                    if !report_coverage(&root, &mut skipped_directories, &mut on_coverage).await {
                         break;
                     }
                     if released_directory_count > 0 {
@@ -924,7 +1037,7 @@ fn take_removed_directories(
     }
 }
 
-fn relative_event_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
+pub(super) fn relative_event_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| Status::internal("file watcher event escaped root"))?;
@@ -1217,6 +1330,7 @@ fn scan_directory_candidates(
     validate_watch_root(root)?;
     let mut roots = Vec::new();
     let mut skipped = Vec::new();
+    let mut skipped_truncated = false;
     let mut skipped_paths = 0_usize;
     let mut inspection_failures = 0_usize;
     for candidate in candidates {
@@ -1266,13 +1380,19 @@ fn scan_directory_candidates(
             Ok(Some(WatchDirectoryWalk {
                 directories: mut tree,
                 skipped: gave_up,
+                skipped_truncated: gave_up_truncated,
             })) => {
                 directories.append(&mut tree);
                 // Each walk caps its own skips; this keeps the whole scan
                 // within the same bound however many walks it runs.
+                // Candidates can name the same blocking ancestor many times,
+                // so room counts distinct skips.
+                skipped.sort();
+                skipped.dedup();
                 let room = MAX_SKIPPED_DIRECTORIES.saturating_sub(skipped.len());
                 skips_overflowed |= gave_up.len() > room;
                 skipped.extend(gave_up.into_iter().take(room));
+                skipped_truncated |= gave_up_truncated;
             }
             // inotify keeps reporting on a root that turned unreadable, so a
             // walk refused the root itself is a skip, walked again on its
@@ -1315,12 +1435,14 @@ fn scan_directory_candidates(
             capacity = MAX_SKIPPED_DIRECTORIES,
             "file watcher discovery found more unreadable directories than it remembers"
         );
+        skipped_truncated = true;
         skipped.truncate(MAX_SKIPPED_DIRECTORIES);
     }
     validate_watch_root(root)?;
     Ok(DirectoryScanResult {
         directories,
         skipped,
+        skipped_truncated,
         incomplete: inspection_failures > 0 || traversal_failures > 0,
     })
 }
@@ -1422,7 +1544,10 @@ where
     // A refused one is released; see `release_refused_charge`.
     if !refused.is_empty() {
         let count = refused.len();
-        skipped.remember(refused_with_blocking_ancestors(root, refused).await);
+        // Reported skips get the recovery budget first.
+        let ancestors = blocking_ancestors(root, &refused).await;
+        skipped.remember(refused);
+        skipped.remember_for_recovery(ancestors);
         watcher.release_directories(count);
         let adjustment = adjust_directories(0, count, None).await;
         if adjustment != DirectoryAdjustment::Applied {
@@ -1432,21 +1557,27 @@ where
     Ok(DirectoryAdjustment::Applied)
 }
 
-/// What to remember for directories whose watch was refused: each directory,
-/// and, when looking it up fails too, the ancestor that blocks the lookup. A
-/// permission change on that ancestor is then the one that brings it back.
-/// The lookups run off the event loop.
-async fn refused_with_blocking_ancestors(root: &Path, refused: Vec<PathBuf>) -> Vec<PathBuf> {
+/// The ancestors that block looking up directories whose watch was refused,
+/// for those whose lookup fails too, to walk again after a permission change:
+/// a permission change on that ancestor is then the one that brings the
+/// directory back. They aren't reported as unwatched, since the refusal
+/// doesn't say which directory lacks permission; a walk that finds an
+/// ancestor unsearchable reports it. The lookups run off the event loop.
+async fn blocking_ancestors(root: &Path, refused: &[PathBuf]) -> Vec<PathBuf> {
     let root = root.to_path_buf();
-    let fallback = refused.clone();
+    let refused = refused.to_vec();
     tokio::task::spawn_blocking(move || {
         refused
-            .into_iter()
-            .flat_map(|path| refusal_blocker(&root, &path).into_iter().chain([path]))
+            .iter()
+            .filter_map(|path| refusal_blocker(&root, path))
             .collect()
     })
     .await
-    .unwrap_or(fallback)
+    .unwrap_or_else(|error| {
+        // Their skips stay reported; only recovery through these is lost.
+        tracing::warn!(%error, "file watcher could not look up blocking ancestors");
+        Vec::new()
+    })
 }
 
 /// Releases the charge of `count` directories whose watch was refused with

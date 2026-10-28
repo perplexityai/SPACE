@@ -297,6 +297,34 @@ fn process_info_to_spaced_preserves_process_config() {
     );
 }
 
+#[test]
+fn modified_files_to_spaced_keeps_coverage_and_rejects_unspecified_kinds() {
+    let file = |kind: SpacedFileEventKind| host_proto::ModifiedFile {
+        path: "src/lib.rs".to_string(),
+        kinds: vec![kind as i32],
+        ..Default::default()
+    };
+    let response = host_proto::GetModifiedFilesResponse {
+        files: vec![file(SpacedFileEventKind::Modified)],
+        unwatched_paths: vec!["/workspace/private".to_string()],
+        unwatched_paths_truncated: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        modified_files_to_spaced(response.clone()).unwrap(),
+        response
+    );
+
+    let unspecified = host_proto::GetModifiedFilesResponse {
+        files: vec![file(SpacedFileEventKind::Unspecified)],
+        ..Default::default()
+    };
+    assert_eq!(
+        modified_files_to_spaced(unspecified).unwrap_err().code(),
+        tonic::Code::Internal
+    );
+}
+
 /// The guest's report of where a reconnected stream starts reaches the data
 /// plane, which relies on it to tell evicted output apart.
 #[test]

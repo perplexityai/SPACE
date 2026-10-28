@@ -658,6 +658,17 @@ pub(super) fn file_event_to_spaced(
     Ok(event)
 }
 
+/// Validates the host's reply in place and returns it whole. The spaced host
+/// already checked each guest field; this hop adds no fields of its own.
+pub(super) fn modified_files_to_spaced(
+    response: host_proto::GetModifiedFilesResponse,
+) -> Result<SpacedGetModifiedFilesResponse, Status> {
+    for kind in response.files.iter().flat_map(|file| &file.kinds) {
+        file_event_kind_to_spaced(*kind)?;
+    }
+    Ok(response)
+}
+
 pub(super) fn file_event_kind_to_spaced(kind: i32) -> Result<i32, Status> {
     if kind == SpacedFileEventKind::Unspecified as i32 {
         return Err(Status::internal(
