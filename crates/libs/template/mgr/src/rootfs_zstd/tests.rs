@@ -139,7 +139,14 @@ fn hashed_compressed_input_matches_a_whole_file_digest() {
 #[case::default(None)]
 #[case::sha256(Some(HashAlg::Sha256))]
 #[case::blake3(Some(HashAlg::Blake3))]
-fn rootfs_zstd_round_trips_sparse_file(#[case] algorithm: Option<HashAlg>) {
+fn rootfs_zstd_round_trips_sparse_file(
+    #[case] algorithm: Option<HashAlg>,
+    #[values(
+        crate::file_reader::TemplateReadMode::Ordinary,
+        crate::file_reader::TemplateReadMode::Sparse
+    )]
+    read_mode: crate::file_reader::TemplateReadMode,
+) {
     let temp = tempfile::tempdir().unwrap();
     let rootfs = temp.path().join(TEMPLATE_ROOTFS_FILE);
     let compressed = temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE);
@@ -155,7 +162,7 @@ fn rootfs_zstd_round_trips_sparse_file(#[case] algorithm: Option<HashAlg>) {
         .write_at(data, 8 * 1024 * 1024)
         .unwrap();
 
-    let compress_stats = compress_rootfs(&rootfs, &compressed).unwrap();
+    let compress_stats = compress_rootfs(&rootfs, &compressed, read_mode).unwrap();
     assert_eq!(
         compress_stats.rootfs_size,
         (2 * DECODE_BUFFER_SIZE + 123) as u64
@@ -211,7 +218,12 @@ fn decompress_rootfs_refuses_to_publish_a_digest_mismatch() {
         let rootfs = temp.path().join(TEMPLATE_ROOTFS_FILE);
         let compressed = temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE);
         std::fs::write(&rootfs, b"bytes the release never hashed").unwrap();
-        compress_rootfs(&rootfs, &compressed).unwrap();
+        compress_rootfs(
+            &rootfs,
+            &compressed,
+            crate::file_reader::TemplateReadMode::Sparse,
+        )
+        .unwrap();
         let bytes = std::fs::read(&rootfs).unwrap();
         let actual_rootfs_hash = match algorithm {
             HashAlg::Sha256 => sha256_bytes(&bytes),
@@ -272,7 +284,12 @@ fn hash_rootfs_file_matches_decompressed_hash() {
         .write_at(data, 1024 * 1024)
         .unwrap();
 
-    compress_rootfs(&rootfs, &compressed).unwrap();
+    compress_rootfs(
+        &rootfs,
+        &compressed,
+        crate::file_reader::TemplateReadMode::Sparse,
+    )
+    .unwrap();
     let (legacy_hash, legacy_size) =
         hash_rootfs_file(&rootfs, pplx_space_common_core::types::HashAlg::Sha256).unwrap();
     assert_eq!(legacy_size, 4 * 1024 * 1024);
@@ -296,7 +313,12 @@ fn decompress_rootfs_rejects_truncated_zstd() {
     let rootfs = temp.path().join(TEMPLATE_ROOTFS_FILE);
     let compressed = temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE);
     std::fs::write(&rootfs, vec![42u8; 1024 * 1024]).unwrap();
-    compress_rootfs(&rootfs, &compressed).unwrap();
+    compress_rootfs(
+        &rootfs,
+        &compressed,
+        crate::file_reader::TemplateReadMode::Sparse,
+    )
+    .unwrap();
     let compressed_size = std::fs::metadata(&compressed).unwrap().len();
     std::fs::OpenOptions::new()
         .write(true)

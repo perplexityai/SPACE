@@ -1618,6 +1618,7 @@ async fn refresh_register_existing_expanded_build_preserves_rootfs_bytes(
     let compressed = crate::rootfs_zstd::compress_rootfs(
         &temp.path().join(TEMPLATE_ROOTFS_FILE),
         &temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE),
+        crate::file_reader::TemplateReadMode::Sparse,
     )
     .unwrap();
     let manifest = normalize_template_manifest(
@@ -2302,6 +2303,7 @@ fn template_refresh_preserves_nocow_and_timestamps() {
 async fn register_template_uses_producer_algorithm(
     #[case] override_algorithm: Option<HashAlg>,
     #[case] cloud_hypervisor: bool,
+    #[values(None, Some(false), Some(true))] sparse_assignment: Option<bool>,
 ) {
     let (fixture, sha256, bytes) = expanded_test_rootfs_setup();
     let expected = match override_algorithm {
@@ -2347,6 +2349,12 @@ async fn register_template_uses_producer_algorithm(
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
             .unwrap()
             .without_sbx_connect_retries();
+    if let Some(enabled) = sparse_assignment {
+        service = service.with_feature_flags(FeatureFlagClient::fixed_bools([(
+            pplx_space_feature_flags::SPACE_TEMPLATE_SPARSE_AWARE_READS_FLAG.key(),
+            enabled,
+        )]));
+    }
     if let Some(algorithm) = override_algorithm {
         service = service.with_production_hash_algorithm(algorithm);
     }

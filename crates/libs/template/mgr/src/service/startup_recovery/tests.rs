@@ -293,9 +293,14 @@ async fn bootable_artifact_hash_matches_dir_name_when_bytes_agree() {
         fixture.rootfs_hash.as_str(),
         "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
     ] {
-        verify_bootable_artifact_hash(fixture.dir.path(), TEMPLATE_ROOTFS_FILE, hash)
-            .await
-            .unwrap();
+        verify_bootable_artifact_hash(
+            fixture.dir.path(),
+            TEMPLATE_ROOTFS_FILE,
+            hash,
+            TemplateReadMode::Sparse,
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -306,6 +311,7 @@ async fn bootable_artifact_hash_rejects_when_bytes_disagree() {
         fixture.dir.path(),
         TEMPLATE_ROOTFS_FILE,
         &sha256_content_hash(b"not-these-bytes"),
+        TemplateReadMode::Sparse,
     )
     .await
     .unwrap_err();

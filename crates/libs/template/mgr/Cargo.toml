@@ -53,6 +53,7 @@ pplx-space-sqlite = { workspace = true }
 pplx-space-stopwatch = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-metrics = { workspace = true }
+pplx-space-feature-flags = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }

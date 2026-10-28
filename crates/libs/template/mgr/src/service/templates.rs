@@ -564,6 +564,7 @@ impl TemplateManagerService {
             rootfs_path.clone(),
             self.production_hash_algorithm,
             "hash expanded rootfs",
+            self.template_read_mode(template_id),
         )
         .await?;
         let expanded_size = std::fs::metadata(&rootfs_path)

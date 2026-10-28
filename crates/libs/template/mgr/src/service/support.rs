@@ -26,9 +26,10 @@ pub(super) async fn compute_template_file_hash(
     path: PathBuf,
     algorithm: HashAlg,
     context: &'static str,
+    read_mode: TemplateReadMode,
 ) -> Result<String, Status> {
     let display_path = path.display().to_string();
-    tokio::task::spawn_blocking(move || compute_content_hash(&display_path, algorithm))
+    tokio::task::spawn_blocking(move || compute_content_hash(&display_path, algorithm, read_mode))
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
         .map_err(|e| Status::internal(format!("{context} {}: {e}", path.display())))
@@ -38,11 +39,11 @@ pub(super) async fn compute_template_file_hash(
 pub(super) fn compute_content_hash(
     rootfs_path: &str,
     algorithm: HashAlg,
+    read_mode: TemplateReadMode,
 ) -> std::io::Result<String> {
     use std::io::Read;
 
-    let mut file =
-        pplx_space_common_io::sparse::SparseFileReader::new(std::fs::File::open(rootfs_path)?)?;
+    let mut file = read_mode.reader(std::fs::File::open(rootfs_path)?)?;
     let mut hasher = crate::content_hash::ContentHasher::new(algorithm);
     let mut buf = vec![0u8; 512 * 1024]; // 512KB read buffer
     loop {

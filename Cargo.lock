@@ -7604,6 +7604,7 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-common",
+ "pplx-space-feature-flags",
  "pplx-space-internal-api-server",
  "pplx-space-metrics",
  "pplx-space-net-common",

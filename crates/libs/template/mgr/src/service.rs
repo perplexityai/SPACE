@@ -20,6 +20,7 @@ use pplx_space_common_core::types::{
 use pplx_space_common_svc::{
     AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
+use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_net_common::{
     NetworkPolicyV1,
     proto::{NetworkPolicyApplyDecision, NetworkPolicyV1 as NetworkPolicyProto},
@@ -29,6 +30,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
+use crate::file_reader::TemplateReadMode;
 use crate::proto::template_manager_server::TemplateManager;
 use crate::proto::{
     CreatePoolRequest, CreatePoolResponse, DeletePoolRequest, DeletePoolResponse,
@@ -369,6 +371,7 @@ pub struct TemplateManagerService {
     db: Arc<Mutex<rusqlite::Connection>>,
     artifact_store: TemplateArtifactStore,
     production_hash_algorithm: HashAlg,
+    feature_flags: FeatureFlagClient,
     pool_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     snapshot_reconcile_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     snapshot_retry_backoff: Arc<Mutex<snapshots::RetryBackoff>>,
@@ -927,6 +930,7 @@ async fn generate_template_compressed_rootfs(
     content_hash: &str,
     digest_dir: &str,
     trigger: &'static str,
+    read_mode: TemplateReadMode,
 ) -> Result<crate::rootfs_zstd::RootfsZstdStats, Status> {
     let rootfs_path = crate::rootfs_zstd::rootfs_path(Path::new(digest_dir));
     let compressed_path = crate::rootfs_zstd::compressed_rootfs_path(Path::new(digest_dir));
@@ -949,9 +953,13 @@ async fn generate_template_compressed_rootfs(
                     compressed_path.display()
                 ))
             })?;
-        let compressed_hash =
-            compute_template_file_hash(compressed_path, HashAlg::Sha256, "hash compressed rootfs")
-                .await?;
+        let compressed_hash = compute_template_file_hash(
+            compressed_path,
+            HashAlg::Sha256,
+            "hash compressed rootfs",
+            read_mode,
+        )
+        .await?;
         return Ok(crate::rootfs_zstd::RootfsZstdStats {
             rootfs_size,
             compressed_size,
@@ -960,7 +968,7 @@ async fn generate_template_compressed_rootfs(
     }
 
     let stats = tokio::task::spawn_blocking(move || {
-        crate::rootfs_zstd::compress_rootfs(&rootfs_path, &compressed_path)
+        crate::rootfs_zstd::compress_rootfs(&rootfs_path, &compressed_path, read_mode)
     })
     .await
     .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
@@ -1542,6 +1550,7 @@ impl TemplateManagerService {
             db,
             artifact_store: TemplateArtifactStore::default(),
             production_hash_algorithm: crate::content_hash::DEFAULT_PRODUCTION_ALGORITHM,
+            feature_flags: FeatureFlagClient::disabled(),
             pool_handle: Arc::new(Mutex::new(None)),
             snapshot_reconcile_locks: Arc::new(Mutex::new(HashMap::new())),
             snapshot_retry_backoff: Arc::new(Mutex::new(snapshots::RetryBackoff::default())),
@@ -1554,6 +1563,16 @@ impl TemplateManagerService {
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
         })
+    }
+
+    /// Install the service-owned runtime flag client before accepting work.
+    pub fn with_feature_flags(mut self, flags: FeatureFlagClient) -> Self {
+        self.feature_flags = flags;
+        self
+    }
+
+    fn template_read_mode(&self, template: &str) -> TemplateReadMode {
+        TemplateReadMode::from_flags(&self.feature_flags, template)
     }
 
     pub(crate) fn with_production_hash_algorithm(mut self, algorithm: HashAlg) -> Self {
@@ -2047,8 +2066,14 @@ impl TemplateManagerService {
 
         let generated_stats = if !compressed_rootfs_path.exists() {
             Some(
-                generate_template_compressed_rootfs(template_id, content_hash, digest_dir, trigger)
-                    .await?,
+                generate_template_compressed_rootfs(
+                    template_id,
+                    content_hash,
+                    digest_dir,
+                    trigger,
+                    self.template_read_mode(template_id),
+                )
+                .await?,
             )
         } else {
             None
@@ -2068,6 +2093,7 @@ impl TemplateManagerService {
                 compressed_rootfs_path.clone(),
                 HashAlg::Sha256,
                 "hash compressed rootfs",
+                self.template_read_mode(template_id),
             )
             .await?;
             let size = std::fs::metadata(&compressed_rootfs_path)
@@ -2157,6 +2183,7 @@ impl TemplateManagerService {
                 rootfs_path.clone(),
                 content_hash_algorithm(content_hash)?,
                 "hash digest rootfs",
+                self.template_read_mode(template_id),
             )
             .await?;
             if observed_hash != content_hash {
@@ -2259,6 +2286,7 @@ impl TemplateManagerService {
             prepared_path.join(TEMPLATE_ROOTFS_FILE),
             content_hash_algorithm(content_hash)?,
             "hash existing rootfs",
+            self.template_read_mode(template_id),
         )
         .await?;
         if observed_hash != content_hash {
@@ -2296,6 +2324,7 @@ impl TemplateManagerService {
                 content_hash,
                 &prepared_path.to_string_lossy(),
                 "local_import",
+                self.template_read_mode(template_id),
             )
             .await?;
             let object = |value: Option<serde_json::Value>| {
@@ -2413,6 +2442,7 @@ impl TemplateManagerService {
             rootfs_path.clone(),
             content_hash_algorithm(content_hash)?,
             "hash digest rootfs",
+            self.template_read_mode(template_id),
         )
         .await?;
         if observed_hash != content_hash {

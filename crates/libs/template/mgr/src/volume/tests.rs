@@ -1421,8 +1421,12 @@ async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release
     let replaced_bytes = b"rootfs bytes the release never hashed";
     std::fs::write(&rootfs_path, replaced_bytes).unwrap();
     let (replaced_hash, _) = crate::rootfs_zstd::hash_rootfs_file(&rootfs_path, algorithm).unwrap();
-    let compress_stats =
-        crate::rootfs_zstd::compress_rootfs(&rootfs_path, &compressed_path).unwrap();
+    let compress_stats = crate::rootfs_zstd::compress_rootfs(
+        &rootfs_path,
+        &compressed_path,
+        crate::file_reader::TemplateReadMode::Sparse,
+    )
+    .unwrap();
     std::fs::remove_file(&rootfs_path).unwrap();
     let release_hash = format!("{algorithm}:{}", "a".repeat(64));
     assert_ne!(replaced_hash, release_hash);
@@ -1493,6 +1497,7 @@ async fn materialize_blake3_release(#[case] compressed: bool) {
         let stats = crate::rootfs_zstd::compress_rootfs(
             &rootfs,
             &directory.path().join(TEMPLATE_ROOTFS_ZSTD_FILE),
+            crate::file_reader::TemplateReadMode::Sparse,
         )
         .unwrap();
         std::fs::remove_file(&rootfs).unwrap();

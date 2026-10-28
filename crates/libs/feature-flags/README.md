@@ -146,10 +146,11 @@ can match on beyond the subject.
 | `space-native-create-pool-claim` | boolean | constant `space-cluster` | none | off |
 | `space-native-hidden-operations` | boolean | SPACE org id | `operation_id` | off |
 | `space-snapshot-retention-config` | JSON object | cluster id | none | env-configured limits |
+| `space-template-sparse-aware-reads` | boolean | template name | none | on |
 
 Each fallback is chosen so that losing the flag backend cannot turn a
 guardrail off: the limiters fall back **on**, and the flags
-that would enable new behavior fall back **off**. All three JSON keys fall back
+that open new operations fall back **off**. All three JSON keys fall back
 to whatever their deployment configured locally rather than to a value chosen
 here, because an override that resolves nothing should leave local
 configuration standing — see `policy::override_allowed`.
@@ -169,6 +170,13 @@ decision. With no provider, an unready provider or no assignment it reads
 worker rollout or migration is needed. The counter
 `sandbox.api.timeout_update.lock_decision` records, per call, whether the lock
 was skipped and why it was not.
+
+`space-template-sparse-aware-reads` controls template hashing and compression.
+It defaults **on**, including when no provider or assignment is available.
+Assigning `false` selects ordinary file reads for new work. Each file operation
+keeps its selected mode; a raw import keeps one mode through hashing and
+compression. Artifact bytes and filesystem-level sparse-read fallbacks are
+unchanged.
 
 `space-native-hidden-operations` opens hidden native operations to an org, so
 its env master, `SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED` (on by default),

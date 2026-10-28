@@ -329,80 +329,90 @@ async fn materialize_compressed_imported_rootfs(
     })
 }
 
-async fn materialize_uncompressed_imported_rootfs(
-    template_id: &str,
-    content_hash: &str,
-    header: &crate::proto::ImportTemplateHeader,
-    staging_dir: &str,
-    rootfs_path: &Path,
-    compressed_rootfs_path: &Path,
-    backing_policy: RootfsBackingPolicy,
-) -> Result<ImportedRootfs, Status> {
-    if backing_policy == RootfsBackingPolicy::NoCow {
-        let raw_path = rootfs_path.to_path_buf();
-        tokio::task::spawn_blocking(move || backing_policy.prepare_raw(&raw_path))
-            .await
-            .map_err(|error| Status::internal(format!("prepare rootfs task: {error}")))?
-            .map_err(|error| Status::internal(format!("prepare rootfs backing: {error}")))?;
-    }
-    let expected_rootfs_hash = header
-        .rootfs_hash
-        .as_deref()
-        .filter(|hash| !hash.is_empty())
-        .unwrap_or(content_hash);
-    let actual_rootfs_hash = compute_template_file_hash(
-        rootfs_path.to_path_buf(),
-        content_hash_algorithm(expected_rootfs_hash)?,
-        "compute streamed rootfs hash",
-    )
-    .await?;
-    if actual_rootfs_hash != expected_rootfs_hash {
-        return Err(Status::data_loss(format!(
-            "rootfs hash mismatch: expected {expected_rootfs_hash}, got {actual_rootfs_hash}"
-        )));
-    }
+impl TemplateManagerService {
+    async fn materialize_uncompressed_imported_rootfs(
+        &self,
+        template_id: &str,
+        content_hash: &str,
+        header: &crate::proto::ImportTemplateHeader,
+        staging_dir: &str,
+        rootfs_path: &Path,
+        compressed_rootfs_path: &Path,
+    ) -> Result<ImportedRootfs, Status> {
+        let backing_policy = self.volume_puller.backing_policy;
+        let read_mode = self.template_read_mode(template_id);
+        if backing_policy == RootfsBackingPolicy::NoCow {
+            let raw_path = rootfs_path.to_path_buf();
+            tokio::task::spawn_blocking(move || backing_policy.prepare_raw(&raw_path))
+                .await
+                .map_err(|error| Status::internal(format!("prepare rootfs task: {error}")))?
+                .map_err(|error| Status::internal(format!("prepare rootfs backing: {error}")))?;
+        }
+        let expected_rootfs_hash = header
+            .rootfs_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+            .unwrap_or(content_hash);
+        let actual_rootfs_hash = compute_template_file_hash(
+            rootfs_path.to_path_buf(),
+            content_hash_algorithm(expected_rootfs_hash)?,
+            "compute streamed rootfs hash",
+            read_mode,
+        )
+        .await?;
+        if actual_rootfs_hash != expected_rootfs_hash {
+            return Err(Status::data_loss(format!(
+                "rootfs hash mismatch: expected {expected_rootfs_hash}, got {actual_rootfs_hash}"
+            )));
+        }
 
-    expand_template_rootfs(template_id, content_hash, staging_dir, "local_import").await?;
-    let expanded_hash = compute_template_file_hash(
-        rootfs_path.to_path_buf(),
-        content_hash_algorithm(content_hash)?,
-        "compute expanded rootfs hash",
-    )
-    .await?;
-    if expanded_hash != content_hash {
-        return Err(Status::data_loss(format!(
-            "expanded rootfs hash mismatch: expected {content_hash}, got {expanded_hash}"
-        )));
-    }
-    generate_template_compressed_rootfs(template_id, content_hash, staging_dir, "local_import")
+        expand_template_rootfs(template_id, content_hash, staging_dir, "local_import").await?;
+        let expanded_hash = compute_template_file_hash(
+            rootfs_path.to_path_buf(),
+            content_hash_algorithm(content_hash)?,
+            "compute expanded rootfs hash",
+            read_mode,
+        )
+        .await?;
+        if expanded_hash != content_hash {
+            return Err(Status::data_loss(format!(
+                "expanded rootfs hash mismatch: expected {content_hash}, got {expanded_hash}"
+            )));
+        }
+        generate_template_compressed_rootfs(
+            template_id,
+            content_hash,
+            staging_dir,
+            "local_import",
+            read_mode,
+        )
         .await?;
 
-    let expanded_size = std::fs::metadata(rootfs_path)
-        .map(|m| m.len())
-        .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
-    let compressed_hash = compute_template_file_hash(
-        compressed_rootfs_path.to_path_buf(),
-        HashAlg::Sha256,
-        "hash compressed rootfs",
-    )
-    .await?;
-    let compressed_size = std::fs::metadata(compressed_rootfs_path)
-        .map(|m| m.len())
-        .map_err(|e| {
-            Status::internal(format!(
-                "stat compressed rootfs {}: {e}",
-                compressed_rootfs_path.display()
-            ))
-        })?;
+        let expanded_size = std::fs::metadata(rootfs_path)
+            .map(|m| m.len())
+            .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
+        let compressed_hash = compute_template_file_hash(
+            compressed_rootfs_path.to_path_buf(),
+            HashAlg::Sha256,
+            "hash compressed rootfs",
+            read_mode,
+        )
+        .await?;
+        let compressed_size = std::fs::metadata(compressed_rootfs_path)
+            .map(|m| m.len())
+            .map_err(|e| {
+                Status::internal(format!(
+                    "stat compressed rootfs {}: {e}",
+                    compressed_rootfs_path.display()
+                ))
+            })?;
 
-    Ok(ImportedRootfs {
-        expanded_size,
-        compressed_hash,
-        compressed_size,
-    })
-}
-
-impl TemplateManagerService {
+        Ok(ImportedRootfs {
+            expanded_size,
+            compressed_hash,
+            compressed_size,
+        })
+    }
     pub(super) async fn do_import(
         &self,
         target: ImportTarget<'_>,
@@ -762,14 +772,13 @@ impl TemplateManagerService {
             )));
         }
 
-        materialize_uncompressed_imported_rootfs(
+        self.materialize_uncompressed_imported_rootfs(
             template_id,
             content_hash,
             header,
             staging_dir,
             &rootfs_path,
             &compressed_rootfs_path,
-            self.volume_puller.backing_policy,
         )
         .await
     }

@@ -10,7 +10,7 @@ use pplx_space_common_core::types::{
     Digest, DigestParseError, HashAlg, TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_FILE,
     TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
-use pplx_space_common_io::sparse::{SparseFileReader, SparseFileWriter};
+use pplx_space_common_io::sparse::SparseFileWriter;
 use pplx_space_common_svc::page_cache;
 use sha2::{Digest as _, Sha256};
 
@@ -184,6 +184,7 @@ pub(crate) fn compressed_rootfs_path(build_dir: &Path) -> PathBuf {
 pub(crate) fn compress_rootfs(
     rootfs_path: &Path,
     compressed_path: &Path,
+    read_mode: crate::file_reader::TemplateReadMode,
 ) -> Result<RootfsZstdStats, RootfsZstdError> {
     let rootfs_size = std::fs::metadata(rootfs_path)
         .map_err(|source| RootfsZstdError::Io {
@@ -222,11 +223,13 @@ pub(crate) fn compress_rootfs(
             operation: "configure compressor workers",
             source,
         })?;
-    let mut reader = SparseFileReader::new(input).map_err(|source| RootfsZstdError::Io {
-        operation: "open sparse rootfs reader",
-        path: rootfs_path.display().to_string(),
-        source,
-    })?;
+    let mut reader = read_mode
+        .reader(input)
+        .map_err(|source| RootfsZstdError::Io {
+            operation: "open rootfs reader",
+            path: rootfs_path.display().to_string(),
+            source,
+        })?;
     std::io::copy(&mut reader, &mut encoder).map_err(|source| RootfsZstdError::Zstd {
         operation: "compress rootfs",
         source,

@@ -220,17 +220,19 @@ async fn verify_bootable_artifact_hash(
     digest_dir: &Path,
     bootable_filename: &str,
     expected_hash: &str,
+    read_mode: TemplateReadMode,
 ) -> Result<(), DigestDirRejection> {
     let path = digest_dir.join(bootable_filename);
     let path_str = path.display().to_string();
     let algorithm = content_hash_algorithm(expected_hash)
         .map_err(|error| DigestDirRejection::BootableArtifactUnreadable(error.to_string()))?;
-    let computed = tokio::task::spawn_blocking(move || compute_content_hash(&path_str, algorithm))
-        .await
-        .map_err(|error| {
-            DigestDirRejection::BootableArtifactUnreadable(format!("hash task failed: {error}"))
-        })?
-        .map_err(|error| DigestDirRejection::BootableArtifactUnreadable(error.to_string()))?;
+    let computed =
+        tokio::task::spawn_blocking(move || compute_content_hash(&path_str, algorithm, read_mode))
+            .await
+            .map_err(|error| {
+                DigestDirRejection::BootableArtifactUnreadable(format!("hash task failed: {error}"))
+            })?
+            .map_err(|error| DigestDirRejection::BootableArtifactUnreadable(error.to_string()))?;
     if computed != expected_hash {
         return Err(DigestDirRejection::BootableArtifactHashMismatch {
             computed,
@@ -488,8 +490,13 @@ async fn reconcile_digest_dir_against_db(
         return;
     }
 
-    if let Err(rejection) =
-        verify_bootable_artifact_hash(digest_dir, &manifest.bootable_artifact, hash_name).await
+    if let Err(rejection) = verify_bootable_artifact_hash(
+        digest_dir,
+        &manifest.bootable_artifact,
+        hash_name,
+        service.template_read_mode(name),
+    )
+    .await
     {
         drop_invalid_digest_dir(service, build, &rejection).await;
         return;

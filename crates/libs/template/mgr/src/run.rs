@@ -184,7 +184,8 @@ async fn run_service(
     let service = TemplateManagerService::new(conn)
         .map_err(RunTemplateMgrError::InitializeService)?
         .with_rootfs_backing_policy(backing_policy)
-        .with_production_hash_algorithm(production_hash_algorithm);
+        .with_production_hash_algorithm(production_hash_algorithm)
+        .with_feature_flags(pplx_space_feature_flags::FeatureFlagClient::from_env());
 
     // Re-arm any durable background jobs that were in flight (i.e.
     // `status='running'`) when the previous tmplmgr exited. Without

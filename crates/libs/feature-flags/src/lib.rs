@@ -171,6 +171,12 @@ pub use provider::{
     AttributeValue, Attributes, FeatureFlagProvider, ProviderState, UnavailableProvider, Unresolved,
 };
 
+/// Selects sparse-aware template hashing and compression, evaluated per template
+/// name before template file work. Defaults on when no assignment resolves;
+/// disabling it affects new operations without changing artifact bytes.
+pub const SPACE_TEMPLATE_SPARSE_AWARE_READS_FLAG: BoolFlag =
+    BoolFlag::new("space-template-sparse-aware-reads", true);
+
 /// Boolean flag acting as a dynamic cluster-wide kill-switch for the
 /// Redis-backed sandbox activation rate limiter. Layered under the static
 /// `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` env master by [`policy`].
