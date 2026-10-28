@@ -92,6 +92,7 @@ fn plaintext_deks_zeroize() {
 
     let mut volume = GetOrIssueSandboxVolumeDekResponse {
         plaintext_dek: b"secret-volume-dek".to_vec(),
+        org_id: String::new(),
     };
     volume.zeroize();
     assert!(volume.plaintext_dek.is_empty());

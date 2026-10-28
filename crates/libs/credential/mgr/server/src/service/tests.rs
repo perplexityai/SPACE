@@ -674,8 +674,9 @@ async fn volume_dek_refuses_a_mismatched_expected_org() {
         }))
         .await
         .unwrap()
-        .into_inner()
-        .take_plaintext_dek();
+        .into_inner();
+    assert_eq!(asserted.org_id, owner.to_string());
+    let asserted = asserted.take_plaintext_dek();
     let unasserted = service
         .get_or_issue_sandbox_volume_dek(root_request(GetOrIssueSandboxVolumeDekRequest {
             sandbox_id,
@@ -683,8 +684,9 @@ async fn volume_dek_refuses_a_mismatched_expected_org() {
         }))
         .await
         .unwrap()
-        .into_inner()
-        .take_plaintext_dek();
+        .into_inner();
+    assert_eq!(unasserted.org_id, owner.to_string());
+    let unasserted = unasserted.take_plaintext_dek();
     assert_eq!(asserted, unasserted);
 }
 

@@ -713,6 +713,7 @@ impl CredentialManager for CredentialManagerService {
                 .await?;
             return Ok(Response::new(GetOrIssueSandboxVolumeDekResponse {
                 plaintext_dek,
+                org_id: org.to_string(),
             }));
         }
 
@@ -768,6 +769,7 @@ impl CredentialManager for CredentialManagerService {
         if canonical.wrapped_dek == wrapped_dek {
             return Ok(Response::new(GetOrIssueSandboxVolumeDekResponse {
                 plaintext_dek,
+                org_id: org.to_string(),
             }));
         }
         // Same previous-owner refusal as the load path above: a concurrent
@@ -789,6 +791,7 @@ impl CredentialManager for CredentialManagerService {
             .await?;
         Ok(Response::new(GetOrIssueSandboxVolumeDekResponse {
             plaintext_dek,
+            org_id: org.to_string(),
         }))
     }
 

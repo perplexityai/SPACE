@@ -72,6 +72,7 @@ fn plaintext_dek_debug_output_is_redacted() {
     assert_redacted(
         &GetOrIssueSandboxVolumeDekResponse {
             plaintext_dek: b"secret-volume-dek".to_vec(),
+            org_id: String::new(),
         },
         "GetOrIssueSandboxVolumeDekResponse",
     );

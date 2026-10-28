@@ -72,6 +72,8 @@ use std::path::{Path, PathBuf};
 use crate::device_backing::{self, Backing, LoopDevice};
 use pplx_space_common_core::types::SandboxId;
 
+pub(crate) mod fork;
+
 /// Bytes of the *decrypted* COW mapper zeroed before a FRESH dm-snapshot is
 /// created over it, so the kernel sees a clean exception store rather than
 /// LUKS header noise. Never written on restore. 4 MiB comfortably covers the
@@ -432,6 +434,11 @@ pub(crate) async fn dm_exists(name: &str) -> Result<bool, DmCryptError> {
 /// Leaves the backing files (`origin.ext4`, `cow.luks`) on disk; the caller
 /// decides whether to keep them (suspend) or delete them (sandbox delete).
 pub async fn release(sandbox_id: &SandboxId, origin_path: &Path) -> Result<(), DmCryptError> {
+    fork::cleanup(
+        &format!("sbxroot-{sandbox_id}-fork-source"),
+        &format!("sbxroot-{sandbox_id}-fork-target"),
+    )
+    .await?;
     let composite = composite_name(sandbox_id);
     let cow = cow_mapper_name(sandbox_id);
 

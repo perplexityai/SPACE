@@ -61,6 +61,7 @@ pub(crate) async fn prepare_encrypted_rootfs(
                 execution_fence: Some(execution_fence.into()),
                 sandbox_id: sandbox_id.to_string(),
                 restore_cow_source: restore_cow_source.map(str::to_string),
+                fork_source: None,
             },
         )
         .await

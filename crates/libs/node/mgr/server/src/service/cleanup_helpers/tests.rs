@@ -46,6 +46,8 @@ fn incomplete_device_setup_is_discovered_without_a_cow_marker() {
     for (name, owned) in [
         (format!("sbxroot-{id}"), true),
         (format!("sbxroot-{id}-cow"), true),
+        (format!("sbxroot-{id}-fork-source"), true),
+        (format!("sbxroot-{id}-fork-target"), true),
         (format!("sbxvol-{id}-snapshot"), true),
         (format!("sbxroot-{id}-unrelated"), false),
         ("sbxroot-another".into(), false),

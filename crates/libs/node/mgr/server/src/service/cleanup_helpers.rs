@@ -1264,7 +1264,9 @@ fn record_device_release(
 /// Best-effort teardown of any BYOK dm-crypt / dm-snapshot device stack for a
 /// sandbox. vol-mgr names these `sbxroot-<id>` (the dm-snapshot composite),
 /// `sbxroot-<id>-cow` (its dm-crypt COW), and `sbxvol-<id>-<name>` (encrypted
-/// data volumes such as the snapshot capture). Enumerate dm devices carrying
+/// data volumes such as the snapshot capture). Disk forks temporarily use
+/// `sbxroot-<id>-fork-source` and `sbxroot-<id>-fork-target` while re-encrypting.
+/// Enumerate dm devices carrying
 /// the sandbox id, remove snapshot composites before the crypt devices they
 /// sit on, then detach the loop devices backing the sandbox's cache files.
 /// Reconcile mapper nodes even when a prior attempt already removed the kernel
@@ -1536,6 +1538,8 @@ fn host_device_stack_exists(
 fn mapper_belongs_to_sandbox(name: &str, sandbox_id: &str) -> bool {
     name == format!("sbxroot-{sandbox_id}")
         || name == format!("sbxroot-{sandbox_id}-cow")
+        || name == format!("sbxroot-{sandbox_id}-fork-source")
+        || name == format!("sbxroot-{sandbox_id}-fork-target")
         || name.starts_with(&format!("sbxvol-{sandbox_id}-"))
 }
 

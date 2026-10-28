@@ -140,9 +140,56 @@ impl NodeManagerService {
         // credmgr (issued+persisted on the first volume, loaded thereafter).
         // The caller never handles a KEK or wrap; credmgr owns org→KEK
         // resolution, the wrap storage, and the AAD.
-        let plaintext_dek = fetch_sandbox_volume_dek(&sandbox_id, None)
+        let fork_source = req
+            .fork_source
+            .map(|source| {
+                let source_id = parse_sandbox_id(&source.sandbox_id)?;
+                if source_id == sandbox_id || restore_cow_source.is_none() {
+                    return Err(Status::invalid_argument(
+                        "fork requires a distinct source and a staged COW",
+                    ));
+                }
+                Ok(source_id)
+            })
+            .transpose()?;
+        let target_key = fetch_sandbox_volume_key(&sandbox_id, None)
             .await
             .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_DEK))?;
+
+        let restore_cow_source = if let Some(source_id) = fork_source {
+            // A published child COW is already independent of the source. Do
+            // not require its old key again, or overwrite the child's writes.
+            let path = cow_path.clone();
+            let existing = crate::device_backing::blocking(move || {
+                crate::device_backing::Backing::open(&path, false).map(|file| file.is_some())
+            })
+            .await
+            .map_err(dmcrypt_error_to_status)?;
+            if !existing {
+                // The authority, not snapshot metadata or the caller, decides
+                // the target's org. Initial re-encryption fails closed if an
+                // older authority does not supply ownership.
+                let org_id = target_key.org_id.ok_or_else(|| {
+                    Status::failed_precondition("credential authority omitted target organization")
+                })?;
+                let source_dek = fetch_sandbox_volume_dek(&source_id, Some(org_id)).await?;
+                let source_path = restore_cow_source
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("missing fork COW"))?;
+                rootfs_dmcrypt::fork::stage(
+                    sandbox_id,
+                    source_path,
+                    &cow_path,
+                    &source_dek,
+                    &target_key.plaintext_dek,
+                )
+                .await
+                .map_err(dmcrypt_error_to_status)?;
+            }
+            None
+        } else {
+            restore_cow_source
+        };
 
         let prepared = rootfs_dmcrypt::prepare(rootfs_dmcrypt::PrepareParams {
             sandbox_id,
@@ -152,7 +199,7 @@ impl NodeManagerService {
             // The COW is sized from the measured origin device; there is no
             // caller-supplied size to cross-check.
             rootfs_size_bytes: 0,
-            dek: &plaintext_dek,
+            dek: &target_key.plaintext_dek,
         })
         .await;
         let prepared = record_outcome(&metric, prepared)?;
@@ -560,6 +607,20 @@ async fn fetch_sandbox_volume_dek(
     sandbox_id: &SandboxId,
     expected_org: Option<OrgId>,
 ) -> Result<Zeroizing<Vec<u8>>, Status> {
+    Ok(fetch_sandbox_volume_key(sandbox_id, expected_org)
+        .await?
+        .plaintext_dek)
+}
+
+struct VolumeKey {
+    plaintext_dek: Zeroizing<Vec<u8>>,
+    org_id: Option<OrgId>,
+}
+
+async fn fetch_sandbox_volume_key(
+    sandbox_id: &SandboxId,
+    expected_org: Option<OrgId>,
+) -> Result<VolumeKey, Status> {
     use pplx_space_metrics::byok;
 
     byok::dek_fetch_attempted();
@@ -587,7 +648,16 @@ async fn fetch_sandbox_volume_dek(
         })?
         .into_inner();
     byok::dek_fetch_duration(started);
-    Ok(Zeroizing::new(std::mem::take(&mut resp.plaintext_dek)))
+    let org_id = (!resp.org_id.is_empty())
+        .then(|| resp.org_id.parse::<OrgId>())
+        .transpose()
+        .map_err(|_| {
+            Status::failed_precondition("credential authority returned invalid target organization")
+        })?;
+    Ok(VolumeKey {
+        plaintext_dek: Zeroizing::new(std::mem::take(&mut resp.plaintext_dek)),
+        org_id,
+    })
 }
 
 fn credmgr_status_with_context(status: Status) -> Status {

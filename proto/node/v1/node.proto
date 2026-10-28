@@ -1231,6 +1231,13 @@ message PrepareEncryptedRootfsRequest {
   // fresh create and on a same-node restore (the COW was kept in place).
   optional string restore_cow_source = 2;
   ExecutionFence execution_fence = 3;
+  // Disk-only restore-as-new: authenticate both key owners in the same org and
+  // re-encrypt the staged COW under the target sandbox's independent key.
+  EncryptedRootfsForkSource fork_source = 4;
+}
+
+message EncryptedRootfsForkSource {
+  string sandbox_id = 1;
 }
 
 message PrepareEncryptedRootfsResponse {
