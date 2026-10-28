@@ -347,30 +347,33 @@ pub(super) async fn consume_activation_completion_receipts(
     if claims.is_empty() {
         return Ok(Vec::new());
     }
+    let ids: Vec<_> = claims.iter().map(|claim| claim.sandbox_id).collect();
+    let statuses: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.status.map(|status| status.as_str()))
+        .collect();
+    let targets: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.target_state.as_str())
+        .collect();
+    let generations: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.execution_generation.get())
+        .collect();
+    let attempts: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.activation_attempt_id.as_uuid())
+        .collect();
     sqlx::query_scalar(sql!(
         "WITH input AS (
-             SELECT sandbox_id, status, transition_receipt_id, transition_receipt_kind,
+             SELECT sandbox_id, status, $7::TEXT AS transition_receipt_kind,
                     transition_receipt_target_state, transition_receipt_execution_generation,
-                    transition_receipt_reason_code, transition_receipt_recovery_policy,
-                    transition_receipt_activation_attempt_id, failure_reason,
-                    current_local_artifact_id, current_local_artifact_kind,
-                    current_local_artifact_origin, execution_generation, pod_uid
-               FROM jsonb_to_recordset($2::jsonb) AS published(
-                   sandbox_id UUID,
-                   status TEXT,
-                   transition_receipt_id UUID,
-                   transition_receipt_kind TEXT,
-                   transition_receipt_target_state TEXT,
-                   transition_receipt_execution_generation BIGINT,
-                   transition_receipt_reason_code TEXT,
-                   transition_receipt_recovery_policy TEXT,
-                   transition_receipt_activation_attempt_id UUID,
-                   failure_reason TEXT,
-                   current_local_artifact_id UUID,
-                   current_local_artifact_kind TEXT,
-                   current_local_artifact_origin TEXT,
-                   execution_generation BIGINT,
-                   pod_uid TEXT
+                    transition_receipt_activation_attempt_id
+               FROM UNNEST($2::UUID[], $3::TEXT[], $4::TEXT[], $5::BIGINT[], $6::UUID[])
+                 AS published(
+                   sandbox_id, status, transition_receipt_target_state,
+                   transition_receipt_execution_generation,
+                   transition_receipt_activation_attempt_id
                )
          ), released AS (
              UPDATE sandbox_k8s_executions execution
@@ -387,7 +390,7 @@ pub(super) async fn consume_activation_completion_receipts(
                 AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
                 AND execution.route_activation_id IS NOT NULL
                 AND execution.activation_attempt_target_state = input.transition_receipt_target_state
-                AND input.transition_receipt_kind = $3
+                AND input.transition_receipt_kind = $7
                 AND LOWER(TRIM(input.status)) = input.transition_receipt_target_state
                 AND (
                     (
@@ -417,7 +420,11 @@ pub(super) async fn consume_activation_completion_receipts(
          RETURNING sandbox.id"
     ))
         .bind(node_id)
-        .bind(Json(claims))
+        .bind(ids)
+        .bind(statuses)
+        .bind(targets)
+        .bind(generations)
+        .bind(attempts)
         .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
         .fetch_all(conn)
         .await

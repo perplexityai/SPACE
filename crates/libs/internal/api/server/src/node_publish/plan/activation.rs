@@ -7,17 +7,13 @@ use pplx_space_common_core::types::{
 use crate::node_publish::validate::sandbox_observation::ValidatedSandboxObservation;
 
 /// The node's completion evidence, not a decision to release the stored attempt.
-#[derive(Debug, serde::Serialize)]
-#[serde(tag = "transition_receipt_kind", rename = "activation_completed")]
+#[derive(Debug)]
 pub(crate) struct ActivationCompletionClaim {
-    sandbox_id: SandboxId,
-    status: Option<SandboxLifecycle>,
-    #[serde(rename = "transition_receipt_target_state")]
-    target_state: SandboxTransitionTargetState,
-    #[serde(rename = "transition_receipt_execution_generation")]
-    execution_generation: ExecutionGeneration,
-    #[serde(rename = "transition_receipt_activation_attempt_id")]
-    activation_attempt_id: SandboxActivationAttemptId,
+    pub(crate) sandbox_id: SandboxId,
+    pub(crate) status: Option<SandboxLifecycle>,
+    pub(crate) target_state: SandboxTransitionTargetState,
+    pub(crate) execution_generation: ExecutionGeneration,
+    pub(crate) activation_attempt_id: SandboxActivationAttemptId,
 }
 
 impl ActivationCompletionClaim {
