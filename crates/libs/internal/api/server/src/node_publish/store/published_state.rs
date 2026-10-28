@@ -511,8 +511,7 @@ pub(crate) async fn publish_validated_sandbox_states(
         conn,
         node_id,
         &rows_json,
-        &plan.stopped,
-        &plan.failed,
+        plan,
         &mut post_commit_events,
     )
     .await?;

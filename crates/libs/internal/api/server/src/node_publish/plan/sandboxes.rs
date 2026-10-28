@@ -1,7 +1,9 @@
 use pplx_space_common_core::types::{
     SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode, SandboxTransitionReceipt,
+    SandboxTransitionReceiptKind,
 };
 
+use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
 use super::lifecycle::{FailedClaim, StoppedClaim};
 use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::node_publish::validate::{
@@ -29,6 +31,8 @@ pub(crate) struct SandboxPlan {
     pub(crate) observations: Vec<ObservedClaim>,
     pub(crate) stopped: Vec<StoppedClaim>,
     pub(crate) failed: Vec<FailedClaim>,
+    pub(crate) activation_completions: Vec<ActivationCompletionClaim>,
+    pub(crate) activation_rollbacks: Vec<ActivationRollbackClaim>,
     pub(crate) state_only: Vec<DegradedSandboxClaim>,
     pub(crate) failure_episodes: Vec<FailureEpisodeClaim>,
     pub(crate) snapshots: Vec<SnapshotClaim>,
@@ -44,6 +48,8 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             observations: Vec::with_capacity(inventory.observations.len()),
             stopped: Vec::new(),
             failed: Vec::new(),
+            activation_completions: Vec::new(),
+            activation_rollbacks: Vec::new(),
             state_only: inventory.state_only.into_iter().map(Into::into).collect(),
             failure_episodes: inventory.failure_episodes,
             snapshots: Vec::new(),
@@ -52,6 +58,19 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             publishes_network_policy: false,
         };
         for claim in inventory.observations {
+            if let Some(receipt) = claim.receipt.as_ref() {
+                match receipt.kind() {
+                    SandboxTransitionReceiptKind::ActivationCompleted => {
+                        plan.activation_completions
+                            .extend(ActivationCompletionClaim::new(&claim.observation, receipt));
+                    }
+                    SandboxTransitionReceiptKind::ActivationRollback => {
+                        plan.activation_rollbacks
+                            .extend(ActivationRollbackClaim::new(&claim.observation, receipt));
+                    }
+                    SandboxTransitionReceiptKind::QuarantineRecovery => {}
+                }
+            }
             match claim.observation.reported_lifecycle() {
                 Some(SandboxLifecycle::Stopped) => plan.stopped.push(StoppedClaim {
                     sandbox_id: claim.observation.sandbox_id(),

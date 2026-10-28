@@ -4,6 +4,8 @@ use pplx_space_common_core::types::NodeId;
 
 use std::sync::LazyLock;
 
+use crate::node_publish::plan::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
+
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, PodUid,
@@ -334,11 +336,15 @@ pub(super) async fn get_quarantine_recovery_plan(
 /// target lifecycle is not projected onto the sandbox.
 /// Route-less legacy residents retain ownership until post-ack route publication:
 /// clearing it earlier would make that publication CAS permanently lose its fence.
+/// Matching writes lock execution then sandbox rows; no match is an empty result.
 pub(super) async fn consume_activation_completion_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[ActivationCompletionClaim],
 ) -> Result<Vec<SandboxId>, ConsumeActivationReceiptsError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     sqlx::query_scalar(sql!(
         "WITH input AS (
              SELECT sandbox_id, status, transition_receipt_id, transition_receipt_kind,
@@ -409,7 +415,7 @@ pub(super) async fn consume_activation_completion_receipts(
          RETURNING sandbox.id"
     ))
         .bind(node_id)
-        .bind(rows_json)
+        .bind(Json(claims))
         .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
         .fetch_all(conn)
         .await
@@ -419,12 +425,15 @@ pub(super) async fn consume_activation_completion_receipts(
 /// Lock only rollback receipts that still own the active central execution.
 /// Both execution and activation-attempt identities must match. Execution
 /// generations are deliberately reused by retries, so generation alone is not
-/// a freshness fence.
+/// a freshness fence. An empty result means no receipt passed the guards.
 pub(super) async fn select_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[ActivationRollbackClaim],
 ) -> Result<Vec<ActivationRollbackCandidate>, SelectActivationRollbacksError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     type CandidateRow = (
         SandboxId,
         SandboxCleanupEpisodeId,
@@ -478,7 +487,7 @@ pub(super) async fn select_activation_rollback_candidates(
           FOR UPDATE OF s, execution"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(claims))
     .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
     .fetch_all(&mut *conn)
     .await

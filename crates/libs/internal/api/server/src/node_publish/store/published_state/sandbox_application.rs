@@ -5,7 +5,7 @@ use super::{
     emit_lifecycle_convergence_events, emit_node_published_state_events, lifecycle_transitions,
     project_node_published_suspended_sandboxes, quarantine_claims, quarantine_persistence,
 };
-use crate::node_publish::plan::lifecycle::{FailedClaim, StoppedClaim};
+use crate::node_publish::plan::sandboxes::SandboxPlan;
 use crate::sandbox_quarantine_store;
 
 /// Preserve lifecycle statement and event order on the publication connection.
@@ -14,8 +14,7 @@ pub(super) async fn converge_lifecycles(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows_json: &Json<serde_json::Value>,
-    stopped: &[StoppedClaim],
-    failed: &[FailedClaim],
+    plan: &SandboxPlan,
     post_commit_events: &mut Vec<PostCommitSandboxEvent>,
 ) -> Result<(), ApplySandboxClaimsError> {
     let restored_ids = lifecycle_transitions::converge_restored(conn, node_id, rows_json).await?;
@@ -27,11 +26,18 @@ pub(super) async fn converge_lifecycles(
         "started",
     );
 
-    sandbox_quarantine_store::consume_activation_completion_receipts(conn, node_id, rows_json)
-        .await?;
-    let rollback_candidates =
-        sandbox_quarantine_store::select_activation_rollback_candidates(conn, node_id, rows_json)
-            .await?;
+    sandbox_quarantine_store::consume_activation_completion_receipts(
+        conn,
+        node_id,
+        &plan.activation_completions,
+    )
+    .await?;
+    let rollback_candidates = sandbox_quarantine_store::select_activation_rollback_candidates(
+        conn,
+        node_id,
+        &plan.activation_rollbacks,
+    )
+    .await?;
     let applied_rollbacks = sandbox_quarantine_store::apply_activation_rollback_candidates(
         conn,
         node_id,
@@ -80,7 +86,7 @@ pub(super) async fn converge_lifecycles(
         },
     ));
 
-    let stopped_ids = lifecycle_transitions::converge_stopped(conn, node_id, stopped).await?;
+    let stopped_ids = lifecycle_transitions::converge_stopped(conn, node_id, &plan.stopped).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &stopped_ids,
@@ -88,7 +94,8 @@ pub(super) async fn converge_lifecycles(
         None,
         "stopped",
     );
-    let failed_sandboxes = lifecycle_transitions::converge_failed(conn, node_id, failed).await?;
+    let failed_sandboxes =
+        lifecycle_transitions::converge_failed(conn, node_id, &plan.failed).await?;
     emit_node_published_state_events(
         node_id,
         &failed_sandboxes,

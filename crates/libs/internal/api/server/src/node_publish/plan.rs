@@ -16,6 +16,7 @@ use super::validate::{
 };
 use sandboxes::SandboxPlan;
 
+pub(crate) mod activation;
 pub(crate) mod lifecycle;
 pub(crate) mod sandboxes;
 

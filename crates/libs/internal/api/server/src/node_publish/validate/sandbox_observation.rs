@@ -80,6 +80,10 @@ impl ValidatedSandboxObservation {
         self.sandbox_id
     }
 
+    pub(crate) fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
+    }
+
     pub(crate) fn reported_lifecycle(&self) -> Option<SandboxLifecycle> {
         self.status
             .as_ref()

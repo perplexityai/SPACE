@@ -3539,6 +3539,8 @@ async fn activation_rollback_receipts_converge_stable_targets_with_attempt_fence
     };
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
+    let healthy_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, healthy_id, node_id, "started").await?;
 
     for (target, central_lifecycle, reason_code) in [
         (
@@ -3595,9 +3597,17 @@ async fn activation_rollback_receipts_converge_stable_targets_with_attempt_fence
             reason_code,
         );
         let mut conn = db.pool.acquire().await?;
-        let outcome =
-            publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&receipt)).await?;
+        let outcome = publish_sandbox_states(
+            &mut conn,
+            node_id,
+            &[
+                published_sandbox_state(healthy_id, "started"),
+                receipt.clone(),
+            ],
+        )
+        .await?;
         assert_eq!(outcome.post_commit_events.len(), 1);
+        assert_eq!(sandbox_lifecycle(&db.pool, healthy_id).await?, "started");
         assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, target);
         let (placement, active_node_id, target_node_id) =
             sqlx::query_as::<_, (String, Option<NodeId>, Option<NodeId>)>(
@@ -3989,6 +3999,8 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     let sandbox_id = SandboxId::new();
     let attempt_a = Uuid::now_v7();
     insert_ready_worker_node(&db.pool, node_id).await?;
+    let healthy_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, healthy_id, node_id, "started").await?;
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "stopped").await?;
     insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", None).await?;
     sqlx::query(
@@ -4008,7 +4020,16 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     receipt.transition_receipt.as_mut().unwrap().reason_code =
         "diagnostic_added_by_newer_worker".to_string();
     let mut conn = db.pool.acquire().await?;
-    publish_sandbox_states(&mut conn, node_id, &[receipt.clone()]).await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[
+            published_sandbox_state(healthy_id, "started"),
+            receipt.clone(),
+        ],
+    )
+    .await?;
+    assert_eq!(sandbox_lifecycle(&db.pool, healthy_id).await?, "started");
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopped");
     let still_owned = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT activation_attempt_id
@@ -4060,7 +4081,16 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     .bind(attempt_a)
     .execute(&db.pool)
     .await?;
-    publish_sandbox_states(&mut conn, node_id, &[receipt.clone()]).await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[
+            published_sandbox_state(healthy_id, "started"),
+            receipt.clone(),
+        ],
+    )
+    .await?;
+    assert_eq!(sandbox_lifecycle(&db.pool, healthy_id).await?, "started");
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "started");
     let released = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT activation_attempt_id
