@@ -4,6 +4,11 @@ fn main() -> anyhow::Result<()> {
     let out_dir = std::env::var("OUT_DIR")?;
     let descriptor_path = std::path::Path::new(&out_dir).join("sandbox_manager_descriptor.bin");
 
+    pplx_space_common_proto_build::compile_protos(
+        tonic_prost_build::configure(),
+        &[proto_root.join("node/api/v1/artifact.proto")],
+        std::slice::from_ref(&proto_root),
+    )?;
     let mgr_dir = proto_root.join("sandbox/manager/v1");
     let mgr_file = mgr_dir.join("manager.proto");
     let proto_dirs = [
@@ -12,6 +17,10 @@ fn main() -> anyhow::Result<()> {
         pplx_space_spaced_build::protobuf_include_dir()?,
     ];
     let builder = tonic_prost_build::configure()
+        .extern_path(
+            ".space.node.api.v1.SnapshotArtifactDigest",
+            "crate::artifact_proto::SnapshotArtifactDigest",
+        )
         .extern_path(
             ".space.spaced.operations.v1",
             "::pplx_space_spaced_common::proto::operations",

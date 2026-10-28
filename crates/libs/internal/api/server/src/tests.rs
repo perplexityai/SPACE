@@ -7338,18 +7338,15 @@ async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult
 }
 
 fn test_artifact_digests() -> Vec<crate::proto::SnapshotArtifactDigest> {
-    vec![
-        crate::proto::SnapshotArtifactDigest {
-            artifact: "memfile".to_string(),
-            digest: format!("sha256:{}", "22".repeat(32)),
-            size_bytes: 1 << 30,
-        },
-        crate::proto::SnapshotArtifactDigest {
-            artifact: "binfile".to_string(),
-            digest: format!("sha256:{}", "11".repeat(32)),
+    ["memfile", "binfile", "rootfs", "metadata.json"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, artifact)| crate::proto::SnapshotArtifactDigest {
+            artifact: artifact.into(),
+            digest: format!("sha256:{}", format!("{index:02x}").repeat(32)),
             size_bytes: 4096,
-        },
-    ]
+        })
+        .collect()
 }
 
 async fn finalize_ready_with_digests(
@@ -7379,34 +7376,43 @@ async fn finalize_to_ready_publishes_artifact_digests_to_restore_lookups() -> Te
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
-    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
-    let local_artifact_id = LocalArtifactId::new();
-    let backup_attempt_id = SnapshotId::new();
-    begin_artifact_backup(
-        &fixture.service,
-        sandbox_id,
-        local_artifact_id,
-        backup_attempt_id,
-        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
-        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
-    )
-    .await?;
-    finalize_ready_with_digests(&fixture.service, backup_attempt_id, test_artifact_digests())
+    let encrypted = ["snapshot.luks", "cow.luks", "metadata.json"]
+        .into_iter()
+        .map(|artifact| crate::proto::SnapshotArtifactDigest {
+            artifact: artifact.into(),
+            digest: format!("sha256:{}", "12".repeat(32)),
+            size_bytes: 4096,
+        })
+        .collect();
+    for digests in [test_artifact_digests(), encrypted] {
+        let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+        let local_artifact_id = LocalArtifactId::new();
+        let backup_attempt_id = SnapshotId::new();
+        begin_artifact_backup(
+            &fixture.service,
+            sandbox_id,
+            local_artifact_id,
+            backup_attempt_id,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+        )
         .await?;
+        finalize_ready_with_digests(&fixture.service, backup_attempt_id, digests.clone()).await?;
 
-    let mut expected = test_artifact_digests();
-    expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
-    let artifact = get_artifact_location(
-        &fixture.service,
-        sandbox_id,
-        local_artifact_id,
-        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
-    )
-    .await?;
-    assert_eq!(artifact.artifact_digests, expected);
-    let suspend = get_location(&fixture.service, sandbox_id).await?;
-    assert_eq!(suspend.snapshot_id, backup_attempt_id.to_string());
-    assert_eq!(suspend.artifact_digests, expected);
+        let mut expected = digests;
+        expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+        let artifact = get_artifact_location(
+            &fixture.service,
+            sandbox_id,
+            local_artifact_id,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        )
+        .await?;
+        assert_eq!(artifact.artifact_digests, expected);
+        let suspend = get_location(&fixture.service, sandbox_id).await?;
+        assert_eq!(suspend.snapshot_id, backup_attempt_id.to_string());
+        assert_eq!(suspend.artifact_digests, expected);
+    }
     Ok(())
 }
 
@@ -7436,7 +7442,15 @@ async fn finalize_rejects_malformed_artifact_digests() -> TestResult {
     malformed_digest[0].digest = "sha256:not-hex".to_string();
     let mut duplicate_artifact = good.clone();
     duplicate_artifact[1].artifact = "memfile".to_string();
-    for artifact_digests in [unknown_artifact, malformed_digest, duplicate_artifact] {
+    let missing_disk_and_metadata = good[..2].to_vec();
+    let disk_for_full_snapshot = good[2..].to_vec();
+    for artifact_digests in [
+        unknown_artifact,
+        malformed_digest,
+        duplicate_artifact,
+        missing_disk_and_metadata,
+        disk_for_full_snapshot,
+    ] {
         let err =
             finalize_ready_with_digests(&fixture.service, backup_attempt_id, artifact_digests)
                 .await

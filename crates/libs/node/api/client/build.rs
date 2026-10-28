@@ -13,6 +13,10 @@ fn main() -> anyhow::Result<()> {
 
     let builder = tonic_prost_build::configure()
         .extern_path(
+            ".space.node.api.v1.SnapshotArtifactDigest",
+            "::pplx_space_sbx_mgr_client::proto::SnapshotArtifactDigest",
+        )
+        .extern_path(
             ".space.sandbox.manager.v1",
             "::pplx_space_sbx_mgr_client::proto",
         )

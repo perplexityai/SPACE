@@ -26,6 +26,7 @@ async fn durable_copy_refusal_can_be_replayed_with_the_same_identity() -> TestRe
             ScriptedReply::Status(refused),
             ScriptedReply::message(&sbx::CreateSnapshotResponse {
                 published_durable_artifact: Some(sbx::PublishedDurableArtifact {
+                    artifact_digests: Vec::new(),
                     storage_uri: destination.to_string(),
                     bytes_published: 42,
                 }),
@@ -55,9 +56,13 @@ async fn durable_copy_refusal_can_be_replayed_with_the_same_identity() -> TestRe
             &target,
             operation_id,
             source,
-            child,
-            "s3://snapshots/source".to_string(),
-            destination.to_string(),
+            sbx::DurableArtifactSnapshotSource {
+                source_storage_uri: "s3://snapshots/source".into(),
+                destination_storage_uri: destination.into(),
+                destination_sandbox_id: child.to_string(),
+                destination_origin: sbx::ArtifactOrigin::Fork as i32,
+                source_artifact_digests: Vec::new(),
+            },
         )
     };
 

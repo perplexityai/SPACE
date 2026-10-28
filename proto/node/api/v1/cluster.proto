@@ -5,6 +5,7 @@ import "execution/v1/execution.proto";
 import "google/protobuf/timestamp.proto";
 
 import "node/api/v1/common.proto";
+import "node/api/v1/artifact.proto";
 import "net/policy/v1/policy.proto";
 import "sandbox/manager/v1/manager.proto";
 import "template/manager/v1/manager.proto";
@@ -1152,21 +1153,6 @@ message FinalizeArtifactBackupRequest {
   // Digests of the artifacts this attempt uploaded. Recorded only for READY
   // and write-once: a replay must repeat the same digests.
   repeated SnapshotArtifactDigest artifact_digests = 5;
-}
-
-// Content digest of one artifact file in a backup attempt, reported by the
-// uploading node and handed back to restore so the bytes it pulls are
-// verified against the catalog rather than trusted from the object store.
-message SnapshotArtifactDigest {
-  // Canonical file name under the attempt prefix: `memfile`, `binfile`,
-  // `rootfs`, `rootfs.btrfs-send`, `snapshot.luks`, `cow.luks`, or
-  // `metadata.json`.
-  string artifact = 1;
-  // `sha256:<64 lowercase hex>` over the artifact bytes as they exist on the
-  // node, before any transfer compression or encryption.
-  string digest = 2;
-  // Size in bytes of the same bytes the digest covers.
-  uint64 size_bytes = 3;
 }
 
 message FinalizeArtifactBackupResponse {}

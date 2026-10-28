@@ -1,0 +1,18 @@
+syntax = "proto3";
+package space.node.api.v1;
+
+// Content digest of one artifact file in a backup attempt, reported by the
+// uploading node and handed back to restore so the bytes it pulls are
+// verified against the catalog rather than trusted from the object store.
+message SnapshotArtifactDigest {
+  // Canonical file name under the attempt prefix: `memfile`, `binfile`,
+  // `rootfs`, `rootfs.btrfs-send`, `snapshot.luks`, `cow.luks`, or
+  // `metadata.json`.
+  string artifact = 1;
+  // `sha256:<64 lowercase hex>` over the artifact bytes as they exist on the
+  // node, before any transfer compression or encryption.
+  string digest = 2;
+  // Size in bytes of the same bytes the digest covers.
+  uint64 size_bytes = 3;
+}
+

@@ -799,6 +799,21 @@ impl ForkSandboxOperationExecutor {
             .ok_or_else(|| {
                 ForkExecutionError::failed_precondition("frozen source artifact disappeared")
             })?;
+        let source_artifact_digests: Vec<_> =
+            pplx_space_snapshot_store::artifact_digests(self.store.pool(), source_snapshot_id)
+                .await
+                .map_err(crate::fork_operation_store::ForkOperationStoreError::from)?
+                .into_iter()
+                .map(
+                    |entry| pplx_space_sbx_mgr_client::proto::SnapshotArtifactDigest {
+                        artifact: entry.artifact.file_name().into(),
+                        digest: entry.digest.to_string(),
+                        size_bytes: entry.size_bytes,
+                    },
+                )
+                .collect();
+        pplx_space_sbx_mgr_client::artifact_integrity::parse_copy_source(&source_artifact_digests)
+            .map_err(|e| ForkExecutionError::failed_precondition(e.to_string()))?;
         let fork_snapshot_id =
             SnapshotId::from_uuid(deterministic_fork_uuid(operation.id.as_uuid(), b"snapshot"));
         let fork_location_id = deterministic_fork_uuid(operation.id.as_uuid(), b"location");
@@ -878,9 +893,14 @@ impl ForkSandboxOperationExecutor {
                         &target.as_target(),
                         operation.id,
                         payload.source_sandbox_id(),
-                        target_sandbox_id,
-                        source_storage_uri,
-                        destination_storage_uri.clone(),
+                        pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource {
+                            source_storage_uri,
+                            destination_storage_uri: destination_storage_uri.clone(),
+                            destination_sandbox_id: target_sandbox_id.to_string(),
+                            destination_origin:
+                                pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32,
+                            source_artifact_digests: source_artifact_digests.clone(),
+                        },
                     ),
                 ),
             )
@@ -908,12 +928,23 @@ impl ForkSandboxOperationExecutor {
                 "node returned a different fork artifact destination",
             ));
         }
+        let digests =
+            match copied_artifact_manifest(&source_artifact_digests, &published.artifact_digests) {
+                Ok(digests) => digests,
+                Err(error) => {
+                    self.store
+                        .retire_copied_artifact(fork_snapshot_id, fork_location_id)
+                        .await?;
+                    return Err(error);
+                }
+            };
         if !self
             .store
             .mark_copied_artifact_ready(
                 fork_snapshot_id,
                 initial_owner_sandbox_id,
                 published.bytes_published,
+                &digests,
             )
             .await?
         {
@@ -1817,6 +1848,17 @@ enum ForkExecutionError {
 impl From<crate::fork_operation_store::ForkOperationStoreError> for ForkExecutionError {
     fn from(error: crate::fork_operation_store::ForkOperationStoreError) -> Self {
         match error {
+            crate::fork_operation_store::ForkOperationStoreError::ReadDigests(
+                pplx_space_snapshot_store::GetArtifactDigestsError::Database(_),
+            )
+            | crate::fork_operation_store::ForkOperationStoreError::RecordDigests(
+                pplx_space_snapshot_store::RecordArtifactDigestsError::Database(_),
+            ) => Self::Retry(error.to_string()),
+            crate::fork_operation_store::ForkOperationStoreError::ReadDigests(_)
+            | crate::fork_operation_store::ForkOperationStoreError::RecordDigests(_)
+            | crate::fork_operation_store::ForkOperationStoreError::LegacyReplay => {
+                Self::failed_precondition(error.to_string())
+            }
             crate::fork_operation_store::ForkOperationStoreError::InvalidCaptureWorkflow
             | crate::fork_operation_store::ForkOperationStoreError::InvalidLeaderState(_) => {
                 Self::terminal(error.to_string())
@@ -1866,6 +1908,46 @@ impl ForkExecutionError {
     fn retry_error(error: impl std::fmt::Display) -> Self {
         Self::Retry(error.to_string())
     }
+}
+
+fn copied_artifact_manifest(
+    source: &[pplx_space_sbx_mgr_client::proto::SnapshotArtifactDigest],
+    output: &[pplx_space_sbx_mgr_client::proto::SnapshotArtifactDigest],
+) -> Result<Vec<pplx_space_snapshot_store::SnapshotArtifactDigest>, ForkExecutionError> {
+    use pplx_space_common_core::types::SnapshotArtifact;
+    use pplx_space_sbx_mgr_client::artifact_integrity::{parse_copied_disk, parse_copy_source};
+    let source = parse_copy_source(source)
+        .map_err(|e| ForkExecutionError::failed_precondition(e.to_string()))?;
+    let output = parse_copied_disk(output)
+        .map_err(|e| ForkExecutionError::failed_precondition(e.to_string()))?;
+    // Only legacy sources may produce legacy copies. A worker predating
+    // verification must not downgrade an authenticated source during rollout.
+    if !source.is_empty() && output.is_empty() {
+        return Err(ForkExecutionError::Retry(
+            "copy worker did not return the authenticated manifest; retry after worker upgrade"
+                .into(),
+        ));
+    }
+    if !output.is_empty()
+        && (source.is_empty()
+            || output.iter().any(|(artifact, identity)| {
+                *artifact != SnapshotArtifact::Metadata && source.get(artifact) != Some(identity)
+            }))
+    {
+        return Err(ForkExecutionError::failed_precondition(
+            "fork disk identity differs from its trusted source",
+        ));
+    }
+    Ok(output
+        .into_iter()
+        .map(
+            |(artifact, (digest, size_bytes))| pplx_space_snapshot_store::SnapshotArtifactDigest {
+                artifact,
+                digest,
+                size_bytes,
+            },
+        )
+        .collect())
 }
 
 #[cfg(test)]

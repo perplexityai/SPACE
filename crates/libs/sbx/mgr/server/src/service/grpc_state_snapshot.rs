@@ -1790,6 +1790,7 @@ impl SandboxManagerService {
                 destination: &destination_storage,
                 destination_storage_uri: source.destination_storage_uri.clone(),
                 destination_origin,
+                source_artifact_digests: &source.source_artifact_digests,
             },
         )
         .await

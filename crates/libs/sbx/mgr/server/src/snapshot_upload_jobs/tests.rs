@@ -1259,3 +1259,80 @@ fn absent_volume_manager_socket() -> std::path::PathBuf {
         .join(format!("space-sbx-mgr-test-{}", uuid::Uuid::now_v7()))
         .join("absent-volume-manager.sock")
 }
+
+#[test]
+fn publication_requires_matching_receipts_and_a_complete_manifest() {
+    use pplx_space_volmgr_client::proto::{ContentIntegrity, TransferJob};
+    let id = JobId::new();
+    let good = TransferJob {
+        job_id: id.to_string(),
+        kind: "push".into(),
+        status: TransferJobStatus::Completed as i32,
+        bytes_transferred: 3,
+        integrity: Some(ContentIntegrity {
+            digest: format!("sha256:{}", "12".repeat(32)),
+            size_bytes: 3,
+        }),
+        ..Default::default()
+    };
+    // Connect the real producer selection and receipt publication to the
+    // catalog's independently owned acceptance policy, including legacy defaults.
+    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_sbx_mgr_client::artifact_integrity;
+    use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+
+    for kind in [None, Some(ArtifactKind::Disk), Some(ArtifactKind::Full)] {
+        for (format, metadata_format) in [
+            (SuspendSnapshotFormat::Unspecified, None),
+            (SuspendSnapshotFormat::Full, Some("full")),
+            (SuspendSnapshotFormat::BtrfsSend, Some("btrfs-send-v1")),
+        ] {
+            for encrypted in [false, true] {
+                let mut meta = reclaim_fixture_meta(metadata_format, kind, None, None);
+                meta.encrypted = encrypted;
+                let artifacts = upload_artifacts_for_meta(&meta);
+                let registered_kind = kind.unwrap_or(ArtifactKind::Full);
+                if !encrypted {
+                    let selected =
+                        crate::snapshot_upload::upload_artifacts_for_kind(registered_kind, format);
+                    assert_eq!(
+                        artifacts.iter().map(|a| a.kind).collect::<Vec<_>>(),
+                        selected.iter().map(|a| a.kind).collect::<Vec<_>>()
+                    );
+                }
+                let observations: Vec<_> = artifacts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        let mut job = good.clone();
+                        job.bytes_transferred = (index + 1) as u64;
+                        job.integrity = Some(ContentIntegrity {
+                            digest: format!("sha256:{}", format!("{:02x}", index + 1).repeat(32)),
+                            size_bytes: job.bytes_transferred,
+                        });
+                        completed_artifact_observation(&job, id).unwrap()
+                    })
+                    .collect();
+                let manifest = completed_artifact_manifest(&artifacts, &observations).unwrap();
+                let parsed = artifact_integrity::parse_backup(&manifest, registered_kind)
+                    .unwrap_or_else(|error| {
+                        panic!("kind={kind:?} format={format:?} encrypted={encrypted}: {error}")
+                    });
+                assert_eq!(parsed.len(), artifacts.len());
+                for (index, entry) in manifest.iter().enumerate() {
+                    assert_eq!(entry.artifact, artifacts[index].kind.file_name());
+                    assert_eq!(
+                        entry.digest,
+                        format!("sha256:{}", format!("{:02x}", index + 1).repeat(32))
+                    );
+                    assert_eq!(entry.size_bytes, (index + 1) as u64);
+                }
+                completed_artifact_manifest(&artifacts, &observations[..observations.len() - 1])
+                    .unwrap_err();
+                let mut extra = observations.clone();
+                extra.push(observations[0]);
+                completed_artifact_manifest(&artifacts, &extra).unwrap_err();
+            }
+        }
+    }
+}

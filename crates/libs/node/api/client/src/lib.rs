@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod node_status_freshness;
 
 pub mod proto {
+    pub use pplx_space_sbx_mgr_client::proto::SnapshotArtifactDigest;
     tonic::include_proto!("space.node.api.v1");
 
     pub const WORKER_FILE_DESCRIPTOR_SET: &[u8] =

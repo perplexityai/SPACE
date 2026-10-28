@@ -24,6 +24,8 @@ struct Transfers {
     disk_ready: std::sync::atomic::AtomicBool,
     published: Mutex<Option<crate::snapshot_upload::SnapshotMeta>>,
     job_id: String,
+    jobs: Mutex<std::collections::HashMap<String, TransferJob>>,
+    omit_upload_receipt: std::sync::atomic::AtomicBool,
 }
 
 impl Transfers {
@@ -48,6 +50,61 @@ impl Transfers {
         Ok(PullFileResponse {
             bytes_downloaded: bytes.len() as u64,
         })
+    }
+
+    fn submit_pull(&self, request: PullFileRequest) -> Result<SubmitTransferResponse, Status> {
+        let expected = request.expected_integrity.clone();
+        let path = request.local_path.clone();
+        self.pull(request)?;
+        let receipt = identity(&std::fs::read(path).map_err(|e| Status::internal(e.to_string()))?);
+        let matches = expected
+            .as_ref()
+            .is_none_or(|expected| expected == &receipt);
+        let job_id = JobId::new().to_string();
+        self.jobs
+            .lock()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .insert(
+                job_id.clone(),
+                TransferJob {
+                    job_id: job_id.clone(),
+                    kind: "pull".into(),
+                    status: if matches {
+                        TransferJobStatus::Completed
+                    } else {
+                        TransferJobStatus::Failed
+                    } as i32,
+                    bytes_transferred: receipt.size_bytes,
+                    integrity: (matches && expected.is_some()).then_some(receipt),
+                    error: (!matches).then(|| "source content does not match the catalog".into()),
+                    ..Default::default()
+                },
+            );
+        Ok(SubmitTransferResponse { job_id })
+    }
+
+    fn submit_push(&self, request: PushFileRequest) -> Result<SubmitTransferResponse, Status> {
+        let receipt = identity(
+            &std::fs::read(&request.local_path).map_err(|e| Status::internal(e.to_string()))?,
+        );
+        self.push(request)?;
+        let job_id = JobId::new().to_string();
+        self.jobs
+            .lock()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .insert(
+                job_id.clone(),
+                TransferJob {
+                    job_id: job_id.clone(),
+                    kind: "push".into(),
+                    status: TransferJobStatus::Completed as i32,
+                    bytes_transferred: receipt.size_bytes,
+                    integrity: (!self.omit_upload_receipt.load(Ordering::SeqCst))
+                        .then_some(receipt),
+                    ..Default::default()
+                },
+            );
+        Ok(SubmitTransferResponse { job_id })
     }
 
     fn copy(&self, request: CopyObjectRequest) -> Result<SubmitTransferResponse, Status> {
@@ -78,6 +135,15 @@ impl Transfers {
     }
 
     fn wait(&self, request: GetTransferJobRequest) -> Result<GetTransferJobResponse, Status> {
+        if let Some(job) = self
+            .jobs
+            .lock()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .get(&request.job_id)
+            .cloned()
+        {
+            return Ok(GetTransferJobResponse { job: Some(job) });
+        }
         self.calls
             .lock()
             .map_err(|error| Status::internal(error.to_string()))?
@@ -182,6 +248,8 @@ async fn peer(metadata: crate::snapshot_upload::SnapshotMeta, reply: CopyReply) 
         disk_ready: false.into(),
         published: Mutex::new(None),
         job_id: Uuid::now_v7().to_string(),
+        jobs: Mutex::new(Default::default()),
+        omit_upload_receipt: false.into(),
     });
     let handler = Arc::clone(&transfers);
     let rpc = tower::service_fn(move |request: http::Request<tonic::body::Body>| {
@@ -191,6 +259,16 @@ async fn peer(metadata: crate::snapshot_upload::SnapshotMeta, reply: CopyReply) 
             let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
             let response = match method {
                 "PullFile" => grpc.unary(Unary(move |r| handler.pull(r)), request).await,
+                "SubmitPullFile" => {
+                    tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                        .unary(Unary(move |r| handler.submit_pull(r)), request)
+                        .await
+                }
+                "SubmitPushFile" => {
+                    tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                        .unary(Unary(move |r| handler.submit_push(r)), request)
+                        .await
+                }
                 "PushFile" => {
                     tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
                         .unary(Unary(move |r| handler.push(r)), request)
@@ -235,6 +313,15 @@ async fn run(
     source: SandboxId,
     destination: SandboxId,
 ) -> Result<crate::proto::CreateSnapshotResponse, Status> {
+    run_with_manifest(peer, source, destination, &[]).await
+}
+
+async fn run_with_manifest(
+    peer: &mut Peer,
+    source: SandboxId,
+    destination: SandboxId,
+    manifest: &[crate::proto::SnapshotArtifactDigest],
+) -> Result<crate::proto::CreateSnapshotResponse, Status> {
     let source_config = crate::snapshot_upload::SnapshotUploadConfig::from_uri(
         "s3://example-artifacts/snapshot?region=us-east-1",
     )
@@ -260,6 +347,7 @@ async fn run(
             destination_storage_uri:
                 "s3://example-artifacts/snapshot/fork/operation?region=us-east-1".into(),
             destination_origin: ArtifactOrigin::Fork,
+            source_artifact_digests: manifest,
         },
         staging.path(),
         move || {
@@ -325,7 +413,17 @@ async fn legacy_and_unsupported_copies_keep_the_existing_disk_transfer() {
         metadata.rootfs_diff_format =
             Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.into());
         let mut peer = peer(metadata, reply).await;
-        run(&mut peer, source, SandboxId::new()).await.unwrap();
+        peer.transfers
+            .omit_upload_receipt
+            .store(true, Ordering::SeqCst);
+        let response = run(&mut peer, source, SandboxId::new()).await.unwrap();
+        assert!(
+            response
+                .published_durable_artifact
+                .unwrap()
+                .artifact_digests
+                .is_empty()
+        );
         let calls = peer.transfers.calls.lock().unwrap();
         assert_eq!(
             calls.iter().filter(|call| *call == "copy").count(),
@@ -392,5 +490,130 @@ async fn invalid_sources_and_interrupted_copy_waits_cannot_publish_metadata() {
         let calls = peer.transfers.calls.lock().unwrap();
         assert_eq!(*calls, ["pull:metadata.json", "copy", "wait"]);
         assert!(peer.transfers.published.lock().unwrap().is_none());
+    }
+}
+
+fn identity(bytes: &[u8]) -> pplx_space_volmgr_client::proto::ContentIntegrity {
+    let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+    let mut digest = [0; 32];
+    digest.copy_from_slice(hash.as_ref());
+    pplx_space_volmgr_client::proto::ContentIntegrity {
+        digest: pplx_space_common_core::types::Digest::sha256(digest).to_string(),
+        size_bytes: bytes.len() as u64,
+    }
+}
+
+fn source_manifest(
+    metadata: &crate::snapshot_upload::SnapshotMeta,
+) -> Vec<crate::proto::SnapshotArtifactDigest> {
+    crate::snapshot_upload::upload_artifacts_for_meta(metadata)
+        .into_iter()
+        .map(|artifact| {
+            let identity = match artifact.kind {
+                SnapshotArtifact::Metadata => identity(&serde_json::to_vec(metadata).unwrap()),
+                SnapshotArtifact::Rootfs | SnapshotArtifact::RootfsBtrfsSend => identity(b"disk"),
+                _ => identity(b"unused"),
+            };
+            crate::proto::SnapshotArtifactDigest {
+                artifact: artifact.kind.file_name().into(),
+                digest: identity.digest,
+                size_bytes: identity.size_bytes,
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn authenticated_copies_preserve_disk_identity_and_publish_metadata_receipts() {
+    for reply in [
+        CopyReply::Complete,
+        CopyReply::Unsupported,
+        CopyReply::Failed,
+    ] {
+        let source = SandboxId::new();
+        let mut metadata = suspended_metadata(source);
+        metadata.rootfs_size_bytes = Some(4);
+        metadata.rootfs_diff_format =
+            Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.into());
+        let manifest = source_manifest(&metadata);
+        let mut peer = peer(metadata, reply).await;
+        let target = SandboxId::new();
+        // Retry uses the same trusted source and yields the same manifest.
+        let first = run_with_manifest(&mut peer, source, target, &manifest)
+            .await
+            .unwrap();
+        let second = run_with_manifest(&mut peer, source, target, &manifest)
+            .await
+            .unwrap();
+        let output = first.published_durable_artifact.unwrap().artifact_digests;
+        assert_eq!(
+            second.published_durable_artifact.unwrap().artifact_digests,
+            output
+        );
+        assert_eq!(output.len(), 2);
+        assert_eq!(
+            output[0],
+            *manifest
+                .iter()
+                .find(|entry| entry.artifact == "rootfs.btrfs-send")
+                .unwrap()
+        );
+        let uploaded = peer.transfers.published.lock().unwrap();
+        let receipt = identity(&serde_json::to_vec_pretty(uploaded.as_ref().unwrap()).unwrap());
+        assert_eq!(output[1].digest, receipt.digest);
+        assert_eq!(output[1].size_bytes, receipt.size_bytes);
+        assert_ne!(
+            output[1].digest,
+            manifest
+                .iter()
+                .find(|entry| entry.artifact == "metadata.json")
+                .unwrap()
+                .digest
+        );
+    }
+}
+
+#[tokio::test]
+async fn authenticated_source_failures_never_fall_back_to_legacy_publication() {
+    for problem in ["metadata", "rootfs", "partial", "missing_upload_receipt"] {
+        let source = SandboxId::new();
+        let mut metadata = suspended_metadata(source);
+        metadata.rootfs_size_bytes = Some(4);
+        metadata.rootfs_diff_format =
+            Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.into());
+        let mut manifest = source_manifest(&metadata);
+        if problem == "partial" {
+            manifest.pop();
+        }
+        if matches!(problem, "metadata" | "rootfs") {
+            let name = if problem == "metadata" {
+                "metadata.json"
+            } else {
+                "rootfs.btrfs-send"
+            };
+            manifest
+                .iter_mut()
+                .find(|entry| entry.artifact == name)
+                .unwrap()
+                .digest = identity(b"other").digest;
+        }
+        let mut peer = peer(metadata, CopyReply::Unsupported).await;
+        peer.transfers
+            .omit_upload_receipt
+            .store(problem == "missing_upload_receipt", Ordering::SeqCst);
+        let error = run_with_manifest(&mut peer, source, SandboxId::new(), &manifest)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            if problem == "missing_upload_receipt" {
+                tonic::Code::Unavailable
+            } else {
+                tonic::Code::FailedPrecondition
+            }
+        );
+        if problem != "missing_upload_receipt" {
+            assert!(peer.transfers.published.lock().unwrap().is_none());
+        }
     }
 }

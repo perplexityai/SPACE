@@ -547,6 +547,7 @@ impl OwnedNodeApiTarget {
 pub struct PublishedDurableSnapshot {
     pub storage_uri: String,
     pub bytes_published: u64,
+    pub artifact_digests: Vec<pplx_space_sbx_mgr_client::proto::SnapshotArtifactDigest>,
 }
 
 /// Substrate-synthesized inventory row. The direct substrate never produces
@@ -1353,9 +1354,7 @@ pub trait SubstrateAdapter: Send + Sync {
         target: &NodeApiTarget<'_>,
         operation_id: OperationId,
         source_sandbox_id: SandboxId,
-        target_sandbox_id: SandboxId,
-        source_storage_uri: String,
-        destination_storage_uri: String,
+        source: pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource,
     ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
         let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
         let mut node_api = retrying_worker_node_api(&endpoint_addr, Duration::from_secs(30))?;
@@ -1374,12 +1373,7 @@ pub trait SubstrateAdapter: Send + Sync {
                     source: Some(pplx_space_sbx_mgr_client::proto::CreateSnapshotSource {
                         source: Some(
                             pplx_space_sbx_mgr_client::proto::create_snapshot_source::Source::DurableArtifact(
-                                pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource {
-                                    source_storage_uri,
-                                    destination_storage_uri,
-                                    destination_sandbox_id: target_sandbox_id.to_string(),
-                                    destination_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32,
-                                },
+                                source,
                             ),
                         ),
                     }),
@@ -1398,6 +1392,7 @@ pub trait SubstrateAdapter: Send + Sync {
         Ok(PublishedDurableSnapshot {
             storage_uri: published.storage_uri,
             bytes_published: published.bytes_published,
+            artifact_digests: published.artifact_digests,
         })
     }
 
@@ -2702,9 +2697,7 @@ impl SubstrateAdapter for Substrate {
         target: &NodeApiTarget<'_>,
         operation_id: OperationId,
         source_sandbox_id: SandboxId,
-        target_sandbox_id: SandboxId,
-        source_storage_uri: String,
-        destination_storage_uri: String,
+        source: pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource,
     ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
         match &self.inner {
             Inner::Direct(substrate) => {
@@ -2713,9 +2706,7 @@ impl SubstrateAdapter for Substrate {
                     target,
                     operation_id,
                     source_sandbox_id,
-                    target_sandbox_id,
-                    source_storage_uri,
-                    destination_storage_uri,
+                    source,
                 )
                 .await
             }
@@ -2726,9 +2717,7 @@ impl SubstrateAdapter for Substrate {
                     target,
                     operation_id,
                     source_sandbox_id,
-                    target_sandbox_id,
-                    source_storage_uri,
-                    destination_storage_uri,
+                    source,
                 )
                 .await
             }
