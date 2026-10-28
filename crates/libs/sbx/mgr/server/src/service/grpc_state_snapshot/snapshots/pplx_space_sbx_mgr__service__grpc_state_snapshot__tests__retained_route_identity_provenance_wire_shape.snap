@@ -61,4 +61,6 @@ SandboxInfo {
         Suspended,
     ),
     current_local_artifact_created_at: None,
+    actual_vcpu: None,
+    actual_memory_mib: None,
 }

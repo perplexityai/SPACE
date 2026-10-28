@@ -267,6 +267,8 @@ fn sim_lifecycle(label: &str) -> sbx::SandboxLifecycleState {
 
 fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxInfo {
     sbx::SandboxInfo {
+        actual_vcpu: None,
+        actual_memory_mib: None,
         lifecycle: Some(sim_lifecycle(&rec.status) as i32),
         sandbox_id: rec.sandbox_id.clone(),
         template: Some(rec.template.clone()),

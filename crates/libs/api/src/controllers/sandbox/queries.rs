@@ -46,6 +46,109 @@ const POOLED_PREPARE_RECLAIMABLE_ERROR_FRAGMENTS: &[&str] = &[
     "transport is closing",
 ];
 
+/// Resolve an omitted allocation before create returns, without waiting for
+/// periodic node publication. The read has a five-second end-to-end bound;
+/// failures preserve already-created node work for normal reconciliation.
+async fn resolve_created_sandbox_shape(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+    binding: &crate::controllers::substrate::ExecutionBinding,
+) -> Result<(), ControllerError> {
+    use pplx_space_node_api_client::{NodeApiClient, WorkerApiClient as RetryingWorkerApiClient};
+    let mut client =
+        NodeApiClient::with_service_name("worker-node-api", binding.runtime_endpoint.clone());
+    let timeout = std::time::Duration::from_secs(5);
+    let mut worker = RetryingWorkerApiClient::new(&mut client);
+    let response = tokio::time::timeout(
+        timeout,
+        worker.sandbox_state(
+            pplx_space_sbx_mgr_client::proto::StateRequest {
+                sandbox_ids: vec![sandbox_id.to_string()],
+            },
+            timeout,
+        ),
+    )
+    .await
+    .map_err(|_| ControllerError::internal("read created sandbox allocation timed out"))?
+    .map_err(|error| {
+        ControllerError::internal(format!("read created sandbox allocation: {error}"))
+    })?
+    .into_inner();
+    let info = response
+        .sandboxes
+        .into_iter()
+        .find(|info| info.sandbox_id == sandbox_id.to_string())
+        .ok_or_else(|| ControllerError::internal("created sandbox is absent from node state"))?;
+    persist_created_sandbox_shape(pool, sandbox_id, node_id, binding, &info).await
+}
+
+async fn persist_created_sandbox_shape(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+    binding: &crate::controllers::substrate::ExecutionBinding,
+    info: &pplx_space_sbx_mgr_client::proto::SandboxInfo,
+) -> Result<(), ControllerError> {
+    // Older workers omit this pair. Preserve their existing behavior during rollout.
+    if info.actual_vcpu.is_none() && info.actual_memory_mib.is_none() {
+        return Ok(());
+    }
+    let invalid = || {
+        ControllerError::internal(
+            "created sandbox reported invalid allocation or execution identity",
+        )
+    };
+    let vcpu = info.actual_vcpu.ok_or_else(invalid)?;
+    let memory = info.actual_memory_mib.ok_or_else(invalid)?;
+    let generation = i64::try_from(binding.execution_generation).map_err(|_| invalid())?;
+    if info.sandbox_id != sandbox_id.to_string()
+        || info.execution_generation != Some(generation)
+        || vcpu == 0
+        || memory == 0
+    {
+        return Err(invalid());
+    }
+    let pod_uid = info.pod_uid.as_deref().ok_or_else(invalid)?;
+    let attempt = info
+        .activation_attempt_id
+        .as_deref()
+        .ok_or_else(invalid)?
+        .parse::<pplx_space_common_core::types::SandboxActivationAttemptId>()
+        .map_err(|_| invalid())?;
+    let vcpu = i32::try_from(vcpu).map_err(|_| invalid())?;
+    let memory_mib = i32::try_from(memory).map_err(|_| invalid())?;
+    // This guarded transition owns the fill: a replaced execution cannot
+    // overwrite the allocation of the sandbox that now occupies the same ID.
+    let filled = sqlx::query(sql!(
+        "UPDATE sandboxes s
+         SET vcpu = COALESCE(s.vcpu, $7), memory_mib = COALESCE(s.memory_mib, $8)
+         FROM sandbox_k8s_executions e
+         WHERE s.id = $1 AND s.active_node_id = $2
+           AND s.lifecycle IN ('creating', 'started')
+           AND e.sandbox_id = s.id AND e.active
+           AND e.generation = $3 AND e.pod_name = $4 AND e.pod_uid = $5
+           AND COALESCE(e.activation_attempt_id, e.route_activation_id) = $6"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(generation)
+    .bind(&binding.execution_object_id)
+    .bind(pod_uid)
+    .bind(attempt.as_uuid())
+    .bind(vcpu)
+    .bind(memory_mib)
+    .execute(pool)
+    .await
+    .map_err(|error| internal_error("persist created sandbox allocation", error))?;
+    if filled.rows_affected() != 1 {
+        return Err(ControllerError::internal(
+            "created sandbox allocation lost its execution fence",
+        ));
+    }
+    Ok(())
+}
+
 async fn finalize_created_sandbox(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -1770,6 +1873,20 @@ impl SandboxController {
                     "sandbox file-change tracking could not be enabled: {err}"
                 )));
             }
+        }
+
+        if self.substrate.capabilities().resolves_cold_create_shape
+            && restore_operation_id.is_none()
+            && req.wait_until_ready
+            && outcome.command_ready
+            && (resources.vcpu.is_none() || resources.memory_mib.is_none())
+            && let (Some(node_id), Some(binding)) =
+                (outcome.active_node_id, outcome.binding.as_ref())
+        {
+            // Do not delete by sandbox ID if this read loses its execution
+            // fence: a replacement may already own that ID. Publication is
+            // the backstop for the node work already tracked in the database.
+            resolve_created_sandbox_shape(pool, outcome.sandbox_id, node_id, binding).await?;
         }
 
         // The finalizer owns `creating -> started`, but a matching durable

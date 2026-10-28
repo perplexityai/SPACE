@@ -391,3 +391,46 @@ fn template_base_snapshot_admission_writes_only_over_a_paused_row() {
         }
     }
 }
+
+// Reusing a template does not fix the runtime shape: each activation's
+// metadata owns its CPU budget and guest RAM, not template defaults or host limits.
+#[tokio::test]
+async fn state_reports_current_activation_allocation_and_preserves_legacy_absence() {
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_common_core::types::{MemorySize, VcpuCount};
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Started);
+    let mut options = SandboxManagerServiceOptions::for_test_in(scratch.path());
+    options.create_cache_dir = Some(scratch.path().to_owned());
+    let service = SandboxManagerService::new_with_options(conn, options);
+    let path = scratch.path().join(&id);
+    std::fs::create_dir_all(&path).unwrap();
+    for (cpu, memory) in [(Some(4), Some(8192)), (Some(8), Some(4096)), (None, None)] {
+        let mut sandbox = service.lookup_sandbox(&id).unwrap();
+        sandbox.template_hash = Some("1".repeat(64));
+        let metadata = super::super::tail_support::activation_metadata_json(
+            &sandbox,
+            cpu.map(|cpu| VcpuCount::try_from_u32(cpu).unwrap()),
+            memory.map(|memory| MemorySize::mib(memory).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(path.join("metadata.json"), metadata).unwrap();
+        let info = service
+            .build_sandbox_info(sandbox.clone(), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (info.actual_vcpu, info.actual_memory_mib),
+            (cpu, memory.map(|memory| memory as u32))
+        );
+        let mut preparing = sandbox;
+        preparing.state = SandboxState::Starting;
+        let info = service
+            .build_sandbox_info(preparing, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!((info.actual_vcpu, info.actual_memory_mib), (None, None));
+    }
+}

@@ -961,6 +961,9 @@ message PublishedSandboxState {
   // Exact activation attempt observed with this state. Generations may be
   // reused by placement retries, so attempt-scoped evidence must carry both.
   optional string activation_attempt_id = 41;
+  // Current activation allocation, forwarded from SandboxInfo.
+  optional uint32 actual_vcpu = 42;
+  optional uint32 actual_memory_mib = 43;
 }
 
 message PublishedTemplateState {

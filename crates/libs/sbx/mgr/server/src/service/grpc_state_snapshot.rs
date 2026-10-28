@@ -1038,7 +1038,27 @@ impl SandboxManagerService {
                 }
             }
         };
+        // Only an activated runtime owns this allocation. During preparation the
+        // artifact can still describe the previous activation. The persisted
+        // guest RAM excludes host cgroup headroom and the CPU is its allocation
+        // budget, including when a restored guest has a larger CPU topology.
+        let allocation = if matches!(observed_state, SandboxState::Started | SandboxState::Paused) {
+            match super::tail_support::sandbox_artifact_metadata_in(self.cache_root(), id) {
+                Ok(metadata) => {
+                    metadata.and_then(|metadata| metadata.cpu_budget.zip(metadata.guest_memory))
+                }
+                Err(error) => {
+                    tracing::warn!(sandbox_id = id, %error, "omitting unreadable runtime allocation");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(SandboxInfo {
+            actual_vcpu: allocation.map(|(cpu, _)| cpu.get().get()),
+            actual_memory_mib: allocation
+                .and_then(|(_, memory)| u32::try_from(memory.as_mib_floor()).ok()),
             sandbox_id: sandbox.id.clone(),
             template: Some(sandbox.template.clone()),
             lifecycle: Some(crate::proto::SandboxLifecycleState::from(observed_state) as i32),

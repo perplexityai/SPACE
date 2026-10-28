@@ -61,4 +61,6 @@ PublishedSandboxState {
     state_changed_at: None,
     quarantine_recovery: None,
     activation_attempt_id: None,
+    actual_vcpu: None,
+    actual_memory_mib: None,
 }
