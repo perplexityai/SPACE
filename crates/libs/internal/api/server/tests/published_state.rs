@@ -4004,6 +4004,30 @@ async fn activation_rollback_receipts_converge_stable_targets_with_attempt_fence
 #[tokio::test(flavor = "current_thread")]
 async fn node_publish_applies_completion_after_same_transaction_lifecycle_projection() -> TestResult
 {
+    use pplx_space_events::{
+        SandboxEvent, SandboxEventDetails, SandboxEventObserver, SandboxEventType,
+        install_sandbox_event_observer,
+    };
+    struct Recorder {
+        ids: [SandboxId; 2],
+        sender: tokio::sync::mpsc::UnboundedSender<(SandboxId, SandboxEventType)>,
+    }
+    impl SandboxEventObserver for Recorder {
+        fn observe(&self, event: &SandboxEvent, _: &SandboxEventDetails) {
+            if self.ids.contains(&event.sandbox_id())
+                && matches!(
+                    event.event_type(),
+                    SandboxEventType::ActivationRollbackCompleted
+                        | SandboxEventType::QuarantineRecovered
+                        | SandboxEventType::DeleteCompleted
+                )
+            {
+                self.sender
+                    .send((event.sandbox_id(), event.event_type()))
+                    .expect("event receiver remains alive throughout publication");
+            }
+        }
+    }
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -4057,6 +4081,22 @@ async fn node_publish_applies_completion_after_same_transaction_lifecycle_projec
     .await?;
     insert_ready_suspend_snapshot(&db.pool, sandbox_id, node_id).await?;
 
+    let recovery_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, recovery_id, node_id, "started").await?;
+    let mut quarantined = quarantined_sandbox_state(recovery_id);
+    quarantined.quarantine_reason_code = Some(SandboxQuarantineReasonCode::PauseFailed.to_string());
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, node_id, &[quarantined]).await?;
+    drop(conn);
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    assert!(
+        install_sandbox_event_observer(Box::new(Recorder {
+            ids: [sandbox_id, recovery_id],
+            sender,
+        }))
+        .is_ok()
+    );
+
     let projected_state = activation_rollback_state(
         sandbox_id,
         Uuid::now_v7(),
@@ -4073,24 +4113,76 @@ async fn node_publish_applies_completion_after_same_transaction_lifecycle_projec
         auto_lifecycle_policy_fingerprint: AutoLifecyclePolicyFingerprint::for_policy(&policy)
             .to_string(),
     };
-    let mut request = Request::new(PublishNodeStateRequest {
+    let publish = PublishNodeStateRequest {
         node_id: node_id.to_string(),
-        sandboxes: vec![projected_state],
+        // Reverse phase order in the input: lifecycle application, not request
+        // position, orders the buffered rollback and recovery events.
+        sandboxes: vec![
+            published_sandbox_state(recovery_id, "paused"),
+            projected_state,
+        ],
         role: Some(ProtoNodeRole::Worker as i32),
         auto_lifecycle_delete_completions: vec![completion],
         ..PublishNodeStateRequest::default()
-    });
-    request
-        .extensions_mut()
-        .insert(tonic::transport::server::TcpConnectInfo {
-            local_addr: None,
-            remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
-        });
+    };
+    let request = || {
+        let mut request = Request::new(publish.clone());
+        request
+            .extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
+            });
+        request
+    };
+    let service = ClusterApiService::new(db.pool.clone());
 
-    let response = ClusterApiService::new(db.pool.clone())
-        .publish_node_state(request)
-        .await?
-        .into_inner();
+    // Deferred failure reaches COMMIT after all publication writes, including
+    // receipt consumption. The fixture alone owns this trigger and function.
+    sqlx::query(sql!(
+        "CREATE FUNCTION fail_publish_commit() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'synthetic commit failure'; END $$"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE CONSTRAINT TRIGGER fail_publish_commit AFTER DELETE ON sandboxes
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_publish_commit()"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let failure = service
+        .publish_node_state(request())
+        .await
+        .expect_err("deferred failure must roll back the entire publication");
+    assert_eq!(failure.code(), tonic::Code::Internal);
+    assert!(failure.message().starts_with("commit node state publish:"));
+    assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "restoring");
+    assert_eq!(
+        sandbox_lifecycle(&db.pool, recovery_id).await?,
+        "quarantined"
+    );
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    sqlx::query(sql!("DROP TRIGGER fail_publish_commit ON sandboxes"))
+        .execute(&db.pool)
+        .await?;
+    let response = service.publish_node_state(request()).await?.into_inner();
+    let mut emitted = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        emitted.push(event);
+    }
+    assert_eq!(
+        emitted,
+        [
+            (sandbox_id, SandboxEventType::ActivationRollbackCompleted),
+            (recovery_id, SandboxEventType::QuarantineRecovered),
+            (sandbox_id, SandboxEventType::DeleteCompleted),
+        ]
+    );
+    assert_eq!(sandbox_lifecycle(&db.pool, recovery_id).await?, "paused");
 
     assert_eq!(
         response.acknowledged_auto_lifecycle_delete_receipt_ids,
