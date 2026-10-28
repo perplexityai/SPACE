@@ -4,7 +4,7 @@ use pplx_space_common_core::types::{
 };
 
 use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
-use super::lifecycle::{FailedClaim, RestoreClaim, StoppedClaim};
+use super::lifecycle::{FailedClaim, PauseFailedRecoveryClaim, RestoreClaim, StoppedClaim};
 use super::recovery_observation::{ClearRecoveryObservationClaim, RecoveryObservationClaim};
 use super::suspended::SuspendedClaim;
 use crate::node_publish::diagnostics::SandboxDiagnostic;
@@ -33,6 +33,7 @@ pub(crate) struct SandboxPlan {
     pub(crate) observations: Vec<ObservedClaim>,
     pub(crate) restored: Vec<RestoreClaim>,
     pub(crate) suspended: Vec<SuspendedClaim>,
+    pub(crate) pause_failed_recoveries: Vec<PauseFailedRecoveryClaim>,
     pub(crate) stopped: Vec<StoppedClaim>,
     pub(crate) failed: Vec<FailedClaim>,
     pub(crate) activation_completions: Vec<ActivationCompletionClaim>,
@@ -54,6 +55,7 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             observations: Vec::with_capacity(inventory.observations.len()),
             restored: Vec::new(),
             suspended: Vec::new(),
+            pause_failed_recoveries: Vec::new(),
             stopped: Vec::new(),
             failed: Vec::new(),
             activation_completions: Vec::new(),
@@ -95,6 +97,14 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
                     }
                     SandboxTransitionReceiptKind::QuarantineRecovery => {}
                 }
+            }
+            if let Some(status @ (SandboxLifecycle::Started | SandboxLifecycle::Paused)) =
+                claim.observation.reported_lifecycle()
+            {
+                plan.pause_failed_recoveries.push(PauseFailedRecoveryClaim {
+                    sandbox_id: claim.observation.sandbox_id(),
+                    status,
+                });
             }
             match claim.observation.reported_lifecycle() {
                 Some(SandboxLifecycle::Started) => {

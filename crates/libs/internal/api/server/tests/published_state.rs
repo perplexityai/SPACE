@@ -2713,6 +2713,15 @@ async fn node_inventory_recovers_pause_failed_quarantine_to_reported_lifecycle()
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
 
+    let neighbor_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, neighbor_id, node_id, "started").await?;
+    let mut neighbor_quarantine = quarantined_sandbox_state(neighbor_id);
+    neighbor_quarantine.quarantine_reason_code =
+        Some(SandboxQuarantineReasonCode::PauseFailed.to_string());
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, node_id, &[neighbor_quarantine]).await?;
+    drop(conn);
+
     for target_state in ["started", "paused"] {
         let sandbox_id = SandboxId::new();
         insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
@@ -2727,11 +2736,18 @@ async fn node_inventory_recovers_pause_failed_quarantine_to_reported_lifecycle()
         let outcome = publish_sandbox_states(
             &mut tx,
             node_id,
-            &[published_sandbox_state(sandbox_id, target_state)],
+            &[
+                published_sandbox_state(neighbor_id, "stopped"),
+                published_sandbox_state(sandbox_id, target_state),
+            ],
         )
         .await?;
         tx.commit().await?;
         assert_eq!(outcome.post_commit_events.len(), 1);
+        assert_eq!(
+            sandbox_lifecycle(&db.pool, neighbor_id).await?,
+            "quarantined"
+        );
 
         let mut tx = db.pool.begin().await?;
         let replay = publish_sandbox_states(

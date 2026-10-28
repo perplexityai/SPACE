@@ -5,6 +5,7 @@ use super::{
     emit_lifecycle_convergence_events, emit_node_published_state_events, lifecycle_transitions,
     project_node_published_suspended_sandboxes, quarantine_claims, quarantine_persistence,
 };
+use crate::node_publish::plan::lifecycle::PauseFailedRecoveryClaim;
 use crate::node_publish::plan::sandboxes::SandboxPlan;
 use crate::sandbox_quarantine_store;
 
@@ -185,11 +186,11 @@ pub(super) async fn project_quarantine(
 pub(super) async fn recover_pause_failed(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[PauseFailedRecoveryClaim],
     post_commit_events: &mut Vec<PostCommitSandboxEvent>,
 ) -> Result<(), ApplySandboxClaimsError> {
     let recoveries =
-        sandbox_quarantine_store::recover_pause_failed_from_inventory(conn, node_id, rows_json)
+        sandbox_quarantine_store::recover_pause_failed_from_inventory(conn, node_id, claims)
             .await?;
     post_commit_events.extend(
         recoveries

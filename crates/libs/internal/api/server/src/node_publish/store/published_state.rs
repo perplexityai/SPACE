@@ -516,8 +516,13 @@ pub(crate) async fn publish_validated_sandbox_states(
         .collect::<Vec<_>>();
     sandbox_application::converge_lifecycles(conn, node_id, plan, &mut post_commit_events).await?;
     sandbox_application::project_quarantine(conn, node_id, quarantine_inputs).await?;
-    sandbox_application::recover_pause_failed(conn, node_id, &rows_json, &mut post_commit_events)
-        .await?;
+    sandbox_application::recover_pause_failed(
+        conn,
+        node_id,
+        &plan.pause_failed_recoveries,
+        &mut post_commit_events,
+    )
+    .await?;
 
     queue_policy_reconcile_refs_for_new_inventory(
         conn,

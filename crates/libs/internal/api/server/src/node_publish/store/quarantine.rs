@@ -5,6 +5,7 @@ use pplx_space_common_core::types::NodeId;
 use std::sync::LazyLock;
 
 use crate::node_publish::plan::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
+use crate::node_publish::plan::lifecycle::PauseFailedRecoveryClaim;
 use crate::node_publish::plan::suspended::SuspendedClaim;
 
 use pplx_space_common_core::sql;
@@ -611,11 +612,16 @@ pub(super) async fn apply_activation_rollback_candidates(
 /// Clear an sbx-manager-authored pause failure after the same node publishes a
 /// definitive healthy runtime state. The caller's publication transaction
 /// keeps the selected sandbox and quarantine rows locked through retirement.
+/// One lookup selects the node's matching quarantines; empty claims skip it,
+/// and an empty result means none of the current rows passed the guards.
 pub(super) async fn recover_pause_failed_from_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[PauseFailedRecoveryClaim],
 ) -> Result<Vec<PauseFailedQuarantineRecovery>, RecoverPauseFailedError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     let quarantine_source = SandboxQuarantineSource::SbxManager.as_str();
     let quarantine_reason = SandboxQuarantineReasonCode::PauseFailed.as_str();
     let candidates: Vec<(Uuid, Uuid, String)> = sqlx::query_as(sql!(
@@ -634,7 +640,7 @@ pub(super) async fn recover_pause_failed_from_inventory(
           FOR UPDATE OF s, qs"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(claims))
     .bind(quarantine_source)
     .bind(quarantine_reason)
     .fetch_all(&mut *conn)
