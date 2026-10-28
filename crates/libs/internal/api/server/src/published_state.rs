@@ -1,7 +1,7 @@
 use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use sqlx::types::Json;
@@ -12,7 +12,7 @@ use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::{
     ArtifactKind, NodeRole, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -37,21 +37,21 @@ use pplx_space_sandbox_portability::{
     suspended_projection_lifecycle_eligible,
 };
 
-use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::node_publish::validate::failure_episode::FailureEpisodeClaim;
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
+#[cfg(test)]
 use crate::node_publish::validate::quarantine::{
     QuarantineRecoveryProjectionState, quarantine_recovery_projection,
 };
 use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
-use crate::node_publish::validate::receipts::{self, PublishedTransitionReceiptError};
-use crate::node_publish::validate::sandbox_observation::ValidatedSandboxObservation;
-use crate::node_publish::validate::snapshots::snapshot_json;
+use crate::node_publish::validate::sandbox_inventory::{
+    LegacySandboxInput, ValidatedSandboxInventory,
+};
 use crate::node_publish::validate::templates::template_state_row;
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
 use crate::sandbox_quarantine_store;
 
-use super::{optional_trimmed, parse_sandbox_id, trimmed_required};
+use super::trimmed_required;
 
 const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
 ON CONFLICT (node_id, facet, element) DO UPDATE
@@ -76,24 +76,6 @@ struct AcceptedSandboxPublishRow {
     published_status: Option<String>,
     state_changed_at: Option<time::OffsetDateTime>,
     status_changed: bool,
-}
-
-fn parse_published_transition_receipt(
-    node_id: NodeId,
-    state: &PublishedSandboxState,
-) -> Result<
-    Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
-    PublishedTransitionReceiptError,
-> {
-    let parsed = receipts::parse(state);
-    if let Some(fallback) = parsed.fallback {
-        SandboxDiagnostic::FallbackTransitionReason {
-            raw_id: state.sandbox_id.clone(),
-            fallback,
-        }
-        .emit(node_id);
-    }
-    parsed.receipt
 }
 
 struct ObservedStateComparableColumn {
@@ -1034,142 +1016,21 @@ pub async fn publish_sandbox_states(
     node_id: NodeId,
     states: &[PublishedSandboxState],
 ) -> Result<SandboxPublicationOutcome, Status> {
-    let mut states_by_id = BTreeMap::new();
-    for state in states {
-        let sandbox_id = match parse_sandbox_id(&state.sandbox_id) {
-            Ok(sandbox_id) => sandbox_id,
-            Err(error) => {
-                SandboxDiagnostic::OmitSandbox {
-                    raw_id: state.sandbox_id.clone(),
-                    error,
-                }
-                .emit(node_id);
-                continue;
-            }
-        };
-        states_by_id.insert(sandbox_id, state);
+    let inventory = ValidatedSandboxInventory::from_proto(states);
+    for diagnostic in inventory.diagnostics() {
+        diagnostic.emit(node_id);
     }
-
-    let mut absent_ids = Vec::new();
-    let mut rows = Vec::new();
-    // Keyed rather than two parallel collections: the ids are reported to
-    // callers and the payloads are written to `sandbox_observed_states`, and a
-    // third state-only disposition that appended to only one of them would
-    // fail silently in whichever half it forgot.
-    //
-    // The payload array this produces is therefore ordered by sandbox id
-    // rather than by publication order, which `jsonb_to_recordset` does not
-    // care about.
-    //
-    // Keying by sandbox id also collapses a request that names one sandbox
-    // twice, where a vector would have emitted both and hit the `ON
-    // CONFLICT`. Nothing dedupes `request.sandboxes`, so that is a real
-    // behaviour change and not merely a consequence of the two dispositions
-    // being mutually exclusive. It is the wanted direction: the value here
-    // is a diagnostic `(sandbox_id, status)` pair, so collapsing duplicates
-    // loses at most one status string, whereas the pending-backup report
-    // rejects a duplicated sandbox outright because there collapsing would
-    // silently drop one of two *artifacts*.
-    let mut state_only: BTreeMap<SandboxId, serde_json::Value> = BTreeMap::new();
-    let mut failure_episode_rows = Vec::new();
-    let mut snapshot_rows = Vec::new();
-    let mut quarantine_inputs = Vec::new();
+    let LegacySandboxInput {
+        absent_ids,
+        rows,
+        state_only,
+        failure_episode_rows,
+        snapshot_rows,
+        quarantine_inputs,
+        publishes_network_policy,
+    } = inventory.into_legacy_input();
     let mut post_commit_events = Vec::new();
     let mut post_commit_state_convergence = Vec::new();
-    let mut publishes_network_policy = false;
-
-    for (sandbox_id, state) in states_by_id {
-        let sandbox_uuid = sandbox_id;
-        if !state.present {
-            absent_ids.push(sandbox_uuid);
-            continue;
-        }
-        if state.state_degraded {
-            failure_episode_rows.push(FailureEpisodeClaim::from_proto(sandbox_uuid, state, true));
-            state_only.insert(
-                sandbox_uuid,
-                serde_json::json!({
-                    "sandbox_id": sandbox_uuid,
-                    "status": optional_trimmed(state.status.as_deref()),
-                }),
-            );
-            continue;
-        }
-        let transition_receipt = match parse_published_transition_receipt(node_id, state) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                SandboxDiagnostic::OmitTransitionReceipt { sandbox_id, error }.emit(node_id);
-                None
-            }
-        };
-        let (quarantine_recovery, quarantine_recovery_degraded) =
-            match quarantine_recovery_projection(state) {
-                Ok(QuarantineRecoveryProjectionState::Absent) => (None, false),
-                Ok(QuarantineRecoveryProjectionState::Degraded) => (None, true),
-                Ok(QuarantineRecoveryProjectionState::Observed(observation)) => {
-                    (Some(observation), false)
-                }
-                Err(error) => {
-                    SandboxDiagnostic::OmitQuarantineRecovery { sandbox_id, error }.emit(node_id);
-                    (None, true)
-                }
-            };
-        let row_count = rows.len();
-        let snapshot_count = snapshot_rows.len();
-        let quarantine_count = quarantine_inputs.len();
-        let mut row_publishes_network_policy = false;
-        let parse_result = (|| -> Result<(), Status> {
-            if let Some(claim) = QuarantineClaim::from_proto(sandbox_id, state) {
-                if let Some((value, error)) = claim.unrecognized_reason() {
-                    SandboxDiagnostic::UnknownQuarantineReason {
-                        sandbox_id,
-                        label: value.to_owned(),
-                        error: error.clone(),
-                    }
-                    .emit(node_id);
-                }
-                quarantine_inputs.push(claim);
-            }
-
-            let validation =
-                ValidatedSandboxObservation::parse(sandbox_id, state, transition_receipt.as_ref());
-            if let Some(warning) = validation.version_warning {
-                SandboxDiagnostic::InvalidSpacedVersion {
-                    sandbox_id,
-                    warning,
-                }
-                .emit(node_id);
-            }
-            let observation = validation.observation?;
-            row_publishes_network_policy = observation.publishes_network_policy();
-            rows.push(observation.legacy_row(
-                transition_receipt.as_ref(),
-                quarantine_recovery.as_ref(),
-                quarantine_recovery_degraded,
-            )?);
-            for snapshot in &state.snapshots {
-                snapshot_rows.push(snapshot_json(sandbox_uuid, snapshot)?);
-            }
-            Ok(())
-        })();
-        if let Err(error) = parse_result {
-            failure_episode_rows.push(FailureEpisodeClaim::from_proto(sandbox_uuid, state, true));
-            rows.truncate(row_count);
-            snapshot_rows.truncate(snapshot_count);
-            quarantine_inputs.truncate(quarantine_count);
-            SandboxDiagnostic::StateOnly { sandbox_id, error }.emit(node_id);
-            state_only.insert(
-                sandbox_uuid,
-                serde_json::json!({
-                    "sandbox_id": sandbox_uuid,
-                    "status": optional_trimmed(state.status.as_deref()),
-                }),
-            );
-        } else {
-            failure_episode_rows.push(FailureEpisodeClaim::from_proto(sandbox_uuid, state, false));
-            publishes_network_policy |= row_publishes_network_policy;
-        }
-    }
 
     let mut accepted = 0_u64;
     if !absent_ids.is_empty() {

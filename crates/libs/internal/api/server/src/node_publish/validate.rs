@@ -14,6 +14,7 @@ pub(crate) mod quarantine;
 pub(crate) mod quarantine_claim;
 pub(crate) mod receipts;
 pub(crate) mod sandbox_identity;
+pub(crate) mod sandbox_inventory;
 pub(crate) mod sandbox_metadata;
 pub(crate) mod sandbox_observation;
 pub(crate) mod sandbox_status;

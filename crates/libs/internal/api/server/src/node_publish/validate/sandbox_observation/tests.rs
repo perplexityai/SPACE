@@ -18,7 +18,7 @@ fn invalid_optional_version_is_omitted_without_changing_valid_observation_fields
     let observation = ValidatedSandboxObservation::parse(sandbox_id, &state, None)
         .observation
         .unwrap();
-    let row = observation.legacy_row(None, None, false).unwrap();
+    let row = observation.legacy_row(None, None, false);
     assert_eq!(row["status"], "StArTeD");
     assert_eq!(row["runtime"], "future-runtime");
     assert_eq!(row["sandbox_owner"], "sample-owner");
@@ -33,6 +33,12 @@ fn invalid_optional_version_is_omitted_without_changing_valid_observation_fields
 fn observation_validation_preserves_optional_field_rejection_precedence() {
     let sandbox_id = SandboxId::from_uuid(uuid::Uuid::from_u128(1));
     let mut state = PublishedSandboxState {
+        status: Some("started".to_owned()),
+        // Valid for the time type, but not representable as an RFC3339 year.
+        state_changed_at: Some(prost_types::Timestamp {
+            seconds: -62_167_219_201,
+            nanos: 0,
+        }),
         pid: Some(u32::MAX),
         last_used_at: Some(prost_types::Timestamp {
             seconds: 0,
@@ -41,10 +47,20 @@ fn observation_validation_preserves_optional_field_rejection_precedence() {
         network_tx_bytes: Some(u64::MAX),
         ..Default::default()
     };
-    for (step, expected) in [
-        "pid exceeds i32::MAX: number too large to fit in target type",
-        "last_used_at has invalid nanos",
-        "network_tx_bytes exceeds i64::MAX: number too large to fit in target type",
+    for (step, (code, expected)) in [
+        (
+            tonic::Code::InvalidArgument,
+            "pid exceeds i32::MAX: number too large to fit in target type",
+        ),
+        (tonic::Code::InvalidArgument, "last_used_at has invalid nanos"),
+        (
+            tonic::Code::InvalidArgument,
+            "network_tx_bytes exceeds i64::MAX: number too large to fit in target type",
+        ),
+        (
+            tonic::Code::Internal,
+            "format state_changed_at: The year component cannot be formatted into the requested format.",
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -52,11 +68,12 @@ fn observation_validation_preserves_optional_field_rejection_precedence() {
         let error = ValidatedSandboxObservation::parse(sandbox_id, &state, None)
             .observation
             .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.code(), code);
         assert_eq!(error.message(), expected);
         match step {
             0 => state.pid = None,
             1 => state.last_used_at = None,
+            2 => state.network_tx_bytes = None,
             _ => {}
         }
     }
