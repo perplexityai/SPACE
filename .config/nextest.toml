@@ -114,6 +114,7 @@ or (package(pplx-space-node-mgr) and test(=service::launch_prepare::tests::retai
 or (package(pplx-space-node-mgr) and test(=service::encrypted_volumes::tests::ciphertext_publication_is_readable_without_exposing_private_backings))
 or (package(pplx-space-node-mgr) and test(=service::permission_tree::tests::owned_walk_prunes_snapshots_and_never_mutates_link_targets))
 or (package(pplx-space-node-mgr) and test(=device_backing::tests::pinned_devices_survive_replacement_and_encrypted_reopen))
+or (package(pplx-space-node-mgr) and test(=service::snapshots::capture_tests::encrypted_capture_publishes_only_the_copy_permissions))
 or (package(pplx-space-node-mgr) and test(=encrypted_volume::tests::busy_close_reports_its_holders_and_recovers))
 or (package(pplx-space-node-mgr) and test(=service::artifact_fs::tests::btrfs_pinned_operations_survive_path_replacement_and_nested_cleanup))
 or (package(pplx-space-node-mgr) and test(=service::artifact_fs::receive::tests::receive_keeps_destination_identity_through_scrub_and_publication))

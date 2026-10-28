@@ -26,6 +26,87 @@ fn prepare_btrfs_snapshot_source(instance_dir: &Path) -> Result<(), Status> {
     ensure_snapshot_export_permissions(instance_dir)
 }
 
+fn capture_instance_snapshot(
+    instance_dir: &Path,
+    snapshots_dir: &Path,
+    name: &std::ffi::OsStr,
+    writable: bool,
+    encrypted: bool,
+) -> Result<(), Status> {
+    if !instance_dir.exists() {
+        return Err(Status::not_found(format!(
+            "instance dir not found: {}",
+            instance_dir.display()
+        )));
+    }
+    if !encrypted {
+        prepare_btrfs_snapshot_source(instance_dir)?;
+    }
+    let snapshots = super::trusted_paths::create_directory(snapshots_dir)?;
+    super::trusted_paths::set_permissions(&snapshots, Some(gids::SPACE_CACHE_RW), 0o2770)?;
+    let source = super::trusted_paths::open_directory(instance_dir)?;
+    if encrypted {
+        return capture_encrypted_instance(&source, &snapshots, name, writable);
+    }
+    super::artifact_fs::btrfs::snapshot(&source, &snapshots, name, !writable)
+        .map_err(super::artifact_fs::error)
+}
+
+fn capture_encrypted_instance(
+    source: &std::fs::File,
+    snapshots: &std::fs::File,
+    name: &std::ffi::OsStr,
+    writable: bool,
+) -> Result<(), Status> {
+    use super::{artifact_fs, trusted_paths};
+    use nix::sys::stat::{Mode, mkdirat};
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+
+    // Export only the copy. The live encrypted backing stays private, and the
+    // copy stays inaccessible to cache peers until its permissions and RO flag
+    // are complete. Abandoned stages are reclaimed with the sandbox cache.
+    let temporary = format!(".encrypted-capture-{}", uuid::Uuid::now_v7());
+    mkdirat(
+        snapshots,
+        temporary.as_str(),
+        Mode::from_bits_truncate(0o700),
+    )
+    .map_err(artifact_fs::error)?;
+    let stage =
+        artifact_fs::directory(snapshots, temporary.as_ref()).map_err(artifact_fs::error)?;
+    let metadata = stage.metadata().map_err(artifact_fs::error)?;
+    if metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+        return Err(Status::failed_precondition(
+            "encrypted capture stage is not private",
+        ));
+    }
+    let result = (|| {
+        artifact_fs::btrfs::snapshot(source, &stage, "capture".as_ref(), false)
+            .map_err(artifact_fs::error)?;
+        let capture =
+            artifact_fs::directory(&stage, "capture".as_ref()).map_err(artifact_fs::error)?;
+        trusted_paths::export_directory_permissions(&capture, Some(gids::SPACE_CACHE_RW))?;
+        // Publish through SNAP_CREATE_V2: permissions and read-only state are
+        // visible together, and an existing name is never replaced. A read-only
+        // subvolume cannot be renamed on every supported kernel.
+        artifact_fs::btrfs::snapshot(&capture, snapshots, name, !writable)
+            .map_err(artifact_fs::error)?;
+        snapshots.sync_all().map_err(artifact_fs::error)
+    })();
+    if let Err(error) = artifact_fs::remove_at(&stage, "capture".as_ref()) {
+        tracing::warn!(%error, "encrypted capture stage retained for sandbox cleanup");
+    }
+    // Only an empty directory may be removed by name; never recursively delete
+    // a replacement in the shared parent after releasing the private stage.
+    if let Err(error) = unlinkat(snapshots, temporary.as_str(), UnlinkatFlags::RemoveDir) {
+        tracing::warn!(%error, "encrypted capture staging directory retained for cleanup");
+    }
+    result
+}
+
+#[cfg(test)]
+mod capture_tests;
+
 pub(super) fn btrfs_snapshot_tier_and_timestamp(name: &str) -> Option<(&str, &str)> {
     if name.starts_with("d-") || name.starts_with("f-") {
         return name
@@ -871,30 +952,47 @@ impl NodeManagerService {
         let snapshots_dir = format!("{CACHE_DIR}/{}/snapshots", req.sandbox_id);
         let snapshot_path = format!("{snapshots_dir}/{}", req.snapshot_name);
         let writable = req.writable;
-
-        self.off_runtime("create btrfs snapshot", move || {
-            let _gate = gate;
-            if !std::path::Path::new(&instance_dir).exists() {
-                return Err(Status::not_found(format!(
-                    "instance dir not found: {instance_dir}"
-                )));
+        let sandbox_id = req
+            .sandbox_id
+            .parse::<SandboxId>()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let device_gate = self
+            .sandbox_device_stack_lock(&sandbox_id)
+            .await
+            .lock_owned()
+            .await;
+        let cow_path = PathBuf::from(&instance_dir).join("cow.luks");
+        let encrypted = crate::device_backing::blocking(move || {
+            match crate::device_backing::Backing::open(&cow_path, false) {
+                Ok(cow) => Ok(cow.is_some()),
+                // The ordinary capture path owns the missing-instance error.
+                // A missing parent here is not a failed encryption probe.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
             }
-            prepare_btrfs_snapshot_source(Path::new(&instance_dir))?;
-            let snapshots = super::trusted_paths::create_directory(Path::new(&snapshots_dir))?;
-            super::trusted_paths::set_permissions(
-                &snapshots,
-                Some(pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW),
-                0o2770,
-            )?;
-            let source = super::trusted_paths::open_directory(Path::new(&instance_dir))?;
+        })
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+        let capture = self.off_runtime("create btrfs snapshot", move || {
             let name = Path::new(&snapshot_path)
                 .file_name()
                 .ok_or_else(|| super::artifact_fs::error("missing snapshot name"))?;
-            super::artifact_fs::btrfs::snapshot(&source, &snapshots, name, !writable)
-                .map_err(super::artifact_fs::error)?;
+            capture_instance_snapshot(
+                Path::new(&instance_dir),
+                Path::new(&snapshots_dir),
+                name,
+                writable,
+                encrypted,
+            )?;
             Ok(Response::new(CreateBtrfsSnapshotResponse {}))
-        })
-        .await
+        });
+        let result = if encrypted {
+            crate::rootfs_dmcrypt::capture_quiesced(sandbox_id, capture).await
+        } else {
+            capture.await
+        };
+        drop((gate, device_gate));
+        result
     }
 
     pub(super) async fn delete_btrfs_snapshot(

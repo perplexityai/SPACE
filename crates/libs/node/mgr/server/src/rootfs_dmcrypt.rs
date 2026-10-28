@@ -449,6 +449,33 @@ pub async fn release(sandbox_id: &SandboxId, origin_path: &Path) -> Result<(), D
     Ok(())
 }
 
+/// Flush the persistent exception store and stop new disk I/O while capturing
+/// its ciphertext. The VM keeps running; only its root disk queues I/O. Even
+/// an ambiguous suspend failure must attempt resume before returning.
+pub(crate) async fn capture_quiesced<T>(
+    sandbox_id: SandboxId,
+    capture: impl std::future::Future<Output = Result<T, tonic::Status>>,
+) -> Result<T, tonic::Status> {
+    let composite = composite_name(&sandbox_id);
+    let status = |error: DmCryptError| {
+        tonic::Status::unavailable(format!("quiesce encrypted disk capture: {error}"))
+    };
+    if !dm_exists(&composite).await.map_err(status)? {
+        return capture.await;
+    }
+    let budget = std::time::Duration::from_secs(5);
+    let suspended = run_bounded("dmsetup", &["suspend", &composite], budget).await;
+    let captured = match suspended {
+        Ok(_) => capture.await,
+        Err(error) => Err(status(error)),
+    };
+    let resumed = run_bounded("dmsetup", &["resume", &composite], budget).await;
+    if let Err(error) = resumed {
+        return Err(status(error));
+    }
+    captured
+}
+
 /// Inputs for [`prepare`].
 pub struct PrepareParams<'a> {
     pub sandbox_id: SandboxId,

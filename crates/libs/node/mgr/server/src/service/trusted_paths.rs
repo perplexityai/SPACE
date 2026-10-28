@@ -262,7 +262,14 @@ pub(super) fn bind_pinned_files(source: &File, target: &File) -> Result<(), Stat
 
 pub(super) fn export_permissions(path: &Path, gid: Option<u32>) -> Result<(), Status> {
     let directory = open_directory(path)?;
-    export_directory(&directory, gid, 0, &mut 100_000)
+    export_directory_permissions(&directory, gid)
+}
+
+pub(super) fn export_directory_permissions(
+    directory: &File,
+    gid: Option<u32>,
+) -> Result<(), Status> {
+    export_directory(directory, gid, 0, &mut 100_000)
 }
 
 fn export_directory(
