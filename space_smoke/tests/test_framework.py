@@ -210,6 +210,9 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "network_policy.v1_udp_respects_ip_allow",
                 "network_policy.v1_udp_respects_ip_deny",
                 "network_policy.v1_wildcard_domain_allow",
+                "node.runtime_crash_preserves_disk",
+                "node.runtime_memory_lifecycle",
+                "node.runtime_survives_manager_restarts",
             ],
         )
         self.assertIs(registered.fixture_type, CommandSandboxFixture)
@@ -218,7 +221,7 @@ runpy.run_module("space_smoke", run_name="__main__")
         self.assertEqual(
             REGISTRY.categories,
             ("ecw", "local", "native", "native_concurrency", "native_contract",
-             "native_recovery", "network_policy")
+             "native_recovery", "network_policy", "node")
         )
 
     def test_external_scenario_package_extends_the_public_inventory(self) -> None:

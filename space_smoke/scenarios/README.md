@@ -9,6 +9,9 @@ The namespace before the first dot is the scenario category:
 - `network_policy.*` exercises portable network-policy enforcement.
 - `native.*` exercises the native API surface.
 - `local.*` carries Kind-only control-plane capabilities.
+- `node.*` exercises node-local CLI contracts on an explicitly dedicated,
+  otherwise idle standalone worker. These scenarios are opt-in and use the
+  `node` API surface with the `deployed` backend.
 
 Discovery derives the category from the ID and filters by the selected
 `E2B_TEMPLATE`; scenario bodies do not contain registration or skip bookkeeping.
@@ -24,6 +27,45 @@ contract for existing untyped smoke tests.
 Scenario-owned sandboxes default to pause-on-timeout with auto-resume disabled.
 This is the smoke framework's default, not the ECW API's omitted-field default.
 It preserves state for explicit reconnect and cleanup.
+
+## Standalone manager recovery
+
+`node.runtime_survives_manager_restarts` creates a pinned sandbox, restarts
+supervisor/node-manager/sandbox-manager while it runs, then repeats the restarts
+while it is stopped. It checks execution and guest-boot continuity, disk
+persistence across cold start, and deletes only its own sandbox. It does not
+request devices or establish GPU recovery evidence.
+
+Run only on an authorized dedicated node. Set `SPACE_SMOKE_BACKEND=deployed`,
+`SPACE_SMOKE_API_SURFACE=node`, and
+`SPACE_SMOKE_NODE_RECOVERY=restart-idle-node`. Supply the target through
+`SPACE_SMOKE_NODE_HOST` (SSH destination), `SPACE_SMOKE_NODE_MACHINE_ID`
+(`/etc/machine-id`), and `SPACE_SMOKE_NODE_CLIENT_ENV` (remote shell environment
+for the installed clients). Pin the inputs with `SPACE_SMOKE_NODE_TEMPLATE`,
+`SPACE_SMOKE_NODE_CONTENT_HASH` and `SPACE_SMOKE_NODE_ENVIRONMENT`. Then run:
+
+```sh
+uv run --frozen --python 3.11 -m space_smoke run node.runtime_survives_manager_restarts
+```
+
+The fixture refuses a nonempty node or mismatched machine identity. Its use
+requires exclusive operator access for the duration; the initial empty-node
+check does not fence other administrators. A lost create reply is recovered
+from the run's private response directory, never by deleting all sandboxes.
+An ambiguous create outcome fails cleanup visibly and retains that directory.
+
+`node.runtime_crash_preserves_disk` additionally requires
+`SPACE_SMOKE_NODE_FAULT=crash-owned-runtime`. It uses a pidfd and verifies the
+captured execution owner before killing only the run-owned runtime process
+(Firecracker or CH). The scenario requires convergence to `stopped`, a new execution on restart and the
+preserved disk marker. Ordinary test cleanup still deletes only its sandbox.
+Neither this fault nor manager restarts request or qualify GPU assignment.
+
+`node.runtime_memory_lifecycle` uses the same standalone-node inputs with a
+snapshot-capable environment. It checks pause/resume, full snapshot capture,
+repeated suspend/restore, and manager restarts both while suspended and after
+restore. Disk and RAM markers plus guest boot identity distinguish restoration
+from a cold boot; blocking guest readiness checks the restored vsock transport.
 
 ## Fork coverage
 

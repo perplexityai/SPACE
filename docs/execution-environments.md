@@ -473,11 +473,13 @@ that suffix is a SHA-256 prefix used only as a locator. Catalog pins, execution
 identities and verification retain full digests. An existing directory whose
 bytes do not match the requested full pins is refused; a prefix collision never
 overwrites or adopts another artifact. Removal also checks the full digest.
-The same naming rule applies to the execution cache. Deploy matching
-node-manager, runtime-manager and supervisor versions before installing managed
-artifacts. This layout replaces the full-digest directory names; existing
-managed development installs must be reinstalled or renamed while unused. Baked
-E0 paths are unchanged.
+The same naming rule applies to the execution cache. Upgrade the supervisor
+first: it accepts both full-digest and compact locators before node-manager or
+runtime-manager can publish compact names. Historical installs require no rename;
+readers and removal retain full-digest support and verification. Before rolling
+back to a supervisor that accepts only full-digest names, drain executions using
+compact artifacts and restore compatible full-digest installations. Baked E0
+paths are unchanged.
 
 Existing cache files are sealed in place. Node-manager warms the cache in tracked
 background work at startup; inventory consumers await the same serialized discovery,
@@ -820,9 +822,10 @@ pairs. On aarch64, where the initial Firecracker contract has no compiled
 environment descriptor, absent settings mean `legacy` for both settings: builders
 and activations retain the existing unbound initial contract. That default report
 has no compiled references or default and has `legacy_unbound_allowed=true`.
-The compiled `ch-54.0-linux-7.2.8` name can be explicitly allowed on ARM64 as well
-as x86-64; its reference is architecture-specific. Installing artifacts alone does
-not add it to the effective policy.
+The compiled `ch-54.0-linux-7.2.8` name can be explicitly allowed on x86-64.
+ARM64 release and kernel pins remain installable for qualification tooling, but
+no ARM64 CH environment is admitted until its execution qualification passes.
+Installing artifacts alone does not add an environment to the effective policy.
 
 The configured default is used only for work without source or exact selection.
 A bound source prefers its exact environment, then compatible fallback if it is
@@ -1437,9 +1440,10 @@ method names during the bridge.
 ## Runtime adapter boundaries
 
 Shared lifecycle code owns sandbox identity, durable activation intent, resource
-ownership, selection and cleanup fences. It asks adapters to interpret a boot
-profile or resident state; it does not construct a particular VMM's JSON or infer
-snapshot support from the presence of an executable.
+ownership, selection and cleanup fences. It asks adapters to interpret a
+cold-boot profile or resident state; cold-boot JSON belongs to those adapters.
+The existing Firecracker restore configuration is still rendered in lifecycle
+code. Snapshot support is never inferred from the presence of an executable.
 
 The Linux direct-boot adapters currently render Firecracker and Cloud Hypervisor
 configuration. They share validated resource inputs, but own their device model,
@@ -1455,15 +1459,17 @@ node-manager owns those host-capable control endpoints. Guest communication is a
 separate channel.
 
 Installing a release does not approve it for execution. The compiled
-`ch-54.0-linux-7.2.8` environment has separate ARM64 and x86-64 identities. Each
-pairs the architecture's static Cloud Hypervisor 54.0 executable with its upstream
-7.2.8+ Linux image: ARM64 Image or x86-64 ELF with a PVH entry. SHA-256 and
-fs-verity measurements are pinned independently. Neither binding has a memory-state
+`ch-54.0-linux-7.2.8` environment pairs the x86-64 static Cloud Hypervisor 54.0
+executable with its upstream 7.2.8+ ELF kernel with a PVH entry. SHA-256 and
+fs-verity measurements are pinned independently. The binding has no memory-state
 format or cross-release replacement qualification. Existing ARM64 unbound Firecracker defaults stay
 unchanged; CH requires explicit policy permission and an exact environment.
 
-Node-manager owns the CH control API and validates the supported boot device
-model before sending configuration. Sandbox-manager receives only the separate
+Node-manager owns the CH control API and parses the supported boot device
+model into a strict typed configuration before sending it. The child launcher
+creates a root-owned, owner-only API listener and passes its descriptor to CH.
+Each control connection verifies its peer PID against the registered runtime
+and its pinned process lifetime; reconnects repeat that proof. Sandbox-manager receives only the separate
 guest communication endpoint. The supervisor opens and authenticates the runtime,
 then a fresh single-threaded launcher creates mount, network, IPC, UTS and PID
 isolation, enters the VM cgroup, drops privilege, and executes the same authenticated
@@ -1487,18 +1493,37 @@ that artifact. RAM is restored into private memory rather than a writable mappin
 of the shared snapshot. Same-environment suspend/restore can use local checkpoints
 or S3 materialization; producer identity and execution fences remain mandatory.
 
+Encrypted checkpoints use the existing volume-manager and credential-provider
+contract. Node-manager binds the opened encrypted volume into the contained
+runtime's state workspace; provider state and RAM staging remain on that volume.
+Capture stops the VMM and drains its encrypted bind before sealing. Restore
+records guest RAM separately from host cgroup overhead, validates the decrypted
+payload against that allocation, and copies RAM into the VMM's private memory.
+Workers need the existing encrypted-volume prerequisites, including `cryptsetup`,
+and a credential authority that can recover the sandbox's key after restart.
+Older plaintext checkpoints can still derive RAM size from their memory file;
+an encrypted checkpoint without a recorded guest allocation fails explicitly.
+
 Upgrade all participating services before allowing the new state environment.
 Keep those versions available while its snapshots exist. Test repeated restore,
 guest-agent readiness, network traffic and manager restart before enabling automatic
-suspend/pause. Pools, encrypted CH memory snapshots, ballooning, huge pages and live
-disk-I/O ceiling updates remain refused. GPU assignment is not implemented.
+suspend/pause. Local base snapshots require the qualified state environment.
+Automatic in-node pool refill currently selects only the legacy template-cache
+partition; CH builds live in environment partitions, so their pools remain empty.
+Runtime pool capability and clone admission do not override that template-manager
+selection restriction. Ballooning, huge pages and live disk-I/O ceiling updates remain
+refused. GPU assignment is not implemented.
 Template finalization requires acknowledged Stop before copying the rootfs.
 Future runtime adapters own their boot and control implementation; the shared
 lifecycle retains selection, execution identity, resource fences and cleanup.
 
-### ARM64 local builder and worker exercise
+### Local x86-64 builder and worker exercise
 
-Use an isolated Linux ARM64 KVM builder/worker with the same SPACE revision across
+ARM64 CH admission remains disabled until build, guest traffic, manager restart,
+VMM crash and cleanup qualification passes on that host platform. Installing its
+artifacts for upstream qualification does not enable SPACE execution.
+
+Use an isolated Linux x86-64 KVM builder/worker with the same SPACE revision across
 runtime-manager, supervisor, node-manager, sandbox-manager, template-manager and
 build-manager. Deploy the protocol migration before removing old RPCs as described
 above. CH authenticates the executable and boot kernel against its compiled catalog.
@@ -1507,7 +1532,10 @@ single-threaded launcher hashes the opened executable immediately before using
 that descriptor with `execveat`; node-manager hashes and links the opened kernel
 in its blocking launch work. Files and their ancestry must remain root-protected.
 Unverified external sources are refused. A missing or wrong seal on a capable
-filesystem is an error, not permission to fall back to SHA-256.
+filesystem is an error, not permission to fall back to SHA-256. When the
+execution cache lacks verity, CH publication creates a fresh, SHA-verified
+executable copy in the execution cache. Discovery and the launcher therefore inspect the same backend;
+the request cannot select a weaker integrity check.
 
 The SHA-256 path relies on immutable root-owned publication and the existing
 host-root trust boundary. It re-reads the full executable and kernel at launch;
@@ -1518,18 +1546,24 @@ supervisors refuse unsealed sources before spawning. Verify the host can boot th
 CH PCI device model before using it for workloads. Nested KVM availability alone does not prove working
 virtio block, network or vsock interrupts.
 
-Add `ch-54.0-linux-7.2.8` to the node-manager startup allowlist. On ARM64 the
-configuration `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS=legacy,ch-54.0-linux-7.2.8`
-keeps the existing unbound default. Leave `SPACE_DEFAULT_EXECUTION_ENVIRONMENT`
+Add `ch-54.0-linux-7.2.8` to the node-manager startup allowlist. The
+configuration `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS=e0,legacy,ch-54.0-linux-7.2.8`
+keeps the existing E0 default. Leave `SPACE_DEFAULT_EXECUTION_ENVIRONMENT`
 unset. Restart node-manager through the normal deployment mechanism. Installing
 artifacts does not change either setting.
+
+For persisted-state operations, also allow `ch-54.0-linux-7.2.8-state-v1` and use
+that environment's reference for `CH_ENV` throughout the build and create steps.
+Build a template with that binding; do not relabel an existing cold-only template.
+The runtime and kernel install commands are the same for both environments.
 
 On that node, install and resolve the exact sources:
 
 ```sh
 space-rtmgr runtimes install cloud-hypervisor-54.0
 space-rtmgr kernels install '7.2.8+' --runtime cloud-hypervisor-54.0
-CH_ENV=sha256:8da931abea319e09b50563ab03d22cbde774ed88296e8723772be8ba75e5d1d0
+# Set CH_ENV to the x86-64 reference from this build's compiled environment catalog.
+: "${CH_ENV:?set the installed environment reference}"
 space-nodemgr environment --reference "$CH_ENV"
 ```
 
@@ -1560,3 +1594,28 @@ sandbox readiness, including guest command transport and stop/start persistence.
 Do not enable CH for fleet placement based on these local results. Environment
 placement, multi-node qualification and additional lifecycle capabilities remain
 separate admission requirements.
+
+### Runtime exit and rollback
+
+Periodic lifecycle recovery examines bounded batches every 60 seconds. A Started
+sandbox whose recorded process has exited is admitted under its cleanup fence to
+Stopping, then the durable cleanup worker converges it to Stopped while retaining
+the disk. A missing identity, permission error or socket timeout is inconclusive,
+not permission to stop another execution. Cleanup retries survive manager restart;
+the bounded scan queues fairly for storage capacity without holding a sandbox
+cleanup fence, and advances past executions already being cleaned. This recovery
+also applies to fenced Firecracker executions; it is not a CH-only deployment
+change. Include Firecracker crash recovery in the canary. The interval is not a
+per-sandbox deadline on a large node. Live crash/restart qualification remains
+required before general multi-tenant enablement.
+
+The contained launcher publishes the child's PID before releasing it to exec,
+so losing the supervisor reply cannot leave an executed VMM without registration.
+It pivots into its minimal root and detaches the inherited host mount tree;
+privileged device creation occurs only in a private root-controlled tmpfs.
+
+Before rolling node-manager or template-manager back to a build without CH,
+stop and drain all CH sandboxes and withdraw CH template use. Preserve the
+upgraded supervisor when compact execution-cache paths exist. The SHA-256
+fallback remains a distinct authenticated integrity mode on filesystems lacking
+fs-verity; a capable filesystem with an invalid or missing seal still fails closed.
