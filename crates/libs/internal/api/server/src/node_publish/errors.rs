@@ -2,6 +2,7 @@ use tonic::Status;
 
 use super::store::ApplyPublishError;
 use super::store::suspend_finalization::FinalizeSuspensionError;
+use super::store::template_inventory::UpsertTemplateInventoryError;
 use crate::execution_observation::PrepareExecutionObservationError;
 use crate::published_state::ApplySandboxClaimsError;
 use crate::sandbox_quarantine_store::{
@@ -52,6 +53,12 @@ impl From<ApplySandboxClaimsError> for Status {
 
 impl From<FinalizeSuspensionError> for Status {
     fn from(error: FinalizeSuspensionError) -> Self {
+        Self::internal(error.to_string())
+    }
+}
+
+impl From<UpsertTemplateInventoryError> for Status {
+    fn from(error: UpsertTemplateInventoryError) -> Self {
         Self::internal(error.to_string())
     }
 }
