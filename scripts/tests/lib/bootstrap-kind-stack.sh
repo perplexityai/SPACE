@@ -699,6 +699,31 @@ bootstrap_kind_stack__wait_for_job() {
     done
 }
 
+# The node-publication wait signs in as root@local, which only Tilt's
+# provision-local-console makes possible, and nothing else the bring-up waits
+# for depends on that step. Wait for it to succeed first, so its failure ends
+# the bring-up with its log instead of as a node-publication timeout.
+bootstrap_kind_stack__wait_for_console() {
+    local deadline=$(( $(date +%s) + BOOTSTRAP_TIMEOUT )) status now last_log_at
+    last_log_at=$(date +%s)
+    while :; do
+        status="$(bootstrap_kind_stack__tilt_update_statuses | awk '$1 == "provision-local-console" { print $2 }')"
+        [[ "$status" == ok ]] && return 0
+        bootstrap_kind_stack__die_on_failed_builds
+        bootstrap_kind_stack__die_on_failed_migration
+        now=$(date +%s)
+        if (( now >= deadline )); then
+            echo "ERROR: provision-local-console did not succeed within ${BOOTSTRAP_TIMEOUT}s (status: ${status:-unknown})" >&2
+            exit 1
+        fi
+        if (( now - last_log_at >= 30 )); then
+            echo "  ...waiting for provision-local-console (${status:-unknown}; timeout in $(( deadline - now ))s)"
+            last_log_at=$now
+        fi
+        sleep 2
+    done
+}
+
 # Every SPACE node published through ClusterApi and schedulable.
 bootstrap_kind_stack__wait_node_publication() {
     SPACE_KIND_CLUSTER="$KIND_CLUSTER" SPACE_KIND_API_URL="$API_URL" \
@@ -1800,6 +1825,8 @@ bootstrap_kind_stack__bring_up() {
 
     # Ready pods are not a registered node: each node's node-ctl publishes it
     # through ClusterApi, and only then does the API schedule onto it.
+    echo "[bootstrap] waiting for provision-local-console, which the node wait signs in through"
+    bootstrap_kind_stack__wait_for_console
     echo "[bootstrap] waiting for every SPACE node to be published and ready"
     bootstrap_kind_stack__wait_node_publication
 
