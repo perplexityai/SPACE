@@ -26,6 +26,15 @@ fn policy_observation_validates_shape_and_old_inventory_readers_omit_it() {
         crate::proto::ExecutionPolicyObservation::from(&legacy_policy),
         legacy_only
     );
+    let legacy_default = crate::proto::ExecutionPolicyObservation {
+        default_environment_reference: None,
+        ..wire.clone()
+    };
+    let parsed = ExecutionPolicyObservation::try_from(&legacy_default).unwrap();
+    assert_eq!(
+        crate::proto::ExecutionPolicyObservation::from(&parsed),
+        legacy_default
+    );
     let value = ExecutionPolicyObservation::try_from(&wire).unwrap();
     assert_eq!(crate::proto::ExecutionPolicyObservation::from(&value), wire);
     let applied = crate::proto::ExecutionPolicyObservation {
@@ -69,6 +78,7 @@ fn policy_observation_validates_shape_and_old_inventory_readers_omit_it() {
         },
         crate::proto::ExecutionPolicyObservation {
             default_environment_reference: None,
+            legacy_unbound_allowed: false,
             ..wire.clone()
         },
         crate::proto::ExecutionPolicyObservation {

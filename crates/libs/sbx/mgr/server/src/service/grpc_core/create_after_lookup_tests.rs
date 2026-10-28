@@ -828,8 +828,15 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         runtime.target.architecture = arch;
         let definition = EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap());
         let execution = definition.execution_requirements().unwrap();
-        let mut wire = pplx_space_execution_common::proto::ExecutionMetadata::from(&execution);
-        wire.environment = None;
+        let firecracker =
+            execution.runtime().kind == pplx_space_common_core::types::RuntimeKind::Firecracker;
+        let bound = definition.bind_execution(execution).unwrap();
+        let mut wire = pplx_space_execution_common::proto::ExecutionMetadata::from(&bound);
+        // Only Firecracker accepts historical, unbound disk evidence. Other
+        // adapters require the exact contract persisted by Create.
+        if firecracker {
+            wire.environment = None;
+        }
         // The disk may have been built by an older consumer of the same
         // kernel. The sandbox must keep the newly selected exact consumer.
         if environment.kernel().version.as_str() == "6.1.155" {
@@ -841,11 +848,10 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         let mut metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(build.dir.path().join("metadata.json")).unwrap())
                 .unwrap();
-        metadata["schema_version"] = 2.into();
+        metadata["schema_version"] = if firecracker { 2 } else { 3 }.into();
         metadata["execution"] = serde_json::to_value(&legacy).unwrap();
         let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
         std::fs::write(build.dir.path().join("metadata.json"), &metadata_bytes).unwrap();
-        let bound = definition.bind_execution(execution).unwrap();
         let response = ResolveExecutionEnvironmentResponse {
             accepted_selection: 0,
             definition: Some((&definition).into()),
@@ -873,6 +879,8 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         fixture.service.create_cache_dir = Some(cache.path().to_owned());
         let mut request = create_request();
         request.boot_mode = BootMode::Cold as i32;
+        request.auto_lifecycle = Some((&AutoLifecyclePolicy::disabled()).into());
+        request.auto_lifecycle_authority = crate::db::PolicyAuthority::Local.as_proto_i32();
         pplx_space_sbx_mgr_client::environment::bind(&mut request, definition.reference());
         let created = fixture.create(request).await.unwrap();
         assert_eq!(
@@ -953,8 +961,11 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
                 Evidence::Alias => wire.components[0].version = Some("legacy-kernel-label".into()),
                 Evidence::Runtime => wire.runtime.as_mut().unwrap().version = "1.16.0".into(),
                 Evidence::RuntimeKind => {
-                    wire.runtime.as_mut().unwrap().kind =
+                    wire.runtime.as_mut().unwrap().kind = if firecracker {
                         pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor as i32
+                    } else {
+                        pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32
+                    };
                 }
                 Evidence::Kernel => {
                     wire.components[0].digest = Some(format!("sha256:{}", "00".repeat(32)))
@@ -985,10 +996,13 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
                 cache.path(),
             )
             .await;
-            if matches!(
-                evidence,
-                Evidence::Matching | Evidence::Alias | Evidence::Runtime | Evidence::Reference
-            ) {
+            if matches!(evidence, Evidence::Matching)
+                || (firecracker
+                    && matches!(
+                        evidence,
+                        Evidence::Alias | Evidence::Runtime | Evidence::Reference
+                    ))
+            {
                 let source = source.unwrap();
                 assert!(source.existing_artifact);
                 assert_eq!(source.execution.environment(), Some(definition.reference()));

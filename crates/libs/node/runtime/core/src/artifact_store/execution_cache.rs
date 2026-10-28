@@ -140,10 +140,13 @@ impl SealedPlan {
 }
 
 impl ArtifactStore {
-    pub fn execution_release_path(parent: &Path, pin: &PinnedRelease) -> PathBuf {
-        parent
-            .join("managed/releases")
-            .join(managed_release_directory(&pin.release, pin.digest()))
+    pub fn execution_release_path(
+        parent: &Path,
+        pin: &PinnedRelease,
+    ) -> Result<PathBuf, PublishError> {
+        let root = parent.join("managed/releases");
+        existing_artifact_path(&root, &release_directory_names(&pin.release, pin.digest()))
+            .map_err(|error| io_publish("locate execution release", &root, error))
     }
 
     /// Stage both binaries on the verity-capable execution filesystem. The
@@ -158,7 +161,7 @@ impl ArtifactStore {
             directory: source,
             protection: RootProtection::Store,
         };
-        let target = Self::execution_release_path(parent, pin);
+        let target = Self::execution_release_path(parent, pin)?;
         source.require_if_uncached(&target)?;
         self.require_verity_api(parent)?;
         source.check_if_uncached(&target, self.owner)?;
@@ -177,7 +180,10 @@ impl ArtifactStore {
         let root = self.prepare_execution_namespace(parent, "releases")?;
         let target = self.stage_sealed_files(
             &root,
-            &managed_release_directory(&pin.release, pin.digest()),
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| StageExecutionError::InvalidSource(target.clone()))?,
             source,
             &files,
             pin.digest(),
@@ -192,14 +198,18 @@ impl ArtifactStore {
         parent: &Path,
     ) -> Result<PathBuf, StageExecutionError> {
         let source = SealedSource::Kernel(source);
-        let target = Self::execution_kernel_path(parent, pin);
+        let target = Self::execution_kernel_path(parent, pin)?;
         source.require_if_uncached(&target)?;
         self.require_verity_api(parent)?;
         source.check_if_uncached(&target, self.owner)?;
         let root = self.prepare_execution_namespace(parent, "kernels")?;
         let target = self.stage_sealed_files(
             &root,
-            &managed_kernel_directory(&pin.version, pin.sha256),
+            target
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| StageExecutionError::InvalidSource(target.clone()))?,
             source,
             &[SealedPlan::from_catalog(PlannedFile {
                 path: KERNEL_IMAGE,

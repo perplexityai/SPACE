@@ -21,7 +21,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::{
-    Arch, ArtifactVersion, Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+    Arch, ArtifactVersion, Digest, DigestPrefix, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -244,6 +244,25 @@ struct CompiledKernel {
     sha256: &'static str,
 }
 
+/// Reviewed upstream direct-boot images; download transport is independent
+/// of the node-manager content pins.
+const CLOUD_HYPERVISOR_KERNELS: &[CompiledKernel] = &[
+    CompiledKernel {
+        version: "7.2.8+",
+        runtime_line: "54.0",
+        architecture: "x86_64",
+        size: 48_205_848,
+        sha256: "edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a853",
+    },
+    CompiledKernel {
+        version: "7.2.8+",
+        runtime_line: "54.0",
+        architecture: "aarch64",
+        size: 24_177_152,
+        sha256: "8f8f3d5a983809f87a4e1e9a13053a3361fda47ef04e09c771a41c5e037cb6c2",
+    },
+];
+
 /// Reviewed Firecracker CI guest kernels. The bucket publishes no SHA-256;
 /// these pins identify inspected downloads. Source snapshots and verification
 /// procedure are documented in `docs/runtime-manager-catalog.md`.
@@ -381,44 +400,63 @@ pub fn release_digest<'a>(binaries: impl IntoIterator<Item = (&'a str, Digest)>)
     Digest::sha256(Sha256::digest(text.as_bytes()).into())
 }
 
-/// A managed directory retains both its diagnostic label and content identity.
+/// A managed directory is a compact locator, not a content identity. Full
+/// digests remain authoritative for verification, publication, and removal.
 /// This naming scheme is not used by external execution roots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedDirectoryName {
     label: String,
-    digest: Digest,
+    digest_prefix: DigestPrefix,
+    full_digest: Option<Digest>,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid managed artifact directory name {0:?}; expected <label>--<sha256>")]
+#[error(
+    "invalid managed artifact directory name {0:?}; expected <label>--<12 or 64 lowercase SHA-256 hex digits>"
+)]
 pub struct ManagedDirectoryNameParseError(String);
 
 impl ManagedDirectoryName {
     pub fn release(release: &RuntimeIdentity, digest: Digest) -> Self {
         Self {
             label: format!("v{}", release.version),
-            digest,
+            digest_prefix: digest.short_prefix(),
+            full_digest: None,
         }
     }
 
     pub fn kernel(version: &ArtifactVersion, digest: Digest) -> Self {
         Self {
             label: version.to_string(),
-            digest,
+            digest_prefix: digest.short_prefix(),
+            full_digest: None,
         }
+    }
+
+    pub fn matches_digest(&self, digest: Digest) -> bool {
+        self.full_digest
+            .map_or_else(|| self.digest_prefix.matches(digest), |full| full == digest)
     }
 
     pub fn label(&self) -> &str {
         &self.label
     }
-    pub fn digest(&self) -> Digest {
-        self.digest
+    pub fn digest_prefix(&self) -> &DigestPrefix {
+        &self.digest_prefix
     }
 }
 
 impl std::fmt::Display for ManagedDirectoryName {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}--{}", self.label, self.digest.hex_string())
+        write!(
+            formatter,
+            "{}--{}",
+            self.label,
+            self.full_digest.map_or_else(
+                || self.digest_prefix.hex_prefix().to_owned(),
+                |digest| digest.hex_string()
+            )
+        )
     }
 }
 
@@ -435,13 +473,22 @@ impl std::str::FromStr for ManagedDirectoryName {
         {
             return Err(invalid());
         }
-        if digest.len() != 64 {
+        if !matches!(digest.len(), 12 | 64) {
             return Err(invalid());
         }
-        let digest = format!("sha256:{digest}").parse().map_err(|_| invalid())?;
+        let full_digest: Option<Digest> = if digest.len() == 64 {
+            Some(format!("sha256:{digest}").parse().map_err(|_| invalid())?)
+        } else {
+            None
+        };
+        let digest_prefix = match full_digest {
+            Some(digest) => digest.short_prefix(),
+            None => format!("sha256:{digest}").parse().map_err(|_| invalid())?,
+        };
         Ok(Self {
             label: label.to_string(),
-            digest,
+            digest_prefix,
+            full_digest,
         })
     }
 }
@@ -614,7 +661,15 @@ impl RuntimeCatalog {
             }
             catalog.releases.push(pinned);
         }
-        for compiled in FIRECRACKER_KERNELS {
+        for (runtime, compiled) in FIRECRACKER_KERNELS
+            .iter()
+            .map(|pin| (RuntimeKind::Firecracker, pin))
+            .chain(
+                CLOUD_HYPERVISOR_KERNELS
+                    .iter()
+                    .map(|pin| (RuntimeKind::CloudHypervisor, pin)),
+            )
+        {
             let entry = || format!("kernel {} {}", compiled.version, compiled.architecture);
             let field = |field, value| CatalogError::Compiled {
                 entry: entry(),
@@ -624,7 +679,7 @@ impl RuntimeCatalog {
             catalog.kernels.push(PinnedKernel {
                 version: ArtifactVersion::parse(compiled.version)
                     .map_err(|_| field("version", compiled.version))?,
-                runtime: RuntimeKind::Firecracker,
+                runtime,
                 runtime_line: RuntimeVersion::parse(compiled.runtime_line)
                     .map_err(|_| field("runtime_line", compiled.runtime_line))?,
                 architecture: compiled

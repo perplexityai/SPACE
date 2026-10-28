@@ -1561,12 +1561,12 @@ fn diagnostic_runtime_version(
 
 fn check_directory_digest(artifact: &mut ScannedArtifact, directory: &ManagedDirectoryName) {
     if let Some(found) = artifact.digest
-        && found != directory.digest()
+        && !directory.matches_digest(found)
     {
         artifact.status = ArtifactStatus::Invalid;
         artifact.detail = Some(format!(
-            "managed directory claims {}, but installed bytes have {found}",
-            directory.digest()
+            "managed directory prefix {} does not match installed bytes {found}",
+            directory.digest_prefix()
         ));
     }
 }

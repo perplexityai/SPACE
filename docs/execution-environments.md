@@ -468,6 +468,17 @@ cache files are sealed and measured against independently pinned verity digests.
 The profile uses SHA-256, 4096-byte blocks and no salt. Verity digests are separate
 catalog metadata: E0 and the other environment references do not change.
 
+Managed runtime and kernel directories use `<version>--<12 hex digits>`, where
+that suffix is a SHA-256 prefix used only as a locator. Catalog pins, execution
+identities and verification retain full digests. An existing directory whose
+bytes do not match the requested full pins is refused; a prefix collision never
+overwrites or adopts another artifact. Removal also checks the full digest.
+The same naming rule applies to the execution cache. Deploy matching
+node-manager, runtime-manager and supervisor versions before installing managed
+artifacts. This layout replaces the full-digest directory names; existing
+managed development installs must be reinstalled or renamed while unused. Baked
+E0 paths are unchanged.
+
 Existing cache files are sealed in place. Node-manager warms the cache in tracked
 background work at startup; inventory consumers await the same serialized discovery,
 while unrelated lifecycle RPCs can serve. For missing copies, source presence is
@@ -799,16 +810,19 @@ SPACE_DEFAULT_EXECUTION_ENVIRONMENT=e0
 ```
 
 On x86_64, absent settings mean `e0,legacy` and default `e0`. Compiled names
-are `e0`, `fc-1.17.0-linux-6.1.155`, and `fc-1.17.0-linux-6.18.44`.
+include `e0`, `fc-1.17.0-linux-6.1.155`, `fc-1.17.0-linux-6.18.44`, and
+`ch-54.0-linux-7.2.8`.
 `legacy` is a separate permission for unbound historical contracts, not an
 environment reference or a selectable default on x86_64. The default must be
 allowed. Surrounding whitespace is ignored. Empty, duplicate or unknown names
 fail startup. Compiled names resolve to immutable references and cannot approve arbitrary downloads or unqualified
-pairs. On aarch64, where no environment descriptor is qualified, absent settings
-mean `legacy` for both settings: builders and activations retain the existing
-unbound initial contract. The report has no compiled references or default but
-has `legacy_unbound_allowed=true`. Explicit compiled names fail startup on that
-architecture; existing artifact pins do not establish environment qualification.
+pairs. On aarch64, where the initial Firecracker contract has no compiled
+environment descriptor, absent settings mean `legacy` for both settings: builders
+and activations retain the existing unbound initial contract. That default report
+has no compiled references or default and has `legacy_unbound_allowed=true`.
+The compiled `ch-54.0-linux-7.2.8` name can be explicitly allowed on ARM64 as well
+as x86-64; its reference is architecture-specific. Installing artifacts alone does
+not add it to the effective policy.
 
 The configured default is used only for work without source or exact selection.
 A bound source prefers its exact environment, then compatible fallback if it is

@@ -238,6 +238,39 @@ fn a_managed_copy_of_the_image_kernel_is_verified_and_removable() {
         0o644
     );
 
+    // A shared directory prefix must never authorize different full bytes.
+    let mut collision = kernel("6.1.155", 8192);
+    let Digest::Sha256(mut bytes) = collision.sha256 else {
+        panic!("kernel pins use SHA-256");
+    };
+    *bytes.last_mut().unwrap() ^= 1;
+    collision.sha256 = Digest::sha256(bytes);
+    assert_eq!(
+        managed_kernel_directory(&collision.version, collision.sha256),
+        published.path.file_name().unwrap().to_str().unwrap()
+    );
+    let error = fixture
+        .store
+        .publish_kernel(&collision, &staged("job-2"))
+        .unwrap_err();
+    assert!(
+        matches!(error, PublishError::ExistingArtifact(_)),
+        "{error}"
+    );
+    fixture
+        .store
+        .verify_kernel_at(&collision, &installed)
+        .unwrap_err();
+    let error = fixture
+        .store
+        .remove_kernel(&collision.version, collision.sha256)
+        .unwrap_err();
+    assert!(
+        matches!(error, RemoveError::IdentityChanged { .. }),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&installed).unwrap(), image);
+
     let version = ArtifactVersion::parse("6.1.155").unwrap();
     assert!(matches!(
         fixture
@@ -587,5 +620,55 @@ fn artifact_io_retries_require_a_recoverable_path_error() {
         assert_eq!(publish.is_transient(), transient, "publish errno {errno}");
         assert_eq!(remove.is_transient(), transient, "remove errno {errno}");
         assert_eq!(StageExecutionError::from(verify).is_transient(), transient);
+    }
+}
+
+#[test]
+fn historical_and_compact_release_copies_remain_verified_and_removable() {
+    for duplicate in [false, true] {
+        let fixture = Fixture::new();
+        let pin = pin("1.15.1", 1);
+        let names = release_directory_names(&pin.release, pin.digest());
+        let compact = fixture.releases.join(&names[0]);
+        let historical = fixture.releases.join(&names[1]);
+        std::fs::rename(&compact, &historical).unwrap();
+        assert_eq!(fixture.store.verify_release(&pin).unwrap().path, historical);
+        let existing = fixture
+            .store
+            .publish_release(&pin, &staged("not-downloaded"))
+            .unwrap();
+        assert_eq!(existing.outcome, PublishOutcome::AlreadyPresent);
+        assert_eq!(existing.path, historical);
+        assert!(!compact.exists());
+        if duplicate {
+            fixture.place_release("1.15.1", 1);
+            assert_eq!(fixture.store.verify_release(&pin).unwrap().path, compact);
+            let historical_binary = historical.join("bin/firecracker");
+            let original = std::fs::read(&historical_binary).unwrap();
+            std::fs::write(&historical_binary, b"changed").unwrap();
+            assert!(matches!(
+                fixture.store.remove_release(&pin.release, pin.digest()),
+                Err(RemoveError::IdentityChanged { .. })
+            ));
+            assert!(compact.exists(), "refusal must preserve the verified copy");
+            assert!(historical.exists());
+            std::fs::write(historical_binary, original).unwrap();
+        }
+        assert_eq!(
+            fixture
+                .store
+                .remove_release(&pin.release, pin.digest())
+                .unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert!(!compact.exists());
+        assert!(!historical.exists());
+        assert_eq!(
+            fixture
+                .store
+                .remove_release(&pin.release, pin.digest())
+                .unwrap(),
+            RemoveOutcome::Absent
+        );
     }
 }

@@ -60,7 +60,7 @@ pub struct RuntimeManagerService {
     audit_identity: AuditIdentity,
     peer_authorizer: UdsPeerAuthorizer,
     /// Where available kernels are listed from and installs download from.
-    kernel_source: Option<Arc<dyn KernelSource>>,
+    kernel_source: crate::installs::source::KernelSources,
     pins: Option<Arc<dyn crate::installs::PinSource>>,
     releases: crate::installs::ReleaseSources,
     /// Present unless the service runs list-only.
@@ -87,7 +87,7 @@ impl RuntimeManagerService {
                 SERVICE_NAME.as_str(),
                 [UdsPeerAccount::with_linux_user(users::SPACE_NODECTL)],
             ),
-            kernel_source: None,
+            kernel_source: Default::default(),
             installer: None,
             pins: None,
             releases: Default::default(),
@@ -95,8 +95,11 @@ impl RuntimeManagerService {
     }
 
     /// List available kernels from `source`.
-    pub(crate) fn with_kernel_source(mut self, source: Arc<dyn KernelSource>) -> Self {
-        self.kernel_source = Some(source);
+    pub(crate) fn with_kernel_source(
+        mut self,
+        source: crate::installs::source::KernelSources,
+    ) -> Self {
+        self.kernel_source = source;
         self
     }
 
@@ -125,9 +128,14 @@ impl RuntimeManagerService {
         })
     }
 
-    fn kernel_source(&self) -> Result<&Arc<dyn KernelSource>, Status> {
-        self.kernel_source.as_ref().ok_or_else(|| {
-            Status::failed_precondition("the runtime manager has no kernel source configured")
+    fn kernel_source(
+        &self,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+    ) -> Result<&Arc<dyn KernelSource>, Status> {
+        self.kernel_source.get(runtime).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "the runtime manager has no kernel source configured for {runtime}"
+            ))
         })
     }
 }
@@ -215,7 +223,12 @@ fn parse_identity(value: Option<&ArtifactIdentity>) -> Result<RequestedArtifact,
         None => Err(Status::invalid_argument("artifact identity is required")),
     }
 }
-fn presence(path: &std::path::Path) -> ArtifactPresence {
+fn presence(root: &std::path::Path, names: &[String; 2]) -> ArtifactPresence {
+    let path =
+        match pplx_space_node_runtime_core::artifact_store::existing_artifact_path(root, names) {
+            Ok(path) => path,
+            Err(_) => return ArtifactPresence::Unreadable,
+        };
     match std::fs::symlink_metadata(path) {
         Ok(_) => ArtifactPresence::Present,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ArtifactPresence::Absent,
@@ -435,12 +448,7 @@ impl RuntimeManager for RuntimeManagerService {
             .map_err(|error| Status::failed_precondition(describe(&error)))?;
         let mut offered = Vec::new();
         if kinds.kernels {
-            let source = self.kernel_source()?;
-            if source.runtime() != runtime {
-                return Err(Status::failed_precondition(
-                    "no component adapter for this runtime",
-                ));
-            }
+            let source = self.kernel_source(runtime)?;
             let mut lines = match line {
                 Some(line) => vec![line],
                 None => catalog
@@ -481,9 +489,8 @@ impl RuntimeManager for RuntimeManagerService {
                         size: None,
                         source: releases.source.root().to_string(),
                         presence: presence(
-                            &releases
-                                .root
-                                .join(pplx_space_node_runtime_core::artifact_store::managed_release_directory(&pin.release, pin.digest())),
+                            &releases.root,
+                            &pplx_space_node_runtime_core::artifact_store::release_directory_names(&pin.release, pin.digest()),
                         ) as i32,
                         compatible_runtimes: Vec::new(),
                     });
@@ -519,7 +526,7 @@ impl RuntimeManager for RuntimeManagerService {
                     presence: kernels_root
                         .as_ref()
                         .map_or(ArtifactPresence::Unspecified, |root| {
-                            presence(&root.join(pplx_space_node_runtime_core::artifact_store::managed_kernel_directory(&pin.version, pin.sha256)))
+                            presence(root, &pplx_space_node_runtime_core::artifact_store::kernel_directory_names(&pin.version, pin.sha256))
                         }) as i32,
                     compatible_runtimes: catalog
                         .releases(runtime, architecture)

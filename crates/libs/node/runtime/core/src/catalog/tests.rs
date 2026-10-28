@@ -228,23 +228,48 @@ fn a_catalog_another_account_could_write_is_refused() {
 }
 
 #[test]
-fn managed_directory_names_retain_labels_and_digests() {
+fn managed_directory_names_retain_labels_and_digest_prefixes() {
     let digest = Digest::sha256([0xab; 32]);
     for label in ["v1.15.1", "6.1.155", "custom--build"] {
-        let text = format!("{label}--{}", digest.hex_string());
-        let name: ManagedDirectoryName = text.parse().unwrap();
-        assert_eq!(name.label(), label);
-        assert_eq!(name.digest(), digest);
-        assert_eq!(name.to_string(), text);
+        for suffix in ["abababababab".to_owned(), digest.hex_string()] {
+            let text = format!("{label}--{suffix}");
+            let name: ManagedDirectoryName = text.parse().unwrap();
+            assert_eq!(name.label(), label);
+            assert!(name.matches_digest(digest));
+            let mut different = [0xab; 32];
+            different[31] = 0xcd;
+            assert_eq!(
+                name.matches_digest(Digest::sha256(different)),
+                suffix.len() == 12
+            );
+            assert_eq!(name.digest_prefix().hex_prefix(), "abababababab");
+            assert_eq!(name.to_string(), text);
+        }
+        assert_eq!(
+            ManagedDirectoryName::kernel(&ArtifactVersion::parse(label).unwrap(), digest)
+                .to_string(),
+            format!("{label}--abababababab")
+        );
     }
-    for name in ["1.15.1", "--", "../v1--", "v1--not-a-digest"] {
+    for name in [
+        "1.15.1",
+        "--",
+        "../v1--",
+        "v1--not-a-digest",
+        "v1--ABABABABABAB",
+        "v1--abababababa",
+        "v1--ababababababa",
+    ] {
         name.parse::<ManagedDirectoryName>().unwrap_err();
     }
 }
 
 #[test]
 fn every_qualified_environment_has_pinned_verity_sources() {
-    for environment in CompiledEnvironment::for_architecture(Arch::X86_64).unwrap() {
+    for environment in [Arch::X86_64, Arch::Aarch64]
+        .into_iter()
+        .flat_map(|arch| CompiledEnvironment::for_architecture(arch).unwrap())
+    {
         for binary in &environment.release().binaries {
             assert!(compiled_verity_digest(binary.sha256).unwrap().is_some());
         }
@@ -253,5 +278,13 @@ fn every_qualified_environment_has_pinned_verity_sources() {
                 .unwrap()
                 .is_some()
         );
+    }
+    // ARM64 is installable for qualification, even while execution is gated.
+    for kernel in RuntimeCatalog::compiled()
+        .unwrap()
+        .all_kernels(Arch::Aarch64)
+        .filter(|pin| pin.runtime == RuntimeKind::CloudHypervisor)
+    {
+        assert!(compiled_verity_digest(kernel.sha256).unwrap().is_some());
     }
 }

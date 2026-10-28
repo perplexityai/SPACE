@@ -8,15 +8,12 @@ use super::describe;
 use super::operations::{InstallLimits, InstallOperation};
 use super::publisher::{ArtifactPublisher, NodeArtifactRef, PinSource};
 use super::release::ReleaseSources;
-use super::source::KernelSource;
+use super::source::KernelSources;
 use super::staging;
 use super::store::{self, JobOutcome, JobPhase, JobResult};
 use pplx_space_common_core::types::{Arch, Digest, JobId};
 use pplx_space_common_jobs::{Job, JobError, JobExecutor};
-use pplx_space_node_runtime_core::artifact_store::{
-    StagedName, kernel_staging, managed_kernel_directory, managed_release_directory,
-    release_staging,
-};
+use pplx_space_node_runtime_core::artifact_store::{StagedName, kernel_staging, release_staging};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -32,7 +29,7 @@ pub(crate) struct ExecutorParts {
     pub(crate) staging: PathBuf,
     pub(crate) limits: InstallLimits,
     pub(crate) host_arch: Arch,
-    pub(crate) source: Arc<dyn KernelSource>,
+    pub(crate) source: KernelSources,
     pub(crate) releases: ReleaseSources,
     pub(crate) publisher: Arc<dyn ArtifactPublisher>,
     pub(crate) pins: Arc<dyn PinSource>,
@@ -43,7 +40,7 @@ pub(super) struct ExecutorContext {
     pub(super) staging: PathBuf,
     pub(super) limits: InstallLimits,
     pub(super) host_arch: Arch,
-    pub(super) source: Arc<dyn KernelSource>,
+    pub(super) source: KernelSources,
     pub(super) releases: ReleaseSources,
     pub(super) publisher: Arc<dyn ArtifactPublisher>,
     pub(super) pins: Arc<dyn PinSource>,
@@ -97,22 +94,30 @@ impl InstallExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(super) fn target(&self, artifact: &NodeArtifactRef) -> Result<PathBuf, JobError> {
+    fn target_names(&self, artifact: &NodeArtifactRef) -> Result<(&Path, [String; 2]), JobError> {
+        use pplx_space_node_runtime_core::artifact_store::{
+            kernel_directory_names, release_directory_names,
+        };
         match artifact {
-            NodeArtifactRef::Kernel(version, digest) => Ok(self.context.kernels_root.join(
-                managed_kernel_directory(version.artifact_version(), *digest),
+            NodeArtifactRef::Kernel(version, digest) => Ok((
+                &self.context.kernels_root,
+                kernel_directory_names(version.artifact_version(), *digest),
             )),
-            NodeArtifactRef::Release(release, digest) => self
-                .context
-                .releases
-                .get(release.kind)
-                .map(|context| {
-                    context
-                        .root
-                        .join(managed_release_directory(release, *digest))
-                })
-                .ok_or_else(|| JobError::permanent("release management is disabled")),
+            NodeArtifactRef::Release(release, digest) => {
+                let context = self
+                    .context
+                    .releases
+                    .get(release.kind)
+                    .ok_or_else(|| JobError::permanent("release management is disabled"))?;
+                Ok((&context.root, release_directory_names(release, *digest)))
+            }
         }
+    }
+
+    pub(super) fn target(&self, artifact: &NodeArtifactRef) -> Result<PathBuf, JobError> {
+        let (root, names) = self.target_names(artifact)?;
+        pplx_space_node_runtime_core::artifact_store::existing_artifact_path(root, &names)
+            .map_err(|error| retriable(&error))
     }
 
     fn staged_root(&self, request: &InstallOperation, job_id: JobId) -> Option<PathBuf> {
@@ -197,21 +202,34 @@ impl InstallExecutor {
         cancellation: &CancellationToken,
     ) -> Result<i64, JobError> {
         let artifact = request.artifact();
-        let target = self.target(&artifact)?;
         let checking = self.clone();
         let checked = request.clone();
-        let (digest, earlier) = tokio::task::spawn_blocking(move || {
+        let (target, digest, earlier) = tokio::task::spawn_blocking(move || {
             let digest = Self::expected_digest(&checked);
             let earlier = store::get_job_result(&checking.db(), &job_id)
                 .map_err(|error| retriable(&error))?;
-            Ok::<_, JobError>((digest, earlier))
+            // Keep the durable operation locator after removal or when another
+            // layout appears. Only the two exact digest locators are compatible.
+            let artifact = checked.artifact();
+            let target = if let Some(result) = &earlier {
+                let (root, names) = checking.target_names(&artifact)?;
+                if !names.iter().any(|name| root.join(name) == result.path()) {
+                    return Err(JobError::permanent(
+                        "operation store path changed; restore its original configuration",
+                    ));
+                }
+                result.path().to_path_buf()
+            } else {
+                checking.target(&artifact)?
+            };
+            Ok::<_, JobError>((target, digest, earlier))
         })
         .await
         .map_err(|error| retriable(&error))??;
         if let Some(result) = &earlier {
-            if result.path() != target || result.digest() != digest {
+            if result.digest() != digest {
                 return Err(JobError::permanent(
-                    "operation store path or identity changed; restore its original configuration",
+                    "operation identity changed; restore its original configuration",
                 ));
             }
             if matches!(result, JobResult::Done { .. }) {
