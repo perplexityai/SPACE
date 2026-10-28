@@ -10,6 +10,7 @@ pub(crate) mod fields;
 pub(crate) mod node_role;
 pub(crate) mod node_status;
 pub(crate) mod quarantine;
+pub(crate) mod quarantine_claim;
 pub(crate) mod receipts;
 pub(crate) mod sandbox_identity;
 pub(crate) mod sandbox_metadata;

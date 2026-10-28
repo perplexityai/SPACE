@@ -47,6 +47,7 @@ use crate::node_publish::validate::fields::{
 use crate::node_publish::validate::quarantine::{
     QuarantineRecoveryProjectionState, quarantine_recovery_projection,
 };
+use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
 use crate::node_publish::validate::receipts::{self, PublishedTransitionReceiptError};
 use crate::node_publish::validate::sandbox_identity::SandboxIdentityEvidence;
 use crate::node_publish::validate::sandbox_metadata::{PublishedRuntimeLabel, policy_authority};
@@ -206,35 +207,25 @@ fn render_observed_state_expression(template: &str, source: &str, column: &str) 
         .replace("{column}", column)
 }
 
-#[derive(Clone, Debug)]
-struct QuarantineProjectionInput {
-    sandbox_id: SandboxId,
-    failure_reason: Option<String>,
-    source: SandboxQuarantineSource,
-    reason_code: SandboxQuarantineReasonCode,
-    quarantine_id: Uuid,
-    history_id: Uuid,
-}
-
 #[derive(Clone, Debug, serde::Serialize)]
 struct QuarantineProjectionSqlInput<'a> {
     sandbox_id: SandboxId,
-    failure_reason: &'a Option<String>,
+    failure_reason: Option<&'a str>,
     source: &'static str,
     reason_code: &'static str,
     quarantine_id: Uuid,
     history_id: Uuid,
 }
 
-impl QuarantineProjectionInput {
-    fn sql_input(&self) -> QuarantineProjectionSqlInput<'_> {
-        QuarantineProjectionSqlInput {
-            sandbox_id: self.sandbox_id,
-            failure_reason: &self.failure_reason,
-            source: self.source.as_str(),
-            reason_code: self.reason_code.as_str(),
-            quarantine_id: self.quarantine_id,
-            history_id: self.history_id,
+impl<'a> QuarantineProjectionSqlInput<'a> {
+    fn materialize(claim: &'a QuarantineClaim) -> Self {
+        Self {
+            sandbox_id: claim.sandbox_id(),
+            failure_reason: claim.failure_reason(),
+            source: claim.source().as_str(),
+            reason_code: claim.reason_code().as_str(),
+            quarantine_id: Uuid::now_v7(),
+            history_id: Uuid::now_v7(),
         }
     }
 }
@@ -1227,41 +1218,17 @@ pub async fn publish_sandbox_states(
         let quarantine_count = quarantine_inputs.len();
         let mut row_publishes_network_policy = false;
         let parse_result = (|| -> Result<(), Status> {
-            if optional_trimmed(state.status.as_deref())
-                .is_some_and(|status| status.eq_ignore_ascii_case("quarantined"))
-            {
-                let (source, reason_code) = match optional_trimmed(
-                    state.quarantine_reason_code.as_deref(),
-                ) {
-                    Some(value) => match value.parse::<SandboxQuarantineReasonCode>() {
-                        Ok(reason_code) => (SandboxQuarantineSource::SbxManager, reason_code),
-                        Err(error) => {
-                            tracing::warn!(
-                                %node_id,
-                                %sandbox_id,
-                                quarantine_reason_code = %value,
-                                %error,
-                                "downgrading unknown node quarantine reason without rejecting state publication"
-                            );
-                            (
-                                SandboxQuarantineSource::NodeStatePublish,
-                                SandboxQuarantineReasonCode::NodePublishedQuarantined,
-                            )
-                        }
-                    },
-                    None => (
-                        SandboxQuarantineSource::NodeStatePublish,
-                        SandboxQuarantineReasonCode::NodePublishedQuarantined,
-                    ),
-                };
-                quarantine_inputs.push(QuarantineProjectionInput {
-                    sandbox_id,
-                    failure_reason: optional_trimmed(state.failure_reason.as_deref()),
-                    source,
-                    reason_code,
-                    quarantine_id: Uuid::now_v7(),
-                    history_id: Uuid::now_v7(),
-                });
+            if let Some(claim) = QuarantineClaim::from_proto(sandbox_id, state) {
+                if let Some((value, error)) = claim.unrecognized_reason() {
+                    tracing::warn!(
+                        %node_id,
+                        %sandbox_id,
+                        quarantine_reason_code = %value,
+                        %error,
+                        "downgrading unknown node quarantine reason without rejecting state publication"
+                    );
+                }
+                quarantine_inputs.push(claim);
             }
 
             let observed_network_policy = state
@@ -2318,7 +2285,7 @@ pub async fn publish_sandbox_states(
     if !quarantine_inputs.is_empty() {
         let quarantine_sql_inputs = quarantine_inputs
             .iter()
-            .map(QuarantineProjectionInput::sql_input)
+            .map(QuarantineProjectionSqlInput::materialize)
             .collect::<Vec<_>>();
         let quarantine_rows_json = Json(
             serde_json::to_value(&quarantine_sql_inputs)
