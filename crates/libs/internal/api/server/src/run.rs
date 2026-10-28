@@ -15,7 +15,8 @@ use tonic::transport::server::TcpIncoming;
 
 use crate::auth;
 use crate::{ClusterApiService, ClusterNodeInfoService};
-use pplx_space_node_api_client::proto::cluster_api_server::ClusterApiServer;
+use pplx_space_cluster_api_client::proto::cluster_api_server::ClusterApiServer as NewClusterApiServer;
+use pplx_space_node_api_client::proto::cluster_api_server::ClusterApiServer as OldClusterApiServer;
 use pplx_space_node_api_client::proto::node_info_server::NodeInfoServer;
 
 /// The service name internal-api reports to telemetry and names its
@@ -35,8 +36,12 @@ pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:9800";
 // Keep a bounded receive allocation while allowing substantial census growth.
 const CLUSTER_API_MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
 
-fn cluster_api_server(service: ClusterApiService) -> ClusterApiServer<ClusterApiService> {
-    ClusterApiServer::new(service).max_decoding_message_size(CLUSTER_API_MAX_DECODE_BYTES)
+fn cluster_api_server(service: ClusterApiService) -> OldClusterApiServer<ClusterApiService> {
+    OldClusterApiServer::new(service).max_decoding_message_size(CLUSTER_API_MAX_DECODE_BYTES)
+}
+
+fn new_cluster_api_server(service: ClusterApiService) -> NewClusterApiServer<ClusterApiService> {
+    NewClusterApiServer::new(service).max_decoding_message_size(CLUSTER_API_MAX_DECODE_BYTES)
 }
 
 /// Connection ceiling for the template-visibility sideline pool.
@@ -318,6 +323,9 @@ pub async fn run(
         .register_encoded_file_descriptor_set(
             pplx_space_node_api_client::proto::CLUSTER_FILE_DESCRIPTOR_SET,
         )
+        .register_encoded_file_descriptor_set(
+            pplx_space_cluster_api_client::proto::CLUSTER_FILE_DESCRIPTOR_SET,
+        )
         .build_v1()?;
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
 
@@ -352,7 +360,8 @@ pub async fn run(
         .layer(publisher_auth)
         .add_service(health_service)
         .add_service(reflection)
-        .add_service(cluster_api_server(svc))
+        .add_service(cluster_api_server(svc.clone()))
+        .add_service(new_cluster_api_server(svc))
         .add_service(NodeInfoServer::new(node_info));
 
     // Spawned after the last fallible setup step, so a replica that never

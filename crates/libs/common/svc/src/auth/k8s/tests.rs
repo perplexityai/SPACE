@@ -144,21 +144,26 @@ async fn data_plane_identity_cannot_reuse_guest_authority_for_control_or_transfe
             ("UnstableResetSandboxServiceRoute", true),
             ("FutureSessionAdministration", false),
         ] {
-            let result = reviewer.authorize_username(
-                &cluster_policy,
-                AuthSurface::Normal,
-                &format!("/space.node.api.v1.ClusterApi/{method}"),
-                username,
-                false,
-            );
-            if allowed {
-                result.unwrap();
-            } else {
-                assert_eq!(
-                    result.unwrap_err().code(),
-                    tonic::Code::PermissionDenied,
-                    "{method}"
+            for service in [
+                "space.node.api.v1.ClusterApi",
+                "space.cluster.api.v1.ClusterApi",
+            ] {
+                let result = reviewer.authorize_username(
+                    &cluster_policy,
+                    AuthSurface::Normal,
+                    &format!("/{service}/{method}"),
+                    username,
+                    false,
                 );
+                if allowed {
+                    result.unwrap();
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().code(),
+                        tonic::Code::PermissionDenied,
+                        "{service}/{method}"
+                    );
+                }
             }
         }
     }

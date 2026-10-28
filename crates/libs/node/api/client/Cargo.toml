@@ -35,6 +35,7 @@ pplx-space-common-grpc-lb = { workspace = true, optional = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-net-gateway-client = { workspace = true }
+pplx-space-node-api-types = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }

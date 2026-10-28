@@ -77,20 +77,26 @@ async fn publication_never_accepts_the_shared_static_credential() {
         .await
         .unwrap();
 
-    for method in [
-        "RegisterTemplate",
-        "RegisterTemplateRelease",
-        "CreateSystemTemplatePublicationGrant",
+    for service in [
+        "space.node.api.v1.ClusterApi",
+        "space.cluster.api.v1.ClusterApi",
     ] {
-        let result = layer
-            .authenticator
-            .authenticate(
-                &format!("/space.node.api.v1.ClusterApi/{method}"),
-                Some("Bearer secret"),
-            )
-            .await;
+        for method in [
+            "RegisterTemplate",
+            "RegisterTemplateRelease",
+            "CreateSystemTemplatePublicationGrant",
+        ] {
+            let result = layer
+                .authenticator
+                .authenticate(&format!("/{service}/{method}"), Some("Bearer secret"))
+                .await;
 
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+            assert_eq!(
+                result.unwrap_err().code(),
+                tonic::Code::Unauthenticated,
+                "{service}/{method}"
+            );
+        }
     }
 }
 

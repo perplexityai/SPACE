@@ -607,6 +607,16 @@ impl AuthSurface {
     }
 }
 
+/// Strips the ClusterApi service prefix from a gRPC path, returning the method.
+///
+/// internal-api serves the same ClusterApi handlers under the legacy
+/// `space.node.api.v1` package and the split `space.cluster.api.v1` package, so
+/// per-method authorization must treat both paths as one method.
+fn cluster_api_method(path: &str) -> Option<&str> {
+    path.strip_prefix("/space.node.api.v1.ClusterApi/")
+        .or_else(|| path.strip_prefix("/space.cluster.api.v1.ClusterApi/"))
+}
+
 fn auth_surface(path: &str) -> Option<AuthSurface> {
     if matches!(
         path,
