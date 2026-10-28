@@ -6,3 +6,4 @@
 
 pub(crate) mod fields;
 pub(crate) mod quarantine;
+pub(crate) mod templates;
