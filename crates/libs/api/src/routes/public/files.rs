@@ -249,45 +249,25 @@ pub async fn write_file(
         .chunks(&chunks);
     let fingerprint = fingerprint.finish()?;
     let guest_key = guest_key(WRITE_FILE, &idempotency_key, &fingerprint)?;
-    let binding = bind_request_key(&state, &sandbox, WRITE_FILE, &idempotency_key, &fingerprint);
+    bind_request_key(&state, &sandbox, WRITE_FILE, &idempotency_key, &fingerprint).await?;
     let metric = SandboxApiMetricIdentity::native("files_write");
     if !parents {
-        // Bind the key while the write connects, which hides the binding's
-        // round trip, but hold the open message until the key is bound. A
-        // refused key ends the stream before it opens, which the sandbox
-        // manager rejects before the guest sees anything. Connecting may
-        // still have woken a dormant sandbox, as the request would have.
-        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-        let mut requests = Some(spaced_write_requests(
-            sandbox.id, path, append, guest_key, chunks, user,
-        ));
-        let requests = stream::once(bound_rx).flat_map(move |bound| {
-            stream::iter(
-                requests
-                    .take()
-                    .filter(|_| bound == Ok(true))
-                    .into_iter()
-                    .flatten(),
+        let response = state
+            .sandbox_controller
+            .spaced_write(
+                &state.pool,
+                &sandbox,
+                metric,
+                stream::iter(spaced_write_requests(
+                    sandbox.id, path, append, guest_key, chunks, user,
+                )),
             )
-        });
-        let binding = async {
-            let result = binding.await;
-            let _ = bound_tx.send(result.is_ok());
-            result
-        };
-        let (bound, response) = tokio::join!(
-            binding,
-            state
-                .sandbox_controller
-                .spaced_write(&state.pool, &sandbox, metric, requests),
-        );
-        bound?;
-        let response = response.map_err(controller_error)?;
+            .await
+            .map_err(controller_error)?;
         return Ok(Json(FileWriteResponse {
             bytes_written: response.bytes_written,
         }));
     }
-    binding.await?;
     // Kept for a second attempt; each attempt copies one chunk at a time.
     let chunks: Arc<[Vec<u8>]> = chunks.into();
     let attempt = |key: IdempotencyKey| {

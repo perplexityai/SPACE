@@ -763,6 +763,71 @@ mod key_binding {
         Ok(())
     }
 
+    /// A refused write is answered before the API asks for the sandbox's
+    /// runtime, so it can neither charge an implicit wake nor restore a
+    /// dormant sandbox. Runtime acquisition starts at the drain gate, whose
+    /// snapshot check reads `snapshot_storage_locations`; with that table
+    /// locked, a refused write still gets its 409, while the same write under
+    /// its own key waits on the lock.
+    #[tokio::test]
+    async fn a_refused_write_never_acquires_the_runtime() -> TestDbResult<()> {
+        use sqlx::Connection as _;
+
+        let fixture = fixture().await?;
+        let sandbox = &fixture.sandbox_id;
+        let key = "file-write-before-runtime";
+        let write = |data: &[u8]| {
+            json!({
+                "path": "/workspace/a",
+                "data_base64": BASE64_STANDARD.encode(data),
+            })
+        };
+        let (status, body) = post(&fixture, sandbox, "write", key, &write(b"first")).await?;
+        assert!(!is_conflict(status, &body), "{body}");
+
+        let mut lock = sqlx::PgConnection::connect(&fixture.db.database_url).await?;
+        let mut held = lock.begin().await?;
+        sqlx::query(sql!(
+            "LOCK TABLE snapshot_storage_locations IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(&mut *held)
+        .await?;
+
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            post(&fixture, sandbox, "write", key, &write(b"other")),
+        )
+        .await
+        .map_err(|_| "the refused write waited on runtime acquisition")??;
+        assert!(is_conflict(status, &body), "{body}");
+
+        let retry = {
+            let app = fixture.app.clone();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/sandboxes/{sandbox}/files:write"))
+                .header("authorization", format!("Bearer {KEY}"))
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(serde_json::to_vec(&write(b"first"))?))?;
+            tokio::spawn(app.oneshot(request))
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            !retry.is_finished(),
+            "the bound write did not wait on runtime acquisition, so the lock proves nothing"
+        );
+        held.rollback().await?;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), retry).await???;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        assert!(
+            !is_conflict(status, &serde_json::from_slice(&body)?),
+            "{status}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_reused_batch_key_refuses_other_entries() -> TestDbResult<()> {
         let fixture = fixture().await?;
