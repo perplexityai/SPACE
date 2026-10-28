@@ -7,7 +7,9 @@ use sqlx::types::Json;
 use tonic::Status;
 
 use crate::node_publish::validate::execution_inventory::ValidatedExecutionInventory;
-use crate::node_publish::validate::execution_observation::{Report, decode};
+use crate::node_publish::validate::execution_observation::{
+    ExecutionInventoryEvidence, Report, ValidatedReport, decode,
+};
 use crate::proto::ExecutionInventoryObservation;
 
 /// The outcome recorded only when the surrounding publication commits.
@@ -70,25 +72,23 @@ pub(super) async fn publish(
     let Some(PreparedObservation { node_id, report }) = prepared else {
         return Ok(None);
     };
-    let (status, inventory) = match report {
-        Report::Complete(inventory) => (InventoryStatus::Complete, Some(inventory)),
-        Report::Legacy(inventory) => (InventoryStatus::Legacy, Some(inventory)),
-        Report::Unavailable => (InventoryStatus::Unavailable, None),
+    let (status, evidence) = match ValidatedReport::try_from_report(report)? {
+        ValidatedReport::Complete(evidence) => (InventoryStatus::Complete, Some(evidence)),
+        ValidatedReport::Legacy(evidence) => (InventoryStatus::Legacy, Some(evidence)),
+        ValidatedReport::Unavailable => (InventoryStatus::Unavailable, None),
     };
-    if let Some(inventory) = inventory {
+    let policy = if let Some(ExecutionInventoryEvidence { inventory, policy }) = evidence {
         publish_inventory(tx, node_id, inventory).await?;
-    }
-    let policy = inventory
-        .and_then(|inventory| inventory.policy.as_ref())
-        .and_then(|policy| {
-            match pplx_space_common_core::types::ExecutionPolicyObservation::try_from(policy) {
-                Ok(policy) => Some(policy),
-                Err(error) => {
-                    tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");
-                    None
-                }
+        match policy {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");
+                None
             }
-        });
+        }
+    } else {
+        None
+    };
     Ok(Some(PublishedExecutionObservation { status, policy }))
 }
 
@@ -99,10 +99,9 @@ pub(super) async fn publish(
 async fn publish_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    inventory: &pplx_space_execution_common::proto::NodeExecutionInventory,
+    inventory: ValidatedExecutionInventory,
 ) -> Result<(), Status> {
-    let (runtime_rows, component_rows) =
-        ValidatedExecutionInventory::try_from_proto(inventory)?.into_legacy_rows();
+    let (runtime_rows, component_rows) = inventory.into_legacy_rows();
     let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
     let component_rows = Json(serde_json::Value::Array(component_rows));
     sqlx::query(sql!(
