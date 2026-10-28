@@ -1006,4 +1006,37 @@ mod not_running {
         .map(|payload| payload.0)
         .collect())
     }
+
+    /// A policy updated to allow the attach's activity after the resolver's
+    /// sandbox read, while the sandbox stays at rest, is judged as it is now:
+    /// the wake is queued and the attach keeps waiting, rather than getting
+    /// the final at-rest answer the earlier policy gave.
+    #[tokio::test]
+    async fn an_attach_is_judged_by_the_policy_read_with_the_lifecycle() -> TestDbResult<()> {
+        use crate::controllers::substrate::ExecutionActivityKind::Access;
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        let stored =
+            crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                .await?
+                .expect("seeded sandbox");
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
+        ))
+        .bind(stored.id)
+        .bind(sqlx::types::Json(wake_policy(&["access"])))
+        .execute(&fixture.db.pool)
+        .await?;
+
+        assert!(
+            queue_implicit_wake(&fixture.db.pool, &stored, Access, true)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+        );
+        assert_eq!(
+            wake_activities(&fixture, sandbox_id).await?,
+            vec![Some("access".to_owned())]
+        );
+        Ok(())
+    }
 }

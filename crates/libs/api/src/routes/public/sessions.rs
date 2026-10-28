@@ -358,40 +358,46 @@ pub(crate) async fn queue_implicit_wake(
     activity: ExecutionActivityKind,
     record_activity: bool,
 ) -> Result<bool, PublicApiError> {
-    let lifecycle = sandbox_lifecycle(sandbox)?;
-    match activity_admission(activity, lifecycle, &sandbox.auto_lifecycle.0) {
-        CommandAdmission::Admit => Ok(true),
-        CommandAdmission::Refuse => {
-            let sandbox_id = PublicSandboxId::from(sandbox.id);
-            let observed = pplx_space_sandbox_store::activation_observation(
-                pool,
-                sandbox.org_id,
-                sandbox.id,
-                &sandbox_id.to_string(),
-            )
-            .await
-            .map_err(|error| {
-                tracing::warn!(sandbox_id = %sandbox.id, %error, "could not read pending activations");
-                PublicApiError::internal()
-            })?;
-            // A start, resume, restore or wake queued since the sandbox was
-            // read is about to place it. One that completed, or got under
-            // way, since then already has: the lifecycle read with the
-            // operations is one the attach is admitted in, running or
-            // heading there.
-            Ok(observed.is_some_and(|observed| {
-                observed.activation_pending
-                    || observed
-                        .lifecycle
-                        .parse::<SandboxLifecycle>()
-                        .is_ok_and(|lifecycle| {
-                            activity_admission(activity, lifecycle, &sandbox.auto_lifecycle.0)
-                                == CommandAdmission::Admit
-                        })
-            }))
+    let sandbox_id = PublicSandboxId::from(sandbox.id);
+    let mut admission = activity_admission(
+        activity,
+        sandbox_lifecycle(sandbox)?,
+        &sandbox.auto_lifecycle.0,
+    );
+    if admission == CommandAdmission::Refuse {
+        // Read the sandbox again before answering no, with its pending
+        // activations in the same statement. A start, resume, restore or
+        // wake queued since the first read is about to place it. One that
+        // completed, or got under way, since then already has: the lifecycle
+        // read now is one the attach is admitted in. A policy updated since
+        // then is judged as it is now, so one that has come to allow
+        // `activity` wakes the sandbox.
+        let observed = pplx_space_sandbox_store::activation_observation(
+            pool,
+            sandbox.org_id,
+            sandbox.id,
+            &sandbox_id.to_string(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(sandbox_id = %sandbox.id, %error, "could not read pending activations");
+            PublicApiError::internal()
+        })?;
+        let Some(observed) = observed else {
+            return Ok(false);
+        };
+        if observed.activation_pending {
+            return Ok(true);
         }
+        let Ok(lifecycle) = observed.lifecycle.parse::<SandboxLifecycle>() else {
+            return Ok(false);
+        };
+        admission = activity_admission(activity, lifecycle, &observed.auto_lifecycle.0);
+    }
+    match admission {
+        CommandAdmission::Admit => Ok(true),
+        CommandAdmission::Refuse => Ok(false),
         CommandAdmission::AdmitAndWake => {
-            let sandbox_id = PublicSandboxId::from(sandbox.id);
             enqueue_implicit_wake(pool, sandbox.org_id, sandbox_id, activity, record_activity)
                 .await?;
             Ok(true)
