@@ -20,8 +20,9 @@ use pplx_space_common_core::{
         MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement,
         NodeSelectorLabelsParseError, SANDBOX_NETWORK_POLICY_ANNOTATION,
         SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION, SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
-        SandboxPodCommon, SandboxPodConfig, SandboxPodConfigValues, SandboxPodRequest,
-        SandboxRuntimePodMetadata, build_sandbox_pod, node_group_label,
+        SANDBOX_TRACE_JOIN_UNTIL_ANNOTATION, SandboxPodCommon, SandboxPodConfig,
+        SandboxPodConfigValues, SandboxPodRequest, SandboxRuntimePodMetadata, build_sandbox_pod,
+        node_group_label,
     },
     types::{
         NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId, StorageUri,
@@ -606,6 +607,7 @@ fn is_wake_recovery_lifecycle(lifecycle: &str) -> bool {
 async fn create_sandbox_pod(
     k8s: &KubernetesState,
     mut request: SandboxPodRequest<'_>,
+    trace_join_until: Option<jiff::Timestamp>,
 ) -> Result<SandboxPodView, KubeError> {
     let common = match &mut request {
         SandboxPodRequest::OnDemand { common, .. }
@@ -625,12 +627,16 @@ async fn create_sandbox_pod(
     // span. The Pod carries the context of the operation that materializes it,
     // captured before rendering so the containerd shim can resume this trace.
     common.traceparent = pplx_space_observability::trace_propagation::traceparent_for_span(&span);
+    let mut pod = build_sandbox_pod(&sandbox_pod_config(k8s), request);
+    if let Some(deadline) = trace_join_until {
+        pod.metadata.annotations.get_or_insert_default().insert(
+            SANDBOX_TRACE_JOIN_UNTIL_ANNOTATION.to_string(),
+            deadline.as_millisecond().to_string(),
+        );
+    }
     let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), &k8s.sandbox_namespace);
     let result = pods
-        .create(
-            &PostParams::default(),
-            &build_sandbox_pod(&sandbox_pod_config(k8s), request),
-        )
+        .create(&PostParams::default(), &pod)
         .instrument(span.clone())
         .await;
     if let Err(error) = &result {

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	"go.opentelemetry.io/otel/attribute"
@@ -219,21 +220,24 @@ func exportingOTLPPipeline(t *testing.T, sampler, arg string) (*otlpTracePipelin
 	return &otlpTracePipeline{tracer: provider.Tracer("test"), provider: provider}, exporter
 }
 
-// linkedCreate starts shim.create linked to an origin with the given trace
+// joinedCreate starts shim.create as a child of an origin with the given trace
 // flags, and shim.sbxmgr.create under it, and returns both spans' contexts,
 // the traceparent the child would send on, and the names of the spans
 // exported once both end.
-func linkedCreate(t *testing.T, p *otlpTracePipeline, exporter *tracetest.InMemoryExporter, flags string) (root, child trace.SpanContext, traceparent string, exported []string) {
+func joinedCreate(t *testing.T, p *otlpTracePipeline, exporter *tracetest.InMemoryExporter, flags string) (root, child trace.SpanContext, traceparent string, exported []string) {
 	t.Helper()
 	origin := propagation.MapCarrier{
 		"traceparent": "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-" + flags,
 	}
-	rootSpan, ctx := p.startLinked(context.Background(), "shim.create", origin)
+	rootSpan, ctx := startCreateSpan(context.Background(), p, origin["traceparent"], "2000", time.UnixMilli(1000))
 	childSpan, childCtx := p.start(ctx, "shim.sbxmgr.create")
 	outgoing := propagation.MapCarrier{}
 	p.inject(childCtx, outgoing)
 	root = rootSpan.(otlpSpan).SpanContext()
 	child = childSpan.(otlpSpan).SpanContext()
+	if root.TraceID().String() != "69f2ccfd00000000e88861448bd50939" {
+		t.Fatalf("create trace ID %s does not join its origin", root.TraceID())
+	}
 	childSpan.End(nil)
 	rootSpan.End(nil)
 	for _, span := range exporter.GetSpans() {
@@ -251,12 +255,12 @@ func traceparentFlags(t *testing.T, traceparent string) string {
 	return parts[3]
 }
 
-// A sampler that is not parent-based leaves a linked root to its origin and
-// its children to the root: a sampled origin keeps both and sends a sampled
+// A sampler that is not parent-based follows the origin and
+// its children follow create: a sampled origin keeps both and sends a sampled
 // traceparent on.
 func TestAlwaysOnKeepsTheCreateOfASampledOrigin(t *testing.T) {
 	p, exporter := exportingOTLPPipeline(t, "always_on", "")
-	root, child, traceparent, exported := linkedCreate(t, p, exporter, "01")
+	root, child, traceparent, exported := joinedCreate(t, p, exporter, "01")
 	if !root.IsSampled() || !child.IsSampled() {
 		t.Fatalf("root sampled=%t child sampled=%t, want both sampled", root.IsSampled(), child.IsSampled())
 	}
@@ -273,7 +277,7 @@ func TestAlwaysOnKeepsTheCreateOfASampledOrigin(t *testing.T) {
 // send a sampled traceparent to sandbox-manager.
 func TestAlwaysOnKeepsTheCreateOfAnUnsampledOriginUnsampled(t *testing.T) {
 	p, exporter := exportingOTLPPipeline(t, "always_on", "")
-	root, child, traceparent, exported := linkedCreate(t, p, exporter, "00")
+	root, child, traceparent, exported := joinedCreate(t, p, exporter, "00")
 	if root.IsSampled() || child.IsSampled() {
 		t.Fatalf("root sampled=%t child sampled=%t, want neither sampled", root.IsSampled(), child.IsSampled())
 	}
@@ -289,7 +293,7 @@ func TestAlwaysOnKeepsTheCreateOfAnUnsampledOriginUnsampled(t *testing.T) {
 // sample nothing, and keeps its parent's tracestate.
 func TestSampledParentKeepsChildUnderZeroRatio(t *testing.T) {
 	p, exporter := exportingOTLPPipeline(t, "traceidratio", "0")
-	root, ctx := p.startLinked(context.Background(), "shim.create", propagation.MapCarrier{
+	root, ctx := p.startChild(context.Background(), "shim.create", propagation.MapCarrier{
 		"traceparent": "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-01",
 	})
 	parent := root.(otlpSpan).SpanContext()
@@ -310,6 +314,88 @@ func TestSampledParentKeepsChildUnderZeroRatio(t *testing.T) {
 	}
 	if len(exporter.GetSpans()) != 2 {
 		t.Fatalf("exported %d spans, want root and child", len(exporter.GetSpans()))
+	}
+}
+
+const createOrigin = "00-11111111111111112222222222222222-3333333333333333-01"
+
+var createTraceCases = []struct {
+	name, origin, joinUntil string
+	joined, linked          bool
+}{
+	{"within window", createOrigin, "2000", true, false},
+	{"expired", createOrigin, "999", false, true},
+	{"at deadline", createOrigin, "1000", false, true},
+	{"legacy producer", createOrigin, "", false, true},
+	{"invalid deadline", createOrigin, "invalid", false, true},
+	{"overflow deadline", createOrigin, "9223372036854775808", false, true},
+	{"zero deadline", createOrigin, "0", false, true},
+	{"negative deadline", createOrigin, "-1", false, true},
+	{"missing origin", "", "2000", false, false},
+	{"invalid origin", "invalid", "2000", false, false},
+	{"invalid legacy origin", "invalid", "", false, false},
+}
+
+func TestOTLPCreateTraceBoundary(t *testing.T) {
+	for _, tc := range createTraceCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, exporter := exportingOTLPPipeline(t, "always_on", "")
+			unrelated, ctx := p.start(context.Background(), "containerd")
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			create, ctx := startCreateSpan(ctx, p, tc.origin, tc.joinUntil, time.UnixMilli(1000),
+				attribute.String("task_id", "attempt-one"))
+			child, childCtx := p.start(ctx, "shim.sbxmgr.create")
+			outgoing := propagation.MapCarrier{}
+			p.inject(childCtx, outgoing)
+			child.End(nil)
+			create.End(nil)
+			unrelated.End(nil)
+			spans := exporter.GetSpans()
+			got := spans[1]
+			if joined := got.SpanContext.TraceID().String() == "11111111111111112222222222222222"; joined != tc.joined {
+				t.Fatalf("joined=%t, want %t", joined, tc.joined)
+			}
+			if tc.joined {
+				if !got.Parent.IsRemote() || got.Parent.SpanID().String() != "3333333333333333" {
+					t.Fatalf("wrong remote parent: %v", got.Parent)
+				}
+			} else if got.Parent.IsValid() {
+				t.Fatalf("fallback inherited unrelated parent: %v", got.Parent)
+			}
+			if linked := len(got.Links) == 1; linked != tc.linked {
+				t.Fatalf("linked=%t, want %t", linked, tc.linked)
+			}
+			if spans[0].Parent.SpanID() != got.SpanContext.SpanID() ||
+				spans[0].SpanContext.TraceID() != got.SpanContext.TraceID() {
+				t.Fatal("manager call is not a child of create")
+			}
+			remote := trace.SpanContextFromContext(tracePropagation.Extract(context.Background(), outgoing))
+			if remote.TraceID() != got.SpanContext.TraceID() || remote.SpanID() != spans[0].SpanContext.SpanID() {
+				t.Fatal("manager propagation lost create trace")
+			}
+			if tc.joined || tc.linked {
+				want := attribute.String(originTraceIDAttribute, "11111111111111112222222222222222")
+				if !slices.Contains(got.Attributes, want) || !slices.Contains(got.Attributes, attribute.Bool(originSampledAttribute, true)) {
+					t.Fatal("origin search attributes missing")
+				}
+			}
+			if !slices.Contains(got.Attributes, attribute.String("task_id", "attempt-one")) {
+				t.Fatal("attempt identity missing")
+			}
+			// The shim must not detach request cancellation when replacing the parent.
+			cancel()
+			if ctx.Err() != context.Canceled {
+				t.Fatal("create lost caller cancellation")
+			}
+			// Teardown remains a linked root even for a joined create.
+			teardown, _ := p.startLinked(ctx, "shim.delete", outgoing)
+			teardown.End(nil)
+			deleted := exporter.GetSpans()[3]
+			if deleted.Parent.IsValid() || len(deleted.Links) != 1 || deleted.SpanContext.TraceID() == got.SpanContext.TraceID() {
+				t.Fatal("teardown must remain a separate linked trace")
+			}
+		})
 	}
 }
 

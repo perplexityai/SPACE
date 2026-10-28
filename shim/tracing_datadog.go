@@ -40,7 +40,7 @@ func newDatadogTracePipeline() tracePipeline {
 
 // originSamplingRules keeps or drops a root that links to an origin as the
 // origin was sampled, as the Rust services' rules do: two rules on
-// origin_sampled, which only such roots carry, ahead of the rules
+// origin_sampled ahead of the rules
 // DD_TRACE_SAMPLING_RULES configures. The tracer lets those environment rules
 // replace any given in code, so they are read here, appended, and taken out
 // of the environment it reads. Rules it cannot parse are left for the tracer
@@ -113,6 +113,19 @@ func (datadogTracePipeline) startLinked(ctx context.Context, name string, carrie
 		}}))
 	}
 	// No ChildOf: the span is a root of its own trace.
+	span := tracer.StartSpan(name, opts...)
+	return datadogSpan{span}, tracer.ContextWithSpan(ctx, span)
+}
+
+func (datadogTracePipeline) startChild(ctx context.Context, name string, carrier propagation.MapCarrier, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
+	opts := make([]tracer.StartSpanOption, 0, len(attrs)+1)
+	for _, attr := range attrs {
+		opts = append(opts, tracer.Tag(string(attr.Key), attr.Value.AsInterface()))
+	}
+	if parent, err := tracer.Extract(tracer.TextMapCarrier(carrier)); err == nil && parent != nil {
+		opts = append(opts, tracer.ChildOf(parent))
+	}
+	// Do not inherit an unrelated containerd RPC span when extraction fails.
 	span := tracer.StartSpan(name, opts...)
 	return datadogSpan{span}, tracer.ContextWithSpan(ctx, span)
 }

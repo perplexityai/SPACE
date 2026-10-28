@@ -112,6 +112,13 @@ async fn create_execution_releases_tracking_when_the_pod_create_is_rejected() ->
     let substrate = substrate_with_store_and_client(db.pool.clone(), client);
     let inputs = CreateInputs::new();
     let template_ref = inputs.template_ref();
+    let join_window = substrate.k8s.create_data_plane_ready_timeout.min(
+        substrate
+            .budgets
+            .create_ready
+            .saturating_sub(substrate.budgets.create_ready_phase_margin),
+    );
+    let earliest_join_deadline = jiff::Timestamp::now().checked_add(join_window)?;
 
     let outcome = substrate
         .create_execution(inputs.create_request(sandbox_id, &template_ref))
@@ -122,9 +129,23 @@ async fn create_execution_releases_tracking_when_the_pod_create_is_rejected() ->
         "expected a failed create, got {:?}",
         outcome.map(|outcome| outcome.sandbox_id)
     );
+    let latest_join_deadline = jiff::Timestamp::now().checked_add(join_window)?;
+    let posts = requests_matching(&log, &Method::POST);
+    let [pod_create] = posts.as_slice() else {
+        panic!("expected one pod create, got {posts:?}");
+    };
+    let deadline = pod_create
+        .body
+        .as_ref()
+        .and_then(|pod| pod.pointer("/metadata/annotations"))
+        .and_then(|annotations| annotations.get(SANDBOX_TRACE_JOIN_UNTIL_ANNOTATION))
+        .and_then(serde_json::Value::as_str)
+        .expect("on-demand pod carries its fixed trace join deadline")
+        .parse::<i64>()?;
     assert!(
-        !requests_matching(&log, &Method::POST).is_empty(),
-        "the pod create must have been attempted"
+        (earliest_join_deadline.as_millisecond()..=latest_join_deadline.as_millisecond())
+            .contains(&deadline),
+        "join deadline must use the effective readiness window in Unix milliseconds"
     );
     assert_eq!(
         active_execution_count(&db.pool, sandbox_id).await?,
