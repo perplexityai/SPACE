@@ -443,7 +443,7 @@ async fn decide_for(
     let mut conn = mirror.pool().acquire().await?;
     Ok(decide(
         &mut conn,
-        reported.as_ref(),
+        PendingBackupReport::from_proto(reported.as_ref()),
         prune,
         &state_only,
         mirror.node_id,

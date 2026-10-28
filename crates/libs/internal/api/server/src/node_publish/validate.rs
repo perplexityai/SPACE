@@ -10,6 +10,7 @@ pub(crate) mod failure_episode;
 pub(crate) mod fields;
 pub(crate) mod node_role;
 pub(crate) mod node_status;
+pub(crate) mod pending_backup;
 pub(crate) mod quarantine;
 pub(crate) mod quarantine_claim;
 pub(crate) mod receipts;

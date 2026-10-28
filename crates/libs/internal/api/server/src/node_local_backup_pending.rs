@@ -149,16 +149,12 @@
 //! `FOR UPDATE` from a second connection and requiring the publish to complete
 //! anyway.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
+use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use pplx_space_common_core::{
     sql,
-    types::{
-        ArtifactKind, LocalArtifactId, LocalArtifactIdParseError, NodeId, SandboxId,
-        SandboxIdParseError,
-    },
+    types::{ArtifactKind, LocalArtifactId, NodeId, SandboxId},
 };
 use pplx_space_metrics::internal_api::{
     LocalBackupQueueOutcome, LocalBackupQueueRemoval, local_backup_queue_absent_not_durable,
@@ -170,106 +166,10 @@ use pplx_space_sandbox_portability::{
 };
 use tonic::Status;
 
-use crate::metadata::artifact_kind_from_proto;
-use crate::proto::PendingLocalBackupReport;
+use crate::node_publish::validate::pending_backup::{
+    ParsedPendingLocalBackups, PendingBackupReport,
+};
 use crate::status::SandboxInventoryPrune;
-use pplx_space_sbx_mgr_client::proto::PendingLocalBackup;
-
-/// The artifact identity one pending-backup entry carries. The sandbox it
-/// belongs to is the map key in [`ParsedPendingLocalBackups`], so it is not
-/// repeated here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingLocalBackupEntry {
-    artifact_id: LocalArtifactId,
-    artifact_kind: ArtifactKind,
-}
-
-/// A node's complete answer to "which of my local artifacts have no durable
-/// copy yet", parsed from one Full census.
-///
-/// Construction is the validation: a report that exists is one the mirror may
-/// act on, including deleting rows from the queue. Entries are keyed by
-/// sandbox, which is the queue's own primary-key prefix — two entries naming
-/// one sandbox contradict the one-row-per-`(node, sandbox)` contract and are
-/// rejected rather than silently collapsed, because collapsing would pick one
-/// of two artifacts arbitrarily and the loser's row would then look absent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ParsedPendingLocalBackups {
-    entries: BTreeMap<SandboxId, PendingLocalBackupEntry>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(super) enum PendingLocalBackupParseError {
-    #[error("invalid pending-backup sandbox_id {value:?}: {source}")]
-    SandboxId {
-        value: String,
-        #[source]
-        source: SandboxIdParseError,
-    },
-    #[error("invalid pending-backup local_artifact_id {value:?}: {source}")]
-    LocalArtifactId {
-        value: String,
-        #[source]
-        source: LocalArtifactIdParseError,
-    },
-    #[error("pending-backup artifact_kind must be DISK or FULL, got {0}")]
-    ArtifactKind(i32),
-    #[error("sandbox {0} appears more than once in the pending-backup report")]
-    DuplicateSandbox(SandboxId),
-}
-
-impl ParsedPendingLocalBackups {
-    fn parse(entries: &[PendingLocalBackup]) -> Result<Self, PendingLocalBackupParseError> {
-        let mut parsed = BTreeMap::new();
-        for entry in entries {
-            let sandbox_id = SandboxId::from_str(entry.sandbox_id.trim()).map_err(|source| {
-                PendingLocalBackupParseError::SandboxId {
-                    value: entry.sandbox_id.trim().to_owned(),
-                    source,
-                }
-            })?;
-            let artifact_id =
-                LocalArtifactId::from_str(entry.local_artifact_id.trim()).map_err(|source| {
-                    PendingLocalBackupParseError::LocalArtifactId {
-                        value: entry.local_artifact_id.trim().to_owned(),
-                        source,
-                    }
-                })?;
-            let artifact_kind = artifact_kind_from_proto(entry.artifact_kind).ok_or(
-                PendingLocalBackupParseError::ArtifactKind(entry.artifact_kind),
-            )?;
-            if parsed
-                .insert(
-                    sandbox_id,
-                    PendingLocalBackupEntry {
-                        artifact_id,
-                        artifact_kind,
-                    },
-                )
-                .is_some()
-            {
-                return Err(PendingLocalBackupParseError::DuplicateSandbox(sandbox_id));
-            }
-        }
-        Ok(Self { entries: parsed })
-    }
-
-    fn names(&self, sandbox_id: SandboxId) -> bool {
-        self.entries.contains_key(&sandbox_id)
-    }
-
-    /// The three parallel arrays the set-replace's `UNNEST` takes, built in one
-    /// pass so "these stay index-aligned" is a property of one expression
-    /// rather than of three separate walks staying in step.
-    fn unnest_columns(&self) -> (Vec<SandboxId>, Vec<LocalArtifactId>, Vec<&'static str>) {
-        self.entries
-            .iter()
-            .map(|(sandbox_id, entry)| {
-                (*sandbox_id, entry.artifact_id, entry.artifact_kind.as_str())
-            })
-            .collect()
-    }
-}
 
 /// What one publication is allowed to do to the node's mirror.
 #[derive(Debug)]
@@ -353,12 +253,12 @@ pub(super) enum PendingLocalBackupCensus {
 /// a degraded observation, which is not the steady state.
 pub(super) async fn decide(
     conn: &mut sqlx::PgConnection,
-    pending_local_backups: Option<&PendingLocalBackupReport>,
+    pending_local_backups: PendingBackupReport,
     inventory_prune: SandboxInventoryPrune,
     state_only_sandbox_ids: &BTreeSet<SandboxId>,
     node_id: NodeId,
 ) -> Result<PendingLocalBackupCensus, Status> {
-    let Some(reported) = pending_local_backups else {
+    let Some(reported) = pending_local_backups.into_parsed() else {
         return Ok(PendingLocalBackupCensus::Declined(
             LocalBackupQueueOutcome::NoReport,
         ));
@@ -368,7 +268,7 @@ pub(super) async fn decide(
             LocalBackupQueueOutcome::CensusRejected,
         ));
     }
-    let report = match ParsedPendingLocalBackups::parse(&reported.pending) {
+    let report = match reported {
         Ok(report) => report,
         Err(error) => {
             tracing::warn!(
@@ -617,7 +517,7 @@ pub(super) async fn reconcile(
     // Every reported entry whose sandbox exists is affected by the upsert,
     // including one whose stored values did not change, so the shortfall is
     // exactly the entries the `EXISTS` filtered out.
-    let reported = report.entries.len() as u64;
+    let reported = report.entry_count() as u64;
     Ok(PendingLocalBackupReconcile {
         unknown_sandboxes: reported.saturating_sub(upserted),
         deleted_durable,
