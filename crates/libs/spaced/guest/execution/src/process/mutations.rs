@@ -47,14 +47,8 @@ impl OwnedMutation {
         self.owner.as_mut().expect("unsettled owner").begin();
         let record = &self.target.record;
         let outcome = match &self.mutation {
-            Mutation::Input(request) => {
-                record.input.write_sequenced(&request.data, &shutdown).await
-            }
-            Mutation::Close => tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => Outcome::Unknown,
-                result = record.close_stdin() => Outcome::from_result(result),
-            },
+            Mutation::Input(request) => record.input.write_outcome(&request.data, &shutdown).await,
+            Mutation::Close => record.input.close_outcome(&shutdown).await,
             Mutation::Signal(signal) => {
                 let kill = signal.as_i32() == libc::SIGKILL;
                 let result = match record.signal_handle.signal(*signal) {
@@ -130,7 +124,11 @@ impl ExecutionService {
                             _payload: payload,
                             _admission: admission,
                         };
-                        let shutdown = owned.target.recovery_cancellation().clone();
+                        let shutdown = owned
+                            .target
+                            .recovery_cancellation()
+                            .expect("recovery effect has an activation lease")
+                            .clone();
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         self.inner.process_tasks.spawn(async move {
                             let result = owned.run(shutdown).await;
@@ -147,7 +145,39 @@ impl ExecutionService {
 }
 
 impl ProcessInput {
-    async fn write_sequenced(&self, data: &[u8], shutdown: &CancellationToken) -> Outcome {
+    pub(super) async fn write_recovery(
+        &self,
+        data: &[u8],
+        shutdown: &CancellationToken,
+    ) -> Result<(), Status> {
+        self.write_outcome(data, shutdown).await.result()
+    }
+
+    pub(super) async fn close_recovery(&self, shutdown: &CancellationToken) -> Result<(), Status> {
+        self.close_outcome(shutdown).await.result()
+    }
+
+    async fn close_outcome(&self, shutdown: &CancellationToken) -> Outcome {
+        match self {
+            Self::Disabled => Outcome::Applied,
+            Self::Pipe(input) => {
+                let mut held = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Outcome::NotBegun,
+                    held = input.lock() => held,
+                };
+                // ChildStdin is unbuffered: dropping it closes the pipe without
+                // an await between the effect and its receipt.
+                drop(held.take());
+                Outcome::Applied
+            }
+            Self::Pty(_) => Outcome::from_result(Err(Status::failed_precondition(
+                "PTY input cannot be half-closed; send terminal EOF or signal the process",
+            ))),
+        }
+    }
+
+    async fn write_outcome(&self, data: &[u8], shutdown: &CancellationToken) -> Outcome {
         match self {
             Self::Disabled => Outcome::from_result(Err(Status::failed_precondition(
                 "process stdin is not enabled or closed",
@@ -165,7 +195,7 @@ async fn write_descriptor<T: tokio::io::AsyncWrite + Unpin>(
 ) -> Outcome {
     let mut held = tokio::select! {
         biased;
-        _ = shutdown.cancelled() => return Outcome::Interrupted {written: 0},
+        _ = shutdown.cancelled() => return Outcome::NotBegun,
         held = input.lock() => held,
     };
     let Some(writer) = held.as_mut() else {
@@ -179,11 +209,13 @@ async fn write_descriptor<T: tokio::io::AsyncWrite + Unpin>(
     while written < data.len() {
         let result = tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return Outcome::Interrupted {written: written as u64},
+            _ = shutdown.cancelled() => return interrupted(written),
             result = writer.write(data.get(written..).expect("writer progress stays within input")) => result,
         };
         match result {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                tokio::task::yield_now().await;
+            }
             Ok(0) => {
                 return write_failure(std::io::Error::from(std::io::ErrorKind::WriteZero), written);
             }
@@ -191,16 +223,18 @@ async fn write_descriptor<T: tokio::io::AsyncWrite + Unpin>(
             Ok(count) => written += count,
         }
     }
-    loop {
-        let result = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return Outcome::Interrupted { written: written as u64 },
-            result = writer.flush() => result,
-        };
-        match result {
-            Ok(()) => return Outcome::Applied,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return write_failure(error, written),
+    // Both production descriptors (ChildStdin and PtyIo) are unbuffered.
+    // Once the last write succeeds, the full input has been accepted; a later
+    // cancellation must not turn that known result into an uncertain receipt.
+    Outcome::Applied
+}
+
+fn interrupted(written: usize) -> Outcome {
+    if written == 0 {
+        Outcome::NotBegun
+    } else {
+        Outcome::Interrupted {
+            written: written as u64,
         }
     }
 }

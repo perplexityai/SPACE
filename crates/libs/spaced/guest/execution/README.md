@@ -397,7 +397,12 @@ the writer, not bytes consumed by the child. Do not resend the remainder.
 An owner lost after beginning records `MutationOutcomeUnknown`; retries preserve
 that uncertainty. Signals acknowledge OS delivery attempts, not handling by the
 child. An I/O failure before any byte was written is a known failure, preserving
-its status metadata; interrupted system calls are retried.
+its status metadata, with diagnostic messages bounded to 1024 bytes. Interrupted
+system calls yield before retrying. Cancellation before any effect is a temporary
+refusal and does not consume the sequence. Once an unbuffered write accepts all
+bytes, its result is applied even if cancellation follows. Version-1 fenced input
+uses the same prefix reporting; closing its pipe is either not begun or applied,
+never a sequence-only unknown outcome.
 
 A next-sequence signal cannot overtake a pending input. To terminate a process
 with blocked input, use version-1 fenced `SendSignal(SIGKILL)` without a sequence,

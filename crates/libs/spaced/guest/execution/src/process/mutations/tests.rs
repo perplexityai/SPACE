@@ -91,3 +91,51 @@ async fn sequenced_input_retries_interrupts_and_distinguishes_known_write_failur
         assert_eq!(input.lock().await.as_ref().unwrap().received, bytes);
     }
 }
+
+#[tokio::test]
+async fn cancellation_before_input_owns_the_descriptor_has_no_effect() {
+    let (writer, mut reader) = tokio::io::duplex(4);
+    let input = InputDescriptor::new(Some(writer));
+    let held = input.lock().await;
+    let shutdown = CancellationToken::new();
+    let mut writing = Box::pin(write_descriptor(&input, b"data", &shutdown));
+    assert!(futures_util::poll!(&mut writing).is_pending());
+    shutdown.cancel();
+    let error = writing.await.result().unwrap_err();
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+    assert_eq!(
+        RecoveryReason::from_status(&error),
+        Some(RecoveryReason::TemporarilyUnavailable)
+    );
+    drop(held);
+    input.release();
+    let mut actual = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut actual)
+        .await
+        .unwrap();
+    assert!(actual.is_empty());
+}
+
+#[tokio::test]
+async fn close_cancelled_before_the_descriptor_lock_has_no_effect() {
+    let input = ProcessInput::Pipe(InputDescriptor::new(None));
+    let ProcessInput::Pipe(pipe) = &input else {
+        unreachable!()
+    };
+    let held = pipe.lock().await;
+    let shutdown = CancellationToken::new();
+    let mut closing = Box::pin(input.close_recovery(&shutdown));
+    assert!(futures_util::poll!(&mut closing).is_pending());
+    shutdown.cancel();
+    let error = closing.await.unwrap_err();
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+    assert_eq!(
+        RecoveryReason::from_status(&error),
+        Some(RecoveryReason::TemporarilyUnavailable)
+    );
+    drop(held);
+    input
+        .close_recovery(&CancellationToken::new())
+        .await
+        .unwrap();
+}

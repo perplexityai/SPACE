@@ -813,10 +813,13 @@ impl Process for ExecutionService {
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let record = &target.record;
-        tokio::select! {
-            biased;
-            _ = target.cancelled() => return Err(pplx_space_spaced_guest_protocol::recovery::RecoveryReason::InputOutcomeUncertain.into_status()),
-            result = record.write_stdin(&request.data) => result?,
+        if let Some(cancellation) = target.recovery_cancellation() {
+            record
+                .input
+                .write_recovery(&request.data, cancellation)
+                .await?;
+        } else {
+            record.write_stdin(&request.data).await?;
         }
         tracing::debug!(
             command = "bridge_guest_process_send_input",
@@ -868,10 +871,10 @@ impl Process for ExecutionService {
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let record = &target.record;
-        tokio::select! {
-            biased;
-            _ = target.cancelled() => return Err(pplx_space_spaced_guest_protocol::recovery::RecoveryReason::MutationOutcomeUnknown.into_status()),
-            result = record.close_stdin() => result?,
+        if let Some(cancellation) = target.recovery_cancellation() {
+            record.input.close_recovery(cancellation).await?;
+        } else {
+            record.close_stdin().await?;
         }
         tracing::debug!(
             command = "bridge_guest_process_close_stdin",

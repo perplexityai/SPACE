@@ -21,6 +21,9 @@ async fn receipts_bind_order_and_survive_owner_loss_without_reapplying() {
         &wait(waiter).await.result().unwrap_err()
     ));
     // Unbegun cancellation leaves the sequence available; begun loss consumes it.
+    let mut cancelled = owner(&ledger, 1, Binding::Close);
+    cancelled.begin();
+    cancelled.complete(Outcome::NotBegun);
     let mut first = owner(&ledger, 1, Binding::Input([1; 32]));
     first.begin();
     for binding in [Binding::Input([2; 32]), Binding::Close, Binding::Signal(2)] {
@@ -92,6 +95,7 @@ fn failed_receipts_preserve_typed_status_metadata() {
     let mut receipt = owner(&ledger, 1, Binding::Close);
     receipt.begin();
     let status = crate::process::map_io_error(std::io::Error::from_raw_os_error(libc::ENOSPC));
+    let status = Status::with_metadata(status.code(), "é".repeat(2048), status.metadata().clone());
     let expected = status.clone();
     receipt.complete(Outcome::from_result(Err(status)));
     let Reservation::Replay(outcome) = ledger.reserve(sequence(1), Binding::Close).unwrap() else {
@@ -99,7 +103,8 @@ fn failed_receipts_preserve_typed_status_metadata() {
     };
     let error = outcome.result().unwrap_err();
     assert_eq!(error.code(), expected.code());
-    assert_eq!(error.message(), expected.message());
+    assert!(error.message().len() <= 1024);
+    assert!(expected.message().starts_with(error.message()));
     assert!(
         !expected.metadata().is_empty(),
         "storage failure has a typed reason"

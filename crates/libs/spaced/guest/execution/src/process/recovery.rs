@@ -71,19 +71,8 @@ pub(super) struct ProcessTarget {
 }
 
 impl ProcessTarget {
-    pub(super) fn recovery_cancellation(&self) -> &CancellationToken {
-        &self
-            ._activation
-            .as_ref()
-            .expect("recovery effect has an activation lease")
-            .cancellation
-    }
-
-    pub(super) async fn cancelled(&self) {
-        match &self._activation {
-            Some(lease) => lease.cancellation.cancelled().await,
-            None => std::future::pending().await,
-        }
+    pub(super) fn recovery_cancellation(&self) -> Option<&CancellationToken> {
+        self._activation.as_ref().map(|lease| &lease.cancellation)
     }
 }
 
