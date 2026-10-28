@@ -11,6 +11,10 @@ autobins = false
 [lints]
 workspace = true
 
+[[bin]]
+name = "publish-load"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
