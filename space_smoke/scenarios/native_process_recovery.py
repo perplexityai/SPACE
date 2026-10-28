@@ -4,6 +4,7 @@ import base64
 import json
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.registry import scenario
@@ -49,9 +50,10 @@ def _discovery(test, path):
             "GET", path + "/process-execution",
             timeout=min(test.config.request_timeout_seconds, remaining),
         )
-        if not (response.status == 412 and response.body.get("message") ==
-                "sandbox is starting, not started"):
-            return response.require(200)
+        if response.status != 503:
+            info = response.require(200)
+            if info.get("activation_id") is not None:
+                return info
         time.sleep(min(max(test.config.poll_interval_seconds, 0.05),
                        max(0, deadline - time.monotonic())))
     raise TimeoutError("guest did not become ready for process recovery discovery")
@@ -147,6 +149,41 @@ def process_recovery(test: NativeHardeningFixture) -> None:
         test.context.verify(gaps[0]["output_bytes_before"] + retained == emitted,
                             "gap and retained bytes do not account for all output")
         test.context.verify(frames[-1]["exit_code"] == 0, "gap replay lost the exit")
+
+    with test.context.phase("blocked stdin cannot prevent resident pause and rearm"):
+        consumed = "/tmp/recovery-input-" + uuid.uuid4().hex
+        blocked = _command(test, sandbox, discovery,
+                           ["sh", "-c", f"dd bs=1 count=1 of=/dev/null 2>/dev/null; touch {consumed}; sleep 300"],
+                           stdin=True)
+        blocked_handle = _call(test, blocked, {"type": "recovery_start"})[0]["handle"]
+        pending_input = {"type": "recovery_input", "handle": blocked_handle,
+                         "sequence": 1, "data_base64": base64.b64encode(b"x" * (512 * 1024)).decode()}
+        with ThreadPoolExecutor(max_workers=1) as writes:
+            writing = writes.submit(_call, test, blocked, pending_input, error="input_outcome_uncertain")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                observed = test.request("POST", path + "/files:stat", body={"path": consumed})
+                if observed.status == 200:
+                    break
+                observed.require(404)
+                time.sleep(0.1)
+            else:
+                raise AssertionError("stdin write did not reach the child")
+            test.context.verify(not writing.done(), "input did not block before pause")
+            operation = test.request("POST", path + ":pause", idempotency_key=test.key("blocked-pause")).require(202)
+            test.wait_operation(operation["operation_id"])
+            writing.result(timeout=5)
+        test.wait_sandbox(sandbox, "paused")
+        operation = test.request("POST", path + ":resume", idempotency_key=test.key("blocked-resume")).require(202)
+        test.wait_operation(operation["operation_id"])
+        test.wait_sandbox(sandbox)
+        resumed = _discovery(test, path)
+        test.context.verify(resumed["instance_id"] == discovery["instance_id"] and
+                            resumed["activation_id"] == discovery["activation_id"],
+                            "resident pause changed recovery identity")
+        _call(test, blocked, pending_input, error="input_outcome_uncertain")
+        _call(test, blocked, {"type": "recovery_signal", "handle": blocked_handle,
+                              "sequence": 2, "signal": 9})
 
     # Keep a process resident in the snapshot. The old start request, input
     # sequence and cursor must all be rejected after restore, not downgraded.

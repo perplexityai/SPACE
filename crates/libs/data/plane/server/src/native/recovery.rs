@@ -23,8 +23,10 @@ fn handle_for_session(
     sequence: Option<u64>,
 ) -> Result<ops::RecoveryHandle, Status> {
     if handle.process_id != process_id_for_session(session_id).as_str()
-        || handle.instance_id != start.expected_instance_id
-        || handle.activation_id != start.expected_activation_id
+        || uuid::Uuid::parse_str(&handle.instance_id).ok()
+            != uuid::Uuid::parse_str(&start.expected_instance_id).ok()
+        || uuid::Uuid::parse_str(&handle.activation_id).ok()
+            != uuid::Uuid::parse_str(&start.expected_activation_id).ok()
     {
         return Err(Status::failed_precondition(
             "handle does not belong to this command session",
@@ -52,7 +54,28 @@ fn error_frame(status: Status) -> Server {
         code: status.code() as i32,
         reason: reason.map(|reason| reason.as_str().to_owned()),
         message: reason.map_or_else(
-            || format!("process request failed: {}", status.code()),
+            || {
+                match status.code() {
+                    tonic::Code::InvalidArgument => "invalid process request",
+                    tonic::Code::NotFound => "process or sandbox is no longer available",
+                    tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                        "process access refused"
+                    }
+                    tonic::Code::ResourceExhausted if guest_storage_full(&status) => {
+                        "sandbox storage is full"
+                    }
+                    tonic::Code::ResourceExhausted => "process capacity or retention limit reached",
+                    tonic::Code::FailedPrecondition => "process request precondition failed",
+                    tonic::Code::Unavailable => "process service is temporarily unavailable",
+                    tonic::Code::DeadlineExceeded => {
+                        "process request deadline elapsed; outcome may be uncertain"
+                    }
+                    tonic::Code::Cancelled => "process request cancelled; outcome may be uncertain",
+                    tonic::Code::DataLoss => "process output is incomplete",
+                    _ => "process request failed",
+                }
+                .to_owned()
+            },
             |reason| reason.into_status().message().to_owned(),
         ),
         input_written: status

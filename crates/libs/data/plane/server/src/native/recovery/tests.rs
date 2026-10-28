@@ -19,6 +19,10 @@ fn recovery_handle_cannot_escape_its_command_session() {
         process_id: process_id_for_session(session).to_string(),
         process_incarnation: uuid::Uuid::now_v7().to_string(),
     };
+    let mut equivalent = handle.clone();
+    equivalent.instance_id = equivalent.instance_id.to_uppercase();
+    equivalent.activation_id = equivalent.activation_id.to_uppercase();
+    handle_for_session(equivalent, &start, session, Some(1)).unwrap();
     let wire = handle_for_session(handle.clone(), &start, session, Some(1)).unwrap();
     assert_eq!(wire.contract_version, 2);
     assert_eq!(wire.sequence, Some(1));
@@ -143,4 +147,96 @@ async fn connect_eof_without_an_exit_is_not_success() {
             assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
         }
     }
+}
+
+#[test]
+fn public_errors_preserve_categories_without_transport_diagnostics() {
+    for (status, expected) in [
+        (
+            Status::not_found("endpoint diagnostic"),
+            "process or sandbox is no longer available",
+        ),
+        (
+            Status::unavailable("endpoint diagnostic"),
+            "process service is temporarily unavailable",
+        ),
+        (
+            RecoveryReason::TemporarilyUnavailable.into_status(),
+            "process recovery is temporarily unavailable",
+        ),
+    ] {
+        let code = status.code() as i32;
+        let Server::RecoveryError {
+            code: actual,
+            message,
+            ..
+        } = error_frame(status)
+        else {
+            panic!("error frame")
+        };
+        assert_eq!(actual, code);
+        assert_eq!(message, expected);
+        assert!(!message.contains("endpoint diagnostic"));
+    }
+}
+
+#[tokio::test]
+async fn recovery_protocol_is_acknowledged_by_the_serving_data_plane() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+    use pplx_space_public_api::recovery::RECOVERY_WEBSOCKET_PROTOCOL;
+    let state = crate::tests::test_data_plane_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = state.clone();
+    let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(serving).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    }));
+    let session = DataPlaneSessionId::Process(pplx_space_public_api::ProcessSessionId::new());
+    for offered in [
+        None,
+        Some("unsupported-protocol"),
+        Some(RECOVERY_WEBSOCKET_PROTOCOL),
+    ] {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let protocol = offered
+            .map(|value| format!("Sec-WebSocket-Protocol: {value}\r\n"))
+            .unwrap_or_default();
+        socket.write_all(format!(
+            "GET /v1/sessions/{session}/attach HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\n{protocol}\r\n",
+            BASE64_STANDARD.encode(b"recovery-fixture!"),
+        ).as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            response.push(socket.read_u8().await.unwrap());
+            assert!(response.len() < 4096);
+        }
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+        let acknowledged = response.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("sec-websocket-protocol")
+                .then(|| value.trim())
+        });
+        assert_eq!(
+            acknowledged,
+            offered.filter(|value| *value == RECOVERY_WEBSOCKET_PROTOCOL)
+        );
+    }
+    state.drain_started.cancel();
+    state.upgrade_tasks.close();
+    tokio::time::timeout(Duration::from_secs(2), state.upgrade_tasks.wait())
+        .await
+        .unwrap();
+    drop(server);
 }

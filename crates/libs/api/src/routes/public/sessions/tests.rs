@@ -199,6 +199,7 @@ mod not_running {
         Ok(sandbox_id)
     }
 
+    const LEGACY_PROCESS_ROUTES: [&str; 2] = ["commands", "process-sessions"];
     /// Every route that creates a session for a process start.
     const PROCESS_ROUTES: [&str; 3] = ["commands", "process-sessions", "recovery-commands"];
 
@@ -318,11 +319,50 @@ mod not_running {
             ("restoring", &[]),
         ] {
             let sandbox_id = sandbox(&fixture, lifecycle, wake_on).await?;
-            for route in PROCESS_ROUTES {
+            for route in LEGACY_PROCESS_ROUTES {
                 let (status, _, body) = command(&fixture, sandbox_id, route).await?;
                 assert_eq!(status, StatusCode::CREATED, "{route} {lifecycle}: {body}");
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_creation_never_queues_a_wake_and_legacy_sessions_reject_envelopes()
+    -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        for lifecycle in ["starting", "paused", "suspended", "restoring"] {
+            let id = sandbox(&fixture, lifecycle, &["command", "access"]).await?;
+            let (status, _, _) = command(&fixture, id, "recovery-commands").await?;
+            assert_eq!(status, StatusCode::CONFLICT, "{lifecycle}");
+            assert!(wakes(&fixture, id).await?.is_empty());
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/sandboxes/{id}/process-execution"))
+                .header("authorization", format!("Bearer {KEY}"))
+                .body(Body::empty())?;
+            let response = fixture.app.clone().oneshot(request).await?;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let id = sandbox(&fixture, "started", &[]).await?;
+        let (status, _, _) = send(
+            &fixture,
+            id,
+            "process-sessions",
+            "wrong-route",
+            json!({"command": [], "recovery": {
+                "contract_version": 1,
+                "expected_instance_id": Uuid::now_v7(),
+                "expected_activation_id": Uuid::now_v7(),
+                "command": ["true"]
+            }}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let sessions: i64 = sqlx::query_scalar(sql!("SELECT count(*) FROM data_plane_sessions"))
+            .fetch_one(&fixture.db.pool)
+            .await?;
+        assert_eq!(sessions, 0);
         Ok(())
     }
 
@@ -359,7 +399,7 @@ mod not_running {
         let fixture = fixture().await?;
         let sandbox_id = sandbox(&fixture, "suspended", &["access"]).await?;
         let answers = futures_util::future::try_join_all((0..20).map(|index| {
-            let route = PROCESS_ROUTES[index % PROCESS_ROUTES.len()];
+            let route = LEGACY_PROCESS_ROUTES[index % LEGACY_PROCESS_ROUTES.len()];
             command(&fixture, sandbox_id, route)
         }))
         .await?;

@@ -109,6 +109,11 @@ pub async fn create_process_session(
     Path(sandbox_id): Path<String>,
     Json(request): Json<CreateProcessRequest>,
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
+    if request.recovery.is_some() {
+        return Err(PublicApiError::bad_request(
+            "use recovery-commands for recovery requests",
+        ));
+    }
     validate_process_request(&request)?;
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
@@ -363,7 +368,13 @@ pub async fn create_recovery_command(
         command: std::mem::take(&mut process.command),
     });
     let lifecycle = sandbox_lifecycle(&sandbox)?;
-    let admission = command_admission(lifecycle, &sandbox.auto_lifecycle.0);
+    // Recovery fences describe a resident execution. Creating a session must
+    // never start or restore a sandbox on behalf of those old fences.
+    let admission = if lifecycle == SandboxLifecycle::Started {
+        CommandAdmission::Admit
+    } else {
+        CommandAdmission::Refuse
+    };
     let mut command = create_process_command_session(
         &state.public_session_store(),
         org.id,
@@ -380,9 +391,6 @@ pub async fn create_recovery_command(
         || admit(admission, sandbox_id, lifecycle),
     )
     .await?;
-    if admission == CommandAdmission::AdmitAndWake {
-        enqueue_command_wake(&state, org.id, sandbox_id).await?;
-    }
     if let Some(attach) = &mut command.attach {
         attach.events_url = None;
     }

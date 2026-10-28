@@ -14,7 +14,12 @@ Call `GET /v1/sandboxes/{sandbox_id}/process-execution` before the first start.
 Require `process_recovery_start`, `process_recovery_handles` and
 `process_mutation_receipts`, a nonempty activation ID and a positive
 `idempotency_retention_ms`. Require `process_output_gap_resume` before requesting
-counted gaps. A missing endpoint or capability means this path is unsupported.
+counted gaps. HTTP 503 means the sandbox is not ready; retry discovery within a
+caller-chosen deadline. A ready response with no activation means rearming is
+pending, so wait and rediscover. HTTP 404 or 412, or missing capabilities on an
+active execution, means this route does not support the requested contract.
+Discovery covers the manager-to-engine route; the WebSocket handshake below
+checks the independently deployed data plane.
 
 Create a command at `POST /v1/sandboxes/{sandbox_id}/recovery-commands`
 with the normal management credential and `Idempotency-Key`:
@@ -34,7 +39,12 @@ with the normal management credential and `Idempotency-Key`:
 
 Older API servers return 404 for this endpoint. The stored session leaves its
 legacy command empty, so an older data plane also rejects it before effects.
-Creating a session does not start execution.
+Creating a session does not start execution or wake the sandbox. For a new
+session the sandbox must be running; otherwise creation returns the usual 409
+`sandbox_not_running` detail without queuing a wake. Resume or restore explicitly,
+then discover the current execution before creating new work. Replaying an
+already-created session keeps its original identity and fences.
+The legacy `process-sessions` endpoint rejects recovery envelopes.
 Persist the returned command and session identity before starting it. Retries
 of creation use the same body and HTTP key; retries of execution use the same
 session and fences. Never create a different session to retry an uncertain start.
@@ -45,7 +55,10 @@ existing command fields and become part of the immutable start request.
 
 Connect to `attach.url`, resolved against your configured data-plane origin.
 Validate the destination before sending the session's `attach.token`; never send
-it to a redirect or an unverified origin. Authenticate with the existing
+it to a redirect or an unverified origin. Offer the WebSocket subprotocol
+`space.process-recovery.v1` and require that exact acknowledgement before sending
+credentials or requests. An older data plane cannot acknowledge it: close the
+connection and never fall back to a legacy frame. Authenticate with the existing
 `{"type":"attach","token":"…"}` frame or authorization header. After the
 server's `attached` frame, send exactly one recovery request:
 
@@ -68,7 +81,11 @@ support recovery commands and refuses them before starting work.
 Each successful request ends with `recovery_complete`. A `recovery_error` carries
 the numeric gRPC code, an optional stable recovery `reason`, and `input_written`
 when a partial input outcome is known. EOF, timeout or a transport error before
-completion is uncertain. No error licenses a retry with different fences or a
+completion is uncertain. Errors without a recovery reason retain their numeric
+code and a public description; raw endpoint diagnostics are not exposed. Branch
+on the code or reason, never on message text. `temporarily_unavailable` during
+quiescing does not invalidate a handle; `activation_changed` does.
+No error licenses a retry with different fences or a
 legacy request. A connect stream that ends without an exit is an error; callers
 may also intentionally close it after their own read window.
 

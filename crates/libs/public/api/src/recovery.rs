@@ -5,6 +5,11 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+/// The data-plane connection must acknowledge this protocol before a client
+/// sends credentials or a recovery request. Discovery covers the engine route;
+/// this handshake covers the independently deployed data plane.
+pub const RECOVERY_WEBSOCKET_PROTOCOL: &str = "space.process-recovery.v1";
+
 /// Create an immutable recovery command session without starting it.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

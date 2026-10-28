@@ -28,7 +28,8 @@ export async function recoveryRequest({dataPlaneUrl, attach, request, timeoutMs 
     let finished = false;
     let attached = false;
     let bytes = 0;
-    const socket = new WebSocket(target);
+    const protocol = 'space.process-recovery.v1';
+    const socket = new WebSocket(target, protocol);
     const finish = (error) => {
       if (finished) return;
       finished = true;
@@ -37,7 +38,10 @@ export async function recoveryRequest({dataPlaneUrl, attach, request, timeoutMs 
       if (error) reject(error); else resolve();
     };
     const timer = setTimeout(() => finish(new Error('request deadline elapsed; outcome may be uncertain')), timeoutMs);
-    socket.addEventListener('open', () => socket.send(JSON.stringify({type: 'attach', token: attach.token})));
+    socket.addEventListener('open', () => {
+      if (socket.protocol !== protocol) return finish(new Error('data plane does not support process recovery'));
+      socket.send(JSON.stringify({type: 'attach', token: attach.token}));
+    });
     socket.addEventListener('message', ({data}) => {
       try {
         bytes += Buffer.byteLength(data);

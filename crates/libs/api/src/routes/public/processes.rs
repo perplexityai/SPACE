@@ -58,6 +58,16 @@ pub async fn get_process_execution(
     Path(sandbox_id): Path<String>,
 ) -> Result<Json<pplx_space_public_api::recovery::ProcessExecution>, PublicApiError> {
     let sandbox = ensure_sandbox_owner(authorized, &state, org.id, &sandbox_id).await?;
+    if sandbox
+        .lifecycle
+        .parse::<pplx_space_common_core::types::SandboxLifecycle>()
+        .map_err(|_| PublicApiError::internal())?
+        != pplx_space_common_core::types::SandboxLifecycle::Started
+    {
+        return Err(PublicApiError::service_unavailable(
+            "sandbox is not ready for process discovery",
+        ));
+    }
     let ready = state
         .sandbox_controller
         .spaced_wait_ready(
