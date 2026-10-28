@@ -22,6 +22,31 @@ TABLES = (
     "sandbox_direct_route_identities",
 )
 ACTIVITY = {"last_access_at", "last_command_at", "last_used_at"}
+# Normalize only named database columns. Opaque text and JSON can themselves
+# contain timestamp-shaped strings or strings equal to generated identifiers.
+SERVER_TIMESTAMPS = {
+    "nodes": {"created_at", "drain_started_at"},
+    "sandboxes": {
+        "created_at", "updated_at", "lifecycle_changed_at", "placement_changed_at",
+        "restore_lease_expires_at", "next_restore_attempt_at", "next_auto_event_at",
+    },
+    "sandbox_observed_states": {"observed_at", "observed_created_at", "updated_at"},
+    "node_facet_observed_status": {"observed_at", "updated_at"},
+    "sandbox_quarantine_state": {
+        "entered_at", "updated_at", "next_action_after", "claim_expires_at",
+    },
+    "sandbox_quarantine_history": {"occurred_at", "next_action_after"},
+    "node_status_snapshots": {
+        "observed_at", "updated_at", "environment_refs_received_at",
+        "execution_inventory_received_at", "execution_policy_received_at",
+        "local_backup_inventory_reported_at", "sandbox_inventory_pruned_at",
+    },
+    "sandbox_k8s_executions": {
+        "created_at", "updated_at", "terminated_at", "pod_materialized_at",
+        "activation_attempt_expires_at",
+    },
+    "sandbox_direct_route_identities": {"updated_at"},
+}
 TIMESTAMP = re.compile(
     r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)$"
 )
@@ -66,46 +91,38 @@ def canonicalize(directory: Path) -> dict[str, Any]:
 
     times: dict[str, set[int]] = defaultdict(set)
 
-    def collect(value: Any, scope: str, key: str = "") -> None:
-        if isinstance(value, dict):
-            for name, child in value.items():
-                collect(child, scope, name)
-        elif isinstance(value, list):
-            for child in value:
-                collect(child, scope, key)
-        elif key not in ACTIVITY and key != "stale_after":
-            instant = timestamp(value)
-            if instant is not None:
-                times[scope].add(instant)
-
     for table, rows in tables.items():
         for row in rows:
-            collect(row, node_scope(table, row))
+            for column in SERVER_TIMESTAMPS[table]:
+                instant = timestamp(row.get(column))
+                if instant is not None:
+                    times[node_scope(table, row)].add(instant)
     ranks = {scope: {instant: rank for rank, instant in enumerate(sorted(values))}
              for scope, values in times.items()}
 
-    def convert(value: Any, scope: str, key: str = "") -> Any:
-        if isinstance(value, dict):
-            result = {name: convert(child, scope, name) for name, child in value.items()
-                      if name != "stale_after"}
-            if "stale_after" in value:
-                deadline = timestamp(value["stale_after"])
-                observed = timestamp(value.get("observed_at"))
+    def convert(table: str, row: dict[str, Any]) -> dict[str, Any]:
+        scope = node_scope(table, row)
+        result = dict(row)
+        for column, value in row.items():
+            if table == "node_status_snapshots" and column == "stale_after":
+                deadline = timestamp(value)
+                observed = timestamp(row.get("observed_at"))
                 if deadline is None or observed is None:
                     raise ValueError("status deadline must have an observed_at timestamp")
-                result["stale_after"] = {"offset_from_observed_ns": deadline - observed}
-            return result
-        if isinstance(value, list):
-            return [convert(child, scope, key) for child in value]
-        instant = timestamp(value)
-        if instant is not None:
-            if key in ACTIVITY:
-                # Exact synthetic node-clock offsets, not rounded age buckets.
-                return {"activity_offset_ns": instant - epoch}
-            return {"server_time_order": ranks[scope][instant]}
-        if isinstance(value, str):
-            return generated.get(value, value)
-        return value
+                result[column] = {"offset_from_observed_ns": deadline - observed}
+            elif table == "sandboxes" and column in ACTIVITY:
+                instant = timestamp(value)
+                if instant is not None:
+                    result[column] = {"activity_offset_ns": instant - epoch}
+            elif column in SERVER_TIMESTAMPS[table]:
+                instant = timestamp(value)
+                if instant is not None:
+                    result[column] = {"server_time_order": ranks[scope][instant]}
+            elif column == "id" and table in {
+                "sandbox_k8s_executions", "sandbox_quarantine_history",
+            }:
+                result[column] = generated.get(value, value)
+        return result
 
     result: dict[str, Any] = {
         "workload": {key: report[key] for key in (
@@ -114,7 +131,7 @@ def canonicalize(directory: Path) -> dict[str, Any]:
     }
     for table, rows in tables.items():
         result[table] = sorted(
-            (convert(row, node_scope(table, row)) for row in rows),
+            (convert(table, row) for row in rows),
             key=lambda row: json.dumps(row, sort_keys=True),
         )
     return result

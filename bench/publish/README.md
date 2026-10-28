@@ -131,6 +131,9 @@ Execution surrogate IDs and generated history IDs are keyed by logical identity;
 deterministic receipt IDs remain literal. Server-generated timestamps retain
 their equality and ordering within each node; the status deadline retains its
 exact offset from `observed_at`. Nothing is silently dropped, including nulls.
+Normalization is restricted to explicitly named timestamp columns and surrogate
+primary keys. Other text and nested JSON remain literal, even when a string
+looks like a timestamp or happens to equal a generated identifier.
 This is normalized row equivalence, not byte equality of independent wall clocks,
 and does not prove identical elapsed time between server writes. Raw exports
 remain available for inspection. There is no counter-freshness exemption.
