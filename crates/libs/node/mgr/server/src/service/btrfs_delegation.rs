@@ -1035,7 +1035,19 @@ impl NodeManagerService {
                 let receive = artifact_fs::receive::ReceiveRoot::open(&sandbox_root)?;
                 receive.receive_staged(owner.as_ref().map(|owner| &owner.cancel))
             })
-            .await?;
+            .await
+            .inspect_err(|status| {
+                if status.code() != tonic::Code::Cancelled {
+                    pplx_space_metrics::node_manager::btrfs_receive_failed();
+                    tracing::warn!(
+                        sandbox_id,
+                        template = %template,
+                        code = ?status.code(),
+                        error = status.message(),
+                        "btrfs-send codec: restore receive failed, including any salvage of a send restarted mid-pipe"
+                    );
+                }
+            })?;
         if let Some(offset) = salvaged {
             pplx_space_metrics::node_manager::btrfs_receive_stream_salvaged();
             tracing::warn!(

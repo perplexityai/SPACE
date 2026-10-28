@@ -11,7 +11,6 @@ use uuid::Uuid;
 use super::{NodeManagerService, artifact_fs, btrfs_send_source, trusted_paths};
 use crate::proto::*;
 
-#[cfg(any(target_os = "linux", test))]
 pub(in crate::service) mod framing;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
