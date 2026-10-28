@@ -12,7 +12,7 @@ use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::NodeRole;
 use pplx_space_common_core::types::{
     ArtifactKind, SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode,
-    SandboxQuarantineSource, SandboxTransitionTargetState,
+    SandboxTransitionTargetState,
 };
 use pplx_space_common_svc::types::{
     FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
@@ -27,8 +27,9 @@ use pplx_space_sandbox_portability::{
 
 use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes, lifecycle_transitions,
-    network_policy, observed_state, quarantine_persistence, sandbox_facet_observations,
-    snapshot_inventory,
+    network_policy, observed_state,
+    quarantine_claims::{self, ClaimedQuarantineProjection},
+    quarantine_persistence, sandbox_facet_observations, snapshot_inventory,
     suspend_finalization::{self, SuspendedFinalizationCandidate},
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
@@ -77,42 +78,6 @@ impl<'a> QuarantineProjectionSqlInput<'a> {
             reason_code: claim.reason_code().as_str(),
             quarantine_id: Uuid::now_v7(),
             history_id: Uuid::now_v7(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ClaimedQuarantineProjection {
-    sandbox_id: SandboxId,
-    from_lifecycle: String,
-    failure_reason: Option<String>,
-    source: SandboxQuarantineSource,
-    reason_code: SandboxQuarantineReasonCode,
-    quarantine_id: Uuid,
-    history_id: Uuid,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct ClaimedQuarantineSqlProjection<'a> {
-    sandbox_id: SandboxId,
-    from_lifecycle: &'a str,
-    failure_reason: &'a Option<String>,
-    source: &'a str,
-    reason_code: &'a str,
-    quarantine_id: Uuid,
-    history_id: Uuid,
-}
-
-impl ClaimedQuarantineProjection {
-    fn sql_projection(&self) -> ClaimedQuarantineSqlProjection<'_> {
-        ClaimedQuarantineSqlProjection {
-            sandbox_id: self.sandbox_id,
-            from_lifecycle: &self.from_lifecycle,
-            failure_reason: &self.failure_reason,
-            source: self.source.as_str(),
-            reason_code: self.reason_code.as_str(),
-            quarantine_id: self.quarantine_id,
-            history_id: self.history_id,
         }
     }
 }
@@ -885,6 +850,10 @@ pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     QuarantineHistory(#[from] quarantine_persistence::RecordHistoryError),
     #[error(transparent)]
+    QuarantineSelection(#[from] quarantine_claims::SelectQuarantineClaimsError),
+    #[error(transparent)]
+    QuarantineProjection(#[from] quarantine_claims::ApplyQuarantineClaimsError),
+    #[error(transparent)]
     FailureEpisodes(#[from] failure_episodes::ReconcileFailureEpisodesError),
     #[error(transparent)]
     SnapshotInventory(#[from] snapshot_inventory::ReplaceSnapshotInventoryError),
@@ -1102,70 +1071,8 @@ pub(crate) async fn publish_validated_sandbox_states(
             serde_json::to_value(&quarantine_sql_inputs)
                 .map_err(|err| Status::internal(format!("serialize quarantine input: {err}")))?,
         );
-        // Unlike failed projection, quarantine is a node-authored hold that
-        // preserves local evidence and hot-node affiliation across substrates.
-        // Quarantine is a stronger hold than cleanup/delete intent: it stops
-        // automated cleanup until a healer or operator decides the next step.
-        // Deleted still wins, but direct-managed rows are allowed to publish
-        // the same hold state as Kubernetes-managed rows.
-        let claimed_rows =
-            sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, Uuid, Uuid)>(sql!(
-                "SELECT
-                     s.id,
-                     s.lifecycle,
-                     input.failure_reason,
-                     input.source,
-                     input.reason_code,
-                     input.quarantine_id,
-                     input.history_id
-                 FROM sandboxes s
-                 JOIN jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     failure_reason TEXT,
-                     source TEXT,
-                     reason_code TEXT,
-                     quarantine_id UUID,
-                     history_id UUID
-                 ) ON input.sandbox_id = s.id
-                 WHERE s.active_node_id = $1
-                   AND LOWER(TRIM(s.lifecycle)) NOT IN ('quarantined', 'deleted')"
-            ))
-            .bind(node_id)
-            .bind(quarantine_rows_json.clone())
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|err| Status::internal(format!("claim quarantined sandboxes: {err}")))?;
-        let claimed = claimed_rows
-            .into_iter()
-            .map(
-                |(
-                    sandbox_id,
-                    from_lifecycle,
-                    failure_reason,
-                    source,
-                    reason_code,
-                    quarantine_id,
-                    history_id,
-                )|
-                 -> Result<_, Status> {
-                    Ok(ClaimedQuarantineProjection {
-                        sandbox_id: SandboxId::from_uuid(sandbox_id),
-                        from_lifecycle,
-                        failure_reason,
-                        source: source.parse().map_err(|error| {
-                            Status::internal(format!("parse claimed quarantine source: {error}"))
-                        })?,
-                        reason_code: reason_code.parse().map_err(|error| {
-                            Status::internal(format!(
-                                "parse claimed quarantine reason code: {error}"
-                            ))
-                        })?,
-                        quarantine_id,
-                        history_id,
-                    })
-                },
-            )
-            .collect::<Result<Vec<_>, _>>()?;
+        let claimed =
+            quarantine_claims::select(conn, node_id, quarantine_rows_json.clone()).await?;
         if !claimed.is_empty() {
             let claimed_sql = claimed
                 .iter()
@@ -1174,25 +1081,7 @@ pub(crate) async fn publish_validated_sandbox_states(
             let claimed_json = Json(serde_json::to_value(&claimed_sql).map_err(|err| {
                 Status::internal(format!("serialize claimed quarantine input: {err}"))
             })?);
-            let updated_ids = sqlx::query_scalar::<_, SandboxId>(sql!(
-                "UPDATE sandboxes s
-                 SET lifecycle = 'quarantined'
-                 FROM jsonb_to_recordset($1::jsonb) AS input(
-                     sandbox_id UUID,
-                     from_lifecycle TEXT
-                 )
-                 WHERE s.id = input.sandbox_id
-                   AND s.active_node_id = $2
-                   AND s.lifecycle = input.from_lifecycle
-                 RETURNING s.id"
-            ))
-            .bind(claimed_json.clone())
-            .bind(node_id)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|err| {
-                Status::internal(format!("mark quarantined sandbox lifecycle: {err}"))
-            })?;
+            let updated_ids = quarantine_claims::apply(conn, node_id, claimed_json.clone()).await?;
             let updated_ids = updated_ids.into_iter().collect::<BTreeSet<_>>();
             let updated = claimed
                 .into_iter()
