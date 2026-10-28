@@ -71,6 +71,14 @@ struct Explained {
 
 #[derive(Debug, serde::Deserialize)]
 struct PlanNode {
+    #[serde(rename = "Node Type")]
+    node_type: String,
+    #[serde(rename = "Join Type", default)]
+    join_type: Option<String>,
+    #[serde(rename = "Relation Name", default)]
+    relation: Option<String>,
+    #[serde(rename = "Index Name", default)]
+    index: Option<String>,
     #[serde(rename = "Actual Rows", default)]
     rows: f64,
     #[serde(rename = "Rows Removed by Filter", default)]
@@ -101,6 +109,35 @@ impl PlanNode {
             .iter()
             .map(PlanNode::rows_handled)
             .sum::<f64>()
+    }
+
+    /// One line per node, indented by depth: its type and join type, the
+    /// table and index it reads, and the rows it and its children handled,
+    /// so a failure names the node that broke the bound. Only plan
+    /// structure, no fixture values.
+    fn outline(&self, depth: usize, out: &mut String) {
+        use std::fmt::Write as _;
+
+        let _ = write!(
+            out,
+            "\n{:indent$}{}",
+            "",
+            self.node_type,
+            indent = depth * 2
+        );
+        if let Some(join_type) = &self.join_type {
+            let _ = write!(out, " {join_type}");
+        }
+        if let Some(relation) = &self.relation {
+            let _ = write!(out, " on {relation}");
+        }
+        if let Some(index) = &self.index {
+            let _ = write!(out, " using {index}");
+        }
+        let _ = write!(out, ": {} rows", self.rows_handled());
+        for child in &self.children {
+            child.outline(depth + 1, out);
+        }
     }
 }
 
@@ -142,11 +179,13 @@ async fn the_count_reads_only_the_orgs_rows_and_the_in_flight_operations() -> Te
     for plan_cache_mode in ["force_custom_plan", "force_generic_plan"] {
         let plan = explain_prepared(pool, &fixture, plan_cache_mode).await?;
         let handled = plan.rows_handled();
+        let mut outline = String::new();
+        plan.outline(1, &mut outline);
         assert!(
             handled <= bound as f64,
             "the count must handle no more rows than {PASSES} passes over the org's {} rows \
              and the cluster's {} in-flight operations ({bound}) ({plan_cache_mode}); it \
-             handled {handled}. Plan was {plan:?}",
+             handled {handled}. Rows handled by node, children included:{outline}",
             fixture.org_rows,
             fixture.in_flight,
         );

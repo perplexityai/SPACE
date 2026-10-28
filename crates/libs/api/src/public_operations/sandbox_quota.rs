@@ -388,57 +388,60 @@ struct SandboxesHeld {
 /// terminal set repeats the lifecycle CAS guards' list.
 ///
 /// A create's row is the one its target names, so the target is parsed back
-/// to a sandbox id and each create probes `sandboxes` by primary key.
-/// Comparing the target with `$5 || s.id::text` instead can use no index,
-/// and a generic plan then rescans the org's rows once per create. Only the
-/// text `s.id::text` produces is parsed: the `LIKE` fixes its length and
-/// its hyphens' places, and the expression allows exactly four hyphens with
+/// to a sandbox id and each create is joined to its row by id. Comparing the
+/// target with `$5 || s.id::text` instead can use no index, and a generic
+/// plan then rescans the org's rows once per create. Only the text
+/// `s.id::text` produces is parsed: the `LIKE` fixes its length and its
+/// hyphens' places, and the expression allows exactly four hyphens with
 /// lowercase hex between them. Any other target names no row, as the text
 /// comparison has it, and never reaches the cast, which would fail the
-/// statement.
+/// statement. One expression with counted repetitions would say the same,
+/// but Postgres evaluates it many times slower than this pair.
 ///
 /// Cost: the org's rows through `idx_sandboxes_org_id`, `deleted`
-/// tombstones included, one primary-key probe per in-flight create of the
-/// org, and the cluster's in-flight native creates through
-/// `idx_public_operations_state_next_attempt`. `OFFSET 0` keeps the org
-/// filter out of that last scan: pushed into it, both plan modes intersect
-/// the state index with `idx_public_operations_tenant_created`, which reads
-/// the org's whole retained operation history. A constant rather than a
-/// literal at its query site so `plan_tests` can `EXPLAIN` the text this
-/// runs.
-const SANDBOXES_HELD: &str = "\
-SELECT COUNT(*), COUNT(*) FILTER (WHERE held.user_id = $2)
-  FROM (
-       SELECT s.user_id
-         FROM sandboxes s
-        WHERE s.org_id = $1
-          AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
-       UNION ALL
-       SELECT op.actor_user_id
-         FROM (
-              SELECT op.org_id, op.actor_user_id, op.target_id
-                FROM public_operations op
-               WHERE op.state IN ('queued', 'running')
-                 AND op.api_product = $3
-                 AND op.kind = $4
-              OFFSET 0
-         ) op
-        WHERE op.org_id = $1
-          AND NOT EXISTS (
-              SELECT 1
-                FROM sandboxes s
-               WHERE s.id = CASE
-                         WHEN starts_with(op.target_id, $5)
-                          AND substr(op.target_id, length($5) + 1)
-                              LIKE '________-____-____-____-____________'
-                          AND substr(op.target_id, length($5) + 1)
-                              ~ '^[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+$'
-                         THEN substr(op.target_id, length($5) + 1)::uuid
-                     END
-                 AND s.org_id = $1
-                 AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
-          )
-  ) held";
+/// tombstones included; each of the org's in-flight creates joined to its
+/// row by id; and every queued or running operation in the cluster, of any
+/// kind or product, through `idx_public_operations_state_next_attempt`,
+/// which has neither column, so the native-create filter applies after the
+/// read. `OFFSET 0` keeps the org filter out of that last scan: pushed into
+/// it, both plan modes intersect the state index with
+/// `idx_public_operations_tenant_created`, which reads the org's whole
+/// retained operation history. A constant rather than a literal at its
+/// query site so `plan_tests` can `EXPLAIN` the text this runs.
+const SANDBOXES_HELD: &str = sql!(
+    "SELECT COUNT(*), COUNT(*) FILTER (WHERE held.user_id = $2)
+       FROM (
+            SELECT s.user_id
+              FROM sandboxes s
+             WHERE s.org_id = $1
+               AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
+            UNION ALL
+            SELECT op.actor_user_id
+              FROM (
+                   SELECT op.org_id, op.actor_user_id, op.target_id
+                     FROM public_operations op
+                    WHERE op.state IN ('queued', 'running')
+                      AND op.api_product = $3
+                      AND op.kind = $4
+                   OFFSET 0
+              ) op
+             WHERE op.org_id = $1
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM sandboxes s
+                    WHERE s.id = CASE
+                              WHEN starts_with(op.target_id, $5)
+                               AND substr(op.target_id, length($5) + 1)
+                                   LIKE '________-____-____-____-____________'
+                               AND substr(op.target_id, length($5) + 1)
+                                   ~ '^[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+$'
+                              THEN substr(op.target_id, length($5) + 1)::uuid
+                          END
+                      AND s.org_id = $1
+                      AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
+               )
+       ) held"
+);
 
 /// Count with [`SANDBOXES_HELD`]; see there for what is counted.
 async fn sandboxes_held_tx(
@@ -446,7 +449,7 @@ async fn sandboxes_held_tx(
     org_id: OrgId,
     subject_id: Option<UserId>,
 ) -> Result<SandboxesHeld, sqlx::Error> {
-    let (org, subject) = sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sql!(SANDBOXES_HELD)))
+    let (org, subject) = sqlx::query_as::<_, (i64, i64)>(SANDBOXES_HELD)
         .bind(org_id)
         .bind(subject_id)
         .bind(ApiProduct::Native.as_str())
