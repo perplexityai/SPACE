@@ -2,7 +2,7 @@ use tonic::Status;
 
 use super::store::ApplyPublishError;
 use super::store::inventory_reconcile::EnqueueInventoryReconcileError;
-use super::store::suspend_finalization::FinalizeSuspensionError;
+use super::store::ready_suspend::ProjectReadySuspendError;
 use super::store::template_components::ReplaceTemplateComponentsError;
 use super::store::template_inventory::UpsertTemplateInventoryError;
 use super::store::template_network_policy::ObserveTemplatePolicyError;
@@ -55,8 +55,8 @@ impl From<ApplySandboxClaimsError> for Status {
     }
 }
 
-impl From<FinalizeSuspensionError> for Status {
-    fn from(error: FinalizeSuspensionError) -> Self {
+impl From<ProjectReadySuspendError> for Status {
+    fn from(error: ProjectReadySuspendError) -> Self {
         Self::internal(error.to_string())
     }
 }

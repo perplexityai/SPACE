@@ -11,6 +11,7 @@ pub(crate) mod network_policy;
 pub(crate) mod observed_state;
 pub(crate) mod quarantine_claims;
 pub(crate) mod quarantine_persistence;
+pub(crate) mod ready_suspend;
 pub(crate) mod sandbox_facet_observations;
 pub(crate) mod snapshot_inventory;
 pub(crate) mod suspend_finalization;
