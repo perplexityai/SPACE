@@ -15,6 +15,7 @@ pub(crate) mod snapshot_inventory;
 pub(crate) mod suspend_finalization;
 pub(crate) mod template_components;
 pub(crate) mod template_inventory;
+pub(crate) mod template_pruning;
 
 use crate::auto_lifecycle_delete_completions::consume_validated_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};

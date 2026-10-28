@@ -31,7 +31,7 @@ use crate::node_publish::store::{
     quarantine_claims::{self, ClaimedQuarantineProjection},
     quarantine_persistence, sandbox_facet_observations, snapshot_inventory,
     suspend_finalization::{self, SuspendedFinalizationCandidate},
-    template_components, template_inventory,
+    template_components, template_inventory, template_pruning,
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 #[cfg(test)]
@@ -224,39 +224,7 @@ pub(crate) async fn publish_validated_template_states(
     inventory: ValidatedTemplateInventory,
 ) -> Result<u64, Status> {
     let (absent_templates, rows) = inventory.into_legacy_rows();
-    let mut accepted = 0_u64;
-    if !absent_templates.is_empty() {
-        let result = sqlx::query(sql!(
-            "DELETE FROM node_template_inventory
-             WHERE node_id = $1 AND template_name = ANY($2)"
-        ))
-        .bind(node_id)
-        .bind(&absent_templates)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| Status::internal(format!("delete absent published template: {err}")))?;
-        accepted = accepted.saturating_add(result.rows_affected());
-        let elements = absent_templates
-            .iter()
-            .map(|template| format!("template:{template}"))
-            .collect::<Vec<_>>();
-        sqlx::query(sql!(
-            "DELETE FROM node_facet_observed_status
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = ANY($3)"
-        ))
-        .bind(node_id)
-        .bind(FACET_NETWORK_POLICY)
-        .bind(&elements)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            Status::internal(format!(
-                "delete absent template network policy facet status: {err}"
-            ))
-        })?;
-    }
+    let mut accepted = template_pruning::remove_absent(conn, node_id, &absent_templates).await?;
 
     if rows.is_empty() {
         return Ok(accepted);
@@ -991,47 +959,7 @@ pub async fn prune_absent_node_templates(
     node_id: NodeId,
     present_keys: &[(String, String)],
 ) -> Result<(), Status> {
-    let templates = present_keys
-        .iter()
-        .map(|(template, _)| template.clone())
-        .collect::<Vec<_>>();
-    let content_hashes = present_keys
-        .iter()
-        .map(|(_, content_hash)| content_hash.clone())
-        .collect::<Vec<_>>();
-    sqlx::query(sql!(
-        "WITH present AS (
-             SELECT *
-             FROM UNNEST($2::TEXT[], $3::TEXT[]) AS present(template_name, content_hash)
-         ),
-         removed AS (
-             DELETE FROM node_template_inventory nti
-             WHERE nti.node_id = $1
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM present
-                   WHERE present.template_name = nti.template_name
-                     AND present.content_hash = nti.content_hash
-               )
-             RETURNING nti.template_name
-         ),
-         removed_elements AS (
-             SELECT DISTINCT 'template:' || template_name AS element
-             FROM removed
-         )
-         DELETE FROM node_facet_observed_status nfos
-         USING removed_elements
-         WHERE nfos.node_id = $1
-           AND nfos.facet = $4
-           AND nfos.element = removed_elements.element"
-    ))
-    .bind(node_id)
-    .bind(templates)
-    .bind(content_hashes)
-    .bind(FACET_NETWORK_POLICY)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("prune absent published templates: {err}")))?;
+    template_pruning::prune_census(conn, node_id, present_keys).await?;
     Ok(())
 }
 

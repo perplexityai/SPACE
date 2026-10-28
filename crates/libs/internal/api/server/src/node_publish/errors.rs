@@ -4,6 +4,7 @@ use super::store::ApplyPublishError;
 use super::store::suspend_finalization::FinalizeSuspensionError;
 use super::store::template_components::ReplaceTemplateComponentsError;
 use super::store::template_inventory::UpsertTemplateInventoryError;
+use super::store::template_pruning::{PruneTemplateCensusError, RemoveAbsentTemplatesError};
 use crate::execution_observation::PrepareExecutionObservationError;
 use crate::published_state::ApplySandboxClaimsError;
 use crate::sandbox_quarantine_store::{
@@ -66,6 +67,18 @@ impl From<UpsertTemplateInventoryError> for Status {
 
 impl From<ReplaceTemplateComponentsError> for Status {
     fn from(error: ReplaceTemplateComponentsError) -> Self {
+        Self::internal(error.to_string())
+    }
+}
+
+impl From<RemoveAbsentTemplatesError> for Status {
+    fn from(error: RemoveAbsentTemplatesError) -> Self {
+        Self::internal(error.to_string())
+    }
+}
+
+impl From<PruneTemplateCensusError> for Status {
+    fn from(error: PruneTemplateCensusError) -> Self {
         Self::internal(error.to_string())
     }
 }

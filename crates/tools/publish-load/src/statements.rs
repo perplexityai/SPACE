@@ -29,6 +29,9 @@ enum ScenarioKind {
     Empty,
     NodeStatus,
     Templates,
+    RepeatedTemplates,
+    AbsentTemplates,
+    EmptyTemplateCensus,
     OrdinarySingle,
     FullInventory,
     NetworkPolicy,
@@ -156,7 +159,69 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
             present: true,
             ..Default::default()
         });
-        scenarios.push(capture(db, &service, ScenarioKind::Templates, templates).await?);
+        scenarios.push(capture(db, &service, ScenarioKind::Templates, templates.clone()).await?);
+        let template_hashes = store::template_inventory_hashes(&db.pool, node.id.parse()?).await?;
+        ensure!(
+            template_hashes == [""],
+            "template inventory was not accepted"
+        );
+        scenarios.push(
+            capture(
+                db,
+                &service,
+                ScenarioKind::RepeatedTemplates,
+                templates.clone(),
+            )
+            .await?,
+        );
+        ensure!(
+            store::template_inventory_hashes(&db.pool, node.id.parse()?).await? == template_hashes,
+            "repeated template inventory changed release identity"
+        );
+        let mut absent_templates = templates.clone();
+        absent_templates.template_inventory_complete = false;
+        absent_templates
+            .templates
+            .first_mut()
+            .context("template missing")?
+            .present = false;
+        scenarios.push(
+            capture(
+                db,
+                &service,
+                ScenarioKind::AbsentTemplates,
+                absent_templates,
+            )
+            .await?,
+        );
+        ensure!(
+            store::template_inventory_hashes(&db.pool, node.id.parse()?)
+                .await?
+                .is_empty(),
+            "explicit absence left template inventory"
+        );
+        send(&service, templates).await?;
+        ensure!(
+            store::template_inventory_hashes(&db.pool, node.id.parse()?).await? == template_hashes,
+            "complete-empty census setup did not restore inventory"
+        );
+        let mut empty_templates = request(node);
+        empty_templates.template_inventory_complete = true;
+        scenarios.push(
+            capture(
+                db,
+                &service,
+                ScenarioKind::EmptyTemplateCensus,
+                empty_templates,
+            )
+            .await?,
+        );
+        ensure!(
+            store::template_inventory_hashes(&db.pool, node.id.parse()?)
+                .await?
+                .is_empty(),
+            "complete-empty census left template inventory"
+        );
         let mut single = request(node);
         single.sandboxes.push(
             node.sandboxes
