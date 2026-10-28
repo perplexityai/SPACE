@@ -261,17 +261,23 @@ Cluster-role nodes omit the sample. The shared node-manager channel is reused;
 connection readiness plus inventory RPC share a five-second budget.
 Failure, an unsupported RPC, or timeout publishes an
 unavailable observation; it does not abort publication of the remaining node
-status. The next periodic tick samples again rather than replaying a cached
-inventory. Other facets omit the observation, leaving its receipt unchanged.
+status. The next node-status publication, a periodic tick, a dirty node-status
+sync or a retry of a publish that could not reach internal-api, samples again
+rather than replaying a cached inventory. Other facets omit the observation,
+leaving its receipt unchanged.
 A successful collection populates both the report and the identical legacy
 inventory so old cluster readers retain their existing behavior.
 
 Execution collection accompanies only the node-status facet. Sandbox and
 template censuses run as separate outbound publications and can also refresh
 node status; an execution protocol error does not reject those separate
-requests. Failed publications remain reconciliation errors and the next
-periodic tick retries with a new sample. A persistent protocol defect needs a
-publisher fix, not a successful acknowledgement of the rejected report.
+requests. Failed publications remain reconciliation errors. One whose connect
+to internal-api failed, or whose connection was lost, is retried within
+seconds with a new sample. One internal-api answered with an error of any
+code, a rejected protocol error included, or whose stream internal-api reset,
+waits for the next periodic tick, which retries with a new sample. A
+persistent protocol defect needs a publisher fix, not a successful
+acknowledgement of the rejected report.
 
 The inventory polling period (60 seconds by default) isn't itself a heartbeat
 freshness guarantee. The node-status freshness window is derived from the

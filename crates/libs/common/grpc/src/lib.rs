@@ -82,8 +82,8 @@ pub use request_admission::{RequestAdmission, RequestLifetime, RequestPermit};
 pub use request_body::PreserveInputErrors;
 pub use retry::{
     ClientConnectFailureCause, client_connect_failure_cause, is_client_connect_failure,
-    is_temporary_tcp_failure, retry_grpc_status_with_context, retry_grpc_status_with_context_if,
-    should_reconnect_status,
+    is_client_transport_failure, is_temporary_tcp_failure, retry_grpc_status_with_context,
+    retry_grpc_status_with_context_if, should_reconnect_status,
 };
 pub use rotate::{RotatingChannel, max_connection_age_from_env};
 pub use server::{GrpcServer, grpc_server_builder};

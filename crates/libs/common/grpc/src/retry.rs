@@ -207,6 +207,58 @@ pub fn client_connect_failure_cause(status: &Status) -> Option<ClientConnectFail
     None
 }
 
+/// True when the client made `status` itself because its transport to the
+/// peer failed: the dial failed (refused, timed out, name resolution, TLS),
+/// or the connection carrying the call was lost before the answer was
+/// complete (an I/O error, a connection closed or dropped mid-call, or a
+/// GOAWAY that ended it before the peer accepted the call). Tonic builds such
+/// a status from the local error and keeps that error as the status's
+/// [`source`](std::error::Error::source), so the chain carries a
+/// [`tonic::transport::Error`], a [`hyper::Error`] or an [`std::io::Error`].
+///
+/// This is a check of who produced the status, not of its code or message.
+/// A status the peer answered is decoded from its `grpc-status` and has no
+/// source, so no answer satisfies it, whatever its code and even when its
+/// message names a transport failure of the peer's own. Neither does a stream
+/// reset the peer sent (an [`h2::Error`] from a received `RST_STREAM`),
+/// whatever its reason, a handler panic's `CANCEL` and `REFUSED_STREAM`
+/// included: the peer was reached and chose to end the call. Nor does a
+/// status a client interceptor returns, such as a bearer token that failed to
+/// attach. The client's own call timeout ([`tonic::TimeoutExpired`]) does not
+/// count, since the peer may only be slow, and neither does an HTTP/2
+/// `ENHANCE_YOUR_CALM` reset or GOAWAY, which tonic reports as
+/// `ResourceExhausted`, since the peer is shedding load.
+///
+/// A status without a source does not prove the peer answered: a generated
+/// client's own "Service was not ready" is stringified without one. That
+/// errs towards not counting a failure, never towards counting an answer.
+///
+/// Unlike [`is_client_connect_failure`], the request may have reached the
+/// peer, so only an idempotent RPC is safe to replay on this alone.
+pub fn is_client_transport_failure(status: &Status) -> bool {
+    if status.code() == Code::ResourceExhausted {
+        return false;
+    }
+    let mut transport = false;
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error.is::<tonic::TimeoutExpired>() {
+            return false;
+        }
+        if error
+            .downcast_ref::<h2::Error>()
+            .is_some_and(|error| error.is_reset() && error.is_remote())
+        {
+            return false;
+        }
+        transport |= error.is::<tonic::transport::Error>()
+            || error.is::<hyper::Error>()
+            || error.is::<std::io::Error>();
+        source = error.source();
+    }
+    transport
+}
+
 pub fn is_temporary_tcp_failure(status: &Status) -> bool {
     // A server refusing the request before starting it (an admission limit,
     // a guest shutting down) answered over a working transport; the caller,
