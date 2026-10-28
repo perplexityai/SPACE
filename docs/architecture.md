@@ -59,6 +59,13 @@ All phases share one transaction; only a successful commit produces the outcome
 that emits post-commit events. No protocol or schema agreement beyond the
 existing contracts is required between server versions.
 
+Observed-state counter-only changes (`uptime`, `pid`, network byte counters,
+and disk usage) refresh at most once per 60 seconds of database transaction time.
+Structural changes still write immediately and refresh counters with them.
+This is a write-frequency throttle, not a hard API-age guarantee: the next
+eligible report supplies the refresh. Activity timestamps retain their existing
+reported-time threshold because they feed idle lifecycle decisions.
+
 SPACE can manage workers directly or through Kubernetes. The [direct adapter](../crates/libs/api/src/controllers/substrate/direct.rs) calls worker services without creating Kubernetes sandbox pods. The [Kubernetes adapter](../crates/libs/api/src/controllers/substrate/kubernetes/mod.rs) is used by the local Kind installation in these guides.
 
 ### Local Kind topology

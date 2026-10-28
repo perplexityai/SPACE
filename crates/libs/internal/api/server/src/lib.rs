@@ -18,6 +18,9 @@
 //! claims in `node_publish::plan`, and applies them through `node_publish::store`
 //! in one transaction. Only the store evaluates lifecycle guards; the committed
 //! outcome owns the post-commit events and response.
+//! Counter-only observed-state writes are throttled to 60 seconds of database
+//! transaction time; structural changes still refresh immediately. A report is
+//! required to refresh counters, so this is not a bound on API-visible age.
 pub use pplx_space_common_svc::auth;
 pub use pplx_space_node_api_client::proto;
 

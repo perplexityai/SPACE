@@ -809,6 +809,15 @@ async fn quarantine_recovery_observation_is_validated_stored_and_cleared() -> Te
     .await?;
     assert_eq!(preserved, Some(local_quarantine_id.to_string()));
 
+    // Keep this assertion about rich state surviving degraded recovery evidence;
+    // the counter throttle's fresh and boundary cases are covered separately.
+    sqlx::query(sql!(
+        "UPDATE sandbox_observed_states SET observed_at = NOW() - INTERVAL '2 minutes'
+         WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
     state.network_tx_bytes = Some(8_675_309);
     state.quarantine_recovery = Some(
         pplx_space_sbx_mgr_client::proto::QuarantineRecoveryObservation {
@@ -1309,6 +1318,11 @@ async fn repeated_sandbox_publish_does_not_rewrite_observed_state() -> TestResul
     let mut state = published_sandbox_state(sandbox_id, "started");
     state.execution = Some((&test_execution()).into());
     state.state_changed_at = Some(timestamp(1_234_567));
+    state.uptime = Some("1m".to_owned());
+    state.pid = Some(11);
+    state.network_tx_bytes = Some(1);
+    state.network_rx_bytes = Some(2);
+    state.disk_usage_bytes = Some(3);
     let mut conn = db.pool.acquire().await?;
     let accepted = publish_sandbox_states(&mut conn, node_id, &[state.clone()]).await?;
     assert_eq!(accepted.accepted, 1);
@@ -1325,7 +1339,7 @@ async fn repeated_sandbox_publish_does_not_rewrite_observed_state() -> TestResul
     .await?;
 
     let mut conn = db.pool.acquire().await?;
-    let accepted = publish_sandbox_states(&mut conn, node_id, &[state]).await?;
+    let accepted = publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&state)).await?;
     assert_eq!(accepted.accepted, 1);
     assert!(accepted.post_commit_state_convergence.is_empty());
     drop(conn);
@@ -1342,6 +1356,96 @@ async fn repeated_sandbox_publish_does_not_rewrite_observed_state() -> TestResul
         updated_at.starts_with("2026-01-01 00:00:00"),
         "unchanged publish should not touch updated_at, got {updated_at}"
     );
+
+    // NOW() is fixed throughout this transaction, including at the exact
+    // throttle boundary. No wall-clock waiting is needed.
+    let mut tx = db.pool.begin().await?;
+    let now: String = sqlx::query_scalar(sql!("SELECT NOW()::TEXT"))
+        .fetch_one(&mut *tx)
+        .await?;
+    let original_counters = serde_json::json!({
+        "uptime": "1m", "pid": 11, "tx": 1, "rx": 2, "disk": 3
+    });
+    let changed_counters = serde_json::json!({
+        "uptime": "2m", "pid": 71, "tx": 5, "rx": 9, "disk": 12
+    });
+    state.uptime = Some("2m".to_owned());
+    state.pid = Some(71);
+    state.network_tx_bytes = Some(5);
+    state.network_rx_bytes = Some(9);
+    state.disk_usage_bytes = Some(12);
+    for (age_seconds, refresh) in [(0_i64, false), (59, false), (60, true), (61, false)] {
+        let before: (String, String) = sqlx::query_as(sql!(
+            "UPDATE sandbox_observed_states
+             SET observed_at = NOW() - $2::BIGINT * INTERVAL '1 second'
+             WHERE sandbox_id = $1 RETURNING observed_at::TEXT, updated_at::TEXT"
+        ))
+        .bind(sandbox_id)
+        .bind(age_seconds)
+        .fetch_one(&mut *tx)
+        .await?;
+        let outcome =
+            publish_sandbox_states(&mut tx, node_id, std::slice::from_ref(&state)).await?;
+        assert_eq!(outcome.accepted, 1);
+        assert!(outcome.post_commit_state_convergence.is_empty());
+        let after: (serde_json::Value, String, String) = sqlx::query_as(sql!(
+            "SELECT jsonb_build_object(
+                 'uptime', uptime, 'pid', pid, 'tx', network_tx_bytes,
+                 'rx', network_rx_bytes, 'disk', disk_usage_bytes
+             ), observed_at::TEXT, updated_at::TEXT
+             FROM sandbox_observed_states WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let expected = if age_seconds < 60 {
+            &original_counters
+        } else {
+            &changed_counters
+        };
+        assert_eq!(&after.0, expected, "counter age {age_seconds}");
+        let expected_times = if refresh {
+            (now.clone(), now.clone())
+        } else {
+            before
+        };
+        assert_eq!(
+            (after.1, after.2),
+            expected_times,
+            "counter age {age_seconds}"
+        );
+    }
+
+    sqlx::query(sql!(
+        "UPDATE sandbox_observed_states SET observed_at = NOW() WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut *tx)
+    .await?;
+    state.status = Some("paused".to_owned());
+    state.uptime = Some("3m".to_owned());
+    state.pid = None;
+    state.network_tx_bytes = Some(8);
+    state.network_rx_bytes = None;
+    state.disk_usage_bytes = None;
+    publish_sandbox_states(&mut tx, node_id, &[state]).await?;
+    let structural: serde_json::Value = sqlx::query_scalar(sql!(
+        "SELECT jsonb_build_object(
+             'status', status, 'uptime', uptime, 'pid', pid, 'tx', network_tx_bytes,
+             'rx', network_rx_bytes, 'disk', disk_usage_bytes
+         ) FROM sandbox_observed_states WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    assert_eq!(
+        structural,
+        serde_json::json!({
+            "status": "paused", "uptime": "3m", "pid": null, "tx": 8,
+            "rx": null, "disk": 12
+        })
+    );
+    tx.rollback().await?;
     Ok(())
 }
 

@@ -16,7 +16,10 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use super::publish_sandbox_states;
 use crate::node_publish::plan::lifecycle::FailedClaim;
+use crate::node_publish::plan::sandboxes::SandboxPlan;
 use crate::node_publish::store::lifecycle_transitions::converge_failed;
+use crate::node_publish::store::observed_state;
+use crate::node_publish::validate::sandbox_inventory::ValidatedSandboxInventory;
 use crate::proto::PublishedSandboxState;
 
 /// Bounds both the wait for the projection to block and its completion.
@@ -91,6 +94,92 @@ async fn wait_until_blocked(pool: &PgPool, waiter: i32, holder: i32) -> TestResu
     })
     .await
     .map_err(|_| format!("backend {waiter} never waited on backend {holder}"))?
+}
+
+/// A candidate selected from a stale snapshot must recheck counter freshness
+/// after acquiring the observation lock, without delaying structural changes.
+#[tokio::test(flavor = "current_thread")]
+async fn observed_counter_throttle_rechecks_the_row_committed_while_it_waits() -> TestResult {
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(pool, node_id).await?;
+
+    for structural_change in [false, true] {
+        let sandbox_id = insert_k8s_sandbox(pool, node_id, "started").await?;
+        let mut state = PublishedSandboxState {
+            sandbox_id: sandbox_id.to_string(),
+            present: true,
+            status: Some("started".to_owned()),
+            uptime: Some("1m".to_owned()),
+            ..Default::default()
+        };
+        let initial = SandboxPlan::from(ValidatedSandboxInventory::from_proto(
+            std::slice::from_ref(&state),
+        ));
+        let mut conn = pool.acquire().await?;
+        assert_eq!(
+            observed_state::upsert(&mut conn, node_id, &initial.observations)
+                .await?
+                .len(),
+            1
+        );
+        drop(conn);
+        sqlx::query(sql!(
+            "UPDATE sandbox_observed_states SET observed_at = NOW() - INTERVAL '2 minutes'
+             WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+
+        let (mut holder, holder_pid) = begin_holder(pool).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_observed_states SET uptime = $2, observed_at = NOW()
+             WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind("2m")
+        .execute(&mut *holder)
+        .await?;
+        state.uptime = Some("3m".to_owned());
+        if structural_change {
+            state.status = Some("paused".to_owned());
+        }
+        let incoming = SandboxPlan::from(ValidatedSandboxInventory::from_proto(&[state]));
+        let mut waiter = pool.begin().await?;
+        let waiter_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+            .fetch_one(&mut *waiter)
+            .await?;
+        let projection = tokio::time::timeout(RACE_BUDGET, async move {
+            let rows = observed_state::upsert(&mut waiter, node_id, &incoming.observations).await?;
+            waiter.commit().await?;
+            TestResult::<Vec<_>>::Ok(rows)
+        });
+        let release = async move {
+            wait_until_blocked(pool, waiter_pid, holder_pid).await?;
+            holder.commit().await?;
+            TestResult::Ok(())
+        };
+        let (projected, released) = tokio::join!(projection, release);
+        released?;
+        let rows = projected.map_err(|_| "observed-state projection did not finish")??;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].updated, structural_change);
+        let actual: (String, String) = sqlx::query_as(sql!(
+            "SELECT status, uptime FROM sandbox_observed_states WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        let expected = if structural_change {
+            ("paused", "3m")
+        } else {
+            ("started", "2m")
+        };
+        assert_eq!((actual.0.as_str(), actual.1.as_str()), expected);
+    }
+    Ok(())
 }
 
 /// The concurrent writer that commits while the `failed` projection waits.

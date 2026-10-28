@@ -13,6 +13,8 @@ pub(crate) enum UpdateActivityError {
 /// clears the existing one-minute write threshold. The update locks matching
 /// sandbox rows; no separate lock acquisition or client-clock comparison occurs.
 /// False means no timestamp passed both the owner guard and write threshold.
+/// This threshold compares reported activity times, not elapsed database time;
+/// it preserves the activity evidence used by idle lifecycle decisions.
 pub(crate) async fn update(
     conn: &mut PgConnection,
     node_id: NodeId,

@@ -6,6 +6,8 @@ use sqlx::{PgConnection, types::Json};
 
 use crate::node_publish::plan::observed_state::ObservedStateClaim;
 
+const COUNTER_REFRESH_INTERVAL_SECONDS: i32 = 60;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UpsertObservedStateError {
     #[error("write published sandbox observed state: {0}")]
@@ -112,9 +114,7 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                     observed_current.state_format_name,
                     observed_current.state_format_version,
                     observed_current.execution_metadata,
-                    observed_current.pid,
                     observed_current.namespace,
-                    observed_current.uptime,
                     observed_current.sandbox_owner,
                     observed_current.sandbox_user,
                     observed_current.image_hash,
@@ -123,9 +123,6 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                     observed_current.pool_template,
                     observed_current.failure_reason,
                     observed_current.observed_created_at,
-                    observed_current.network_tx_bytes,
-                    observed_current.network_rx_bytes,
-                    observed_current.disk_usage_bytes,
                     observed_current.auto_lifecycle_authority,
                     observed_current.missing_publish_count)
                    IS DISTINCT FROM
@@ -139,9 +136,7 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                     publishable.state_format_name,
                     publishable.state_format_version,
                     publishable.execution_metadata,
-                    publishable.pid,
                     publishable.namespace,
-                    publishable.uptime,
                     publishable.sandbox_owner,
                     publishable.sandbox_user,
                     publishable.image_hash,
@@ -150,11 +145,18 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                     publishable.pool_template,
                     publishable.failure_reason,
                     publishable.observed_created_at,
-                    publishable.network_tx_bytes,
-                    publishable.network_rx_bytes,
-                    COALESCE(publishable.disk_usage_bytes, observed_current.disk_usage_bytes),
                     publishable.auto_lifecycle_authority,
                     0)
+                OR (
+                    observed_current.observed_at <= NOW() - $27::INTEGER * INTERVAL '1 second'
+                    AND (observed_current.uptime, observed_current.pid,
+                         observed_current.network_tx_bytes, observed_current.network_rx_bytes,
+                         observed_current.disk_usage_bytes)
+                        IS DISTINCT FROM
+                        (publishable.uptime, publishable.pid,
+                         publishable.network_tx_bytes, publishable.network_rx_bytes,
+                         COALESCE(publishable.disk_usage_bytes, observed_current.disk_usage_bytes))
+                )
          ),
          upserted AS (
              INSERT INTO sandbox_observed_states (
@@ -239,9 +241,7 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                    sandbox_observed_states.state_format_name,
                    sandbox_observed_states.state_format_version,
                    sandbox_observed_states.execution_metadata,
-                   sandbox_observed_states.pid,
                    sandbox_observed_states.namespace,
-                   sandbox_observed_states.uptime,
                    sandbox_observed_states.sandbox_owner,
                    sandbox_observed_states.sandbox_user,
                    sandbox_observed_states.image_hash,
@@ -250,9 +250,6 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                    sandbox_observed_states.pool_template,
                    sandbox_observed_states.failure_reason,
                    sandbox_observed_states.observed_created_at,
-                   sandbox_observed_states.network_tx_bytes,
-                   sandbox_observed_states.network_rx_bytes,
-                   sandbox_observed_states.disk_usage_bytes,
                    sandbox_observed_states.auto_lifecycle_authority,
                    sandbox_observed_states.missing_publish_count)
                   IS DISTINCT FROM
@@ -266,9 +263,7 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                    EXCLUDED.state_format_name,
                    EXCLUDED.state_format_version,
                    EXCLUDED.execution_metadata,
-                   EXCLUDED.pid,
                    EXCLUDED.namespace,
-                   EXCLUDED.uptime,
                    EXCLUDED.sandbox_owner,
                    EXCLUDED.sandbox_user,
                    EXCLUDED.image_hash,
@@ -277,11 +272,18 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
                    EXCLUDED.pool_template,
                    EXCLUDED.failure_reason,
                    EXCLUDED.observed_created_at,
-                   EXCLUDED.network_tx_bytes,
-                   EXCLUDED.network_rx_bytes,
-                   COALESCE(EXCLUDED.disk_usage_bytes, sandbox_observed_states.disk_usage_bytes),
                    EXCLUDED.auto_lifecycle_authority,
                    0)
+               OR (
+                   sandbox_observed_states.observed_at <= NOW() - $27::INTEGER * INTERVAL '1 second'
+                   AND (sandbox_observed_states.uptime, sandbox_observed_states.pid,
+                        sandbox_observed_states.network_tx_bytes, sandbox_observed_states.network_rx_bytes,
+                        sandbox_observed_states.disk_usage_bytes)
+                       IS DISTINCT FROM
+                       (EXCLUDED.uptime, EXCLUDED.pid,
+                        EXCLUDED.network_tx_bytes, EXCLUDED.network_rx_bytes,
+                        COALESCE(EXCLUDED.disk_usage_bytes, sandbox_observed_states.disk_usage_bytes))
+               )
             RETURNING sandbox_id, (xmax = 0) AS inserted
         )
          SELECT publishable.sandbox_id,
@@ -307,6 +309,9 @@ const UPSERT_OBSERVED_STATE_SQL: &str = sql!(
 /// Direct route ownership when present. Conflict handling locks observation
 /// rows even for no-op updates, without explicit sandbox locks. Unchanged observations
 /// remain accepted, and an empty result means no input passed the owner guard.
+/// Structural changes write immediately. Counter-only changes write at most once
+/// per 60 seconds of database transaction time, rechecked against the locked row.
+/// This bounds write frequency, not API age: refresh still requires a report.
 pub(crate) async fn upsert(
     conn: &mut PgConnection,
     node_id: NodeId,
@@ -388,6 +393,7 @@ pub(crate) async fn upsert(
         .bind(column!(|claim| claim
             .auto_lifecycle_authority
             .map(|authority| authority.as_str())))
+        .bind(COUNTER_REFRESH_INTERVAL_SECONDS)
         .fetch_all(&mut *conn)
         .await
         .map_err(UpsertObservedStateError::Upsert)
