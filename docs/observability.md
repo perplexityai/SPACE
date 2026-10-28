@@ -1130,3 +1130,45 @@ local answers and capacity rejections.
 `gateway.reserved_dns.upstream_busy.lookup_in_flight` samples only `Busy` that
 reaches Hickory, not sends on closed connections. A send that races the
 connection's exit can still reach Hickory as `Busy`.
+
+## Network slot resets
+
+A released network slot keeps its sandbox ID and UID until node-manager resets
+it. The reset first checks that the released lease's runtime is gone. When it is
+not, the slot stays `dirty`, its `last_error` reads
+`cannot reset slot … runtime is <Live|Unknown> (<source>[ pid <pid>])`, and
+node-manager warns `network slot reset deferred while leased process is still
+alive` and retries every 30 seconds. `<source>` names the first evidence that
+blocked the reset:
+
+- `sidecar_cgroup`, `vm_cgroup`, `fc_pid`: the sandbox's sidecar cgroup, VM
+  cgroup or registered Firecracker PID. The reset uses these only while the
+  sandbox holds no newer lease on another slot.
+- `tracked_pid`: the PID the released lease recorded.
+- `netns_member`: a thread inside the released slot's network namespace.
+- `slot_uid`: a process running as the released slot's VM or gateway UID.
+- `netns_unverifiable`: the slot's namespace mount could not be inspected.
+- `pid_namespace_incomplete`: the sandbox's cgroups hold tasks node-manager
+  cannot see, or their `cgroup.procs` could not be read.
+- `process_unreadable`: `/proc` or the named process could not be read.
+
+Allocate can give a sandbox a new slot while its previous slot is still dirty,
+for example when a suspend is followed at once by a wake on the same node. From
+then on the sandbox's cgroups and `fc.pid` describe the new slot's VM, so the
+reset judges the old slot only by its own evidence: `tracked_pid`,
+`netns_member` and `slot_uid`. A `Live` deferral with one of these sources means
+a process of the released lease really survives, named by its PID. A deferral
+from the sandbox-wide sources means the sandbox runs no newer lease, and its
+runtime has not exited. An `Unknown` deferral repeats until the evidence can be
+read again. It does not quarantine the slot, so a node whose slots keep
+reporting it needs an operator.
+
+This evidence needs the host PID namespace. Node-manager runs with
+`hostPID: true`. Without it, node-manager could not see the runtime's
+processes, so every reset with a newer lease defers as
+`pid_namespace_incomplete` while that lease's VM runs.
+
+The reset also reads the sandbox's current lease from the slot store. If that
+read fails, node-manager warns `reset successor lease unavailable; retry
+scheduled` and retries the reset without changing the slot. Repeated warnings
+mean the slot store is failing for every reset.
