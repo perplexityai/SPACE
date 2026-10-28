@@ -112,6 +112,11 @@ fn spawn_in_current_span<T: Send + 'static>(
         .spawn(move || span.in_scope(work))
 }
 
+/// Iterate a channel until it closes, adding each blocking receive to `wait`.
+fn timed_recv<'a, T>(rx: &'a Receiver<T>, wait: &'a mut Duration) -> impl Iterator<Item = T> + 'a {
+    std::iter::from_fn(move || timed(wait, || rx.recv().ok()))
+}
+
 fn timed<T>(elapsed: &mut Duration, operation: impl FnOnce() -> T) -> T {
     let started = Instant::now();
     let result = operation();
@@ -893,7 +898,7 @@ fn hash_compressed_rootfs_chunks(
 ) -> Result<String, RootfsZstdError> {
     let mut timing = StageTiming::new(RootfsStage::CompressedHash);
     let mut hasher = sha256_hasher();
-    while let Ok(chunk) = timed(&mut timing.recv_wait, || chunk_rx.recv()) {
+    for chunk in timed_recv(&chunk_rx, &mut timing.recv_wait) {
         let bytes = chunk.bytes().map_err(|_| RootfsZstdError::Pipeline {
             operation: "read compressed chunk bytes",
         })?;
@@ -921,7 +926,7 @@ fn write_decoded_rootfs_chunks(
             }
         })?;
     let mut decoded_size = 0u64;
-    while let Ok(chunk) = timed(&mut timing.recv_wait, || chunk_rx.recv()) {
+    for chunk in timed_recv(&chunk_rx, &mut timing.recv_wait) {
         decoded_size = decoded_size.saturating_add(usize_to_u64_saturating(chunk.len));
         let bytes = chunk.bytes()?;
         // Includes zero classification, buffered writes and hole seeks without
@@ -958,7 +963,7 @@ fn hash_decoded_rootfs_chunks(
     let mut timing = StageTiming::new(RootfsStage::DecodedHash);
     let mut hasher = ContentHasher::new(algorithm);
     let mut decoded_size = 0u64;
-    while let Ok(chunk) = timed(&mut timing.recv_wait, || chunk_rx.recv()) {
+    for chunk in timed_recv(&chunk_rx, &mut timing.recv_wait) {
         decoded_size = decoded_size.saturating_add(usize_to_u64_saturating(chunk.len));
         let bytes = chunk.bytes()?;
         timed(&mut timing.busy, || hasher.update(bytes));

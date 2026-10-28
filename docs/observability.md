@@ -1032,50 +1032,22 @@ exporter work; guest telemetry needs an independently reviewed collection path.
 
 ## Rootfs materialization
 
-Template pulls trace `materialize_rootfs` beneath `pull_in_scope`, preserving
-that parent through blocking tasks and the decompression worker threads.
-`decompress_rootfs` has `rootfs.setup`, `rootfs.pipeline`, `rootfs.finalize`,
-`rootfs.verify`, and `rootfs.publish` spans. Setup covers opening the input,
-creating the temporary output and applying its backing policy. Pipeline covers
-decoder/buffer initialization and all concurrent stages through their joins.
-Finalize is a child of pipeline covering its tail: decoder finish,
-compressed-hash finalization/cache advice, and decoded-hash/writer joins.
-Verify precedes publish, which covers rename and stat.
+Template pulls trace `materialize_rootfs` under `pull_in_scope`. Its
+`decompress_rootfs` child has `rootfs.setup`, `rootfs.pipeline` (with a
+`rootfs.finalize` child for the tail and thread joins), `rootfs.verify` and
+`rootfs.publish`. The uncompressed path uses `rootfs.raw_setup` and
+`hash_rootfs_file`.
 
-Concurrent `rootfs.stage` spans carry a bounded `stage` value and accumulated
-`busy_ms`, `recv_wait_ms`, `send_wait_ms`, `wall_ms`, and `bytes`. Receive and
-send times include the channel call overhead as well as blocking. Counters
-are accumulated once per pooled chunk, not per sparse block; they are recorded
-on drop, including partial work on errors.
+Each concurrent stage gets a `rootfs.stage` span with a `stage` of `decode`,
+`compressed_input`, `compressed_hash`, `decoded_hash`, `writer` or `raw_hash`,
+and records `busy_ms`, `recv_wait_ms`, `send_wait_ms`, `wall_ms` and `bytes`
+when it ends, including on error. Counters are taken once per pooled chunk.
+The decoder also records `read_ms` (inclusive zstd read time; `busy_ms`
+subtracts the nested compressed-input time), and the writer records
+`data_bytes` and `hole_bytes` (logical sparse classification).
 
-| Stage | Busy work | Receive / send waits | Bytes |
-| --- | --- | --- | --- |
-| `decode` | zstd reads minus measured compressed-input work and waits | Reusable output buffer / decoded-hash queue | Decoded bytes |
-| `compressed_input` | Reading compressed chunks from the file | Reusable input buffer / compressed-hash queue | Compressed bytes read |
-| `compressed_hash` | SHA-256 update and finalization | Input chunks / recycled input buffers | Compressed bytes hashed |
-| `decoded_hash` | Content hash update and finalization | Decoded chunks / writer queue | Decoded bytes hashed |
-| `writer` | Zero classification, writes, hole seeks and final flush | Hashed chunks / recycled output buffers | Decoded bytes written or made sparse |
-| `raw_hash` | Content hash update and finalization | None | Uncompressed bytes hashed |
-
-`decode.read_ms` (the `read_ms` attribute on the decode stage) is inclusive
-zstd-read time before subtracting input work. The writer also records
-`data_bytes` and `hole_bytes`, whose sum is its `bytes` on success. These
-describe logical sparse classification, not physical disk allocation or
-durable writes. `decompress_rootfs` records `decoded_bytes` and `compressed_bytes` once the
-pipeline has joined successfully.
-
-The uncompressed-only path uses `rootfs.raw_setup` for backing-policy work,
-then `hash_rootfs_file` with setup, raw-hash stage and finalize spans.
-Its `read_ms` measures file reads separately from hash busy time, and
-`hash_rootfs_file.decoded_bytes` records the bytes hashed.
-
-Use busy time versus channel waits to locate a pipeline limiter; stage wall
-times alone overlap and must not be added. Busy is elapsed operation time,
-not CPU utilization: disk I/O, scheduler delays and hash implementation work
-can all contribute. Decoder busy is an estimate obtained by subtracting
-nested input timings. Span lifetime includes untimed setup, bookkeeping or
-finalization, so counters need not add exactly to wall time. Final byte
-attributes are absent if the operation fails before they can be determined.
+The stage with high `busy_ms` and low waits is the limiter. Stage wall times
+overlap and must not be added, and busy is elapsed time, not CPU time.
 
 ## Reconnect attribution baseline
 
