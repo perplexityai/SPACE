@@ -1,9 +1,14 @@
 use super::*;
-use crate::node_publish::validate::execution_observation::ObservationError;
-use crate::proto::{ExecutionInventoryUnavailable, execution_inventory_observation::Outcome};
+use crate::node_publish::validate::execution_observation::{ObservationError, Report, decode};
+use crate::proto::{
+    ExecutionInventoryObservation, ExecutionInventoryUnavailable,
+    execution_inventory_observation::Outcome,
+};
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
-use pplx_space_execution_common::proto::{RuntimeIdentity, RuntimeInstallation, RuntimeKind};
+use pplx_space_execution_common::proto::{
+    NodeExecutionInventory, RuntimeIdentity, RuntimeInstallation, RuntimeKind,
+};
 use pplx_space_test_env::TestResult;
 use prost::Message;
 
@@ -119,7 +124,7 @@ async fn publish_with_status(
     observation: Option<&ExecutionInventoryObservation>,
     legacy: Option<&NodeExecutionInventory>,
 ) -> Result<(), Status> {
-    let prepared = prepare(tx, node_id, observation, legacy).await?;
+    let prepared = prepare(tx, node_id, validated_report(observation, legacy)?).await?;
     let outcome = publish(tx, prepared).await?;
     crate::status::upsert_node_status_from_publish(
         tx,
@@ -131,6 +136,15 @@ async fn publish_with_status(
         outcome,
     )
     .await
+}
+
+fn validated_report(
+    observation: Option<&ExecutionInventoryObservation>,
+    legacy: Option<&NodeExecutionInventory>,
+) -> Result<Option<ValidatedReport>, Status> {
+    decode(observation, legacy)?
+        .map(ValidatedReport::try_from_report)
+        .transpose()
 }
 
 async fn observed(
@@ -222,13 +236,13 @@ async fn empty_publications_serialize_until_status_receipt_commits() -> TestResu
     let empty = complete(NodeExecutionInventory::default());
     let mut first = db.pool.begin().await?;
     // No status or artifact rows are needed to serialize a replacement.
-    let prepared = prepare(&mut first, node_id, Some(&empty), None).await?;
+    let prepared = prepare(&mut first, node_id, validated_report(Some(&empty), None)?).await?;
     let outcome = publish(&mut first, prepared).await?;
     let mut second = db.pool.begin().await?;
     sqlx::query(sql!("SET LOCAL lock_timeout = '20ms'"))
         .execute(&mut *second)
         .await?;
-    let result = prepare(&mut second, node_id, Some(&empty), None).await;
+    let result = prepare(&mut second, node_id, validated_report(Some(&empty), None)?).await;
     let error = match result {
         Err(error) => error,
         Ok(_) => panic!("concurrent empty publication did not wait for the node lock"),

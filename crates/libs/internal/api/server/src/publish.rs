@@ -1,12 +1,11 @@
 use super::status::*;
 use super::*;
-use crate::auto_lifecycle_delete_completions::consume_auto_lifecycle_delete_completions;
+use crate::auto_lifecycle_delete_completions::consume_validated_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
-use crate::node_publish::validate::census::SandboxCensus;
+use crate::node_publish::validate::ValidatedPublish;
 use crate::node_publish::validate::node_role::PublicationRoleIntent;
-use crate::node_publish::validate::node_status::ValidatedNodeStatus;
+use crate::published_state::{publish_validated_sandbox_states, publish_validated_template_states};
 use pplx_space_metrics::internal_api::{LocalBackupQueueOutcome, local_backup_queue_reconcile};
-use pplx_space_node_api_client::node_status_freshness::reported_freshness;
 use pplx_space_placement::StoredSandboxLifecycle;
 
 impl ClusterApiService {
@@ -14,9 +13,6 @@ impl ClusterApiService {
         &self,
         request: Request<PublishNodeStateRequest>,
     ) -> Result<Response<PublishNodeStateResponse>, Status> {
-        let template_inventory_complete = request.get_ref().template_inventory_complete;
-        let auto_lifecycle_delete_completions_received =
-            request.get_ref().auto_lifecycle_delete_completions.len();
         let role_intent = PublicationRoleIntent::try_from_proto(request.get_ref())?;
         let origin = self
             .authenticated_origin_node_id(
@@ -26,34 +22,25 @@ impl ClusterApiService {
             )
             .await?;
         role_intent.validate_authenticated_role(origin.role)?;
-        let request = request.into_inner();
-        let reported_window = reported_freshness(
-            request
-                .node_status
-                .as_ref()
-                .and_then(|status| status.node_ctl.as_ref()),
-        );
-        let node_status = request
-            .node_status
-            .map(ValidatedNodeStatus::try_from_proto)
-            .transpose()?;
-        let (sandbox_census, census_diagnostics) =
-            SandboxCensus::from_proto(&request.sandboxes, request.sandbox_inventory_complete);
+        let ValidatedPublish {
+            origin,
+            reported_window,
+            node_status,
+            sandbox_census,
+            census_diagnostics,
+            template_census,
+            templates,
+            sandboxes,
+            execution_observation,
+            pending_local_backups,
+            delete_completions,
+            delete_completions_received: auto_lifecycle_delete_completions_received,
+        } = ValidatedPublish::try_from_proto(origin, request.into_inner())?;
         let sandbox_inventory_complete = sandbox_census.claimed_complete();
+        let template_inventory_complete = template_census.is_some();
         for diagnostic in census_diagnostics {
             diagnostic.emit(&origin);
         }
-        let present_template_keys = request
-            .templates
-            .iter()
-            .filter(|template| template.present)
-            .filter_map(|template| {
-                let name = optional_trimmed(Some(&template.template))?;
-                let content_hash =
-                    optional_trimmed(template.content_hash.as_deref()).unwrap_or_default();
-                Some((name, content_hash))
-            })
-            .collect::<Vec<_>>();
 
         let mut tx = self
             .pool
@@ -67,17 +54,13 @@ impl ClusterApiService {
             tracing::enabled!(target: "space_publish_timing", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
 
-        let execution_observation = crate::execution_observation::prepare(
-            &mut tx,
-            origin.id,
-            request.execution_observation.as_ref(),
-            request.execution_inventory.as_ref(),
-        )
-        .await?;
+        let execution_observation =
+            crate::execution_observation::prepare(&mut tx, origin.id, execution_observation)
+                .await?;
         let templates_accepted =
-            publish_template_states(&mut tx, origin.id, origin.role, &request.templates).await?;
+            publish_validated_template_states(&mut tx, origin.id, templates).await?;
         let sandbox_publication =
-            publish_sandbox_states(&mut tx, origin.id, &request.sandboxes).await?;
+            publish_validated_sandbox_states(&mut tx, origin.id, sandboxes).await?;
         let execution_observation =
             crate::execution_observation::publish(&mut tx, execution_observation).await?;
         // Produce the census-freshness verdict from the branch that prunes,
@@ -91,8 +74,8 @@ impl ClusterApiService {
         } else {
             SandboxInventoryPrune::Skipped
         };
-        if template_inventory_complete {
-            prune_absent_node_templates(&mut tx, origin.id, &present_template_keys).await?;
+        if let Some(census) = template_census {
+            prune_absent_node_templates(&mut tx, origin.id, census.legacy_keys()).await?;
         }
         // Mirror the node's pending-backup set before the status upsert that
         // stamps its freshness gate, so the gate is only ever written after
@@ -102,10 +85,6 @@ impl ClusterApiService {
         // declined: the two outcomes this publication can have, held in one
         // value so the gate stamp below and the metric after the commit cannot
         // come to disagree about which one happened.
-        let pending_local_backups =
-            crate::node_publish::validate::pending_backup::PendingBackupReport::from_proto(
-                request.pending_local_backups.as_ref(),
-            );
         let reported_count = pending_local_backups.reported_count();
         let backup_queue = match node_local_backup_pending::decide(
             &mut tx,
@@ -156,10 +135,10 @@ impl ClusterApiService {
         // Consume receipts only after this publication's sandbox, execution,
         // pruning, and node-status writes. Receipt fencing must observe the
         // final evidence produced by the same transaction.
-        let delete_consumption = consume_auto_lifecycle_delete_completions(
+        let delete_consumption = consume_validated_auto_lifecycle_delete_completions(
             &mut tx,
             origin.id,
-            &request.auto_lifecycle_delete_completions,
+            delete_completions,
         )
         .await?;
         tx.commit()

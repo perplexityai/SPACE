@@ -2,15 +2,13 @@
 //! as an empty inventory. Existing placement projections remain unchanged.
 
 use pplx_space_common_core::{sql, types::NodeId};
-use pplx_space_execution_common::proto::NodeExecutionInventory;
 use sqlx::types::Json;
 use tonic::Status;
 
 use crate::node_publish::validate::execution_inventory::ValidatedExecutionInventory;
 use crate::node_publish::validate::execution_observation::{
-    ExecutionInventoryEvidence, Report, ValidatedReport, decode,
+    ExecutionInventoryEvidence, ValidatedReport,
 };
-use crate::proto::ExecutionInventoryObservation;
 
 /// The outcome recorded only when the surrounding publication commits.
 #[derive(Clone, Copy, Debug)]
@@ -32,18 +30,18 @@ impl InventoryStatus {
 
 /// Holds decoded evidence after acquiring this publication's node lock.
 /// Construct before census writes; consume before the status upsert.
-pub(super) struct PreparedObservation<'a> {
+#[derive(Debug)]
+pub(super) struct PreparedObservation {
     node_id: NodeId,
-    report: Report<'a>,
+    report: ValidatedReport,
 }
 
-pub(super) async fn prepare<'a>(
+pub(super) async fn prepare(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     node_id: NodeId,
-    observation: Option<&'a ExecutionInventoryObservation>,
-    legacy: Option<&'a NodeExecutionInventory>,
-) -> Result<Option<PreparedObservation<'a>>, Status> {
-    let Some(report) = decode(observation, legacy)? else {
+    report: Option<ValidatedReport>,
+) -> Result<Option<PreparedObservation>, Status> {
+    let Some(report) = report else {
         return Ok(None);
     };
     // Acquire before census writes to preserve node-before-sandbox lock order.
@@ -67,12 +65,12 @@ pub(super) struct PublishedExecutionObservation {
 
 pub(super) async fn publish(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    prepared: Option<PreparedObservation<'_>>,
+    prepared: Option<PreparedObservation>,
 ) -> Result<Option<PublishedExecutionObservation>, Status> {
     let Some(PreparedObservation { node_id, report }) = prepared else {
         return Ok(None);
     };
-    let (status, evidence) = match ValidatedReport::try_from_report(report)? {
+    let (status, evidence) = match report {
         ValidatedReport::Complete(evidence) => (InventoryStatus::Complete, Some(evidence)),
         ValidatedReport::Legacy(evidence) => (InventoryStatus::Legacy, Some(evidence)),
         ValidatedReport::Unavailable => (InventoryStatus::Unavailable, None),

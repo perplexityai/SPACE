@@ -9,8 +9,10 @@ use tonic::Status;
 use uuid::Uuid;
 
 use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
+#[cfg(test)]
+use pplx_space_common_core::types::NodeRole;
 use pplx_space_common_core::types::{
-    ArtifactKind, NodeRole, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
+    ArtifactKind, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
@@ -48,7 +50,9 @@ use crate::node_publish::validate::sandbox_inventory::{
     LegacySandboxInput, ValidatedSandboxInventory,
 };
 use crate::node_publish::validate::templates::ValidatedTemplateInventory;
-use crate::proto::{PublishedSandboxState, PublishedTemplateState};
+use crate::proto::PublishedSandboxState;
+#[cfg(test)]
+use crate::proto::PublishedTemplateState;
 use crate::sandbox_quarantine_store;
 
 const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
@@ -352,7 +356,8 @@ async fn queue_policy_reconcile_refs_for_new_inventory(
     Ok(())
 }
 
-pub async fn publish_template_states(
+#[cfg(test)]
+async fn publish_template_states(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     publisher_role: NodeRole,
@@ -1015,6 +1020,17 @@ pub async fn publish_sandbox_states(
     states: &[PublishedSandboxState],
 ) -> Result<SandboxPublicationOutcome, Status> {
     let inventory = ValidatedSandboxInventory::from_proto(states);
+    publish_validated_sandbox_states(conn, node_id, inventory).await
+}
+
+/// Apply parsed node claims on the caller's connection. Lifecycle guards and
+/// row locks remain in their existing statement order; an unmatched guard is
+/// an ordinary outcome, not authority to retry an unguarded write.
+pub(crate) async fn publish_validated_sandbox_states(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    inventory: ValidatedSandboxInventory,
+) -> Result<SandboxPublicationOutcome, Status> {
     for diagnostic in inventory.diagnostics() {
         diagnostic.emit(node_id);
     }
