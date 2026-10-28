@@ -1,3 +1,4 @@
+use crate::node_publish::validate::node_status::ValidatedNodeStatus;
 use pplx_space_common_core::types::{NodeId, SubstrateKind};
 
 use super::*;
@@ -237,7 +238,7 @@ pub(super) async fn upsert_node_status_from_publish(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     reported_window: Option<std::time::Duration>,
-    node_status: Option<PublishedNodeStatusDb>,
+    node_status: Option<ValidatedNodeStatus>,
     inventory_prune: SandboxInventoryPrune,
     local_backup_report: LocalBackupInventoryReport,
     execution_observation: Option<crate::execution_observation::PublishedExecutionObservation>,
@@ -255,7 +256,7 @@ pub(super) async fn upsert_node_status_from_publish(
         node_ctl,
     ) = match node_status {
         Some(status) => (
-            Some(status.scheduling_status),
+            Some(status.scheduling_status_label()),
             Some(status.scheduling_reason),
             Some(status.network_slots_ready),
             Some(status.network_pool_min_ready),
