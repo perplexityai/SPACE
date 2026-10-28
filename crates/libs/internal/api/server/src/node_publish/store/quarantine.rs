@@ -624,23 +624,24 @@ pub(super) async fn recover_pause_failed_from_inventory(
     }
     let quarantine_source = SandboxQuarantineSource::SbxManager.as_str();
     let quarantine_reason = SandboxQuarantineReasonCode::PauseFailed.as_str();
+    let ids: Vec<_> = claims.iter().map(|claim| claim.sandbox_id).collect();
+    let statuses: Vec<_> = claims.iter().map(|claim| claim.status.as_str()).collect();
     let candidates: Vec<(Uuid, Uuid, String)> = sqlx::query_as(sql!(
         "SELECT s.id, qs.quarantine_id, LOWER(TRIM(input.status))
            FROM sandboxes s
-           JOIN jsonb_to_recordset($2::jsonb) AS input(
-               sandbox_id UUID,
-               status TEXT
-           ) ON input.sandbox_id = s.id
+           JOIN UNNEST($2::UUID[], $3::TEXT[]) AS input(sandbox_id, status)
+             ON input.sandbox_id = s.id
            JOIN sandbox_quarantine_state qs ON qs.sandbox_id = s.id
           WHERE s.active_node_id = $1
             AND LOWER(TRIM(s.lifecycle)) = 'quarantined'
             AND LOWER(TRIM(input.status)) IN ('started', 'paused')
-            AND qs.source = $3
-            AND qs.reason_code = $4
+            AND qs.source = $4
+            AND qs.reason_code = $5
           FOR UPDATE OF s, qs"
     ))
     .bind(node_id)
-    .bind(Json(claims))
+    .bind(ids)
+    .bind(statuses)
     .bind(quarantine_source)
     .bind(quarantine_reason)
     .fetch_all(&mut *conn)

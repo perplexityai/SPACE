@@ -1,7 +1,7 @@
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SandboxTransitionReceiptKind};
 
 /// A healthy runtime claim that may retire a stored pause-failure quarantine.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct PauseFailedRecoveryClaim {
     pub(crate) sandbox_id: SandboxId,
     pub(crate) status: SandboxLifecycle,
