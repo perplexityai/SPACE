@@ -170,6 +170,11 @@ impl SendStreamFraming {
         }
     }
 
+    /// Whether the stream's first command passed its CRC.
+    fn passed_first_command(&self) -> bool {
+        self.item_offset > STREAM_HEADER as u64
+    }
+
     fn start_command(&mut self) {
         self.item_offset = self.offset;
         self.state = State::CommandHeader([0; 10], 0);
@@ -200,10 +205,18 @@ impl SendStreamFraming {
     }
 }
 
-/// Most stream headers [`last_complete_stream`] tries: a restarted send writes
-/// one partial stream per restart, and restarts are rare.
-const MAX_STREAM_CANDIDATES: usize = 64;
+/// Most partial streams [`last_complete_stream`] passes over: a restarted send
+/// leaves one per restart, and restarts are rare. A partial stream is a
+/// header whose first command passes its CRC, so a send stream stored in the
+/// guest's own files can count as one too.
+const MAX_PARTIAL_STREAMS: usize = 64;
+/// Most header-shaped runs of bytes whose first command fails that
+/// [`last_complete_stream`] passes over. Each costs one read of at most
+/// [`SALVAGE_CHUNK`]; the cap bounds the search when guest file data holds
+/// many.
+const MAX_HEADER_LOOKALIKES: usize = 4096;
 const SALVAGE_CHUNK: usize = 1 << 20;
+const STREAM_HEADER: usize = 17;
 
 /// Where the complete stream of a restarted send begins.
 ///
@@ -215,34 +228,28 @@ const SALVAGE_CHUNK: usize = 1 << 20;
 /// `None` means no header starts a valid stream, so nothing can be salvaged.
 /// The earliest valid header is the complete stream's own: a header-shaped run
 /// of bytes inside its payload cannot validate past the next real command.
+///
+/// Each header is validated as the scan reaches it, so the search reads the
+/// file once plus each candidate's stream. It gives up after
+/// [`MAX_PARTIAL_STREAMS`] partial streams or [`MAX_HEADER_LOOKALIKES`]
+/// header-shaped runs, and returns `None` once `stopped` returns true; it is
+/// checked before every read.
 pub(in crate::service) fn last_complete_stream(
     file: &std::fs::File,
+    stopped: &dyn Fn() -> bool,
 ) -> std::io::Result<Option<u64>> {
-    for offset in stream_headers(file)? {
-        if stream_valid_from(file, offset)? {
-            return Ok(Some(offset));
-        }
-    }
-    Ok(None)
-}
-
-/// Read size for a scan of `file`: whole small files, else [`SALVAGE_CHUNK`].
-fn chunk_for(file: &std::fs::File) -> std::io::Result<usize> {
-    let len = file.metadata()?.len();
-    Ok(usize::try_from(len).map_or(SALVAGE_CHUNK, |len| len.min(SALVAGE_CHUNK)))
-}
-
-/// Offsets of the first [`MAX_STREAM_CANDIDATES`] supported stream headers.
-fn stream_headers(file: &std::fs::File) -> std::io::Result<Vec<u64>> {
     use std::os::unix::fs::FileExt;
-    const HEADER: usize = 17;
-    let mut found = Vec::new();
-    let mut buf = vec![0; chunk_for(file)?.max(1)];
+    let chunk = chunk_for(file)?.max(1);
+    let (mut buf, mut validate_buf) = (vec![0; chunk], vec![0; chunk]);
+    let (mut partial_streams, mut lookalikes) = (0, 0);
     // Unscanned tail of the previous read, then the new read; `base` is the
     // file offset of `window[0]`.
-    let mut window = Vec::with_capacity(buf.len() + HEADER);
+    let mut window = Vec::with_capacity(chunk + STREAM_HEADER);
     let (mut base, mut next) = (0u64, 0u64);
     loop {
+        if stopped() {
+            return Ok(None);
+        }
         let read = file.read_at(&mut buf, next)?;
         next += read as u64;
         window.extend_from_slice(buf.get(..read).unwrap_or_default());
@@ -252,25 +259,54 @@ fn stream_headers(file: &std::fs::File) -> std::io::Result<Vec<u64>> {
             .and_then(|rest| rest.iter().position(|&byte| byte == MAGIC[0]))
         {
             at += skip;
-            let Some(header) = window.get(at..at + HEADER) else {
+            let Some(header) = window.get(at..at + STREAM_HEADER) else {
                 break;
             };
             if is_stream_header(header) {
-                found.push(base + at as u64);
-                if found.len() == MAX_STREAM_CANDIDATES {
-                    return Ok(found);
+                let offset = base + at as u64;
+                match stream_from(file, offset, &mut validate_buf, stopped)? {
+                    Candidate::Complete => return Ok(Some(offset)),
+                    Candidate::Partial => {
+                        partial_streams += 1;
+                        if partial_streams == MAX_PARTIAL_STREAMS {
+                            return Ok(None);
+                        }
+                    }
+                    Candidate::NotAStream => {
+                        lookalikes += 1;
+                        if lookalikes == MAX_HEADER_LOOKALIKES {
+                            return Ok(None);
+                        }
+                    }
                 }
             }
             at += 1;
         }
         if read == 0 {
-            return Ok(found);
+            return Ok(None);
         }
         // Keep the bytes that may begin a header the next read completes.
-        let keep_from = window.len().saturating_sub(HEADER - 1);
+        let keep_from = window.len().saturating_sub(STREAM_HEADER - 1);
         window.drain(..keep_from);
         base += keep_from as u64;
     }
+}
+
+/// What a stream header found by [`last_complete_stream`] starts.
+enum Candidate {
+    /// A valid stream that ends with END exactly at the end of the file.
+    Complete,
+    /// A stream whose first command passes its CRC but that does not run to
+    /// the end of the file, such as a restart's partial output.
+    Partial,
+    /// Header-shaped bytes whose first command fails, or a stop.
+    NotAStream,
+}
+
+/// Read size for a scan of `file`: whole small files, else [`SALVAGE_CHUNK`].
+fn chunk_for(file: &std::fs::File) -> std::io::Result<usize> {
+    let len = file.metadata()?.len();
+    Ok(usize::try_from(len).map_or(SALVAGE_CHUNK, |len| len.min(SALVAGE_CHUNK)))
 }
 
 fn is_stream_header(header: &[u8]) -> bool {
@@ -281,18 +317,35 @@ fn is_stream_header(header: &[u8]) -> bool {
     header.starts_with(MAGIC) && version.is_some_and(|version| (1..=2).contains(&version))
 }
 
-fn stream_valid_from(file: &std::fs::File, offset: u64) -> std::io::Result<bool> {
+fn stream_from(
+    file: &std::fs::File,
+    offset: u64,
+    buf: &mut [u8],
+    stopped: &dyn Fn() -> bool,
+) -> std::io::Result<Candidate> {
     use std::os::unix::fs::FileExt;
     let mut framing = SendStreamFraming::new();
-    let mut buf = vec![0; chunk_for(file)?.max(1)];
     let mut at = offset;
+    let failed = |framing: &SendStreamFraming| {
+        if framing.passed_first_command() {
+            Candidate::Partial
+        } else {
+            Candidate::NotAStream
+        }
+    };
     loop {
-        let read = file.read_at(&mut buf, at)?;
+        if stopped() {
+            return Ok(Candidate::NotAStream);
+        }
+        let read = file.read_at(buf, at)?;
         if read == 0 {
-            return Ok(framing.finish().is_ok());
+            return Ok(match framing.finish() {
+                Ok(()) => Candidate::Complete,
+                Err(_) => failed(&framing),
+            });
         }
         if framing.feed(buf.get(..read).unwrap_or_default()).is_err() {
-            return Ok(false);
+            return Ok(failed(&framing));
         }
         at += read as u64;
     }

@@ -38,9 +38,17 @@ impl ReceiveRoot {
             Err(status) => status,
         };
         let mut stream = self.stream()?;
-        match crate::service::btrfs_send_transport::framing::last_complete_stream(&stream)
-            .map_err(error)?
-        {
+        let cancelled = || cancel.is_some_and(CancellationToken::is_cancelled);
+        let complete = crate::service::btrfs_send_transport::framing::last_complete_stream(
+            &stream, &cancelled,
+        )
+        .map_err(error)?;
+        if cancelled() {
+            return Err(Status::cancelled(
+                "btrfs receive cancelled while looking for a complete stream",
+            ));
+        }
+        match complete {
             Some(offset) if offset > 0 => {
                 use std::io::{Seek, SeekFrom};
                 stream.seek(SeekFrom::Start(offset)).map_err(error)?;

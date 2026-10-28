@@ -80,10 +80,14 @@ fn a_stream_without_the_header_fails() {
 }
 
 fn salvage(bytes: &[u8]) -> Option<u64> {
+    salvage_until(bytes, &|| false)
+}
+
+fn salvage_until(bytes: &[u8], stopped: &dyn Fn() -> bool) -> Option<u64> {
     use std::io::Write;
     let mut file = tempfile::tempfile().unwrap();
     file.write_all(bytes).unwrap();
-    last_complete_stream(&file).unwrap()
+    last_complete_stream(&file, stopped).unwrap()
 }
 
 #[test]
@@ -148,4 +152,47 @@ fn a_header_across_a_read_boundary_is_found() {
             "{before} bytes before"
         );
     }
+}
+
+/// Header-shaped runs whose first command fails do not use up the partial
+/// stream budget; only the much larger lookalike cap ends the search.
+#[test]
+fn header_lookalikes_do_not_use_up_the_partial_stream_budget() {
+    let lookalike = [&STREAM[..17], b"x".as_slice()].concat();
+    for count in [MAX_PARTIAL_STREAMS, MAX_HEADER_LOOKALIKES - 1] {
+        let prefixed = [lookalike.repeat(count).as_slice(), STREAM].concat();
+        assert_eq!(
+            salvage(&prefixed),
+            Some((count * lookalike.len()) as u64),
+            "{count} lookalikes"
+        );
+    }
+    let prefixed = [lookalike.repeat(MAX_HEADER_LOOKALIKES).as_slice(), STREAM].concat();
+    assert_eq!(salvage(&prefixed), None);
+}
+
+#[test]
+fn the_search_stops_after_its_partial_stream_budget() {
+    let cut = STREAM.len() / 2;
+    for (count, expected) in [
+        (MAX_PARTIAL_STREAMS - 1, Some(((MAX_PARTIAL_STREAMS - 1) * cut) as u64)),
+        (MAX_PARTIAL_STREAMS, None),
+    ] {
+        let restarted = [STREAM[..cut].repeat(count).as_slice(), STREAM].concat();
+        assert_eq!(salvage(&restarted), expected, "{count} partial streams");
+    }
+}
+
+/// A stop requested mid-search ends it without a salvage, even when a
+/// complete stream follows.
+#[test]
+fn a_stopped_search_salvages_nothing() {
+    let restarted = [&STREAM[..STREAM.len() / 2], STREAM].concat();
+    assert_eq!(salvage_until(&restarted, &|| true), None);
+    let checks = std::cell::Cell::new(0);
+    let stop_after_first_read = || {
+        checks.set(checks.get() + 1);
+        checks.get() > 1
+    };
+    assert_eq!(salvage_until(&restarted, &stop_after_first_read), None);
 }
