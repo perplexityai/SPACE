@@ -1751,15 +1751,21 @@ async fn publishing_owned_suspended_sandbox_with_current_durable_snapshot_projec
     .await?;
     insert_ready_suspend_snapshot(&db.pool, sandbox_id, node_id).await?;
 
+    let healthy_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, healthy_id, node_id, "started").await?;
     let mut conn = db.pool.acquire().await?;
     let accepted = publish_sandbox_states(
         &mut conn,
         node_id,
-        &[published_sandbox_state(sandbox_id, "suspended")],
+        &[
+            published_sandbox_state(healthy_id, "started"),
+            published_sandbox_state(sandbox_id, "suspended"),
+        ],
     )
     .await?;
 
-    assert_eq!(accepted.accepted, 1);
+    assert_eq!(accepted.accepted, 2);
+    assert_eq!(sandbox_lifecycle(&db.pool, healthy_id).await?, "started");
     let (sandbox_lifecycle, placement, active_node_id, target_node_id, observed_status) =
         sqlx::query_as::<_, (String, String, Option<NodeId>, Option<NodeId>, String)>(
             "SELECT s.lifecycle, s.placement, s.active_node_id, s.target_node_id, sos.status
@@ -4327,6 +4333,8 @@ async fn publishing_owned_started_sandbox_converges_restoring_lifecycle() -> Tes
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
+    let healthy_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, healthy_id, node_id, "started").await?;
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "restoring").await?;
     insert_k8s_execution(&db.pool, sandbox_id, 7, "running", Some("100.64.10.7")).await?;
 
@@ -4334,11 +4342,15 @@ async fn publishing_owned_started_sandbox_converges_restoring_lifecycle() -> Tes
     publish_sandbox_states(
         &mut conn,
         node_id,
-        &[published_sandbox_state(sandbox_id, "started")],
+        &[
+            published_sandbox_state(healthy_id, "started"),
+            published_sandbox_state(sandbox_id, "started"),
+        ],
     )
     .await?;
     drop(conn);
 
+    assert_eq!(sandbox_lifecycle(&db.pool, healthy_id).await?, "started");
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "started");
     Ok(())
 }

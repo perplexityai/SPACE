@@ -13,11 +13,11 @@ use crate::sandbox_quarantine_store;
 pub(super) async fn converge_lifecycles(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
     plan: &SandboxPlan,
     post_commit_events: &mut Vec<PostCommitSandboxEvent>,
 ) -> Result<(), ApplySandboxClaimsError> {
-    let restored_ids = lifecycle_transitions::converge_restored(conn, node_id, rows_json).await?;
+    let restored_ids =
+        lifecycle_transitions::converge_restored(conn, node_id, &plan.restored).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &restored_ids,
@@ -56,7 +56,7 @@ pub(super) async fn converge_lifecycles(
     }));
 
     let suspended_projection =
-        project_node_published_suspended_sandboxes(conn, node_id, rows_json).await?;
+        project_node_published_suspended_sandboxes(conn, node_id, &plan.suspended).await?;
     let recovered_ids = suspended_projection
         .recoveries
         .iter()

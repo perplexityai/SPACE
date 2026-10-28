@@ -1,4 +1,4 @@
-use crate::node_publish::plan::lifecycle::{FailedClaim, StoppedClaim};
+use crate::node_publish::plan::lifecycle::{FailedClaim, RestoreClaim, StoppedClaim};
 use pplx_space_common_core::{
     sql,
     types::{NodeId, SandboxId, SandboxTransitionReceiptKind, SubstrateKind},
@@ -31,8 +31,11 @@ pub(crate) enum ConvergeFailedError {
 pub(crate) async fn converge_restored(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[RestoreClaim],
 ) -> Result<Vec<SandboxId>, ConvergeRestoredError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     // Publishing `started` proves the node-local runtime finished, but for
     // Kubernetes sandboxes the control plane also needs a routable active
     // execution row. The blocking wake/restore path is what hydrates that row
@@ -73,7 +76,7 @@ pub(crate) async fn converge_restored(
          RETURNING s.id"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(Json(claims))
     .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)

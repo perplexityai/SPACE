@@ -5,6 +5,7 @@ use pplx_space_common_core::types::NodeId;
 use std::sync::LazyLock;
 
 use crate::node_publish::plan::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
+use crate::node_publish::plan::suspended::SuspendedClaim;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
@@ -915,8 +916,11 @@ static SELECT_SUSPENDED_PROJECTIONS: LazyLock<String> = LazyLock::new(|| {
 pub(super) async fn select_suspended_projection_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[SuspendedClaim],
 ) -> Result<Vec<SuspendedProjectionCandidate>, SelectSuspendedProjectionsError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     type CandidateRow = (
         SandboxId,
         bool,
@@ -934,7 +938,7 @@ pub(super) async fn select_suspended_projection_candidates(
     let rows: Vec<CandidateRow> =
         sqlx::query_as(sqlx::AssertSqlSafe(SELECT_SUSPENDED_PROJECTIONS.as_str()))
             .bind(node_id)
-            .bind(rows_json)
+            .bind(Json(claims))
             .bind(SandboxTransitionReceiptKind::QuarantineRecovery.as_str())
             .bind(SandboxQuarantineSource::SbxManager.as_str())
             .bind(SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact.as_str())

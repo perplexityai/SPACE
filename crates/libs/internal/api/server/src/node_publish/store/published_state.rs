@@ -21,6 +21,7 @@ use pplx_space_events::{
 };
 
 use crate::node_publish::plan::sandboxes::SandboxPlan;
+use crate::node_publish::plan::suspended::SuspendedClaim;
 use crate::node_publish::store::sandbox_input::LegacySandboxInput;
 use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes,
@@ -507,14 +508,7 @@ pub(crate) async fn publish_validated_sandbox_states(
         .filter(|row| row.assigned_to_node && row.first_seen)
         .map(|row| row.sandbox_id)
         .collect::<Vec<_>>();
-    sandbox_application::converge_lifecycles(
-        conn,
-        node_id,
-        &rows_json,
-        plan,
-        &mut post_commit_events,
-    )
-    .await?;
+    sandbox_application::converge_lifecycles(conn, node_id, plan, &mut post_commit_events).await?;
     sandbox_application::project_quarantine(conn, node_id, quarantine_inputs).await?;
     sandbox_application::recover_pause_failed(conn, node_id, &rows_json, &mut post_commit_events)
         .await?;
@@ -557,10 +551,10 @@ struct SuspendedProjectionOutcome {
 async fn project_node_published_suspended_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[SuspendedClaim],
 ) -> Result<SuspendedProjectionOutcome, ApplySandboxClaimsError> {
     let candidates = crate::sandbox_quarantine_store::select_suspended_projection_candidates(
-        conn, node_id, rows_json,
+        conn, node_id, claims,
     )
     .await?;
     if candidates.is_empty() {

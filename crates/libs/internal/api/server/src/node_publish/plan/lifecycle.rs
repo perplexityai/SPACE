@@ -1,4 +1,12 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_core::types::{SandboxId, SandboxTransitionReceiptKind};
+
+/// A started report that may complete a restore if the stored row still permits it.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(tag = "status", rename = "started")]
+pub(crate) struct RestoreClaim {
+    pub(crate) sandbox_id: SandboxId,
+    pub(crate) transition_receipt_kind: Option<SandboxTransitionReceiptKind>,
+}
 
 /// A node reported a stopped runtime, not permission to change its database row.
 #[derive(Clone, Copy, Debug, serde::Serialize)]

@@ -19,6 +19,7 @@ use sandboxes::SandboxPlan;
 pub(crate) mod activation;
 pub(crate) mod lifecycle;
 pub(crate) mod sandboxes;
+pub(crate) mod suspended;
 
 /// Ownership of the checked claims moves into the plan without payload clones.
 /// Lifecycle guards, row locks and generated identifiers belong to the store.

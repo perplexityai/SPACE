@@ -4,7 +4,8 @@ use pplx_space_common_core::types::{
 };
 
 use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
-use super::lifecycle::{FailedClaim, StoppedClaim};
+use super::lifecycle::{FailedClaim, RestoreClaim, StoppedClaim};
+use super::suspended::SuspendedClaim;
 use crate::node_publish::diagnostics::SandboxDiagnostic;
 use crate::node_publish::validate::{
     failure_episode::FailureEpisodeClaim,
@@ -29,6 +30,8 @@ pub(crate) struct ObservedClaim {
 pub(crate) struct SandboxPlan {
     pub(crate) absent_ids: Vec<SandboxId>,
     pub(crate) observations: Vec<ObservedClaim>,
+    pub(crate) restored: Vec<RestoreClaim>,
+    pub(crate) suspended: Vec<SuspendedClaim>,
     pub(crate) stopped: Vec<StoppedClaim>,
     pub(crate) failed: Vec<FailedClaim>,
     pub(crate) activation_completions: Vec<ActivationCompletionClaim>,
@@ -46,6 +49,8 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
         let mut plan = Self {
             absent_ids: inventory.absent_ids,
             observations: Vec::with_capacity(inventory.observations.len()),
+            restored: Vec::new(),
+            suspended: Vec::new(),
             stopped: Vec::new(),
             failed: Vec::new(),
             activation_completions: Vec::new(),
@@ -72,6 +77,19 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
                 }
             }
             match claim.observation.reported_lifecycle() {
+                Some(SandboxLifecycle::Started) => {
+                    let receipt_kind = claim.receipt.as_ref().map(|receipt| receipt.kind());
+                    if receipt_kind != Some(SandboxTransitionReceiptKind::ActivationCompleted) {
+                        plan.restored.push(RestoreClaim {
+                            sandbox_id: claim.observation.sandbox_id(),
+                            transition_receipt_kind: receipt_kind,
+                        });
+                    }
+                }
+                Some(SandboxLifecycle::Suspended) => {
+                    plan.suspended
+                        .push(SuspendedClaim::new(&claim.observation, claim.receipt));
+                }
                 Some(SandboxLifecycle::Stopped) => plan.stopped.push(StoppedClaim {
                     sandbox_id: claim.observation.sandbox_id(),
                 }),
