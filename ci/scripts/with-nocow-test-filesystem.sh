@@ -13,9 +13,18 @@ done
 
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/space-nocow-tests.XXXXXX")
 loop_device=
+cache_mounted=false
+cache_created=false
 cleanup() {
     local status=$?
     trap - EXIT
+    if $cache_mounted; then
+        if ! umount /space/cache; then
+            echo "Failed to unmount owned cache fixture; retaining backing image" >&2
+            exit 1
+        fi
+    fi
+    if $cache_created; then rmdir /space/cache; fi
     if mountpoint -q "$fixture/mount"; then
         if ! umount "$fixture/mount"; then
             echo "Failed to unmount owned fixture $fixture; leaving image attached for diagnosis" >&2
@@ -42,4 +51,18 @@ loop_device=$(losetup --find --show "$fixture/filesystem.img")
 mkfs.btrfs -q "$loop_device"
 mount -t btrfs -o noatime "$loop_device" "$fixture/mount"
 export SPACE_NOCOW_TEST_BTRFS_DIR="$fixture/mount"
+# Receive resolves incremental parents through the cache filesystem root.
+# Never hide an existing cache or reuse caller-owned state.
+if mountpoint -q /space/cache || [[ -d /space/cache && -n "$(ls -A /space/cache)" ]]; then
+    echo "Refusing to overlay an existing /space/cache" >&2
+    exit 1
+fi
+if [[ ! -d /space/cache ]]; then
+    mkdir -p /space/cache
+    cache_created=true
+fi
+mount --bind "$fixture/mount" /space/cache
+cache_mounted=true
+mkdir -p /space/cache/nodemgr-fixture /space/cache/firecracker/sandboxes
+export SPACE_NODEMGR_RECEIVE_TEST_BTRFS_DIR=/space/cache/nodemgr-fixture
 "$@"

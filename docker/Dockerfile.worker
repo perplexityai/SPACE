@@ -15,6 +15,12 @@ ARG AWS_CLI_IMAGE=public.ecr.aws/aws-cli/aws-cli:2.27.41
 FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
 FROM ${AWS_CLI_IMAGE} AS aws-cli
 
+FROM public.ecr.aws/ubuntu/ubuntu:24.04 AS space-btrfs-progs
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+COPY docker/build-btrfs-progs.sh /tmp/build-btrfs-progs.sh
+RUN bash /tmp/build-btrfs-progs.sh
+
 FROM public.ecr.aws/ubuntu/ubuntu:24.04 AS space-e2fsprogs
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -95,6 +101,11 @@ COPY --from=space-e2fsprogs \
     /opt/space/e2fsprogs/sbin/tune2fs \
     /usr/local/sbin/
 RUN test "$(command -v e2fsck)" = /usr/local/sbin/e2fsck && e2fsck -V
+
+COPY --from=space-btrfs-progs /opt/space/btrfs-progs/btrfs /usr/local/sbin/btrfs
+RUN test "$(command -v btrfs)" = /usr/local/sbin/btrfs \
+    && test "$(btrfs --version | head -n 1)" = 'btrfs-progs v7.3' \
+    && sha256sum /usr/local/sbin/btrfs
 
 # node-manager init can stage an immutable, digest-pinned guest kernel from the
 # cluster bootstrap bucket. Copy the authenticated AWS CLI from its pinned
