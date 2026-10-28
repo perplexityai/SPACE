@@ -13,6 +13,7 @@ pub(crate) mod quarantine_persistence;
 pub(crate) mod sandbox_facet_observations;
 pub(crate) mod snapshot_inventory;
 pub(crate) mod suspend_finalization;
+pub(crate) mod template_components;
 pub(crate) mod template_inventory;
 
 use crate::auto_lifecycle_delete_completions::consume_validated_auto_lifecycle_delete_completions;

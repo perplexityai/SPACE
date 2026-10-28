@@ -31,7 +31,7 @@ use crate::node_publish::store::{
     quarantine_claims::{self, ClaimedQuarantineProjection},
     quarantine_persistence, sandbox_facet_observations, snapshot_inventory,
     suspend_finalization::{self, SuspendedFinalizationCandidate},
-    template_inventory,
+    template_components, template_inventory,
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
 #[cfg(test)]
@@ -265,104 +265,7 @@ pub(crate) async fn publish_validated_template_states(
     let rows_json = Json(serde_json::Value::Array(rows));
     let accepted_rows = template_inventory::upsert(conn, node_id, rows_json.clone()).await?;
 
-    sqlx::query(sql!(
-        "WITH scope AS (
-             SELECT DISTINCT input.template_name, COALESCE(input.content_hash, '') AS content_hash
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT
-             )
-         ),
-         input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT,
-                 execution_components JSONB
-             )
-         ),
-         incoming AS (
-             SELECT input.template_name, COALESCE(input.content_hash, '') AS content_hash,
-                    component.kind, component.role_key, component.version,
-                    component.digest, component.format
-             FROM input
-             JOIN node_template_inventory inventory
-               ON inventory.node_id = $1
-              AND inventory.template_name = input.template_name
-              AND inventory.content_hash = COALESCE(input.content_hash, '')
-             CROSS JOIN LATERAL jsonb_to_recordset(
-                 COALESCE(input.execution_components, '[]'::jsonb)
-             ) AS component(
-                 kind TEXT, role_key TEXT, version TEXT, digest TEXT, format TEXT
-             )
-         )
-         DELETE FROM node_template_components component
-         USING scope
-         WHERE component.node_id = $1
-           AND component.template_name = scope.template_name
-           AND component.content_hash = scope.content_hash
-           AND NOT EXISTS (
-               SELECT 1
-               FROM incoming
-               WHERE incoming.template_name = component.template_name
-                 AND incoming.content_hash = component.content_hash
-                 AND incoming.kind = component.kind
-                 AND incoming.role_key = component.role_key
-           )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("replace node template components: {err}")))?;
-    sqlx::query(
-        sql!("WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT,
-                 execution_components JSONB
-             )
-         ),
-         incoming AS (
-             SELECT $1 AS node_id, input.template_name, COALESCE(input.content_hash, '') AS content_hash,
-                    component.kind, component.role_key, component.version,
-                    component.digest, component.format
-             FROM input
-             JOIN node_template_inventory inventory
-               ON inventory.node_id = $1
-              AND inventory.template_name = input.template_name
-              AND inventory.content_hash = COALESCE(input.content_hash, '')
-             CROSS JOIN LATERAL jsonb_to_recordset(
-                 COALESCE(input.execution_components, '[]'::jsonb)
-             ) AS component(
-                 kind TEXT, role_key TEXT, version TEXT, digest TEXT, format TEXT
-             )
-         )
-         INSERT INTO node_template_components (
-             node_id, template_name, content_hash, kind, role_key, version, digest, format
-         )
-         SELECT node_id, template_name, content_hash, kind, role_key, version, digest, format
-         FROM incoming
-         ON CONFLICT (node_id, template_name, content_hash, kind, role_key) DO UPDATE
-         SET version = EXCLUDED.version,
-             digest = EXCLUDED.digest,
-             format = EXCLUDED.format
-         WHERE (
-             node_template_components.version,
-             node_template_components.digest,
-             node_template_components.format
-         ) IS DISTINCT FROM (
-             EXCLUDED.version,
-             EXCLUDED.digest,
-             EXCLUDED.format
-         )"),
-    )
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("insert node template components: {err}")))?;
+    template_components::replace(conn, node_id, rows_json.clone()).await?;
 
     // Node publication deliberately never writes `template_releases`. Release
     // rows are fleet-shared, and any per-node write to them (even a guarded
