@@ -27,6 +27,15 @@ if [ -z "${NEXTEST_ENV:-}" ] || [ -z "${NEXTEST_RUN_ID:-}" ]; then
     exit 1
 fi
 
+# An explicit fixture URL names an already migrated, caller-owned server.
+# Preserve it rather than starting Docker and silently testing another major
+# version. The fixtures still connect and clone their template normally, so
+# an unavailable or uninitialized server fails rather than skipping tests.
+if [ -n "${SPACE_TEST_POSTGRES_ADMIN_URL:-}" ]; then
+    printf 'SPACE_TEST_POSTGRES_ADMIN_URL=%s\n' "${SPACE_TEST_POSTGRES_ADMIN_URL}" >>"${NEXTEST_ENV}"
+    exit 0
+fi
+
 # Migrate the template on the given server and publish it to the tests.
 publish_postgres() {
     local admin_database_url="$1"

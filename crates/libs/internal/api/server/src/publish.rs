@@ -96,6 +96,12 @@ impl ClusterApiService {
             .await
             .map_err(|err| Status::internal(format!("begin node state publish: {err}")))?;
 
+        // Opt-in synthetic timing: exclude pool acquisition and BEGIN, and
+        // include the entire open transaction through successful COMMIT.
+        let transaction_started =
+            tracing::enabled!(target: "space_publish_timing", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
+
         let execution_observation = crate::execution_observation::prepare(
             &mut tx,
             origin.id,
@@ -189,6 +195,13 @@ impl ClusterApiService {
         tx.commit()
             .await
             .map_err(|err| Status::internal(format!("commit node state publish: {err}")))?;
+        if let Some(started) = transaction_started {
+            tracing::trace!(
+                target: "space_publish_timing",
+                transaction_open_us = started.elapsed().as_secs_f64() * 1_000_000.0,
+                "node publish committed"
+            );
+        }
         delete_consumption.emit_metrics();
         // One verdict, used for the metric and the log, so the two cannot
         // disagree about what this publication did.
