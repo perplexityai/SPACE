@@ -311,6 +311,15 @@ impl PublicOperationStore {
         Ok(false)
     }
 
+    /// [`sandbox_creates_in_flight`], outside any transaction.
+    pub(crate) async fn sandbox_creates_in_flight(
+        &self,
+        org_id: OrgId,
+        target: pplx_space_public_api::PublicSandboxId,
+    ) -> Result<Vec<OperationId>, sqlx::Error> {
+        sandbox_creates_in_flight(&self.pool, org_id, target).await
+    }
+
     /// A create retried while waiting for capacity can carry a newer grant.
     /// Do not change an executing claim or resurrect a terminal payload. The
     /// producer ordering is the same as sandbox_federated_service_grants.

@@ -622,7 +622,31 @@ impl SandboxLifecycleOperationExecutor {
         }
 
         let sandbox_uuid = payload.sandbox_id;
-        let sandbox = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;
+        let mut sandbox = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;
+        if payload.action == SandboxLifecycleAction::Delete
+            && sandbox.is_none()
+            && operation.api_product != ApiProduct::Admin
+        {
+            // A create can answer before its sandbox has a row. Without the
+            // dispatcher's keyed claim, which holds a delete behind its
+            // sandbox's create, this delete can run while that create builds
+            // the sandbox. Finishing now would report a sandbox the create
+            // then records, so wait for it to end.
+            if !crate::public_operations::PublicOperationStore::new(self.pool.clone())
+                .sandbox_creates_in_flight(operation.org_id, payload.sandbox_id)
+                .await?
+                .is_empty()
+            {
+                return Ok(PublicOperationExecutionResult::workflow_progress(
+                    "waiting for the sandbox's create to finish",
+                    CREATE_RETRY_AFTER,
+                ));
+            }
+            // A create that succeeds commits its row before it leaves queued
+            // or running, so one that finished since the first read has a
+            // row by now.
+            sandbox = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;
+        }
         if let Some(sandbox) = sandbox.as_ref()
             && sandbox.org_id != operation.org_id
         {
