@@ -44,6 +44,8 @@ enum ScenarioKind {
     SuspendCompleted,
     ActivationRollback,
     PauseFailedRecovery,
+    Quarantine,
+    RepeatedQuarantine,
 }
 
 #[derive(Debug, Serialize)]
@@ -263,6 +265,28 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
             scenarios.push(capture(db, &service, name, rare).await?);
         }
         store::verify_transitions(&db.pool, args).await?;
+        let mut episode = None;
+        for name in [ScenarioKind::Quarantine, ScenarioKind::RepeatedQuarantine] {
+            let mut sandbox = node
+                .sandboxes
+                .get(1)
+                .context("ordinary sandbox missing")?
+                .clone();
+            sandbox.status = Some("quarantined".to_owned());
+            sandbox.failure_reason = Some("  synthetic quarantine evidence  ".to_owned());
+            let sandbox_id = sandbox.sandbox_id.parse()?;
+            let mut hold = request(node);
+            hold.sandboxes.push(sandbox);
+            scenarios.push(capture(db, &service, name, hold).await?);
+            let observed = store::verify_quarantine(&db.pool, node.id.parse()?, sandbox_id).await?;
+            if let Some(previous) = episode {
+                ensure!(
+                    previous == observed,
+                    "repeat quarantine replaced the active episode"
+                );
+            }
+            episode = Some(observed);
+        }
         let report = Report {
             schema: 1,
             seed: args.seed,

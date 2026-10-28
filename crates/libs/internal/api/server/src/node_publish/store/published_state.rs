@@ -11,19 +11,12 @@ use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 #[cfg(test)]
 use pplx_space_common_core::types::NodeRole;
 use pplx_space_common_core::types::{
-    ArtifactKind, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionTargetState,
+    ArtifactKind, SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxTransitionTargetState,
 };
-use pplx_space_common_svc::{
-    sql::sandbox_quarantine::{
-        quarantine_history_insert_columns, quarantine_state_conflict_assignments,
-        quarantine_state_insert_columns,
-    },
-    types::{
-        FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
-        FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
-    },
+use pplx_space_common_svc::types::{
+    FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -34,7 +27,8 @@ use pplx_space_sandbox_portability::{
 
 use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes, lifecycle_transitions,
-    network_policy, observed_state, sandbox_facet_observations, snapshot_inventory,
+    network_policy, observed_state, quarantine_persistence, sandbox_facet_observations,
+    snapshot_inventory,
     suspend_finalization::{self, SuspendedFinalizationCandidate},
 };
 pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
@@ -887,6 +881,10 @@ pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     SuspendFinalization(#[from] suspend_finalization::FinalizeSuspensionError),
     #[error(transparent)]
+    QuarantineState(#[from] quarantine_persistence::RecordStateError),
+    #[error(transparent)]
+    QuarantineHistory(#[from] quarantine_persistence::RecordHistoryError),
+    #[error(transparent)]
     FailureEpisodes(#[from] failure_episodes::ReconcileFailureEpisodesError),
     #[error(transparent)]
     SnapshotInventory(#[from] snapshot_inventory::ReplaceSnapshotInventoryError),
@@ -1208,71 +1206,8 @@ pub(crate) async fn publish_validated_sandbox_states(
                 let updated_json = Json(serde_json::to_value(&updated_sql).map_err(|err| {
                     Status::internal(format!("serialize updated quarantine input: {err}"))
                 })?);
-                let state_columns = quarantine_state_insert_columns();
-                let state_conflict_assignments = quarantine_state_conflict_assignments();
-                let query = format!(
-                    "INSERT INTO sandbox_quarantine_state ({state_columns})
-                     SELECT
-                         input.sandbox_id,
-                         input.quarantine_id,
-                         NOW(),
-                         NOW(),
-                         input.from_lifecycle,
-                         input.source,
-                         input.reason_code,
-                         NULLIF(BTRIM(input.failure_reason), ''),
-                         jsonb_build_object('node_id', $3::TEXT),
-                         $2,
-                         $1
-                     FROM jsonb_to_recordset($4::jsonb) AS input(
-                         sandbox_id UUID,
-                         from_lifecycle TEXT,
-                         failure_reason TEXT,
-                         source TEXT,
-                         reason_code TEXT,
-                         quarantine_id UUID
-                     )
-                     ON CONFLICT (sandbox_id) DO UPDATE SET {state_conflict_assignments}",
-                );
-                sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_id)
-                    .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                    .bind(node_id.to_string())
-                    .bind(updated_json.clone())
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|err| Status::internal(format!("record quarantine state: {err}")))?;
-                let history_columns = quarantine_history_insert_columns();
-                let query = format!(
-                    "INSERT INTO sandbox_quarantine_history ({history_columns})
-                     SELECT
-                         input.history_id,
-                         input.quarantine_id,
-                         input.sandbox_id,
-                         NOW(),
-                         input.source,
-                         $2,
-                         input.reason_code,
-                         NULLIF(BTRIM(input.failure_reason), ''),
-                         $3,
-                         jsonb_build_object('node_id', $1::TEXT)
-                     FROM jsonb_to_recordset($4::jsonb) AS input(
-                         sandbox_id UUID,
-                         failure_reason TEXT,
-                         source TEXT,
-                         reason_code TEXT,
-                         quarantine_id UUID,
-                         history_id UUID
-                     )",
-                );
-                sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_id.to_string())
-                    .bind(SandboxQuarantineHistoryAction::EnteredQuarantine.as_str())
-                    .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                    .bind(updated_json)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|err| Status::internal(format!("record quarantine history: {err}")))?;
+                quarantine_persistence::record_state(conn, node_id, updated_json.clone()).await?;
+                quarantine_persistence::record_history(conn, node_id, updated_json).await?;
                 quarantined_sandboxes = updated
                     .iter()
                     .map(|row| (row.sandbox_id, row.from_lifecycle.clone()))

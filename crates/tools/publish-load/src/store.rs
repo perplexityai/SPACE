@@ -19,6 +19,8 @@ use crate::{Args, Node};
 
 mod policy;
 pub use policy::{seed_policy_failure, verify_policy_observation};
+mod quarantine;
+pub use quarantine::verify_quarantine;
 
 /// Enable statement inspection only after the launcher-owned fixture is open.
 /// PostgreSQL takes extension-catalog locks; no publication rows are touched.
