@@ -98,3 +98,41 @@ fn lineage_precondition_carries_bounded_cause_metadata() {
         "instance_not_subvolume"
     );
 }
+
+/// A template directory holding other builds, but not this one, as a
+/// Full-codec restore can leave behind.
+fn absent_send_parent_build() -> (tempfile::TempDir, PathBuf, TemplateBuildTarget) {
+    let root = tempfile::tempdir().unwrap();
+    let template_dir = root.path().canonicalize().unwrap().join("tmpl-a");
+    std::fs::create_dir(&template_dir).unwrap();
+    let target =
+        TemplateBuildTarget::parse("tmpl-a", &format!("sha256:{}", "a".repeat(64)), None).unwrap();
+    let digest_dir = template_dir.join(target.dir_name());
+    (root, digest_dir, target)
+}
+
+#[test]
+fn absent_send_parent_build_is_a_lineage_precondition() {
+    let (_root, digest_dir, target) = absent_send_parent_build();
+
+    let error = validated_suspend_send_parent(digest_dir, &target)
+        .err()
+        .unwrap();
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert_eq!(
+        error.metadata().get(LINEAGE_CAUSE_METADATA).unwrap(),
+        "template_absent"
+    );
+}
+
+#[test]
+fn absent_send_parent_build_stays_not_found_for_named_snapshots() {
+    // The fork executor refreezes and captures again on FAILED_PRECONDITION;
+    // a missing build would only fail the same way on every capture.
+    let (_root, digest_dir, target) = absent_send_parent_build();
+
+    let error = validated_send_parent(digest_dir, &target).err().unwrap();
+
+    assert_eq!(error.code(), tonic::Code::NotFound, "{error}");
+}

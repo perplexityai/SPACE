@@ -43,6 +43,7 @@ use crate::proto::{
 
 use pplx_space_common_core::host::linux::paths::TEMPLATE_CACHE_DIR_MODE;
 use pplx_space_common_svc::core::host::linux::identities::{gids, users};
+use pplx_space_node_mgr_client::BTRFS_LINEAGE_CAUSE_METADATA as LINEAGE_CAUSE_METADATA;
 
 use super::validation::validate_sandbox_id;
 use super::{CACHE_DIR, NodeManagerService};
@@ -250,8 +251,36 @@ struct ValidatedSendParent {
     uuid: uuid::Uuid,
 }
 
-fn validated_send_parent(template: &TemplateBuildTarget) -> Result<ValidatedSendParent, Status> {
-    let path = template.digest_dir();
+/// The suspend encoder's send parent. A Full-codec restore does not need its
+/// template, so it can place a sandbox on a node that never held this build
+/// or has since evicted it. Suspend can fall back to the Full codec there;
+/// the named-snapshot encoder keeps NOT_FOUND, which its fork caller treats as
+/// terminal rather than as a reason to capture again.
+fn validated_suspend_send_parent(
+    path: PathBuf,
+    template: &TemplateBuildTarget,
+) -> Result<ValidatedSendParent, Status> {
+    validated_send_parent(path, template).map_err(|error| {
+        if error.code() != tonic::Code::NotFound {
+            return error;
+        }
+        lineage_precondition(
+            LineageFallbackCause::TemplateAbsent,
+            format!(
+                "btrfs-send codec requires template {template} on this node, and it is not \
+                 installed here: {}. Retry with format=full.",
+                error.message()
+            ),
+        )
+    })
+}
+
+/// The send parent at `path`, the digest directory of `template`. The
+/// named-snapshot encoder uses it as is; an absent build stays NOT_FOUND.
+fn validated_send_parent(
+    path: PathBuf,
+    template: &TemplateBuildTarget,
+) -> Result<ValidatedSendParent, Status> {
     if !artifact_fs::is_subvolume(&path)? {
         return Err(lineage_precondition(
             LineageFallbackCause::TemplateNotSubvolume,
@@ -363,14 +392,13 @@ impl Drop for ArtifactDirectoryGuard {
     }
 }
 
-const LINEAGE_CAUSE_METADATA: &str = "x-space-btrfs-lineage-cause";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LineageFallbackCause {
     InstanceNotSubvolume,
     InstanceParentMismatch,
     SnapshotNotSubvolume,
     SnapshotParentMismatch,
+    TemplateAbsent,
     TemplateNotSubvolume,
     TemplateReceivedUuidMismatch,
 }
@@ -382,6 +410,7 @@ impl LineageFallbackCause {
             Self::InstanceParentMismatch => "instance_parent_mismatch",
             Self::SnapshotNotSubvolume => "snapshot_not_subvolume",
             Self::SnapshotParentMismatch => "snapshot_parent_mismatch",
+            Self::TemplateAbsent => "template_absent",
             Self::TemplateNotSubvolume => "template_not_subvolume",
             Self::TemplateReceivedUuidMismatch => "template_received_uuid_mismatch",
         }
@@ -669,7 +698,7 @@ impl NodeManagerService {
                         snapshot_dir.display()
                     ))
                 })?;
-                validated_send_parent(&template)
+                validated_suspend_send_parent(template.digest_dir(), &template)
             })
             .await?
         };
@@ -839,7 +868,7 @@ impl NodeManagerService {
                         ),
                     ));
                 }
-                let send_parent = validated_send_parent(&template)?;
+                let send_parent = validated_send_parent(template.digest_dir(), &template)?;
                 let instance_info = artifact_fs::info(&instance_path).map_err(|error| {
                     lineage_precondition(
                         LineageFallbackCause::InstanceNotSubvolume,

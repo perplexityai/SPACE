@@ -87,6 +87,10 @@ use tonic::transport::{Channel, Endpoint};
 
 pub const NODE_STATUS_FAILURE_GRACE: Duration = Duration::from_secs(5 * 60);
 
+/// Status metadata naming the bounded cause of a btrfs-send lineage
+/// `FAILED_PRECONDITION`, such as `template_absent`.
+pub const BTRFS_LINEAGE_CAUSE_METADATA: &str = "x-space-btrfs-lineage-cause";
+
 pub use pplx_space_node_mgr_protocol::CacheDiskSchedulingEffect;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

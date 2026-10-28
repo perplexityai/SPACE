@@ -1377,7 +1377,8 @@ Known limits until the cluster side carries partitions:
   be registered or published yet. Node-ctl publishes a template's
   legacy-partition build, and another partition's only when it has none.
 - The sandbox btrfs-send codec names legacy builds only. A sandbox booted from
-  another partition fails the codec's lineage check and uses the Full codec.
+  another partition fails the codec's lineage check and uses the Full codec,
+  whether or not its node also holds the legacy build.
 - Prefetch names no environment: it pulls without a selector, counts a build
   in any partition of a digest as cached, and its tag pins use the legacy
   partition key.

@@ -239,8 +239,11 @@ service NodeManager {
   // RO snapshot in the requested snapshot destination, runs the send writing
   // `rootfs.btrfs-send` there, removes the
   // superseded `rootfs.ext4`, cleans up the RO snapshot. Errors:
-  // `FailedPrecondition` for any precondition mismatch (caller can
-  // retry with Full codec); `Internal` for codec failures mid-send.
+  // `FailedPrecondition` for any precondition mismatch, including a
+  // template build absent from this node, and for a refused execution
+  // fence or a failed filesystem or send operation, including one
+  // mid-send. `rootfs.ext4` is removed only after a successful send, so
+  // the caller can retry with the Full codec.
   rpc BtrfsEncodeRootfsSend(BtrfsEncodeRootfsSendRequest)
       returns (BtrfsEncodeRootfsSendResponse);
 
