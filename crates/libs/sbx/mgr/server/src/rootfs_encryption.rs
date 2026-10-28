@@ -29,6 +29,12 @@
 /// key material and persists no wrap.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EncryptedRootfsPrepareError {
+    #[error("read encrypted disk restore metadata: {0}")]
+    MetadataIo(#[source] std::io::Error),
+    #[error("parse encrypted disk restore metadata: {0}")]
+    MetadataJson(#[from] serde_json::Error),
+    #[error("encrypted disk restore metadata does not match the target sandbox")]
+    MetadataIdentity,
     #[error("node-manager connect for encrypted rootfs: {0}")]
     Connect(#[from] pplx_space_node_mgr_client::ConnectError),
     #[error("node-manager PrepareEncryptedRootfs ({code:?}): {message}", code = .0.code(), message = .0.message())]
@@ -39,6 +45,10 @@ impl EncryptedRootfsPrepareError {
     pub(crate) fn into_status(self, message: String) -> tonic::Status {
         match self {
             Self::Connect(_) => tonic::Status::internal(message),
+            Self::MetadataIo(_) => tonic::Status::unavailable(message),
+            Self::MetadataJson(_) | Self::MetadataIdentity => {
+                tonic::Status::failed_precondition(message)
+            }
             Self::Rpc(status) => {
                 let details = tonic::codegen::Bytes::copy_from_slice(status.details());
                 let metadata = status.metadata().clone();
@@ -54,14 +64,48 @@ pub(crate) async fn prepare_encrypted_rootfs(
     restore_cow_source: Option<&str>,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> Result<String, EncryptedRootfsPrepareError> {
+    let mut fork_source = None;
+    let mut cow_source = restore_cow_source.map(str::to_owned);
+    if cow_source.is_none() {
+        let snapshot_dir = std::path::Path::new(crate::byok::CACHE_DIR)
+            .join(sandbox_id)
+            .join("snapshot");
+        match tokio::fs::read(snapshot_dir.join("snapshot.json")).await {
+            Ok(bytes) => {
+                let meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&bytes)?;
+                if meta.encrypted
+                    && crate::snapshot_upload::artifact_kind_from_meta(&meta)
+                        == pplx_space_common_core::types::ArtifactKind::Disk
+                {
+                    if meta.sandbox_id != sandbox_id {
+                        return Err(EncryptedRootfsPrepareError::MetadataIdentity);
+                    }
+                    let source = meta
+                        .rootfs_encryption_source
+                        .ok_or(EncryptedRootfsPrepareError::MetadataIdentity)?;
+                    if source.to_string() == sandbox_id {
+                        return Err(EncryptedRootfsPrepareError::MetadataIdentity);
+                    }
+                    cow_source = Some(snapshot_dir.join("cow.luks").to_string_lossy().into_owned());
+                    fork_source = Some(
+                        pplx_space_node_mgr_client::proto::EncryptedRootfsForkSource {
+                            sandbox_id: source.to_string(),
+                        },
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(EncryptedRootfsPrepareError::MetadataIo(error)),
+        }
+    }
     let mut node = node_manager.connect().await?;
     let prepared = node
         .prepare_encrypted_rootfs(
             pplx_space_node_mgr_client::proto::PrepareEncryptedRootfsRequest {
                 execution_fence: Some(execution_fence.into()),
                 sandbox_id: sandbox_id.to_string(),
-                restore_cow_source: restore_cow_source.map(str::to_string),
-                fork_source: None,
+                restore_cow_source: cow_source,
+                fork_source,
             },
         )
         .await

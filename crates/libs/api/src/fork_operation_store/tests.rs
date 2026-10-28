@@ -41,6 +41,7 @@ fn published_artifact_leader_is_not_a_capture_candidate() {
         7,
         ForkSourceLifecycle::Started,
         ForkTargetConfig {
+            volume_encryption: false,
             egress_profiles: Default::default(),
             template: "seed:latest".parse().unwrap(),
             source_template_id: Some("seed".to_string()),
@@ -75,6 +76,7 @@ fn capture_candidate_must_match_the_frozen_source_lifecycle() {
         7,
         ForkSourceLifecycle::Paused,
         ForkTargetConfig {
+            volume_encryption: false,
             egress_profiles: Default::default(),
             template: "seed:latest".parse().unwrap(),
             source_template_id: Some("seed".to_string()),
@@ -113,6 +115,7 @@ fn capture_leader_must_still_match_the_followers_frozen_source() {
         8,
         ForkSourceLifecycle::Started,
         ForkTargetConfig {
+            volume_encryption: false,
             egress_profiles: Default::default(),
             template: "seed:latest".parse().unwrap(),
             source_template_id: Some("seed".to_string()),

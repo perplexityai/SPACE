@@ -131,6 +131,16 @@ Lifecycle names differ across the two APIs:
 
 ECW does not expose the SPACE API's resident-memory pause/resume operations.
 
+Forks cold-boot a new sandbox from a durable disk artifact, without copying
+memory or changing the source lifecycle. Both live and suspended encrypted
+sources are supported within the same organization. Encrypted forks transfer
+only the sealed disk COW; node-manager re-encrypts it with an independent child
+key before boot. The source key must remain available until that copy finishes.
+Afterward, the child can suspend and restore independently of its source.
+Forks preserve the source's encryption mode and fail closed if it no longer
+satisfies the organization's encryption policy. Existing sandbox identity
+forwarding and target authorization requirements still apply.
+
 The following compatibility limits are important:
 
 - Unsupported sandbox-create capabilities `mcp`, `volumeMounts`, and `iam`

@@ -341,6 +341,7 @@ fn restore_artifact_as_new_context(
         target_owner: format!("user:{}", uuid::Uuid::now_v7()).parse().unwrap(),
         artifact_kind,
         target_disk_io_limits: None,
+        volume_encryption: false,
     }
 }
 
@@ -446,6 +447,7 @@ fn disk_artifact_meta() -> (
             rootfs_diff_format: None,
             rootfs_send_source_id: None,
             encrypted: false,
+            rootfs_encryption_source: None,
             local_artifact_id: Some(LocalArtifactId::new()),
             artifact_kind: Some(pplx_space_common_core::types::ArtifactKind::Disk),
             artifact_origin: Some(pplx_space_common_core::types::ArtifactOrigin::Snapshot),
@@ -961,6 +963,16 @@ fn restore_artifact_as_new_accepts_only_bound_disk_artifacts() {
     context.source_sandbox_id = meta.sandbox_id.parse().unwrap();
     validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
         .expect("disk artifact is accepted");
+    context.volume_encryption = true;
+    validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
+        .expect_err("a plaintext artifact must not downgrade an encrypted target");
+    meta.encrypted = true;
+    validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
+        .expect("encrypted disk matches the frozen target assignment");
+    context.volume_encryption = false;
+    validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)
+        .expect_err("encrypted disk must not select a plaintext target");
+    meta.encrypted = false;
 
     meta.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Full);
     let error = validate_artifact_restore_as_new(&meta, &context, &context.source_sandbox_id)

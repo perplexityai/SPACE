@@ -563,6 +563,11 @@ fn project_disk_metadata(
         ));
     }
     validate_disk_projection_source(&metadata)?;
+    if metadata.encrypted {
+        metadata
+            .rootfs_encryption_source
+            .get_or_insert(source_sandbox_id);
+    }
     metadata.sandbox_id = destination_sandbox_id.to_string();
     metadata.size_bytes = rootfs_bytes;
     metadata.rootfs_size_bytes = Some(rootfs_bytes);
@@ -579,6 +584,9 @@ fn rootfs_artifact(
     metadata: &crate::snapshot_upload::SnapshotMeta,
 ) -> Result<SnapshotArtifact, Status> {
     validate_disk_projection_source(metadata)?;
+    if metadata.encrypted {
+        return Ok(SnapshotArtifact::EncryptedRootfsCow);
+    }
     if metadata.rootfs_diff_format.as_deref()
         == Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1)
     {
@@ -591,11 +599,6 @@ fn rootfs_artifact(
 fn validate_disk_projection_source(
     metadata: &crate::snapshot_upload::SnapshotMeta,
 ) -> Result<(), Status> {
-    if metadata.encrypted {
-        return Err(Status::failed_precondition(
-            "encrypted suspended artifacts cannot be forked as disk-only artifacts",
-        ));
-    }
     match metadata.artifact_kind {
         // A suspended artifact contains a valid rootfs plus runtime state. A disk-only fork
         // deliberately projects just that rootfs into a new disk artifact; memory is not copied.

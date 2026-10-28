@@ -59,6 +59,7 @@ uuid = { workspace = true, features = ["v5", "v7"] }
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-common-io = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-common-lru-reaper = { workspace = true }
 pplx-space-common-svc = { workspace = true }

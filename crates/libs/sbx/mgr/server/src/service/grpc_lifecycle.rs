@@ -55,6 +55,7 @@ pub(super) use self::artifact_backup::{
     reupload_precondition_for_cluster_api_env, reupload_resolution_to_config,
 };
 use self::backup_submission::suspend_artifact_metadata;
+pub(super) use self::backup_submission::suspend_snapshot_metadata;
 #[cfg(test)]
 use self::pause_resume::{PauseReconciliationOutcome, pause_reconciliation_outcome};
 use self::pause_resume::{pause_with_reconciliation, prepare_guest_for_pause};

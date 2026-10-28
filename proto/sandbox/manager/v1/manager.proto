@@ -1752,6 +1752,9 @@ message RestoreArtifactAsNewContext {
   // these fields, in which case the restored snapshot's assignment is kept.
   optional uint64 disk_io_max_operations_per_sec = 5;
   optional uint64 disk_io_max_bandwidth_mib_per_sec = 6;
+  // Immutable target assignment. Artifact metadata must match it before any
+  // restore files or node-local sandbox state are published.
+  bool volume_encryption = 7;
 }
 
 message AutoLifecycleDeleteReceipt {

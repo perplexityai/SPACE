@@ -12176,8 +12176,11 @@ type RestoreArtifactAsNewContext struct {
 	// these fields, in which case the restored snapshot's assignment is kept.
 	DiskIoMaxOperationsPerSec   *uint64 `protobuf:"varint,5,opt,name=disk_io_max_operations_per_sec,json=diskIoMaxOperationsPerSec,proto3,oneof" json:"disk_io_max_operations_per_sec,omitempty"`
 	DiskIoMaxBandwidthMibPerSec *uint64 `protobuf:"varint,6,opt,name=disk_io_max_bandwidth_mib_per_sec,json=diskIoMaxBandwidthMibPerSec,proto3,oneof" json:"disk_io_max_bandwidth_mib_per_sec,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// Immutable target assignment. Artifact metadata must match it before any
+	// restore files or node-local sandbox state are published.
+	VolumeEncryption bool `protobuf:"varint,7,opt,name=volume_encryption,json=volumeEncryption,proto3" json:"volume_encryption,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RestoreArtifactAsNewContext) Reset() {
@@ -12250,6 +12253,13 @@ func (x *RestoreArtifactAsNewContext) GetDiskIoMaxBandwidthMibPerSec() uint64 {
 		return *x.DiskIoMaxBandwidthMibPerSec
 	}
 	return 0
+}
+
+func (x *RestoreArtifactAsNewContext) GetVolumeEncryption() bool {
+	if x != nil {
+		return x.VolumeEncryption
+	}
+	return false
 }
 
 type AutoLifecycleDeleteReceipt struct {
@@ -14060,14 +14070,15 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\tH\x00R\x06reason\x88\x01\x01\x12_\n" +
 	"\x12published_artifact\x18\x03 \x01(\v2+.space.sandbox.manager.v1.PublishedArtifactH\x01R\x11publishedArtifact\x88\x01\x01B\t\n" +
 	"\a_reasonB\x15\n" +
-	"\x13_published_artifact\"\xc9\x03\n" +
+	"\x13_published_artifact\"\xf6\x03\n" +
 	"\x1bRestoreArtifactAsNewContext\x12*\n" +
 	"\x11source_sandbox_id\x18\x01 \x01(\tR\x0fsourceSandboxId\x120\n" +
 	"\x14artifact_snapshot_id\x18\x02 \x01(\tR\x12artifactSnapshotId\x12!\n" +
 	"\ftarget_owner\x18\x03 \x01(\tR\vtargetOwner\x12K\n" +
 	"\rartifact_kind\x18\x04 \x01(\x0e2&.space.sandbox.manager.v1.ArtifactKindR\fartifactKind\x12F\n" +
 	"\x1edisk_io_max_operations_per_sec\x18\x05 \x01(\x04H\x00R\x19diskIoMaxOperationsPerSec\x88\x01\x01\x12K\n" +
-	"!disk_io_max_bandwidth_mib_per_sec\x18\x06 \x01(\x04H\x01R\x1bdiskIoMaxBandwidthMibPerSec\x88\x01\x01B!\n" +
+	"!disk_io_max_bandwidth_mib_per_sec\x18\x06 \x01(\x04H\x01R\x1bdiskIoMaxBandwidthMibPerSec\x88\x01\x01\x12+\n" +
+	"\x11volume_encryption\x18\a \x01(\bR\x10volumeEncryptionB!\n" +
 	"\x1f_disk_io_max_operations_per_secB$\n" +
 	"\"_disk_io_max_bandwidth_mib_per_sec\"\x88\x02\n" +
 	"\x1aAutoLifecycleDeleteReceipt\x12\x1d\n" +

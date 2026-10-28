@@ -1056,7 +1056,7 @@ fn published_remote_restore_artifacts_complete(
     let expected_subject = pplx_space_common_core::types::SubjectId::Sandbox(sandbox_id);
     let snapshot_dir = canonical_sandbox_dir.join("snapshot");
     let artifacts = if meta.encrypted {
-        crate::snapshot_upload::encrypted_vm_artifacts()
+        crate::snapshot_upload::encrypted_artifacts(artifact_kind)
     } else {
         crate::snapshot_upload::artifact_files_for_kind(
             artifact_kind,
@@ -1977,6 +1977,7 @@ pub async fn restore_pull_rootfs(
             &stage.config,
             &stage.snapshot_dir,
             stage.transfer_scope_id,
+            crate::snapshot_upload::artifact_kind_from_meta(&stage.meta),
         )
         .await;
         if let Err(ref e) = stage_result {
@@ -2569,23 +2570,22 @@ async fn stage_encrypted_restore(
     config: &SnapshotUploadConfig,
     snapshot_dir: &Path,
     transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+    artifact_kind: ArtifactKind,
 ) -> Result<(), RestoreError> {
     std::fs::create_dir_all(snapshot_dir)
         .map_err(|e| RestoreError::Other(format!("mkdir {}: {e}", snapshot_dir.display())))?;
-    let pulls = [
-        (SnapshotArtifact::EncryptedSnapshotVolume, "snapshot.luks"),
-        (SnapshotArtifact::EncryptedRootfsCow, "cow.luks"),
-    ]
-    .map(|(artifact, local_name)| -> BoxFuture<'_, _> {
-        Box::pin(pull_artifact(
-            identity,
-            config,
-            snapshot_dir.join(local_name),
-            artifact,
-            transfer_scope_id,
-        ))
-    });
-    run_staging_transfers(None, pulls.into()).await
+    let pulls = crate::snapshot_upload::encrypted_artifacts(artifact_kind)
+        .into_iter()
+        .map(|artifact| -> BoxFuture<'_, _> {
+            Box::pin(pull_artifact(
+                identity,
+                config,
+                snapshot_dir.join(artifact.local_name),
+                artifact.kind,
+                transfer_scope_id,
+            ))
+        });
+    run_staging_transfers(None, pulls.collect()).await
 }
 
 /// Restore-side staging for the `btrfs-send-v1` codec.

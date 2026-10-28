@@ -2210,11 +2210,16 @@ func (s *ociSpec) sandboxArtifactRestoreAsNew() (*pb.RestoreArtifactAsNewContext
 	if strings.TrimSpace(context.TargetOwner) == "" {
 		return nil, fmt.Errorf("targetOwner must not be empty")
 	}
+	volumeEncryption, err := s.sandboxVolumeEncryption()
+	if err != nil {
+		return nil, err
+	}
 	return &pb.RestoreArtifactAsNewContext{
 		SourceSandboxId:    context.SourceSandboxID,
 		ArtifactSnapshotId: context.ArtifactSnapshotID,
 		TargetOwner:        context.TargetOwner,
 		ArtifactKind:       pb.ArtifactKind_ARTIFACT_KIND_DISK,
+		VolumeEncryption:   volumeEncryption,
 	}, nil
 }
 

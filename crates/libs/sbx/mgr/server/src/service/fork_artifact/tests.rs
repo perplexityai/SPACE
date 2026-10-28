@@ -63,6 +63,7 @@ fn suspended_metadata(sandbox_id: SandboxId) -> crate::snapshot_upload::Snapshot
         rootfs_diff_format: None,
         rootfs_send_source_id: None,
         encrypted: false,
+        rootfs_encryption_source: None,
         local_artifact_id: Some(LocalArtifactId::new()),
         artifact_kind: Some(ArtifactKind::Full),
         artifact_origin: Some(ArtifactOrigin::Suspend),
@@ -101,22 +102,35 @@ fn projected_metadata_keeps_the_group_readable_mode_after_atomic_replace() {
 }
 
 #[test]
-fn copied_metadata_rejects_encrypted_artifacts() {
+fn copied_encrypted_metadata_projects_only_the_ciphertext_disk() {
     let source_sandbox_id = SandboxId::new();
     let mut metadata = suspended_metadata(source_sandbox_id);
     metadata.encrypted = true;
-    let error = rootfs_artifact(&metadata)
-        .expect_err("encrypted metadata must fail before the rootfs pull");
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    let error = project_disk_metadata(
+    assert_eq!(
+        rootfs_artifact(&metadata).unwrap(),
+        SnapshotArtifact::EncryptedRootfsCow
+    );
+    let projected = project_disk_metadata(
         metadata,
         source_sandbox_id,
         SandboxId::new(),
         42,
         ArtifactOrigin::Fork,
     )
-    .expect_err("encrypted artifact is not a disk-only fork source");
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    .expect("encrypted full snapshots support disk-only projection");
+    assert!(projected.encrypted);
+    let artifacts = crate::snapshot_upload::upload_artifacts_for_meta(&projected);
+    assert_eq!(
+        artifacts
+            .iter()
+            .map(|artifact| artifact.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            SnapshotArtifact::EncryptedRootfsCow,
+            SnapshotArtifact::Metadata
+        ],
+        "disk forks must neither copy memory nor publish a plaintext rootfs",
+    );
 }
 
 #[test]

@@ -272,30 +272,47 @@ fn completed_target_results_follow_admission_order() -> TestResult {
 
 #[test]
 fn payload_capture_progress_prevents_duplicate_side_effects() -> TestResult {
-    let mut payload = ForkSandboxPayloadV1::new(
-        SandboxId::new(),
-        ForkRequest::from_wire(Some(60), Some(1))?,
-        "e2b.example.test".to_string(),
-    );
-    assert_eq!(payload.capture_progress(), ForkCaptureProgress::Capture);
-    payload.freeze_source(7, ForkSourceLifecycle::Started, test_target_config(), None);
+    for encrypted in [false, true] {
+        let mut payload = ForkSandboxPayloadV1::new(
+            SandboxId::new(),
+            ForkRequest::from_wire(Some(60), Some(1))?,
+            "e2b.example.test".to_string(),
+        );
+        assert_eq!(payload.capture_progress(), ForkCaptureProgress::Capture);
+        let mut config = test_target_config();
+        config.volume_encryption = encrypted;
+        payload.freeze_source(7, ForkSourceLifecycle::Started, config, None);
 
-    let local_artifact_id = LocalArtifactId::new();
-    payload.record_local_artifact(local_artifact_id);
-    assert_eq!(
-        payload.capture_progress(),
-        ForkCaptureProgress::EnqueueBackup(local_artifact_id)
-    );
+        let local_artifact_id = LocalArtifactId::new();
+        payload.record_local_artifact(local_artifact_id);
+        assert_eq!(
+            payload.capture_progress(),
+            ForkCaptureProgress::EnqueueBackup(local_artifact_id)
+        );
 
-    let attempt_id = BackupAttemptId::new();
-    payload.record_backup_attempt(attempt_id);
-    assert_eq!(
-        payload.capture_progress(),
-        ForkCaptureProgress::ObserveBackup {
-            local_artifact_id,
-            attempt_id,
-        }
-    );
+        let attempt_id = BackupAttemptId::new();
+        payload.record_backup_attempt(attempt_id);
+        assert_eq!(
+            payload.capture_progress(),
+            ForkCaptureProgress::ObserveBackup {
+                local_artifact_id,
+                attempt_id,
+            }
+        );
+        let encoded = serde_json::to_value(ForkSandboxPayload::v1(payload))?;
+        let restored = decode_fork_payload(encoded)?;
+        assert_eq!(
+            restored.target_config().unwrap().volume_encryption,
+            encrypted
+        );
+        assert_eq!(
+            restored.capture_progress(),
+            ForkCaptureProgress::ObserveBackup {
+                local_artifact_id,
+                attempt_id
+            }
+        );
+    }
     Ok(())
 }
 
@@ -541,6 +558,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
 
 fn test_target_config() -> ForkTargetConfig {
     ForkTargetConfig {
+        volume_encryption: false,
         egress_profiles: Default::default(),
         template: "seed:latest".parse().unwrap(),
         source_template_id: Some("seed".to_string()),

@@ -415,6 +415,7 @@ pub struct RestoreForkDiskAsNewContext<'a> {
     pub snapshot: crate::controllers::substrate::SnapshotRef<'a>,
     pub operation_id: OperationId,
     pub restore_lease_seconds: u32,
+    pub volume_encryption: bool,
 }
 
 /// Whether the owner org has BYOK (per-sandbox volume encryption) enabled.
@@ -900,6 +901,11 @@ fn pool_slot_claimed_event_details(
     details
 }
 
+struct ForkDiskRestore<'a> {
+    snapshot: crate::controllers::substrate::SnapshotRef<'a>,
+    volume_encryption: bool,
+}
+
 struct SandboxCreateExecutionMode<'a> {
     sandbox_id: SandboxId,
     /// `sandbox_id` is visible to the caller and must be the created ID.
@@ -908,7 +914,7 @@ struct SandboxCreateExecutionMode<'a> {
     /// `sandbox_id`, so this is the one way a pinned create may adopt a slot.
     admitted_pool_claim: Option<AdmittedPoolClaim>,
     federated: FederatedSandboxCreateContext<'a>,
-    restore_from: Option<crate::controllers::substrate::SnapshotRef<'a>>,
+    restore_from: Option<ForkDiskRestore<'a>>,
     restore_operation_id: Option<OperationId>,
     restore_lease_seconds: u32,
 }
@@ -1169,7 +1175,10 @@ impl SandboxController {
                 sandbox_id_pinned: true,
                 admitted_pool_claim: None,
                 federated: restore.federated,
-                restore_from: Some(restore.snapshot),
+                restore_from: Some(ForkDiskRestore {
+                    snapshot: restore.snapshot,
+                    volume_encryption: restore.volume_encryption,
+                }),
                 restore_operation_id: Some(restore.operation_id),
                 restore_lease_seconds: restore.restore_lease_seconds,
             },
@@ -1198,6 +1207,10 @@ impl SandboxController {
             restore_operation_id,
             restore_lease_seconds,
         } = mode;
+        let fork_volume_encryption = restore_from
+            .as_ref()
+            .map(|restore| restore.volume_encryption);
+        let restore_from = restore_from.map(|restore| restore.snapshot);
         let egress_profiles = if let Some(selected) = federated.egress_profiles {
             selected.clone()
         } else if restore_from.is_some() {
@@ -1291,8 +1304,19 @@ impl SandboxController {
         // Immutable per-sandbox encryption stamp: decided exactly once, here.
         // It gates the pool bypass below, lands on the control-plane row, and
         // rides the substrate create to the node row.
-        let volume_encryption =
-            org_byok_enabled(pool, create_owner.org_id).await? && byok_volume_encryption_engaged();
+        let org_byok = org_byok_enabled(pool, create_owner.org_id).await?;
+        let encryption_required = org_byok && byok_volume_encryption_engaged();
+        let volume_encryption = match fork_volume_encryption {
+            Some(frozen) => {
+                if (frozen && !org_byok) || (!frozen && encryption_required) {
+                    return Err(ControllerError::bad_request(
+                        "fork encryption no longer satisfies the organization's policy",
+                    ));
+                }
+                frozen
+            }
+            None => encryption_required,
+        };
         // A placed create must land in its pool. Warm-pool pods are pre-created
         // on general nodes, so a pin can't adopt one — bypass the warm pool when
         // a pin is set, and reject the incompatible `boot_mode=pool` + pin combo.
@@ -1300,11 +1324,6 @@ impl SandboxController {
         if placement_requested && boot_mode == CreateBootMode::Pool {
             return Err(ControllerError::bad_request(
                 "node_pool placement is incompatible with boot_mode=pool",
-            ));
-        }
-        if restore_from.is_some() && volume_encryption {
-            return Err(ControllerError::bad_request(
-                "encrypted sandboxes cannot be fork targets",
             ));
         }
         let pooled_input = PooledCreateInput {

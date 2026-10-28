@@ -76,6 +76,7 @@ fn restore_artifact_as_new_request() -> StartRequest {
             artifact_kind: crate::proto::ArtifactKind::Disk as i32,
             disk_io_max_operations_per_sec: None,
             disk_io_max_bandwidth_mib_per_sec: None,
+            volume_encryption: false,
         }),
         ..Default::default()
     }
@@ -1108,6 +1109,7 @@ fn a_stopped_target_and_a_fork_cannot_be_requested_together() {
         artifact_kind: crate::proto::ArtifactKind::Disk as i32,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+        volume_encryption: false,
     };
     let fork_storage_uri = format!(
         "s3://snapshots/suspend/{source_sandbox_id}/{artifact_snapshot_id}?region=us-east-1"

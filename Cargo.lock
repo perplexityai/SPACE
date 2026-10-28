@@ -7025,6 +7025,7 @@ dependencies = [
  "opentelemetry-proto",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-common-io",
  "pplx-space-common-jobs",
  "pplx-space-common-lru-reaper",
  "pplx-space-common-svc",

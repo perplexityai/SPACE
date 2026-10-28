@@ -492,6 +492,8 @@ impl std::fmt::Display for ForkSourceLifecycle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkTargetConfig {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub volume_encryption: bool,
     #[serde(
         default,
         skip_serializing_if = "crate::egress_profiles::EgressProfileSelection::is_empty"

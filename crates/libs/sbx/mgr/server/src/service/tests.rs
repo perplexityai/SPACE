@@ -17814,6 +17814,7 @@ pub(crate) mod service_tests {
                         artifact_kind: crate::proto::ArtifactKind::Disk as i32,
                         disk_io_max_operations_per_sec: None,
                         disk_io_max_bandwidth_mib_per_sec: None,
+                        volume_encryption: false,
                     }),
                     ..Default::default()
                 },

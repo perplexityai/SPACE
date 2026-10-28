@@ -305,7 +305,7 @@ pub(super) async fn require_artifact_backup_files(
 ) -> Result<(), Status> {
     use crate::retained_source::BtrfsSendRootfsPresence;
     let mut files = crate::snapshot_upload::artifact_files_for_kind(kind, format);
-    if kind == pplx_space_common_core::types::ArtifactKind::Full {
+    {
         let sidecar = std::path::Path::new(local_path)
             .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
         match std::fs::read(&sidecar) {
@@ -321,7 +321,7 @@ pub(super) async fn require_artifact_backup_files(
                 // Admission must require the same files the uploader reads,
                 // regardless of the plaintext rootfs codec in the sidecar.
                 if meta.encrypted {
-                    files = crate::snapshot_upload::encrypted_vm_artifacts();
+                    files = crate::snapshot_upload::encrypted_artifacts(kind);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

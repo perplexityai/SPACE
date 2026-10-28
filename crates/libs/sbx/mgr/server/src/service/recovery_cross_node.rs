@@ -20,6 +20,7 @@ pub(super) struct RestoreArtifactAsNewContext {
     pub(super) target_owner: SandboxOwner,
     pub(super) artifact_kind: ArtifactKind,
     pub(super) target_disk_io_limits: Option<pplx_space_common_core::types::DiskIoLimits>,
+    pub(super) volume_encryption: bool,
 }
 
 impl RestoreArtifactAsNewContext {
@@ -92,6 +93,7 @@ impl RestoreArtifactAsNewContext {
             target_owner,
             artifact_kind,
             target_disk_io_limits,
+            volume_encryption: context.volume_encryption,
         })
     }
 }
@@ -2315,6 +2317,11 @@ fn validate_artifact_restore_as_new(
     context: &RestoreArtifactAsNewContext,
     target_sandbox_id: &SandboxId,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
+    if meta.encrypted != context.volume_encryption {
+        return Err(crate::snapshot_restore::RestoreError::Other(
+            "artifact encryption does not match the immutable target assignment".to_owned(),
+        ));
+    }
     let expected_kind = match context.artifact_kind {
         pplx_space_common_core::types::ArtifactKind::Disk => {
             pplx_space_common_core::types::ArtifactKind::Disk
@@ -2347,11 +2354,6 @@ fn validate_artifact_restore_as_new(
         &target_sandbox_id.to_string(),
         &context.source_sandbox_id.to_string(),
     )?;
-    if meta.encrypted {
-        return Err(crate::snapshot_restore::RestoreError::Other(
-            "artifact restore-as-new does not support encrypted artifacts".to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -2377,6 +2379,14 @@ fn rebind_artifact_snapshot_identity(
     target_sandbox_id: &str,
     target_owner: &pplx_space_common_core::types::SandboxOwner,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
+    if meta.encrypted && meta.rootfs_encryption_source.is_none() {
+        meta.rootfs_encryption_source = Some(meta.sandbox_id.parse().map_err(|source| {
+            crate::snapshot_restore::RestoreError::InvalidSandboxId {
+                value: meta.sandbox_id.clone(),
+                source,
+            }
+        })?);
+    }
     meta.sandbox_id = target_sandbox_id.to_string();
     // The staged disk remains an immutable source artifact. It seeds a cold boot and must
     // not become the child's current suspend checkpoint.

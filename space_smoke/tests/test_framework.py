@@ -141,6 +141,8 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.concurrent_restore_converges_to_one_execution",
                 "local.deferred_btrfs_send_capture_restores_cross_node",
                 "local.ecw_template_build_from_oci_boots",
+                "local.encrypted_disk_fork",
+                "local.encrypted_live_disk_fork",
                 "local.encrypted_resuspend_preserves_cow",
                 "local.forced_drain_evacuates_sandbox",
                 "local.fork_saturation_safety",

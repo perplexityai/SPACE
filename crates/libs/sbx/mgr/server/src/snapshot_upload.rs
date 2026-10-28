@@ -173,6 +173,11 @@ pub struct SnapshotMeta {
     /// snapshot volume. Absent/false on every legacy snapshot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub encrypted: bool,
+    /// The sandbox whose key encrypts a projected COW. Absent on ordinary
+    /// snapshots, whose ciphertext belongs to `sandbox_id`. Restore-as-new
+    /// retains this identity until node-manager re-encrypts the child's COW.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_encryption_source: Option<pplx_space_common_core::types::SandboxId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_artifact_id: Option<LocalArtifactId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -645,10 +650,18 @@ pub(crate) fn encrypted_vm_artifacts() -> Vec<Artifact> {
     ]
 }
 
+pub(crate) fn encrypted_artifacts(kind: ArtifactKind) -> Vec<Artifact> {
+    let mut artifacts = encrypted_vm_artifacts();
+    if kind == ArtifactKind::Disk {
+        artifacts.retain(|artifact| artifact.kind == SnapshotArtifact::EncryptedRootfsCow);
+    }
+    artifacts
+}
+
 /// Encrypted-snapshot upload set: the encrypted VM artifacts plus the metadata
 /// document, in submit order (mirrors [`upload_artifacts_for_kind`]).
-pub(crate) fn encrypted_upload_artifacts() -> Vec<Artifact> {
-    let mut out = encrypted_vm_artifacts();
+pub(crate) fn encrypted_upload_artifacts(kind: ArtifactKind) -> Vec<Artifact> {
+    let mut out = encrypted_artifacts(kind);
     out.push(Artifact {
         kind: SnapshotArtifact::Metadata,
         local_name: SNAPSHOT_METADATA_FILENAME,
@@ -658,7 +671,7 @@ pub(crate) fn encrypted_upload_artifacts() -> Vec<Artifact> {
 
 pub(crate) fn upload_artifacts_for_meta(meta: &SnapshotMeta) -> Vec<Artifact> {
     if meta.encrypted {
-        encrypted_upload_artifacts()
+        encrypted_upload_artifacts(artifact_kind_from_meta(meta))
     } else {
         upload_artifacts_for_kind(artifact_kind_from_meta(meta), format_from_meta(meta))
     }
@@ -751,7 +764,13 @@ pub(crate) fn write_snapshot_metadata_to(
                 None => (stat(path)?, true),
             }
         } else {
-            (stat(path)?, artifact.kind == SnapshotArtifact::Rootfs)
+            (
+                stat(path)?,
+                matches!(
+                    artifact.kind,
+                    SnapshotArtifact::Rootfs | SnapshotArtifact::EncryptedRootfsCow
+                ),
+            )
         };
         if is_rootfs_payload {
             rootfs_size_bytes = Some(len);
@@ -896,7 +915,7 @@ pub(crate) fn prepare_suspend_snapshot(
 ) -> Result<SnapshotUploadJobs, String> {
     let sandbox_id = &meta.sandbox_id;
     let vm_artifacts = if meta.encrypted {
-        encrypted_vm_artifacts()
+        encrypted_artifacts(artifact_kind)
     } else {
         artifact_files_for_kind(artifact_kind, format)
     };

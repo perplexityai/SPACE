@@ -64,10 +64,15 @@ impl Transfers {
         let destination =
             pplx_space_common_core::types::StorageUri::parse(&request.destination_s3_uri)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        assert_eq!(source.key_prefix, "snapshot/rootfs.btrfs-send");
+        let disk_name = if self.metadata.encrypted {
+            "cow.luks"
+        } else {
+            "rootfs.btrfs-send"
+        };
+        assert_eq!(source.key_prefix, format!("snapshot/{disk_name}"));
         assert_eq!(
             destination.key_prefix,
-            "snapshot/fork/operation/rootfs.btrfs-send"
+            format!("snapshot/fork/operation/{disk_name}")
         );
         if matches!(self.reply, CopyReply::Unsupported) {
             return Err(Status::unimplemented("older volume-manager"));
@@ -282,34 +287,45 @@ async fn run(
 
 #[tokio::test]
 async fn server_copy_publishes_only_disk_metadata_after_durable_copy() {
-    let source = "019f8000-0000-7000-8000-000000000001".parse().unwrap();
-    let destination = "019f8000-0000-7000-8000-000000000002".parse().unwrap();
-    let mut metadata = suspended_metadata(source);
-    metadata.rootfs_size_bytes = Some(4);
-    metadata.rootfs_diff_format =
-        Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.into());
-    let mut peer = peer(metadata, CopyReply::Complete).await;
-    let response = run(&mut peer, source, destination).await.unwrap();
-    assert_eq!(
-        *peer.transfers.calls.lock().unwrap(),
-        ["pull:metadata.json", "copy", "wait", "push:metadata.json"]
-    );
-    let published = peer.transfers.published.lock().unwrap();
-    let metadata = published.as_ref().unwrap();
-    assert_eq!(metadata.sandbox_id, destination.to_string());
-    assert_eq!(metadata.size_bytes, 4);
-    assert_eq!(metadata.rootfs_size_bytes, Some(4));
-    assert_eq!(metadata.artifact_kind, Some(ArtifactKind::Disk));
-    assert_eq!(metadata.local_artifact_id, None);
-    assert_eq!(metadata.rootfs_send_source_id, None);
-    insta::assert_snapshot!(
-        "fork_disk_metadata",
-        serde_json::to_string_pretty(metadata).unwrap()
-    );
-    assert_eq!(
-        response.published_durable_artifact.unwrap().bytes_published,
-        4 + serde_json::to_vec_pretty(metadata).unwrap().len() as u64
-    );
+    for encrypted in [false, true] {
+        let source = "019f8000-0000-7000-8000-000000000001".parse().unwrap();
+        let destination = "019f8000-0000-7000-8000-000000000002".parse().unwrap();
+        let mut metadata = suspended_metadata(source);
+        metadata.rootfs_size_bytes = Some(4);
+        metadata.rootfs_diff_format =
+            (!encrypted).then(|| crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.into());
+        metadata.encrypted = encrypted;
+        let mut peer = peer(metadata, CopyReply::Complete).await;
+        let response = run(&mut peer, source, destination).await.unwrap();
+        assert_eq!(
+            *peer.transfers.calls.lock().unwrap(),
+            ["pull:metadata.json", "copy", "wait", "push:metadata.json"]
+        );
+        let published = peer.transfers.published.lock().unwrap();
+        let metadata = published.as_ref().unwrap();
+        assert_eq!(metadata.sandbox_id, destination.to_string());
+        assert_eq!(metadata.size_bytes, 4);
+        assert_eq!(metadata.rootfs_size_bytes, Some(4));
+        assert_eq!(metadata.artifact_kind, Some(ArtifactKind::Disk));
+        assert_eq!(metadata.local_artifact_id, None);
+        assert_eq!(metadata.rootfs_send_source_id, None);
+        if encrypted {
+            assert_eq!(metadata.rootfs_encryption_source, Some(source));
+            insta::assert_snapshot!(
+                "fork_encrypted_disk_metadata",
+                serde_json::to_string_pretty(metadata).unwrap()
+            );
+        } else {
+            insta::assert_snapshot!(
+                "fork_disk_metadata",
+                serde_json::to_string_pretty(metadata).unwrap()
+            );
+        }
+        assert_eq!(
+            response.published_durable_artifact.unwrap().bytes_published,
+            4 + serde_json::to_vec_pretty(metadata).unwrap().len() as u64
+        );
+    }
 }
 
 #[tokio::test]
@@ -351,11 +367,9 @@ async fn legacy_and_unsupported_copies_keep_the_existing_disk_transfer() {
 async fn invalid_sources_and_interrupted_copy_waits_cannot_publish_metadata() {
     let source = SandboxId::new();
     let wrong_owner = suspended_metadata(SandboxId::new());
-    let mut encrypted = suspended_metadata(source);
-    encrypted.encrypted = true;
     let mut untyped = suspended_metadata(source);
     untyped.artifact_kind = None;
-    for mut metadata in [wrong_owner, encrypted, untyped] {
+    for mut metadata in [wrong_owner, untyped] {
         metadata.rootfs_size_bytes = Some(4);
         let mut peer = peer(metadata, CopyReply::Interrupted).await;
         assert_eq!(

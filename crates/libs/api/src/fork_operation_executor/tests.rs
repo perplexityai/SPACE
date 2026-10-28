@@ -268,6 +268,7 @@ fn invalid_capture_leader_state_is_terminal() {
 
 fn target_config() -> ForkTargetConfig {
     ForkTargetConfig {
+        volume_encryption: false,
         egress_profiles: Default::default(),
         template: "seed:latest".parse().unwrap(),
         source_template_id: Some("seed".to_string()),
@@ -570,10 +571,11 @@ fn live_source_requires_a_positive_execution_generation() {
 }
 
 #[test]
-fn byok_organizations_are_rejected_before_capture() {
+fn encrypted_forks_require_enrolled_orgs_and_never_upgrade_plaintext_origins() {
     assert!(validate_source_encryption(true, false).is_err());
     assert!(validate_source_encryption(false, true).is_err());
     validate_source_encryption(false, false).unwrap();
+    validate_source_encryption(true, true).unwrap();
 }
 
 #[test]

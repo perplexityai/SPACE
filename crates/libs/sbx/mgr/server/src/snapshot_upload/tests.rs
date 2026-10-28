@@ -66,6 +66,7 @@ fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
         rootfs_diff_format: rootfs_diff_format.map(str::to_string),
         rootfs_send_source_id: None,
         encrypted: false,
+        rootfs_encryption_source: None,
         local_artifact_id: None,
         artifact_kind: None,
         artifact_origin: None,

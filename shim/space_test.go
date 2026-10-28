@@ -549,6 +549,13 @@ func TestSandboxArtifactRestoreAsNew(t *testing.T) {
 		context.ArtifactKind != pb.ArtifactKind_ARTIFACT_KIND_DISK {
 		t.Fatalf("sandboxArtifactRestoreAsNew() = %#v", context)
 	}
+	for _, encrypted := range []bool{false, true} {
+		spec.Annotations[sandboxVolumeEncryptionAnnotation] = fmt.Sprint(encrypted)
+		context, err = spec.sandboxArtifactRestoreAsNew()
+		if err != nil || context.GetVolumeEncryption() != encrypted {
+			t.Fatalf("restore encryption = %v, error = %v, want %v", context.GetVolumeEncryption(), err, encrypted)
+		}
+	}
 
 	spec.Annotations[sandboxArtifactRestoreAsNewAnnotation] = `{"artifactSnapshotId":"019f8000-0000-7000-8000-000000000003","targetOwner":"user:019f8000-0000-7000-8000-000000000004"}`
 	if _, err := spec.sandboxArtifactRestoreAsNew(); err == nil {

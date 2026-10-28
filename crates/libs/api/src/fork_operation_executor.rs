@@ -473,6 +473,7 @@ impl ForkSandboxOperationExecutor {
         let execution_generation =
             frozen_execution_generation(source.active_execution_generation, lifecycle)?;
         let target_config = ForkTargetConfig {
+            volume_encryption: source.volume_encryption,
             egress_profiles: crate::egress_profiles::load(self.store.pool(), source.id)
                 .await
                 .map_err(ForkExecutionError::retry_error)?,
@@ -1079,6 +1080,7 @@ impl ForkSandboxOperationExecutor {
                         &request,
                         SandboxApiMetricIdentity::ecw("fork"),
                         RestoreForkDiskAsNewContext {
+                            volume_encryption: config.volume_encryption,
                             sandbox_id: target_id,
                             federated,
                             operation_id: operation.id,
@@ -1485,14 +1487,14 @@ fn validate_source_encryption(
     org_byok_enabled: bool,
     volume_encryption: bool,
 ) -> Result<(), ForkExecutionError> {
-    if org_byok_enabled {
+    if org_byok_enabled && !volume_encryption {
         return Err(ForkExecutionError::failed_precondition(
-            "sandboxes in BYOK organizations cannot be forked",
+            "plaintext fork source cannot satisfy the organization's encryption policy",
         ));
     }
-    if volume_encryption {
+    if volume_encryption && !org_byok_enabled {
         return Err(ForkExecutionError::failed_precondition(
-            "encrypted sandboxes cannot be forked",
+            "encrypted forks require an organization with BYOK enabled",
         ));
     }
     Ok(())

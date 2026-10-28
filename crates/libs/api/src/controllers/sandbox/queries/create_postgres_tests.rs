@@ -2914,6 +2914,7 @@ async fn postgres_federated_restore_inserts_restore_ownership() -> TestResult {
             &req,
             SandboxApiMetricIdentity::native("fork"),
             RestoreForkDiskAsNewContext {
+                volume_encryption: false,
                 sandbox_id: SandboxId::new(),
                 federated: FederatedSandboxCreateContext::new(Some(&owner), Some(&grant))
                     .with_egress_profiles(Some(&selection)),

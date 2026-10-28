@@ -51,7 +51,7 @@ pub(super) fn captured_suspend_snapshot_metadata(
 /// Snapshot metadata built from the sandbox's current state. It records no
 /// capture CPU: a caller rebuilding metadata for an artifact captured earlier
 /// can't know which host captured it.
-pub(super) fn suspend_snapshot_metadata(
+pub(in crate::service) fn suspend_snapshot_metadata(
     sandbox: &crate::db::SandboxRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
 ) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
@@ -97,6 +97,7 @@ pub(super) fn suspend_snapshot_metadata(
         // Set by the suspend publication once it knows whether the sandbox's
         // live rootfs is encrypted (BYOK); plaintext suspends leave it false.
         encrypted: false,
+        rootfs_encryption_source: None,
         local_artifact_id: None,
         artifact_kind: None,
         artifact_origin: None,

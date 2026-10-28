@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::LocalArtifactId;
+use std::os::unix::fs::PermissionsExt;
 
 use super::cache_cleanup::is_sandbox_running;
 use super::create_support::*;
@@ -1480,11 +1481,6 @@ impl SandboxManagerService {
             self.ensure_memory_state_supported(&sandbox, "create operation snapshot")?;
             self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "create operation snapshot")?;
             self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "create operation snapshot")?;
-            if sandbox.volume_encryption {
-                return Err(Status::failed_precondition(
-                    "encrypted sandboxes do not support operation snapshots",
-                ));
-            }
             if sandbox.space_api_route_identity.execution_generation != Some(expected_generation) {
                 return Err(Status::aborted(
                     "source execution generation changed before snapshot creation",
@@ -1617,20 +1613,64 @@ impl SandboxManagerService {
             }
         }
 
-        let encode_result = match initial_sandbox.template_hash.as_deref() {
-            Some(content_hash) => crate::btrfs_via_nodemgr::encode_snapshot_rootfs_send(
-                &sandbox_id,
-                &initial_sandbox.template,
-                content_hash,
-                snapshot_name.as_str(),
-                &paths.artifact,
-                &self.node_manager,
-            )
+        let encode_result = if initial_sandbox.volume_encryption {
+            let capture = std::path::PathBuf::from(&paths.capture).join("cow.luks");
+            let artifact_dir = std::path::PathBuf::from(&paths.artifact);
+            let mut metadata = super::grpc_lifecycle::suspend_snapshot_metadata(
+                initial_sandbox,
+                crate::proto::SuspendSnapshotFormat::Full,
+            )?;
+            metadata.encrypted = true;
+            metadata.local_artifact_id = Some(local_artifact_id);
+            metadata.artifact_kind = Some(ArtifactKind::Disk);
+            metadata.artifact_origin = Some(ArtifactOrigin::Snapshot);
+            metadata.artifact_snapshot_name = Some(snapshot_name.clone());
+            tokio::task::spawn_blocking(move || {
+                crate::transfer_directory::prepare(&artifact_dir).map_err(|error| {
+                    Status::internal(format!("prepare encrypted disk artifact: {error}"))
+                })?;
+                pplx_space_common_io::reflink::reflink_file(
+                    &capture,
+                    &artifact_dir.join("cow.luks"),
+                )
+                .map_err(|error| {
+                    Status::internal(format!("copy encrypted disk artifact: {error}"))
+                })?;
+                let cow = artifact_dir.join("cow.luks");
+                std::fs::set_permissions(&cow, std::fs::Permissions::from_mode(0o660))
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                let bytes = std::fs::metadata(&cow)
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .len();
+                metadata.rootfs_size_bytes = Some(bytes);
+                metadata.size_bytes = bytes;
+                let sidecar = serde_json::to_vec_pretty(&metadata)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                crate::snapshot_scheduler::write_file_atomic(
+                    artifact_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+                    &sidecar,
+                )
+                .map_err(|error| Status::internal(error.to_string()))?;
+                Ok(bytes)
+            })
             .await
-            .map_err(crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::into_status),
-            None => Err(Status::failed_precondition(
-                "btrfs-send operation snapshot requires sandbox.template_hash",
-            )),
+            .map_err(|error| Status::internal(format!("encrypted disk artifact task: {error}")))?
+        } else {
+            match initial_sandbox.template_hash.as_deref() {
+                Some(content_hash) => crate::btrfs_via_nodemgr::encode_snapshot_rootfs_send(
+                    &sandbox_id,
+                    &initial_sandbox.template,
+                    content_hash,
+                    snapshot_name.as_str(),
+                    &paths.artifact,
+                    &self.node_manager,
+                )
+                .await
+                .map_err(crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::into_status),
+                None => Err(Status::failed_precondition(
+                    "btrfs-send operation snapshot requires sandbox.template_hash",
+                )),
+            }
         };
         let local_path = match encode_result {
             Ok(stream_bytes) => {
