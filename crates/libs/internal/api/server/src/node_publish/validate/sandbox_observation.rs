@@ -17,11 +17,15 @@ use super::sandbox_status::PublishedSandboxStatus;
 use crate::metadata::{optional_trimmed, proto_network_policy_to_common};
 use crate::proto::PublishedSandboxState;
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(transparent)]
-struct PublishedActivityTimestamp(String);
+pub(crate) struct PublishedActivityTimestamp(String);
 
 impl PublishedActivityTimestamp {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
     fn parse(raw: Option<&prost_types::Timestamp>, field: &str) -> Result<Option<Self>, Status> {
         raw.map(|timestamp| proto_timestamp_to_rfc3339(timestamp, field).map(Self))
             .transpose()
@@ -78,6 +82,18 @@ pub(crate) struct ValidatedSandboxObservation {
 impl ValidatedSandboxObservation {
     pub(crate) fn sandbox_id(&self) -> SandboxId {
         self.sandbox_id
+    }
+
+    pub(crate) fn last_used_at(&self) -> Option<&PublishedActivityTimestamp> {
+        self.last_used_at.as_ref()
+    }
+
+    pub(crate) fn last_access_at(&self) -> Option<&PublishedActivityTimestamp> {
+        self.last_access_at.as_ref()
+    }
+
+    pub(crate) fn last_command_at(&self) -> Option<&PublishedActivityTimestamp> {
+        self.last_command_at.as_ref()
     }
 
     pub(crate) fn identity(&self) -> &SandboxIdentityEvidence {

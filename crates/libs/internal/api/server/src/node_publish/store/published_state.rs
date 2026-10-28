@@ -507,7 +507,7 @@ pub(crate) async fn publish_validated_sandbox_states(
         &plan.clear_recovery_observations,
     )
     .await?;
-    activity::update(conn, node_id, &rows_json).await?;
+    activity::update(conn, node_id, &plan.activities).await?;
 
     let first_seen_sandbox_ids = accepted_rows
         .iter()

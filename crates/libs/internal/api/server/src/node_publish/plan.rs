@@ -17,12 +17,13 @@ use super::validate::{
 use sandboxes::SandboxPlan;
 
 pub(crate) mod activation;
+pub(crate) mod activity;
 pub(crate) mod lifecycle;
 pub(crate) mod recovery_observation;
 pub(crate) mod sandboxes;
 pub(crate) mod suspended;
 
-/// Ownership of the checked claims moves into the plan without payload clones.
+/// Ownership of checked claims moves into the plan without cloning opaque payloads.
 /// Lifecycle guards, row locks and generated identifiers belong to the store.
 #[derive(Debug)]
 pub(crate) struct PublishPlan {

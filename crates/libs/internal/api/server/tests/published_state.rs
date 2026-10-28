@@ -2474,14 +2474,45 @@ async fn publish_sandbox_state_updates_activity_clocks_without_touching_updated_
     insert_ready_worker_node(&db.pool, node_id).await?;
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
     set_sandbox_updated_at_for_test(&db.pool, sandbox_id, original_updated_at).await?;
+    let used_only_id = SandboxId::new();
+    let idle_id = SandboxId::new();
+    insert_active_sandbox(&db.pool, used_only_id, node_id, "started").await?;
+    insert_active_sandbox(&db.pool, idle_id, node_id, "started").await?;
+    let idle_activity = sandbox_activity_at(&db.pool, idle_id).await?;
+    let mut used_only = published_sandbox_state(used_only_id, "started");
+    used_only.last_used_at = Some(timestamp(1_800_000_010));
 
     let mut state = published_sandbox_state(sandbox_id, "started");
     state.last_access_at = Some(timestamp(1_800_000_000));
     state.last_command_at = Some(timestamp(1_800_000_120));
 
     let mut conn = db.pool.acquire().await?;
-    publish_sandbox_states(&mut conn, node_id, &[state]).await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[
+            used_only,
+            published_sandbox_state(idle_id, "started"),
+            state,
+        ],
+    )
+    .await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[published_sandbox_state(idle_id, "started")],
+    )
+    .await?;
     drop(conn);
+    assert_eq!(
+        sandbox_activity_at(&db.pool, used_only_id).await?,
+        (
+            Some(time::OffsetDateTime::from_unix_timestamp(1_800_000_010)?),
+            None,
+            None,
+        )
+    );
+    assert_eq!(sandbox_activity_at(&db.pool, idle_id).await?, idle_activity);
 
     let (last_used_at, last_access_at, last_command_at) =
         sandbox_activity_at(&db.pool, sandbox_id).await?;

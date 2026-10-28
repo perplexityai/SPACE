@@ -4,6 +4,7 @@ use pplx_space_common_core::types::{
 };
 
 use super::activation::{ActivationCompletionClaim, ActivationRollbackClaim};
+use super::activity::ActivityClaim;
 use super::lifecycle::{FailedClaim, PauseFailedRecoveryClaim, RestoreClaim, StoppedClaim};
 use super::recovery_observation::{ClearRecoveryObservationClaim, RecoveryObservationClaim};
 use super::suspended::SuspendedClaim;
@@ -31,6 +32,7 @@ pub(crate) struct ObservedClaim {
 pub(crate) struct SandboxPlan {
     pub(crate) absent_ids: Vec<SandboxId>,
     pub(crate) observations: Vec<ObservedClaim>,
+    pub(crate) activities: Vec<ActivityClaim>,
     pub(crate) restored: Vec<RestoreClaim>,
     pub(crate) suspended: Vec<SuspendedClaim>,
     pub(crate) pause_failed_recoveries: Vec<PauseFailedRecoveryClaim>,
@@ -53,6 +55,7 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
         let mut plan = Self {
             absent_ids: inventory.absent_ids,
             observations: Vec::with_capacity(inventory.observations.len()),
+            activities: Vec::new(),
             restored: Vec::new(),
             suspended: Vec::new(),
             pause_failed_recoveries: Vec::new(),
@@ -70,6 +73,8 @@ impl From<ValidatedSandboxInventory> for SandboxPlan {
             publishes_network_policy: false,
         };
         for claim in inventory.observations {
+            plan.activities
+                .extend(ActivityClaim::from_observation(&claim.observation));
             match &claim.recovery {
                 QuarantineRecoveryProjectionState::Observed(observation) => {
                     plan.recovery_observations.push(RecoveryObservationClaim {

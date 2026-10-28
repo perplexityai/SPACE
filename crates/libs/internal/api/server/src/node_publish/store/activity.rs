@@ -1,5 +1,7 @@
 use pplx_space_common_core::{sql, types::NodeId};
-use sqlx::{PgConnection, types::Json};
+use sqlx::PgConnection;
+
+use crate::node_publish::plan::activity::ActivityClaim;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UpdateActivityError {
@@ -14,17 +16,20 @@ pub(crate) enum UpdateActivityError {
 pub(crate) async fn update(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[ActivityClaim],
 ) -> Result<bool, UpdateActivityError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
     let result = sqlx::query(sql!(
         "WITH input AS (
          SELECT sandbox_id, last_used_at, last_access_at, last_command_at
-         FROM jsonb_to_recordset($2::jsonb) AS input(
-             sandbox_id UUID,
-             last_used_at TIMESTAMPTZ,
-             last_access_at TIMESTAMPTZ,
-             last_command_at TIMESTAMPTZ
-         )
+           FROM UNNEST(
+               $2::UUID[],
+               $3::TEXT[]::TIMESTAMPTZ[],
+               $4::TEXT[]::TIMESTAMPTZ[],
+               $5::TEXT[]::TIMESTAMPTZ[]
+           ) AS input(sandbox_id, last_used_at, last_access_at, last_command_at)
      ),
      activity AS (
          SELECT input.sandbox_id,
@@ -104,7 +109,45 @@ pub(crate) async fn update(
        )"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| {
+                claim
+                    .last_used_at
+                    .as_ref()
+                    .map(|timestamp| timestamp.as_str())
+            })
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| {
+                claim
+                    .last_access_at
+                    .as_ref()
+                    .map(|timestamp| timestamp.as_str())
+            })
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| {
+                claim
+                    .last_command_at
+                    .as_ref()
+                    .map(|timestamp| timestamp.as_str())
+            })
+            .collect::<Vec<_>>(),
+    )
     .execute(&mut *conn)
     .await
     .map_err(UpdateActivityError::Update)?;
