@@ -393,18 +393,44 @@ pub fn create_cgroup(
     sandbox_id: &SandboxId,
     limits: &CgroupLimits,
 ) -> Result<CgroupCreateResult, String> {
-    let cgroup_path = sidecar_cgroup_path(sandbox_id);
+    create_cgroup_at(&sidecar_cgroup_path(sandbox_id), limits)
+}
 
-    let created = match fs::create_dir(&cgroup_path) {
+/// Create the VM resource domain for adapters that do not have an external jailer.
+/// The caller must hold the execution fence and prove that no VM remains in it.
+pub fn create_vm_cgroup(
+    sandbox_id: &SandboxId,
+    limits: &CgroupLimits,
+) -> Result<CgroupCreateResult, String> {
+    let path = jailer_cgroup_path(&sandbox_id.to_string());
+    let path = path.to_str().ok_or("VM cgroup path is not UTF-8")?;
+    let result = create_cgroup_at(path, limits)?;
+    if result.created {
+        return Ok(result);
+    }
+    // A prior interrupted preparation can leave an empty directory with only
+    // some limits applied. Reapply all limits before admitting a new process.
+    write_cgroup_file(path, "cpu.max", &limits.cpu_max)?;
+    write_cgroup_file(path, "memory.max", &limits.memory_max.to_string())?;
+    write_cgroup_file(path, "memory.swap.max", "0")?;
+    write_cgroup_file(path, "pids.max", &limits.pids_max.to_string())?;
+    Ok(result)
+}
+
+fn create_cgroup_at(
+    cgroup_path: &str,
+    limits: &CgroupLimits,
+) -> Result<CgroupCreateResult, String> {
+    let created = match fs::create_dir(cgroup_path) {
         Ok(()) => true,
         Err(error)
             if error.kind() == std::io::ErrorKind::AlreadyExists
-                && Path::new(&cgroup_path).is_dir() =>
+                && Path::new(cgroup_path).is_dir() =>
         {
             false
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(&cgroup_path)
+            fs::create_dir_all(cgroup_path)
                 .map_err(|e| format!("failed to create cgroup {cgroup_path}: {e}"))?;
             true
         }
@@ -416,10 +442,10 @@ pub fn create_cgroup(
     }
 
     // Set resource limits
-    write_cgroup_file(&cgroup_path, "cpu.max", &limits.cpu_max)?;
-    write_cgroup_file(&cgroup_path, "memory.max", &limits.memory_max.to_string())?;
-    write_cgroup_file(&cgroup_path, "memory.swap.max", "0")?; // Prevent swap data remanence
-    write_cgroup_file(&cgroup_path, "pids.max", &limits.pids_max.to_string())?;
+    write_cgroup_file(cgroup_path, "cpu.max", &limits.cpu_max)?;
+    write_cgroup_file(cgroup_path, "memory.max", &limits.memory_max.to_string())?;
+    write_cgroup_file(cgroup_path, "memory.swap.max", "0")?; // Prevent swap data remanence
+    write_cgroup_file(cgroup_path, "pids.max", &limits.pids_max.to_string())?;
 
     Ok(CgroupCreateResult { created })
 }

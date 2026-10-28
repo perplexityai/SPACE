@@ -14,7 +14,8 @@ use tokio::sync::OwnedSemaphorePermit;
 // allowing the full public request shape to cross it.
 const MAX_LAUNCH_SPEC_BYTES: usize = 32 * 1024 * 1024;
 const MAX_LAUNCHER_ERROR_BYTES: usize = 64 * 1024;
-const PREPARED_TAG: u8 = b'P';
+pub(crate) const RUNTIME_PID_TAG: u8 = 3;
+pub(crate) const PREPARED_TAG: u8 = b'P';
 const ERROR_TAG: u8 = b'E';
 /// Hidden CLI option name used by the supervisor's self-exec launcher protocol.
 pub const SIDECAR_LAUNCHER_FD_ARG_NAME: &str = "sidecar-launcher-fd";
@@ -31,6 +32,17 @@ pub(crate) struct PreparedSidecarLauncher {
 }
 
 impl SpawnedSidecarLauncher {
+    /// The namespace runner reports the VMM's host PID, which is the UDS peer
+    /// identity. The runner itself remains tracked separately for child reaping.
+    pub(crate) async fn wait_for_contained_exec(mut self) -> Result<u32, String> {
+        write_frame_async(&mut self.stream, &self.launch_spec).await?;
+        self.stream
+            .shutdown()
+            .await
+            .map_err(|e| format!("finish contained launch request: {e}"))?;
+        read_contained_outcome(&mut self.stream).await
+    }
+
     pub(crate) async fn wait_for_exec(mut self) -> Result<(), String> {
         write_frame_async(&mut self.stream, &self.launch_spec).await?;
         self.stream
@@ -41,10 +53,55 @@ impl SpawnedSidecarLauncher {
     }
 }
 
+async fn read_contained_outcome(stream: &mut UnixStream) -> Result<u32, String> {
+    let tag = stream
+        .read_u8()
+        .await
+        .map_err(|e| format!("read runtime PID tag: {e}"))?;
+    if tag == ERROR_TAG {
+        return Err(read_error_async(stream).await?);
+    }
+    if tag != RUNTIME_PID_TAG {
+        return Err("missing contained runtime PID".into());
+    }
+    let pid = stream
+        .read_u32()
+        .await
+        .map_err(|e| format!("read runtime PID: {e}"))?;
+    if pid <= 1 {
+        return Err("invalid contained runtime PID".into());
+    }
+    read_launcher_outcome(stream).await?;
+    Ok(pid)
+}
+
 /// Serialize and bound a sidecar launch before creating any process or cgroup
 /// state. Cancellation is therefore harmless throughout this async phase.
 pub(crate) async fn prepare(
     config: SidecarLauncherConfig,
+    launcher_slot: OwnedSemaphorePermit,
+) -> Result<PreparedSidecarLauncher, String> {
+    prepare_spec(LaunchSpec::Sidecar(config), launcher_slot).await
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "config")]
+enum LaunchSpec {
+    Contained {
+        contained: crate::contained_launcher::Config,
+    },
+    Sidecar(SidecarLauncherConfig),
+}
+
+pub(crate) async fn prepare_contained(
+    config: crate::contained_launcher::Config,
+    launcher_slot: OwnedSemaphorePermit,
+) -> Result<PreparedSidecarLauncher, String> {
+    prepare_spec(LaunchSpec::Contained { contained: config }, launcher_slot).await
+}
+
+async fn prepare_spec(
+    config: LaunchSpec,
     launcher_slot: OwnedSemaphorePermit,
 ) -> Result<PreparedSidecarLauncher, String> {
     // Move the permit into the blocking task. Dropping the caller detaches
@@ -160,7 +217,18 @@ pub fn run(raw_fd: RawFd) -> Result<(), String> {
     set_cloexec(&stream, true)
         .map_err(|error| format!("protect sidecar launcher status fd: {error}"))?;
 
-    match run_inner(&mut stream) {
+    let request = read_frame(&mut stream).and_then(|bytes| {
+        serde_json::from_slice::<LaunchSpec>(&bytes)
+            .map_err(|error| format!("decode launcher specification: {error}"))
+    });
+    let result = match request {
+        Ok(LaunchSpec::Contained { contained }) => {
+            return crate::contained_launcher::run(contained, stream);
+        }
+        Ok(LaunchSpec::Sidecar(config)) => run_inner(config, &mut stream),
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => Ok(()),
         Err(error) => match write_error(&mut stream, &error) {
             Ok(()) => Err(error),
@@ -171,10 +239,7 @@ pub fn run(raw_fd: RawFd) -> Result<(), String> {
     }
 }
 
-fn run_inner(stream: &mut StdUnixStream) -> Result<(), String> {
-    let launch_spec = read_frame(stream)?;
-    let config: SidecarLauncherConfig = serde_json::from_slice(&launch_spec)
-        .map_err(|error| format!("decode sidecar launch specification: {error}"))?;
+fn run_inner(config: SidecarLauncherConfig, stream: &mut StdUnixStream) -> Result<(), String> {
     let prepared = pplx_space_node_runtime_core::launch::prepare_sidecar_launch(config)?;
     stream
         .write_all(&[PREPARED_TAG])
@@ -235,7 +300,7 @@ async fn write_frame_async(stream: &mut UnixStream, body: &[u8]) -> Result<(), S
         .map_err(|error| format!("write sidecar launch specification: {error}"))
 }
 
-fn write_error(stream: &mut StdUnixStream, error: &str) -> Result<(), std::io::Error> {
+pub(crate) fn write_error(stream: &mut StdUnixStream, error: &str) -> Result<(), std::io::Error> {
     let mut end = error.len().min(MAX_LAUNCHER_ERROR_BYTES);
     while !error.is_char_boundary(end) {
         end -= 1;
