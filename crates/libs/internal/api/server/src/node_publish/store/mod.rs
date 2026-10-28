@@ -1,5 +1,4 @@
 use sqlx::PgPool;
-use tonic::Status;
 
 pub(crate) mod absent_sandboxes;
 pub(crate) mod activity;
@@ -25,7 +24,7 @@ use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
 use crate::node_publish::outcome::PublishOutcome;
 use crate::node_publish::validate::ValidatedPublish;
 use crate::published_state::{
-    ApplySandboxClaimsError, prune_absent_node_templates, publish_validated_sandbox_states,
+    ApplySandboxClaimsError, ApplyTemplateClaimsError, publish_validated_sandbox_states,
     publish_validated_template_states,
 };
 use crate::status::{
@@ -42,6 +41,10 @@ pub(crate) enum ApplyPublishError {
     #[error(transparent)]
     Sandboxes(#[from] ApplySandboxClaimsError),
     #[error(transparent)]
+    Templates(#[from] ApplyTemplateClaimsError),
+    #[error(transparent)]
+    TemplateCensus(#[from] template_pruning::PruneTemplateCensusError),
+    #[error(transparent)]
     PendingBackupDecision(#[from] node_local_backup_pending::DecidePendingBackupError),
     #[error(transparent)]
     PendingBackupReconciliation(#[from] node_local_backup_pending::ReconcilePendingBackupError),
@@ -57,8 +60,6 @@ pub(crate) enum ApplyPublishError {
     DeleteCompletions(
         #[from] crate::auto_lifecycle_delete_completions::ConsumeDeleteCompletionsError,
     ),
-    #[error(transparent)]
-    Legacy(#[from] Status),
 }
 
 /// Apply all publication evidence in one transaction and retain row-lock order.
@@ -116,7 +117,7 @@ pub(crate) async fn apply(
         SandboxInventoryPrune::Skipped
     };
     if let Some(census) = template_census {
-        prune_absent_node_templates(&mut tx, origin.id, census.legacy_keys()).await?;
+        template_pruning::prune_census(&mut tx, origin.id, census.legacy_keys()).await?;
     }
     // Mirror the node's pending-backup set before the status upsert that
     // stamps its freshness gate, so the gate is only ever written after

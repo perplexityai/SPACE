@@ -152,7 +152,23 @@ async fn publish_template_states(
     states: &[PublishedTemplateState],
 ) -> Result<u64, Status> {
     let inventory = ValidatedTemplateInventory::try_from_proto(publisher_role, states)?;
-    publish_validated_template_states(conn, node_id, inventory).await
+    publish_validated_template_states(conn, node_id, inventory)
+        .await
+        .map_err(Status::from)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApplyTemplateClaimsError {
+    #[error(transparent)]
+    Absent(#[from] template_pruning::RemoveAbsentTemplatesError),
+    #[error(transparent)]
+    Inventory(#[from] template_inventory::UpsertTemplateInventoryError),
+    #[error(transparent)]
+    Components(#[from] template_components::ReplaceTemplateComponentsError),
+    #[error(transparent)]
+    InventoryReconcile(#[from] inventory_reconcile::EnqueueInventoryReconcileError),
+    #[error(transparent)]
+    NetworkPolicy(#[from] template_network_policy::ObserveTemplatePolicyError),
 }
 
 /// Apply checked template evidence on the caller's connection. This phase uses
@@ -162,7 +178,7 @@ pub(crate) async fn publish_validated_template_states(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     inventory: ValidatedTemplateInventory,
-) -> Result<u64, Status> {
+) -> Result<u64, ApplyTemplateClaimsError> {
     let (absent_templates, rows) = inventory.into_legacy_rows();
     let mut accepted = template_pruning::remove_absent(conn, node_id, &absent_templates).await?;
 
@@ -334,6 +350,16 @@ pub async fn publish_sandbox_states(
 }
 
 #[derive(Debug, thiserror::Error)]
+pub(crate) enum EncodeQuarantineInputError {
+    #[error("serialize quarantine input: {0}")]
+    Input(#[source] serde_json::Error),
+    #[error("serialize claimed quarantine input: {0}")]
+    Claimed(#[source] serde_json::Error),
+    #[error("serialize updated quarantine input: {0}")]
+    Updated(#[source] serde_json::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     InventoryReconcile(#[from] inventory_reconcile::EnqueueInventoryReconcileError),
@@ -390,7 +416,7 @@ pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     RecoveryHistory(#[from] crate::sandbox_quarantine_store::RecordQuarantineRecoveryError),
     #[error(transparent)]
-    Legacy(#[from] Status),
+    QuarantineEncoding(#[from] EncodeQuarantineInputError),
 }
 
 /// Apply parsed node claims on the caller's connection. Lifecycle guards and
@@ -583,7 +609,7 @@ pub(crate) async fn publish_validated_sandbox_states(
             .collect::<Vec<_>>();
         let quarantine_rows_json = Json(
             serde_json::to_value(&quarantine_sql_inputs)
-                .map_err(|err| Status::internal(format!("serialize quarantine input: {err}")))?,
+                .map_err(EncodeQuarantineInputError::Input)?,
         );
         let claimed =
             quarantine_claims::select(conn, node_id, quarantine_rows_json.clone()).await?;
@@ -592,9 +618,9 @@ pub(crate) async fn publish_validated_sandbox_states(
                 .iter()
                 .map(ClaimedQuarantineProjection::sql_projection)
                 .collect::<Vec<_>>();
-            let claimed_json = Json(serde_json::to_value(&claimed_sql).map_err(|err| {
-                Status::internal(format!("serialize claimed quarantine input: {err}"))
-            })?);
+            let claimed_json = Json(
+                serde_json::to_value(&claimed_sql).map_err(EncodeQuarantineInputError::Claimed)?,
+            );
             let updated_ids = quarantine_claims::apply(conn, node_id, claimed_json.clone()).await?;
             let updated_ids = updated_ids.into_iter().collect::<BTreeSet<_>>();
             let updated = claimed
@@ -606,9 +632,10 @@ pub(crate) async fn publish_validated_sandbox_states(
                     .iter()
                     .map(ClaimedQuarantineProjection::sql_projection)
                     .collect::<Vec<_>>();
-                let updated_json = Json(serde_json::to_value(&updated_sql).map_err(|err| {
-                    Status::internal(format!("serialize updated quarantine input: {err}"))
-                })?);
+                let updated_json = Json(
+                    serde_json::to_value(&updated_sql)
+                        .map_err(EncodeQuarantineInputError::Updated)?,
+                );
                 quarantine_persistence::record_state(conn, node_id, updated_json.clone()).await?;
                 quarantine_persistence::record_history(conn, node_id, updated_json).await?;
                 quarantined_sandboxes = updated
@@ -746,15 +773,6 @@ pub(crate) async fn project_ready_suspend_snapshot(
     ready_suspend::project(conn, snapshot_id)
         .await
         .map_err(Status::from)
-}
-
-pub async fn prune_absent_node_templates(
-    conn: &mut sqlx::PgConnection,
-    node_id: NodeId,
-    present_keys: &[(String, String)],
-) -> Result<(), Status> {
-    template_pruning::prune_census(conn, node_id, present_keys).await?;
-    Ok(())
 }
 
 #[cfg(test)]

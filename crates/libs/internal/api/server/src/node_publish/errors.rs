@@ -1,30 +1,26 @@
 use tonic::Status;
 
 use super::store::ApplyPublishError;
-use super::store::inventory_reconcile::EnqueueInventoryReconcileError;
 use super::store::ready_suspend::ProjectReadySuspendError;
-use super::store::template_components::ReplaceTemplateComponentsError;
-use super::store::template_inventory::UpsertTemplateInventoryError;
-use super::store::template_network_policy::ObserveTemplatePolicyError;
-use super::store::template_pruning::{PruneTemplateCensusError, RemoveAbsentTemplatesError};
 use crate::execution_observation::PrepareExecutionObservationError;
-use crate::published_state::ApplySandboxClaimsError;
+use crate::published_state::{ApplySandboxClaimsError, ApplyTemplateClaimsError};
 use crate::sandbox_quarantine_store::{
     ApplyActivationRollbacksError, RecordQuarantineRecoveryError, RecoverPauseFailedError,
 };
 
-// Keep transport mapping at the RPC boundary. Legacy operations retain their
-// existing status unchanged until they acquire operation-specific error types.
+// Keep transport mapping at the RPC boundary; store operations retain their
+// typed causes throughout the publication transaction.
 impl From<ApplyPublishError> for Status {
     fn from(error: ApplyPublishError) -> Self {
         match error {
-            ApplyPublishError::Legacy(error) => error,
             ApplyPublishError::Sandboxes(error) => error.into(),
+            ApplyPublishError::Templates(error) => error.into(),
             ApplyPublishError::ExecutionPreparation(
                 error @ PrepareExecutionObservationError::MissingNode,
             ) => Self::not_found(error.to_string()),
             error @ (ApplyPublishError::Begin(_)
             | ApplyPublishError::Commit(_)
+            | ApplyPublishError::TemplateCensus(_)
             | ApplyPublishError::PendingBackupDecision(_)
             | ApplyPublishError::PendingBackupReconciliation(_)
             | ApplyPublishError::ExecutionPreparation(_)
@@ -39,7 +35,6 @@ impl From<ApplyPublishError> for Status {
 impl From<ApplySandboxClaimsError> for Status {
     fn from(error: ApplySandboxClaimsError) -> Self {
         match error {
-            ApplySandboxClaimsError::Legacy(error) => error,
             error @ (ApplySandboxClaimsError::ActivationRollback(
                 ApplyActivationRollbacksError::LostOwnership(_),
             )
@@ -61,38 +56,8 @@ impl From<ProjectReadySuspendError> for Status {
     }
 }
 
-impl From<UpsertTemplateInventoryError> for Status {
-    fn from(error: UpsertTemplateInventoryError) -> Self {
-        Self::internal(error.to_string())
-    }
-}
-
-impl From<ReplaceTemplateComponentsError> for Status {
-    fn from(error: ReplaceTemplateComponentsError) -> Self {
-        Self::internal(error.to_string())
-    }
-}
-
-impl From<RemoveAbsentTemplatesError> for Status {
-    fn from(error: RemoveAbsentTemplatesError) -> Self {
-        Self::internal(error.to_string())
-    }
-}
-
-impl From<PruneTemplateCensusError> for Status {
-    fn from(error: PruneTemplateCensusError) -> Self {
-        Self::internal(error.to_string())
-    }
-}
-
-impl From<ObserveTemplatePolicyError> for Status {
-    fn from(error: ObserveTemplatePolicyError) -> Self {
-        Self::internal(error.to_string())
-    }
-}
-
-impl From<EnqueueInventoryReconcileError> for Status {
-    fn from(error: EnqueueInventoryReconcileError) -> Self {
+impl From<ApplyTemplateClaimsError> for Status {
+    fn from(error: ApplyTemplateClaimsError) -> Self {
         Self::internal(error.to_string())
     }
 }
