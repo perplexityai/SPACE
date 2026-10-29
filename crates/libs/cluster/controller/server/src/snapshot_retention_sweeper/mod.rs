@@ -130,7 +130,12 @@ impl ReconcilerConfig {
                 default.max_per_tick,
                 MAX_PER_TICK_CEILING,
             ),
-            max_concurrent_deletes: default.max_concurrent_deletes,
+            max_concurrent_deletes: NonZeroU32::new(config.bounded_u32(
+                "SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_CONCURRENT_DELETES",
+                default.max_concurrent_deletes.get(),
+                MAX_PER_TICK_CEILING,
+            ))
+            .expect("bounded_u32 with a positive default and ceiling is non-zero"),
             min_age: config.test_optional_duration_secs(
                 SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_ENV,
                 default.min_age,

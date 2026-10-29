@@ -38,6 +38,10 @@ fn environment_overrides_policy_and_scope() {
     env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS", "120");
     env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N", "5");
     env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_PER_TICK", "42");
+    env.set(
+        "SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_CONCURRENT_DELETES",
+        "3",
+    );
     env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS", "900");
     env.set("SPACE_SNAPSHOT_BUCKET", "my-bucket");
 
@@ -49,9 +53,9 @@ fn environment_overrides_policy_and_scope() {
     assert_eq!(config.max_per_tick, 42);
     assert_eq!(config.min_age, Some(Duration::from_secs(900)));
     assert_eq!(config.scoped_bucket.as_deref(), Some("my-bucket"));
-    assert_eq!(config.max_concurrent_deletes.get(), 1);
+    assert_eq!(config.max_concurrent_deletes.get(), 3);
     let policy = RetentionPolicy::from(config);
-    assert_eq!(policy.max_concurrent_deletes.get(), 1);
+    assert_eq!(policy.max_concurrent_deletes.get(), 3);
 }
 
 #[test]
@@ -96,6 +100,20 @@ fn invalid_and_dangerous_values_fall_back_or_clamp() {
     assert_eq!(config.max_per_tick, MAX_PER_TICK_CEILING);
     assert_eq!(config.min_age, None);
     assert_eq!(config.scoped_bucket, None);
+
+    for (raw, expected) in [
+        ("0", 1),
+        ("invalid", 1),
+        ("-1", 1),
+        ("30000000000", MAX_PER_TICK_CEILING),
+    ] {
+        env.set(
+            "SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_CONCURRENT_DELETES",
+            raw,
+        );
+        let config = ReconcilerConfig::from_environment(&env);
+        assert_eq!(config.max_concurrent_deletes.get(), expected, "{raw}");
+    }
 }
 
 #[derive(Clone)]

@@ -78,6 +78,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED` | off | |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN` | off | When on, the sweeper scans and reports what it would prune, but deletes nothing. Set it with `ENABLED` to observe a new environment before pruning. Accepts `true`/`1`/`yes`/`on` and their negations, ignoring case and surrounding spaces; any other value, empty included, keeps dry run on and logs a warning. |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N`, `SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_PER_TICK` | built-in | |
+| `SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_CONCURRENT_DELETES` | `1` | Concurrent claim/delete/finalize workflows, still bounded by the shared per-tick budget. Positive integer, clamped to 10,000; unset, zero or invalid values use the default. A valid `space-snapshot-retention-config` provider assignment can override it. |
 | `SPACE_ADMIN_AUDIT_RETENTION_GRACE_SECS` | 30 days | The retention loops themselves always run. |
 | `SPACE_ADMIN_AUDIT_RETENTION_MAX_RECORDS` | 100,000 | Row cap applied regardless of age; raise it to keep more history (ceiling 10,000,000). |
 | `SPACE_TEMPLATE_PUBLISH_RESERVED_NAMES` | empty | Extra template names reserved for operator publication, in addition to `seed` and `code-runtime`. |
