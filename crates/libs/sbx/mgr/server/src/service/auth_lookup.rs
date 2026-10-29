@@ -584,10 +584,10 @@ impl SandboxManagerService {
     ) -> Result<crate::db::SandboxRow, Status> {
         let sandbox = self.lookup_sandbox(sandbox_id)?;
         if sandbox.state != SandboxState::Started {
-            return Err(Status::failed_precondition(format!(
-                "sandbox is {}, not started",
-                sandbox.state
-            )));
+            return Err(pplx_space_common_grpc::mark_sandbox_not_running(
+                Status::failed_precondition(format!("sandbox is {}, not started", sandbox.state)),
+                sandbox.state.as_str(),
+            ));
         }
         Ok(sandbox)
     }
@@ -775,6 +775,19 @@ impl SandboxManagerService {
             let sandbox = crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|e| Status::internal(format!("db error: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox not found: {sandbox_id}")))?;
+            if sandbox.state == SandboxState::Started {
+                // An implicit wake may have resumed this resident before an
+                // explicit Resume arrived. Preserve its policy and clocks;
+                // a policy-bearing retry must still name this execution.
+                if let Some((_, generation)) = activation_policy
+                    && generation != sandbox.space_api_route_identity.execution_generation
+                {
+                    return Err(Status::failed_precondition(
+                        "resident execution changed before resume",
+                    ));
+                }
+                return Ok(());
+            }
             sandbox
                 .state
                 .transition(SandboxState::Resuming)

@@ -3,6 +3,9 @@ use pplx_space_common_core::types::{
     GuestUserName, IdempotencyKey, Pii, ProcessCommand, ProcessId, ProcessSignal,
     validate_linux_guest_path_input,
 };
+use pplx_space_spaced_common::recovery::{
+    ControlContract, ProcessHandle, RecoveryFence, validate_handle, validate_start,
+};
 
 pub(super) type HostFileInfoStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileInfo, Status>> + Send>>;
@@ -163,7 +166,10 @@ pub(super) fn bridge_enable_file_changes_request(
 
 pub(super) fn bridge_process_start_request(
     mut request: StartRequest,
-) -> Result<StartRequest, Status> {
+) -> Result<(StartRequest, Option<RecoveryFence>), Status> {
+    if let Some(fence) = validate_start(&request)? {
+        return Ok((request, Some(fence)));
+    }
     let command = ProcessCommand::new(request.command).map_err(invalid_argument_status)?;
     request.command = Pii::new(&command).expose_pii().argv().to_vec();
     request.env = proto_env(&parse_env(request.env));
@@ -181,47 +187,78 @@ pub(super) fn bridge_process_start_request(
         .map(IdempotencyKey::parse)
         .transpose()
         .map_err(invalid_argument_status)?;
-    Ok(request)
+    Ok((request, None))
 }
 
 pub(super) fn bridge_process_connect_request(
     request: ConnectProcessRequest,
-) -> Result<ConnectProcessRequest, Status> {
-    ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+) -> Result<(ConnectProcessRequest, Option<ProcessHandle>), Status> {
+    let recovery = validate_handle(&request.process_id, request.recovery.as_ref())?;
+    if recovery.is_none() {
+        ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+    }
+    if recovery
+        .as_ref()
+        .is_some_and(|handle| !matches!(handle.contract, ControlContract::Fenced))
+    {
+        return Err(Status::invalid_argument(
+            "this operation does not support mutation sequences",
+        ));
+    }
     validate_optional_timeout(request.timeout)?;
-    Ok(request)
+    Ok((request, recovery))
 }
 
 pub(super) fn bridge_process_send_signal_request(
     request: SendSignalRequest,
-) -> Result<SendSignalRequest, Status> {
-    ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+) -> Result<(SendSignalRequest, Option<ProcessHandle>), Status> {
+    let recovery = validate_handle(&request.process_id, request.recovery.as_ref())?;
+    if recovery.is_none() {
+        ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+    }
     ProcessSignal::try_from_i32(request.signal).map_err(invalid_argument_status)?;
-    Ok(request)
+    Ok((request, recovery))
 }
 
 pub(super) fn bridge_process_send_input_request(
     request: SendInputRequest,
-) -> Result<SendInputRequest, Status> {
-    ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+) -> Result<(SendInputRequest, Option<ProcessHandle>), Status> {
+    let recovery = validate_handle(&request.process_id, request.recovery.as_ref())?;
+    if recovery.is_none() {
+        ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+    }
 
-    Ok(request)
+    Ok((request, recovery))
 }
 
 pub(super) fn bridge_process_close_stdin_request(
     request: CloseStdinRequest,
-) -> Result<CloseStdinRequest, Status> {
-    ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+) -> Result<(CloseStdinRequest, Option<ProcessHandle>), Status> {
+    let recovery = validate_handle(&request.process_id, request.recovery.as_ref())?;
+    if recovery.is_none() {
+        ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+    }
 
-    Ok(request)
+    Ok((request, recovery))
 }
 
 pub(super) fn bridge_process_resize_pty_request(
     request: ResizePtyRequest,
-) -> Result<ResizePtyRequest, Status> {
-    ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+) -> Result<(ResizePtyRequest, Option<ProcessHandle>), Status> {
+    let recovery = validate_handle(&request.process_id, request.recovery.as_ref())?;
+    if recovery.is_none() {
+        ProcessId::parse(&request.process_id).map_err(invalid_argument_status)?;
+    }
+    if recovery
+        .as_ref()
+        .is_some_and(|handle| !matches!(handle.contract, ControlContract::Fenced))
+    {
+        return Err(Status::invalid_argument(
+            "this operation does not support mutation sequences",
+        ));
+    }
 
-    Ok(request)
+    Ok((request, recovery))
 }
 
 pub(super) fn bridge_process_kill_request(

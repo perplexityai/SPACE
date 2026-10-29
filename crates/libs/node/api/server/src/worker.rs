@@ -88,7 +88,14 @@ fn classify_wait_ready_policy(
 
 fn retain_process_capabilities(capabilities: &mut Vec<String>) {
     capabilities.retain(|capability| {
-        capability == pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume.as_str()
+        use pplx_space_common_grpc::GuestCapability;
+        matches!(
+            capability.parse::<GuestCapability>(),
+            Ok(GuestCapability::ProcessOutputGapResume
+                | GuestCapability::ProcessRecoveryStart
+                | GuestCapability::ProcessRecoveryHandles
+                | GuestCapability::ProcessMutationReceipts)
+        )
     });
 }
 

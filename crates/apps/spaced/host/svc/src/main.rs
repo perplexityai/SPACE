@@ -10,6 +10,10 @@ struct Cli {
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
 
+    /// External identity of the resident VM; selected by the runtime owner.
+    #[arg(long)]
+    process_recovery_activation: Option<pplx_space_common_svc::core::types::ProcessRecoveryToken>,
+
     #[arg(long)]
     socket: Option<PathBuf>,
     #[arg(long)]
@@ -59,6 +63,7 @@ impl From<BootType> for SpacedHostBootType {
 impl From<Cli> for SpacedHostRunConfig {
     fn from(cli: Cli) -> Self {
         Self {
+            process_recovery_activation: cli.process_recovery_activation,
             socket: cli.socket,
             host_control_socket: cli.host_control_socket,
             vsock_uds: cli.vsock_uds,

@@ -490,6 +490,7 @@ impl SandboxManagerService {
                 ));
             }
             WakeStartConfig {
+                recovery_fence: None,
                 expected_execution_generation: start_context
                     .expected_execution_generation
                     .map(ExecutionGeneration::new)

@@ -64,7 +64,7 @@
 "crates/libs/node/ctl/server/src/lib.rs" = 1918
 "crates/libs/node/mgr/server/src/firewall.rs" = 1497
 "crates/libs/node/mgr/server/src/service/cleanup_helpers.rs" = 1279
-"crates/libs/node/mgr/server/src/service/runtime.rs" = 1124
+"crates/libs/node/mgr/server/src/service/runtime.rs" = 1057
 "crates/libs/node/mgr/server/src/service/snapshots.rs" = 1063
 "crates/libs/node/mgr/server/src/slot_pool.rs" = 1822
 "crates/libs/node/mgr/server/src/slot_pool/worker.rs" = 1404
@@ -83,9 +83,9 @@
 "crates/libs/sbx/mgr/server/src/service/create.rs" = 1195
 "crates/libs/sbx/mgr/server/src/service/grpc_core.rs" = 1087
 "crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/suspend_snapshot.rs" = 1016
-"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1618
+"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1208
 "crates/libs/sbx/mgr/server/src/service/grpc_state_snapshot.rs" = 1831
-"crates/libs/sbx/mgr/server/src/service/mod.rs" = 1755
+"crates/libs/sbx/mgr/server/src/service/mod.rs" = 1689
 "crates/libs/sbx/mgr/server/src/service/network_runtime.rs" = 1112
 "crates/libs/sbx/mgr/server/src/service/recovery.rs" = 2017
 "crates/libs/sbx/mgr/server/src/service/recovery_cross_node.rs" = 1946
@@ -98,7 +98,6 @@
 "crates/libs/sbx/mgr/store/src/db/cleanup_episodes.rs" = 1815
 "crates/libs/sbx/mgr/store/src/db/quarantine_recovery.rs" = 1042
 "crates/libs/sbx/mgr/store/src/db/sandboxes.rs" = 1516
-"crates/libs/spaced/host/client/src/lib.rs" = 1040
 "crates/libs/template/mgr/src/db.rs" = 1276
 "crates/libs/template/mgr/src/service.rs" = 1871
 "crates/libs/template/mgr/src/volume.rs" = 2294

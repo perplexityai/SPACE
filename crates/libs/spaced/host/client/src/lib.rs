@@ -150,6 +150,7 @@ mod filesystem;
 mod meta;
 mod networking;
 mod process;
+mod recovery;
 
 #[allow(unused_imports)]
 use filesystem::*;

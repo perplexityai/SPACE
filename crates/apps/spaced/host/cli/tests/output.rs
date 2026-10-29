@@ -43,6 +43,7 @@ async fn read_run_and_connect_preserve_bytes_without_waiting_for_process_exit() 
     let host = SpacedHostService::new_with_config(
         shutdown.clone(),
         SpacedHostServiceConfig {
+            process_recovery_activation: None,
             socket_path: host_socket.clone(),
             bridge_host_socket_path: directory.path().join("bridge-host.sock"),
             bridge_guest_connector: BridgeGuestConnector::Uds(guest_socket),

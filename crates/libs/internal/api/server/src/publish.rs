@@ -189,6 +189,7 @@ impl ClusterApiService {
         tx.commit()
             .await
             .map_err(|err| Status::internal(format!("commit node state publish: {err}")))?;
+        crate::resident_resume::reconcile(&self.pool, &origin, &request.sandboxes).await;
         delete_consumption.emit_metrics();
         // One verdict, used for the metric and the log, so the two cannot
         // disagree about what this publication did.

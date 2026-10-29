@@ -6,10 +6,12 @@
 //! Services use temporary socket paths, an explicit node identity, and a
 //! shutdown token and task tracker that each test drains.
 
+use super::activation_support::internal_request;
 use super::{
     RouteVerificationBundleRefresh, RouteVerificationBundleRefreshError, SandboxManagerService,
     SandboxManagerServiceOptions, SandboxState, SpacedRpc,
 };
+use crate::auto_lifecycle::policy_to_proto;
 use crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
@@ -559,17 +561,13 @@ async fn route_verification_bundle_refresh_installs_only_forward_updates() {
 fn expected_resume_refusal(state: SandboxState) -> (Code, &'static str) {
     use SandboxState::*;
     match state {
-        Paused => (
+        Paused | Started => (
             Code::FailedPrecondition,
             "resident execution changed before resume",
         ),
         Created => (
             Code::FailedPrecondition,
             "cannot resume: sandbox is created, not paused",
-        ),
-        Started => (
-            Code::FailedPrecondition,
-            "cannot resume: sandbox is started, not paused",
         ),
         Stopped => (
             Code::FailedPrecondition,
@@ -631,6 +629,60 @@ fn expected_resume_refusal(state: SandboxState) -> (Code, &'static str) {
             Code::Unavailable,
             "cannot resume: sandbox is restoring — wait for restore to complete",
         ),
+    }
+}
+
+#[tokio::test]
+async fn resume_of_started_resident_preserves_policy_and_activity() {
+    if !enter_route_identity_test_process(None) {
+        return;
+    }
+    for policy in [false, true] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new();
+        let resident_policy = AutoLifecyclePolicy::disabled();
+        insert_sandbox(
+            &conn,
+            id,
+            SandboxState::Started,
+            Some("route-test-pool"),
+            &resident_policy,
+        );
+        let generation = ExecutionGeneration::new(4).unwrap();
+        crate::db::update_space_api_route_identity(
+            &conn,
+            id,
+            &SpaceApiRouteIdentity {
+                execution_generation: Some(generation),
+                ..Default::default()
+            },
+            RouteIdentityProvenance::Unfenced,
+        )
+        .unwrap();
+        let before = crate::db::get_sandbox(&conn, &id.to_string())
+            .unwrap()
+            .unwrap();
+        let service = RouteTestService::new(conn);
+        service
+            .resume(internal_request(crate::proto::ResumeRequest {
+                sandbox_id: id.to_string(),
+                blocking: true,
+                ready_timeout_secs: Some(1),
+                activation_auto_lifecycle: policy.then(|| policy_to_proto(&access_idle_policy())),
+                expected_execution_generation: policy.then_some(generation.get()),
+            }))
+            .await
+            .expect("an implicit wake already satisfied the resident resume");
+        let after = service.lookup_sandbox(&id.to_string()).unwrap();
+        assert_eq!(after.state, SandboxState::Started);
+        assert_eq!(after.auto_lifecycle, before.auto_lifecycle);
+        assert_eq!(after.auto_lifecycle_state, before.auto_lifecycle_state);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            after.space_api_route_identity,
+            before.space_api_route_identity
+        );
+        service.shut_down().await;
     }
 }
 
