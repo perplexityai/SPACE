@@ -266,6 +266,10 @@ do not enqueue a wake; callers explicitly resume or restore, then discover the
 execution for new work. An admitted resident resume completes or rolls back even
 if its caller times out or disconnects. During manager drain, matching recovery
 handles may still access an already running resident; they cannot start a resume.
+Node publication confirms a resident wake with a fresh worker observation before
+advancing the public lifecycle. A concurrent lifecycle write or replacement
+execution invalidates that confirmation. Explicit resume of the same already
+running resident succeeds without resetting its policy or activity clocks.
 Legacy command wake policy is unchanged.
 
 ### Snapshot activation handshake
