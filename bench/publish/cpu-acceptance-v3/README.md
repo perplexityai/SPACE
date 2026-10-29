@@ -70,6 +70,7 @@ are not established by these results.
 | [71323bd8](head-71323bd8/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.349 | -0.7218% |
 | [c55485c0](head-c55485c0/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 3.328 | 0.0000% |
 | [ce6bf8df](head-ce6bf8df/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.288 | 0.1518% |
+| [0a70b4d5](head-0a70b4d5/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 2.080 | 37.5000% |
 | [938e0cf4](head-938e0cf4/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 1.522 | 54.4038% |
 
 Reductions compare each head with its own lane's fixed reference; negative
