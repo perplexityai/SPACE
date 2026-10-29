@@ -463,6 +463,11 @@ run locally without root, it prints a SKIPPED line, and when CI sets
 test missing from the group fails the unprivileged half instead of passing
 there without testing anything. Keep the group small; a test that needs
 privilege only for an incidental step should lose that step instead.
+A test of what an unprivileged caller is refused has the opposite need, since
+root bypasses permission checks: call
+`pplx_space_test_env::unprivileged_or_skip(...)` and return when it returns
+false, so a root run prints a SKIPPED line instead of passing silently. The
+unprivileged CI step refuses to run as root, so these tests run there.
 
 The group's filter has one clause per line. The job checks that each clause
 matches at least one test and that every test it matches is in the group, so

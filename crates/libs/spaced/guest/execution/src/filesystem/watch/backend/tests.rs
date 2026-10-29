@@ -443,23 +443,52 @@ async fn removal_invalidation_retains_only_bounded_scan_roots() {
         task: tokio::spawn(async {
             Ok(DirectoryScanResult {
                 directories: Vec::new(),
+                skipped: Vec::new(),
                 incomplete: false,
             })
         }),
         candidate_roots: candidates,
         invalidated_roots: HashSet::new(),
         invalidated_candidate_roots: BTreeSet::new(),
+        narrowed_removals: 0,
+        rechecks: BTreeSet::new(),
+        metadata_changed: HashSet::new(),
+        metadata_changes_overflowed: false,
     };
 
     scan.invalidate(
-        &[root.join("unrelated-file"), candidate.join("removed-file")],
+        &[root.join("unrelated-file"), candidate.join("removed")],
         [root.join("known-directory")],
     );
-
+    // Below the candidate, only the removed subtree's results are stale.
     assert_eq!(
         scan.invalidated_roots,
-        HashSet::from([candidate.clone(), root.join("known-directory")])
+        HashSet::from([candidate.join("removed"), root.join("known-directory")])
     );
+    assert!(scan.invalidated_candidate_roots.is_empty());
+
+    // Removing the candidate itself discards its walk and queues it again.
+    scan.invalidate(std::slice::from_ref(&candidate), []);
+    assert!(scan.invalidated_roots.contains(&candidate));
+    assert_eq!(
+        scan.invalidated_candidate_roots,
+        BTreeSet::from([candidate.clone()])
+    );
+
+    // Removed registered directories don't count toward the bound...
+    scan.invalidated_candidate_roots.clear();
+    scan.invalidate(
+        &[],
+        (0..DIRECTORY_DISCOVERY_CANDIDATE_CAPACITY).map(|index| root.join(format!("gone-{index}"))),
+    );
+    scan.invalidate(&[candidate.join("early")], []);
+    assert!(scan.invalidated_candidate_roots.is_empty());
+
+    // ...but past it, a removal below the candidate walks it again instead.
+    for index in 0..DIRECTORY_DISCOVERY_CANDIDATE_CAPACITY {
+        scan.invalidate(&[candidate.join(format!("churn-{index}"))], []);
+    }
+    scan.invalidate(&[candidate.join("late")], []);
     assert_eq!(
         scan.invalidated_candidate_roots,
         BTreeSet::from([candidate])
@@ -526,6 +555,7 @@ async fn moved_subtrees_wait_for_admission_while_existing_events_progress() {
                     WatchRegistrationPlan {
                         root: root.clone(),
                         descendants: vec![],
+                        skipped: vec![],
                     },
                     tokio_util::task::TaskTracker::new(),
                 )
@@ -652,6 +682,7 @@ async fn registration_does_not_follow_directory_symlinks() {
         WatchRegistrationPlan {
             root: root.clone(),
             descendants: vec![],
+            skipped: vec![],
         },
         tokio_util::task::TaskTracker::new(),
     )
@@ -695,14 +726,17 @@ async fn failed_registration_and_cancelled_operation_retain_physical_admission()
         WatchRegistrationPlan {
             root: directory.path().to_path_buf(),
             descendants: vec![],
+            skipped: vec![],
         },
         tasks.clone(),
     )
     .await
     .expect("registered root");
     let _result = apply_discovered_directories(
+        directory.path(),
         &mut registration.watcher,
         &mut HashSet::new(),
+        &mut SkippedDirectories::default(),
         vec![PathBuf::from(format!(
             "/spaced-missing-{}",
             uuid::Uuid::now_v7()
@@ -915,3 +949,37 @@ async fn registration_rejects_a_root_lost_after_planning() {
         "fresh setup can recover"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn registration_skips_a_descendant_that_turned_unreadable_after_planning() {
+    use std::os::unix::fs::PermissionsExt;
+    if !pplx_space_test_env::unprivileged_or_skip("be refused an unreadable directory") {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_path_buf();
+    let locked = root.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let registration = RegisteredWatch::prepare(
+        WatchRegistrationPlan {
+            root: root.clone(),
+            descendants: vec![locked.clone()],
+            skipped: vec![],
+        },
+        tokio_util::task::TaskTracker::new(),
+    )
+    .await
+    .expect("an unreadable descendant does not fail registration");
+    assert_eq!(registration.directories, vec![root.clone()]);
+    // The refused descendant is remembered for its next permission change,
+    // and its charge is released.
+    // It was refused for its own mode, so it alone is remembered: a permission
+    // change on it is what brings it back.
+    assert_eq!(registration.skipped, vec![locked.clone()]);
+    assert_eq!(registration.directory_count(), 1);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+mod recovery;

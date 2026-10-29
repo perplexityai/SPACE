@@ -8,7 +8,7 @@ use crate::filesystem::map_io_error;
 use pplx_space_common_core::types::GuestPath;
 
 use super::filter::WatchFilter;
-use super::{MAX_LEDGER_ROOTS, MAX_WATCHED_DIRECTORIES};
+use super::{MAX_LEDGER_ROOTS, MAX_SKIPPED_DIRECTORIES, MAX_WATCHED_DIRECTORIES};
 
 const MAX_CONCURRENT_WATCH_DIRECTORY_SCANS: usize = 4;
 
@@ -82,15 +82,13 @@ pub(super) async fn normalize_ledger_roots(roots: Vec<GuestPath>) -> Result<Vec<
 pub(super) struct WatchRegistrationPlan {
     pub(super) root: PathBuf,
     pub(super) descendants: Vec<PathBuf>,
+    /// Where the walk gave up for lack of permission; see [`WatchDirectoryWalk`].
+    pub(super) skipped: Vec<PathBuf>,
 }
 
 impl WatchRegistrationPlan {
     pub(super) fn len(&self) -> usize {
         1 + self.descendants.len()
-    }
-
-    pub(super) fn into_directories(self) -> Vec<PathBuf> {
-        std::iter::once(self.root).chain(self.descendants).collect()
     }
 }
 
@@ -106,11 +104,16 @@ pub(super) fn validate_watch_root(root: &Path) -> Result<(), Status> {
     Ok(())
 }
 
-fn watch_root_io_error(root: &Path, error: std::io::Error) -> Status {
+pub(super) fn watch_root_io_error(root: &Path, error: std::io::Error) -> Status {
+    watch_io_error("watch root", root, error)
+}
+
+/// Maps `error` as the filesystem API does, naming the path it concerns.
+pub(super) fn watch_io_error(prefix: &str, path: &Path, error: std::io::Error) -> Status {
     let status = map_io_error(error);
     Status::new(
         status.code(),
-        format!("watch root {}: {}", root.display(), status.message()),
+        format!("{prefix} {}: {}", path.display(), status.message()),
     )
 }
 
@@ -125,6 +128,7 @@ pub(super) async fn plan_watch_registration(
         return Ok(WatchRegistrationPlan {
             root: root.to_path_buf(),
             descendants: Vec::new(),
+            skipped: Vec::new(),
         });
     }
     let scan_slot = try_acquire_watch_directory_scan_slot(scan_slots)?;
@@ -133,13 +137,17 @@ pub(super) async fn plan_watch_registration(
     tasks
         .spawn_blocking(move || {
             let _scan_slot = scan_slot;
-            let mut directories = collect_watch_directories(&root, &root, &filter)?;
+            let WatchDirectoryWalk {
+                mut directories,
+                skipped,
+            } = collect_watch_directories(&root, &root, &filter)?;
             // Required-root traversal always puts the root first.
             debug_assert_eq!(directories.first(), Some(&root));
             directories.remove(0);
             Ok(WatchRegistrationPlan {
                 root,
                 descendants: directories,
+                skipped,
             })
         })
         .await
@@ -150,12 +158,35 @@ pub(super) async fn plan_watch_registration(
         })?
 }
 
+#[derive(Debug)]
+pub(super) struct WatchDirectoryWalk {
+    pub(super) directories: Vec<PathBuf>,
+    /// Where the walk gave up for lack of permission: a directory it could not
+    /// list, a listed directory whose entries it could not inspect, or the
+    /// ancestor whose missing search permission refused a lookup. A
+    /// permission change on one of these is what brings the hidden part of
+    /// the tree back. At most [`MAX_SKIPPED_DIRECTORIES`] per walk.
+    pub(super) skipped: Vec<PathBuf>,
+}
+
 pub(super) fn collect_watch_directories(
     root: &Path,
     start: &Path,
     filter: &WatchFilter,
-) -> Result<Vec<PathBuf>, Status> {
+) -> Result<WatchDirectoryWalk, Status> {
     collect_watch_directories_with_limit(root, start, filter, MAX_WATCHED_DIRECTORIES)
+}
+
+/// Walks the tree like [`collect_watch_directories`], except that a root this
+/// identity can't look up or list is reported as `None` rather than failing:
+/// a watch whose root turned unreadable keeps its root watch, and the root's
+/// next permission change walks it again.
+pub(super) fn collect_watch_directories_or_root_refusal(
+    root: &Path,
+    start: &Path,
+    filter: &WatchFilter,
+) -> Result<Option<WatchDirectoryWalk>, Status> {
+    walk_watch_directories(root, start, filter, MAX_WATCHED_DIRECTORIES, true)
 }
 
 fn collect_watch_directories_with_limit(
@@ -163,8 +194,21 @@ fn collect_watch_directories_with_limit(
     start: &Path,
     filter: &WatchFilter,
     limit: usize,
-) -> Result<Vec<PathBuf>, Status> {
+) -> Result<WatchDirectoryWalk, Status> {
+    walk_watch_directories(root, start, filter, limit, false)?
+        .ok_or_else(|| Status::internal("file watcher root refusal was not reported"))
+}
+
+fn walk_watch_directories(
+    root: &Path,
+    start: &Path,
+    filter: &WatchFilter,
+    limit: usize,
+    report_root_refusal: bool,
+) -> Result<Option<WatchDirectoryWalk>, Status> {
     let mut directories = Vec::new();
+    let mut skipped = Vec::new();
+    let mut vanished = 0_usize;
     let mut stack = vec![start.to_path_buf()];
     while let Some(path) = stack.pop() {
         let required_root = path == root;
@@ -173,8 +217,19 @@ fn collect_watch_directories_with_limit(
         }
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) if !required_root && error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if !required_root && skippable_descendant_error(&error) => {
+                // A refused lookup means a directory above this one is not
+                // searchable: usually the parent this walk listed, but an
+                // ancestor can lose search permission after the listing.
+                if is_permission_denied(&error) {
+                    record_skip(&mut skipped, &blocking_ancestor(root, &path));
+                } else {
+                    vanished = vanished.saturating_add(1);
+                }
                 continue;
+            }
+            Err(error) if required_root && report_root_refusal && is_permission_denied(&error) => {
+                return Ok(None);
             }
             Err(error) if required_root => return Err(watch_root_io_error(root, error)),
             Err(error) => return Err(map_io_error(error)),
@@ -188,44 +243,65 @@ fn collect_watch_directories_with_limit(
             }
             continue;
         }
+        // A filter-excluded required root is still traversed: the filter
+        // selects entries, and skipping the walk would leave existing
+        // subdirectories unwatched while later-created ones are discovered.
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if !required_root && skippable_descendant_error(&error) => {
+                // A directory that disappeared or cannot be listed is not
+                // watched, so it takes no budget; keep the live directories
+                // collected from other branches.
+                if is_permission_denied(&error) {
+                    record_skip(&mut skipped, &path);
+                } else {
+                    vanished = vanished.saturating_add(1);
+                }
+                continue;
+            }
+            Err(error) if required_root && report_root_refusal && is_permission_denied(&error) => {
+                return Ok(None);
+            }
+            Err(error) if required_root => return Err(watch_root_io_error(root, error)),
+            Err(error) => return Err(map_io_error(error)),
+        };
         directories.push(path.clone());
         if directories.len() > limit {
             return Err(Status::resource_exhausted(
                 "file watcher directory budget exceeded",
             ));
         }
-        // A filter-excluded required root is still traversed: the filter
-        // selects entries, and skipping the walk would leave existing
-        // subdirectories unwatched while later-created ones are discovered.
-        let entries = match std::fs::read_dir(&path) {
-            Ok(entries) => entries,
-            Err(error) if !required_root && error.kind() == std::io::ErrorKind::NotFound => {
-                // This path was appended immediately above, but disappeared
-                // before traversal. Do not retain a stale budget entry; keep
-                // the live directories collected from other branches.
-                directories.pop();
-                continue;
-            }
-            Err(error) if required_root => return Err(watch_root_io_error(root, error)),
-            Err(error) => return Err(map_io_error(error)),
-        };
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(map_io_error(error)),
             };
+            // Without d_type this stats the entry, which a listable but
+            // unsearchable parent refuses; such an entry cannot be watched.
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if skippable_descendant_error(&error) => {
+                    // The listed directory is the one a permission change
+                    // must reach, not each entry it hides.
+                    if is_permission_denied(&error) {
+                        record_skip(&mut skipped, &path);
+                    } else {
+                        vanished = vanished.saturating_add(1);
+                    }
+                    continue;
+                }
                 Err(error) => return Err(map_io_error(error)),
             };
             if file_type.is_dir() && !file_type.is_symlink() {
                 let path = entry.path();
                 if filter.matches_path(root, &path) {
                     // A wide directory must not accumulate an unbounded
-                    // frontier before the next visited-directory check.
-                    if directories.len() + stack.len() >= limit {
+                    // frontier before the next visited-directory check. The
+                    // frontier bounds memory, with headroom for entries that
+                    // turn out unwatchable; the directory budget itself is
+                    // the check on visited directories above.
+                    if directories.len() + stack.len() >= limit.saturating_mul(2) {
                         return Err(Status::resource_exhausted(
                             "file watcher directory budget exceeded",
                         ));
@@ -235,7 +311,55 @@ fn collect_watch_directories_with_limit(
             }
         }
     }
-    Ok(directories)
+    if vanished > 0 || !skipped.is_empty() {
+        tracing::debug!(
+            vanished,
+            unreadable_directories = skipped.len(),
+            "file watcher skipped descendants that vanished or cannot be read"
+        );
+    }
+    Ok(Some(WatchDirectoryWalk {
+        directories,
+        skipped,
+    }))
+}
+
+pub(super) fn is_permission_denied(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// The directory whose missing search permission refused the lookup of `path`.
+/// Looking a path up needs search permission on every directory above it, so
+/// the blocking one is the nearest ancestor whose own lookup succeeds.
+pub(super) fn blocking_ancestor(root: &Path, path: &Path) -> PathBuf {
+    path.ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor.starts_with(root))
+        .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
+        .unwrap_or(root)
+        .to_path_buf()
+}
+
+// Refusals usually come in runs from one directory, so comparing with the last
+// entry keeps one entry per directory without a set.
+fn record_skip(skipped: &mut Vec<PathBuf>, path: &Path) {
+    if skipped.len() < MAX_SKIPPED_DIRECTORIES && skipped.last().map(PathBuf::as_path) != Some(path)
+    {
+        skipped.push(path.to_path_buf());
+    }
+}
+
+/// A descendant that vanished, or that this identity cannot read, is left out
+/// of the watch with its subtree: inotify needs read access to watch a
+/// directory, and one unreadable cache directory must not cost the caller the
+/// rest of the tree. The watch remembers where it gave up, and a permission
+/// change there (an IN_ATTRIB event) walks that part of the tree again. The
+/// required root has no such fallback.
+pub(super) fn skippable_descendant_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 pub(super) fn consumer_accepts_event(

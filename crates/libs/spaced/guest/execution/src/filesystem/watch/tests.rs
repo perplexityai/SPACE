@@ -355,3 +355,127 @@ async fn watch_managers_do_not_share_a_directory_scan_budget() {
     other.shutdown().await;
     busy.shutdown().await;
 }
+
+#[cfg(target_os = "linux")]
+async fn event_arrives_at(stream: &mut WatchStream, relative: &str, within: Duration) -> bool {
+    use futures_util::StreamExt;
+    tokio::time::timeout(within, async {
+        loop {
+            let event = stream
+                .next()
+                .await
+                .expect("watch stays open")
+                .expect("watch keeps delivering events");
+            if event.path == relative {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recursive_watch_skips_unreadable_subtrees_and_watches_the_rest() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !pplx_space_test_env::unprivileged_or_skip("be refused an unreadable directory") {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    // Neither listable nor searchable, and listable but not searchable: both
+    // shapes a package cache can leave under a home directory.
+    std::fs::create_dir_all(root.join("no-access/inner")).unwrap();
+    std::fs::create_dir_all(root.join("no-search/inner")).unwrap();
+    std::fs::create_dir(root.join("sibling")).unwrap();
+    let mode = |path: &str, mode| {
+        std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode("no-access", 0o000);
+    mode("no-search", 0o400);
+
+    let manager = WatchManager::new(CancellationToken::new());
+    let mut stream = manager
+        .watch_stream(
+            GuestPath::parse(root.display().to_string()).unwrap(),
+            true,
+            false,
+            vec![],
+            vec![],
+            Some(false),
+        )
+        .await
+        .expect("an unreadable descendant does not fail the watch");
+    std::fs::write(root.join("sibling/first"), b"x").unwrap();
+    assert!(event_arrives_at(&mut stream, "sibling/first", Duration::from_secs(5)).await);
+
+    // Discovery after registration skips a new unreadable directory the same
+    // way instead of ending the watch. Discovery scans run in event order, so
+    // once `later` is watched the scan that met `late` has completed.
+    std::fs::DirBuilder::new()
+        .mode(0o000)
+        .create(root.join("sibling/late"))
+        .unwrap();
+    std::fs::create_dir(root.join("sibling/later")).unwrap();
+    let discovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            std::fs::write(root.join("sibling/later/probe"), b"x").unwrap();
+            if event_arrives_at(
+                &mut stream,
+                "sibling/later/probe",
+                Duration::from_millis(100),
+            )
+            .await
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        discovered.is_ok(),
+        "the watch discovers `later` after skipping `late`"
+    );
+
+    manager.shutdown().await;
+    for path in ["no-access", "no-search", "sibling/late"] {
+        mode(path, 0o700);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unreadable_watch_root_is_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+    if !pplx_space_test_env::unprivileged_or_skip("be refused an unreadable directory") {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let locked = directory.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let root = GuestPath::parse(locked.display().to_string()).unwrap();
+    let manager = WatchManager::new(CancellationToken::new());
+    for recursive in [false, true] {
+        let Err(stream_error) = manager
+            .watch_stream(root.clone(), recursive, false, vec![], vec![], None)
+            .await
+        else {
+            panic!("an unreadable root cannot be watched (recursive={recursive})");
+        };
+        let watcher_error = manager
+            .create_watcher(root.clone(), recursive, false, vec![], vec![], None)
+            .await
+            .expect_err("an unreadable root cannot be watched");
+        for error in [stream_error, watcher_error] {
+            assert_eq!(
+                error.code(),
+                tonic::Code::PermissionDenied,
+                "recursive={recursive}: {error:?}"
+            );
+        }
+    }
+    manager.shutdown().await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+}

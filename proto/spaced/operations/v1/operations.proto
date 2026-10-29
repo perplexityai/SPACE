@@ -113,6 +113,15 @@ message NormalizeWatchRootResponse { string root = 1; }
 
 message WatchRequest {
   string path = 1;
+  // A recursive watch leaves out what the caller can't reach and keeps
+  // watching the rest: a descendant directory it can't read, with its
+  // subtree, or the subdirectories of one it can read but not search. A later
+  // permission change on the directory where it stopped walks that part again,
+  // as does creating or renaming it; a watch remembers a bounded number of
+  // such directories. Changes that raise no file event, such as a
+  // security-policy update, don't, and files written while it was left out
+  // aren't reported.
+  // An unreadable root is refused at setup.
   bool recursive = 2;
   bool include_metadata_events = 3;
   repeated string include_globs = 4;
@@ -157,8 +166,10 @@ message RemoveWatcherResponse {}
 
 message EnableFileChangesRequest {
   // Empty selects /home/user and /tmp.
-  // Every selected root must be an accessible directory; setup fails rather
-  // than silently monitoring a subset. Create missing roots before enabling.
+  // Every selected root must be a readable directory. If any root is missing,
+  // isn't a directory or can't be read, setup fails rather than monitoring
+  // only the other roots. Create missing roots before enabling. Inside a root,
+  // descendants the caller can't reach are left out as for a recursive watch.
   repeated string roots = 1;
   repeated string include_globs = 2;
   repeated string exclude_globs = 3;

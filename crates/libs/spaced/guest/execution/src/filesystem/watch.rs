@@ -43,6 +43,9 @@ pub(super) type WatchStream =
 const MAX_ACTIVE_WATCHER_CONSUMERS: usize = 64;
 const MAX_LEDGER_ROOTS: usize = 8;
 const MAX_WATCHED_DIRECTORIES: usize = 16_384;
+// Skipped directories are remembered so a permission change on one brings its
+// subtree into the watch. Past this bound, further skips are not remembered.
+const MAX_SKIPPED_DIRECTORIES: usize = 4_096;
 // Keep burst capacity for small events, but cap path payloads independently.
 // Overflow is explicit and requires the caller to rescan.
 const STREAM_BUFFER_CAPACITY: usize = 1024;
