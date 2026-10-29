@@ -427,6 +427,7 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
     insert_ready_worker_node(&db.pool, node_id).await?;
     enum Change {
         RevokeFlags,
+        MergeDuplicateRuntimeClaims,
         RemoveGuest,
         RemoveFormat,
         RemoveComponent,
@@ -435,6 +436,7 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
     }
     for change in [
         Change::RevokeFlags,
+        Change::MergeDuplicateRuntimeClaims,
         Change::RemoveGuest,
         Change::RemoveFormat,
         Change::RemoveComponent,
@@ -449,6 +451,15 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
                 inventory.runtimes[0].state_formats[0].can_load = false;
                 inventory.components[0].default_for_new = false;
                 inventory.components[0].legacy_default = false;
+                vec!["component", "format", "guest", "runtime"]
+            }
+            Change::MergeDuplicateRuntimeClaims => {
+                // Duplicate installation keys union guests and combine format
+                // permissions rather than choosing one report's flags.
+                let mut duplicate = inventory.runtimes[0].clone();
+                inventory.runtimes[0].state_formats[0].can_load = false;
+                duplicate.state_formats[0].can_create = false;
+                inventory.runtimes.push(duplicate);
                 vec!["component", "format", "guest", "runtime"]
             }
             Change::RemoveGuest => {
@@ -478,7 +489,10 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
             rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
             expected_kinds
         );
-        if matches!(change, Change::RevokeFlags) {
+        if matches!(
+            change,
+            Change::RevokeFlags | Change::MergeDuplicateRuntimeClaims
+        ) {
             for (kind, content, _) in rows {
                 let content: serde_json::Value = serde_json::from_str(&content)?;
                 for &flag in match kind.as_str() {
@@ -486,7 +500,13 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
                     "format" => &["can_create", "can_load"][..],
                     _ => &[],
                 } {
-                    assert_eq!(content[flag], serde_json::Value::Bool(false));
+                    assert_eq!(
+                        content[flag],
+                        serde_json::Value::Bool(matches!(
+                            change,
+                            Change::MergeDuplicateRuntimeClaims
+                        )),
+                    );
                 }
             }
         }

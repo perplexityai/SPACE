@@ -27,8 +27,65 @@ struct ComponentInstallation {
 
 #[derive(Debug)]
 pub(crate) struct ValidatedExecutionInventory {
-    runtimes: Vec<RuntimeInstallation>,
+    pub(crate) runtimes: RuntimeInventoryClaims,
     components: Vec<ComponentInstallation>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeGuestClaim {
+    pub(crate) runtime: RuntimeIdentity,
+    pub(crate) guest: GuestPlatform,
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeFormatKey {
+    pub(crate) runtime: RuntimeIdentity,
+    pub(crate) format: StateFormatIdentity,
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeFormatClaim {
+    pub(crate) key: RuntimeFormatKey,
+    pub(crate) can_create: bool,
+    pub(crate) can_load: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeInventoryClaims {
+    pub(crate) installations: Vec<RuntimeIdentity>,
+    pub(crate) guests: Vec<RuntimeGuestClaim>,
+    pub(crate) formats: Vec<RuntimeFormatClaim>,
+}
+
+impl From<Vec<RuntimeInstallation>> for RuntimeInventoryClaims {
+    fn from(installations: Vec<RuntimeInstallation>) -> Self {
+        let mut claims = Self::default();
+        for installation in installations {
+            claims.guests.extend(
+                installation
+                    .guests
+                    .into_iter()
+                    .map(|guest| RuntimeGuestClaim {
+                        runtime: installation.identity.clone(),
+                        guest,
+                    }),
+            );
+            claims
+                .formats
+                .extend(installation.state_formats.into_iter().map(|capability| {
+                    RuntimeFormatClaim {
+                        key: RuntimeFormatKey {
+                            runtime: installation.identity.clone(),
+                            format: capability.identity,
+                        },
+                        can_create: capability.can_create,
+                        can_load: capability.can_load,
+                    }
+                }));
+            claims.installations.push(installation.identity);
+        }
+        claims
+    }
 }
 
 impl ValidatedExecutionInventory {
@@ -39,29 +96,23 @@ impl ValidatedExecutionInventory {
             .runtimes
             .iter()
             .map(RuntimeInstallation::try_from_proto)
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         let components = inventory
             .components
             .iter()
             .map(ComponentInstallation::try_from_proto)
             .collect::<Result<_, _>>()?;
         Ok(Self {
-            runtimes,
+            runtimes: RuntimeInventoryClaims::from(runtimes),
             components,
         })
     }
 
-    pub(crate) fn legacy_rows(&self) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
-        (
-            self.runtimes
-                .iter()
-                .map(RuntimeInstallation::json)
-                .collect(),
-            self.components
-                .iter()
-                .map(ComponentInstallation::json)
-                .collect(),
-        )
+    pub(crate) fn component_rows(&self) -> Vec<serde_json::Value> {
+        self.components
+            .iter()
+            .map(ComponentInstallation::json)
+            .collect()
     }
 }
 
@@ -92,37 +143,6 @@ impl RuntimeInstallation {
             identity,
             guests,
             state_formats,
-        })
-    }
-
-    fn json(&self) -> serde_json::Value {
-        let guests = self
-            .guests
-            .iter()
-            .map(|guest| {
-                serde_json::json!({
-                    "guest_os": guest.os.as_str(),
-                    "guest_arch": guest.architecture.as_str(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let state_formats = self
-            .state_formats
-            .iter()
-            .map(|capability| {
-                serde_json::json!({
-                    "state_format_name": capability.identity.format.as_str(),
-                    "state_format_version": capability.identity.version.as_str(),
-                    "can_create": capability.can_create,
-                    "can_load": capability.can_load,
-                })
-            })
-            .collect::<Vec<_>>();
-        serde_json::json!({
-            "runtime": self.identity.kind.alias(),
-            "runtime_version": self.identity.version.as_str(),
-            "guests": guests,
-            "state_formats": state_formats,
         })
     }
 }

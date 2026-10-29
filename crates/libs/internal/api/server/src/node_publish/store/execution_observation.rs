@@ -1,10 +1,15 @@
 //! Decode publication evidence without treating omission or collection failure
 //! as an empty inventory. Existing placement projections remain unchanged.
 
-use pplx_space_common_core::{sql, types::NodeId};
+use pplx_space_common_core::{
+    sql,
+    types::{NodeId, RuntimeIdentity},
+};
 use sqlx::types::Json;
 
-use crate::node_publish::validate::execution_inventory::ValidatedExecutionInventory;
+use crate::node_publish::validate::execution_inventory::{
+    RuntimeFormatClaim, RuntimeFormatKey, RuntimeGuestClaim, ValidatedExecutionInventory,
+};
 use crate::node_publish::validate::execution_observation::{
     ExecutionInventoryEvidence, ValidatedReport,
 };
@@ -132,36 +137,54 @@ async fn publish_inventory(
     node_id: NodeId,
     inventory: &ValidatedExecutionInventory,
 ) -> Result<(), PublishExecutionInventoryError> {
-    let (runtime_rows, component_rows) = inventory.legacy_rows();
-    let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
-    let component_rows = Json(serde_json::Value::Array(component_rows));
-    prune_installations(conn, node_id, &runtime_rows, &component_rows).await?;
-    upsert_runtime_inventory(conn, node_id, runtime_rows).await?;
+    let component_rows = Json(serde_json::Value::Array(inventory.component_rows()));
+    let runtimes = &inventory.runtimes;
+    prune_runtime_installations(conn, node_id, &runtimes.installations).await?;
+    prune_component_installations(conn, node_id, &component_rows).await?;
+    upsert_runtime_installations(conn, node_id, &runtimes.installations).await?;
+    prune_runtime_guests(conn, node_id, &runtimes.guests).await?;
+    upsert_runtime_guests(conn, node_id, &runtimes.guests).await?;
+    let format_keys = runtimes
+        .formats
+        .iter()
+        .map(|claim| &claim.key)
+        .collect::<Vec<_>>();
+    prune_runtime_formats(conn, node_id, &format_keys).await?;
+    upsert_runtime_formats(conn, node_id, &runtimes.formats).await?;
     upsert_component_inventory(conn, node_id, component_rows).await
 }
 
 /// Prune omitted installations under the caller's node lock.
 /// Empty censuses still delete previous rows; zero deletions is normal.
-async fn prune_installations(
+async fn prune_runtime_installations(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    runtime_rows: &Json<serde_json::Value>,
-    component_rows: &Json<serde_json::Value>,
+    claims: &[RuntimeIdentity],
 ) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "DELETE FROM node_runtime_installations installed
          WHERE node_id = $1 AND NOT EXISTS (
-             SELECT 1 FROM jsonb_to_recordset($2::jsonb)
-                 AS input(runtime TEXT, runtime_version TEXT)
+             SELECT 1 FROM UNNEST($2::TEXT[], $3::TEXT[]) AS input(runtime, runtime_version)
              WHERE (input.runtime, input.runtime_version) =
                    (installed.runtime, installed.runtime_version)
          )"
     ))
     .bind(node_id)
-    .bind(runtime_rows)
+    .bind(column_values(claims, |claim| claim.kind.alias()))
+    .bind(column_values(claims, |claim| claim.version.as_str()))
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::ReplaceRuntimes)?;
+    Ok(())
+}
+
+/// Prune omitted components under the caller's node lock.
+/// Complete empty censuses still delete previous rows; zero deletions is normal.
+async fn prune_component_installations(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    component_rows: &Json<serde_json::Value>,
+) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "DELETE FROM node_artifact_components installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -181,112 +204,153 @@ async fn prune_installations(
     Ok(())
 }
 
-/// Replace retained runtime capabilities under the caller's node lock.
-/// Conflict handling retains existing installations and locks changed rows.
-async fn upsert_runtime_inventory(
+/// Add reported runtime keys under the caller's node lock.
+/// Existing keys and empty claims are successful no-ops.
+async fn upsert_runtime_installations(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    runtime_rows: Json<serde_json::Value>,
+    claims: &[RuntimeIdentity],
 ) -> Result<(), PublishExecutionInventoryError> {
+    if claims.is_empty() {
+        return Ok(());
+    }
     sqlx::query(sql!(
-        "WITH input AS (
-             SELECT runtime, runtime_version, guests, state_formats
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 runtime TEXT, runtime_version TEXT, guests JSONB, state_formats JSONB
-             )
-         )
-         INSERT INTO node_runtime_installations (node_id, runtime, runtime_version, observed_at)
-         SELECT DISTINCT $1, runtime, runtime_version, NOW() FROM input WHERE TRUE
+        "INSERT INTO node_runtime_installations (node_id, runtime, runtime_version, observed_at)
+         SELECT DISTINCT $1, runtime, runtime_version, NOW()
+         FROM UNNEST($2::TEXT[], $3::TEXT[]) AS input(runtime, runtime_version) WHERE TRUE
          ON CONFLICT (node_id, runtime, runtime_version) DO NOTHING"
     ))
     .bind(node_id)
-    .bind(&runtime_rows)
+    .bind(column_values(claims, |claim| claim.kind.alias()))
+    .bind(column_values(claims, |claim| claim.version.as_str()))
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::InsertRuntimes)?;
+    Ok(())
+}
+
+/// Delete guests omitted from the complete census under the caller's node lock.
+/// The empty census must revoke retained capabilities too; zero deletions is normal.
+async fn prune_runtime_guests(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    claims: &[RuntimeGuestClaim],
+) -> Result<(), PublishExecutionInventoryError> {
     // A retained runtime can lose a guest or format; pruning only removed
     // runtime parents would leave those capabilities advertised indefinitely.
     sqlx::query(sql!(
         "DELETE FROM node_runtime_guests installed
          WHERE node_id = $1 AND NOT EXISTS (
-             SELECT 1 FROM jsonb_to_recordset($2::jsonb)
-                 AS input(runtime TEXT, runtime_version TEXT, guests JSONB)
-             CROSS JOIN LATERAL jsonb_to_recordset(input.guests)
-                 AS guest(guest_os TEXT, guest_arch TEXT)
-             WHERE (input.runtime, input.runtime_version, guest.guest_os, guest.guest_arch) =
+             SELECT 1 FROM UNNEST($2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[])
+                 AS input(runtime, runtime_version, guest_os, guest_arch)
+             WHERE (input.runtime, input.runtime_version, input.guest_os, input.guest_arch) =
                    (installed.runtime, installed.runtime_version,
                     installed.guest_os, installed.guest_arch)
          )"
     ))
     .bind(node_id)
-    .bind(&runtime_rows)
+    .bind(column_values(claims, |claim| claim.runtime.kind.alias()))
+    .bind(column_values(claims, |claim| {
+        claim.runtime.version.as_str()
+    }))
+    .bind(column_values(claims, |claim| claim.guest.os.as_str()))
+    .bind(column_values(claims, |claim| {
+        claim.guest.architecture.as_str()
+    }))
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::PruneGuests)?;
+    Ok(())
+}
+
+/// Add reported guest keys under the caller's node lock.
+/// Existing keys and empty claims are successful no-ops.
+async fn upsert_runtime_guests(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    claims: &[RuntimeGuestClaim],
+) -> Result<(), PublishExecutionInventoryError> {
+    if claims.is_empty() {
+        return Ok(());
+    }
     sqlx::query(sql!(
-        "WITH input AS (
-             SELECT runtime, runtime_version, guests
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 runtime TEXT, runtime_version TEXT, guests JSONB
-             )
-         )
-         INSERT INTO node_runtime_guests (
+        "INSERT INTO node_runtime_guests (
              node_id, runtime, runtime_version, guest_os, guest_arch
          )
          SELECT DISTINCT $1, input.runtime, input.runtime_version,
-                guest.guest_os, guest.guest_arch
-         FROM input
-         CROSS JOIN LATERAL jsonb_to_recordset(COALESCE(input.guests, '[]'::jsonb))
-             AS guest(guest_os TEXT, guest_arch TEXT)
+                input.guest_os, input.guest_arch
+         FROM UNNEST($2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[])
+             AS input(runtime, runtime_version, guest_os, guest_arch)
          WHERE TRUE
          ON CONFLICT (node_id, runtime, runtime_version, guest_os, guest_arch) DO NOTHING"
     ))
     .bind(node_id)
-    .bind(&runtime_rows)
+    .bind(column_values(claims, |claim| claim.runtime.kind.alias()))
+    .bind(column_values(claims, |claim| {
+        claim.runtime.version.as_str()
+    }))
+    .bind(column_values(claims, |claim| claim.guest.os.as_str()))
+    .bind(column_values(claims, |claim| {
+        claim.guest.architecture.as_str()
+    }))
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::InsertGuests)?;
+    Ok(())
+}
+
+/// Revoke formats omitted from the complete census under the caller's node lock.
+/// Empty censuses still delete previous rows; zero deletions is normal.
+async fn prune_runtime_formats(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    keys: &[&RuntimeFormatKey],
+) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "DELETE FROM node_runtime_state_formats installed
          WHERE node_id = $1 AND NOT EXISTS (
-             SELECT 1 FROM jsonb_to_recordset($2::jsonb)
-                 AS input(runtime TEXT, runtime_version TEXT, state_formats JSONB)
-             CROSS JOIN LATERAL jsonb_to_recordset(input.state_formats)
-                 AS state_format(state_format_name TEXT, state_format_version TEXT)
+             SELECT 1 FROM UNNEST($2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[])
+                 AS input(runtime, runtime_version, state_format_name, state_format_version)
              WHERE (input.runtime, input.runtime_version,
-                    state_format.state_format_name, state_format.state_format_version) =
+                    input.state_format_name, input.state_format_version) =
                    (installed.runtime, installed.runtime_version,
                     installed.state_format_name, installed.state_format_version)
          )"
     ))
     .bind(node_id)
-    .bind(&runtime_rows)
+    .bind(column_values(keys, |key| key.runtime.kind.alias()))
+    .bind(column_values(keys, |key| key.runtime.version.as_str()))
+    .bind(column_values(keys, |key| key.format.format.as_str()))
+    .bind(column_values(keys, |key| key.format.version.as_str()))
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::PruneFormats)?;
+    Ok(())
+}
+
+/// Merge reported format capabilities under the caller's node lock.
+/// Repeated keys retain bool-or semantics; unchanged and empty claims are no-ops.
+async fn upsert_runtime_formats(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    claims: &[RuntimeFormatClaim],
+) -> Result<(), PublishExecutionInventoryError> {
+    if claims.is_empty() {
+        return Ok(());
+    }
     sqlx::query(sql!(
-        "WITH input AS (
-             SELECT runtime, runtime_version, state_formats
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 runtime TEXT, runtime_version TEXT, state_formats JSONB
-             )
-         )
-         INSERT INTO node_runtime_state_formats (
+        "INSERT INTO node_runtime_state_formats (
              node_id, runtime, runtime_version, state_format_name,
              state_format_version, can_create, can_load
          )
          SELECT $1, input.runtime, input.runtime_version,
-                state_format.state_format_name, state_format.state_format_version,
-                bool_or(state_format.can_create), bool_or(state_format.can_load)
-         FROM input
-         CROSS JOIN LATERAL jsonb_to_recordset(
-             COALESCE(input.state_formats, '[]'::jsonb)
-         ) AS state_format(
-             state_format_name TEXT, state_format_version TEXT,
-             can_create BOOLEAN, can_load BOOLEAN
-         )
+                input.state_format_name, input.state_format_version,
+                bool_or(input.can_create), bool_or(input.can_load)
+         FROM UNNEST($2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::BOOLEAN[], $7::BOOLEAN[])
+             AS input(runtime, runtime_version, state_format_name, state_format_version,
+                      can_create, can_load)
          GROUP BY input.runtime, input.runtime_version,
-                  state_format.state_format_name, state_format.state_format_version
+                  input.state_format_name, input.state_format_version
          ON CONFLICT (
              node_id, runtime, runtime_version,
              state_format_name, state_format_version
@@ -297,7 +361,20 @@ async fn upsert_runtime_inventory(
                IS DISTINCT FROM (EXCLUDED.can_create, EXCLUDED.can_load)"
     ))
     .bind(node_id)
-    .bind(runtime_rows)
+    .bind(column_values(claims, |claim| {
+        claim.key.runtime.kind.alias()
+    }))
+    .bind(column_values(claims, |claim| {
+        claim.key.runtime.version.as_str()
+    }))
+    .bind(column_values(claims, |claim| {
+        claim.key.format.format.as_str()
+    }))
+    .bind(column_values(claims, |claim| {
+        claim.key.format.version.as_str()
+    }))
+    .bind(column_values(claims, |claim| claim.can_create))
+    .bind(column_values(claims, |claim| claim.can_load))
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::InsertFormats)?;
@@ -349,6 +426,10 @@ async fn upsert_component_inventory(
     .await
     .map_err(PublishExecutionInventoryError::InsertComponents)?;
     Ok(())
+}
+
+fn column_values<'a, T, C>(claims: &'a [C], value: impl Fn(&'a C) -> T) -> Vec<T> {
+    claims.iter().map(value).collect()
 }
 
 #[cfg(test)]
