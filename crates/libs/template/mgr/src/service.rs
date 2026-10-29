@@ -1306,6 +1306,87 @@ async fn fetch_warm_pool_protected_keys() -> Result<HashSet<(String, String)>, S
         .collect())
 }
 
+/// Disk delete routes through `btrfs_via_nodemgr` so a build
+/// installed as a btrfs subvolume actually gets its
+/// subvolume removed — `std::fs::remove_dir_all` recurses
+/// contents but cannot `rmdir` a subvolume root, leaving an
+/// empty undeletable subvolume per evicted build. The fallback
+/// path mirrors `volume::cleanup_digest_dir_after_hash_mismatch`:
+/// when the nodemgr RPC is unreachable we still wipe the
+/// snapshot dir (plain dir) and the subvol contents
+/// (`remove_dir_all` succeeds on file inodes inside the subvol
+/// even when the root is undeletable). That at least disarms
+/// the recovery path; the empty subvol root is a known leak
+/// until nodemgr comes back.
+///
+/// The closure is invoked from `execute_one_async` between
+/// the pre-check and finalize txns, with the DB lock
+/// released — so we can `await` the nodemgr RPC directly
+/// instead of going through `Handle::block_on` from inside a
+/// `spawn_blocking` thread.
+fn gc_delete_disk_fn(artifact_store: TemplateArtifactStore) -> crate::eviction::DeleteDiskFn {
+    let store = artifact_store;
+    Arc::new(
+        move |name: &str, content_hash: &str, partition: TemplateCachePartition| {
+            let n = name.to_string();
+            let h = content_hash.to_string();
+            let store = store.clone();
+            Box::pin(async move {
+                let outcome: Result<(), String> =
+                    match crate::btrfs_via_nodemgr::delete_template_subvolume(&n, &h, partition)
+                        .await
+                    {
+                        Ok(()) => {
+                            // Snapshot dirs are plain dirs under
+                            // `<root>/<name>/snapshots/<hash>/`,
+                            // separate from the digest subvol nodemgr
+                            // just deleted. Run only the snapshot
+                            // half locally — the combined helper
+                            // would re-try a now-gone build dir.
+                            store
+                                .remove_snapshot_artifacts(&n, &h, partition)
+                                .map_err(|err| format!("snapshot cleanup: {err}"))
+                        }
+                        Err(rpc_err) => {
+                            tracing::warn!(
+                                template = %n,
+                                content_hash = %h,
+                                cache_partition = %partition,
+                                err = %rpc_err,
+                                "btrfs_via_nodemgr::delete_template_subvolume failed; falling back to subvolume-aware local cleanup"
+                            );
+                            // Subvolume-aware local fallback. Plain
+                            // `remove_dir_all` EROFSes on the first
+                            // unlink inside a read-only digest
+                            // subvolume, surfacing Err to the caller
+                            // and leaving the row stuck in
+                            // `state='deleting'`. The shared
+                            // `cleanup_digest_dir_sync` helper from
+                            // volume.rs clears the RO flag first and
+                            // handles the subvol-vs-plain-dir
+                            // disambiguation the same way
+                            // `cleanup_digest_dir_after_hash_mismatch`
+                            // does on the pull-failure path.
+                            fallback_delete_build_artifacts(&store, &n, &h, partition)
+                                .map_err(|err| err.to_string())
+                        }
+                    };
+                outcome.map_err(|err| {
+                    // Surface the disk error as a SQLite error
+                    // so it bubbles out of `execute_one_async`.
+                    // The wrapping `Code::SQLITE_IOERR` is a
+                    // synthetic carrier; the underlying error
+                    // is logged by `run_loop`.
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                        Some(err),
+                    )
+                })
+            })
+        },
+    )
+}
+
 /// Total on-disk footprint for a build: every regular file in the
 /// digest dir (rootfs.ext4, rootfs.ext4.zst, manifest.json,
 /// metadata.json, plus any future entries) summed by allocated
@@ -1732,88 +1813,7 @@ impl TemplateManagerService {
             },
         );
 
-        // Disk delete routes through `btrfs_via_nodemgr` so a build
-        // installed as a btrfs subvolume actually gets its
-        // subvolume removed — `std::fs::remove_dir_all` recurses
-        // contents but cannot `rmdir` a subvolume root, leaving an
-        // empty undeletable subvolume per evicted build. The fallback
-        // path mirrors `volume::cleanup_digest_dir_after_hash_mismatch`:
-        // when the nodemgr RPC is unreachable we still wipe the
-        // snapshot dir (plain dir) and the subvol contents
-        // (`remove_dir_all` succeeds on file inodes inside the subvol
-        // even when the root is undeletable). That at least disarms
-        // the recovery path; the empty subvol root is a known leak
-        // until nodemgr comes back.
-        //
-        // The closure is invoked from `execute_one_async` between
-        // the pre-check and finalize txns, with the DB lock
-        // released — so we can `await` the nodemgr RPC directly
-        // instead of going through `Handle::block_on` from inside a
-        // `spawn_blocking` thread.
-        let delete_disk_for: crate::eviction::DeleteDiskFn = {
-            let store = artifact_store.clone();
-            Arc::new(
-                move |name: &str, content_hash: &str, partition: TemplateCachePartition| {
-                    let n = name.to_string();
-                    let h = content_hash.to_string();
-                    let store = store.clone();
-                    Box::pin(async move {
-                        let outcome: Result<(), String> =
-                            match crate::btrfs_via_nodemgr::delete_template_subvolume(
-                                &n, &h, partition,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    // Snapshot dirs are plain dirs under
-                                    // `<root>/<name>/snapshots/<hash>/`,
-                                    // separate from the digest subvol nodemgr
-                                    // just deleted. Run only the snapshot
-                                    // half locally — the combined helper
-                                    // would re-try a now-gone build dir.
-                                    store
-                                        .remove_snapshot_artifacts(&n, &h, partition)
-                                        .map_err(|err| format!("snapshot cleanup: {err}"))
-                                }
-                                Err(rpc_err) => {
-                                    tracing::warn!(
-                                        template = %n,
-                                        content_hash = %h,
-                                        cache_partition = %partition,
-                                        err = %rpc_err,
-                                        "btrfs_via_nodemgr::delete_template_subvolume failed; falling back to subvolume-aware local cleanup"
-                                    );
-                                    // Subvolume-aware local fallback. Plain
-                                    // `remove_dir_all` EROFSes on the first
-                                    // unlink inside a read-only digest
-                                    // subvolume, surfacing Err to the caller
-                                    // and leaving the row stuck in
-                                    // `state='deleting'`. The shared
-                                    // `cleanup_digest_dir_sync` helper from
-                                    // volume.rs clears the RO flag first and
-                                    // handles the subvol-vs-plain-dir
-                                    // disambiguation the same way
-                                    // `cleanup_digest_dir_after_hash_mismatch`
-                                    // does on the pull-failure path.
-                                    fallback_delete_build_artifacts(&store, &n, &h, partition)
-                                        .map_err(|err| err.to_string())
-                                }
-                            };
-                        outcome.map_err(|err| {
-                            // Surface the disk error as a SQLite error
-                            // so it bubbles out of `execute_one_async`.
-                            // The wrapping `Code::SQLITE_IOERR` is a
-                            // synthetic carrier; the underlying error
-                            // is logged by `run_loop`.
-                            rusqlite::Error::SqliteFailure(
-                                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                                Some(err),
-                            )
-                        })
-                    })
-                },
-            )
-        };
+        let delete_disk_for = gc_delete_disk_fn(artifact_store.clone());
 
         // Stuck-deleting reaper probe: queried by `gc_tick`'s
         // start-of-tick recovery pass for any row left in

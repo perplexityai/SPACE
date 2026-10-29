@@ -1598,13 +1598,14 @@ fn unanswered_templates_wait_out_the_grace_before_eviction() {
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>()
     };
-    let local = names(&["generic", "left-a", "left-b"]);
+    let local = names(&["generic", "left-b", "left-a"]);
     let mut unanswered = UnansweredTemplates::default();
 
-    // `generic` is always answered. `left-a` is left out from the start;
-    // `left-b` is answered once at half the wait, then left out again.
+    // `generic` is always answered. `left-b` is left out from the start;
+    // `left-a` is answered once at half the wait, then left out again. The
+    // one left out longest sorts last by name, so order by name would fail.
     unanswered.observe(&local, &set(&["generic"]), true, at(Duration::ZERO));
-    unanswered.observe(&local, &set(&["generic", "left-b"]), true, at(after / 2));
+    unanswered.observe(&local, &set(&["generic", "left-a"]), true, at(after / 2));
     unanswered.observe(&local, &set(&["generic"]), true, at(after / 2 + after / 4));
     assert!(
         unanswered
@@ -1614,36 +1615,45 @@ fn unanswered_templates_wait_out_the_grace_before_eviction() {
     );
     assert_eq!(
         unanswered.due(at(after), after, 10),
-        ["left-a"],
+        ["left-b"],
         "an answer restarts the wait"
     );
     let both = at(after / 2 + after / 4 + after);
     assert_eq!(
         unanswered.due(both, after, 10),
-        ["left-a", "left-b"],
+        ["left-b", "left-a"],
         "longest-unanswered first"
     );
     assert_eq!(
         unanswered.due(both, after, 1),
-        ["left-a"],
+        ["left-b"],
         "capped per sync"
     );
 
     // A one-template request leaves the others alone; a full one drops
     // templates that are no longer local.
-    unanswered.observe(&names(&["left-b"]), &set(&[]), false, both);
-    assert_eq!(unanswered.due(both, after, 10), ["left-a", "left-b"]);
-    unanswered.observe(&names(&["left-b"]), &set(&[]), true, both);
-    assert_eq!(unanswered.due(both, after, 10), ["left-b"]);
+    unanswered.observe(&names(&["left-a"]), &set(&[]), false, both);
+    assert_eq!(unanswered.due(both, after, 10), ["left-b", "left-a"]);
+    unanswered.observe(&names(&["left-a"]), &set(&[]), true, both);
+    assert_eq!(unanswered.due(both, after, 10), ["left-a"]);
 
     // After a delete attempt, a template that is gone is not tried again. One
-    // still here, because a local sandbox uses it or the delete failed, waits
-    // the whole period again instead of being retried on the next sync.
+    // still here, because template-manager kept it, can't delete idle
+    // templates yet, or failed, waits the whole period again instead of being
+    // retried on the next sync.
     for (result, retried) in [
         (Ok(()), false),
         (Err(tonic::Status::not_found("template not found")), false),
         (
-            Err(tonic::Status::failed_precondition("local sandboxes use it")),
+            Err(tonic::Status::failed_precondition(
+                "a build was used recently",
+            )),
+            true,
+        ),
+        (
+            Err(tonic::Status::unimplemented(
+                "template-manager predates the RPC",
+            )),
             true,
         ),
         (

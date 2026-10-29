@@ -59,6 +59,97 @@ impl TemplateManagerService {
         Ok(Response::new(DeleteTemplateResponse {}))
     }
 
+    /// Delete a template the cluster no longer wants on this node, without
+    /// racing a sandbox create that is about to use it: builds go through the
+    /// GC's eviction with an idle bound instead of `DeleteTemplate`'s
+    /// whole-tree removal (see [`crate::eviction::evict_idle_template`]).
+    pub(super) async fn delete_idle_template(
+        &self,
+        request: Request<crate::proto::DeleteIdleTemplateRequest>,
+    ) -> Result<Response<crate::proto::DeleteIdleTemplateResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "DeleteIdleTemplate",
+            ALLOW_TEMPLATE_DESIRED_STATE_OPERATOR,
+        )?;
+        let publish_node_state = !crate::node_state_sync::should_skip_node_publish(&request);
+        let crate::proto::DeleteIdleTemplateRequest {
+            template,
+            idle_secs,
+        } = request.into_inner();
+        validate_template_name(&template)?;
+        if idle_secs == 0 {
+            return Err(Status::invalid_argument("idle_secs must be positive"));
+        }
+        let touched_before_secs = jiff::Timestamp::now()
+            .as_second()
+            .max(0)
+            .cast_unsigned()
+            .saturating_sub(idle_secs);
+
+        // Pool members keep the builds referenced, and each refill touches
+        // its build, so the pool goes first. The eviction below then refuses
+        // until the pool's last touch is older than the idle period.
+        let db = Arc::clone(&self.db);
+        let name = template.clone();
+        let has_pool = tokio::task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| Status::internal("db mutex poisoned while reading template pool"))?;
+            crate::db::get_pool(&conn, &name)
+                .map(|pool| pool.is_some())
+                .map_err(|e| Status::internal(format!("db get_pool: {e}")))
+        })
+        .await
+        .map_err(|e| blocking_join_status("read template pool", &template, e))??;
+        if has_pool {
+            self.delete_pool(internal_request(DeletePoolRequest {
+                template: template.clone(),
+            }))
+            .await?;
+        }
+
+        let dependency_error = |error: String| {
+            Status::unavailable(format!(
+                "cannot check what protects template {template} before deleting it: {error}"
+            ))
+        };
+        let active = fetch_build_referencing_sandbox_keys()
+            .await
+            .map_err(dependency_error)?;
+        let warm_pool = fetch_warm_pool_protected_keys()
+            .await
+            .map_err(dependency_error)?;
+        let outcome = crate::eviction::evict_idle_template(
+            Arc::clone(&self.db),
+            &template,
+            touched_before_secs,
+            active,
+            warm_pool,
+            gc_delete_disk_fn(self.artifact_store.clone()),
+        )
+        .await
+        .map_err(|e| Status::internal(format!("evict idle template {template}: {e}")))?;
+
+        let (changed, result) = match outcome {
+            crate::eviction::IdleTemplateEviction::Evicted => (true, Ok(())),
+            crate::eviction::IdleTemplateEviction::NotFound => (
+                has_pool,
+                Err(Status::not_found(format!("template not found: {template}"))),
+            ),
+            crate::eviction::IdleTemplateEviction::Kept { evicted, reason } => (
+                has_pool || evicted > 0,
+                Err(Status::failed_precondition(format!(
+                    "kept template {template}: {reason}"
+                ))),
+            ),
+        };
+        if changed && publish_node_state {
+            crate::node_state_sync::mark_template_dirty(&self.db, &template);
+        }
+        result.map(|()| Response::new(crate::proto::DeleteIdleTemplateResponse {}))
+    }
+
     async fn template_local_state_exists(&self, template: &str) -> Result<bool, Status> {
         let db = Arc::clone(&self.db);
         let name = template.to_string();

@@ -1489,3 +1489,170 @@ fn execute_one_on_a_twin_leaves_its_legacy_sibling() {
         .unwrap();
     assert_eq!(snapshots, 0);
 }
+
+/// Seed `name@hash` created and last used at `secs`, so a test controls which
+/// side of an idle bound it falls on.
+fn seed_build_touched_at(conn: &Connection, name: &str, hash: &str, secs: u64) {
+    seed_build(conn, name, hash, 100);
+    conn.execute(
+        "UPDATE template_builds SET created_at = ?3, last_used_at = ?3
+         WHERE name = ?1 AND content_hash = ?2",
+        params![name, hash, secs.to_string()],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() {
+    use IdleTemplateKept::{Active, Pinned, Recent, WarmPool};
+    let bound = 1_000;
+    let kept = |reason| IdleTemplateEviction::Kept { evicted: 0, reason };
+    // (case, last touch of each build of `doomed`, pinned, active, warm pool, outcome)
+    let cases: [(
+        &str,
+        &[(&str, u64)],
+        &[&str],
+        &[&str],
+        &[&str],
+        IdleTemplateEviction,
+    ); 6] = [
+        (
+            "idle",
+            &[("h1", 500), ("h2", 1_000)],
+            &[],
+            &[],
+            &[],
+            IdleTemplateEviction::Evicted,
+        ),
+        (
+            "one recent",
+            &[("h1", 500), ("h2", 1_001)],
+            &[],
+            &[],
+            &[],
+            kept(Recent),
+        ),
+        ("pinned", &[("h1", 500)], &["h1"], &[], &[], kept(Pinned)),
+        ("in use", &[("h1", 500)], &[], &["h1"], &[], kept(Active)),
+        (
+            "warm pool",
+            &[("h1", 500)],
+            &[],
+            &[],
+            &["h1"],
+            kept(WarmPool),
+        ),
+        (
+            "not cached",
+            &[],
+            &[],
+            &[],
+            &[],
+            IdleTemplateEviction::NotFound,
+        ),
+    ];
+    for (case, builds, pinned, active, warm_pool, expected) in cases {
+        let conn = crate::db::test_conn();
+        seed_build_touched_at(&conn, "other", "h1", 1);
+        for (hash, touched) in builds {
+            seed_build_touched_at(&conn, "doomed", hash, *touched);
+        }
+        for hash in pinned {
+            plant_pin(&conn, "doomed", hash);
+        }
+        crate::db::upsert_template_settings(
+            &conn,
+            "doomed",
+            &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let delete_disk: DeleteDiskFn = {
+            let deleted = Arc::clone(&deleted);
+            Arc::new(move |name, hash, _| {
+                deleted.lock().unwrap().push(format!("{name}@{hash}"));
+                Box::pin(async { Ok(()) })
+            })
+        };
+        let pairs = |hashes: &[&str]| {
+            hashes
+                .iter()
+                .map(|hash| ("doomed".to_string(), (*hash).to_string()))
+                .collect::<HashSet<_>>()
+        };
+
+        let outcome = evict_idle_template(
+            Arc::clone(&db),
+            "doomed",
+            bound,
+            pairs(active),
+            pairs(warm_pool),
+            delete_disk,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, expected, "{case}");
+        let conn = db.lock().unwrap();
+        let left = crate::db::list_builds_by_name(&conn, "doomed").unwrap();
+        let settings = crate::db::get_template_settings(&conn, "doomed").unwrap();
+        if expected == IdleTemplateEviction::Evicted {
+            assert!(left.is_empty(), "{case}: every build is gone");
+            assert!(settings.is_none(), "{case}: so are the template's settings");
+            let mut deleted = deleted.lock().unwrap().clone();
+            deleted.sort();
+            assert_eq!(deleted, ["doomed@h1", "doomed@h2"], "{case}");
+        } else {
+            assert_eq!(left.len(), builds.len(), "{case}: no build is evicted");
+            assert!(settings.is_some(), "{case}: settings stay");
+            assert!(deleted.lock().unwrap().is_empty(), "{case}");
+        }
+        assert_eq!(
+            crate::db::list_builds_by_name(&conn, "other")
+                .unwrap()
+                .len(),
+            1,
+            "{case}: other templates are untouched"
+        );
+    }
+}
+
+/// The swap checks the idle bound again. A build `GetTemplate` hands to a
+/// sandbox create after the caller's check keeps it, before sandbox-manager
+/// records the sandbox that will use it.
+#[tokio::test]
+async fn idle_bound_keeps_a_build_used_after_the_check() {
+    let conn = crate::db::test_conn();
+    seed_build_touched_at(&conn, "doomed", "h1", 500);
+    crate::db::touch_build(&conn, "doomed", "h1", TemplateCachePartition::Legacy).unwrap();
+    let db = Arc::new(Mutex::new(conn));
+    let delete_disk: DeleteDiskFn =
+        Arc::new(|_, _, _| panic!("a build used after the check must survive"));
+    let candidate = EvictionCandidate {
+        name: "doomed".to_string(),
+        content_hash: "h1".to_string(),
+        cache_partition: TemplateCachePartition::Legacy,
+        size_bytes: 100,
+    };
+
+    let outcome = execute_one_async_touched_before(
+        Arc::clone(&db),
+        keys(&[]),
+        keys(&[]),
+        candidate,
+        delete_disk,
+        Some(1_000),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, EvictionOutcome::SkippedRowMissing);
+    assert_eq!(
+        crate::db::list_eviction_candidates(&db.lock().unwrap())
+            .unwrap()
+            .len(),
+        1,
+        "the build is still ready"
+    );
+}
