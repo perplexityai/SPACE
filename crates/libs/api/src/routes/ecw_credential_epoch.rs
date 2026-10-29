@@ -66,7 +66,7 @@ fn db_error(error: &sqlx::Error, sandbox_id: SandboxId) -> Response {
         .into_response()
 }
 
-fn valid_internal_token(headers: &HeaderMap) -> bool {
+pub(super) fn valid_internal_token(headers: &HeaderMap) -> bool {
     let expected = std::env::var(SPACE_INTERNAL_TOKEN_ENV).unwrap_or_default();
     let provided = headers
         .get("x-internal-token")

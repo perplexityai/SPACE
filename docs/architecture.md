@@ -133,6 +133,34 @@ so a temporary reduction does not permanently prevent raising the quota again.
 
 By default, sandboxes created through the SPACE API suspend after six hours without access or command activity. This is an idle limit, not a maximum lifetime.
 
+A nullable `sandboxes.lifecycle_registration` JSONB column holds typed enrollment,
+revision, and product-owner binding independently of `auto_lifecycle_json`. SQL
+NULL means unenrolled for both existing and newly created sandboxes. Registration-only
+writes preserve activity, `updated_at`, and runtime bookkeeping. A concurrent,
+nonpartial expression index supports bounded scans; it also indexes existing rows
+without backfilling their registration data.
+
+Trusted integrations can register product lifecycle policy bindings with
+`PUT /internal/v1/sandboxes/{sandbox_id}/lifecycle-registration`. The body supplies
+`enabled`, `binding` (`user_id`, nullable `organization_uuid`, opaque `session_id`,
+nullable `context_uuid`), and `expected_revision` (zero for initial registration).
+Updates compare the revision; a conflict reports the current revision for explicit
+reconciliation after an uncertain response. These assertions require the existing
+`x-internal-token` credential, not an ordinary native API key. The integration
+must verify product ownership before asserting it; native security ownership is
+unchanged. Session identifiers contain 1–128 ASCII letters, digits, `_` or `-`.
+
+`GET /internal/v1/lifecycle/candidates` uses the same privileged credential and
+returns enabled registrations in stable sandbox-ID order, with `limit` (1–500,
+default 100), an opaque `cursor`, and `next_cursor` for continuation. Restart from
+no cursor when a sweep ends, including for indefinite policies. Inventory reads
+and registration updates never touch activity, wake execution, or change suspend
+policy. Missing registration is disabled; no existing sandbox is enrolled by the
+migration. Access timestamps are asynchronous observations: this feed supports
+advisory policy evaluation, not authorization to archive or delete. No archival
+or deletion executor is provided by these endpoints. The caller must provision
+its internal credential separately before using this trusted surface.
+
 A created or overwritten file that can replace its destination is published
 atomically when its writes complete, and persisted at lifecycle boundaries,
 not per write: an acknowledged one is not guaranteed to survive a sandbox

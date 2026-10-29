@@ -1,0 +1,10 @@
+{
+  "items": [{
+    "sandbox_id": "00000000-0000-0000-0000-000000000001",
+    "binding": {"user_id": 42, "organization_uuid": null, "session_id": "session_test", "context_uuid": null},
+    "registration_revision": 2,
+    "lifecycle": "started",
+    "last_access_at": "2026-01-01T00:00:00Z"
+  }],
+  "next_cursor": null
+}

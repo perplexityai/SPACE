@@ -10,7 +10,8 @@
 //!
 //! # Boundaries
 //!
-//! * **Writes touch `sandboxes` only, and only its unguarded columns.** Of
+//! * Lifecycle registration owns a nullable product-policy column on this row.
+//! * **Sandbox row writes touch only its unguarded columns.** Of
 //!   the 81 production `UPDATE sandboxes` statements outside the node-local
 //!   SQLite table, 70 re-check a precondition in their `WHERE` and five more
 //!   are placement transitions; none of those belong here. What is left is
@@ -55,6 +56,8 @@
 //! list stays explicit so adding one is a reviewed change, not a `*`. Verbs
 //! are added the same way — with their first migrated caller, never
 //! speculatively.
+
+pub mod lifecycle_registration;
 
 use pplx_space_common_core::types::{LocalArtifactId, OrgId, UserId};
 
