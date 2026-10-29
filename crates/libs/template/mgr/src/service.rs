@@ -399,6 +399,8 @@ pub struct TemplateManagerService {
     /// deliberately runs without a sandbox-manager socket can decline the wait
     /// instead of buying the full default budget on every enrichment call.
     sbx_connect_retry_policy: pplx_space_sbx_mgr_client::GrpcRetryPolicy,
+    /// Shared by the GC loop, startup recovery and `DeleteIdleTemplate`.
+    eviction_gate: crate::eviction::EvictionGate,
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -1387,6 +1389,25 @@ fn gc_delete_disk_fn(artifact_store: TemplateArtifactStore) -> crate::eviction::
     )
 }
 
+/// The stuck-`deleting` repair's disk probe: a build whose rootfs is gone
+/// cannot be restored to `ready`.
+fn gc_reaper_probe_fn(artifact_store: TemplateArtifactStore) -> crate::eviction::ReaperDiskProbeFn {
+    Arc::new(
+        move |name: &str, content_hash: &str, partition: TemplateCachePartition| {
+            let store = artifact_store.clone();
+            let n = name.to_string();
+            let h = content_hash.to_string();
+            Box::pin(async move {
+                if store.build_artifacts_missing(&n, &h, partition) {
+                    crate::eviction::ReaperDiskState::Missing
+                } else {
+                    crate::eviction::ReaperDiskState::Intact
+                }
+            })
+        },
+    )
+}
+
 /// Total on-disk footprint for a build: every regular file in the
 /// digest dir (rootfs.ext4, rootfs.ext4.zst, manifest.json,
 /// metadata.json, plus any future entries) summed by allocated
@@ -1643,6 +1664,7 @@ impl TemplateManagerService {
             peer_authorizer: template_peer_authorizer(),
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
+            eviction_gate: crate::eviction::EvictionGate::default(),
         })
     }
 
@@ -1822,23 +1844,7 @@ impl TemplateManagerService {
         // missing rootfs.ext4 means the build is unrecoverable and
         // the row should be dropped; otherwise reset to 'ready' and
         // let the planner replan it.
-        let reaper_probe: crate::eviction::ReaperDiskProbeFn = {
-            let store = artifact_store.clone();
-            Arc::new(
-                move |name: &str, content_hash: &str, partition: TemplateCachePartition| {
-                    let store = store.clone();
-                    let n = name.to_string();
-                    let h = content_hash.to_string();
-                    Box::pin(async move {
-                        if store.build_artifacts_missing(&n, &h, partition) {
-                            crate::eviction::ReaperDiskState::Missing
-                        } else {
-                            crate::eviction::ReaperDiskState::Intact
-                        }
-                    })
-                },
-            )
-        };
+        let reaper_probe = gc_reaper_probe_fn(artifact_store.clone());
 
         spawn_observed_background_loop(
             "eviction",
@@ -1853,6 +1859,7 @@ impl TemplateManagerService {
                     delete_disk_for,
                     reaper_probe,
                 },
+                self.eviction_gate.clone(),
             ),
         );
     }

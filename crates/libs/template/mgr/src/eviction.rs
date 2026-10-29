@@ -533,6 +533,25 @@ async fn execute_one_async_touched_before(
     Ok(EvictionOutcome::Deleted)
 }
 
+/// Serializes evictions that run outside the GC loop with the passes that
+/// repair rows an interrupted eviction left in `deleting`. Those passes (the
+/// GC tick's [`reap_stuck_deleting`] and startup recovery) put a `deleting`
+/// row whose artifacts are intact back to `ready`, which is right only when
+/// no eviction is still deleting it. The GC loop holds the gate for a whole
+/// tick, so its own evictions never overlap its repair pass.
+#[derive(Clone, Debug, Default)]
+pub struct EvictionGate(Arc<tokio::sync::Mutex<()>>);
+
+impl EvictionGate {
+    pub(crate) async fn hold(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.lock().await
+    }
+
+    fn try_hold(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.0.try_lock().ok()
+    }
+}
+
 /// What [`evict_idle_template`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdleTemplateEviction {
@@ -540,6 +559,8 @@ pub(crate) enum IdleTemplateEviction {
     Evicted,
     /// The template has no ready build.
     NotFound,
+    /// Another eviction or repair pass holds the gate; nothing was read.
+    Busy,
     /// A build stayed. Builds evicted before it stay evicted.
     Kept {
         evicted: usize,
@@ -580,14 +601,26 @@ impl std::fmt::Display for IdleTemplateKept {
 /// recording that sandbox: the touch keeps the build. Once no build is left,
 /// the template's pool, settings and snapshot rows go too, as
 /// `DeleteTemplate` removes them.
+///
+/// Returns [`IdleTemplateEviction::Busy`] instead of waiting while the GC loop
+/// or another eviction holds `gate`. A build whose disk delete or final row
+/// delete fails is repaired before returning, as the GC's next tick would:
+/// back to `ready` when its artifacts are intact, dropped otherwise.
 pub(crate) async fn evict_idle_template(
     db: Arc<Mutex<Connection>>,
+    gate: &EvictionGate,
     name: &str,
     touched_before_secs: u64,
     active: HashSet<(String, String)>,
     warm_pool: HashSet<(String, String)>,
     delete_disk: DeleteDiskFn,
+    reaper_probe: &ReaperDiskProbeFn,
 ) -> rusqlite::Result<IdleTemplateEviction> {
+    // Held until the last build is finalized, so no repair pass sees this
+    // eviction's `deleting` rows as abandoned.
+    let Some(_evicting) = gate.try_hold() else {
+        return Ok(IdleTemplateEviction::Busy);
+    };
     let builds = {
         let db = Arc::clone(&db);
         let name = name.to_string();
@@ -630,7 +663,7 @@ pub(crate) async fn evict_idle_template(
             cache_partition: build.cache_partition,
             size_bytes: build.artifact_size_bytes,
         };
-        let reason = match execute_one_async_touched_before(
+        let outcome = execute_one_async_touched_before(
             Arc::clone(&db),
             active.clone(),
             warm_pool.clone(),
@@ -638,8 +671,18 @@ pub(crate) async fn evict_idle_template(
             Arc::clone(&delete_disk),
             Some(touched_before_secs),
         )
-        .await?
-        {
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Still holding the gate, so every `deleting` row is ours
+                // or abandoned. Don't leave this one for a GC loop that may
+                // be disabled.
+                reap_stuck_deleting(Arc::clone(&db), reaper_probe).await;
+                return Err(error);
+            }
+        };
+        let reason = match outcome {
             EvictionOutcome::Deleted => {
                 evicted += 1;
                 continue;
@@ -770,12 +813,13 @@ pub(crate) type ReaperDiskProbeFn = Arc<
 ///   `digest_dir_existed` adoption path.
 ///
 /// **Race safety:** called at the start of `gc_tick`, before any
-/// candidate enters `execute_precheck`. Within a single
-/// template-manager process, `execute_precheck`'s Phase 1 CAS is the
-/// sole writer of `state='deleting'`, so any row in that state at
-/// start-of-tick is necessarily from a prior tick or from a crash —
-/// not from an in-flight eviction within this same tick. Tests model
-/// this directly by planting `'deleting'` before invoking `gc_tick`.
+/// candidate enters `execute_precheck`. `execute_precheck`'s Phase 1 CAS
+/// is the only writer of `state='deleting'`, and its callers outside the
+/// tick (`evict_idle_template`) hold the [`EvictionGate`] that
+/// `run_loop` holds around each tick, so any row in that state at
+/// start-of-tick is from a prior tick, an interrupted eviction or a
+/// crash, not from an eviction still in flight. Tests model this
+/// directly by planting `'deleting'` before invoking `gc_tick`.
 pub(crate) async fn reap_stuck_deleting(
     db: Arc<Mutex<Connection>>,
     reaper_probe: &ReaperDiskProbeFn,
@@ -1241,6 +1285,7 @@ pub async fn run_loop(
     cfg: GcConfig,
     shutdown: CancellationToken,
     hooks: GcHooks,
+    gate: EvictionGate,
 ) {
     let GcHooks {
         fetch_active,
@@ -1346,15 +1391,19 @@ pub async fn run_loop(
         let tick_result = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
-            result = gc_tick(
-                Arc::clone(&db),
-                &cfg,
-                active,
-                warm_pool,
-                Arc::clone(&disk_size_for),
-                Arc::clone(&delete_disk_for),
-                Arc::clone(&reaper_probe),
-            ) => result,
+            result = async {
+                let _evicting = gate.hold().await;
+                gc_tick(
+                    Arc::clone(&db),
+                    &cfg,
+                    active,
+                    warm_pool,
+                    Arc::clone(&disk_size_for),
+                    Arc::clone(&delete_disk_for),
+                    Arc::clone(&reaper_probe),
+                )
+                .await
+            } => result,
         };
         match tick_result {
             Ok(report) => {

@@ -88,26 +88,14 @@ impl TemplateManagerService {
             .saturating_sub(idle_secs);
 
         // Pool members keep the builds referenced, and each refill touches
-        // its build, so the pool goes first. The eviction below then refuses
-        // until the pool's last touch is older than the idle period.
-        let db = Arc::clone(&self.db);
-        let name = template.clone();
-        let has_pool = tokio::task::spawn_blocking(move || {
-            let conn = db
-                .lock()
-                .map_err(|_| Status::internal("db mutex poisoned while reading template pool"))?;
-            crate::db::get_pool(&conn, &name)
-                .map(|pool| pool.is_some())
-                .map_err(|e| Status::internal(format!("db get_pool: {e}")))
-        })
-        .await
-        .map_err(|e| blocking_join_status("read template pool", &template, e))??;
-        if has_pool {
-            self.delete_pool(internal_request(DeletePoolRequest {
-                template: template.clone(),
-            }))
-            .await?;
-        }
+        // its build, so the pool goes first, every time: `DeletePool` also
+        // stops members a failed earlier teardown left behind. The eviction
+        // below then refuses until the pool's last touch is older than the
+        // idle period.
+        self.delete_pool(internal_request(DeletePoolRequest {
+            template: template.clone(),
+        }))
+        .await?;
 
         let dependency_error = |error: String| {
             Status::unavailable(format!(
@@ -120,25 +108,48 @@ impl TemplateManagerService {
         let warm_pool = fetch_warm_pool_protected_keys()
             .await
             .map_err(dependency_error)?;
-        let outcome = crate::eviction::evict_idle_template(
-            Arc::clone(&self.db),
-            &template,
-            touched_before_secs,
-            active,
-            warm_pool,
-            gc_delete_disk_fn(self.artifact_store.clone()),
-        )
-        .await
-        .map_err(|e| Status::internal(format!("evict idle template {template}: {e}")))?;
+        // Spawned, so a caller that stops waiting cannot interrupt the
+        // eviction between a build's `deleting` swap and its final row delete.
+        let eviction = tokio::spawn({
+            let db = Arc::clone(&self.db);
+            let gate = self.eviction_gate.clone();
+            let name = template.clone();
+            let delete_disk = gc_delete_disk_fn(self.artifact_store.clone());
+            let reaper_probe = gc_reaper_probe_fn(self.artifact_store.clone());
+            async move {
+                crate::eviction::evict_idle_template(
+                    db,
+                    &gate,
+                    &name,
+                    touched_before_secs,
+                    active,
+                    warm_pool,
+                    delete_disk,
+                    &reaper_probe,
+                )
+                .await
+            }
+        });
+        let outcome = eviction
+            .await
+            .map_err(|e| blocking_join_status("evict idle template", &template, e))?
+            .map_err(|e| Status::internal(format!("evict idle template {template}: {e}")))?;
 
+        // `DeletePool` publishes its own change; this publishes evicted builds.
         let (changed, result) = match outcome {
             crate::eviction::IdleTemplateEviction::Evicted => (true, Ok(())),
             crate::eviction::IdleTemplateEviction::NotFound => (
-                has_pool,
+                false,
                 Err(Status::not_found(format!("template not found: {template}"))),
             ),
+            crate::eviction::IdleTemplateEviction::Busy => (
+                false,
+                Err(Status::unavailable(format!(
+                    "template cache eviction is running; retry deleting {template} later"
+                ))),
+            ),
             crate::eviction::IdleTemplateEviction::Kept { evicted, reason } => (
-                has_pool || evicted > 0,
+                evicted > 0,
                 Err(Status::failed_precondition(format!(
                     "kept template {template}: {reason}"
                 ))),
