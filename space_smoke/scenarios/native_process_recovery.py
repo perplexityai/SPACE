@@ -67,7 +67,9 @@ def process_recovery(test: NativeHardeningFixture) -> None:
     """Start replay, cursor reads and sequenced input survive transport reconnects;
     a restored VM rejects handles from its previous activation before effects.
     """
-    sandbox = test.create_ready()
+    sandbox = test.create_ready({"auto_lifecycle": {
+        "wake": {"on": ["access"]}, "condition_sets": {}, "stages": [],
+    }})
     path = f"/v1/sandboxes/{sandbox}"
     discovery = _discovery(test, path)
     test.context.verify({"process_recovery_start", "process_recovery_handles", "process_mutation_receipts", "process_output_gap_resume"}
@@ -179,14 +181,14 @@ def process_recovery(test: NativeHardeningFixture) -> None:
             test.wait_operation(operation["operation_id"])
             first_result = writing.result(timeout=35)
         test.wait_sandbox(sandbox, "paused")
-        operation = test.request("POST", path + ":resume", idempotency_key=test.key("blocked-resume")).require(202)
-        test.wait_operation(operation["operation_id"])
+        # A retry with the current fence resumes the resident VM itself. It must
+        # preserve the activation and return the original interrupted receipt.
+        receipt = _call(test, blocked, pending_input, error="input_outcome_uncertain")
         test.wait_sandbox(sandbox)
         resumed = _discovery(test, path)
         test.context.verify(resumed["instance_id"] == discovery["instance_id"] and
                             resumed["activation_id"] == discovery["activation_id"],
                             "resident pause changed recovery identity")
-        receipt = _call(test, blocked, pending_input, error="input_outcome_uncertain")
         test.context.verify(0 < receipt["input_written"] < 512 * 1024,
                             "blocked input did not preserve its written prefix")
         if first_result.get("reason") == "input_outcome_uncertain":
@@ -202,6 +204,13 @@ def process_recovery(test: NativeHardeningFixture) -> None:
         operation = test.request("POST", path + ":" + action,
                                  idempotency_key=test.key(action)).require(202)
         test.wait_operation(operation["operation_id"])
+        if action == "suspend":
+            test.wait_sandbox(sandbox, "suspended")
+            _call(test, resident,
+                  {"type": "recovery_connect", "handle": resident_handle,
+                   "output_cursor": 0, "resume_after_output_gap": True},
+                  error="activation_changed")
+            test.wait_sandbox(sandbox, "suspended")
     test.wait_sandbox(sandbox)
     restored = _discovery(test, path)
     test.context.verify(restored["activation_id"] != discovery["activation_id"],
