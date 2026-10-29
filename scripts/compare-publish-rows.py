@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from collections.abc import Iterator
 from datetime import datetime, timezone
-import difflib
 import json
 from pathlib import Path
 import re
@@ -205,6 +205,30 @@ def canonicalize_scenarios(path: Path) -> dict[str, Any]:
     return {"seed": report["seed"], "scenarios": scenarios}
 
 
+def differences(
+    base: Any, head: Any, path: str = "$",
+) -> Iterator[tuple[str, Any, Any]]:
+    """Walk JSON structurally instead of aligning repetitive full-table lines."""
+    if type(base) is not type(head):
+        yield path, base, head
+    elif isinstance(base, dict):
+        for key in sorted(base.keys() | head.keys()):
+            child = f"{path}[{json.dumps(key)}]"
+            if key not in base:
+                yield child, "<missing>", head[key]
+            elif key not in head:
+                yield child, base[key], "<missing>"
+            else:
+                yield from differences(base[key], head[key], child)
+    elif isinstance(base, list):
+        if len(base) != len(head):
+            yield f"{path}.length", len(base), len(head)
+        for index, (before, after) in enumerate(zip(base, head)):
+            yield from differences(before, after, f"{path}[{index}]")
+    elif base != head:
+        yield path, base, head
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", type=Path)
@@ -218,17 +242,21 @@ def main() -> int:
         args.output.mkdir(parents=True, exist_ok=False)
         for name, value in (("base", base), ("head", head)):
             (args.output / f"{name}.json").write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    if base == head:
+    changes = differences(base, head)
+    first = next(changes, None)
+    if first is None:
         print("Equivalent synthetic rows after explicit run-local normalization.")
         return 0
-    changes = list(difflib.unified_diff(
-        json.dumps(base, indent=2, sort_keys=True).splitlines(),
-        json.dumps(head, indent=2, sort_keys=True).splitlines(),
-        fromfile="base", tofile="head",
-    ))
-    print("\n".join(changes[:200]), file=sys.stderr)
-    if len(changes) > 200:
-        print("Diff truncated; use --output for complete canonical evidence.", file=sys.stderr)
+    change = first
+    for _ in range(20):
+        path, before, after = change
+        print(f"Difference at {path}", file=sys.stderr)
+        print(f"  base: {json.dumps(before, sort_keys=True)[:500]}", file=sys.stderr)
+        print(f"  head: {json.dumps(after, sort_keys=True)[:500]}", file=sys.stderr)
+        change = next(changes, None)
+        if change is None:
+            break
+    print("Use --output for complete canonical evidence; diagnostics are bounded.", file=sys.stderr)
     return 1
 
 
