@@ -1,0 +1,60 @@
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_net_common::NetworkPolicyV1;
+use uuid::Uuid;
+
+use super::ArtifactComponentProjection;
+
+/// Checked publication evidence, including the original spelling of open labels.
+/// The legacy JSON batch keeps nullable fields explicit for existing SQL readers.
+#[derive(serde::Serialize)]
+pub(super) struct PublishedSandboxRow {
+    pub(super) sandbox_id: SandboxId,
+    pub(super) status: Option<String>,
+    pub(super) template: Option<String>,
+    pub(super) runtime: Option<String>,
+    pub(super) spaced_version: Option<String>,
+    pub(super) runtime_version: Option<String>,
+    pub(super) guest_os: Option<String>,
+    pub(super) guest_arch: Option<String>,
+    pub(super) state_format_name: Option<String>,
+    pub(super) state_format_version: Option<String>,
+    pub(super) execution_metadata: Option<serde_json::Value>,
+    pub(super) execution_components: Vec<ArtifactComponentProjection>,
+    pub(super) pid: Option<i32>,
+    pub(super) namespace: Option<String>,
+    pub(super) uptime: Option<String>,
+    pub(super) sandbox_owner: Option<String>,
+    pub(super) sandbox_user: Option<String>,
+    pub(super) image_hash: Option<String>,
+    pub(super) snapshots_enabled: bool,
+    pub(super) pool_template: Option<String>,
+    pub(super) failure_reason: Option<String>,
+    pub(super) observed_created_at: Option<String>,
+    pub(super) last_used_at: Option<String>,
+    pub(super) last_access_at: Option<String>,
+    pub(super) last_command_at: Option<String>,
+    pub(super) network_tx_bytes: Option<i64>,
+    pub(super) network_rx_bytes: Option<i64>,
+    pub(super) disk_usage_bytes: Option<i64>,
+    pub(super) observed_network_policy_json: Option<NetworkPolicyV1>,
+    pub(super) observed_network_policy_generation: Option<i64>,
+    pub(super) observed_network_policy_source: Option<&'static str>,
+    pub(super) observed_network_policy_authority: Option<&'static str>,
+    pub(super) auto_lifecycle_authority: Option<&'static str>,
+    pub(super) quarantine_reason_code: Option<String>,
+    pub(super) transition_receipt_id: Option<Uuid>,
+    pub(super) transition_receipt_kind: Option<&'static str>,
+    pub(super) transition_receipt_target_state: Option<&'static str>,
+    pub(super) transition_receipt_execution_generation: Option<i64>,
+    pub(super) transition_receipt_reason_code: Option<&'static str>,
+    pub(super) transition_receipt_activation_attempt_id: Option<Uuid>,
+    pub(super) quarantine_recovery_payload: Option<serde_json::Value>,
+    pub(super) quarantine_recovery_observation_degraded: bool,
+    pub(super) transition_receipt_recovery_policy: Option<String>,
+    pub(super) current_local_artifact_id: Option<String>,
+    pub(super) current_local_artifact_kind: Option<String>,
+    pub(super) current_local_artifact_origin: Option<String>,
+    pub(super) state_changed_at: Option<String>,
+    pub(super) execution_generation: Option<i64>,
+    pub(super) pod_uid: Option<String>,
+}
