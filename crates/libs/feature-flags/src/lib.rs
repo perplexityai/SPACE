@@ -212,6 +212,12 @@ pub const SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG: BoolFlag =
 /// rollout). Layered under `SPACE_API_CLIENT_CONCURRENCY_MODE` by
 /// [`policy::override_allowed`]: the flag can only retune caps, never enable a
 /// limiter the env var turned off.
+///
+/// Its optional `rate` field, `{"<client-key>": {"refill_rps": <f64>,
+/// "burst": <f64>} | null}`, belongs to the cluster activation limiter
+/// instead: per-client activation rates, mastered by
+/// `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` rather than the concurrency
+/// mode. A `rate` key doesn't allowlist a client.
 pub const SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG: JsonFlag =
     JsonFlag::new("space-api-client-concurrency-quotas");
 

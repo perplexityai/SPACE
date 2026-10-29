@@ -14,11 +14,25 @@ use crate::redis_otel::{RedisEndpoint, record_redis_result, redis_client_span};
 /// Redis token-bucket ops are sub-millisecond in-region, so this is generous.
 const CONSUME_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Outcome of a single atomic token-bucket consume against Redis.
+/// One bucket a consume draws from: its Redis key and its refill parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum ConsumeOutcome {
-    Admitted { remaining: f64 },
-    RateLimited { remaining: f64 },
+pub(super) struct BucketSpec<'a> {
+    pub(super) key: &'a str,
+    pub(super) refill_rps: f64,
+    pub(super) burst: f64,
+}
+
+/// Outcome of a single atomic consume across one or more buckets.
+///
+/// `remaining` holds one count per [`BucketSpec`] passed to
+/// [`RedisTokenBucket::consume`], in the same order. When `admitted`, each is
+/// what the bucket holds after the consume. When not, nothing was consumed, so
+/// a bucket was one of the empty ones exactly when its count is below the
+/// requested amount.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ConsumeOutcome {
+    pub(super) admitted: bool,
+    pub(super) remaining: Vec<f64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,18 +45,22 @@ pub(super) enum BucketError {
     Endpoint(#[source] redis::RedisError),
     #[error("redis command failed: {0}")]
     Redis(#[from] redis::RedisError),
-    #[error("redis returned an unparseable token count: {0:?}")]
+    #[error("redis returned an unparseable admit flag or token count: {0:?}")]
     Parse(String),
+    #[error(
+        "redis returned {got} values for {buckets} buckets, expected one more than the buckets"
+    )]
+    Arity { got: usize, buckets: usize },
     #[error("redis consume timed out after {0:?}")]
     Timeout(Duration),
 }
 
-/// A shared, cluster-wide token bucket backed by a single Redis key.
+/// A set of shared token buckets, one Redis key each.
 ///
-/// One atomic `EVALSHA` per admission performs refill + consume + TTL using the
-/// Redis server clock, so every API and cluster-controller replica shares one
-/// rate with no client-clock skew, no `SELECT … FOR UPDATE`, and no
-/// transaction. The connection pool is lazy, so constructing this never blocks
+/// One atomic `EVALSHA` per admission performs refill + consume + TTL across
+/// every bucket the admission draws from, using the Redis server clock, so
+/// every API and cluster-controller replica shares one rate with no
+/// client-clock skew, no `SELECT … FOR UPDATE`, and no transaction. The connection pool is lazy, so constructing this never blocks
 /// on Redis reachability; connection failures surface at consume time and the
 /// caller fails open.
 #[derive(Clone)]
@@ -87,13 +105,45 @@ impl RedisTokenBucket {
         Ok(())
     }
 
-    /// Atomically refill and consume `requested` tokens from `key`. Returns the
-    /// admit/reject outcome and the remaining token count after the operation.
+    /// The token count `key` holds as last written, or `None` when no consume
+    /// has written it. Unlike a consume, this neither refills nor spends.
+    #[cfg(test)]
+    pub(super) async fn stored_tokens(&self, key: &str) -> Result<Option<f64>, BucketError> {
+        let mut conn = self.pool.get().await?;
+        let stored: Option<String> = deadpool_redis::redis::cmd("HGET")
+            .arg(key)
+            .arg("tokens")
+            .query_async(&mut conn)
+            .await?;
+        stored
+            .map(|tokens| {
+                tokens
+                    .parse::<f64>()
+                    .map_err(|_| BucketError::Parse(tokens))
+            })
+            .transpose()
+    }
+
+    /// `key`'s remaining time to live in seconds, as Redis's `TTL` reports it.
+    #[cfg(test)]
+    pub(super) async fn ttl(&self, key: &str) -> Result<i64, BucketError> {
+        let mut conn = self.pool.get().await?;
+        Ok(deadpool_redis::redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await?)
+    }
+
+    /// Atomically refill every bucket in `buckets` and take `requested` tokens
+    /// from each of them, or from none when any of them holds fewer. Returns
+    /// the admit/reject outcome and each bucket's count after the operation.
+    ///
+    /// The buckets go to one `EVALSHA`, so in a clustered Redis their keys must
+    /// hash to one slot; see `client_bucket_key` in the sibling `client_rate`
+    /// module.
     pub(super) async fn consume(
         &self,
-        key: &str,
-        refill_rps: f64,
-        burst: f64,
+        buckets: &[BucketSpec<'_>],
         requested: f64,
     ) -> Result<ConsumeOutcome, BucketError> {
         let span = redis_client_span("EVALSHA", &self.endpoint);
@@ -101,12 +151,10 @@ impl RedisTokenBucket {
             // Bound the whole operation so a stalled Redis / exhausted pool
             // surfaces as an error the caller fails open on, rather than
             // hanging the create path.
-            let result = tokio::time::timeout(
-                CONSUME_TIMEOUT,
-                self.consume_inner(key, refill_rps, burst, requested),
-            )
-            .await
-            .unwrap_or(Err(BucketError::Timeout(CONSUME_TIMEOUT)));
+            let result =
+                tokio::time::timeout(CONSUME_TIMEOUT, self.consume_inner(buckets, requested))
+                    .await
+                    .unwrap_or(Err(BucketError::Timeout(CONSUME_TIMEOUT)));
             record_redis_result(&tracing::Span::current(), result.as_ref().map(|_| ()));
             result
         }
@@ -116,26 +164,46 @@ impl RedisTokenBucket {
 
     async fn consume_inner(
         &self,
-        key: &str,
-        refill_rps: f64,
-        burst: f64,
+        buckets: &[BucketSpec<'_>],
         requested: f64,
     ) -> Result<ConsumeOutcome, BucketError> {
+        let mut invocation = TOKEN_BUCKET_SCRIPT.prepare_invoke();
+        invocation.arg(requested);
+        for bucket in buckets {
+            invocation
+                .key(bucket.key)
+                .arg(bucket.refill_rps)
+                .arg(bucket.burst);
+        }
         let mut conn = self.pool.get().await?;
-        let (allowed, remaining): (i64, String) = TOKEN_BUCKET_SCRIPT
-            .key(key)
-            .arg(refill_rps)
-            .arg(burst)
-            .arg(requested)
-            .invoke_async(&mut conn)
-            .await?;
-        let remaining = remaining
-            .parse::<f64>()
-            .map_err(|_| BucketError::Parse(remaining))?;
-        Ok(if allowed == 1 {
-            ConsumeOutcome::Admitted { remaining }
-        } else {
-            ConsumeOutcome::RateLimited { remaining }
+        // The script replies with an integer and then decimal strings; reading
+        // the whole reply as strings keeps it one array type, and an integer
+        // reply converts to its decimal text.
+        let reply: Vec<String> = invocation.invoke_async(&mut conn).await?;
+        let (Some((allowed, counts)), true) =
+            (reply.split_first(), reply.len() == buckets.len() + 1)
+        else {
+            return Err(BucketError::Arity {
+                got: reply.len(),
+                buckets: buckets.len(),
+            });
+        };
+        let remaining = counts
+            .iter()
+            .map(|count| {
+                count
+                    .parse::<f64>()
+                    .map_err(|_| BucketError::Parse(count.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let admitted = match allowed.as_str() {
+            "1" => true,
+            "0" => false,
+            _ => return Err(BucketError::Parse(allowed.clone())),
+        };
+        Ok(ConsumeOutcome {
+            admitted,
+            remaining,
         })
     }
 }

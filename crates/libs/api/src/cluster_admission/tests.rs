@@ -1,24 +1,25 @@
-use pplx_space_common_core::types::{ClientKey, NodeId};
+use pplx_space_common_core::types::ClientKey;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use sqlx::PgPool;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::redis::Redis;
 use tracing::Subscriber;
 use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 use uuid::Uuid;
 
-use super::redis_bucket::{ConsumeOutcome, RedisTokenBucket};
+use super::redis_bucket::{BucketSpec, RedisTokenBucket};
 use super::*;
 use crate::controllers::substrate::Substrate;
 // Direct is only a placeholder capacity source for most of this module's tests:
 // they need zero or some eligible nodes. `capacity_probe_failure_fails_open`
 // needs a count that fails, which only Direct's can.
-use crate::test_support::{direct_substrate, enabled_config};
+use crate::test_support::{
+    direct_substrate, enabled_config, seed_start_eligible_node, try_redis_admission, try_redis_url,
+};
 
 use pplx_space_test_env::TestResult;
 
@@ -47,39 +48,6 @@ fn admission_with_flags(
     }
 }
 
-/// A bucket pointed at a real Redis, plus an optional container handle that
-/// must be kept alive for the bucket's lifetime.
-///
-/// Prefers `SPACE_TEST_REDIS_URL` (e.g. a locally running `redis-server`) so
-/// the token-bucket Lua can be exercised without Docker; otherwise starts a
-/// throwaway Redis container. Returns `None` (skips the test) only when neither
-/// is available and the run opted out of required test dependencies.
-async fn try_redis_url() -> TestResult<Option<(Option<ContainerAsync<Redis>>, String)>> {
-    if let Ok(url) = std::env::var("SPACE_TEST_REDIS_URL")
-        && !url.trim().is_empty()
-    {
-        return Ok(Some((None, url.trim().to_string())));
-    }
-    // Start from the mirrored image (see `redis_image_ref`): the default
-    // `redis:5.0` would be an anonymous Docker Hub pull, whose per-IP quota is
-    // shared by every job on a CI agent.
-    let (image_name, image_tag) = pplx_space_db_test_fixtures::redis_image_ref()?;
-    let node = match Redis::default()
-        .with_name(image_name)
-        .with_tag(image_tag)
-        .start()
-        .await
-    {
-        Ok(node) => node,
-        Err(error) => {
-            pplx_space_db_test_fixtures::report_unavailable_dependency("redis", &error)?;
-            return Ok(None);
-        }
-    };
-    let port = node.get_host_port_ipv4(6379).await?;
-    Ok(Some((Some(node), format!("redis://127.0.0.1:{port}"))))
-}
-
 async fn try_redis_bucket() -> TestResult<Option<(Option<ContainerAsync<Redis>>, RedisTokenBucket)>>
 {
     match try_redis_url().await? {
@@ -88,39 +56,12 @@ async fn try_redis_bucket() -> TestResult<Option<(Option<ContainerAsync<Redis>>,
     }
 }
 
-async fn seed_start_eligible_node(pool: &PgPool) -> Result<(), sqlx::Error> {
-    let node_id = NodeId::new();
-    sqlx::query(
-        "INSERT INTO nodes (id, address, role, managed_by, state)
-         VALUES ($1, '127.0.0.1', 'worker', 'space', 'registered')",
-    )
-    .bind(node_id)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO node_direct (node_id, name, node_api_endpoint)
-         VALUES ($1, 'worker-test', '127.0.0.1:9802')",
-    )
-    .bind(node_id)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO node_status_snapshots (
-             node_id,
-             observed_at,
-             stale_after,
-             reachable,
-             role,
-             scheduling_status,
-             services,
-             updated_at
-         )
-         VALUES ($1, NOW(), NOW() + INTERVAL '1 hour', true, 'worker', 'ready', '[]'::jsonb, NOW())",
-    )
-    .bind(node_id)
-    .execute(pool)
-    .await?;
-    Ok(())
+fn spec(key: &str, refill_rps: f64, burst: f64) -> BucketSpec<'_> {
+    BucketSpec {
+        key,
+        refill_rps,
+        burst,
+    }
 }
 
 #[test]
@@ -130,6 +71,7 @@ fn sanitize_config_falls_back_to_absolute_cluster_defaults() {
         refill_rps: f64::NAN,
         burst: 0.0,
         redis_url: None,
+        client_rate: None,
     });
 
     assert!(!config.enabled);
@@ -146,6 +88,7 @@ fn sanitize_config_clamps_sub_one_burst_up_to_one() {
         refill_rps: 6.0,
         burst: 0.25,
         redis_url: None,
+        client_rate: None,
     });
     assert!((config.burst - 1.0).abs() < f64::EPSILON);
 }
@@ -346,7 +289,7 @@ fn the_cap_is_the_only_reason_a_caller_returns_before_its_token() {
     let refill_rps = 1e-4;
     let earliest = earliest_refill(1.0, refill_rps);
     assert_eq!(earliest, Duration::from_secs(10_000));
-    let hint = rate_limited_retry_after(0.0, refill_rps);
+    let hint = rate_limited_retry_after(&[(0.0, refill_rps)]);
     assert!(
         hint < earliest,
         "the cap should still bind at {refill_rps}/s: hint {hint:?} vs token at {earliest:?}"
@@ -363,7 +306,7 @@ fn a_subnormal_refill_rate_is_capped_rather_than_panicking() {
     // sandbox create path. `try_from_secs_f64` makes it an error the cap
     // absorbs. The node-side limiter carries the twin regression test,
     // `activation_admission_extreme_refill_rate_does_not_panic_retry_after`.
-    assert_hint_in_window(rate_limited_retry_after(0.0, 1e-320), RETRY_AFTER_CAP);
+    assert_hint_in_window(rate_limited_retry_after(&[(0.0, 1e-320)]), RETRY_AFTER_CAP);
     // And the other end of the same guard: a deficit that is already satisfied
     // must floor rather than take the unrepresentable-ratio branch.
     assert_eq!(earliest_refill(0.0, 60.0), RETRY_AFTER_FLOOR);
@@ -420,7 +363,7 @@ fn a_rate_limited_hint_is_paced_by_the_configured_refill_rate() {
     // 5 * (4/5)^200, about 2e-19.
     let earliest = Duration::from_secs(10);
     let sampled: BTreeSet<Duration> = (0..200)
-        .map(|_| rate_limited_retry_after(0.0, 0.1))
+        .map(|_| rate_limited_retry_after(&[(0.0, 0.1)]))
         .collect();
     let expected: BTreeSet<Duration> = (0..=RETRY_AFTER_JITTER.as_secs())
         .map(|offset| earliest + Duration::from_secs(offset))
@@ -431,7 +374,7 @@ fn a_rate_limited_hint_is_paced_by_the_configured_refill_rate() {
     assert_eq!(sampled, expected);
     // A high refill rate collapses onto the floor.
     let fast_refill: BTreeSet<Duration> = (0..200)
-        .map(|_| rate_limited_retry_after(0.0, 60.0))
+        .map(|_| rate_limited_retry_after(&[(0.0, 60.0)]))
         .collect();
     let floor_expected: BTreeSet<Duration> = (0..=RETRY_AFTER_JITTER.as_secs())
         .map(|offset| RETRY_AFTER_FLOOR + Duration::from_secs(offset))
@@ -488,7 +431,7 @@ async fn unreachable_redis_consume_errors() {
     // which the admission layer turns into a fail-open admit.
     let bucket = RedisTokenBucket::from_url("redis://127.0.0.1:1").expect("pool builds lazily");
     let result = bucket
-        .consume("space:test:unreachable", 6.0, 60.0, 1.0)
+        .consume(&[spec("space:test:unreachable", 6.0, 60.0)], 1.0)
         .await;
     assert!(
         result.is_err(),
@@ -503,7 +446,9 @@ async fn redis_consume_records_client_span_on_error() {
     let subscriber = tracing_subscriber::registry().with(capture.clone());
 
     let guard = tracing::subscriber::set_default(subscriber);
-    let result = bucket.consume("space:test:trace", 6.0, 60.0, 1.0).await;
+    let result = bucket
+        .consume(&[spec("space:test:trace", 6.0, 60.0)], 1.0)
+        .await;
     drop(guard);
 
     assert!(result.is_err(), "dead Redis endpoint should fail consume");
@@ -548,17 +493,11 @@ async fn shared_bucket_allows_burst_then_rejects() -> TestResult {
 
     // Tiny refill + single-token burst: the first consume drains it, the
     // second is rejected because refill over the round-trip is negligible.
-    let first = bucket.consume(&key, 0.001, 1.0, 1.0).await?;
-    assert!(
-        matches!(first, ConsumeOutcome::Admitted { .. }),
-        "{first:?}"
-    );
+    let first = bucket.consume(&[spec(&key, 0.001, 1.0)], 1.0).await?;
+    assert!(first.admitted, "{first:?}");
 
-    let second = bucket.consume(&key, 0.001, 1.0, 1.0).await?;
-    assert!(
-        matches!(second, ConsumeOutcome::RateLimited { .. }),
-        "{second:?}"
-    );
+    let second = bucket.consume(&[spec(&key, 0.001, 1.0)], 1.0).await?;
+    assert!(!second.admitted, "{second:?}");
     Ok(())
 }
 
@@ -631,19 +570,14 @@ async fn concurrent_consumers_cannot_overspend_shared_bucket() -> TestResult {
     };
     let key = format!("space:test:{}", Uuid::now_v7());
 
-    let first = bucket.consume(&key, 0.001, 1.0, 1.0);
-    let second = bucket.consume(&key, 0.001, 1.0, 1.0);
+    let buckets = [spec(&key, 0.001, 1.0)];
+    let first = bucket.consume(&buckets, 1.0);
+    let second = bucket.consume(&buckets, 1.0);
     let (first, second) = tokio::join!(first, second);
 
     let outcomes = [first?, second?];
-    let admitted = outcomes
-        .iter()
-        .filter(|outcome| matches!(outcome, ConsumeOutcome::Admitted { .. }))
-        .count();
-    let rejected = outcomes
-        .iter()
-        .filter(|outcome| matches!(outcome, ConsumeOutcome::RateLimited { .. }))
-        .count();
+    let admitted = outcomes.iter().filter(|outcome| outcome.admitted).count();
+    let rejected = outcomes.iter().filter(|outcome| !outcome.admitted).count();
     assert_eq!(
         admitted, 1,
         "exactly one consumer spends the token: {outcomes:?}"
@@ -748,6 +682,7 @@ async fn exhausted_bucket_rate_limits_activation() -> TestResult {
         refill_rps: config_refill_rps,
         burst: 1.0,
         redis_url: None,
+        client_rate: None,
     };
     let admission = admission(direct_substrate(&db.pool), config, Some(bucket));
 
@@ -833,6 +768,7 @@ async fn with_config_builds_bucket_from_config_redis_url() -> TestResult {
         refill_rps: 0.001,
         burst: 1.0,
         redis_url: Some(url),
+        client_rate: None,
     };
     let admission = ClusterSandboxAdmission::with_config(
         direct_substrate(&db.pool),
@@ -851,5 +787,482 @@ async fn with_config_builds_bucket_from_config_redis_url() -> TestResult {
         matches!(error, ClusterAdmissionError::RateLimited { .. }),
         "{error:?}"
     );
+    Ok(())
+}
+
+// --- Per-client activation rate -------------------------------------------
+
+#[test]
+fn a_client_rate_needs_a_positive_refill_and_at_least_one_token_of_burst() {
+    for refill in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            ClientActivationRate::new(refill, Some(5.0)),
+            None,
+            "{refill}"
+        );
+    }
+    // No burst, or an unusable one, is one second of refill.
+    let rate = |refill, burst| ClientActivationRate::new(refill, burst).expect("usable");
+    assert_eq!(rate(4.0, None).burst, 4.0);
+    assert_eq!(rate(4.0, Some(f64::NAN)).burst, 4.0);
+    // Below one token either way rounds up, or the client could never activate.
+    assert_eq!(rate(0.1, None).burst, 1.0);
+    assert_eq!(rate(4.0, Some(0.5)).burst, 1.0);
+    assert_eq!(rate(4.0, Some(20.0)).burst, 20.0);
+}
+
+#[test]
+fn the_env_client_rate_is_off_when_its_refill_is_unusable() {
+    let parse = ClientActivationRate::parse;
+    assert_eq!(
+        parse(" 2 ", Some("20")),
+        ClientActivationRate::new(2.0, Some(20.0))
+    );
+    assert_eq!(parse("2", None), ClientActivationRate::new(2.0, None));
+    // A bad burst keeps the rate, at one second of refill.
+    assert_eq!(
+        parse("2", Some("lots")),
+        ClientActivationRate::new(2.0, None)
+    );
+    // A bad refill is no per-client rate, never a built-in one.
+    assert_eq!(parse("fast", Some("20")), None);
+    assert_eq!(parse("0", Some("20")), None);
+}
+
+#[test]
+fn sanitize_config_drops_an_unusable_hand_built_client_rate() {
+    let config = |client_rate| {
+        sanitize_config(ClusterSandboxAdmissionConfig {
+            client_rate,
+            ..enabled_config()
+        })
+        .client_rate
+    };
+    assert_eq!(
+        config(Some(ClientActivationRate {
+            refill_rps: 0.0,
+            burst: 5.0,
+        })),
+        None
+    );
+    assert_eq!(
+        config(Some(ClientActivationRate {
+            refill_rps: 2.0,
+            burst: 0.0,
+        })),
+        ClientActivationRate::new(2.0, None)
+    );
+}
+
+/// Redis Cluster's key-to-slot mapping, from the cluster specification: CRC16
+/// (XMODEM) of the hash tag when the key has a non-empty `{...}`, of the whole
+/// key otherwise, mod 16384. Written out here because the redis crate doesn't
+/// export its copy.
+fn cluster_slot(key: &str) -> u16 {
+    let bytes = key.as_bytes();
+    let hashed = bytes
+        .iter()
+        .position(|b| *b == b'{')
+        .and_then(|open| {
+            let close = bytes[open + 1..].iter().position(|b| *b == b'}')?;
+            (close > 0).then(|| &bytes[open + 1..open + 1 + close])
+        })
+        .unwrap_or(bytes);
+    let mut crc: u16 = 0;
+    for byte in hashed {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc % 16384
+}
+
+#[test]
+fn every_client_bucket_shares_the_cluster_buckets_slot() {
+    // The spec's own check value, so the oracle above is the real function.
+    assert_eq!(cluster_slot("123456789"), 0x31C3);
+    let cluster = cluster_slot(SANDBOX_ACTIVATION_BUCKET);
+    for client in ["acme", "globex", "unknown", "a.b-c_d"] {
+        let key = client_bucket_key(client);
+        assert_eq!(cluster_slot(&key), cluster, "{key}");
+        assert_ne!(key, SANDBOX_ACTIVATION_BUCKET);
+    }
+}
+
+fn rate_flags(value: serde_json::Value) -> FeatureFlagClient {
+    FeatureFlagClient::fixed_json([(
+        pplx_space_feature_flags::SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG.key(),
+        value,
+    )])
+}
+
+#[test]
+fn the_quotas_flag_retunes_or_exempts_single_clients() {
+    let env_rate = ClientActivationRate::new(2.0, Some(20.0));
+    let flags = rate_flags(serde_json::json!({
+        // The concurrency limiter's fields share the flag and are ignored here.
+        "unspecified": 4,
+        "overrides": {"acme": 8},
+        "rate": {
+            "acme": {"refill_rps": 0.5, "burst": 5},
+            "globex": null,
+            "unknown": {"refill_rps": 1},
+            "typo": {"refill_rps": 0},
+        },
+    }));
+    let overrides = ClientRateOverrides::from_flags(true, &flags);
+    let rate_for = |client| ClientRateOverrides::rate_for(overrides.as_ref(), client, env_rate);
+
+    assert_eq!(rate_for("acme"), ClientActivationRate::new(0.5, Some(5.0)));
+    assert_eq!(rate_for("globex"), None, "null exempts the client");
+    assert_eq!(rate_for("unknown"), ClientActivationRate::new(1.0, None));
+    assert_eq!(rate_for("typo"), env_rate, "a bad entry keeps the env rate");
+    assert_eq!(
+        rate_for("other"),
+        env_rate,
+        "an absent entry keeps the env rate"
+    );
+    // With no env rate, only the flag's entries rate anyone.
+    assert_eq!(
+        ClientRateOverrides::rate_for(overrides.as_ref(), "other", None),
+        None
+    );
+}
+
+#[test]
+fn the_quotas_flag_rate_map_decodes_when_flagd_stringifies_it() {
+    let flags = rate_flags(serde_json::json!({
+        "rate": r#"{"acme": {"refill_rps": 0.5, "burst": 5}}"#,
+    }));
+    let overrides = ClientRateOverrides::from_flags(true, &flags);
+    assert_eq!(
+        ClientRateOverrides::rate_for(overrides.as_ref(), "acme", None),
+        ClientActivationRate::new(0.5, Some(5.0))
+    );
+}
+
+#[test]
+fn the_quotas_flag_falls_back_to_the_env_rate_when_it_cannot_apply() {
+    let rated = serde_json::json!({"rate": {"acme": {"refill_rps": 0.5}}});
+
+    // The env master is the hard off for the override, as for the gate.
+    let off = ClientRateOverrides::from_flags(false, &rate_flags(rated.clone()));
+    assert_eq!(off, None);
+    // No provider, and an assignment that doesn't parse.
+    assert_eq!(
+        ClientRateOverrides::from_flags(true, &FeatureFlagClient::disabled()),
+        None
+    );
+    let malformed = rate_flags(serde_json::json!({"rate": "not a map"}));
+    assert_eq!(ClientRateOverrides::from_flags(true, &malformed), None);
+}
+
+#[test]
+fn a_malformed_rate_entry_costs_only_its_own_key() {
+    let env_rate = ClientActivationRate::new(2.0, None);
+    let flags = rate_flags(serde_json::json!({
+        "rate": {
+            "acme": "fast",
+            "typo": {"refil_rps": 1},
+            "globex": null,
+            "initech": {"refill_rps": 0.5},
+        },
+    }));
+    let overrides = ClientRateOverrides::from_flags(true, &flags);
+    let rate_for = |client| ClientRateOverrides::rate_for(overrides.as_ref(), client, env_rate);
+
+    assert_eq!(rate_for("acme"), env_rate);
+    assert_eq!(rate_for("typo"), env_rate);
+    // The other keys' exemptions and rates survive the bad entries.
+    assert_eq!(rate_for("globex"), None);
+    assert_eq!(rate_for("initech"), ClientActivationRate::new(0.5, None));
+}
+
+#[test]
+fn a_two_bucket_rejection_waits_for_the_slower_bucket() {
+    // Cluster at 60/s is at the floor; a client at 0.1/s needs 10s for a whole
+    // token, so every hint sits in the window above 10s.
+    for _ in 0..50 {
+        assert_hint_in_window(
+            rate_limited_retry_after(&[(0.0, 60.0), (0.0, 0.1)]),
+            Duration::from_secs(10),
+        );
+    }
+    // Order doesn't matter, and one short bucket is the single-bucket hint.
+    for _ in 0..50 {
+        assert_hint_in_window(
+            rate_limited_retry_after(&[(0.0, 0.1), (0.0, 60.0)]),
+            Duration::from_secs(10),
+        );
+        assert_hint_in_window(
+            rate_limited_retry_after(&[(0.5, 0.1)]),
+            Duration::from_secs(5),
+        );
+    }
+}
+
+#[test]
+fn the_client_message_names_the_client_and_explains_unknown() {
+    let named = client_rate_limited_message(&client_key("acme"));
+    assert!(named.starts_with("Client rate limit:"), "{named}");
+    assert!(named.contains("`acme`"), "{named}");
+    assert!(!named.contains("X-Client-ID"), "{named}");
+    let unknown = client_rate_limited_message(ClientKey::unknown_ref());
+    assert!(unknown.contains("X-Client-ID"), "{unknown}");
+    assert!(unknown.contains("implicit wakes"), "{unknown}");
+}
+
+fn client_key(id: &str) -> ClientKey {
+    ClientKey::allowlisted(id).expect("a label-safe test client id")
+}
+
+/// Keys under a fresh namespace, so a shared test Redis and nextest retries
+/// never see another run's tokens.
+fn fresh_keys() -> (String, String) {
+    let cluster = format!("space:test:{}", Uuid::now_v7());
+    let client = format!("{{{cluster}}}:client:acme");
+    (cluster, client)
+}
+
+fn assert_tokens(actual: f64, expected: f64, what: &str) {
+    // The refill rates below are 0.001/s, so a slow test run moves a count by
+    // well under this.
+    assert!(
+        (actual - expected).abs() < 0.05,
+        "{what}: {actual} tokens, expected about {expected}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_client_bucket_takes_no_cluster_token() -> TestResult {
+    let Some((_node, bucket)) = try_redis_bucket().await? else {
+        return Ok(());
+    };
+    let (cluster, client) = fresh_keys();
+    let both = [spec(&cluster, 0.001, 5.0), spec(&client, 0.001, 1.0)];
+
+    let first = bucket.consume(&both, 1.0).await?;
+    assert!(first.admitted, "{first:?}");
+    assert_tokens(first.remaining[0], 4.0, "cluster after the admit");
+    assert_tokens(first.remaining[1], 0.0, "client after the admit");
+
+    for _ in 0..3 {
+        let rejected = bucket.consume(&both, 1.0).await?;
+        assert!(!rejected.admitted, "{rejected:?}");
+        assert_tokens(rejected.remaining[0], 4.0, "cluster after a rejection");
+        assert_tokens(rejected.remaining[1], 0.0, "client after a rejection");
+    }
+
+    // Read the cluster bucket on its own: every rejection left it untouched.
+    let cluster_only = bucket.consume(&[spec(&cluster, 0.001, 5.0)], 1.0).await?;
+    assert!(cluster_only.admitted, "{cluster_only:?}");
+    assert_tokens(
+        cluster_only.remaining[0],
+        3.0,
+        "cluster after its own consume",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_cluster_bucket_takes_no_client_token() -> TestResult {
+    let Some((_node, bucket)) = try_redis_bucket().await? else {
+        return Ok(());
+    };
+    let (cluster, client) = fresh_keys();
+    let both = [spec(&cluster, 0.001, 1.0), spec(&client, 0.001, 5.0)];
+
+    assert!(bucket.consume(&both, 1.0).await?.admitted);
+    for _ in 0..3 {
+        let rejected = bucket.consume(&both, 1.0).await?;
+        assert!(!rejected.admitted, "{rejected:?}");
+        assert_tokens(rejected.remaining[0], 0.0, "cluster after a rejection");
+        assert_tokens(rejected.remaining[1], 4.0, "client after a rejection");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_two_bucket_consumers_spend_both_buckets_together() -> TestResult {
+    let Some((_node, bucket)) = try_redis_bucket().await? else {
+        return Ok(());
+    };
+    let (cluster, client) = fresh_keys();
+    let both = [spec(&cluster, 0.001, 3.0), spec(&client, 0.001, 10.0)];
+
+    let outcomes = futures_util::future::join_all((0..8).map(|_| bucket.consume(&both, 1.0))).await;
+    let outcomes = outcomes.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let admitted = outcomes.iter().filter(|outcome| outcome.admitted).count();
+    assert_eq!(
+        admitted, 3,
+        "the cluster bucket admits its burst: {outcomes:?}"
+    );
+
+    // The five rejections took nothing from the client bucket either.
+    let after = bucket.consume(&[spec(&client, 0.001, 10.0)], 1.0).await?;
+    assert_tokens(
+        after.remaining[0],
+        6.0,
+        "client after 3 admits and its own consume",
+    );
+    Ok(())
+}
+
+/// An admission-path config: one token a second would refill during a test,
+/// so both rates are 0.001/s, and every bucket starts full.
+fn rated_config(
+    cluster_burst: f64,
+    client_rate: Option<ClientActivationRate>,
+) -> ClusterSandboxAdmissionConfig {
+    ClusterSandboxAdmissionConfig {
+        enabled: true,
+        refill_rps: 0.001,
+        burst: cluster_burst,
+        redis_url: None,
+        client_rate,
+    }
+}
+
+#[tokio::test]
+async fn a_client_over_its_rate_is_rejected_while_others_are_admitted() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let config = rated_config(10.0, ClientActivationRate::new(0.001, Some(2.0)));
+    let Some((_node, admission)) =
+        try_redis_admission(&db.pool, 2, config, FeatureFlagClient::disabled()).await?
+    else {
+        return Ok(());
+    };
+    // Fresh client keys, so a nextest retry starts from full client buckets.
+    let flooding = client_key(&format!("flood-{}", Uuid::now_v7()));
+    let other = client_key(&format!("other-{}", Uuid::now_v7()));
+
+    for class in [
+        ClusterActivationClass::Cold,
+        ClusterActivationClass::Restore,
+    ] {
+        admission.admit_activation(class, &flooding).await?;
+    }
+    for class in [
+        ClusterActivationClass::Cold,
+        ClusterActivationClass::Restore,
+    ] {
+        let error = admission
+            .admit_activation(class, &flooding)
+            .await
+            .expect_err("cold and restore share the client's bucket");
+        let message = error.to_string();
+        assert!(message.starts_with("Client rate limit:"), "{message}");
+        assert!(message.contains(flooding.as_str()), "{message}");
+        // The client's 0.001/s refill paces the hint, not the header floor.
+        assert!(
+            error.retry_after().expect("rate limit carries a hint")
+                > RETRY_AFTER_FLOOR + RETRY_AFTER_JITTER,
+            "{error:?}"
+        );
+    }
+
+    // Another client still gets in, and so does `unknown`, which has a bucket
+    // of its own.
+    admission
+        .admit_activation(ClusterActivationClass::Cold, &other)
+        .await?;
+    admission
+        .admit_activation(ClusterActivationClass::Cold, ClientKey::unknown_ref())
+        .await?;
+
+    // Four admits, and the two rejections took no token from either bucket.
+    let (cluster, client) = admission.stored_tokens(&flooding).await?;
+    assert_tokens(cluster.expect("charged"), 6.0, "cluster after four admits");
+    assert_tokens(client.expect("charged"), 0.0, "client after its two admits");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_cluster_bucket_is_reported_as_the_server_limit() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let config = rated_config(1.0, ClientActivationRate::new(0.001, Some(5.0)));
+    let Some((_node, admission)) =
+        try_redis_admission(&db.pool, 3, config, FeatureFlagClient::disabled()).await?
+    else {
+        return Ok(());
+    };
+    let client = client_key(&format!("client-{}", Uuid::now_v7()));
+
+    admission
+        .admit_activation(ClusterActivationClass::Cold, &client)
+        .await?;
+    let error = admission
+        .admit_activation(ClusterActivationClass::Cold, &client)
+        .await
+        .expect_err("the cluster bucket is empty");
+    let message = error.to_string();
+    assert!(message.starts_with("Server rate limit:"), "{message}");
+
+    // The cluster rejection took nothing from the client's bucket.
+    let (_, client_tokens) = admission.stored_tokens(&client).await?;
+    assert_tokens(
+        client_tokens.expect("charged"),
+        4.0,
+        "client after one admit",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_exempt_client_draws_only_from_the_cluster_bucket() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let client = client_key(&format!("exempt-{}", Uuid::now_v7()));
+    // An env rate of one token, which the flag lifts for this client.
+    let config = rated_config(10.0, ClientActivationRate::new(0.001, Some(1.0)));
+    let flags = rate_flags(serde_json::json!({"rate": {client.as_str(): null}}));
+    let Some((_node, admission)) = try_redis_admission(&db.pool, 4, config, flags).await? else {
+        return Ok(());
+    };
+    for _ in 0..3 {
+        admission
+            .admit_activation(ClusterActivationClass::Cold, &client)
+            .await?;
+    }
+    let (cluster, client_tokens) = admission.stored_tokens(&client).await?;
+    assert_tokens(cluster.expect("charged"), 7.0, "cluster after three admits");
+    assert_eq!(client_tokens, None, "an exempt client has no bucket");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_slow_bucket_outlives_its_refill_and_an_unbounded_one_is_capped() -> TestResult {
+    let Some((_node, bucket)) = try_redis_bucket().await? else {
+        return Ok(());
+    };
+    let (slow, unbounded) = fresh_keys();
+    // One token at 1e-8/s takes 1e8 seconds, about three years, to refill.
+    // At 1e-320/s `burst / rate` is infinite, past anything EXPIRE accepts:
+    // uncapped, the script fails after its writes and the caller admits open.
+    let both = [spec(&slow, 1e-8, 1.0), spec(&unbounded, 1e-320, 1.0)];
+
+    let first = bucket.consume(&both, 1.0).await?;
+    assert!(first.admitted, "{first:?}");
+    let second = bucket.consume(&both, 1.0).await?;
+    assert!(!second.admitted, "both tokens are spent: {second:?}");
+
+    // A key that expired early would come back full, handing out tokens the
+    // rate never refilled, so the slow key lives its whole refill time.
+    let slow_ttl = bucket.ttl(&slow).await?;
+    assert!(
+        (100_000_000..=100_000_010).contains(&slow_ttl),
+        "slow bucket TTL {slow_ttl}s"
+    );
+    assert_eq!(bucket.ttl(&unbounded).await?, 1_000_000_000_000);
     Ok(())
 }

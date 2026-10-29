@@ -210,7 +210,33 @@ pub fn node_refill_rps(value: f64) {
     );
 }
 
+/// The cluster activation limiter's bucket that decided an admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterAdmissionBucket {
+    /// The cluster-wide bucket every client shares. Every decision but a
+    /// per-client rejection carries it, including admits that also drew a
+    /// per-client token.
+    SandboxActivation,
+    /// The activating client's own bucket, which rejected while the cluster
+    /// bucket may have held a token.
+    ClientActivation,
+}
+
+impl ClusterAdmissionBucket {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SandboxActivation => "sandbox_activation",
+            Self::ClientActivation => "client_activation",
+        }
+    }
+}
+
+/// One cluster activation admission decision. `bucket` is
+/// `client_activation` only on a rejection by the activating client's own
+/// rate, so `reason:rate_limited` split by `bucket` separates a client over
+/// its rate from cluster-wide shedding.
 pub fn cluster_decision(
+    bucket: ClusterAdmissionBucket,
     operation_class: AdmissionOperationClass,
     decision: AdmissionDecision,
     reason: AdmissionRejectReason,
@@ -219,7 +245,7 @@ pub fn cluster_decision(
         "cluster.sandbox_admission.rate.decision",
         1,
         &[
-            tag("bucket", "sandbox_activation"),
+            tag("bucket", bucket.as_str()),
             tag("operation_class", operation_class.as_str()),
             tag("decision", decision.as_str()),
             tag("reason", reason.as_str()),

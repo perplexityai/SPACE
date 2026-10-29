@@ -227,6 +227,7 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
             refill_rps: 6.0,
             burst: 60.0,
             redis_url: None,
+            client_rate: None,
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
@@ -302,6 +303,7 @@ async fn direct_start_restore_spends_deferred_admission_at_entry() -> TestResult
             refill_rps: 6.0,
             burst: 60.0,
             redis_url: None,
+            client_rate: None,
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
@@ -557,6 +559,7 @@ async fn invalid_activation_options_reject_before_admission_and_requested_event(
             refill_rps: 6.0,
             burst: 60.0,
             redis_url: None,
+            client_rate: None,
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
@@ -766,6 +769,7 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
             refill_rps: 6.0,
             burst: 60.0,
             redis_url: None,
+            client_rate: None,
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );

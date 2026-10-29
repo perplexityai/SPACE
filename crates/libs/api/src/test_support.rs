@@ -73,6 +73,7 @@ pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
         refill_rps: 6.0,
         burst: 60.0,
         redis_url: None,
+        client_rate: None,
     }
 }
 
@@ -170,4 +171,119 @@ pub(crate) async fn finish_create_while_a_request_reads_operations<T: Send + 'st
     lock.commit().await?;
     connection.close().await?;
     Ok(request.await?)
+}
+
+/// A bucket pointed at a real Redis, plus an optional container handle that
+/// must be kept alive for the bucket's lifetime.
+///
+/// Prefers `SPACE_TEST_REDIS_URL` (e.g. a locally running `redis-server`) so
+/// the token-bucket Lua can be exercised without Docker; otherwise starts a
+/// throwaway Redis container. Returns `None` (skips the test) only when neither
+/// is available and the run opted out of required test dependencies.
+pub(crate) async fn try_redis_url() -> pplx_space_test_env::TestResult<
+    Option<(
+        Option<testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>>,
+        String,
+    )>,
+> {
+    use testcontainers::ImageExt as _;
+    use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::redis::Redis;
+
+    if let Ok(url) = std::env::var("SPACE_TEST_REDIS_URL")
+        && !url.trim().is_empty()
+    {
+        return Ok(Some((None, url.trim().to_string())));
+    }
+    // Start from the mirrored image (see `redis_image_ref`): the default
+    // `redis:5.0` would be an anonymous Docker Hub pull, whose per-IP quota is
+    // shared by every job on a CI agent.
+    let (image_name, image_tag) = pplx_space_db_test_fixtures::redis_image_ref()?;
+    let node = match Redis::default()
+        .with_name(image_name)
+        .with_tag(image_tag)
+        .start()
+        .await
+    {
+        Ok(node) => node,
+        Err(error) => {
+            pplx_space_db_test_fixtures::report_unavailable_dependency("redis", &error)?;
+            return Ok(None);
+        }
+    };
+    let port = node.get_host_port_ipv4(6379).await?;
+    Ok(Some((Some(node), format!("redis://127.0.0.1:{port}"))))
+}
+
+/// Seed one start-eligible Direct worker, so cluster admission over a Direct
+/// substrate sees a non-empty cluster.
+pub(crate) async fn seed_start_eligible_node(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let node_id = pplx_space_common_core::types::NodeId::new();
+    sqlx::query(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1', 'worker', 'space', 'registered')",
+    )
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO node_direct (node_id, name, node_api_endpoint)
+         VALUES ($1, 'worker-test', '127.0.0.1:9802')",
+    )
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO node_status_snapshots (
+             node_id,
+             observed_at,
+             stale_after,
+             reachable,
+             role,
+             scheduling_status,
+             services,
+             updated_at
+         )
+         VALUES ($1, NOW(), NOW() + INTERVAL '1 hour', true, 'worker', 'ready', '[]'::jsonb, NOW())",
+    )
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A Redis-backed cluster admission over a Direct substrate with one
+/// start-eligible node and full cluster and `unknown` buckets, plus the Redis container
+/// handle to keep alive. `None` skips the test, as [`try_redis_url`] does.
+///
+/// The admission uses logical DB `redis_db`, which the caller picks distinct
+/// per test: those two buckets' keys are fixed, and nextest runs these tests
+/// at the same time. Taken so far: 0 and 1 by `cluster_admission::tests`
+/// tests that build their buckets directly, 2 to 4 by its tests that use this,
+/// and 6 to 9 in `controllers::sandbox::queries::create_postgres_tests::pool_step`.
+pub(crate) async fn try_redis_admission(
+    pool: &PgPool,
+    redis_db: u8,
+    config: ClusterSandboxAdmissionConfig,
+    feature_flags: pplx_space_feature_flags::FeatureFlagClient,
+) -> pplx_space_test_env::TestResult<
+    Option<(
+        Option<testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>>,
+        crate::cluster_admission::ClusterSandboxAdmission,
+    )>,
+> {
+    let Some((node, url)) = try_redis_url().await? else {
+        return Ok(None);
+    };
+    seed_start_eligible_node(pool).await?;
+    let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
+        direct_substrate(pool),
+        ClusterSandboxAdmissionConfig {
+            redis_url: Some(format!("{}/{redis_db}", url.trim_end_matches('/'))),
+            ..config
+        },
+        feature_flags,
+    );
+    admission.clear_shared_buckets().await?;
+    Ok(Some((node, admission)))
 }

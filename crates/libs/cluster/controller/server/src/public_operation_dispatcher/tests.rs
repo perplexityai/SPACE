@@ -55,6 +55,7 @@ fn direct_native_executor(
                 refill_rps: 6.0,
                 burst: 60.0,
                 redis_url: None,
+                client_rate: None,
             },
             FeatureFlagClient::disabled(),
         ),
