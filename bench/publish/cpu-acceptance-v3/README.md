@@ -67,6 +67,7 @@ are not established by these results.
 | [c0f8acab](head-c0f8acab/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.337 | -0.3609% |
 | [88aefee5](head-88aefee5/README.md) | [Lane H](baseline-lane-h/README.md) | 3.352 → 3.357 | -0.1492% |
 | [8b345478](head-8b345478/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 3.362 | -0.7190% |
+| [f373db56](head-f373db56/README.md) | [Lane D](baseline-lane-d/README.md) | 3.319 → 3.311 | 0.2410% |
 | [74dba9b9](head-74dba9b9/README.md) | [Lane E](baseline-lane-e/README.md) | 3.338 → 3.346 | -0.2397% |
 | [16243df3](head-16243df3/README.md) | [Lane E](baseline-lane-e/README.md) | 3.338 → 3.343 | -0.1498% |
 | [71323bd8](head-71323bd8/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.349 | -0.7218% |
