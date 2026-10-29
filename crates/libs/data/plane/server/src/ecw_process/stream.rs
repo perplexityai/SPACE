@@ -688,6 +688,7 @@ where
         shutdown: Box::pin(lease.shutdown_token.cancelled_owned()),
         flushed_after_shutdown: None,
         delivered_any: false,
+        keepalive_deadline: None,
         start_wait: None,
         _stream_permit: lease.permit,
     }
@@ -720,6 +721,7 @@ pub(super) struct ProcessConnectJsonStream<S> {
     /// Whether any message reached the client, so a start knows whether it
     /// has reported itself yet.
     delivered_any: bool,
+    keepalive_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// How long a start that has not reported itself waits after the deadline.
     start_wait: Option<Pin<Box<tokio::time::Sleep>>>,
     _stream_permit: AttachedStreamPermit,
@@ -749,6 +751,10 @@ pub(super) const SHUTDOWN_FLUSH_BYTES: usize = 1024 * 1024;
 /// message once the stream sees the deadline, leaving the rest of the
 /// 5-second cancel grace to deliver it.
 pub(super) const SHUTDOWN_START_WAIT: Duration = Duration::from_secs(2);
+
+// Response body bytes keep idle HTTP intermediaries alive; backend transport
+// keepalives do not reach the ECW client. This does not renew the process lease.
+const PROCESS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 impl<S> ProcessConnectJsonStream<S> {
     fn end_for_shutdown(&mut self) -> Bytes {
@@ -810,6 +816,20 @@ where
         loop {
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => {
+                    match &event.event {
+                        Some(spaced_ops::process_event::Event::Started(_))
+                        | Some(spaced_ops::process_event::Event::Connected(_)) => {
+                            // Start must reach the SDK before any keepalive.
+                            if !this.delivered_any {
+                                this.keepalive_deadline =
+                                    Some(Box::pin(tokio::time::sleep(PROCESS_KEEPALIVE_INTERVAL)));
+                            }
+                        }
+                        Some(spaced_ops::process_event::Event::Exit(_)) => {
+                            this.keepalive_deadline = None;
+                        }
+                        _ => {}
+                    }
                     if let Some(bytes) = ecw_connect::process_event_to_connect_message(
                         event,
                         this.connected_as_start,
@@ -820,6 +840,11 @@ where
                             flushed.bytes += bytes.len();
                         }
                         this.delivered_any = true;
+                        if let Some(deadline) = this.keepalive_deadline.as_mut() {
+                            deadline
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + PROCESS_KEEPALIVE_INTERVAL);
+                        }
                         record_ecw_process_stream_bytes(&bytes);
                         return Poll::Ready(Some(Ok(bytes)));
                     }
@@ -874,6 +899,20 @@ where
                         let bytes = ecw_connect::connect_error_end_stream(
                             tonic::Code::Unavailable,
                             PROCESS_STREAM_STALL_MESSAGE,
+                        );
+                        record_ecw_process_stream_bytes(&bytes);
+                        return Poll::Ready(Some(Ok(bytes)));
+                    }
+                    if this.delivered_any
+                        && let Some(deadline) = this.keepalive_deadline.as_mut()
+                        && deadline.as_mut().poll(cx).is_ready()
+                    {
+                        deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + PROCESS_KEEPALIVE_INTERVAL);
+                        let bytes = ecw_connect::connect_json_message(
+                            serde_json::json!({"event": {"keepalive": {}}}),
+                            false,
                         );
                         record_ecw_process_stream_bytes(&bytes);
                         return Poll::Ready(Some(Ok(bytes)));

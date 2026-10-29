@@ -1490,3 +1490,115 @@ async fn process_stream_flush_after_the_deadline_is_capped_in_bytes() {
     assert!(delivered >= SHUTDOWN_FLUSH_BYTES);
     assert!(delivered < SHUTDOWN_FLUSH_BYTES + 512 * 1024, "{delivered}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn quiet_process_stream_keeps_transport_alive_without_changing_command_events() {
+    for connected_as_start in [false, true] {
+        let process_id = ProcessId::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut stream = shutdown_test_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+            connected_as_start,
+            &CancellationToken::new(),
+        );
+        // The SDK must receive start before any keepalive, even if opening is slow.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(futures_util::poll!(stream.next()).is_pending());
+        let start = if connected_as_start {
+            connected_process_event(&process_id)
+        } else {
+            started_process_event(&process_id)
+        };
+        tx.send(Ok(start)).await.unwrap();
+        let bytes = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes[5..]).unwrap(),
+            serde_json::json!({"event": {"start": {"pid": 123}}})
+        );
+        // A quiet command can outlive several proxy idle windows. Each receive
+        // has its own idle budget, as an HTTP intermediary would.
+        for _ in 0..3 {
+            let bytes = tokio::time::timeout(Duration::from_secs(30), stream.next())
+                .await
+                .expect("quiet stream must emit before the transport idles")
+                .unwrap()
+                .unwrap();
+            assert_eq!(bytes[0], 0);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes[5..]).unwrap(),
+                serde_json::json!({"event": {"keepalive": {}}})
+            );
+            assert!(
+                futures_util::poll!(stream.next()).is_pending(),
+                "no heartbeat burst"
+            );
+        }
+        // Ready output and exit take priority over a due keepalive.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tx.send(Ok(stdout_process_event(&process_id, b"done")))
+            .await
+            .unwrap();
+        tx.send(Ok(exited_process_event(&process_id)))
+            .await
+            .unwrap();
+        let bytes = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes[5..]).unwrap(),
+            serde_json::json!({"event": {"data": {"stdout": "ZG9uZQ=="}}})
+        );
+        let bytes = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes[5..]).unwrap(),
+            serde_json::json!({"event": {"end": {"exitCode": 0, "exited": true, "status": "exited"}}})
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            futures_util::poll!(stream.next()).is_pending(),
+            "no keepalive after exit"
+        );
+        drop(tx);
+        assert_eq!(stream.next().await.unwrap().unwrap()[0], 2);
+        assert!(stream.next().await.is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn quiet_process_keepalive_does_not_extend_deadlines() {
+    for shutdown in [false, true] {
+        let limiter = Arc::new(crate::state::AttachedStreamLimiter::new(4, 4, 4));
+        let token = CancellationToken::new();
+        let backend = futures_util::stream::iter([Ok(started_process_event(&ProcessId::new()))])
+            .chain(futures_util::stream::pending());
+        let mut stream = Box::pin(process_connect_json_stream(
+            backend,
+            "Process.Start",
+            &test_ecw_route(1),
+            false,
+            ecw_connect::EcwProcessStdoutStream::Stdout,
+            Some(Duration::from_secs(30)),
+            EcwProcessStreamLease {
+                permit: limiter.try_acquire_label(ECW_PROCESS_STREAM_KIND).unwrap(),
+                shutdown_token: token.clone(),
+            },
+        ));
+        stream.next().await.unwrap().unwrap(); // start
+        let bytes = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes[5..]).unwrap(),
+            serde_json::json!({"event": {"keepalive": {}}})
+        );
+        if shutdown {
+            token.cancel();
+        }
+        let end = tokio::time::timeout(Duration::from_secs(15), stream.next())
+            .await
+            .expect("keepalive must not extend the deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            end[0], 2,
+            "deadline wins over a simultaneously due heartbeat"
+        );
+        assert!(stream.next().await.is_none());
+    }
+}
