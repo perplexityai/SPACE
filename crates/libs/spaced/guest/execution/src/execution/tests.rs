@@ -370,3 +370,41 @@ fn process_retention_is_bounded() {
     )
     .expect("the maximum window is accepted");
 }
+
+#[tokio::test]
+async fn execution_instance_follows_the_service_lifetime() {
+    let create = || {
+        ExecutionService::with_config(
+            CancellationToken::new(),
+            ExecutionServiceConfig {
+                identity_policy: IdentityPolicy::Guest,
+                filesystem_execution: FilesystemExecutionMode::Direct,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let service = create();
+    let info = service.process_execution_info();
+    assert!(!uuid::Uuid::parse_str(&info.instance_id).unwrap().is_nil());
+    assert!(
+        info.capabilities
+            .iter()
+            .any(|name| name == "process_output_gap_resume")
+    );
+    let clone = service.clone();
+    service
+        .configure_process_env(EnvMap::empty())
+        .await
+        .unwrap();
+    assert_eq!(clone.process_execution_info(), info);
+    service.close();
+    service.drain().await.unwrap();
+    assert_eq!(clone.process_execution_info(), info);
+    let replacement = create();
+    assert_ne!(
+        replacement.process_execution_info().instance_id,
+        info.instance_id
+    );
+    replacement.drain().await.unwrap();
+}

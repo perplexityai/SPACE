@@ -44,7 +44,6 @@
 "crates/libs/credential/mgr/server/src/run.rs" = 1130
 "crates/libs/credential/mgr/server/src/service.rs" = 1052
 "crates/libs/data/plane/server/src/ecw_files.rs" = 1521
-"crates/libs/data/plane/server/src/ecw_process.rs" = 1615
 "crates/libs/data/plane/server/src/lib.rs" = 1550
 "crates/libs/data/plane/server/src/native.rs" = 3046
 "crates/libs/data/plane/server/src/state.rs" = 1830
@@ -60,7 +59,7 @@
 "crates/libs/net/gateway/server/src/state.rs" = 1086
 "crates/libs/net/gateway/server/src/udp_proxy.rs" = 1345
 "crates/libs/node/api/server/src/worker.rs" = 1222
-"crates/libs/node/api/sim/src/worker.rs" = 1881
+"crates/libs/node/api/sim/src/worker.rs" = 1666
 "crates/libs/node/ctl/server/src/facets.rs" = 2765
 "crates/libs/node/ctl/server/src/lib.rs" = 1918
 "crates/libs/node/mgr/server/src/firewall.rs" = 1497
@@ -84,13 +83,12 @@
 "crates/libs/sbx/mgr/server/src/service/create.rs" = 1195
 "crates/libs/sbx/mgr/server/src/service/grpc_core.rs" = 1087
 "crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/suspend_snapshot.rs" = 1016
-"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1620
+"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1618
 "crates/libs/sbx/mgr/server/src/service/grpc_state_snapshot.rs" = 1831
-"crates/libs/sbx/mgr/server/src/service/mod.rs" = 1757
+"crates/libs/sbx/mgr/server/src/service/mod.rs" = 1755
 "crates/libs/sbx/mgr/server/src/service/network_runtime.rs" = 1112
 "crates/libs/sbx/mgr/server/src/service/recovery.rs" = 2017
 "crates/libs/sbx/mgr/server/src/service/recovery_cross_node.rs" = 1946
-"crates/libs/sbx/mgr/server/src/service/spaced_bridge.rs" = 1024
 "crates/libs/sbx/mgr/server/src/service/start.rs" = 2302
 "crates/libs/sbx/mgr/server/src/service/suspend_snapshot_publication.rs" = 1006
 "crates/libs/sbx/mgr/server/src/snapshot_restore.rs" = 2150
@@ -101,7 +99,6 @@
 "crates/libs/sbx/mgr/store/src/db/quarantine_recovery.rs" = 1042
 "crates/libs/sbx/mgr/store/src/db/sandboxes.rs" = 1516
 "crates/libs/spaced/host/client/src/lib.rs" = 1040
-"crates/libs/spaced/host/server/src/bridge.rs" = 1249
 "crates/libs/template/mgr/src/db.rs" = 1276
 "crates/libs/template/mgr/src/service.rs" = 1871
 "crates/libs/template/mgr/src/volume.rs" = 2294

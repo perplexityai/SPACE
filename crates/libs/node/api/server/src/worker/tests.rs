@@ -287,3 +287,13 @@ async fn sandbox_kill_is_admitted_while_every_sandbox_permit_is_held() {
         .await;
     assert_eq!(sandbox_kill.unwrap_err().code(), tonic::Code::Unimplemented);
 }
+
+#[test]
+fn discovery_only_advertises_forwarded_process_capabilities() {
+    let mut capabilities = vec![
+        "process_output_gap_resume".to_owned(),
+        "future_process_contract".to_owned(),
+    ];
+    retain_process_capabilities(&mut capabilities);
+    assert_eq!(capabilities, ["process_output_gap_resume"]);
+}

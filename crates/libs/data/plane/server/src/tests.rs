@@ -3614,7 +3614,8 @@ fn process_events_map_to_native_data_plane_frames() {
             })),
         },
         &mut seq,
-    );
+    )
+    .unwrap();
     assert_eq!(stdout.output_bytes, 5);
     assert_eq!(
         stdout.frames,
@@ -3656,7 +3657,8 @@ fn process_events_map_to_native_data_plane_frames() {
                 })),
             },
             &mut seq,
-        );
+        )
+        .unwrap();
         assert_eq!(exited.output_bytes, 0);
         assert_eq!(
             exited.frames,
@@ -3667,6 +3669,26 @@ fn process_events_map_to_native_data_plane_frames() {
             }]
         );
     }
+    // Native connects never ask to continue past lost output, so a gap fails
+    // the stream instead of disappearing.
+    let gap = process_event_frames(
+        ProcessEvent {
+            process_id: "proc-1".to_string(),
+            pid: Some(7),
+            event: Some(spaced_process_event::Event::OutputGap(
+                pplx_space_sbx_mgr_client::operations::ProcessOutputGap {
+                    skipped_events: 1,
+                    output_cursor: 2,
+                    output_bytes_before: 3,
+                },
+            )),
+        },
+        &mut seq,
+    );
+    assert!(matches!(
+        gap,
+        Err(StreamBridgeError::BackendStatus(status)) if status.code() == tonic::Code::DataLoss
+    ));
 }
 
 #[test]

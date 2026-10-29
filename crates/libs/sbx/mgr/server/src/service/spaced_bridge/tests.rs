@@ -306,6 +306,7 @@ fn process_event_to_spaced_keeps_the_connected_output_cursor() {
         pid: Some(123),
         event: Some(host_proto::process_event::Event::Connected(
             host_proto::ProcessConnected {
+                resume_after_output_gap: false,
                 output_cursor: Some(9),
             },
         )),
@@ -317,6 +318,7 @@ fn process_event_to_spaced_keeps_the_connected_output_cursor() {
         spaced.event,
         Some(crate::proto::spaced_process_event::Event::Connected(
             SpacedProcessConnected {
+                resume_after_output_gap: false,
                 output_cursor: Some(9)
             }
         ))
@@ -527,4 +529,83 @@ async fn producer_panic_is_an_explicit_stream_error() {
     assert_eq!(error.code(), tonic::Code::Internal);
     assert_eq!(error.message(), "route stream forwarding task failed");
     assert!(response.next().await.is_none());
+}
+
+#[tokio::test]
+async fn process_reconnect_options_reach_the_host() {
+    use pplx_space_spaced_host_client::{SpacedHostClient, SpacedHostClientConfig};
+    use tokio_stream::wrappers::UnixListenerStream;
+
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("host.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received = recorded.clone();
+    let connect = tower::service_fn(move |request: Request<host_proto::ConnectProcessRequest>| {
+        received.lock().unwrap().push(request.into_inner());
+        std::future::ready(Ok::<_, Status>(Response::new(
+            futures_util::stream::empty::<Result<host_proto::ProcessEvent, Status>>(),
+        )))
+    });
+    let rpc = tower::service_fn(move |request: http::Request<tonic::body::Body>| {
+        assert_eq!(
+            request.uri().path(),
+            "/space.spaced.host.v1.Process/ConnectProcess"
+        );
+        let connect = connect.clone();
+        async move {
+            Ok::<_, std::convert::Infallible>(
+                tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                    .server_streaming(connect, request)
+                    .await,
+            )
+        }
+    });
+    let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .serve_with_incoming(rpc, UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    }));
+    let client = SpacedHostClient::new_with_config(
+        SpacedHostClientConfig::default().with_socket_path(socket),
+    )
+    .await
+    .unwrap();
+    for resume_after_output_gap in [None, Some(false), Some(true)] {
+        let operation = pplx_space_sbx_mgr_client::operations::ConnectProcessRequest {
+            process_id: "process".into(),
+            timeout: Some(prost_types::Duration {
+                seconds: 2,
+                nanos: 0,
+            }),
+            output_cursor: Some(7),
+            resume_from_oldest_retained: true,
+            resume_after_output_gap,
+        };
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_process_stream(&client, &operation),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(stream.message().await.unwrap().is_none());
+        let actual = recorded
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("host received a request");
+        assert_eq!(actual.process_id, operation.process_id);
+        assert_eq!(actual.timeout, operation.timeout);
+        assert_eq!(actual.output_cursor, operation.output_cursor);
+        assert!(actual.resume_from_oldest_retained);
+        // The convenience client omits false; only true opts into recovery.
+        assert_eq!(
+            actual.resume_after_output_gap,
+            resume_after_output_gap.filter(|enabled| *enabled)
+        );
+    }
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }

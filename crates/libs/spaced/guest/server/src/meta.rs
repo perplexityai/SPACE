@@ -110,6 +110,7 @@ impl SpacedGuestService {
             compatibility_family: pplx_space_spaced_common::spaced_compatibility_family(),
             mem_total_bytes: ready.then(guest_mem_total_bytes).flatten(),
             vcpu_count: ready.then(guest_vcpu_count).flatten(),
+            process_execution: ready.then(|| self.inner.execution.process_execution_info()),
         }
     }
 

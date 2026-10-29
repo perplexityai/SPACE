@@ -428,6 +428,7 @@ async fn pending_process_stream_stops_when_receiver_closes() {
             changed: journal.subscribe(),
             next_sequence: 0,
             primary: None,
+            gap_resume: None,
         }),
     );
 
@@ -514,6 +515,7 @@ async fn process_journal_reports_lag_when_local_ring_evicts_output() {
                 changed: journal.subscribe(),
                 next_sequence: 0,
                 primary: None,
+                gap_resume: None,
             }),
         );
         for _ in 0..count {
@@ -548,7 +550,7 @@ async fn attached_output_backpressures_and_disconnect_releases_the_producer() {
             shared_bytes,
         ))));
         let process_id = ProcessId::new();
-        let cursor = journal.cursor(Some(0), false);
+        let cursor = journal.cursor(Some(0), false, None);
         let event = process_stdout_event(&process_id, Some(1), vec![b'a'; 8192]);
         while journal.try_append_output(event.clone()).is_none() {}
         let tail = journal.tail_cursor();
@@ -650,7 +652,7 @@ async fn fallback_drain_bounds_inherited_writer_despite_consuming_reader() {
     let pid = std::process::id();
     let journal = Arc::new(ProcessEventJournal::new(output_slots()));
     let mut stream =
-        process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0), false)));
+        process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0), false, None)));
     let event = process_stdout_event(&id, Some(pid), vec![0; 8192]);
     while journal.try_append_output(event.clone()).is_none() {}
     let (blocked, mut pending) = tokio::sync::mpsc::channel(1);
@@ -797,6 +799,67 @@ async fn kill_reaped_process_releases_stalled_output_and_capacity() {
     drop(stream);
 }
 
+// A reader that asked to resume learns how much it missed and keeps reading:
+// the gap names the next cursor, and the bytes before it plus the bytes still
+// retained account for everything the process wrote.
+#[tokio::test]
+async fn a_resumed_reader_reports_the_output_gap_and_continues() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+
+    let process_id = ProcessId::new();
+    let (chunk_bytes, count) = (8192_u64, 600_u64);
+    let journal = Arc::new(ProcessEventJournal::new(output_slots()));
+    let mut resumed = process_event_stream_with_prefix(
+        Vec::new(),
+        // An observer, so the journal evicts rather than holding output back.
+        Some(ProcessJournalCursor {
+            journal: Arc::downgrade(&journal),
+            changed: journal.subscribe(),
+            next_sequence: 0,
+            primary: None,
+            gap_resume: Some(OutputGapResume {
+                process_id: process_id.as_str().to_string(),
+                pid: Some(1),
+            }),
+        }),
+    );
+    for _ in 0..count {
+        journal.append_output(process_stdout_event(
+            &process_id,
+            Some(1),
+            vec![b'a'; chunk_bytes as usize],
+        ));
+    }
+    let ProcessJournalRead::Lagged {
+        first_sequence: resume_sequence,
+        ..
+    } = journal.read(0)
+    else {
+        panic!("the journal evicted unread output");
+    };
+
+    let gap = resumed
+        .next()
+        .await
+        .unwrap()
+        .expect("a resumed reader does not fail");
+    assert_eq!(gap.process_id, process_id.as_str());
+    let Some(Event::OutputGap(gap)) = gap.event else {
+        panic!("the first event reports the gap: {gap:?}");
+    };
+    assert_eq!(gap.skipped_events, resume_sequence);
+    assert_eq!(gap.output_cursor, resume_sequence);
+    assert_eq!(gap.output_bytes_before, resume_sequence * chunk_bytes);
+    let mut retained = 0;
+    for _ in resume_sequence..count {
+        match resumed.next().await.unwrap().unwrap().event {
+            Some(Event::Stdout(output)) => retained += output.data.len() as u64,
+            other => panic!("only retained output follows the gap: {other:?}"),
+        }
+    }
+    assert_eq!(gap.output_bytes_before + retained, count * chunk_bytes);
+}
+
 #[test]
 fn process_journal_drops_oversized_chunk_without_panicking() {
     let journal = ProcessEventJournal::new(output_slots());
@@ -863,6 +926,7 @@ async fn completed_cursor_keeps_terminal_event_without_retaining_journal() {
         changed: journal.subscribe(),
         next_sequence: 0,
         primary: None,
+        gap_resume: None,
     };
     journal.complete(exit.clone());
     drop(journal);
@@ -877,35 +941,73 @@ async fn completed_cursor_keeps_terminal_event_without_retaining_journal() {
 
 #[tokio::test]
 async fn evicted_cursor_reports_lag_before_terminal_event() {
-    let journal = Arc::new(ProcessEventJournal::new(output_slots()));
-    let process_id = ProcessId::new();
-    journal.append_output(process_stdout_event(
-        &process_id,
-        Some(1),
-        b"unread".to_vec(),
-    ));
-    let exit = process_stdout_event(&process_id, Some(1), b"terminal".to_vec());
-    let cursor = ProcessJournalCursor {
-        journal: Arc::downgrade(&journal),
-        changed: journal.subscribe(),
-        next_sequence: 0,
-        primary: None,
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        ProcessOutputGap, process_event::Event,
     };
-    journal.complete(exit);
-    drop(journal);
 
-    let events = process_event_stream_with_prefix(Vec::new(), Some(cursor))
-        .collect::<Vec<_>>()
-        .await;
+    for (resume_after_output_gap, release_output_only) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let journal = Arc::new(ProcessEventJournal::new(output_slots()));
+        let process_id = ProcessId::new();
+        journal.append_output(process_stdout_event(
+            &process_id,
+            Some(1),
+            b"unread".to_vec(),
+        ));
+        let exit = process_stdout_event(&process_id, Some(1), b"terminal".to_vec());
+        let cursor = ProcessJournalCursor {
+            journal: Arc::downgrade(&journal),
+            changed: journal.subscribe(),
+            next_sequence: 0,
+            primary: None,
+            gap_resume: resume_after_output_gap.then(|| OutputGapResume {
+                process_id: process_id.as_str().to_string(),
+                pid: Some(1),
+            }),
+        };
+        journal.complete(exit.clone());
+        let retained = if release_output_only {
+            journal.backdate_completion(Duration::from_secs(2));
+            assert!(journal.release_output_if_due(Duration::from_secs(1)));
+            Some(journal)
+        } else {
+            drop(journal);
+            None
+        };
 
-    assert_eq!(events.len(), 1);
-    assert_eq!(
-        events[0]
-            .as_ref()
-            .expect_err("lagged replay must fail")
-            .code(),
-        tonic::Code::ResourceExhausted
-    );
+        let events = process_event_stream_with_prefix(Vec::new(), Some(cursor))
+            .collect::<Vec<_>>()
+            .await;
+
+        if !resume_after_output_gap {
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0]
+                    .as_ref()
+                    .expect_err("lagged replay must fail")
+                    .code(),
+                tonic::Code::ResourceExhausted
+            );
+            continue;
+        }
+        // The record is gone, so everything unread before the exit is a gap.
+        let events = events
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("a resumed reader does not fail");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event,
+            Some(Event::OutputGap(ProcessOutputGap {
+                skipped_events: 1,
+                output_cursor: 1,
+                output_bytes_before: b"unread".len() as u64,
+            }))
+        );
+        assert_eq!(events[1], exit);
+        drop(retained);
+    }
 }
 
 /// A cursor past the written output fails at once, whether the process is
@@ -926,8 +1028,10 @@ async fn cursor_past_the_output_fails_instead_of_waiting() {
             journal.complete(exit.clone());
         }
 
-        let mut ahead =
-            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(5), false)));
+        let mut ahead = process_event_stream_with_prefix(
+            Vec::new(),
+            Some(journal.cursor(Some(5), false, None)),
+        );
         let error = tokio::time::timeout(Duration::from_secs(1), ahead.next())
             .await
             .expect("a cursor past the output must not wait")
@@ -947,8 +1051,10 @@ async fn cursor_past_the_output_fails_instead_of_waiting() {
         );
         assert!(ahead.next().await.is_none());
 
-        let mut at_end =
-            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(1), false)));
+        let mut at_end = process_event_stream_with_prefix(
+            Vec::new(),
+            Some(journal.cursor(Some(1), false, None)),
+        );
         let next = tokio::time::timeout(Duration::from_millis(100), at_end.next()).await;
         if completed {
             assert_eq!(next.unwrap().unwrap().unwrap(), exit);
@@ -975,7 +1081,7 @@ async fn lagged_cursor_reports_the_oldest_retained_output() {
     journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
 
     let mut lagged =
-        process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0), false)));
+        process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(0), false, None)));
     let error = lagged.next().await.unwrap().unwrap_err();
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     let metadata = |key| {
@@ -999,7 +1105,7 @@ async fn lagged_cursor_reports_the_oldest_retained_output() {
 
     let mut retained = process_event_stream_with_prefix(
         Vec::new(),
-        Some(journal.cursor(Some(first_sequence), false)),
+        Some(journal.cursor(Some(first_sequence), false, None)),
     );
     let event = retained.next().await.unwrap().unwrap();
     assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
@@ -1013,31 +1119,46 @@ async fn lagged_cursor_reports_the_oldest_retained_output() {
 async fn lagged_cursor_from_oldest_retained_starts_there_and_holds_it() {
     use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
 
-    let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(0))));
-    let process_id = ProcessId::new();
-    journal.append_output(process_stdout_event(
-        &process_id,
-        Some(1),
-        vec![0; PROCESS_OUTPUT_RETENTION_BYTES],
-    ));
-    journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
+    for (from_oldest, gap_resume) in [(true, false), (false, true), (true, true)] {
+        let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(0))));
+        let process_id = ProcessId::new();
+        journal.append_output(process_stdout_event(
+            &process_id,
+            Some(1),
+            vec![0; PROCESS_OUTPUT_RETENTION_BYTES],
+        ));
+        journal.append_output(process_stdout_event(&process_id, Some(1), b"kept".to_vec()));
 
-    let cursor = journal.cursor(Some(0), true);
-    assert_eq!(
-        cursor.next_sequence, 1,
-        "starts at the oldest retained output"
-    );
-    let more = process_stdout_event(&process_id, Some(1), vec![0; 8192]);
-    let waited = (0..2 * PROCESS_OUTPUT_RETENTION_BYTES / 8192)
-        .any(|_| journal.try_append_output(more.clone()).is_some());
-    assert!(
-        waited,
-        "later output waits for the reader instead of evicting"
-    );
+        let cursor = journal.cursor(
+            Some(0),
+            from_oldest,
+            gap_resume.then(|| OutputGapResume {
+                process_id: process_id.as_str().to_string(),
+                pid: Some(1),
+            }),
+        );
+        let more = process_stdout_event(&process_id, Some(1), vec![0; 8192]);
+        let waited = (0..2 * PROCESS_OUTPUT_RETENTION_BYTES / 8192)
+            .any(|_| journal.try_append_output(more.clone()).is_some());
+        assert!(
+            waited,
+            "later output waits for the reader instead of evicting"
+        );
 
-    let mut retained = process_event_stream_with_prefix(Vec::new(), Some(cursor));
-    let event = retained.next().await.unwrap().unwrap();
-    assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
+        let mut retained = process_event_stream_with_prefix(Vec::new(), Some(cursor));
+        if gap_resume {
+            let event = retained.next().await.unwrap().unwrap();
+            assert!(
+                matches!(event.event, Some(Event::OutputGap(gap)) if gap.output_cursor == 1 && gap.skipped_events == 1)
+            );
+            assert!(
+                journal.try_append_output(more.clone()).is_some(),
+                "reporting the gap must not release retained output"
+            );
+        }
+        let event = retained.next().await.unwrap().unwrap();
+        assert!(matches!(event.event, Some(Event::Stdout(output)) if output.data == b"kept"));
+    }
 }
 
 #[tokio::test]
@@ -1641,6 +1762,7 @@ async fn a_completed_process_exit_stays_connectable_until_its_retention_ends() {
         Process::connect_process(
             &service,
             Request::new(ConnectProcessRequest {
+                resume_after_output_gap: None,
                 process_id: process_id.into(),
                 timeout: None,
                 output_cursor: None,
@@ -1790,6 +1912,7 @@ async fn a_completed_process_releases_its_output_after_the_idempotency_window() 
     let events = Process::connect_process(
         &service,
         Request::new(ConnectProcessRequest {
+            resume_after_output_gap: None,
             process_id: process_id.into(),
             timeout: None,
             output_cursor: None,
@@ -2371,6 +2494,115 @@ async fn completed_process_replay_follows_configured_retention() {
     assert!(
         registry.records.is_empty(),
         "the retry must not spawn a new process"
+    );
+    shut_down(&service).await;
+}
+
+// Through ConnectProcess: a caller that opts in reads a noisy process to its
+// exit, learning exactly how many bytes it missed; one that does not keeps the
+// lagged failure.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn connect_resumes_after_an_output_gap_only_when_asked() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::ConnectProcessRequest;
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+
+    let service = cancellation_service();
+    let process_id = ProcessId::new();
+    let noise = PROCESS_OUTPUT_RETENTION_BYTES + 65536;
+    let start = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("head -c {noise} /dev/zero; printf tail"),
+            ],
+            process_id: Some(process_id.as_str().to_string()),
+            idempotency_key: Some("output-gap".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    // A poller holds no stream between polls, so nothing holds output back.
+    drop(start);
+    let record = service
+        .inner
+        .processes
+        .get_record(&process_id)
+        .expect("process is registered");
+    let mut changed = record.journal.subscribe();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !record.journal.is_completed() {
+            changed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the process exits");
+    drop(record);
+    let connect = |resume: bool, from_oldest: bool| {
+        Process::connect_process(
+            &service,
+            Request::new(ConnectProcessRequest {
+                process_id: process_id.as_str().to_string(),
+                output_cursor: Some(0),
+                resume_after_output_gap: resume.then_some(true),
+                resume_from_oldest_retained: from_oldest,
+                ..Default::default()
+            }),
+        )
+    };
+
+    for from_oldest in [false, true] {
+        let mut resumed = connect(true, from_oldest)
+            .await
+            .expect("connect")
+            .into_inner();
+        let (mut acknowledged, mut bytes_before, mut received, mut exited) =
+            (false, None, 0_u64, false);
+        while let Some(event) = resumed.next().await {
+            match event.expect("a resumed reader does not fail").event {
+                Some(Event::Connected(connected)) => {
+                    acknowledged = connected.resume_after_output_gap
+                }
+                Some(Event::OutputGap(gap)) => {
+                    assert_eq!(bytes_before, None, "one gap for one eviction run");
+                    assert_eq!(received, 0);
+                    bytes_before = Some(gap.output_bytes_before);
+                }
+                Some(Event::Stdout(output)) => received += output.data.len() as u64,
+                Some(Event::Exit(_)) => exited = true,
+                _ => {}
+            }
+        }
+        assert!(acknowledged, "spaced-host relies on the acknowledgement");
+        let bytes_before = bytes_before.expect("the reader was told about the gap");
+        assert!(bytes_before > 0);
+        assert_eq!(bytes_before + received, noise as u64 + 4);
+        assert!(exited);
+    }
+
+    let mut legacy = connect(false, false).await.expect("connect").into_inner();
+    let mut error = None;
+    while let Some(event) = legacy.next().await {
+        match event {
+            Ok(event) => {
+                if let Some(Event::Connected(connected)) = event.event {
+                    assert!(!connected.resume_after_output_gap);
+                }
+            }
+            Err(status) => {
+                error = Some(status);
+                break;
+            }
+        }
+    }
+    let error = error.expect("a reader that did not opt in still fails");
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        error.message(),
+        pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE
     );
     shut_down(&service).await;
 }

@@ -343,7 +343,7 @@ impl ProcessLaunch {
         ));
         claim.publish(Arc::clone(&record));
 
-        let cursor = record.journal.cursor(Some(0), false);
+        let cursor = record.journal.cursor(Some(0), false, None);
         let mut output_tasks = VecDeque::new();
         if let Some(reader) = pty_reader {
             output_tasks.push_back(spawn_process_output_reader(

@@ -16246,6 +16246,7 @@ pub(crate) mod service_tests {
                     timeout: None,
                     output_cursor: Some(7),
                     resume_from_oldest_retained: false,
+                    resume_after_output_gap: None,
                 },
             ),
         });

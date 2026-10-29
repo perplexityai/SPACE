@@ -72,6 +72,7 @@ fn process_events_encode_connect_wire_shape() {
             event: Some(spaced_process_event::Event::Connected(
                 SpacedProcessConnected {
                     output_cursor: None,
+                    resume_after_output_gap: false,
                 },
             )),
         },
