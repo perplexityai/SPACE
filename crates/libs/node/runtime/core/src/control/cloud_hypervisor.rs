@@ -152,9 +152,12 @@ impl RuntimeControl for Client {
     }
     fn restore_state(&self, workspace: StateWorkspace, memory_bytes: u64) -> ControlFuture<'_, ()> {
         Box::pin(async move {
+            // Both restore workspaces stay with the execution. The encrypted
+            // volume remains mounted until the VMM exits, so its private
+            // memory clone can also back guest RAM without an eager copy.
             self.request(Method::PUT, "/api/v1/vm.restore", Bytes::from_static(match workspace {
-                StateWorkspace::Plain => br#"{"source_url":"file:///state/restore","prefault":false,"memory_restore_mode":"Copy","resume":false}"#,
-                StateWorkspace::Encrypted => br#"{"source_url":"file:///state/encsnap/restore","prefault":false,"memory_restore_mode":"Copy","resume":false}"#,
+                StateWorkspace::Plain => br#"{"source_url":"file:///state/restore","prefault":false,"memory_restore_mode":"CopyOnWrite","resume":false}"#,
+                StateWorkspace::Encrypted => br#"{"source_url":"file:///state/encsnap/restore","prefault":false,"memory_restore_mode":"CopyOnWrite","resume":false}"#,
             }), super::memory_state_timeout(memory_bytes)).await?;
             Ok(())
         })
