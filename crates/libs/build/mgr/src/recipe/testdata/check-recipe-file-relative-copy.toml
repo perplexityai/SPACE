@@ -1,0 +1,8 @@
+[metadata]
+name = "check-recipe-file-relative-copy"
+base = "seed"
+
+[[steps]]
+type = "copy"
+source = "files/example.txt"
+dest = "tmp/example.txt"
