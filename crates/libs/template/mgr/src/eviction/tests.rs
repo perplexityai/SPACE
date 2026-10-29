@@ -1502,21 +1502,45 @@ fn seed_build_touched_at(conn: &Connection, name: &str, hash: &str, secs: u64) {
     .unwrap();
 }
 
+/// One row of `idle_template_eviction_takes_every_build_only_when_none_is_protected`.
+struct IdleCase {
+    case: &'static str,
+    /// Each build of `doomed` and its last touch.
+    builds: &'static [(&'static str, u64)],
+    pinned: &'static [&'static str],
+    active: &'static [&'static str],
+    warm_pool: &'static [&'static str],
+    expected: IdleTemplateEviction,
+}
+
+impl IdleCase {
+    const fn new(
+        case: &'static str,
+        builds: &'static [(&'static str, u64)],
+        pinned: &'static [&'static str],
+        active: &'static [&'static str],
+        warm_pool: &'static [&'static str],
+        expected: IdleTemplateEviction,
+    ) -> Self {
+        Self {
+            case,
+            builds,
+            pinned,
+            active,
+            warm_pool,
+            expected,
+        }
+    }
+}
+
 #[tokio::test]
 async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() {
     use IdleTemplateKept::{Active, Pinned, Recent, WarmPool};
     let bound = 1_000;
     let kept = |reason| IdleTemplateEviction::Kept { evicted: 0, reason };
-    // (case, last touch of each build of `doomed`, pinned, active, warm pool, outcome)
-    let cases: [(
-        &str,
-        &[(&str, u64)],
-        &[&str],
-        &[&str],
-        &[&str],
-        IdleTemplateEviction,
-    ); 6] = [
-        (
+    let row = IdleCase::new;
+    let cases = [
+        row(
             "idle",
             &[("h1", 500), ("h2", 1_000)],
             &[],
@@ -1524,7 +1548,7 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
             &[],
             IdleTemplateEviction::Evicted,
         ),
-        (
+        row(
             "one recent",
             &[("h1", 500), ("h2", 1_001)],
             &[],
@@ -1532,9 +1556,9 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
             &[],
             kept(Recent),
         ),
-        ("pinned", &[("h1", 500)], &["h1"], &[], &[], kept(Pinned)),
-        ("in use", &[("h1", 500)], &[], &["h1"], &[], kept(Active)),
-        (
+        row("pinned", &[("h1", 500)], &["h1"], &[], &[], kept(Pinned)),
+        row("in use", &[("h1", 500)], &[], &["h1"], &[], kept(Active)),
+        row(
             "warm pool",
             &[("h1", 500)],
             &[],
@@ -1542,7 +1566,7 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
             &["h1"],
             kept(WarmPool),
         ),
-        (
+        row(
             "not cached",
             &[],
             &[],
@@ -1551,7 +1575,15 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
             IdleTemplateEviction::NotFound,
         ),
     ];
-    for (case, builds, pinned, active, warm_pool, expected) in cases {
+    for IdleCase {
+        case,
+        builds,
+        pinned,
+        active,
+        warm_pool,
+        expected,
+    } in cases
+    {
         let conn = crate::db::test_conn();
         seed_build_touched_at(&conn, "other", "h1", 1);
         for (hash, touched) in builds {
