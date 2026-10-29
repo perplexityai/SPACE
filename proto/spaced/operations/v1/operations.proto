@@ -248,6 +248,15 @@ message PtySize {
 message PtyConfig {
   PtySize size = 1;
 }
+// A fenced request leaves its legacy process_id empty. Older readers reject it.
+message RecoveryHandle {
+  uint32 contract_version = 1;
+  string expected_instance_id = 2;
+  string expected_activation_id = 3;
+  string process_id = 4;
+  string process_incarnation = 5;
+}
+
 message ConnectProcessRequest {
   string process_id = 1;
   optional google.protobuf.Duration timeout = 2;
@@ -278,6 +287,7 @@ message ConnectProcessRequest {
   // reports the initial gap instead of silently moving the starting cursor.
   // Takes precedence when both options are set.
   optional bool resume_after_output_gap = 5;
+  RecoveryHandle recovery = 6;
 }
 message ListProcessesRequest {
   // Also list processes that have exited but are still retained, with their
@@ -303,21 +313,27 @@ message ProcessInfo {
 message SendSignalRequest {
   string process_id = 1;
   int32 signal = 2;
+  RecoveryHandle recovery = 3;
 }
 message SendSignalResponse {}
 message SendInputRequest {
   string process_id = 1;
   // Sensitive process input. Callers must not log or format this field.
   bytes data = 2;
+  RecoveryHandle recovery = 3;
 }
 message SendInputResponse {}
 // Closes pipe stdin and delivers EOF. PTYs have no half-close: returns
 // FailedPrecondition and leaves terminal input usable.
-message CloseStdinRequest { string process_id = 1; }
+message CloseStdinRequest {
+  string process_id = 1;
+  RecoveryHandle recovery = 2;
+}
 message CloseStdinResponse {}
 message ResizePtyRequest {
   string process_id = 1;
   PtySize size = 2;
+  RecoveryHandle recovery = 3;
 }
 message ResizePtyResponse {}
 message KillRequest { string process_id = 1; }

@@ -209,6 +209,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
+        if operation.recovery.is_some() {
+            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
+                "process recovery routing is unsupported",
+            ));
+        }
         if operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
@@ -304,6 +310,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
+        if operation.recovery.is_some() {
+            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
+                "process recovery routing is unsupported",
+            ));
+        }
         if operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
@@ -345,6 +357,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
+        if operation.recovery.is_some() {
+            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
+                "process recovery routing is unsupported",
+            ));
+        }
         if operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
@@ -382,6 +400,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
+        if operation.recovery.is_some() {
+            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
+                "process recovery routing is unsupported",
+            ));
+        }
         if operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }
@@ -417,6 +441,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
+        if operation.recovery.is_some() {
+            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryHandles,
+                "process recovery routing is unsupported",
+            ));
+        }
         if operation.process_id.is_empty() {
             return Err(Status::invalid_argument("process_id is required"));
         }

@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn process_stdin_debug_output_is_redacted() {
     let request = proto::operations::SendInputRequest {
+        recovery: None,
         process_id: "process-id".to_string(),
         data: b"sensitive process input".to_vec(),
     };

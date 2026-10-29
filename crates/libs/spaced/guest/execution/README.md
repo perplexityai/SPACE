@@ -336,3 +336,28 @@ their lifecycle handshake and forwarding are separate work. They filter out
 service sees no legacy command in a recovery request and rejects it before
 launching. Fenced reconnect/control requests and mutation receipts remain
 separate extensions in the process recovery RFC.
+
+## Fenced process handles
+
+Native `ConnectProcess`, `SendInput`, `CloseStdin`, `SendSignal` and `ResizePty`
+accept a version-1 `RecoveryHandle` in `recovery`, with the legacy `process_id`
+left empty. Keep the engine instance and activation from discovery, and the
+process ID and incarnation returned by recovery Start. The caller also binds
+these values to the sandbox being addressed.
+
+Each call checks both lifetime fences and the selected record's incarnation
+before replay or effects. A missing record remains `NotFound`; a changed engine,
+activation or incarnation is `FailedPrecondition`, with a machine-readable
+`space-process-recovery-reason` exposed by `RecoveryReason::from_status`.
+The selected record remains owned through the operation, so concurrent eviction
+and process-ID reuse cannot redirect it to a replacement process. A new activation
+retires handles for processes started under the previous activation; replacing
+only the token in an old handle cannot renew it.
+
+Disabling recovery waits for admitted control calls, including a blocked stdin
+write; it does not wait for read streams or legacy calls. Bound pending calls
+with an application deadline before preparing a snapshot. Version 1 adds fencing
+only: a cancelled write may have delivered a prefix, and input or signals must
+not be automatically retried. Mutation receipts are a separate extension.
+The daemon routing path still filters `process_recovery_handles` until its
+activation handshake and forwarding support are implemented.

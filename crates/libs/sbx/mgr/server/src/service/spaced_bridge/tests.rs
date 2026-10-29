@@ -574,6 +574,7 @@ async fn process_reconnect_options_reach_the_host() {
     .unwrap();
     for resume_after_output_gap in [None, Some(false), Some(true)] {
         let operation = pplx_space_sbx_mgr_client::operations::ConnectProcessRequest {
+            recovery: None,
             process_id: "process".into(),
             timeout: Some(prost_types::Duration {
                 seconds: 2,

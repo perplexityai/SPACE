@@ -452,6 +452,7 @@ pub(super) fn build_process_start_resume_request(
     SpacedConnectProcessRequest {
         sandbox_id: route.sandbox_id.to_string(),
         operation: Some(spaced_ops::ConnectProcessRequest {
+            recovery: None,
             process_id: process_id.to_string(),
             timeout: start_request
                 .operation
