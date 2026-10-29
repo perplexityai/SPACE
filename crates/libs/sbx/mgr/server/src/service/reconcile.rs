@@ -257,6 +257,12 @@ impl SandboxManagerService {
         let wake_lock = self.auto_lifecycle.wake_lock(storage_id);
         let _wake_guard = wake_lock.lock_owned().await;
         if let Ok(sandbox) = self.lookup_auto_lifecycle_sandbox(storage_id) {
+            if super::grpc_lifecycle::is_transient_backup_handoff(error) {
+                if let Err(persist_error) = self.defer_auto_suspend_handoff(&sandbox, error) {
+                    tracing::error!(%sandbox_id, %persist_error, "could not persist transient handoff retry");
+                }
+                return;
+            }
             let mut runtime_state = sandbox.auto_lifecycle_state.clone();
             let due = due_stage(&sandbox.auto_lifecycle, &runtime_state, now_secs());
             let stage_context = due
@@ -471,22 +477,24 @@ impl SandboxManagerService {
                 if matches!(sandbox.state, SandboxState::Started | SandboxState::Paused) {
                     let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
                     let artifact_guard = artifact_lock.lock_owned().await;
-                    let context = SuspendRequestContext::new(
-                        sandbox.id.clone(),
-                        true,
-                        0,
-                        true,
-                        Some(SandboxEventTrigger::AutoLifecycle),
-                    );
-                    let (_, publication) = self
-                        .prepare_suspend_snapshot_publication_after_locks(
-                            &context,
-                            &wake_guard,
-                            &artifact_guard,
-                        )
-                        .await?;
-                    self.complete_suspend_snapshot_publication(publication)
-                        .await?;
+                    if !self.resume_auto_suspend_handoff(&sandbox.id).await? {
+                        let context = SuspendRequestContext::new(
+                            sandbox.id.clone(),
+                            true,
+                            0,
+                            true,
+                            Some(SandboxEventTrigger::AutoLifecycle),
+                        );
+                        let (_, publication) = self
+                            .prepare_suspend_snapshot_publication_after_locks(
+                                &context,
+                                &wake_guard,
+                                &artifact_guard,
+                            )
+                            .await?;
+                        self.complete_suspend_snapshot_publication(publication)
+                            .await?;
+                    }
                     drop(artifact_guard);
                 }
                 AutoLifecycleTransition::Suspend

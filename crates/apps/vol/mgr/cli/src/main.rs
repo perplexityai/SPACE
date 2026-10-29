@@ -485,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let response = client
                 .list_transfer_jobs(ListTransferJobsRequest {
+                    s3_uri: None,
                     subject_id: subject,
                     status_filter: status.map(|s| s.to_proto() as i32),
                     limit,

@@ -789,6 +789,25 @@ pub fn yield_running_job(conn: &Connection, job_id: &JobId) -> rusqlite::Result<
     Ok(changed == 1)
 }
 
+/// Yield a claimed job to a durable prerequisite without spending an attempt.
+/// Cancellation and a replacement lease remain authoritative.
+pub fn defer_running_job(
+    conn: &Connection,
+    job_id: &JobId,
+    lease_owner: Option<&str>,
+    delay_secs: u64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE jobs
+         SET status = 'pending', attempts = MAX(attempts - 1, 0),
+             started_at = NULL, next_attempt_at = datetime('now', ?3),
+             lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL
+         WHERE job_id = ?1 AND status = 'running' AND lease_owner IS ?2",
+        params![job_id, lease_owner, format!("+{delay_secs} seconds")],
+    )?;
+    Ok(changed == 1)
+}
+
 pub fn yield_leased_job(
     conn: &Connection,
     job_id: &JobId,

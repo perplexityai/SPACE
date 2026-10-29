@@ -644,6 +644,7 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         _ => TransferJobStatus::Unspecified,
     };
     Ok(TransferJob {
+        dedup_key: job.dedup_key,
         job_id: job.job_id.to_string(),
         status: transfer_job_status_code(status),
         kind: job.kind,
@@ -1405,10 +1406,25 @@ impl VolumeManager for VolumeManagerService {
                 TransferJobStatus::Cancelled => Some("cancelled"),
                 TransferJobStatus::Unspecified => None,
             });
-        let jobs = self
-            .worker
-            .list_jobs(req.subject_id.as_deref(), status_str, req.limit)?;
+        let jobs = if let Some(uri) = req.s3_uri.as_deref() {
+            let subject = req
+                .subject_id
+                .as_deref()
+                .ok_or_else(|| Status::invalid_argument("destination lookup requires a subject"))?;
+            if req.status_filter.is_some() {
+                return Err(Status::invalid_argument(
+                    "destination lookup includes terminal jobs",
+                ));
+            }
+            parse_uri(uri)?;
+            db::transfer_jobs_at_destination(&*self.lock_db()?, subject, uri, req.limit)
+                .map_err(db_err)?
+        } else {
+            self.worker
+                .list_jobs(req.subject_id.as_deref(), status_str, req.limit)?
+        };
         Ok(Response::new(ListTransferJobsResponse {
+            exact_destination_lookup: true,
             jobs: jobs
                 .into_iter()
                 .map(job_to_proto)

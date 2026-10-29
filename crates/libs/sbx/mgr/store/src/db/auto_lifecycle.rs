@@ -227,6 +227,16 @@ pub fn update_auto_lifecycle_with_state(
 ) -> Result<()> {
     let auto_lifecycle_json = serde_json::to_string(auto_lifecycle)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let mut auto_lifecycle_state = auto_lifecycle_state.clone();
+    if let Some(current) = get_sandbox(conn, id)?
+        && (current.auto_lifecycle != *auto_lifecycle
+            || current.auto_lifecycle_state != auto_lifecycle_state)
+    {
+        // A replacement or rearm invalidates the old decision. An identical
+        // desired-policy replay must preserve both its floor and pending work.
+        auto_lifecycle_state.handoff_epoch =
+            current.auto_lifecycle_state.handoff_epoch.wrapping_add(1);
+    }
     let auto_lifecycle_state_json = serde_json::to_string(&auto_lifecycle_state)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     conn.execute(

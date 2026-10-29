@@ -760,6 +760,7 @@ pub(crate) fn reclaim_fixture_payload(
     snapshot_dir: std::path::PathBuf,
 ) -> SnapshotUploadJobs {
     SnapshotUploadJobs {
+        auto_suspend: None,
         meta: reclaim_fixture_meta(
             Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1),
             Some(pplx_space_common_core::types::ArtifactKind::Full),

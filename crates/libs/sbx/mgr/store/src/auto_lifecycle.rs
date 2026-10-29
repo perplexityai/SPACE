@@ -725,6 +725,7 @@ pub fn mark_error_and_disarm_conditions(
     policy: &AutoLifecyclePolicy,
     error: impl Into<String>,
 ) {
+    state.handoff_epoch = state.handoff_epoch.wrapping_add(1);
     for condition in state.conditions.values_mut() {
         condition.armed = false;
     }
@@ -735,6 +736,7 @@ pub fn mark_error_and_disarm_conditions(
 /// Clearing the error is also what resets the suspend retry budget: both mean
 /// "the failure loop is over" (activity or a completed transition).
 fn clear_auto_error(state: &mut AutoLifecycleRuntimeState) {
+    state.handoff_epoch = state.handoff_epoch.wrapping_add(1);
     state.last_auto_error = None;
     state.auto_error_streak = 0;
 }
@@ -788,6 +790,7 @@ pub fn extend_access_deadline(
         return Ok(false);
     }
     state.access_extended_until = Some(state.access_extended_until.unwrap_or(0).max(minimum));
+    clear_auto_error(state);
     recompute_runtime_state(state, policy);
     Ok(true)
 }

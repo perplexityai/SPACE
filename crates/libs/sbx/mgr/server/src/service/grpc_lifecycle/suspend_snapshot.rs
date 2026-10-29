@@ -478,6 +478,7 @@ impl SandboxManagerService {
             started_at: create_started_at,
             publish_node_state,
             durability,
+            auto_suspend,
         } = publication;
         let mut cleanup_fence = Some(cleanup_fence);
         // Backstop: if this publication is abandoned before its intentional
@@ -1133,6 +1134,7 @@ impl SandboxManagerService {
                         local_artifact_id,
                         &snapshot_dir_string,
                         published_format,
+                        auto_suspend,
                     )
                     .await;
                 self.require_node_local_backup_handoff(&sandbox.id, local_artifact_id, enqueue_result)?;

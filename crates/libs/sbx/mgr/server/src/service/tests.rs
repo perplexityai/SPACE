@@ -20426,7 +20426,10 @@ pub(crate) mod service_tests {
         assert_eq!(updated.auto_lifecycle, requested_policy);
         assert_eq!(
             updated.auto_lifecycle_state,
-            AutoLifecycleRuntimeState::default()
+            AutoLifecycleRuntimeState {
+                handoff_epoch: existing.auto_lifecycle_state.handoff_epoch.wrapping_add(1),
+                ..Default::default()
+            }
         );
         assert_eq!(updated.next_auto_event_at, None);
     }

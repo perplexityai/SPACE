@@ -1626,6 +1626,26 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                     }
                     self.notify_completion(&job.job_id);
                 }
+                Ok(Err(JobError::Deferred(delay))) => {
+                    let delay = Duration::from_secs(delay.as_secs().max(1));
+                    let deferred = {
+                        let conn = self.lock_db_for_background();
+                        db::defer_running_job(&conn, &job.job_id, lease_owner.as_deref(), delay.as_secs())
+                    };
+                    if matches!(deferred, Ok(true)) && self.lease.is_none() {
+                        let worker = self.clone();
+                        let job_id = job.job_id;
+                        let kind = job.kind.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                biased;
+                                _ = worker.stopping.cancelled() => {}
+                                _ = tokio::time::sleep(delay) => worker.spawn_job_for_mode(job_id, &kind),
+                            }
+                        });
+                    }
+                    log_conditional_update_result(deferred, &job, "defer prerequisite");
+                }
                 Ok(Err(JobError::YieldedForRestart)) => {
                     tracing::info!(
                         job_id = %job.job_id,

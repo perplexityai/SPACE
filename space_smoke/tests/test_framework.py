@@ -18,12 +18,12 @@ from space_smoke.fixtures import CommandSandboxFixture, Ecw
 from space_smoke.model import Verdict
 from space_smoke.registry import ScenarioRegistry
 from space_smoke.runtime import (
-    InvariantViolation,
-    background,
     CommandResult,
+    InvariantViolation,
     ResourceScope,
     SmokeConfigurationError,
     SubprocessExecutor,
+    background,
     execute_scenario,
 )
 from space_smoke.scenarios import REGISTRY
@@ -134,6 +134,8 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "ecw.timeout_update",
                 "ecw.warm_pool_environment",
                 "ecw.watcher_identity",
+                "local.auto_suspend_handoff_recovers_after_manager_restart",
+                "local.auto_suspend_recovers_volume_handoff",
                 "local.btrfs_send_restore_fails_closed_without_parent_source",
                 "local.btrfs_send_restore_pulls_parent_template",
                 "local.btrfs_send_restore_rejects_corrupted_stream",

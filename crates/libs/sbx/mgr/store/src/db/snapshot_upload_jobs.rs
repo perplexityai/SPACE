@@ -36,7 +36,10 @@ pub fn replace_active_job_payload(
     kind: &str,
 ) -> Result<usize> {
     conn.execute(
-        "UPDATE jobs SET payload = ?1
+        "UPDATE jobs SET payload =
+             CASE WHEN json_type(payload, '$.auto_suspend') = 'object'
+                  THEN json_set(?1, '$.auto_suspend', json_extract(payload, '$.auto_suspend'))
+                  ELSE ?1 END
          WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
         params![payload, job_id, kind],
     )
@@ -50,6 +53,44 @@ pub fn set_upload_failure_scope(conn: &Connection, job_id: &JobId, scope: &str) 
         "UPDATE jobs SET payload = json_set(payload, '$.failure_scope', ?1)
          WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
         params![scope, job_id, SNAPSHOT_UPLOAD_JOB_KIND],
+    )
+}
+
+/// Update only the scheduler's retry counter, never overwrite transfer handles
+/// or the worker's concurrent upload/finalization bookkeeping.
+pub fn schedule_auto_suspend_retry(
+    conn: &Connection,
+    sandbox_id: &str,
+    job_id: &JobId,
+    failures: u32,
+    state: &pplx_space_common_core::types::AutoLifecycleRuntimeState,
+) -> Result<bool> {
+    let transaction = crate::db::Transaction::immediate(conn)?;
+    let changed = transaction.execute(
+        "UPDATE jobs SET payload = json_set(payload, '$.auto_suspend.failures', ?2)
+         WHERE job_id = ?1 AND kind = 'snapshot_upload'
+           AND json_type(payload, '$.auto_suspend') = 'object'",
+        params![job_id, failures],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    crate::db::update_auto_lifecycle_state(&transaction, sandbox_id, state)?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+/// Preserve the first peer admission refusal as durable job diagnostics. This
+/// does not grant teardown authority or change the scheduling deadline.
+pub fn record_auto_suspend_refusal(conn: &Connection, job_id: &JobId, at: u64) -> Result<usize> {
+    let at = i64::try_from(at)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    conn.execute(
+        "UPDATE jobs SET payload = json_set(payload, '$.auto_suspend.refused_at', ?2)
+         WHERE job_id = ?1 AND kind = 'snapshot_upload'
+           AND json_type(payload, '$.auto_suspend') = 'object'
+           AND json_extract(payload, '$.auto_suspend.refused_at') IS NULL",
+        params![job_id, at],
     )
 }
 

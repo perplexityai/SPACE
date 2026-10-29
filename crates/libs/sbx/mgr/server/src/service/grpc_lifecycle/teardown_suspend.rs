@@ -1355,6 +1355,7 @@ impl SandboxManagerService {
                         &backup.artifact.local_path,
                         backup.format,
                         backup.registration_generation(),
+                        ArtifactBackupHandoff::TeardownFence,
                     )
                     .await
                     .map_err(|error| {

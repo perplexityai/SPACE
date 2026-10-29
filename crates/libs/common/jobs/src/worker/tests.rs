@@ -66,6 +66,76 @@ struct RestartYieldExecutor {
     started: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Clone)]
+struct PrerequisiteExecutor {
+    ready: Arc<AtomicBool>,
+    attempted: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl JobExecutor for PrerequisiteExecutor {
+    async fn execute(&self, job: &Job, _cancellation: CancellationToken) -> Result<i64, JobError> {
+        if job.kind == "waiting" && !self.ready.load(Ordering::SeqCst) {
+            self.attempted.notify_one();
+            return Err(JobError::Deferred(Duration::from_secs(5)));
+        }
+        Ok(1)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_prerequisite_refunds_attempt_and_releases_worker_capacity() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_test_schema(&conn);
+    let db = Arc::new(Mutex::new(conn));
+    let executor = PrerequisiteExecutor {
+        ready: Arc::new(AtomicBool::new(false)),
+        attempted: Arc::new(tokio::sync::Notify::new()),
+    };
+    let worker = BackgroundWorker::new(
+        db,
+        executor.clone(),
+        WorkerConfig::new(1, Duration::from_secs(10), 1),
+    );
+    let first = worker.submit("waiting", "{}", None, None).unwrap();
+    executor.attempted.notified().await;
+    for _ in 0..100 {
+        if worker.get_job(&first).unwrap().unwrap().status == "pending" {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let pending = worker.get_job(&first).unwrap().unwrap();
+    assert_eq!(pending.status, "pending");
+    assert_eq!(pending.attempts, 0);
+    let scheduled: bool = worker
+        .lock_db_for_background()
+        .query_row(
+            "SELECT next_attempt_at > datetime('now') FROM jobs WHERE job_id = ?1",
+            [first],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(scheduled);
+    let other = worker.submit("ready", "{}", None, None).unwrap();
+    assert_eq!(
+        worker
+            .wait_for_job(&other, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .status,
+        "completed"
+    );
+    executor.ready.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let completed = worker
+        .wait_for_job(&first, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(completed.status, "completed");
+    assert_eq!(completed.attempts, 1);
+}
+
 #[async_trait]
 impl JobExecutor for RestartYieldExecutor {
     async fn execute(&self, _job: &Job, cancellation: CancellationToken) -> Result<i64, JobError> {

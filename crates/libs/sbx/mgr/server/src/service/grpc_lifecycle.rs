@@ -36,6 +36,7 @@ use pplx_space_events::{
 
 mod artifact_backup;
 mod auto_lifecycle_policy;
+mod auto_suspend_handoff;
 mod backup_submission;
 mod kill;
 mod pause_resume;
@@ -195,6 +196,7 @@ pub(super) struct SuspendSnapshotPublicationContext {
     started_at: std::time::Instant,
     publish_node_state: bool,
     durability: SuspendDurability,
+    auto_suspend: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,6 +333,8 @@ enum ArtifactBackupHandoff {
     RestoreVisible,
     /// Stage and register the exact artifact before runtime teardown.
     TeardownFence,
+    /// The scheduler alone owns admission for this immutable idle decision.
+    AutoLifecycle { due_at: u64 },
 }
 
 pub(super) const AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA: &str =
@@ -350,6 +354,45 @@ enum ArtifactBackupSubmissionError {
     },
     #[error(transparent)]
     RetainedUpload(#[from] suspend_snapshot::RetainedUploadError),
+    #[error(transparent)]
+    Admission(#[from] crate::snapshot_upload::SnapshotSubmissionError),
+    #[error("backup handoff yielded to the successor")]
+    Restart,
+}
+
+pub(super) fn is_transient_backup_handoff(status: &Status) -> bool {
+    std::error::Error::source(status)
+        .and_then(|source| source.downcast_ref::<ArtifactBackupSubmissionError>())
+        .is_some_and(|error| {
+            matches!(error, ArtifactBackupSubmissionError::Admission(cause) if cause.is_transient())
+        })
+}
+
+fn node_local_backup_status(error: ArtifactBackupSubmissionError) -> Status {
+    let mut status = match &error {
+        ArtifactBackupSubmissionError::Restart => {
+            pplx_space_sbx_mgr_client::restart_retry_on_successor_status(
+                "snapshot handoff interrupted by sandbox-manager shutdown",
+            )
+        }
+        ArtifactBackupSubmissionError::Admission(cause) if cause.is_transient() => cause
+            .status()
+            .cloned()
+            .unwrap_or_else(|| Status::unavailable(error.to_string())),
+        ArtifactBackupSubmissionError::Admission(cause)
+            if cause
+                .status()
+                .is_some_and(pplx_space_common_grpc::is_refused_before_start) =>
+        {
+            cause
+                .status()
+                .cloned()
+                .unwrap_or_else(|| Status::cancelled(error.to_string()))
+        }
+        _ => artifact_backup_fence_status(error.to_string()),
+    };
+    status.set_source(std::sync::Arc::new(error));
+    status
 }
 
 impl From<String> for ArtifactBackupSubmissionError {

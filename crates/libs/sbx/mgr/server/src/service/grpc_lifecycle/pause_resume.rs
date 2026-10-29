@@ -260,6 +260,7 @@ impl SandboxManagerService {
         let _artifact_guard = artifact_lock.lock().await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Pause")?;
+        self.invalidate_auto_suspend_handoff(&sandbox.id)?;
         sandbox
             .state
             .transition(SandboxState::Pausing)
@@ -418,6 +419,7 @@ impl SandboxManagerService {
 
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Resume")?;
+        self.invalidate_auto_suspend_handoff(&sandbox.id)?;
         self.resume_after_wake_lock(&sandbox.id, resume_policy, blocking, ready_timeout_secs)
             .await?;
         if publish_node_state {
