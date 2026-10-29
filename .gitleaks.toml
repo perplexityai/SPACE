@@ -21,3 +21,10 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''(^|/)crates/libs/sbx/mgr/server/src/snapshot_restore/tests\.rs$''']
 regexes = ['''^019e31d9-79a6-7132-b90f-007f1c62ddea$''']
+
+[[allowlists]]
+description = "Verified SHA-256 of the frozen synthetic publication baseline executable"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^bench/publish/cpu-acceptance-v3/baseline-lane-a/summary\.json$''']
+regexes = ['''^44aa5e48d18180ae6751969b40acbc0a268ae440dc07bb5c754d3a6dbb3e97f3$''']
