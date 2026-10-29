@@ -67,9 +67,7 @@ def process_recovery(test: NativeHardeningFixture) -> None:
     """Start replay, cursor reads and sequenced input survive transport reconnects;
     a restored VM rejects handles from its previous activation before effects.
     """
-    sandbox = test.create_ready({"auto_lifecycle": {
-        "wake": {"on": ["access"]}, "condition_sets": {}, "stages": [],
-    }})
+    sandbox = test.create_ready()
     path = f"/v1/sandboxes/{sandbox}"
     discovery = _discovery(test, path)
     test.context.verify({"process_recovery_start", "process_recovery_handles", "process_mutation_receipts", "process_output_gap_resume"}
@@ -181,14 +179,14 @@ def process_recovery(test: NativeHardeningFixture) -> None:
             test.wait_operation(operation["operation_id"])
             first_result = writing.result(timeout=35)
         test.wait_sandbox(sandbox, "paused")
-        # A retry with the current fence resumes the resident VM itself. It must
-        # preserve the activation and return the original interrupted receipt.
-        receipt = _call(test, blocked, pending_input, error="input_outcome_uncertain")
+        operation = test.request("POST", path + ":resume", idempotency_key=test.key("blocked-resume")).require(202)
+        test.wait_operation(operation["operation_id"])
         test.wait_sandbox(sandbox)
         resumed = _discovery(test, path)
         test.context.verify(resumed["instance_id"] == discovery["instance_id"] and
                             resumed["activation_id"] == discovery["activation_id"],
                             "resident pause changed recovery identity")
+        receipt = _call(test, blocked, pending_input, error="input_outcome_uncertain")
         test.context.verify(0 < receipt["input_written"] < 512 * 1024,
                             "blocked input did not preserve its written prefix")
         if first_result.get("reason") == "input_outcome_uncertain":
@@ -204,13 +202,6 @@ def process_recovery(test: NativeHardeningFixture) -> None:
         operation = test.request("POST", path + ":" + action,
                                  idempotency_key=test.key(action)).require(202)
         test.wait_operation(operation["operation_id"])
-        if action == "suspend":
-            test.wait_sandbox(sandbox, "suspended")
-            _call(test, resident,
-                  {"type": "recovery_connect", "handle": resident_handle,
-                   "output_cursor": 0, "resume_after_output_gap": True},
-                  error="activation_changed")
-            test.wait_sandbox(sandbox, "suspended")
     test.wait_sandbox(sandbox)
     restored = _discovery(test, path)
     test.context.verify(restored["activation_id"] != discovery["activation_id"],
@@ -226,3 +217,25 @@ def process_recovery(test: NativeHardeningFixture) -> None:
     recovered = _call(test, fresh, {"type": "recovery_connect", "handle": fresh_handle,
                                   "output_cursor": 0, "resume_after_output_gap": True})
     test.context.verify(recovered[-1]["exit_code"] == 0, "new activation cannot execute")
+
+    with test.context.phase("a matching recovery handle resumes a paused resident"):
+        paused = test.create_ready({"auto_lifecycle": {
+            "wake": {"on": ["access"]}, "condition_sets": {}, "stages": [],
+        }})
+        paused_path = f"/v1/sandboxes/{paused}"
+        info = _discovery(test, paused_path)
+        process = _command(test, paused, info, ["sleep", "300"])
+        handle = _call(test, process, {"type": "recovery_start"})[0]["handle"]
+        operation = test.request("POST", paused_path + ":pause",
+                                 idempotency_key=test.key("fenced-pause")).require(202)
+        test.wait_operation(operation["operation_id"])
+        test.wait_sandbox(paused, "paused")
+        # Exercise the resident wake through the process API itself. No explicit
+        # resume or new discovery may run before these fenced guest calls.
+        _call(test, process, {"type": "recovery_signal", "handle": handle,
+                             "sequence": 1, "signal": 15})
+        exited = _call(test, process,
+                       {"type": "recovery_connect", "handle": handle,
+                        "output_cursor": 0, "resume_after_output_gap": True})
+        test.context.verify(exited[-1]["status"] == "signaled" and exited[-1]["signal"] == 15,
+                            "matching recovery handle did not resume the resident")
