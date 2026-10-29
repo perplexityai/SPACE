@@ -428,6 +428,7 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
     enum Change {
         RevokeFlags,
         MergeDuplicateRuntimeClaims,
+        MergeDuplicateComponentClaims,
         RemoveGuest,
         RemoveFormat,
         RemoveComponent,
@@ -437,6 +438,7 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
     for change in [
         Change::RevokeFlags,
         Change::MergeDuplicateRuntimeClaims,
+        Change::MergeDuplicateComponentClaims,
         Change::RemoveGuest,
         Change::RemoveFormat,
         Change::RemoveComponent,
@@ -461,6 +463,21 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
                 duplicate.state_formats[0].can_create = false;
                 inventory.runtimes.push(duplicate);
                 vec!["component", "format", "guest", "runtime"]
+            }
+            Change::MergeDuplicateComponentClaims => {
+                let mut duplicate = inventory.components[0].clone();
+                inventory.components[0].legacy_default = false;
+                duplicate.default_for_new = false;
+                inventory.components.push(duplicate);
+                let mut nullable = inventory.components[0].clone();
+                let component = nullable.component.as_mut().unwrap();
+                component.version = None;
+                component.digest = None;
+                component.format = None;
+                nullable.default_for_new = true;
+                nullable.legacy_default = true;
+                inventory.components.push(nullable);
+                vec!["component", "component", "format", "guest", "runtime"]
             }
             Change::RemoveGuest => {
                 inventory.runtimes[0].supported_guests.clear();
@@ -491,10 +508,20 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
         );
         if matches!(
             change,
-            Change::RevokeFlags | Change::MergeDuplicateRuntimeClaims
+            Change::RevokeFlags
+                | Change::MergeDuplicateRuntimeClaims
+                | Change::MergeDuplicateComponentClaims
         ) {
             for (kind, content, _) in rows {
                 let content: serde_json::Value = serde_json::from_str(&content)?;
+                if kind == "component" && content["version"].is_null() {
+                    for field in ["digest", "format"] {
+                        assert!(content[field].is_null());
+                    }
+                    for field in ["version_key", "digest_key", "format_key"] {
+                        assert_eq!(content[field], "");
+                    }
+                }
                 for &flag in match kind.as_str() {
                     "component" => &["default_for_new", "legacy_default"][..],
                     "format" => &["can_create", "can_load"][..],
@@ -505,6 +532,7 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
                         serde_json::Value::Bool(matches!(
                             change,
                             Change::MergeDuplicateRuntimeClaims
+                                | Change::MergeDuplicateComponentClaims
                         )),
                     );
                 }

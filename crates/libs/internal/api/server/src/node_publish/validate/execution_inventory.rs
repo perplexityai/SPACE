@@ -19,16 +19,16 @@ struct RuntimeInstallation {
 }
 
 #[derive(Debug)]
-struct ComponentInstallation {
-    component: ArtifactComponentMetadata,
-    default_for_new: bool,
-    legacy_default: bool,
+pub(crate) struct ComponentInstallation {
+    pub(crate) component: ArtifactComponentMetadata,
+    pub(crate) default_for_new: bool,
+    pub(crate) legacy_default: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct ValidatedExecutionInventory {
     pub(crate) runtimes: RuntimeInventoryClaims,
-    components: Vec<ComponentInstallation>,
+    pub(crate) components: Vec<ComponentInstallation>,
 }
 
 #[derive(Debug)]
@@ -107,13 +107,6 @@ impl ValidatedExecutionInventory {
             components,
         })
     }
-
-    pub(crate) fn component_rows(&self) -> Vec<serde_json::Value> {
-        self.components
-            .iter()
-            .map(ComponentInstallation::json)
-            .collect()
-    }
 }
 
 impl RuntimeInstallation {
@@ -173,22 +166,6 @@ impl ComponentInstallation {
             component,
             default_for_new: installation.default_for_new,
             legacy_default: installation.legacy_default,
-        })
-    }
-
-    fn json(&self) -> serde_json::Value {
-        let component = &self.component;
-        serde_json::json!({
-            "kind": component.kind.as_str(),
-            "role_key": component.role.as_ref().map_or("", |role| role.as_str()),
-            "version_key": component.version.as_ref().map(ToString::to_string).unwrap_or_default(),
-            "digest_key": component.digest.as_ref().map(ToString::to_string).unwrap_or_default(),
-            "format_key": component.format.as_ref().map(ToString::to_string).unwrap_or_default(),
-            "version": component.version.as_ref().map(ToString::to_string),
-            "digest": component.digest.as_ref().map(ToString::to_string),
-            "format": component.format.as_ref().map(ToString::to_string),
-            "default_for_new": self.default_for_new,
-            "legacy_default": self.legacy_default,
         })
     }
 }

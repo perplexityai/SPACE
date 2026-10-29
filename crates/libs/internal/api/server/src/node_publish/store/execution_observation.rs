@@ -3,12 +3,12 @@
 
 use pplx_space_common_core::{
     sql,
-    types::{NodeId, RuntimeIdentity},
+    types::{ArtifactComponentMetadata, NodeId, RuntimeIdentity},
 };
-use sqlx::types::Json;
 
 use crate::node_publish::validate::execution_inventory::{
-    RuntimeFormatClaim, RuntimeFormatKey, RuntimeGuestClaim, ValidatedExecutionInventory,
+    ComponentInstallation, RuntimeFormatClaim, RuntimeFormatKey, RuntimeGuestClaim,
+    ValidatedExecutionInventory,
 };
 use crate::node_publish::validate::execution_observation::{
     ExecutionInventoryEvidence, ValidatedReport,
@@ -137,10 +137,14 @@ async fn publish_inventory(
     node_id: NodeId,
     inventory: &ValidatedExecutionInventory,
 ) -> Result<(), PublishExecutionInventoryError> {
-    let component_rows = Json(serde_json::Value::Array(inventory.component_rows()));
+    let component_keys = inventory
+        .components
+        .iter()
+        .map(|claim| &claim.component)
+        .collect::<Vec<_>>();
     let runtimes = &inventory.runtimes;
     prune_runtime_installations(conn, node_id, &runtimes.installations).await?;
-    prune_component_installations(conn, node_id, &component_rows).await?;
+    prune_component_installations(conn, node_id, &component_keys).await?;
     upsert_runtime_installations(conn, node_id, &runtimes.installations).await?;
     prune_runtime_guests(conn, node_id, &runtimes.guests).await?;
     upsert_runtime_guests(conn, node_id, &runtimes.guests).await?;
@@ -151,7 +155,7 @@ async fn publish_inventory(
         .collect::<Vec<_>>();
     prune_runtime_formats(conn, node_id, &format_keys).await?;
     upsert_runtime_formats(conn, node_id, &runtimes.formats).await?;
-    upsert_component_inventory(conn, node_id, component_rows).await
+    upsert_component_inventory(conn, node_id, &inventory.components).await
 }
 
 /// Prune omitted installations under the caller's node lock.
@@ -183,13 +187,13 @@ async fn prune_runtime_installations(
 async fn prune_component_installations(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    component_rows: &Json<serde_json::Value>,
+    keys: &[&ArtifactComponentMetadata],
 ) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "DELETE FROM node_artifact_components installed
          WHERE node_id = $1 AND NOT EXISTS (
-             SELECT 1 FROM jsonb_to_recordset($2::jsonb) AS input(
-                 kind TEXT, role_key TEXT, version_key TEXT, digest_key TEXT, format_key TEXT
+             SELECT 1 FROM UNNEST($2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[]) AS input(
+                 kind, role_key, version_key, digest_key, format_key
              )
              WHERE (input.kind, input.role_key, input.version_key, input.digest_key, input.format_key) =
                    (installed.kind, installed.role_key, installed.version_key,
@@ -197,7 +201,12 @@ async fn prune_component_installations(
          )"
     ))
     .bind(node_id)
-    .bind(component_rows)
+    .bind(column_values(keys, |key| key.kind.as_str()))
+    .bind(column_values(keys, |key| key.role.as_ref().map_or("", |role| role.as_str())))
+    // Empty strings are the existing non-null key representation of omitted metadata.
+    .bind(column_values(keys, |key| key.version.as_ref().map_or("", |version| version.as_str())))
+    .bind(column_values(keys, |key| key.digest.as_ref().map(ToString::to_string).unwrap_or_default()))
+    .bind(column_values(keys, |key| key.format.as_ref().map_or("", |format| format.as_str())))
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::ReplaceComponents)?;
@@ -386,16 +395,22 @@ async fn upsert_runtime_formats(
 async fn upsert_component_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    component_rows: Json<serde_json::Value>,
+    claims: &[ComponentInstallation],
 ) -> Result<(), PublishExecutionInventoryError> {
+    if claims.is_empty() {
+        return Ok(());
+    }
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT kind, role_key, version_key, digest_key, format_key,
+             SELECT kind, role_key,
+                    COALESCE(version, $9::TEXT) AS version_key,
+                    COALESCE(digest, $9::TEXT) AS digest_key,
+                    COALESCE(format, $9::TEXT) AS format_key,
                     version, digest, format, default_for_new, legacy_default
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 kind TEXT, role_key TEXT, version_key TEXT, digest_key TEXT,
-                 format_key TEXT, version TEXT, digest TEXT, format TEXT,
-                 default_for_new BOOLEAN, legacy_default BOOLEAN
+             FROM UNNEST(
+                 $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7::BOOLEAN[], $8::BOOLEAN[]
+             ) AS input(
+                 kind, role_key, version, digest, format, default_for_new, legacy_default
              )
          )
          INSERT INTO node_artifact_components (
@@ -421,7 +436,14 @@ async fn upsert_component_inventory(
                                  EXCLUDED.version, EXCLUDED.digest, EXCLUDED.format)"
     ))
     .bind(node_id)
-    .bind(component_rows)
+    .bind(column_values(claims, |claim| claim.component.kind.as_str()))
+    .bind(column_values(claims, |claim| claim.component.role.as_ref().map_or("", |role| role.as_str())))
+    .bind(column_values(claims, |claim| claim.component.version.as_ref().map(|version| version.as_str())))
+    .bind(column_values(claims, |claim| claim.component.digest.as_ref().map(ToString::to_string)))
+    .bind(column_values(claims, |claim| claim.component.format.as_ref().map(|format| format.as_str())))
+    .bind(column_values(claims, |claim| claim.default_for_new))
+    .bind(column_values(claims, |claim| claim.legacy_default))
+    .bind("")
     .execute(&mut *conn)
     .await
     .map_err(PublishExecutionInventoryError::InsertComponents)?;
