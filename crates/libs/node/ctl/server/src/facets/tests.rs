@@ -1651,6 +1651,10 @@ fn unanswered_templates_wait_out_the_grace_before_eviction() {
             true,
         ),
         (
+            Err(tonic::Status::aborted("template cache eviction is running")),
+            true,
+        ),
+        (
             Err(tonic::Status::unimplemented(
                 "template-manager predates the RPC",
             )),

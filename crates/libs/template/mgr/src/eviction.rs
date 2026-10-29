@@ -552,6 +552,14 @@ impl EvictionGate {
     }
 }
 
+/// The disk side of an eviction outside the GC loop: how to delete a build's
+/// files, and how a repair pass tells whether they are still there.
+#[derive(Clone)]
+pub(crate) struct EvictionDisk {
+    pub(crate) delete: DeleteDiskFn,
+    pub(crate) probe: ReaperDiskProbeFn,
+}
+
 /// What [`evict_idle_template`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdleTemplateEviction {
@@ -613,8 +621,7 @@ pub(crate) async fn evict_idle_template(
     touched_before_secs: u64,
     active: HashSet<(String, String)>,
     warm_pool: HashSet<(String, String)>,
-    delete_disk: DeleteDiskFn,
-    reaper_probe: &ReaperDiskProbeFn,
+    disk: EvictionDisk,
 ) -> rusqlite::Result<IdleTemplateEviction> {
     // Held until the last build is finalized, so no repair pass sees this
     // eviction's `deleting` rows as abandoned.
@@ -668,7 +675,7 @@ pub(crate) async fn evict_idle_template(
             active.clone(),
             warm_pool.clone(),
             candidate,
-            Arc::clone(&delete_disk),
+            Arc::clone(&disk.delete),
             Some(touched_before_secs),
         )
         .await;
@@ -678,7 +685,7 @@ pub(crate) async fn evict_idle_template(
                 // Still holding the gate, so every `deleting` row is ours
                 // or abandoned. Don't leave this one for a GC loop that may
                 // be disabled.
-                reap_stuck_deleting(Arc::clone(&db), reaper_probe).await;
+                reap_stuck_deleting(Arc::clone(&db), &disk.probe).await;
                 return Err(error);
             }
         };

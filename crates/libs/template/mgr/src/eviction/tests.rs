@@ -1624,8 +1624,10 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
             bound,
             pairs(active),
             pairs(warm_pool),
-            delete_disk,
-            &noop_reaper_probe(),
+            EvictionDisk {
+                delete: delete_disk,
+                probe: noop_reaper_probe(),
+            },
         )
         .await
         .unwrap();
@@ -1717,8 +1719,10 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
             1_000,
             keys(&[]),
             keys(&[]),
-            delete_disk,
-            &intact,
+            EvictionDisk {
+                delete: delete_disk,
+                probe: intact,
+            },
         )
         .await;
 
@@ -1747,7 +1751,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
                 assert_eq!(ready, ["h3"], "the pulled build keeps its row");
             }
             During::DiskDeleteFails => {
-                assert!(outcome.is_err());
+                outcome.expect_err("the failed disk delete is reported");
                 assert_eq!(ready.len(), 2, "the failed build is back to ready");
                 assert!(
                     crate::db::list_deleting_builds(&conn).unwrap().is_empty(),
@@ -1795,8 +1799,10 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
                 1_000,
                 keys(&[]),
                 keys(&[]),
-                delete_disk,
-                &noop_reaper_probe(),
+                EvictionDisk {
+                    delete: delete_disk,
+                    probe: noop_reaper_probe(),
+                },
             )
             .await
         }
@@ -1810,8 +1816,10 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
             1_000,
             keys(&[]),
             keys(&[]),
-            Arc::new(|_, _, _| panic!("a second eviction must not start")),
-            &noop_reaper_probe(),
+            EvictionDisk {
+                delete: Arc::new(|_, _, _| panic!("a second eviction must not start")),
+                probe: noop_reaper_probe(),
+            },
         )
         .await
         .unwrap(),

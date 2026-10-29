@@ -23,7 +23,8 @@ service TemplateManager {
   // template's local pool and its members first, even when it then keeps the
   // template, since pool refills keep its builds in use. Fails with FAILED_PRECONDITION while
   // a build is that recent, pinned, used by a local sandbox or targeted by a
-  // warm pool, and NOT_FOUND when no build is cached.
+  // warm pool, ABORTED while the cache GC or another eviction is running, and
+  // NOT_FOUND when no build is cached.
   rpc DeleteIdleTemplate(DeleteIdleTemplateRequest) returns (DeleteIdleTemplateResponse);
 
   // List all templates with snapshot/pool status.

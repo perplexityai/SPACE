@@ -114,8 +114,10 @@ impl TemplateManagerService {
             let db = Arc::clone(&self.db);
             let gate = self.eviction_gate.clone();
             let name = template.clone();
-            let delete_disk = gc_delete_disk_fn(self.artifact_store.clone());
-            let reaper_probe = gc_reaper_probe_fn(self.artifact_store.clone());
+            let disk = crate::eviction::EvictionDisk {
+                delete: gc_delete_disk_fn(self.artifact_store.clone()),
+                probe: gc_reaper_probe_fn(self.artifact_store.clone()),
+            };
             async move {
                 crate::eviction::evict_idle_template(
                     db,
@@ -124,8 +126,7 @@ impl TemplateManagerService {
                     touched_before_secs,
                     active,
                     warm_pool,
-                    delete_disk,
-                    &reaper_probe,
+                    disk,
                 )
                 .await
             }
@@ -144,7 +145,7 @@ impl TemplateManagerService {
             ),
             crate::eviction::IdleTemplateEviction::Busy => (
                 false,
-                Err(Status::unavailable(format!(
+                Err(Status::aborted(format!(
                     "template cache eviction is running; retry deleting {template} later"
                 ))),
             ),

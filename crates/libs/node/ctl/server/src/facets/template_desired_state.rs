@@ -115,8 +115,9 @@ pub(super) enum UnansweredDelete {
     Deleted,
     /// It was no longer local.
     Gone,
-    /// template-manager kept it: a build was used within the wait, or a local
-    /// sandbox, a pin or a warm pool still protects one.
+    /// template-manager kept it: a build was used within the wait, a local
+    /// sandbox, a pin or a warm pool still protects one, or another eviction
+    /// was running.
     InUse,
     /// template-manager predates `DeleteIdleTemplate`.
     Unsupported,
@@ -128,7 +129,9 @@ impl UnansweredDelete {
         match result {
             Ok(_) => Self::Deleted,
             Err(error) if error.code() == Code::NotFound => Self::Gone,
-            Err(error) if error.code() == Code::FailedPrecondition => Self::InUse,
+            Err(error) if matches!(error.code(), Code::FailedPrecondition | Code::Aborted) => {
+                Self::InUse
+            }
             Err(error) if error.code() == Code::Unimplemented => Self::Unsupported,
             Err(_) => Self::Failed,
         }
@@ -244,7 +247,9 @@ pub(super) async fn refresh_template_desired_state(
         .await
         .map_err(|error| format!("cluster template desired-state refresh failed: {error}"))?
         .into_inner();
-    let evict_unanswered = if node_role == Some(NodeRole::Worker) {
+    // Templates due for deletion, and one template the same answer named,
+    // which each recheck below asks about too.
+    let (evict_unanswered, witness) = if node_role == Some(NodeRole::Worker) {
         let answered = response
             .templates
             .iter()
@@ -256,24 +261,27 @@ pub(super) async fn refresh_template_desired_state(
         // about any of them, since a broken read returns exactly that. A node
         // whose every template is omitted keeps them until the cluster
         // answers for one of its templates again.
-        if answered.is_empty() {
-            Vec::new()
-        } else {
-            unanswered.observe(&templates, &answered, full_scope, now);
-            // Only the full sync deletes, so the cap holds per sync and a run
-            // scoped to other templates acts on nothing it did not ask about.
-            if full_scope {
-                unanswered.due(
-                    now,
-                    unanswered_template_evict_after(),
-                    UNANSWERED_TEMPLATE_EVICTS_PER_SYNC,
-                )
-            } else {
-                Vec::new()
+        match answered.first() {
+            None => (Vec::new(), None),
+            Some(witness) => {
+                unanswered.observe(&templates, &answered, full_scope, now);
+                // Only the full sync deletes, so the cap holds per sync and a
+                // run scoped to other templates acts on nothing it did not ask
+                // about.
+                let due = if full_scope {
+                    unanswered.due(
+                        now,
+                        unanswered_template_evict_after(),
+                        UNANSWERED_TEMPLATE_EVICTS_PER_SYNC,
+                    )
+                } else {
+                    Vec::new()
+                };
+                (due, Some(witness.clone()))
             }
         }
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     let mut tmpl = pplx_space_template_mgr_client::connect()
@@ -478,6 +486,9 @@ pub(super) async fn refresh_template_desired_state(
     }
 
     for template in evict_unanswered {
+        let Some(witness) = witness.as_ref() else {
+            break;
+        };
         if !local_templates.contains_key(&template) {
             unanswered_templates().settle(
                 &template,
@@ -486,14 +497,14 @@ pub(super) async fn refresh_template_desired_state(
             );
             continue;
         }
-        // Ask again for this template alone just before deleting it. The
-        // answer that made it due can be up to a sync old (a run scoped to
-        // other templates reuses it), and a sandbox placed here since then
-        // makes the cluster answer for the template.
+        // Ask again just before deleting it. The answer that made it due can
+        // be up to a sync old, and a sandbox placed here since then makes the
+        // cluster answer for the template. The witness, which that answer
+        // named, tells an omission from a recheck that answered nothing.
         let recheck = cluster
             .get_node_template_desired_state(GetNodeTemplateDesiredStateRequest {
                 node_id: node_id.to_string(),
-                templates: vec![template.clone()],
+                templates: vec![template.clone(), witness.clone()],
                 role: proto_node_role(node_role),
             })
             .await;
@@ -511,6 +522,14 @@ pub(super) async fn refresh_template_desired_state(
                         &answered,
                         false,
                         std::time::Instant::now(),
+                    );
+                    continue;
+                }
+                if !answered.contains(witness) {
+                    tracing::debug!(
+                        template,
+                        witness,
+                        "kept unanswered local template: the cluster recheck answered nothing"
                     );
                     continue;
                 }
