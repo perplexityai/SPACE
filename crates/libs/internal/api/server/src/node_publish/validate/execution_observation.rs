@@ -25,17 +25,17 @@ pub(crate) struct ExecutionInventoryEvidence {
 
 #[derive(Debug)]
 pub(crate) enum ValidatedReport {
-    Complete(ExecutionInventoryEvidence),
-    Legacy(ExecutionInventoryEvidence),
+    Complete(Result<ExecutionInventoryEvidence, Status>),
+    Legacy(Result<ExecutionInventoryEvidence, Status>),
     Unavailable,
 }
 
 impl ValidatedReport {
-    pub(crate) fn try_from_report(report: Report<'_>) -> Result<Self, Status> {
+    pub(crate) fn from_report(report: Report<'_>) -> Self {
         match report {
-            Report::Complete(inventory) => parse_inventory(inventory).map(Self::Complete),
-            Report::Legacy(inventory) => parse_inventory(inventory).map(Self::Legacy),
-            Report::Unavailable => Ok(Self::Unavailable),
+            Report::Complete(inventory) => Self::Complete(parse_inventory(inventory)),
+            Report::Legacy(inventory) => Self::Legacy(parse_inventory(inventory)),
+            Report::Unavailable => Self::Unavailable,
         }
     }
 }
@@ -53,7 +53,7 @@ fn parse_inventory(
     })
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub(crate) enum ObservationError {
     #[error("execution observation is missing a supported outcome")]
     MissingOutcome,

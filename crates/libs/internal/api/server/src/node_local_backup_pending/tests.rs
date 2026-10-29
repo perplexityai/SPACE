@@ -433,29 +433,26 @@ fn pending_backup(
 // The decision, without a database
 // ---------------------------------------------------------------------------
 
+type TestBackupDecision = Result<ParsedPendingLocalBackups, LocalBackupQueueOutcome>;
+
 async fn decide_for(
     mirror: &Mirror,
     pending: Option<Vec<PendingLocalBackup>>,
     prune: SandboxInventoryPrune,
     state_only: BTreeSet<SandboxId>,
-) -> TestResult<PendingLocalBackupCensus> {
+) -> TestResult<TestBackupDecision> {
     let reported = pending.map(|pending| PendingLocalBackupReport { pending });
+    let report = PendingBackupReport::from_proto(reported.as_ref());
     let mut conn = mirror.pool().acquire().await?;
-    Ok(decide(
-        &mut conn,
-        PendingBackupReport::from_proto(reported.as_ref()),
-        prune,
-        &state_only,
-        mirror.node_id,
-    )
-    .await?)
+    let decision = decide(&mut conn, &report, prune, &state_only, mirror.node_id).await?;
+    Ok(match decision {
+        PendingLocalBackupCensus::Report(report) => Ok(report.clone()),
+        PendingLocalBackupCensus::Declined(outcome) => Err(outcome),
+    })
 }
 
-fn declined(census: &PendingLocalBackupCensus) -> Option<LocalBackupQueueOutcome> {
-    match census {
-        PendingLocalBackupCensus::Declined(outcome) => Some(*outcome),
-        PendingLocalBackupCensus::Report(_) => None,
-    }
+fn declined(census: &TestBackupDecision) -> Option<LocalBackupQueueOutcome> {
+    census.as_ref().err().copied()
 }
 
 /// An absent report is "this node said nothing"; a present but empty one is
@@ -498,7 +495,7 @@ async fn an_absent_report_and_an_empty_one_take_different_branches() -> TestResu
         BTreeSet::new(),
     )
     .await?;
-    assert!(matches!(census, PendingLocalBackupCensus::Report(_)));
+    assert_eq!(census.unwrap().entry_count(), 0);
     Ok(())
 }
 
@@ -960,7 +957,7 @@ async fn the_reconcile_counts_agree_with_the_rows_it_leaves() -> TestResult {
         BTreeSet::new(),
     )
     .await?;
-    let PendingLocalBackupCensus::Report(report) = census else {
+    let Ok(report) = census else {
         panic!("a well-formed report on an accepted census must mirror");
     };
 

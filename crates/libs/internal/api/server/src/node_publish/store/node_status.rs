@@ -5,6 +5,18 @@ use super::*;
 use pplx_space_common_core::sql;
 use std::sync::LazyLock;
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PruneSandboxCensusError {
+    #[error("prune absent published sandbox observations: {0}")]
+    Prune(#[source] sqlx::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum UpsertPublishedNodeStatusError {
+    #[error("upsert node status from publish: {0}")]
+    Upsert(#[source] sqlx::Error),
+}
+
 /// Built once: every input is bound, so the text is the same on every publish.
 /// Mirrors `sandbox_quarantine_store`'s composed queries in this crate.
 ///
@@ -113,7 +125,7 @@ pub(super) async fn prune_absent_node_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     present_sandbox_ids: &[SandboxId],
-) -> Result<(), Status> {
+) -> Result<(), PruneSandboxCensusError> {
     sqlx::query(sqlx::AssertSqlSafe(
         PRUNE_ABSENT_NODE_SANDBOXES_QUERY.as_str(),
     ))
@@ -123,11 +135,7 @@ pub(super) async fn prune_absent_node_sandboxes(
     .bind(SubstrateKind::Space)
     .execute(&mut *conn)
     .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "prune absent published sandbox observations: {err}"
-        ))
-    })?;
+    .map_err(PruneSandboxCensusError::Prune)?;
     Ok(())
 }
 
@@ -212,65 +220,8 @@ impl LocalBackupInventoryReport {
     }
 }
 
-/// Refresh a node's `node_status_snapshots` row from an accepted publication.
-///
-/// `reachable` and `stale_after` advance on every call, so they record that the
-/// node answered and bind nothing about how current its sandbox census is.
-/// `sandbox_inventory_pruned_at` is the census-freshness signal, and it moves
-/// only when `inventory_prune` says a prune ran — see
-/// [`SandboxInventoryPrune`], and
-/// `pplx_space_common_svc::sql::sandbox_residency` for the gates that read it.
-/// `local_backup_inventory_reported_at` is the same shape one column over, for
-/// the pending-backup mirror — see [`LocalBackupInventoryReport`].
-/// Execution collection has its own receipt time: only a supplied outcome
-/// advances it. Heartbeats and other facets preserve the previous evidence.
-///
-/// `reported_window` is how long past now the node counts as fresh, from
-/// [`reported_freshness`](pplx_space_node_api_client::node_status_freshness::reported_freshness).
-/// A publication that reports no usable interval keeps the row's stored window
-/// (`stale_after - observed_at`), and a node's first such publication gets
-/// [`DEFAULT_NODE_STATUS_FRESHNESS`](pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS).
-/// The stored window is usually the last reported interval's, but the Direct
-/// substrate's create-failure mark writes a 10 s one, and that's the one kept
-/// until a publication reports an interval again: the node reads stale
-/// sooner, never later.
-pub(super) async fn upsert_node_status_from_publish(
-    conn: &mut sqlx::PgConnection,
-    node_id: NodeId,
-    reported_window: Option<std::time::Duration>,
-    node_status: Option<ValidatedNodeStatus>,
-    inventory_prune: SandboxInventoryPrune,
-    local_backup_report: LocalBackupInventoryReport,
-    execution_observation: Option<crate::execution_observation::PublishedExecutionObservation>,
-) -> Result<(), Status> {
-    let (
-        scheduling_status,
-        scheduling_reason,
-        network_slots_ready,
-        network_pool_min_ready,
-        network_slots_degraded,
-        network_slots_quarantined,
-        network_slots_total,
-        network_slots_leased,
-        network_pool_max_slots,
-        node_ctl,
-    ) = match node_status {
-        Some(status) => (
-            Some(status.scheduling_status_label()),
-            Some(status.scheduling_reason),
-            Some(status.network_slots_ready),
-            Some(status.network_pool_min_ready),
-            Some(status.network_slots_degraded),
-            Some(status.network_slots_quarantined),
-            Some(status.network_slots_total),
-            Some(status.network_slots_leased),
-            Some(status.network_pool_max_slots),
-            status.node_ctl,
-        ),
-        None => (None, None, None, None, None, None, None, None, None, None),
-    };
-    sqlx::query(sql!(
-        "INSERT INTO node_status_snapshots (
+const UPSERT_PUBLISHED_NODE_STATUS: &str = sql!(
+    "INSERT INTO node_status_snapshots (
              node_id,
              observed_at,
              stale_after,
@@ -425,39 +376,98 @@ pub(super) async fn upsert_node_status_from_publish(
                  ELSE node_status_snapshots.execution_inventory_received_at
              END,
              updated_at = NOW()"
-    ))
-    .bind(node_id)
-    .bind(reported_window.map(|window| window.as_secs_f64()))
-    .bind(scheduling_status)
-    .bind(scheduling_reason)
-    .bind(network_slots_ready)
-    .bind(network_pool_min_ready)
-    .bind(network_slots_degraded)
-    .bind(network_slots_quarantined)
-    .bind(network_slots_total)
-    .bind(network_slots_leased)
-    .bind(network_pool_max_slots)
-    .bind(node_ctl.map(Json))
-    .bind(inventory_prune.stamps_pruned_at())
-    .bind(local_backup_report.stamps_reported_at())
-    .bind(local_backup_report.clears_reported_at())
-    .bind(
-        execution_observation
-            .as_ref()
-            .map(|observation| observation.status.as_str()),
-    )
-    .bind(
-        execution_observation
-            .and_then(|observation| observation.policy)
-            .map(Json),
-    )
-    .bind(
-        pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS
-            .as_secs_f64(),
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("upsert node status from publish: {err}")))?;
+);
+
+/// Refresh a node's `node_status_snapshots` row from an accepted publication.
+///
+/// `reachable` and `stale_after` advance on every call, so they record that the
+/// node answered and bind nothing about how current its sandbox census is.
+/// `sandbox_inventory_pruned_at` is the census-freshness signal, and it moves
+/// only when `inventory_prune` says a prune ran — see
+/// [`SandboxInventoryPrune`], and
+/// `pplx_space_common_svc::sql::sandbox_residency` for the gates that read it.
+/// `local_backup_inventory_reported_at` is the same shape one column over, for
+/// the pending-backup mirror — see [`LocalBackupInventoryReport`].
+/// Execution collection has its own receipt time: only a supplied outcome
+/// advances it. Heartbeats and other facets preserve the previous evidence.
+///
+/// `reported_window` is how long past now the node counts as fresh, from
+/// [`reported_freshness`](pplx_space_node_api_client::node_status_freshness::reported_freshness).
+/// A publication that reports no usable interval keeps the row's stored window
+/// (`stale_after - observed_at`), and a node's first such publication gets
+/// [`DEFAULT_NODE_STATUS_FRESHNESS`](pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS).
+/// The stored window is usually the last reported interval's, but the Direct
+/// substrate's create-failure mark writes a 10 s one, and that's the one kept
+/// until a publication reports an interval again: the node reads stale
+/// sooner, never later.
+pub(super) async fn upsert_node_status_from_publish(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    reported_window: Option<std::time::Duration>,
+    node_status: Option<&ValidatedNodeStatus>,
+    inventory_prune: SandboxInventoryPrune,
+    local_backup_report: LocalBackupInventoryReport,
+    execution_observation: Option<crate::execution_observation::PublishedExecutionObservation<'_>>,
+) -> Result<(), UpsertPublishedNodeStatusError> {
+    let (
+        scheduling_status,
+        scheduling_reason,
+        network_slots_ready,
+        network_pool_min_ready,
+        network_slots_degraded,
+        network_slots_quarantined,
+        network_slots_total,
+        network_slots_leased,
+        network_pool_max_slots,
+        node_ctl,
+    ) = match node_status {
+        Some(status) => (
+            Some(status.scheduling_status_label()),
+            Some(status.scheduling_reason.as_str()),
+            Some(status.network_slots_ready),
+            Some(status.network_pool_min_ready),
+            Some(status.network_slots_degraded),
+            Some(status.network_slots_quarantined),
+            Some(status.network_slots_total),
+            Some(status.network_slots_leased),
+            Some(status.network_pool_max_slots),
+            status.node_ctl.as_ref(),
+        ),
+        None => (None, None, None, None, None, None, None, None, None, None),
+    };
+    sqlx::query(UPSERT_PUBLISHED_NODE_STATUS)
+        .bind(node_id)
+        .bind(reported_window.map(|window| window.as_secs_f64()))
+        .bind(scheduling_status)
+        .bind(scheduling_reason)
+        .bind(network_slots_ready)
+        .bind(network_pool_min_ready)
+        .bind(network_slots_degraded)
+        .bind(network_slots_quarantined)
+        .bind(network_slots_total)
+        .bind(network_slots_leased)
+        .bind(network_pool_max_slots)
+        .bind(node_ctl.map(Json))
+        .bind(inventory_prune.stamps_pruned_at())
+        .bind(local_backup_report.stamps_reported_at())
+        .bind(local_backup_report.clears_reported_at())
+        .bind(
+            execution_observation
+                .as_ref()
+                .map(|observation| observation.status.as_str()),
+        )
+        .bind(
+            execution_observation
+                .and_then(|observation| observation.policy)
+                .map(Json),
+        )
+        .bind(
+            pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS
+                .as_secs_f64(),
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(UpsertPublishedNodeStatusError::Upsert)?;
     Ok(())
 }
 
@@ -516,9 +526,9 @@ pub(super) fn reconcile_retry_delay_secs(attempts_before_failure: i32) -> i64 {
 }
 
 #[cfg(test)]
-#[path = "status_tests.rs"]
+#[path = "../../status_tests.rs"]
 mod status_tests;
 
 #[cfg(test)]
-#[path = "status_freshness_tests.rs"]
+#[path = "../../status_freshness_tests.rs"]
 mod status_freshness_tests;

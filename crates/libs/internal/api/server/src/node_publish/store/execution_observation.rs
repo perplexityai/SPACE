@@ -2,15 +2,42 @@
 //! as an empty inventory. Existing placement projections remain unchanged.
 
 use pplx_space_common_core::{sql, types::NodeId};
-use pplx_space_execution_common::proto::NodeExecutionInventory;
 use sqlx::types::Json;
-use tonic::Status;
 
 use crate::node_publish::validate::execution_inventory::ValidatedExecutionInventory;
 use crate::node_publish::validate::execution_observation::{
-    ExecutionInventoryEvidence, Report, ValidatedReport, decode,
+    ExecutionInventoryEvidence, ValidatedReport,
 };
-use crate::proto::ExecutionInventoryObservation;
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PrepareExecutionObservationError {
+    #[error("lock node execution publication: {0}")]
+    Lock(#[source] sqlx::Error),
+    #[error("publishing node no longer exists")]
+    MissingNode,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PublishExecutionInventoryError {
+    #[error(transparent)]
+    InvalidInventory(tonic::Status),
+    #[error("replace node runtime inventory: {0}")]
+    ReplaceRuntimes(#[source] sqlx::Error),
+    #[error("replace node component inventory: {0}")]
+    ReplaceComponents(#[source] sqlx::Error),
+    #[error("insert node runtime inventory: {0}")]
+    InsertRuntimes(#[source] sqlx::Error),
+    #[error("prune node runtime guests: {0}")]
+    PruneGuests(#[source] sqlx::Error),
+    #[error("insert node runtime guests: {0}")]
+    InsertGuests(#[source] sqlx::Error),
+    #[error("prune node state formats: {0}")]
+    PruneFormats(#[source] sqlx::Error),
+    #[error("insert node state formats: {0}")]
+    InsertFormats(#[source] sqlx::Error),
+    #[error("insert node component inventory: {0}")]
+    InsertComponents(#[source] sqlx::Error),
+}
 
 /// The outcome recorded only when the surrounding publication commits.
 #[derive(Clone, Copy, Debug)]
@@ -32,18 +59,21 @@ impl InventoryStatus {
 
 /// Holds decoded evidence after acquiring this publication's node lock.
 /// Construct before census writes; consume before the status upsert.
+#[derive(Debug)]
 pub(super) struct PreparedObservation<'a> {
     node_id: NodeId,
-    report: Report<'a>,
+    report: &'a ValidatedReport,
 }
 
+/// Lock the registered node before inventory writes, including empty censuses.
+/// Omitted evidence acquires no lock; a missing registration is distinct from
+/// an unavailable inventory and must not create a new node.
 pub(super) async fn prepare<'a>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     node_id: NodeId,
-    observation: Option<&'a ExecutionInventoryObservation>,
-    legacy: Option<&'a NodeExecutionInventory>,
-) -> Result<Option<PreparedObservation<'a>>, Status> {
-    let Some(report) = decode(observation, legacy)? else {
+    report: Option<&'a ValidatedReport>,
+) -> Result<Option<PreparedObservation<'a>>, PrepareExecutionObservationError> {
+    let Some(report) = report else {
         return Ok(None);
     };
     // Acquire before census writes to preserve node-before-sandbox lock order.
@@ -55,32 +85,38 @@ pub(super) async fn prepare<'a>(
         .bind(node_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|error| Status::internal(format!("lock node execution publication: {error}")))?
-        .ok_or_else(|| Status::not_found("publishing node no longer exists"))?;
+        .map_err(PrepareExecutionObservationError::Lock)?
+        .ok_or(PrepareExecutionObservationError::MissingNode)?;
     Ok(Some(PreparedObservation { node_id, report }))
 }
 
-pub(super) struct PublishedExecutionObservation {
+pub(super) struct PublishedExecutionObservation<'a> {
     pub status: InventoryStatus,
-    pub policy: Option<pplx_space_common_core::types::ExecutionPolicyObservation>,
+    pub policy: Option<&'a pplx_space_common_core::types::ExecutionPolicyObservation>,
 }
 
-pub(super) async fn publish(
+/// Apply inventory evidence under the node lock acquired by `prepare`.
+/// Omitted or unavailable evidence preserves inventory rows; a complete empty
+/// census replaces the inventory. Unchanged rows are a successful outcome.
+pub(super) async fn publish<'a>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    prepared: Option<PreparedObservation<'_>>,
-) -> Result<Option<PublishedExecutionObservation>, Status> {
+    prepared: Option<PreparedObservation<'a>>,
+) -> Result<Option<PublishedExecutionObservation<'a>>, PublishExecutionInventoryError> {
     let Some(PreparedObservation { node_id, report }) = prepared else {
         return Ok(None);
     };
-    let (status, evidence) = match ValidatedReport::try_from_report(report)? {
+    let (status, evidence) = match report {
         ValidatedReport::Complete(evidence) => (InventoryStatus::Complete, Some(evidence)),
         ValidatedReport::Legacy(evidence) => (InventoryStatus::Legacy, Some(evidence)),
         ValidatedReport::Unavailable => (InventoryStatus::Unavailable, None),
     };
-    let policy = if let Some(ExecutionInventoryEvidence { inventory, policy }) = evidence {
+    let policy = if let Some(evidence) = evidence {
+        let ExecutionInventoryEvidence { inventory, policy } = evidence
+            .as_ref()
+            .map_err(|error| PublishExecutionInventoryError::InvalidInventory(error.clone()))?;
         publish_inventory(tx, node_id, inventory).await?;
         match policy {
-            Ok(policy) => policy,
+            Ok(policy) => policy.as_ref(),
             Err(error) => {
                 tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");
                 None
@@ -99,11 +135,24 @@ pub(super) async fn publish(
 async fn publish_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    inventory: ValidatedExecutionInventory,
-) -> Result<(), Status> {
-    let (runtime_rows, component_rows) = inventory.into_legacy_rows();
+    inventory: &ValidatedExecutionInventory,
+) -> Result<(), PublishExecutionInventoryError> {
+    let (runtime_rows, component_rows) = inventory.legacy_rows();
     let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
     let component_rows = Json(serde_json::Value::Array(component_rows));
+    prune_installations(conn, node_id, &runtime_rows, &component_rows).await?;
+    upsert_runtime_inventory(conn, node_id, runtime_rows).await?;
+    upsert_component_inventory(conn, node_id, component_rows).await
+}
+
+/// Prune omitted installations under the caller's node lock.
+/// Empty censuses still delete previous rows; zero deletions is normal.
+async fn prune_installations(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    runtime_rows: &Json<serde_json::Value>,
+    component_rows: &Json<serde_json::Value>,
+) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "DELETE FROM node_runtime_installations installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -114,10 +163,10 @@ async fn publish_inventory(
          )"
     ))
     .bind(node_id)
-    .bind(&runtime_rows)
+    .bind(runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("replace node runtime inventory: {error}")))?;
+    .map_err(PublishExecutionInventoryError::ReplaceRuntimes)?;
     sqlx::query(sql!(
         "DELETE FROM node_artifact_components installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -130,14 +179,24 @@ async fn publish_inventory(
          )"
     ))
     .bind(node_id)
-    .bind(&component_rows)
+    .bind(component_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("replace node component inventory: {error}")))?;
+    .map_err(PublishExecutionInventoryError::ReplaceComponents)?;
+    Ok(())
+}
 
+/// Replace retained runtime capabilities under the caller's node lock.
+/// Conflict handling retains existing installations and locks changed rows.
+async fn upsert_runtime_inventory(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    runtime_rows: Json<serde_json::Value>,
+) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
+             SELECT runtime, runtime_version, guests, state_formats
+             FROM jsonb_to_recordset($2::jsonb) AS input(
                  runtime TEXT, runtime_version TEXT, guests JSONB, state_formats JSONB
              )
          )
@@ -146,10 +205,10 @@ async fn publish_inventory(
          ON CONFLICT (node_id, runtime, runtime_version) DO NOTHING"
     ))
     .bind(node_id)
-    .bind(runtime_rows.clone())
+    .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("insert node runtime inventory: {error}")))?;
+    .map_err(PublishExecutionInventoryError::InsertRuntimes)?;
     // A retained runtime can lose a guest or format; pruning only removed
     // runtime parents would leave those capabilities advertised indefinitely.
     sqlx::query(sql!(
@@ -168,10 +227,11 @@ async fn publish_inventory(
     .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("prune node runtime guests: {error}")))?;
+    .map_err(PublishExecutionInventoryError::PruneGuests)?;
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
+             SELECT runtime, runtime_version, guests
+             FROM jsonb_to_recordset($2::jsonb) AS input(
                  runtime TEXT, runtime_version TEXT, guests JSONB
              )
          )
@@ -187,10 +247,10 @@ async fn publish_inventory(
          ON CONFLICT (node_id, runtime, runtime_version, guest_os, guest_arch) DO NOTHING"
     ))
     .bind(node_id)
-    .bind(runtime_rows.clone())
+    .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("insert node runtime guests: {error}")))?;
+    .map_err(PublishExecutionInventoryError::InsertGuests)?;
     sqlx::query(sql!(
         "DELETE FROM node_runtime_state_formats installed
          WHERE node_id = $1 AND NOT EXISTS (
@@ -208,10 +268,11 @@ async fn publish_inventory(
     .bind(&runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("prune node state formats: {error}")))?;
+    .map_err(PublishExecutionInventoryError::PruneFormats)?;
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
+             SELECT runtime, runtime_version, state_formats
+             FROM jsonb_to_recordset($2::jsonb) AS input(
                  runtime TEXT, runtime_version TEXT, state_formats JSONB
              )
          )
@@ -244,11 +305,22 @@ async fn publish_inventory(
     .bind(runtime_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("insert node state formats: {error}")))?;
+    .map_err(PublishExecutionInventoryError::InsertFormats)?;
+    Ok(())
+}
 
+/// Write component descriptions after runtime replacement on the same connection.
+/// Conflicts lock component rows; unchanged descriptions remain successful.
+async fn upsert_component_inventory(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    component_rows: Json<serde_json::Value>,
+) -> Result<(), PublishExecutionInventoryError> {
     sqlx::query(sql!(
         "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
+             SELECT kind, role_key, version_key, digest_key, format_key,
+                    version, digest, format, default_for_new, legacy_default
+             FROM jsonb_to_recordset($2::jsonb) AS input(
                  kind TEXT, role_key TEXT, version_key TEXT, digest_key TEXT,
                  format_key TEXT, version TEXT, digest TEXT, format TEXT,
                  default_for_new BOOLEAN, legacy_default BOOLEAN
@@ -280,9 +352,10 @@ async fn publish_inventory(
     .bind(component_rows)
     .execute(&mut *conn)
     .await
-    .map_err(|error| Status::internal(format!("insert node component inventory: {error}")))?;
+    .map_err(PublishExecutionInventoryError::InsertComponents)?;
     Ok(())
 }
 
 #[cfg(test)]
+#[path = "../../execution_observation/tests.rs"]
 mod tests;

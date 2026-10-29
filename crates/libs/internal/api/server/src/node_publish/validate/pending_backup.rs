@@ -132,12 +132,12 @@ impl PendingBackupReport {
         }
     }
 
-    pub(crate) fn into_parsed(
-        self,
-    ) -> Option<Result<ParsedPendingLocalBackups, PendingLocalBackupParseError>> {
+    pub(crate) fn parsed(
+        &self,
+    ) -> Option<Result<&ParsedPendingLocalBackups, &PendingLocalBackupParseError>> {
         match self {
             Self::Absent => None,
-            Self::Present { parsed, .. } => Some(parsed),
+            Self::Present { parsed, .. } => Some(parsed.as_ref()),
         }
     }
 }

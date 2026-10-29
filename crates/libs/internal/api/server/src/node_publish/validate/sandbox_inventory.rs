@@ -5,65 +5,99 @@ use pplx_space_common_core::types::{
 };
 use tonic::Status;
 
+use super::census::SandboxCensus;
 use super::failure_episode::FailureEpisodeClaim;
 use super::quarantine::{QuarantineRecoveryProjectionState, quarantine_recovery_projection};
 use super::quarantine_claim::QuarantineClaim;
 use super::receipts;
 use super::sandbox_observation::ValidatedSandboxObservation;
 use super::sandbox_status::PublishedSandboxStatus;
-use super::snapshots::snapshot_json;
+use super::snapshots::SnapshotClaim;
 use crate::metadata::parse_sandbox_id;
-use crate::node_publish::diagnostics::SandboxDiagnostic;
+use crate::node_publish::diagnostics::{InvalidCensusIdentity, SandboxDiagnostic};
 use crate::proto::PublishedSandboxState;
 
 #[derive(Debug)]
-struct ObservedSandboxClaim {
-    observation: ValidatedSandboxObservation,
-    receipt: Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
-    recovery: QuarantineRecoveryProjectionState,
-    quarantine: Option<QuarantineClaim>,
-    // Snapshot IDs and descriptive labels are open legacy metadata. Only their
-    // numeric bounds are rejected; do not reinterpret them as central UUIDs.
-    snapshots: Vec<serde_json::Value>,
+pub(in crate::node_publish) struct ObservedSandboxClaim {
+    pub(in crate::node_publish) observation: ValidatedSandboxObservation,
+    pub(in crate::node_publish) receipt:
+        Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
+    pub(in crate::node_publish) recovery: QuarantineRecoveryProjectionState,
+    pub(in crate::node_publish) quarantine: Option<QuarantineClaim>,
+    pub(in crate::node_publish) snapshots: Vec<SnapshotClaim>,
 }
 
 /// A batch of node claims, without database decisions or generated identifiers.
 #[derive(Debug, Default)]
 pub(crate) struct ValidatedSandboxInventory {
-    absent_ids: Vec<SandboxId>,
-    observations: Vec<ObservedSandboxClaim>,
-    state_only: BTreeMap<SandboxId, Option<PublishedSandboxStatus>>,
-    failure_episodes: Vec<FailureEpisodeClaim>,
-    diagnostics: Vec<SandboxDiagnostic>,
+    pub(in crate::node_publish) absent_ids: Vec<SandboxId>,
+    pub(in crate::node_publish) observations: Vec<ObservedSandboxClaim>,
+    pub(in crate::node_publish) state_only: BTreeMap<SandboxId, Option<PublishedSandboxStatus>>,
+    pub(in crate::node_publish) failure_episodes: Vec<FailureEpisodeClaim>,
+    pub(in crate::node_publish) diagnostics: Vec<SandboxDiagnostic>,
 }
 
-/// Persistence encoding for the existing statements, not guarded row changes.
+/// Presence and optional status survive when a rich observation is unusable.
 #[derive(Debug)]
-pub(crate) struct LegacySandboxInput {
-    pub(crate) absent_ids: Vec<SandboxId>,
-    pub(crate) rows: Vec<serde_json::Value>,
-    pub(crate) state_only: BTreeMap<SandboxId, serde_json::Value>,
-    pub(crate) failure_episode_rows: Vec<FailureEpisodeClaim>,
-    pub(crate) snapshot_rows: Vec<serde_json::Value>,
-    pub(crate) quarantine_inputs: Vec<QuarantineClaim>,
-    pub(crate) publishes_network_policy: bool,
+pub(crate) struct DegradedSandboxClaim {
+    sandbox_id: SandboxId,
+    status: Option<PublishedSandboxStatus>,
+}
+
+impl DegradedSandboxClaim {
+    pub(crate) fn sandbox_id(&self) -> SandboxId {
+        self.sandbox_id
+    }
+
+    pub(crate) fn legacy_row(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sandbox_id": self.sandbox_id,
+            "status": self.status.as_ref().map(PublishedSandboxStatus::as_str),
+        })
+    }
+}
+
+impl From<(SandboxId, Option<PublishedSandboxStatus>)> for DegradedSandboxClaim {
+    fn from((sandbox_id, status): (SandboxId, Option<PublishedSandboxStatus>)) -> Self {
+        Self { sandbox_id, status }
+    }
 }
 
 impl ValidatedSandboxInventory {
     pub(crate) fn from_proto(states: &[PublishedSandboxState]) -> Self {
+        Self::from_publication(states, false).0
+    }
+
+    /// Inventory deduplication keeps the last declaration, while pruning keeps
+    /// every present declaration, including one followed by an absence.
+    pub(crate) fn from_publication(
+        states: &[PublishedSandboxState],
+        complete: bool,
+    ) -> (Self, SandboxCensus, Vec<InvalidCensusIdentity>) {
         let mut inventory = Self::default();
         let mut states_by_id = BTreeMap::new();
+        let mut present_ids = Vec::new();
+        let mut census_diagnostics = Vec::new();
         for state in states {
             match parse_sandbox_id(&state.sandbox_id) {
                 Ok(sandbox_id) => {
+                    if state.present {
+                        present_ids.push(sandbox_id);
+                    }
                     // The last declaration wins; process surviving identities
                     // in canonical order, not in wire order.
                     states_by_id.insert(sandbox_id, state);
                 }
-                Err(error) => inventory.diagnostics.push(SandboxDiagnostic::OmitSandbox {
-                    raw_id: state.sandbox_id.clone(),
-                    error,
-                }),
+                Err(error) => {
+                    census_diagnostics.push(InvalidCensusIdentity {
+                        raw_id: state.sandbox_id.clone(),
+                        error: error.clone(),
+                    });
+                    inventory.diagnostics.push(SandboxDiagnostic::OmitSandbox {
+                        raw_id: state.sandbox_id.clone(),
+                        error,
+                    });
+                }
             }
         }
         for (sandbox_id, state) in states_by_id {
@@ -102,53 +136,14 @@ impl ValidatedSandboxInventory {
                 );
             }
         }
-        inventory
-    }
-
-    pub(crate) fn diagnostics(&self) -> &[SandboxDiagnostic] {
-        &self.diagnostics
-    }
-
-    pub(crate) fn into_legacy_input(self) -> LegacySandboxInput {
-        let mut input = LegacySandboxInput {
-            absent_ids: self.absent_ids,
-            rows: Vec::with_capacity(self.observations.len()),
-            state_only: self
-                .state_only
-                .into_iter()
-                .map(|(sandbox_id, status)| {
-                    (
-                        sandbox_id,
-                        serde_json::json!({
-                            "sandbox_id": sandbox_id,
-                            "status": status.as_ref().map(PublishedSandboxStatus::as_str),
-                        }),
-                    )
-                })
-                .collect(),
-            failure_episode_rows: self.failure_episodes,
-            snapshot_rows: Vec::new(),
-            quarantine_inputs: Vec::new(),
-            publishes_network_policy: false,
+        let census = if !complete {
+            SandboxCensus::Partial
+        } else if census_diagnostics.is_empty() {
+            SandboxCensus::Complete(present_ids)
+        } else {
+            SandboxCensus::InvalidComplete
         };
-        for claim in self.observations {
-            let (recovery, recovery_degraded) = match &claim.recovery {
-                QuarantineRecoveryProjectionState::Absent => (None, false),
-                QuarantineRecoveryProjectionState::Degraded => (None, true),
-                QuarantineRecoveryProjectionState::Observed(observation) => {
-                    (Some(observation), false)
-                }
-            };
-            input.publishes_network_policy |= claim.observation.publishes_network_policy();
-            input.rows.push(claim.observation.legacy_row(
-                claim.receipt.as_ref(),
-                recovery,
-                recovery_degraded,
-            ));
-            input.snapshot_rows.extend(claim.snapshots);
-            input.quarantine_inputs.extend(claim.quarantine);
-        }
-        input
+        (inventory, census, census_diagnostics)
     }
 }
 
@@ -200,7 +195,7 @@ fn parse_observed(
     let snapshots = state
         .snapshots
         .iter()
-        .map(|snapshot| snapshot_json(sandbox_id, snapshot))
+        .map(|snapshot| SnapshotClaim::try_from_proto(sandbox_id, snapshot))
         .collect::<Result<_, _>>()?;
     // No part of a rich observation survives a malformed snapshot. Keep all
     // fields local until the whole observation can be accepted atomically.

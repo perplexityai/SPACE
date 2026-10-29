@@ -1,11 +1,18 @@
 use super::*;
-use crate::node_publish::validate::execution_observation::ObservationError;
-use crate::proto::{ExecutionInventoryUnavailable, execution_inventory_observation::Outcome};
+use crate::node_publish::store::ApplyPublishError;
+use crate::node_publish::validate::execution_observation::{ObservationError, Report, decode};
+use crate::proto::{
+    ExecutionInventoryObservation, ExecutionInventoryUnavailable,
+    execution_inventory_observation::Outcome,
+};
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
-use pplx_space_execution_common::proto::{RuntimeIdentity, RuntimeInstallation, RuntimeKind};
+use pplx_space_execution_common::proto::{
+    NodeExecutionInventory, RuntimeIdentity, RuntimeInstallation, RuntimeKind,
+};
 use pplx_space_test_env::TestResult;
 use prost::Message;
+use tonic::Status;
 
 // A deployed reader knows field 8 but not the observation envelope at field 11.
 #[derive(Clone, PartialEq, Message)]
@@ -119,8 +126,13 @@ async fn publish_with_status(
     observation: Option<&ExecutionInventoryObservation>,
     legacy: Option<&NodeExecutionInventory>,
 ) -> Result<(), Status> {
-    let prepared = prepare(tx, node_id, observation, legacy).await?;
-    let outcome = publish(tx, prepared).await?;
+    let report = validated_report(observation, legacy)?;
+    let prepared = prepare(tx, node_id, report.as_ref())
+        .await
+        .map_err(ApplyPublishError::from)?;
+    let outcome = publish(tx, prepared)
+        .await
+        .map_err(ApplyPublishError::from)?;
     crate::status::upsert_node_status_from_publish(
         tx,
         node_id,
@@ -131,6 +143,15 @@ async fn publish_with_status(
         outcome,
     )
     .await
+    .map_err(ApplyPublishError::from)
+    .map_err(Status::from)
+}
+
+fn validated_report(
+    observation: Option<&ExecutionInventoryObservation>,
+    legacy: Option<&NodeExecutionInventory>,
+) -> Result<Option<ValidatedReport>, Status> {
+    Ok(decode(observation, legacy)?.map(ValidatedReport::from_report))
 }
 
 async fn observed(
@@ -213,6 +234,21 @@ async fn observation_and_projection_follow_publication_outcomes_atomically() -> 
 }
 
 #[tokio::test]
+async fn missing_node_publication_retains_not_found_status() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let node_id = NodeId::new();
+    let empty = complete(NodeExecutionInventory::default());
+    let mut tx = db.pool.begin().await?;
+    let error = publish_with_status(&mut tx, node_id, Some(&empty), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound);
+    assert_eq!(error.message(), "publishing node no longer exists");
+    tx.rollback().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn empty_publications_serialize_until_status_receipt_commits() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
@@ -220,20 +256,24 @@ async fn empty_publications_serialize_until_status_receipt_commits() -> TestResu
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
     let empty = complete(NodeExecutionInventory::default());
+    let report = validated_report(Some(&empty), None)?;
     let mut first = db.pool.begin().await?;
     // No status or artifact rows are needed to serialize a replacement.
-    let prepared = prepare(&mut first, node_id, Some(&empty), None).await?;
+    let prepared = prepare(&mut first, node_id, report.as_ref()).await?;
     let outcome = publish(&mut first, prepared).await?;
     let mut second = db.pool.begin().await?;
     sqlx::query(sql!("SET LOCAL lock_timeout = '20ms'"))
         .execute(&mut *second)
         .await?;
-    let result = prepare(&mut second, node_id, Some(&empty), None).await;
+    let result = prepare(&mut second, node_id, report.as_ref()).await;
     let error = match result {
         Err(error) => error,
         Ok(_) => panic!("concurrent empty publication did not wait for the node lock"),
     };
-    assert_eq!(error.code(), tonic::Code::Internal);
+    assert_eq!(
+        Status::from(ApplyPublishError::from(error)).code(),
+        tonic::Code::Internal
+    );
     second.rollback().await?;
     crate::status::upsert_node_status_from_publish(
         &mut first,

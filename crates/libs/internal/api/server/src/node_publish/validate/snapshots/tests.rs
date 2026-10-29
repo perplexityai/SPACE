@@ -31,7 +31,7 @@ fn snapshot_numeric_fields_keep_field_specific_rejections() {
     ];
     let sandbox = "01990000-0000-7000-8000-000000000001".parse().unwrap();
     for (snapshot, field, integer) in cases {
-        let error = snapshot_json(sandbox, &snapshot).unwrap_err();
+        let error = SnapshotClaim::try_from_proto(sandbox, &snapshot).unwrap_err();
         assert_eq!(error.code(), Code::InvalidArgument);
         assert_eq!(
             error.message(),
@@ -50,14 +50,15 @@ fn unknown_snapshot_types_remain_explicit_unknown_observations() {
     ];
     let sandbox = "01990000-0000-7000-8000-000000000001".parse().unwrap();
     for (kind, expected) in cases {
-        let row = snapshot_json(
+        let row = SnapshotClaim::try_from_proto(
             sandbox,
             &SnapshotDetail {
                 r#type: kind,
                 ..SnapshotDetail::default()
             },
         )
-        .unwrap();
+        .unwrap()
+        .legacy_row();
         assert_eq!(row["type"], expected);
         assert!(row["size_bytes"].is_null());
         assert_eq!(row["locations"], serde_json::json!([]));

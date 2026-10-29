@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, str::FromStr};
+#[cfg(test)]
+use std::str::FromStr;
+use std::{collections::BTreeMap, ops::ControlFlow};
 
 use pplx_space_common_core::{
     sql,
@@ -23,12 +25,37 @@ use pplx_space_metrics::sandbox::publication::{
 use pplx_space_placement::StoredSandboxLifecycle;
 use pplx_space_sandbox_teardown::finalize_sandbox_db_delete_tx;
 use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
+#[cfg(test)]
 use tonic::Status;
 
 use crate::node_publish::validate::delete_completions::{
     DeleteCompletionClaim as ParsedCompletion, ValidatedDeleteCompletions,
 };
+#[cfg(test)]
 use crate::proto::AutoLifecycleDeleteCompletion;
+
+#[path = "delete_completions/authority.rs"]
+mod authority;
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ConsumeDeleteCompletionsError {
+    #[error("bound auto-lifecycle delete completion lock waits: {0}")]
+    BoundLockWaits(#[source] sqlx::Error),
+    #[error("begin auto-lifecycle delete receipt scope: {0}")]
+    BeginReceipt(#[source] sqlx::Error),
+    #[error("finish auto-lifecycle delete receipt scope: {0}")]
+    FinishReceipt(#[source] sqlx::Error),
+    #[error("discard auto-lifecycle delete receipt scope: {0}")]
+    DiscardReceipt(#[source] sqlx::Error),
+    #[error("inspect auto-lifecycle delete completion authority: {0}")]
+    InspectAuthority(#[source] sqlx::Error),
+    #[error("inspect auto-lifecycle delete completion evidence: {0}")]
+    InspectEvidence(#[source] sqlx::Error),
+    #[error("inspect auto-lifecycle delete quarantine ownership: {0}")]
+    InspectQuarantine(#[source] sqlx::Error),
+    #[error("finalize auto-lifecycle delete completion: {0}")]
+    Finalize(#[source] sqlx::Error),
+}
 
 #[derive(Debug, FromRow)]
 struct CompletionAuthorityRow {
@@ -173,13 +200,17 @@ fn is_retryable_finalize_error(error: &sqlx::Error) -> bool {
     contention::is_lock_contention(error)
 }
 
-pub(super) async fn consume_auto_lifecycle_delete_completions(
+#[cfg(test)]
+async fn consume_auto_lifecycle_delete_completions(
     tx: &mut Transaction<'_, Postgres>,
     origin_node_id: NodeId,
     completions: &[AutoLifecycleDeleteCompletion],
 ) -> Result<AutoLifecycleDeleteConsumption, Status> {
     let completions = ValidatedDeleteCompletions::from_proto(completions);
-    consume_validated_auto_lifecycle_delete_completions(tx, origin_node_id, completions).await
+    consume_validated_auto_lifecycle_delete_completions(tx, origin_node_id, &completions)
+        .await
+        .map_err(crate::node_publish::store::ApplyPublishError::from)
+        .map_err(Status::from)
 }
 
 /// Consume selected claims after this publication's final evidence writes.
@@ -187,8 +218,8 @@ pub(super) async fn consume_auto_lifecycle_delete_completions(
 pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
     tx: &mut Transaction<'_, Postgres>,
     origin_node_id: NodeId,
-    completions: ValidatedDeleteCompletions,
-) -> Result<AutoLifecycleDeleteConsumption, Status> {
+    completions: &ValidatedDeleteCompletions,
+) -> Result<AutoLifecycleDeleteConsumption, ConsumeDeleteCompletionsError> {
     for diagnostic in &completions.diagnostics {
         diagnostic.emit(origin_node_id);
     }
@@ -201,10 +232,12 @@ pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
         ..
     } = completions;
     let mut consumption = AutoLifecycleDeleteConsumption {
-        acknowledged_receipt_ids,
-        deferred_by_batch_limit,
-        deferred_by_request_limit,
-        completion_metrics,
+        // These bounded response accumulators grow during application; the
+        // selected claims and their diagnostics remain borrowed from the plan.
+        acknowledged_receipt_ids: acknowledged_receipt_ids.clone(),
+        deferred_by_batch_limit: *deferred_by_batch_limit,
+        deferred_by_request_limit: *deferred_by_request_limit,
+        completion_metrics: completion_metrics.clone(),
         ..Default::default()
     };
     if selected.is_empty() {
@@ -223,11 +256,7 @@ pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
         ))
         .execute(&mut **tx)
         .await
-        .map_err(|error| {
-            Status::internal(format!(
-                "bound auto-lifecycle delete completion lock waits: {error}"
-            ))
-        })?;
+        .map_err(ConsumeDeleteCompletionsError::BoundLockWaits)?;
 
     for completion in selected {
         // One savepoint per receipt. A NOWAIT failure or a finalize deadlock
@@ -237,23 +266,21 @@ pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
         // a savepoint that takes a row lock assigns a subtransaction id, and a
         // backend that exceeds its 64-entry subtransaction cache pushes every
         // other backend onto pg_subtrans SLRU lookups.
-        let mut receipt_tx = tx.begin().await.map_err(|error| {
-            Status::internal(format!(
-                "begin auto-lifecycle delete receipt scope: {error}"
-            ))
-        })?;
+        let mut receipt_tx = tx
+            .begin()
+            .await
+            .map_err(ConsumeDeleteCompletionsError::BeginReceipt)?;
         // Keeping the savepoint disposition and the bookkeeping in one match is
         // what makes a new outcome variant a compile error rather than a silent
         // rollback.
-        match apply_receipt(&mut receipt_tx, origin_node_id, &completion).await? {
+        match apply_receipt(&mut receipt_tx, origin_node_id, completion).await? {
             ReceiptOutcome::Applied { from_lifecycle } => {
                 // Releasing the savepoint promotes the delete and its row locks
                 // to the publication transaction.
-                receipt_tx.commit().await.map_err(|error| {
-                    Status::internal(format!(
-                        "finish auto-lifecycle delete receipt scope: {error}"
-                    ))
-                })?;
+                receipt_tx
+                    .commit()
+                    .await
+                    .map_err(ConsumeDeleteCompletionsError::FinishReceipt)?;
                 consumption
                     .acknowledged_receipt_ids
                     .push(completion.receipt_id);
@@ -271,11 +298,11 @@ pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
             }
             ReceiptOutcome::AcknowledgedNoop(reason) => {
                 discard_receipt_scope(receipt_tx).await?;
-                acknowledge_noop(&mut consumption, &completion, origin_node_id, reason);
+                acknowledge_noop(&mut consumption, completion, origin_node_id, reason);
             }
             ReceiptOutcome::Deferred(reason) => {
                 discard_receipt_scope(receipt_tx).await?;
-                defer_completion(&mut consumption, &completion, reason);
+                defer_completion(&mut consumption, completion, reason);
             }
         }
     }
@@ -287,12 +314,13 @@ pub(super) async fn consume_validated_auto_lifecycle_delete_completions(
 ///
 /// No receipt path other than [`ReceiptOutcome::Applied`] writes, so this only
 /// releases evidence locks the publication no longer needs.
-async fn discard_receipt_scope(receipt_tx: Transaction<'_, Postgres>) -> Result<(), Status> {
-    receipt_tx.rollback().await.map_err(|error| {
-        Status::internal(format!(
-            "discard auto-lifecycle delete receipt scope: {error}"
-        ))
-    })
+async fn discard_receipt_scope(
+    receipt_tx: Transaction<'_, Postgres>,
+) -> Result<(), ConsumeDeleteCompletionsError> {
+    receipt_tx
+        .rollback()
+        .await
+        .map_err(ConsumeDeleteCompletionsError::DiscardReceipt)
 }
 
 /// Evaluate one receipt's fencing chain and, when every link matches, delete the
@@ -305,7 +333,7 @@ async fn apply_receipt(
     tx: &mut Transaction<'_, Postgres>,
     origin_node_id: NodeId,
     completion: &ParsedCompletion,
-) -> Result<ReceiptOutcome, Status> {
+) -> Result<ReceiptOutcome, ConsumeDeleteCompletionsError> {
     let row = sqlx::query_as::<_, CompletionAuthorityRow>(sql!(
         "SELECT s.lifecycle,
                 s.auto_lifecycle_json,
@@ -328,9 +356,7 @@ async fn apply_receipt(
             ));
         }
         Err(error) => {
-            return Err(Status::internal(format!(
-                "inspect auto-lifecycle delete completion authority: {error}"
-            )));
+            return Err(ConsumeDeleteCompletionsError::InspectAuthority(error));
         }
     };
 
@@ -377,9 +403,7 @@ async fn apply_receipt(
             ));
         }
         Err(error) => {
-            return Err(Status::internal(format!(
-                "inspect auto-lifecycle delete completion evidence: {error}"
-            )));
+            return Err(ConsumeDeleteCompletionsError::InspectEvidence(error));
         }
     };
 
@@ -388,99 +412,15 @@ async fn apply_receipt(
             AutoLifecycleDeleteCompletionReason::MissingLineage,
         ));
     };
-    let latest_generation = evidence.latest_execution_generation;
-    if latest_generation > completion.execution_generation {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::StaleGeneration,
-        ));
-    }
-    if latest_generation < completion.execution_generation {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::AheadOfLineage,
-        ));
-    }
-    let Some(route_activation_id) = evidence.route_activation_id else {
-        // Receipts are emitted only after the route-assignment write has
-        // populated this identity. A missing value is legacy or partial
-        // central evidence and cannot be relaxed to generation-only ABA
-        // fencing.
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::MissingRouteIdentity,
-        ));
-    };
-    if route_activation_id != completion.route_activation_id {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::RouteIncarnationMismatch,
-        ));
-    }
-    if !evidence.publisher_owns_execution {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::DifferentExecutionNode,
-        ));
+    if let Some(outcome) = authority::execution_outcome(&evidence, completion) {
+        return Ok(outcome);
     }
 
-    let stored_lifecycle = match StoredSandboxLifecycle::from_str(&row.lifecycle) {
-        Ok(lifecycle) => lifecycle,
-        Err(error) => {
-            tracing::warn!(
-                sandbox_id = %completion.sandbox_id,
-                receipt_id = %completion.receipt_id,
-                lifecycle = %row.lifecycle,
-                %error,
-                "acknowledging auto-lifecycle delete completion for unknown central lifecycle"
-            );
-            return Ok(ReceiptOutcome::AcknowledgedNoop(
-                AutoLifecycleDeleteCompletionReason::UnknownLifecycle,
-            ));
-        }
+    let authority = match authority::decide(row, completion) {
+        ControlFlow::Continue(authority) => authority,
+        ControlFlow::Break(outcome) => return Ok(outcome),
     };
-    let from_lifecycle = match stored_lifecycle {
-        StoredSandboxLifecycle::Deleted => {
-            return Ok(ReceiptOutcome::AcknowledgedNoop(
-                AutoLifecycleDeleteCompletionReason::DeletedTombstone,
-            ));
-        }
-        StoredSandboxLifecycle::CleanupRequired => {
-            return Ok(ReceiptOutcome::AcknowledgedNoop(
-                AutoLifecycleDeleteCompletionReason::CleanupRequired,
-            ));
-        }
-        StoredSandboxLifecycle::Live(lifecycle) => lifecycle,
-    };
-    let current_policy =
-        match serde_json::from_value::<AutoLifecyclePolicy>(row.auto_lifecycle_json.0) {
-            Ok(policy) => policy,
-            Err(error) => {
-                tracing::warn!(
-                    sandbox_id = %completion.sandbox_id,
-                    receipt_id = %completion.receipt_id,
-                    %error,
-                    "deferring auto-lifecycle delete completion with unreadable central policy"
-                );
-                return Ok(ReceiptOutcome::Deferred(
-                    AutoLifecycleDeleteCompletionReason::PolicyUnreadable,
-                ));
-            }
-        };
-    let current_policy_fingerprint = AutoLifecyclePolicyFingerprint::for_policy(&current_policy);
-    if current_policy_fingerprint != completion.policy_fingerprint {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::PolicyMismatch,
-        ));
-    }
-    // The fingerprint already commits to the delete action. Retain this
-    // explicit authorization check as defense against a nonconforming
-    // publisher or a future fingerprint projection bug.
-    if !current_policy.contains_action(AutoLifecycleIdleAction::Delete) {
-        return Ok(ReceiptOutcome::AcknowledgedNoop(
-            AutoLifecycleDeleteCompletionReason::PolicyDoesNotAuthorizeDelete,
-        ));
-    }
-    if from_lifecycle.is_transient() {
-        return Ok(ReceiptOutcome::Deferred(
-            AutoLifecycleDeleteCompletionReason::TransientLifecycle,
-        ));
-    }
+    let from_lifecycle = authority.prior_lifecycle();
 
     if from_lifecycle == SandboxLifecycle::Quarantined {
         let matching_orphan_quarantine = sqlx::query_scalar::<_, bool>(sql!(
@@ -508,9 +448,7 @@ async fn apply_receipt(
                 ));
             }
             Err(error) => {
-                return Err(Status::internal(format!(
-                    "inspect auto-lifecycle delete quarantine ownership: {error}"
-                )));
+                return Err(ConsumeDeleteCompletionsError::InspectQuarantine(error));
             }
         };
         if !matching_orphan_quarantine {
@@ -518,58 +456,8 @@ async fn apply_receipt(
                 AutoLifecycleDeleteCompletionReason::QuarantineHold,
             ));
         }
-    } else {
-        match row.active_node_id {
-            Some(node_id) if node_id == origin_node_id => {}
-            Some(_) => {
-                return Ok(ReceiptOutcome::AcknowledgedNoop(
-                    AutoLifecycleDeleteCompletionReason::DifferentActiveNode,
-                ));
-            }
-            None => match from_lifecycle {
-                // Dormant rows clear their active placement by construction, so
-                // the locked latest execution row is the durable ownership
-                // evidence.
-                SandboxLifecycle::Stopped | SandboxLifecycle::Suspended => {}
-                // A live-looking row with no active node is mid-transition.
-                // Defer until placement is republished, but only for as long as
-                // a transition could plausibly still be running.
-                SandboxLifecycle::Started | SandboxLifecycle::Paused => {
-                    if row.ownership_evidence_expired {
-                        return Ok(ReceiptOutcome::AcknowledgedNoop(
-                            AutoLifecycleDeleteCompletionReason::OwnershipEvidenceExpired,
-                        ));
-                    }
-                    return Ok(ReceiptOutcome::Deferred(
-                        AutoLifecycleDeleteCompletionReason::AwaitingOwnershipEvidence,
-                    ));
-                }
-                // Never placed or already failed out of placement: there is no
-                // ownership left to prove, and no retry would produce one.
-                SandboxLifecycle::Created | SandboxLifecycle::Failed => {
-                    return Ok(ReceiptOutcome::AcknowledgedNoop(
-                        AutoLifecycleDeleteCompletionReason::OwnershipAbsent,
-                    ));
-                }
-                // Transient states returned above and quarantine took the other
-                // branch. Fail closed rather than widen the delete-authorizing
-                // set if that ever stops holding.
-                SandboxLifecycle::Creating
-                | SandboxLifecycle::Starting
-                | SandboxLifecycle::Restoring
-                | SandboxLifecycle::Pausing
-                | SandboxLifecycle::Resuming
-                | SandboxLifecycle::Suspending
-                | SandboxLifecycle::Stopping
-                | SandboxLifecycle::Deleting
-                | SandboxLifecycle::Checkpointing
-                | SandboxLifecycle::Quarantined => {
-                    return Ok(ReceiptOutcome::AcknowledgedNoop(
-                        AutoLifecycleDeleteCompletionReason::OwnershipAbsent,
-                    ));
-                }
-            },
-        }
+    } else if let Some(outcome) = authority.ownership_outcome(origin_node_id) {
+        return Ok(outcome);
     }
     if evidence.creating_snapshot_exists {
         return Ok(ReceiptOutcome::Deferred(
@@ -582,11 +470,10 @@ async fn apply_receipt(
         Err(error) if is_retryable_finalize_error(&error) => Ok(ReceiptOutcome::Deferred(
             AutoLifecycleDeleteCompletionReason::FinalizeContended,
         )),
-        Err(error) => Err(Status::internal(format!(
-            "finalize auto-lifecycle delete completion: {error}"
-        ))),
+        Err(error) => Err(ConsumeDeleteCompletionsError::Finalize(error)),
     }
 }
 
 #[cfg(test)]
+#[path = "../../auto_lifecycle_delete_completions/tests.rs"]
 mod tests;

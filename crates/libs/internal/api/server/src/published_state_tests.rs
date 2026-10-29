@@ -1,5 +1,6 @@
 use super::*;
 use crate::ClusterApiService;
+use crate::node_publish::validate::execution_observation::{Report, ValidatedReport};
 use crate::node_publish::validate::fields::published_artifact_origin;
 use crate::node_publish::validate::templates::template_state_row;
 use crate::proto::cluster_api_server::ClusterApi;
@@ -148,8 +149,9 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
     sandbox.execution = Some((&execution).into());
 
     let mut tx = db.pool.begin().await?;
+    let report = ValidatedReport::from_report(Report::Legacy(&inventory));
     let observation =
-        crate::execution_observation::prepare(&mut tx, node_id, None, Some(&inventory)).await?;
+        crate::execution_observation::prepare(&mut tx, node_id, Some(&report)).await?;
     crate::execution_observation::publish(&mut tx, observation).await?;
     tx.commit().await?;
     let mut conn = db.pool.acquire().await?;
@@ -757,7 +759,7 @@ async fn post_selection_execution_identity_change_blocks_exact_finalization() ->
     .bind(sandbox_id)
     .execute(&db.pool)
     .await?;
-    let projected = apply_suspended_k8s_finalization(
+    let projected = suspend_finalization::apply(
         &mut tx,
         &[SuspendedFinalizationCandidate {
             sandbox_id,

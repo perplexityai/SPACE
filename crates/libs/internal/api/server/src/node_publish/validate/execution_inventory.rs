@@ -51,15 +51,15 @@ impl ValidatedExecutionInventory {
         })
     }
 
-    pub(crate) fn into_legacy_rows(self) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    pub(crate) fn legacy_rows(&self) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
         (
             self.runtimes
-                .into_iter()
-                .map(RuntimeInstallation::into_json)
+                .iter()
+                .map(RuntimeInstallation::json)
                 .collect(),
             self.components
-                .into_iter()
-                .map(ComponentInstallation::into_json)
+                .iter()
+                .map(ComponentInstallation::json)
                 .collect(),
         )
     }
@@ -95,10 +95,10 @@ impl RuntimeInstallation {
         })
     }
 
-    fn into_json(self) -> serde_json::Value {
+    fn json(&self) -> serde_json::Value {
         let guests = self
             .guests
-            .into_iter()
+            .iter()
             .map(|guest| {
                 serde_json::json!({
                     "guest_os": guest.os.as_str(),
@@ -108,7 +108,7 @@ impl RuntimeInstallation {
             .collect::<Vec<_>>();
         let state_formats = self
             .state_formats
-            .into_iter()
+            .iter()
             .map(|capability| {
                 serde_json::json!({
                     "state_format_name": capability.identity.format.as_str(),
@@ -156,8 +156,8 @@ impl ComponentInstallation {
         })
     }
 
-    fn into_json(self) -> serde_json::Value {
-        let component = self.component;
+    fn json(&self) -> serde_json::Value {
+        let component = &self.component;
         serde_json::json!({
             "kind": component.kind.as_str(),
             "role_key": component.role.as_ref().map_or("", |role| role.as_str()),

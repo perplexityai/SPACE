@@ -13,6 +13,11 @@
 //! thin `main` that parses flags, initializes telemetry, and calls [`run`], so
 //! a deployment that needs private wiring can supply its own `main` against
 //! this library without copying any of the service.
+//!
+//! Node publication parses evidence in `node_publish::validate`, groups typed
+//! claims in `node_publish::plan`, and applies them through `node_publish::store`
+//! in one transaction. Only the store evaluates lifecycle guards; the committed
+//! outcome owns the post-commit events and response.
 pub use pplx_space_common_svc::auth;
 pub use pplx_space_node_api_client::proto;
 
@@ -144,14 +149,16 @@ impl FinalizedSnapshotRow {
     }
 }
 
-#[path = "published_state.rs"]
+// These module names preserve tracing and snapshot identity. Their source
+// belongs to the node-publication store.
+#[path = "node_publish/store/published_state.rs"]
 mod published_state;
 /// Re-exported so Space's Datadog DBM query tests (private to Space) can drive the publish path.
 pub use published_state::publish_sandbox_states;
+#[path = "node_publish/store/quarantine.rs"]
 mod sandbox_quarantine_store;
 use published_state::{
-    capture_host_cpu, project_ready_suspend_snapshot, prune_absent_node_templates,
-    publish_template_states, snapshot_execution_metadata,
+    capture_host_cpu, project_ready_suspend_snapshot, snapshot_execution_metadata,
 };
 
 const SUPPORTED_TEMPLATE_RUNTIMES: &[RuntimeKind] = &[RuntimeKind::Firecracker];
@@ -1483,13 +1490,17 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 }
 
 mod adapter;
+#[path = "node_publish/store/delete_completions.rs"]
 mod auto_lifecycle_delete_completions;
 mod backup_generation_fence;
 mod execution_currency;
+#[path = "node_publish/store/execution_observation.rs"]
 mod execution_observation;
 mod metadata;
+#[path = "node_publish/store/backup_pending.rs"]
 mod node_local_backup_pending;
 mod publish;
+#[path = "node_publish/store/node_status.rs"]
 mod status;
 mod template_publication;
 mod template_registration_store;

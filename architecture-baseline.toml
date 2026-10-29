@@ -53,7 +53,6 @@
 "crates/libs/internal/api/server/src/data_plane_sessions.rs" = 1780
 "crates/libs/internal/api/server/src/lib.rs" = 1222
 "crates/libs/internal/api/server/src/metadata.rs" = 1078
-"crates/libs/internal/api/server/src/published_state.rs" = 3750
 "crates/libs/metrics/src/sandbox/api.rs" = 1036
 "crates/libs/metrics/src/sandbox/worker.rs" = 1397
 "crates/libs/net/common/src/lib.rs" = 1508
@@ -121,7 +120,9 @@
 "crates/libs/cluster/trigger-queue/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
 "crates/libs/internal/api/server/src/lib.rs" = 1
-"crates/libs/internal/api/server/src/published_state.rs" = 4
+"crates/libs/internal/api/server/src/node_publish/store/observed_state.rs" = 1
+"crates/libs/internal/api/server/src/node_publish/store/degraded_observations.rs" = 1
+"crates/libs/internal/api/server/src/node_publish/store/failure_episodes.rs" = 2
 "crates/libs/sandbox/store/src/lib.rs" = 2
 
 [pattern_ratchet.kubernetes_access]
@@ -171,9 +172,13 @@
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
 "crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 12
 "crates/libs/internal/api/server/src/data_plane_sessions/service_route.rs" = 1
-"crates/libs/internal/api/server/src/published_state.rs" = 9
-"crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 3
-"crates/libs/internal/api/server/src/status.rs" = 1
+"crates/libs/internal/api/server/src/node_publish/store/quarantine_claims.rs" = 1
+"crates/libs/internal/api/server/src/node_publish/store/suspend_finalization.rs" = 1
+"crates/libs/internal/api/server/src/node_publish/store/lifecycle_transitions.rs" = 3
+"crates/libs/internal/api/server/src/node_publish/store/activity.rs" = 1
+"crates/libs/internal/api/server/src/node_publish/store/absent_sandboxes.rs" = 1
+"crates/libs/internal/api/server/src/node_publish/store/quarantine.rs" = 3
+"crates/libs/internal/api/server/src/node_publish/store/node_status.rs" = 1
 "crates/libs/placement/machine/src/postgres.rs" = 1
 "crates/libs/sandbox/teardown/src/lib.rs" = 1
 

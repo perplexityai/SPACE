@@ -11,15 +11,9 @@ fn entry() -> PendingLocalBackup {
 
 #[test]
 fn absent_empty_and_unusable_reports_remain_distinct() {
-    assert!(
-        PendingBackupReport::from_proto(None)
-            .into_parsed()
-            .is_none()
-    );
-    let empty = PendingBackupReport::from_proto(Some(&PendingLocalBackupReport::default()))
-        .into_parsed()
-        .unwrap()
-        .unwrap();
+    assert!(PendingBackupReport::from_proto(None).parsed().is_none());
+    let report = PendingBackupReport::from_proto(Some(&PendingLocalBackupReport::default()));
+    let empty = report.parsed().unwrap().unwrap();
     assert_eq!(empty.entry_count(), 0);
     for entries in [
         vec![PendingLocalBackup {
@@ -40,7 +34,7 @@ fn absent_empty_and_unusable_reports_remain_distinct() {
             pending: entries.clone(),
         }));
         assert_eq!(report.reported_count(), Some(entries.len()));
-        report.into_parsed().unwrap().unwrap_err();
+        report.parsed().unwrap().unwrap_err();
     }
     let valid = ParsedPendingLocalBackups::parse(&[entry()]).unwrap();
     assert!(valid.names(SandboxId::from_uuid(uuid::Uuid::from_u128(1))));

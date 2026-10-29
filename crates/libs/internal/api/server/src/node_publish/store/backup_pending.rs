@@ -171,11 +171,27 @@ use crate::node_publish::validate::pending_backup::{
 };
 use crate::status::SandboxInventoryPrune;
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum DecidePendingBackupError {
+    #[error("look up undescribed pending-backup owners: {0}")]
+    LookupOwners(#[source] pplx_space_sandbox_store::SandboxStoreError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ReconcilePendingBackupError {
+    #[error("mirror reported pending local backups: {0}")]
+    Mirror(#[source] sqlx::Error),
+    #[error("prune durable absent pending local backups: {0}")]
+    Prune(#[source] sqlx::Error),
+    #[error("count mirrored pending local backups: {0}")]
+    Count(#[source] sqlx::Error),
+}
+
 /// What one publication is allowed to do to the node's mirror.
 #[derive(Debug)]
-pub(super) enum PendingLocalBackupCensus {
+pub(super) enum PendingLocalBackupCensus<'a> {
     /// Set-replace the node's rows against this report and advance the gate.
-    Report(ParsedPendingLocalBackups),
+    Report(&'a ParsedPendingLocalBackups),
     /// Leave the rows exactly as the last census left them. The gate is a
     /// separate decision made by the caller: a publication that could not
     /// have mirrored preserves it, one that claimed a complete inventory and
@@ -251,14 +267,14 @@ pub(super) enum PendingLocalBackupCensus {
 ///
 /// The extra read costs a statement only on publications that actually carry
 /// a degraded observation, which is not the steady state.
-pub(super) async fn decide(
+pub(super) async fn decide<'a>(
     conn: &mut sqlx::PgConnection,
-    pending_local_backups: PendingBackupReport,
+    pending_local_backups: &'a PendingBackupReport,
     inventory_prune: SandboxInventoryPrune,
     state_only_sandbox_ids: &BTreeSet<SandboxId>,
     node_id: NodeId,
-) -> Result<PendingLocalBackupCensus, Status> {
-    let Some(reported) = pending_local_backups.into_parsed() else {
+) -> Result<PendingLocalBackupCensus<'a>, DecidePendingBackupError> {
+    let Some(reported) = pending_local_backups.parsed() else {
         return Ok(PendingLocalBackupCensus::Declined(
             LocalBackupQueueOutcome::NoReport,
         ));
@@ -282,7 +298,7 @@ pub(super) async fn decide(
         }
     };
     if let Some(sandbox_id) =
-        undescribed_artifact_owner(conn, state_only_sandbox_ids, &report, node_id).await?
+        undescribed_artifact_owner(conn, state_only_sandbox_ids, report, node_id).await?
     {
         tracing::warn!(
             %node_id,
@@ -353,7 +369,7 @@ async fn undescribed_artifact_owner(
     state_only_sandbox_ids: &BTreeSet<SandboxId>,
     report: &ParsedPendingLocalBackups,
     node_id: NodeId,
-) -> Result<Option<SandboxId>, Status> {
+) -> Result<Option<SandboxId>, DecidePendingBackupError> {
     let omitted = state_only_sandbox_ids
         .iter()
         .copied()
@@ -361,9 +377,7 @@ async fn undescribed_artifact_owner(
         .collect::<Vec<_>>();
     pplx_space_sandbox_store::any_undescribed_artifact_owner(conn, node_id, &omitted)
         .await
-        .map_err(|err| {
-            Status::internal(format!("look up undescribed pending-backup owners: {err}"))
-        })
+        .map_err(DecidePendingBackupError::LookupOwners)
 }
 
 /// Counts from one set-replace, emitted after the publish transaction commits.
@@ -424,7 +438,7 @@ pub(super) async fn reconcile(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     report: &ParsedPendingLocalBackups,
-) -> Result<PendingLocalBackupReconcile, Status> {
+) -> Result<PendingLocalBackupReconcile, ReconcilePendingBackupError> {
     let (reported_sandbox_ids, reported_artifact_ids, reported_artifact_kinds) =
         report.unnest_columns();
 
@@ -494,7 +508,7 @@ pub(super) async fn reconcile(
         .bind(&reported_artifact_kinds)
         .execute(&mut *conn)
         .await
-        .map_err(|err| Status::internal(format!("mirror reported pending local backups: {err}")))?
+        .map_err(ReconcilePendingBackupError::Mirror)?
         .rows_affected()
     };
 
@@ -512,7 +526,7 @@ pub(super) async fn reconcile(
     .bind(&reported_sandbox_ids)
     .fetch_one(&mut *conn)
     .await
-    .map_err(|err| Status::internal(format!("count mirrored pending local backups: {err}")))?;
+    .map_err(ReconcilePendingBackupError::Count)?;
 
     // Every reported entry whose sandbox exists is affected by the upsert,
     // including one whose stored values did not change, so the shortfall is
@@ -577,16 +591,14 @@ async fn delete_durable_absent(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     reported_sandbox_ids: &[SandboxId],
-) -> Result<u64, Status> {
+) -> Result<u64, ReconcilePendingBackupError> {
     Ok(
         sqlx::query(sqlx::AssertSqlSafe(DELETE_DURABLE_ABSENT.as_str()))
             .bind(node_id.as_uuid())
             .bind(reported_sandbox_ids)
             .execute(conn)
             .await
-            .map_err(|err| {
-                Status::internal(format!("prune durable absent pending local backups: {err}"))
-            })?
+            .map_err(ReconcilePendingBackupError::Prune)?
             .rows_affected(),
     )
 }
@@ -678,4 +690,5 @@ pub(super) async fn clear_finalized(
 }
 
 #[cfg(test)]
+#[path = "../../node_local_backup_pending/tests.rs"]
 mod tests;
