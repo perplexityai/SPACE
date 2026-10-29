@@ -56,6 +56,6 @@ The completed local matrix includes optimized builds, formatting, workspace Clip
 
 Row evidence covers 20 exported tables after explicit run-local normalization. Counter-aware records permit only the approved counter freshness differences and preserve their observed lag diagnostics. Empty tables do not prove their write paths, and this is not all-table or all-cascade coverage. Mixed-version rollout, real microVM behavior, and multi-node races beyond the test suite were not validated. No strict counter API-age guarantee is asserted.
 
-The next report received at least 60 seconds after the last counter write refreshes them; meaningful state changes still write immediately. This is a write-frequency rule, not a strict 60-second API-age guarantee.
+Counter-only writes use a 60-second threshold against the row's `observed_at`, not a separate counter-write timestamp. Degraded reports also advance `observed_at` without refreshing counters and can restart the window. This observation-clock behavior is accepted as best effort; tighter counter freshness is deferred. Meaningful state changes write immediately. No strict API-age or last-counter-write guarantee is asserted.
 
 This is scoped local evidence, not a claim that all GitHub CI passes.
