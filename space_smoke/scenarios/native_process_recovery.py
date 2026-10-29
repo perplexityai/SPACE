@@ -239,3 +239,12 @@ def process_recovery(test: NativeHardeningFixture) -> None:
                         "output_cursor": 0, "resume_after_output_gap": True})
         test.context.verify(exited[-1]["status"] == "signaled" and exited[-1]["signal"] == 15,
                             "matching recovery handle did not resume the resident")
+        test.wait_sandbox(paused)
+        resumed = _discovery(test, paused_path)
+        test.context.verify(resumed["instance_id"] == info["instance_id"] and
+                            resumed["activation_id"] == info["activation_id"],
+                            "implicit resident resume changed recovery identity")
+        operation = test.request("POST", paused_path + ":resume",
+                                 idempotency_key=test.key("already-resumed")).require(202)
+        test.wait_operation(operation["operation_id"])
+        test.wait_sandbox(paused)
