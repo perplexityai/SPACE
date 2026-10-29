@@ -17,12 +17,7 @@ fn export_fixture() -> (tempfile::TempDir, TemplateManagerService, String) {
         [&digest],
     )
     .unwrap();
-    let dir = build_artifacts_dir(
-        root.path(),
-        TEMPLATE,
-        &digest,
-        crate::db::TemplateCachePartition::Legacy,
-    );
+    let dir = build_artifacts_dir(root.path(), TEMPLATE, &digest);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join(TEMPLATE_ROOTFS_ZSTD_FILE),
@@ -65,7 +60,6 @@ async fn export_enforces_forwarded_authority(
             name: TEMPLATE.into(),
             content_hash: Some(digest.clone()),
             tag: None,
-            environment: None,
         }),
         ..Default::default()
     });
@@ -134,7 +128,6 @@ async fn export_resolves_catalog_tag(
                 name: TEMPLATE.into(),
                 content_hash: None,
                 tag: Some(tag.into()),
-                environment: None,
             }),
             ..Default::default()
         }))

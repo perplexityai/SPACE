@@ -1,4 +1,3 @@
-use super::super::TEMPLATE_DIR;
 use super::*;
 
 #[test]
@@ -126,13 +125,10 @@ fn content_hash_rejects_malformed_inputs() {
 
 #[test]
 fn paths_compose_under_expected_roots() {
-    let tdir = TemplateBuildTarget::parse(
+    let tdir = template_digest_dir(
         "seed",
         "sha256:6dfaca783bd73dbb42fe5833b46e575a7c9555e56801e79cda7f01f573f2ebb1",
-        None,
-    )
-    .unwrap()
-    .digest_dir();
+    );
     assert!(
         tdir.starts_with(TEMPLATE_DIR),
         "{tdir:?} should be under TEMPLATE_DIR={TEMPLATE_DIR}"
@@ -152,93 +148,4 @@ fn paths_compose_under_expected_roots() {
             "{p:?} should be under CACHE_DIR={CACHE_DIR}"
         );
     }
-}
-
-fn fixture_hash() -> String {
-    pplx_space_common_core::types::Digest::blake3([7; 32]).to_string()
-}
-
-fn other_environment() -> pplx_space_common_core::types::EnvironmentReference {
-    pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([9; 32]),
-    )
-}
-
-#[test]
-fn legacy_template_targets_keep_their_directory_and_received_uuid() {
-    let hash = fixture_hash();
-    let target = TemplateBuildTarget::parse("seed", &hash, None).unwrap();
-    assert_eq!(
-        target.digest_dir(),
-        PathBuf::from(format!("{TEMPLATE_DIR}/seed/{hash}"))
-    );
-    assert_eq!(
-        target.received_uuid(),
-        pplx_space_common_core::host::btrfs::deterministic_template_received_uuid("seed", &hash)
-    );
-}
-
-#[test]
-fn environment_template_targets_use_their_own_directory_and_received_uuid() {
-    let hash = fixture_hash();
-    let environment = other_environment();
-    let build = EnvironmentTemplateBuild {
-        content_hash: hash.clone(),
-        environment: environment.to_string(),
-    };
-    let target = TemplateBuildTarget::parse("seed", "", Some(&build)).unwrap();
-    let legacy = TemplateBuildTarget::parse("seed", &hash, None).unwrap();
-    assert_eq!(
-        target.digest_dir(),
-        PathBuf::from(format!("{TEMPLATE_DIR}/seed/{hash}@{environment}"))
-    );
-    assert_ne!(target.received_uuid(), legacy.received_uuid());
-}
-
-#[test]
-fn environment_template_targets_reject_ambiguous_or_legacy_identities() {
-    let hash = fixture_hash();
-    let initial = pplx_space_node_runtime_core::catalog::initial_environment_reference().unwrap();
-    for (content_hash, build) in [
-        // Both identities: an old caller's field and a new one.
-        (
-            hash.clone(),
-            EnvironmentTemplateBuild {
-                content_hash: hash.clone(),
-                environment: other_environment().to_string(),
-            },
-        ),
-        // The initial environment lives in the legacy layout.
-        (
-            String::new(),
-            EnvironmentTemplateBuild {
-                content_hash: hash.clone(),
-                environment: initial.to_string(),
-            },
-        ),
-        (
-            String::new(),
-            EnvironmentTemplateBuild {
-                content_hash: hash.clone(),
-                environment: "not-a-digest".to_string(),
-            },
-        ),
-        (
-            String::new(),
-            EnvironmentTemplateBuild {
-                content_hash: "../escape".to_string(),
-                environment: other_environment().to_string(),
-            },
-        ),
-    ] {
-        let error = TemplateBuildTarget::parse("seed", &content_hash, Some(&build)).unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{build:?}");
-    }
-    // An empty legacy hash is what an old server sees; it stays invalid.
-    assert_eq!(
-        TemplateBuildTarget::parse("seed", "", None)
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
-    );
 }

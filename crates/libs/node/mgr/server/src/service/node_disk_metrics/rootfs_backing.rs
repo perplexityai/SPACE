@@ -134,9 +134,8 @@ fn collect(sandboxes: &Path, templates: &Path) -> io::Result<Inventory> {
                 let name = name.to_string_lossy();
                 // Import, republish and replaced-generation siblings append
                 // dot-separated markers; they are not canonical cache entries.
-                // Every cache partition's build dir is one.
-                pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(&name)
-                    .is_some()
+                name.parse::<pplx_space_common_core::types::Digest>()
+                    .is_ok()
             }) {
                 inventory.record(Kind::Template, &digest)?;
             }

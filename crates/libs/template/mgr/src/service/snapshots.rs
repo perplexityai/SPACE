@@ -7,7 +7,6 @@ pub(super) struct BuildBaseSnapshotArgs<'a> {
     pub(super) sandbox_id: &'a str,
     pub(super) template_name: &'a str,
     pub(super) content_hash: &'a str,
-    pub(super) partition: crate::db::TemplateCachePartition,
     pub(super) vcpu: u32,
     pub(super) memory_mib: u32,
     pub(super) ready_timeout: u32,
@@ -46,33 +45,17 @@ fn base_snapshot_start_request(
     }
 }
 
-/// Cold-boot request for a base-snapshot capture. A build outside the legacy
-/// partition is created through the environment input, so sandbox-manager
-/// resolves that partition's build and boots it under its own environment;
-/// a node that doesn't admit the environment refuses the capture.
-pub(super) fn base_snapshot_create_request(
+fn base_snapshot_create_request(
     template_name: &str,
     content_hash: &str,
-    partition: crate::db::TemplateCachePartition,
     snapshot_rootfs_size_mb: Option<u32>,
     runtime: pplx_space_common_core::types::RuntimeKind,
 ) -> pplx_space_sbx_mgr_client::proto::CreateRequest {
-    let (environment, template, runtime) = match partition.environment() {
-        None => (None, template_name.to_string(), runtime.alias().to_string()),
-        Some(environment) => (
-            Some(pplx_space_sbx_mgr_client::proto::EnvironmentCreateInput {
-                reference: environment.to_string(),
-                template: template_name.to_string(),
-            }),
-            String::new(),
-            String::new(),
-        ),
-    };
     pplx_space_sbx_mgr_client::proto::CreateRequest {
-        environment,
-        template,
+        environment: None,
+        template: template_name.to_string(),
         owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
-        runtime,
+        runtime: runtime.alias().into(),
         snapshots_enabled: false,
         autostart: false,
         pool_template: None,
@@ -98,9 +81,9 @@ pub(super) fn base_snapshot_create_request(
 }
 
 impl TemplateManagerService {
-    /// Resolve a template name and optional content hash to its ready build,
-    /// preferring `preferred`'s cache partition, then the legacy partition,
-    /// then any other. Returns NOT_FOUND if unresolvable.
+    /// Resolve a template reference to (name, content_hash).
+    /// Accepts name + optional content_hash (tag is accepted but ignored).
+    /// Returns NOT_FOUND if unresolvable.
     ///
     /// Every successful resolution advances `last_used_at` on the
     /// matched build so the on-node LRU eviction loop sees real
@@ -115,35 +98,35 @@ impl TemplateManagerService {
     /// disk delete and fail with a missing rootfs. Returning
     /// `NotFound` instead lets the caller fail fast with a clean
     /// error.
-    pub(super) fn resolve_template_build(
+    pub(super) fn resolve_template(
         conn: &rusqlite::Connection,
         name: &str,
         content_hash: &str,
-        preferred: Option<crate::db::TemplateCachePartition>,
-    ) -> Result<crate::db::BuildRow, Status> {
+        _tag: &str,
+    ) -> Result<(String, String), Status> {
         // Exact hash takes precedence
-        let build = if content_hash.is_empty() {
-            // Find the newest build for this template name.
-            // `get_latest_build` already filters `state='ready'`, so a
-            // mid-eviction build is invisible to the latest-build path.
-            crate::db::get_latest_build(conn, name, preferred)
-                .map_err(|e| Status::internal(format!("db get_latest_build: {e}")))?
-                .ok_or_else(|| Status::not_found(format!("no builds found for '{name}'")))?
-        } else {
-            crate::db::find_ready_build(conn, name, content_hash, preferred)
-                .map_err(|e| Status::internal(format!("db find_ready_build: {e}")))?
+        if !content_hash.is_empty() {
+            let row = crate::db::get_build(conn, name, content_hash)
+                .map_err(|e| Status::internal(format!("db get_build: {e}")))?
+                .filter(|row| row.state == "ready")
                 .ok_or_else(|| {
                     Status::not_found(format!("build not found: {name}@{content_hash}"))
-                })?
-        };
+                })?;
+            validate_content_hash(&row.content_hash)?;
+            touch_lru(conn, &row.name, &row.content_hash);
+            return Ok((row.name, row.content_hash));
+        }
+
+        // Find the newest build for this template name.
+        // `get_latest_build` already filters `state='ready'`, so a
+        // mid-eviction build is invisible to the latest-build path.
+        let build = crate::db::get_latest_build(conn, name)
+            .map_err(|e| Status::internal(format!("db get_latest_build: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("no builds found for '{name}'")))?;
         validate_content_hash(&build.content_hash)?;
-        touch_lru(
-            conn,
-            &build.name,
-            &build.content_hash,
-            build.cache_partition,
-        );
-        Ok(build)
+        touch_lru(conn, &build.name, &build.content_hash);
+
+        Ok((build.name, build.content_hash))
     }
 
     /// Inner build logic used by desired base-snapshot reconciliation.
@@ -157,7 +140,6 @@ impl TemplateManagerService {
             sandbox_id,
             template_name,
             content_hash,
-            partition,
             vcpu,
             memory_mib,
             ready_timeout,
@@ -224,13 +206,7 @@ impl TemplateManagerService {
         }
 
         // 5. Verify sbx-manager created the canonical memory artifact.
-        let snap_dir = snapshot_dir(
-            template_name,
-            content_hash,
-            partition,
-            vcpu,
-            snapshot_memory_mib,
-        );
+        let snap_dir = snapshot_dir(template_name, content_hash, vcpu, snapshot_memory_mib);
         let snapshot_base = format!("{snap_dir}/snapshot.base");
         std::fs::metadata(&snapshot_base)
             .map_err(|e| Status::internal(format!("stat snapshot.base {snapshot_base}: {e}")))?;
@@ -246,17 +222,7 @@ impl TemplateManagerService {
                 let conn = db
                     .lock()
                     .map_err(|_| crate::db::mutex_poison_error("base snapshot upsert"))?;
-                crate::db::upsert_snapshot(
-                    &conn,
-                    crate::db::SnapshotKey {
-                        name: &name,
-                        content_hash: &hash,
-                        cache_partition: partition,
-                        vcpu,
-                        memory_mib: snapshot_memory_mib,
-                    },
-                    &sh,
-                )
+                crate::db::upsert_snapshot(&conn, &name, &hash, vcpu, snapshot_memory_mib, &sh)
             })
             .await
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
@@ -264,9 +230,8 @@ impl TemplateManagerService {
         }
         crate::node_state_sync::mark_template_dirty(&self.db, template_name);
 
-        // 7. Invalidate existing pool sandboxes for this template, when they
-        // boot this partition's build.
-        if snapshot_invalidates_pools(partition) {
+        // 7. Invalidate existing pool sandboxes for this template
+        {
             let sbx_connect = pplx_space_sbx_mgr_client::connect()
                 .await
                 .map_err(|e| e.to_string());
@@ -309,7 +274,6 @@ impl TemplateManagerService {
         &self,
         template_name: &str,
         content_hash: &str,
-        partition: crate::db::TemplateCachePartition,
         vcpu: u32,
         memory_mib: u32,
         ready_timeout: u32,
@@ -331,7 +295,7 @@ impl TemplateManagerService {
                 "clamped template base snapshot build memory to sandbox policy"
             );
         }
-        let bdir = build_dir(template_name, content_hash, partition);
+        let bdir = build_dir(template_name, content_hash);
         if !std::path::Path::new(&format!("{bdir}/rootfs.ext4")).exists() {
             return Err(Status::not_found(format!(
                 "template rootfs not found: {bdir}/rootfs.ext4"
@@ -360,7 +324,7 @@ impl TemplateManagerService {
                 let conn = db
                     .lock()
                     .map_err(|_| Status::internal("template DB mutex poisoned"))?;
-                let build = crate::db::get_build(&conn, &name, &hash, partition)
+                let build = crate::db::get_build(&conn, &name, &hash)
                     .map_err(|error| Status::internal(error.to_string()))?
                     .ok_or_else(|| Status::not_found("base snapshot template build disappeared"))?;
                 build
@@ -384,7 +348,6 @@ impl TemplateManagerService {
             .create(base_snapshot_create_request(
                 template_name,
                 content_hash,
-                partition,
                 snapshot_rootfs_size_mb,
                 runtime,
             ))
@@ -403,7 +366,6 @@ impl TemplateManagerService {
                     sandbox_id: &sandbox_id,
                     template_name,
                     content_hash,
-                    partition,
                     vcpu,
                     memory_mib,
                     ready_timeout,
@@ -487,11 +449,10 @@ impl TemplateManagerService {
     pub(super) fn snapshot_files_exist(
         template_name: &str,
         content_hash: &str,
-        partition: crate::db::TemplateCachePartition,
         vcpu: u32,
         memory_mib: u32,
     ) -> bool {
-        let dir = snapshot_dir(template_name, content_hash, partition, vcpu, memory_mib);
+        let dir = snapshot_dir(template_name, content_hash, vcpu, memory_mib);
         Self::snapshot_files_exist_in_dir(&dir)
     }
 
@@ -511,21 +472,11 @@ impl TemplateManagerService {
                 .map_err(|e| Status::internal(format!("db list_builds_by_name: {e}")))?;
             let mut had_snapshots = false;
             for build in builds {
-                let snapshots = crate::db::list_snapshots(
-                    &conn,
-                    &build.name,
-                    &build.content_hash,
-                    build.cache_partition,
-                )
-                .map_err(|e| Status::internal(format!("db list_snapshots: {e}")))?;
+                let snapshots = crate::db::list_snapshots(&conn, &build.name, &build.content_hash)
+                    .map_err(|e| Status::internal(format!("db list_snapshots: {e}")))?;
                 had_snapshots |= !snapshots.is_empty();
-                crate::db::delete_snapshots_for_build(
-                    &conn,
-                    &build.name,
-                    &build.content_hash,
-                    build.cache_partition,
-                )
-                .map_err(|e| Status::internal(format!("db delete_snapshots_for_build: {e}")))?;
+                crate::db::delete_snapshots_for_build(&conn, &build.name, &build.content_hash)
+                    .map_err(|e| Status::internal(format!("db delete_snapshots_for_build: {e}")))?;
             }
             Ok::<_, Status>(had_snapshots)
         })
@@ -551,7 +502,6 @@ impl TemplateManagerService {
         template: &str,
         keep_name: &str,
         keep_content_hash: &str,
-        keep_partition: crate::db::TemplateCachePartition,
         keep_vcpu: u32,
         keep_memory_mib: u32,
     ) -> Result<bool, Status> {
@@ -565,9 +515,8 @@ impl TemplateManagerService {
                 .lock()
                 .map_err(|_| Status::internal("db mutex poisoned while listing stale snapshots"))?;
             let mut stale_snapshots = Vec::new();
-            let snapshots =
-                crate::db::list_snapshots(&conn, &keep_name, &keep_content_hash, keep_partition)
-                    .map_err(|e| Status::internal(format!("db list_snapshots: {e}")))?;
+            let snapshots = crate::db::list_snapshots(&conn, &keep_name, &keep_content_hash)
+                .map_err(|e| Status::internal(format!("db list_snapshots: {e}")))?;
             for snapshot in snapshots {
                 if snapshot.vcpu == keep_vcpu && snapshot.memory_mib == keep_memory_mib {
                     continue;
@@ -586,7 +535,7 @@ impl TemplateManagerService {
 
         let mut pruned = false;
         for (name, content_hash, vcpu, memory_mib) in stale_snapshots {
-            let dir = snapshot_dir(&name, &content_hash, keep_partition, vcpu, memory_mib);
+            let dir = snapshot_dir(&name, &content_hash, vcpu, memory_mib);
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -602,17 +551,8 @@ impl TemplateManagerService {
                 let conn = db.lock().map_err(|_| {
                     Status::internal("db mutex poisoned while deleting stale snapshot")
                 })?;
-                crate::db::delete_snapshot(
-                    &conn,
-                    crate::db::SnapshotKey {
-                        name: &name,
-                        content_hash: &content_hash,
-                        cache_partition: keep_partition,
-                        vcpu,
-                        memory_mib,
-                    },
-                )
-                .map_err(|e| Status::internal(format!("db delete_snapshot: {e}")))
+                crate::db::delete_snapshot(&conn, &name, &content_hash, vcpu, memory_mib)
+                    .map_err(|e| Status::internal(format!("db delete_snapshot: {e}")))
             })
             .await
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
@@ -756,27 +696,32 @@ impl TemplateManagerService {
             );
         }
 
-        // Every cache partition of the template keeps its own base snapshot:
-        // an environment's twin of a release cold-boots and is captured under
-        // that environment, so its memory state never comes from another one.
-        let partitions = {
+        let resolved = {
             let db = Arc::clone(&self.db);
             let template = template.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db.lock().map_err(|_| {
-                    Status::internal("db mutex poisoned while listing build partitions")
+                    Status::internal("db mutex poisoned while resolving desired snapshot")
                 })?;
-                crate::db::list_build_partitions(&conn, &template)
-                    .map_err(|e| Status::internal(format!("db list_build_partitions: {e}")))
+                // Transitional M3a behavior: desired snapshot policy follows
+                // this node's local latest build until cluster-pinned template
+                // hashes/aliases land and the caller can pass an exact hash.
+                let (name, content_hash) = Self::resolve_template(&conn, &template, "", "latest")?;
+                let snapshot = crate::db::get_snapshot(
+                    &conn,
+                    &name,
+                    &content_hash,
+                    snapshot_vcpu,
+                    snapshot_memory_mib,
+                )
+                .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))?;
+                Ok::<_, Status>((name, content_hash, snapshot))
             })
             .await
         };
-        let partitions = match partitions {
-            // No builds: resolving the legacy partition reports NotFound.
-            Ok(Ok(partitions)) if partitions.is_empty() => {
-                vec![crate::db::TemplateCachePartition::Legacy]
-            }
-            Ok(Ok(partitions)) => partitions,
+
+        let (name, content_hash, snapshot) = match resolved {
+            Ok(Ok(resolved)) => resolved,
             Ok(Err(err)) => {
                 let message = err.message().to_string();
                 self.record_snapshot_reconcile_result(&template, Some(&message))
@@ -799,152 +744,60 @@ impl TemplateManagerService {
             }
         };
 
-        // The reconcile lock stays held until every partition settles, even
-        // if the caller stops waiting.
-        let service = self.clone_for_snapshot_reconcile();
-        let task_template = template.clone();
-        let reconcile_task = tokio::spawn(async move {
-            let _reconcile_guard = reconcile_guard;
-            let mut combined = PartitionReconcile::default();
-            for partition in partitions {
-                let reconciled = service
-                    .reconcile_partition_base_snapshot(
-                        &task_template,
-                        partition,
-                        snapshot_vcpu,
-                        snapshot_memory_mib,
-                    )
-                    .await;
-                combined.merge(partition, reconciled);
-            }
-            combined
-        });
-
-        match reconcile_task.await {
-            Ok(combined) => {
-                if let Some(error) = combined.recorded_result() {
-                    self.record_snapshot_reconcile_result(&template, error)
-                        .await;
-                }
-                combined.outcome
-            }
-            Err(err) => {
-                let message = format!("base snapshot reconcile task failed: {err}");
-                self.record_snapshot_reconcile_result(&template, Some(&message))
-                    .await;
-                SnapshotReconcileOutcome {
-                    reconciled: true,
-                    error: Some(message),
-                    ..Default::default()
-                }
-            }
-        }
-    }
-
-    /// Ensure the newest build of one cache partition has the desired base
-    /// snapshot, capturing it when missing.
-    pub(super) async fn reconcile_partition_base_snapshot(
-        &self,
-        template: &str,
-        partition: crate::db::TemplateCachePartition,
-        snapshot_vcpu: u32,
-        snapshot_memory_mib: u32,
-    ) -> PartitionReconcile {
-        let resolved = {
-            let db = Arc::clone(&self.db);
-            let template = template.to_string();
-            tokio::task::spawn_blocking(move || {
-                let conn = db.lock().map_err(|_| {
-                    Status::internal("db mutex poisoned while resolving desired snapshot")
-                })?;
-                // Transitional M3a behavior: desired snapshot policy follows
-                // this node's local latest build until cluster-pinned template
-                // hashes/aliases land and the caller can pass an exact hash.
-                // Exactly this partition: a sibling's build isn't this
-                // partition's to capture.
-                let build = crate::db::get_latest_build_in_partition(&conn, &template, partition)
-                    .map_err(|e| Status::internal(format!("db get_latest_build: {e}")))?
-                    .ok_or_else(|| {
-                        Status::not_found(format!("no builds found for '{template}'"))
-                    })?;
-                validate_content_hash(&build.content_hash)?;
-                touch_lru(&conn, &build.name, &build.content_hash, partition);
-                let snapshot = crate::db::get_snapshot(
-                    &conn,
-                    crate::db::SnapshotKey {
-                        name: &build.name,
-                        content_hash: &build.content_hash,
-                        cache_partition: partition,
-                        vcpu: snapshot_vcpu,
-                        memory_mib: snapshot_memory_mib,
-                    },
-                )
-                .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))?;
-                Ok::<_, Status>((build.name, build.content_hash, snapshot))
-            })
-            .await
-        };
-
-        let (name, content_hash, snapshot) = match resolved {
-            Ok(Ok(resolved)) => resolved,
-            Ok(Err(err)) => return PartitionReconcile::failed(None, err.message().to_string()),
-            Err(err) => return PartitionReconcile::failed(None, format!("spawn_blocking: {err}")),
-        };
-
         let snapshot_ok = snapshot.is_some()
-            && Self::snapshot_files_exist(
-                &name,
-                &content_hash,
-                partition,
-                snapshot_vcpu,
-                snapshot_memory_mib,
-            );
+            && Self::snapshot_files_exist(&name, &content_hash, snapshot_vcpu, snapshot_memory_mib);
         if snapshot_ok {
-            return match self
+            let snapshot_deleted = match self
                 .prune_base_snapshots_except(
-                    template,
+                    &template,
                     &name,
                     &content_hash,
-                    partition,
                     snapshot_vcpu,
                     snapshot_memory_mib,
                 )
                 .await
             {
-                Ok(snapshot_deleted) => PartitionReconcile::recorded(SnapshotReconcileOutcome {
-                    reconciled: true,
-                    snapshot_deleted,
-                    content_hash: Some(content_hash),
-                    ..Default::default()
-                }),
+                Ok(pruned) => pruned,
                 Err(err) => {
-                    PartitionReconcile::failed(Some(content_hash), err.message().to_string())
+                    let message = err.message().to_string();
+                    self.record_snapshot_reconcile_result(&template, Some(&message))
+                        .await;
+                    return SnapshotReconcileOutcome {
+                        reconciled: true,
+                        content_hash: Some(content_hash),
+                        error: Some(message),
+                        ..Default::default()
+                    };
                 }
+            };
+            self.record_snapshot_reconcile_result(&template, None).await;
+            return SnapshotReconcileOutcome {
+                reconciled: true,
+                snapshot_deleted,
+                content_hash: Some(content_hash),
+                ..Default::default()
             };
         }
 
-        // Backoff is per build dir, so a failed twin doesn't hold back its
-        // sibling partitions.
-        let backoff_key = partition.build_dir_name(&content_hash);
         let retry_allowed = match self.snapshot_retry_backoff.lock() {
-            Ok(mut backoff) => backoff.allows(&name, &backoff_key, std::time::Instant::now()),
+            Ok(mut backoff) => backoff.allows(&name, &content_hash, std::time::Instant::now()),
             Err(_) => {
-                return PartitionReconcile::unrecorded(SnapshotReconcileOutcome {
+                return SnapshotReconcileOutcome {
                     error: Some("snapshot backoff mutex poisoned".into()),
                     ..Default::default()
-                });
+                };
             }
         };
         if !retry_allowed {
-            return PartitionReconcile::unrecorded(SnapshotReconcileOutcome {
+            return SnapshotReconcileOutcome {
                 content_hash: Some(content_hash),
-                error: Some("snapshot preparation retry deferred after failure (five-minute per-build backoff)".into()),
+                error: Some("snapshot preparation retry deferred after failure (five-minute per-digest backoff)".into()),
                 ..Default::default()
-            });
+            };
         }
         {
             let db = Arc::clone(&self.db);
-            let template_to_record = template.to_string();
+            let template_to_record = template.clone();
             let recorded = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().map_err(|_| {
                     crate::db::mutex_poison_error("record snapshot reconcile started")
@@ -957,66 +810,108 @@ impl TemplateManagerService {
             }
         }
 
-        // Its own task, so a panicking capture defers this partition's retry
-        // like any other failure.
         let service = self.clone_for_snapshot_reconcile();
-        let (task_name, task_content_hash) = (name.clone(), content_hash.clone());
-        let result = tokio::spawn(async move {
+        let task_template = template.clone();
+        let task_name = name.clone();
+        let task_content_hash = content_hash.clone();
+        let build_task = tokio::spawn(async move {
+            let _reconcile_guard = reconcile_guard;
             service
-                .build_base_snapshot_for_resolved(
-                    &task_name,
-                    &task_content_hash,
-                    partition,
+                .run_base_snapshot_reconcile_build(
+                    task_template,
+                    task_name,
+                    task_content_hash,
                     snapshot_vcpu,
                     snapshot_memory_mib,
                     BASE_SNAPSHOT_BUILD_READY_TIMEOUT_SECS,
                 )
                 .await
-        })
-        .await
-        .unwrap_or_else(|err| {
-            Err(Status::internal(format!(
-                "base snapshot reconcile task failed: {err}"
-            )))
         });
+
+        match build_task.await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.defer_failed_snapshot(&template, &content_hash);
+                let message = format!("base snapshot reconcile task failed: {err}");
+                self.record_snapshot_reconcile_result(&template, Some(&message))
+                    .await;
+                SnapshotReconcileOutcome {
+                    reconciled: true,
+                    content_hash: Some(content_hash),
+                    error: Some(message),
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
+    async fn run_base_snapshot_reconcile_build(
+        &self,
+        template: String,
+        name: String,
+        content_hash: String,
+        snapshot_vcpu: u32,
+        snapshot_memory_mib: u32,
+        ready_timeout: u32,
+    ) -> SnapshotReconcileOutcome {
+        let result = self
+            .build_base_snapshot_for_resolved(
+                &name,
+                &content_hash,
+                snapshot_vcpu,
+                snapshot_memory_mib,
+                ready_timeout,
+            )
+            .await;
         match result {
             Ok(built) => {
-                match self
+                let built_memory_mib = built.memory_mib;
+                let snapshot_deleted = match self
                     .prune_base_snapshots_except(
-                        template,
+                        &template,
                         &name,
                         &content_hash,
-                        partition,
                         snapshot_vcpu,
-                        built.memory_mib,
+                        built_memory_mib,
                     )
                     .await
                 {
-                    Ok(snapshot_deleted) => {
-                        PartitionReconcile::recorded(SnapshotReconcileOutcome {
+                    Ok(pruned) => pruned,
+                    Err(err) => {
+                        let message = err.message().to_string();
+                        self.record_snapshot_reconcile_result(&template, Some(&message))
+                            .await;
+                        return SnapshotReconcileOutcome {
                             reconciled: true,
                             snapshot_built: true,
-                            snapshot_deleted,
                             content_hash: Some(content_hash),
+                            error: Some(message),
                             ..Default::default()
-                        })
+                        };
                     }
-                    Err(err) => {
-                        let mut failed = PartitionReconcile::failed(
-                            Some(content_hash),
-                            err.message().to_string(),
-                        );
-                        failed.outcome.snapshot_built = true;
-                        failed
-                    }
+                };
+                self.record_snapshot_reconcile_result(&template, None).await;
+                SnapshotReconcileOutcome {
+                    reconciled: true,
+                    snapshot_built: true,
+                    snapshot_deleted,
+                    content_hash: Some(content_hash),
+                    ..Default::default()
                 }
             }
             Err(err) => {
                 let message = err.message().to_string();
-                self.defer_failed_snapshot(&name, &backoff_key);
-                tracing::warn!(template, content_hash, cache_partition = %partition, error = %message,
+                self.defer_failed_snapshot(&name, &content_hash);
+                tracing::warn!(template, content_hash, error = %message,
                     "base snapshot preparation failed; cold boot remains available");
-                PartitionReconcile::failed(Some(content_hash), message)
+                self.record_snapshot_reconcile_result(&template, Some(&message))
+                    .await;
+                SnapshotReconcileOutcome {
+                    reconciled: true,
+                    content_hash: Some(content_hash),
+                    error: Some(message),
+                    ..Default::default()
+                }
             }
         }
     }
@@ -1048,104 +943,12 @@ impl TemplateManagerService {
     }
 }
 
-/// Whether a rebuilt base snapshot invalidates the template's pool sandboxes.
-/// Pools boot only legacy-partition builds, because sandbox-manager's
-/// `validate_environment_create_fields` refuses a pool for a selected
-/// environment, so a twin's snapshot leaves them alone. Lifting that refusal
-/// needs a partition-aware invalidation.
-pub(super) fn snapshot_invalidates_pools(partition: crate::db::TemplateCachePartition) -> bool {
-    partition == crate::db::TemplateCachePartition::Legacy
-}
-
-/// One partition's base-snapshot reconcile, folded into the template's.
-#[derive(Default)]
-pub(super) struct PartitionReconcile {
-    pub(super) outcome: SnapshotReconcileOutcome,
-    /// Whether the result belongs in `template_settings`; deferred retries
-    /// and poisoned locks leave the last recorded result in place.
-    record: bool,
-    /// Errors of the merged partitions that recorded.
-    recorded_error: Option<String>,
-}
-
-impl PartitionReconcile {
-    pub(super) fn recorded(outcome: SnapshotReconcileOutcome) -> Self {
-        Self {
-            outcome,
-            record: true,
-            recorded_error: None,
-        }
-    }
-
-    pub(super) fn failed(content_hash: Option<String>, message: String) -> Self {
-        Self::recorded(SnapshotReconcileOutcome {
-            reconciled: true,
-            content_hash,
-            error: Some(message),
-            ..Default::default()
-        })
-    }
-
-    /// The template reports the first resolved hash, the legacy partition's
-    /// when it resolved one, and every partition's error, labelled outside
-    /// the legacy partition.
-    pub(super) fn merge(&mut self, partition: crate::db::TemplateCachePartition, other: Self) {
-        let label = |error: String| match partition {
-            crate::db::TemplateCachePartition::Legacy => error,
-            crate::db::TemplateCachePartition::Environment(_) => format!("{partition}: {error}"),
-        };
-        let append = |into: &mut Option<String>, error: String| {
-            *into = Some(match into.take() {
-                Some(existing) => format!("{existing}; {error}"),
-                None => error,
-            });
-        };
-        if other.record {
-            self.record = true;
-            if let Some(error) = other.outcome.error.clone() {
-                append(&mut self.recorded_error, label(error));
-            }
-        }
-        let outcome = &mut self.outcome;
-        outcome.reconciled |= other.outcome.reconciled;
-        outcome.snapshot_built |= other.outcome.snapshot_built;
-        outcome.snapshot_deleted |= other.outcome.snapshot_deleted;
-        if outcome.content_hash.is_none() {
-            outcome.content_hash = other.outcome.content_hash;
-        }
-        if let Some(error) = other.outcome.error {
-            append(&mut outcome.error, label(error));
-        }
-    }
-
-    /// What a merged result records in `template_settings`, if anything: it
-    /// records when any partition's result did, with only those partitions'
-    /// errors, so a deferred twin neither hides nor overwrites the others.
-    pub(super) fn recorded_result(&self) -> Option<Option<&str>> {
-        self.record.then_some(self.recorded_error.as_deref())
-    }
-
-    /// A per-partition result that leaves the recorded result in place.
-    pub(super) fn unrecorded(outcome: SnapshotReconcileOutcome) -> Self {
-        Self {
-            outcome,
-            record: false,
-            recorded_error: None,
-        }
-    }
-}
-
 /// Advance the LRU clock on a resolved build. Logged on failure but
 /// never surfaced to the caller — the resolution succeeded and the
 /// LRU column is a best-effort hint for eviction, not a correctness
 /// boundary.
-fn touch_lru(
-    conn: &rusqlite::Connection,
-    name: &str,
-    content_hash: &str,
-    partition: crate::db::TemplateCachePartition,
-) {
-    if let Err(err) = crate::db::touch_build(conn, name, content_hash, partition) {
+fn touch_lru(conn: &rusqlite::Connection, name: &str, content_hash: &str) {
+    if let Err(err) = crate::db::touch_build(conn, name, content_hash) {
         tracing::warn!(
             template = %name,
             content_hash = %content_hash,

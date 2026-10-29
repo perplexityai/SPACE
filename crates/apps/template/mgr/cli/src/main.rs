@@ -268,7 +268,6 @@ async fn main() -> anyhow::Result<()> {
                         name: template.clone(),
                         content_hash: None,
                         tag: Some(tag),
-                        environment: None,
                     }),
                     network_policy: network_policy.map(NetworkPolicyMode::to_proto),
                     staging_dir: None,
@@ -305,7 +304,6 @@ async fn main() -> anyhow::Result<()> {
                             Some(content_hash)
                         },
                         tag: if tag.is_empty() { None } else { Some(tag) },
-                        environment: None,
                     }),
                     vcpu,
                     memory_mib,
@@ -357,7 +355,6 @@ async fn main() -> anyhow::Result<()> {
                         name: name.clone(),
                         content_hash: Some(content_hash.clone()),
                         tag: None,
-                        environment: None,
                     }),
                 })
                 .await?;

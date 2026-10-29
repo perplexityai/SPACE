@@ -283,7 +283,6 @@ async fn run_authenticated_rpc(fixture: AuthenticatedRpc) -> TestResult {
                 .unwrap()
                 .push_back(Ok(BuildOutcome {
                     content_hash: Some(hash.clone()),
-                    environment: None,
                 }));
         }
         let mut request = start_build_request(

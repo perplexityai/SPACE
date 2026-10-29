@@ -13,84 +13,15 @@ fn template_import_target_path(
     }
 }
 
-/// The build an import writes: a digest in the cache partition of the
-/// environment the imported manifest binds.
-#[derive(Clone, Copy)]
-pub(super) struct ImportTarget<'a> {
-    pub(super) template_id: &'a str,
-    pub(super) content_hash: &'a str,
-    pub(super) partition: crate::db::TemplateCachePartition,
-    pub(super) environment: Option<pplx_space_common_core::types::EnvironmentReference>,
-}
-
-impl<'a> ImportTarget<'a> {
-    /// Reads the binding from the header's manifest, else its metadata. A
-    /// header whose binding can't be read targets the legacy partition, as
-    /// every import did before partitions, so the existing identity and
-    /// schema validation reports it. A header selecting an environment must
-    /// name the one the build binds.
-    pub(super) fn from_header(
-        template_id: &'a str,
-        content_hash: &'a str,
-        header: &crate::proto::ImportTemplateHeader,
-    ) -> Result<Self, Status> {
-        let metadata = serde_json::from_slice::<pplx_space_common_core::types::TemplateMetadata>(
-            &header.metadata_json,
-        )
-        .unwrap_or_default();
-        let environment = if header.manifest_json.is_empty() {
-            metadata.environment().ok().flatten()
-        } else {
-            parse_template_manifest("incoming manifest_json", &header.manifest_json)
-                .ok()
-                .and_then(|manifest| {
-                    crate::service::effective_environment(&manifest, &metadata)
-                        .ok()
-                        .flatten()
-                })
-        };
-        let partition =
-            pplx_space_node_runtime_core::catalog::template_cache_partition(environment);
-        let requested = super::lookup::requested_cache_partition(
-            header
-                .template
-                .as_ref()
-                .and_then(|template| template.environment.as_deref()),
-        )?;
-        if requested.is_some_and(|requested| requested != partition) {
-            return Err(Status::invalid_argument(format!(
-                "import for {template_id}@{content_hash} selects a different environment than its manifest binds"
-            )));
-        }
-        Ok(Self {
-            template_id,
-            content_hash,
-            partition,
-            environment,
-        })
-    }
-
-    /// Key for the in-flight import set: one import per build dir.
-    pub(super) fn lock_key(&self) -> String {
-        format!(
-            "{}@{}",
-            self.template_id,
-            self.partition.build_dir_name(self.content_hash)
-        )
-    }
-}
-
 fn import_template_response(
-    target: ImportTarget<'_>,
+    template_id: &str,
+    content_hash: &str,
 ) -> Response<crate::proto::ImportTemplateResponse> {
     Response::new(crate::proto::ImportTemplateResponse {
         template: Some(crate::proto::TemplateRef {
-            name: target.template_id.to_string(),
-            content_hash: Some(target.content_hash.to_string()),
+            name: template_id.to_string(),
+            content_hash: Some(content_hash.to_string()),
             tag: None,
-            environment: target
-                .environment
-                .map(|environment| environment.to_string()),
         }),
     })
 }
@@ -415,43 +346,41 @@ impl TemplateManagerService {
     }
     pub(super) async fn do_import(
         &self,
-        target: ImportTarget<'_>,
+        template_id: &str,
+        content_hash: &str,
         header: &crate::proto::ImportTemplateHeader,
         stream: &mut tonic::Streaming<crate::proto::ImportTemplateRequest>,
     ) -> Result<Response<crate::proto::ImportTemplateResponse>, Status> {
-        let digest_dir = build_artifacts_dir(
-            &self.artifact_store.root,
-            target.template_id,
-            target.content_hash,
-            target.partition,
-        );
+        let digest_dir = build_artifacts_dir(&self.artifact_store.root, template_id, content_hash);
         let digest_dir = digest_dir.to_string_lossy().into_owned();
         let staging_dir = format!("{digest_dir}.importing.{}", Uuid::now_v7());
 
         if std::path::Path::new(&digest_dir).exists() {
             return self
-                .import_existing_build(target, header, stream, &digest_dir)
+                .import_existing_build(template_id, content_hash, header, stream, &digest_dir)
                 .await;
         }
 
-        self.import_new_build(target, header, stream, &digest_dir, &staging_dir)
-            .await
+        self.import_new_build(
+            template_id,
+            content_hash,
+            header,
+            stream,
+            &digest_dir,
+            &staging_dir,
+        )
+        .await
     }
 
     async fn import_existing_build(
         &self,
-        target: ImportTarget<'_>,
+        template_id: &str,
+        content_hash: &str,
         header: &crate::proto::ImportTemplateHeader,
         stream: &mut tonic::Streaming<crate::proto::ImportTemplateRequest>,
         digest_dir: &str,
     ) -> Result<Response<crate::proto::ImportTemplateResponse>, Status> {
         use tokio_stream::StreamExt;
-        let ImportTarget {
-            template_id,
-            content_hash,
-            partition,
-            ..
-        } = target;
 
         self.validate_existing_import_identity(template_id, content_hash, header, digest_dir)?;
         let manifest_json =
@@ -473,7 +402,6 @@ impl TemplateManagerService {
                 &self.artifact_store.root,
                 template_id,
                 content_hash,
-                partition,
                 dimensions.0,
                 dimensions.1,
             )
@@ -482,7 +410,7 @@ impl TemplateManagerService {
             std::fs::create_dir_all(&snap_dir)
                 .map_err(|e| Status::internal(format!("create snapshot dir: {e}")))?;
             self.receive_snapshot_chunks(stream, &snap_dir).await?;
-            self.persist_imported_snapshot(target, &snap_dir, dimensions)
+            self.persist_imported_snapshot(template_id, content_hash, &snap_dir, dimensions)
                 .await?;
         } else {
             while let Some(msg) = stream.next().await {
@@ -494,7 +422,7 @@ impl TemplateManagerService {
             .await?;
 
         crate::node_state_sync::mark_template_dirty(&self.db, template_id);
-        Ok(import_template_response(target))
+        Ok(import_template_response(template_id, content_hash))
     }
 
     fn validate_existing_import_identity(
@@ -530,18 +458,13 @@ impl TemplateManagerService {
 
     async fn import_new_build(
         &self,
-        target: ImportTarget<'_>,
+        template_id: &str,
+        content_hash: &str,
         header: &crate::proto::ImportTemplateHeader,
         stream: &mut tonic::Streaming<crate::proto::ImportTemplateRequest>,
         digest_dir: &str,
         staging_dir: &str,
     ) -> Result<Response<crate::proto::ImportTemplateResponse>, Status> {
-        let ImportTarget {
-            template_id,
-            content_hash,
-            partition,
-            ..
-        } = target;
         // Ensure the name dir exists
         let name_dir = template_artifacts_dir(&self.artifact_store.root, template_id);
         std::fs::create_dir_all(&name_dir)
@@ -594,7 +517,6 @@ impl TemplateManagerService {
                 let sd = snapshot_dir(
                     template_id,
                     content_hash,
-                    partition,
                     snapshot_vcpu,
                     snapshot_memory_mib,
                 );
@@ -682,7 +604,6 @@ impl TemplateManagerService {
                 &crate::db::BuildUpsert {
                     name: &n,
                     content_hash: &h,
-                    cache_partition: partition,
                     build_date: &build_date,
                     manifest_json: &manifest_json,
                     runtime: &runtime,
@@ -701,12 +622,12 @@ impl TemplateManagerService {
             let dimensions = snapshot_dimensions.ok_or_else(|| {
                 Status::internal("snapshot dimensions missing after snapshot import")
             })?;
-            self.persist_imported_snapshot(target, sd, dimensions)
+            self.persist_imported_snapshot(template_id, content_hash, sd, dimensions)
                 .await?;
         }
 
         crate::node_state_sync::mark_template_dirty(&self.db, template_id);
-        Ok(import_template_response(target))
+        Ok(import_template_response(template_id, content_hash))
     }
 
     async fn receive_import_files(
@@ -785,16 +706,11 @@ impl TemplateManagerService {
 
     async fn persist_imported_snapshot(
         &self,
-        target: ImportTarget<'_>,
+        template_id: &str,
+        content_hash: &str,
         snap_dir: &str,
         dimensions: (u32, u32),
     ) -> Result<(), Status> {
-        let ImportTarget {
-            template_id,
-            content_hash,
-            partition,
-            ..
-        } = target;
         if !std::path::Path::new(&format!("{snap_dir}/snapshot.base")).exists()
             || !std::path::Path::new(&format!("{snap_dir}/vmstate.base")).exists()
         {
@@ -819,17 +735,7 @@ impl TemplateManagerService {
             let conn = db
                 .lock()
                 .map_err(|_| crate::db::mutex_poison_error("upsert imported snapshot"))?;
-            crate::db::upsert_snapshot(
-                &conn,
-                crate::db::SnapshotKey {
-                    name: &n,
-                    content_hash: &h,
-                    cache_partition: partition,
-                    vcpu: dimensions.0,
-                    memory_mib: dimensions.1,
-                },
-                &snap_hash,
-            )
+            crate::db::upsert_snapshot(&conn, &n, &h, dimensions.0, dimensions.1, &snap_hash)
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?

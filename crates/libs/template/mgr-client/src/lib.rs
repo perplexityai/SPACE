@@ -43,7 +43,6 @@ impl TryFrom<&TemplateReference> for proto::TemplateRef {
             name: reference.name().as_str().to_string(),
             content_hash: None,
             tag: None,
-            environment: None,
         };
         match reference.selector() {
             TemplateSelector::Tag(tag) => {
@@ -59,24 +58,6 @@ impl TryFrom<&TemplateReference> for proto::TemplateRef {
             }
         }
         Ok(template)
-    }
-}
-
-impl proto::TemplateFullInfo {
-    /// Environment the listed build is bound to; `None` for unbound builds.
-    /// Template-manager caches a rootfs once per environment it's bound to,
-    /// so one digest can be listed more than once.
-    pub fn environment(
-        &self,
-    ) -> Result<
-        Option<pplx_space_common_core::types::EnvironmentReference>,
-        pplx_space_common_core::types::DigestParseError,
-    > {
-        self.execution
-            .as_ref()
-            .and_then(|execution| execution.environment.as_deref())
-            .map(str::parse)
-            .transpose()
     }
 }
 

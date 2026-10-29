@@ -1966,10 +1966,9 @@ impl SandboxManagerService {
 
             let snapshot_memory_mib =
                 snapshot_file_memory_mib(&staging_dir_path.join("snapshot.base"))?;
-            let snapshot_dir = super::validation::template_base_snapshot_dir(
+            let snapshot_dir = pplx_space_common_core::host::linux::paths::template_snapshot_dir(
                 &sandbox.template,
                 &content_hash,
-                sandbox.execution_metadata.as_ref(),
                 req.vcpu,
                 snapshot_memory_mib,
             );

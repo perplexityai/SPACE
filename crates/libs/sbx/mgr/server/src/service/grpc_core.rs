@@ -239,16 +239,12 @@ impl SandboxManagerService {
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
-            // A selected environment prefers its own build of the rootfs, so a
-            // twin bound to it boots instead of its sibling; otherwise any
-            // compatible build of the digest is checked below.
             let mut resolved_template = resolve_template_paths(
                 self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: template.to_string(),
                     content_hash: req.content_hash.clone(),
                     tag: None,
-                    environment: environment.map(|reference| reference.to_string()),
                 },
                 scope,
             )
@@ -1236,8 +1232,6 @@ fn project_template_catalog(
             })?;
         // Match the owner's latest-build ordering. A digest breaks equal-date
         // ties deterministically instead of depending on filesystem iteration.
-        // Builds of one digest in several environments' cache partitions are
-        // listed legacy first, so the first stays.
         let replace = latest.get(&build.name).is_none_or(|current| {
             (&build.built_at, &build.content_hash) > (&current.built_at, &current.content_hash)
         });
@@ -1248,15 +1242,10 @@ fn project_template_catalog(
     latest
         .into_values()
         .map(|build| {
-            let environment = build.environment().map_err(|error| {
-                Status::data_loss(format!("invalid template catalog environment: {error}"))
-            })?;
-            let partition =
-                pplx_space_node_runtime_core::catalog::template_cache_partition(environment);
             let hash = build.content_hash.unwrap_or_default();
             let path = template_dir
                 .join(&build.name)
-                .join(partition.build_dir_name(&hash))
+                .join(&hash)
                 .join("metadata.json");
             let metadata: serde_json::Value = match std::fs::read(&path) {
                 Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {

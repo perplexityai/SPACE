@@ -113,11 +113,10 @@ pub use template::{
     ResolvedTemplateVariant, RuntimeScopedTemplateReference, SystemTemplate,
     SystemTemplateParseError, TemplateArtifactDigest, TemplateArtifactDigestPrefix,
     TemplateBuildId, TemplateBuildJobState, TemplateBuildJobStateParseError, TemplateBuildState,
-    TemplateCachePartition, TemplateDesiredState, TemplateDesiredStateParseError, TemplateId,
-    TemplateIndexDigest, TemplateIndexDigestPrefix, TemplateName, TemplateParseError,
-    TemplateReference, TemplateReferenceParseError, TemplateReferenceResolveError,
-    TemplateSelector, TemplateTag, TemplateTagParseError, TemplateVisibility,
-    TemplateVisibilityParseError,
+    TemplateDesiredState, TemplateDesiredStateParseError, TemplateId, TemplateIndexDigest,
+    TemplateIndexDigestPrefix, TemplateName, TemplateParseError, TemplateReference,
+    TemplateReferenceParseError, TemplateReferenceResolveError, TemplateSelector, TemplateTag,
+    TemplateTagParseError, TemplateVisibility, TemplateVisibilityParseError,
 };
 #[cfg(feature = "serde")]
 pub use template::{

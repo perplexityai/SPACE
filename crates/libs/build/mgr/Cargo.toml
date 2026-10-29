@@ -50,7 +50,6 @@ pplx-space-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
-pplx-space-node-runtime-core = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
