@@ -26,7 +26,7 @@ BLOCKED = "blocked"
 
 # The PATCH operation succeeds once the desired policy is stored; enforcement
 # reaches the running gateway asynchronously through the node reconcile.
-_CONVERGENCE_TIMEOUT_SECONDS = 30
+_CONVERGENCE_TIMEOUT_SECONDS = 10
 _CURL_TIMEOUT_SECONDS = 5
 # curl exit codes that mean the connection never produced an HTTP response.
 _CURL_NETWORK_FAILURE_EXIT_CODES = "5|6|7|28|35|52|55|56"
