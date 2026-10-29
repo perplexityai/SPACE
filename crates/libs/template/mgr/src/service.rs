@@ -376,6 +376,8 @@ pub struct TemplateManagerService {
     /// deliberately runs without a sandbox-manager socket can decline the wait
     /// instead of buying the full default budget on every enrichment call.
     sbx_connect_retry_policy: pplx_space_sbx_mgr_client::GrpcRetryPolicy,
+    /// Shared by the GC loop, startup recovery and `DeleteIdleTemplate`.
+    eviction_gate: crate::eviction::EvictionGate,
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -1222,6 +1224,99 @@ async fn fetch_warm_pool_protected_keys() -> Result<HashSet<(String, String)>, S
         .collect())
 }
 
+/// Disk delete routes through `btrfs_via_nodemgr` so a build
+/// installed as a btrfs subvolume actually gets its
+/// subvolume removed — `std::fs::remove_dir_all` recurses
+/// contents but cannot `rmdir` a subvolume root, leaving an
+/// empty undeletable subvolume per evicted build. The fallback
+/// path mirrors `volume::cleanup_digest_dir_after_hash_mismatch`:
+/// when the nodemgr RPC is unreachable we still wipe the
+/// snapshot dir (plain dir) and the subvol contents
+/// (`remove_dir_all` succeeds on file inodes inside the subvol
+/// even when the root is undeletable). That at least disarms
+/// the recovery path; the empty subvol root is a known leak
+/// until nodemgr comes back.
+///
+/// The closure is invoked from `execute_one_async` between
+/// the pre-check and finalize txns, with the DB lock
+/// released — so we can `await` the nodemgr RPC directly
+/// instead of going through `Handle::block_on` from inside a
+/// `spawn_blocking` thread.
+fn gc_delete_disk_fn(artifact_store: TemplateArtifactStore) -> crate::eviction::DeleteDiskFn {
+    let store = artifact_store;
+    Arc::new(move |name: &str, content_hash: &str| {
+        let n = name.to_string();
+        let h = content_hash.to_string();
+        let store = store.clone();
+        Box::pin(async move {
+            let outcome: Result<(), String> =
+                match crate::btrfs_via_nodemgr::delete_template_subvolume(&n, &h).await {
+                    Ok(()) => {
+                        // Snapshot dirs are plain dirs under
+                        // `<root>/<name>/snapshots/<hash>/`,
+                        // separate from the digest subvol nodemgr
+                        // just deleted. Run only the snapshot
+                        // half locally — the combined helper
+                        // would re-try a now-gone build dir.
+                        store
+                            .remove_snapshot_artifacts(&n, &h)
+                            .map_err(|err| format!("snapshot cleanup: {err}"))
+                    }
+                    Err(rpc_err) => {
+                        tracing::warn!(
+                            template = %n,
+                            content_hash = %h,
+                            err = %rpc_err,
+                            "btrfs_via_nodemgr::delete_template_subvolume failed; falling back to subvolume-aware local cleanup"
+                        );
+                        // Subvolume-aware local fallback. Plain
+                        // `remove_dir_all` EROFSes on the first
+                        // unlink inside a read-only digest
+                        // subvolume, surfacing Err to the caller
+                        // and leaving the row stuck in
+                        // `state='deleting'`. The shared
+                        // `cleanup_digest_dir_sync` helper from
+                        // volume.rs clears the RO flag first and
+                        // handles the subvol-vs-plain-dir
+                        // disambiguation the same way
+                        // `cleanup_digest_dir_after_hash_mismatch`
+                        // does on the pull-failure path.
+                        fallback_delete_build_artifacts(&store, &n, &h)
+                            .map_err(|err| err.to_string())
+                    }
+                };
+            outcome.map_err(|err| {
+                // Surface the disk error as a SQLite error
+                // so it bubbles out of `execute_one_async`.
+                // The wrapping `Code::SQLITE_IOERR` is a
+                // synthetic carrier; the underlying error
+                // is logged by `run_loop`.
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                    Some(err),
+                )
+            })
+        })
+    })
+}
+
+/// The stuck-`deleting` repair's disk probe: a build whose rootfs is gone
+/// cannot be restored to `ready`.
+fn gc_reaper_probe_fn(artifact_store: TemplateArtifactStore) -> crate::eviction::ReaperDiskProbeFn {
+    Arc::new(move |name: &str, content_hash: &str| {
+        let store = artifact_store.clone();
+        let n = name.to_string();
+        let h = content_hash.to_string();
+        Box::pin(async move {
+            if store.build_artifacts_missing(&n, &h) {
+                crate::eviction::ReaperDiskState::Missing
+            } else {
+                crate::eviction::ReaperDiskState::Intact
+            }
+        })
+    })
+}
+
 /// Total on-disk footprint for a build: every regular file in the
 /// digest dir (rootfs.ext4, rootfs.ext4.zst, manifest.json,
 /// metadata.json, plus any future entries) summed by allocated
@@ -1475,6 +1570,7 @@ impl TemplateManagerService {
             peer_authorizer: template_peer_authorizer(),
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
+            eviction_gate: crate::eviction::EvictionGate::default(),
         })
     }
 
@@ -1635,81 +1731,7 @@ impl TemplateManagerService {
             },
         );
 
-        // Disk delete routes through `btrfs_via_nodemgr` so a build
-        // installed as a btrfs subvolume actually gets its
-        // subvolume removed — `std::fs::remove_dir_all` recurses
-        // contents but cannot `rmdir` a subvolume root, leaving an
-        // empty undeletable subvolume per evicted build. The fallback
-        // path mirrors `volume::cleanup_digest_dir_after_hash_mismatch`:
-        // when the nodemgr RPC is unreachable we still wipe the
-        // snapshot dir (plain dir) and the subvol contents
-        // (`remove_dir_all` succeeds on file inodes inside the subvol
-        // even when the root is undeletable). That at least disarms
-        // the recovery path; the empty subvol root is a known leak
-        // until nodemgr comes back.
-        //
-        // The closure is invoked from `execute_one_async` between
-        // the pre-check and finalize txns, with the DB lock
-        // released — so we can `await` the nodemgr RPC directly
-        // instead of going through `Handle::block_on` from inside a
-        // `spawn_blocking` thread.
-        let delete_disk_for: crate::eviction::DeleteDiskFn = {
-            let store = artifact_store.clone();
-            Arc::new(move |name: &str, content_hash: &str| {
-                let n = name.to_string();
-                let h = content_hash.to_string();
-                let store = store.clone();
-                Box::pin(async move {
-                    let outcome: Result<(), String> =
-                        match crate::btrfs_via_nodemgr::delete_template_subvolume(&n, &h).await {
-                            Ok(()) => {
-                                // Snapshot dirs are plain dirs under
-                                // `<root>/<name>/snapshots/<hash>/`,
-                                // separate from the digest subvol nodemgr
-                                // just deleted. Run only the snapshot
-                                // half locally — the combined helper
-                                // would re-try a now-gone build dir.
-                                store
-                                    .remove_snapshot_artifacts(&n, &h)
-                                    .map_err(|err| format!("snapshot cleanup: {err}"))
-                            }
-                            Err(rpc_err) => {
-                                tracing::warn!(
-                                    template = %n,
-                                    content_hash = %h,
-                                    err = %rpc_err,
-                                    "btrfs_via_nodemgr::delete_template_subvolume failed; falling back to subvolume-aware local cleanup"
-                                );
-                                // Subvolume-aware local fallback. Plain
-                                // `remove_dir_all` EROFSes on the first
-                                // unlink inside a read-only digest
-                                // subvolume, surfacing Err to the caller
-                                // and leaving the row stuck in
-                                // `state='deleting'`. The shared
-                                // `cleanup_digest_dir_sync` helper from
-                                // volume.rs clears the RO flag first and
-                                // handles the subvol-vs-plain-dir
-                                // disambiguation the same way
-                                // `cleanup_digest_dir_after_hash_mismatch`
-                                // does on the pull-failure path.
-                                fallback_delete_build_artifacts(&store, &n, &h)
-                                    .map_err(|err| err.to_string())
-                            }
-                        };
-                    outcome.map_err(|err| {
-                        // Surface the disk error as a SQLite error
-                        // so it bubbles out of `execute_one_async`.
-                        // The wrapping `Code::SQLITE_IOERR` is a
-                        // synthetic carrier; the underlying error
-                        // is logged by `run_loop`.
-                        rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                            Some(err),
-                        )
-                    })
-                })
-            })
-        };
+        let delete_disk_for = gc_delete_disk_fn(artifact_store.clone());
 
         // Stuck-deleting reaper probe: queried by `gc_tick`'s
         // start-of-tick recovery pass for any row left in
@@ -1718,21 +1740,7 @@ impl TemplateManagerService {
         // missing rootfs.ext4 means the build is unrecoverable and
         // the row should be dropped; otherwise reset to 'ready' and
         // let the planner replan it.
-        let reaper_probe: crate::eviction::ReaperDiskProbeFn = {
-            let store = artifact_store.clone();
-            Arc::new(move |name: &str, content_hash: &str| {
-                let store = store.clone();
-                let n = name.to_string();
-                let h = content_hash.to_string();
-                Box::pin(async move {
-                    if store.build_artifacts_missing(&n, &h) {
-                        crate::eviction::ReaperDiskState::Missing
-                    } else {
-                        crate::eviction::ReaperDiskState::Intact
-                    }
-                })
-            })
-        };
+        let reaper_probe = gc_reaper_probe_fn(artifact_store.clone());
 
         spawn_observed_background_loop(
             "eviction",
@@ -1747,6 +1755,7 @@ impl TemplateManagerService {
                     delete_disk_for,
                     reaper_probe,
                 },
+                self.eviction_gate.clone(),
             ),
         );
     }

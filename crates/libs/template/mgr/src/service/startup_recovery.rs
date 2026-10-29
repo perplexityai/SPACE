@@ -759,7 +759,11 @@ impl TemplateManagerService {
     /// cleanup path without running the full recovery sweep, and so the
     /// delete-template crash window has a single named hook.
     pub(super) async fn prune_stale_template_artifact_db_rows(&self) {
-        prune_catalog_rows_missing_on_disk(&self.db, &self.artifact_store).await;
+        {
+            // Its stuck-`deleting` repair must not meet a live eviction.
+            let _evicting = self.eviction_gate.hold().await;
+            prune_catalog_rows_missing_on_disk(&self.db, &self.artifact_store).await;
+        }
     }
 
     /// Spawn startup recovery without delaying the template-manager gRPC bind.

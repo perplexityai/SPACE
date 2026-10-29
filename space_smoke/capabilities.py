@@ -792,6 +792,71 @@ class OrphanedRestorePodGcControl(Protocol):
 
 
 @dataclass(frozen=True)
+class NodeTemplatePresence:
+    """The `space.pplx.net/template-build-*` metadata on one Node.
+
+    node-ctl keeps one label per ready local template build and a same-key
+    annotation carrying the build's full content hash.
+    """
+
+    labels: frozenset[str]
+    annotations: Mapping[str, str]
+
+
+class UnansweredTemplateEvictionControl(Protocol):
+    """Kind-only operations for node-ctl's unanswered-template cleanup scenario.
+
+    A worker's node-ctl waits an hour before deleting a local template the
+    cluster stopped answering for, and reads that wait once at start, so the
+    scenario overrides one env key on the worker node-ctl DaemonSet
+    (`SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS`, a test hook, to a
+    bounded number of seconds) under its own mutation Lease and puts the
+    captured literal back. The observables are what an operator reads on the
+    worker: `space-tmplmgr list`, the template's digest directories, and the
+    Node's template-build labels and annotations. node-ctl's log is failure
+    evidence only.
+    """
+
+    def acquire_node_ctl_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible worker node-ctl DaemonSet Lease; returns its release."""
+        ...
+
+    def unanswered_template_evict_env(self) -> str | None:
+        """The key's literal on the worker node-ctl DaemonSet, None if unset."""
+        ...
+
+    def set_unanswered_template_evict_after(self, seconds: int) -> None:
+        """Set the wait and await the rollout; refuses a value outside 60..600 s."""
+        ...
+
+    def restore_unanswered_template_evict_env(self, standing: str | None) -> None:
+        """Put the captured literal back (None unsets) and await the rollout."""
+        ...
+
+    def running_unanswered_template_evict_env(self, node_name: str) -> str | None:
+        """The key's literal on the node-ctl pod running on that worker, None if unset."""
+        ...
+
+    def other_sandbox_worker_node(self, excluding_node: str) -> str:
+        """A sandbox-pool kube node other than `excluding_node`, or a configuration error."""
+        ...
+
+    def local_template_names(self, node_name: str) -> frozenset[str]:
+        """The template names `space-tmplmgr list` reports on that worker."""
+        ...
+
+    def template_digest_dirs(self, node_name: str, template: str) -> tuple[str, ...]:
+        """Names of the `sha256:*` digest directories under the template, from disk."""
+        ...
+
+    def node_template_presence(self, node_name: str) -> NodeTemplatePresence: ...
+
+    def node_ctl_log(self, node_name: str, *, since_time: str) -> str:
+        """That worker's node-ctl log since `since_time`. Failure evidence only."""
+        ...
+
+
+@dataclass(frozen=True)
 class TemplateRecipe:
     """A Dockerfile-plus-SDK template definition, rendered by the SDK adapter."""
 

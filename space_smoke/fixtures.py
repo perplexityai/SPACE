@@ -29,6 +29,7 @@ from space_smoke.capabilities import (
     TeardownRestartControl,
     OrphanedRestorePodGcControl,
     ReconcileQueueGcControl,
+    UnansweredTemplateEvictionControl,
     TemplateBuildControl,
     TemplateBuilder,
     RateLimiterControl,
@@ -103,6 +104,7 @@ from space_smoke.node_groups import NodeGroupAssertions
 from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
+from space_smoke.unanswered_template_eviction import UnansweredTemplateEvictionAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
@@ -2892,6 +2894,23 @@ class KindEcw(Ecw):
                 self, self._orphaned_restore_pod_gc_control, self._context.scope
             )
         return self._orphaned_restore_pod_gc_assertions
+
+    _unanswered_template_control: UnansweredTemplateEvictionControl | None = None
+    _unanswered_template_assertions: UnansweredTemplateEvictionAssertions | None = None
+
+    @property
+    def unanswered_templates(self) -> UnansweredTemplateEvictionAssertions:
+        """Privileged assertions for a worker node-ctl's unanswered-template cleanup."""
+
+        if self._unanswered_template_control is None:
+            raise SmokeConfigurationError(
+                "unanswered-template control is only available on the kind backend"
+            )
+        if self._unanswered_template_assertions is None:
+            self._unanswered_template_assertions = UnansweredTemplateEvictionAssertions(
+                self, self._unanswered_template_control, self._context.scope
+            )
+        return self._unanswered_template_assertions
 
     _reconcile_queue_gc_control: ReconcileQueueGcControl | None = None
     _reconcile_queue_gc_assertions: ReconcileQueueGcAssertions | None = None

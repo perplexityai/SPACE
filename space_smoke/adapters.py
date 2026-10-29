@@ -45,6 +45,7 @@ from space_smoke.capabilities import (
     FencePolicy,
     NodeSnapshot,
     NodeCtlIdentity,
+    NodeTemplatePresence,
     PendingBackupRow,
     SaWriteOutcome,
     WhoAmI,
@@ -525,6 +526,13 @@ NODE_TEMPLATE_MANAGER = "template-manager"
 NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
 NODE_API = "node-api"
+# The worker node-ctl DaemonSet (release `space`) and the one env key the
+# unanswered-template scenario may set on it, a test hook read once at start
+# (`unanswered_template_evict_after` in node-ctl's template desired-state facet).
+WORKER_NODE_CTL_DAEMONSET = f"space-{NODE_CTL}"
+UNANSWERED_TEMPLATE_EVICT_AFTER_ENV = "SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS"
+UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS = (60, 600)
+NODE_TEMPLATE_PRESENCE_PREFIX = "space.pplx.net/template-build-"
 # The node services that read the object store, by DaemonSet and the
 # container that does: each holds the store's static keys in
 # `SPACE_KIND_STORAGE_CREDENTIALS=static` only, and exchanges its credentials
@@ -1108,6 +1116,7 @@ class KindHarness:
         self._cordon_lease_ownership: _LeaseOwnership | None = None
         self._public_api_lease_ownership: _LeaseOwnership | None = None
         self._drain_gate_lease_ownership: _LeaseOwnership | None = None
+        self._node_ctl_lease_ownership: _LeaseOwnership | None = None
         # The public API autoscaler's bounds before `scale_public_api` pinned
         # them: (name, uid, minReplicas, maxReplicas).
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
@@ -5297,6 +5306,135 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             f"remove planted orphan pods {token}",
         )
+
+    # --- node-ctl's unanswered-template wait ---------------------------------
+    #
+    # One allowlisted key on the worker node-ctl DaemonSet, under its own
+    # Lease. The captured literal goes back verbatim: node-ctl falls back to
+    # its one-hour default on an unparseable value, and restoring must not
+    # change what the bench ran with.
+
+    def acquire_node_ctl_mutation(self) -> Callable[[], None]:
+        context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
+        ownership = self._acquire_named_mutation_lease(
+            f"space-smoke-node-ctl-{context_hash}", "worker node-ctl DaemonSet mutation"
+        )
+        self._node_ctl_lease_ownership = ownership
+
+        def release() -> None:
+            self._release_lease(ownership)
+            if self._node_ctl_lease_ownership is ownership:
+                self._node_ctl_lease_ownership = None
+
+        return release
+
+    def unanswered_template_evict_env(self) -> str | None:
+        result = self.kubectl(
+            "get", "daemonset", WORKER_NODE_CTL_DAEMONSET, "-o",
+            f"jsonpath={{.spec.template.spec.containers[?(@.name=='{NODE_CTL}')].env}}",
+            timeout=15,
+        )
+        _require_ok(result, f"read env of {WORKER_NODE_CTL_DAEMONSET}")
+        return _env_literals(
+            json.loads(result.stdout or "[]"), (UNANSWERED_TEMPLATE_EVICT_AFTER_ENV,),
+            owner=WORKER_NODE_CTL_DAEMONSET,
+            value_from_refusal="; refusing to override what a literal restore could not put back",
+        )[UNANSWERED_TEMPLATE_EVICT_AFTER_ENV]
+
+    def set_unanswered_template_evict_after(self, seconds: int) -> None:
+        low, high = UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or not low <= seconds <= high:
+            raise ValueError(f"refusing an unanswered-template wait of {seconds!r} s outside {low}..{high}")
+        self._apply_unanswered_template_evict_env(str(seconds))
+
+    def restore_unanswered_template_evict_env(self, standing: str | None) -> None:
+        self._apply_unanswered_template_evict_env(standing)
+
+    def _apply_unanswered_template_evict_env(self, value: str | None) -> None:
+        self._require_isolated_kind("worker node-ctl env override")
+        ownership = self._node_ctl_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a worker node-ctl DaemonSet write without the caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a worker node-ctl DaemonSet write")
+        key = UNANSWERED_TEMPLATE_EVICT_AFTER_ENV
+        _require_ok(
+            self.kubectl(
+                "set", "env", f"daemonset/{WORKER_NODE_CTL_DAEMONSET}", "-c", NODE_CTL,
+                f"{key}-" if value is None else f"{key}={value}", timeout=30,
+            ),
+            f"set env on {WORKER_NODE_CTL_DAEMONSET}",
+        )
+        self._await_daemonset_rollout(WORKER_NODE_CTL_DAEMONSET, timeout=300)
+
+    def _await_daemonset_rollout(self, name: str, *, timeout: float) -> None:
+        """`rollout status`, then until each node runs one pod and none is Terminating.
+
+        The node services surge: the replaced pod is still shutting down when
+        the rollout reports done, and a per-node read would find two pods.
+        """
+
+        _require_ok(
+            self.kubectl(
+                "rollout", "status", f"daemonset/{name}", f"--timeout={int(timeout)}s",
+                timeout=timeout + 30,
+            ),
+            f"await rollout of {name}",
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            daemonset = json.loads(
+                _require_ok(self.kubectl("get", "daemonset", name, "-o", "json", timeout=15), f"read {name}")
+            )
+            desired = int((daemonset.get("status") or {}).get("desiredNumberScheduled", 0))
+            match_labels = daemonset["spec"]["selector"].get("matchLabels") or {}
+            if not match_labels:
+                raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
+            selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
+            pods = json.loads(
+                _require_ok(self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15), f"list {name} pods")
+            ).get("items", [])
+            terminating = [pod["metadata"]["name"] for pod in pods if pod["metadata"].get("deletionTimestamp")]
+            if not terminating and len(pods) == desired:
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{name} pods did not settle to {desired} within {timeout:g}s "
+                    f"(present={len(pods)}, terminating={terminating})"
+                )
+            time.sleep(2)
+
+    def running_unanswered_template_evict_env(self, node_name: str) -> str | None:
+        return self._node_service_env(node_name, NODE_CTL).get(UNANSWERED_TEMPLATE_EVICT_AFTER_ENV)
+
+    def local_template_names(self, node_name: str) -> frozenset[str]:
+        result = self._node_shell_exec(node_name, "space-tmplmgr list", timeout=60)
+        output = _require_ok(result, f"list templates on {node_name}")
+        # A box-drawn table whose first column is the name; the header row
+        # says NAME and the rules hold no name-shaped cell.
+        names = set()
+        for line in output.splitlines():
+            cells = [cell.strip() for cell in re.split(r"[\u2500-\u257f|]", line)]
+            first = next((cell for cell in cells if cell), "")
+            if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", first):
+                names.add(first)
+        return frozenset(names)
+
+    def node_template_presence(self, node_name: str) -> NodeTemplatePresence:
+        result = self.kubectl("get", "node", _kube_node_name(node_name), "-o", "json", timeout=15)
+        metadata = json.loads(_require_ok(result, f"read {node_name}") or "{}").get("metadata") or {}
+        labels = metadata.get("labels") or {}
+        annotations = metadata.get("annotations") or {}
+        return NodeTemplatePresence(
+            labels=frozenset(str(k) for k in labels if str(k).startswith(NODE_TEMPLATE_PRESENCE_PREFIX)),
+            annotations={
+                str(k): str(v) for k, v in annotations.items() if str(k).startswith(NODE_TEMPLATE_PRESENCE_PREFIX)
+            },
+        )
+
+    def node_ctl_log(self, node_name: str, *, since_time: str) -> str:
+        return self._node_service_logs(node_name, NODE_CTL, since_time=since_time)
 
     # --- template-manager startup recovery -------------------------------
 

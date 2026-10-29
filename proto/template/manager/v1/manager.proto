@@ -18,6 +18,15 @@ service TemplateManager {
   // Delete a template (all builds, snapshots, and tags).
   rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
 
+  // Delete a template's cached builds the way the cache GC evicts one, only
+  // while none was created or used in the last idle_secs. Deletes the
+  // template's local pool and its members first, even when it then keeps the
+  // template, since pool refills keep its builds in use. Fails with FAILED_PRECONDITION while
+  // a build is that recent, pinned, used by a local sandbox or targeted by a
+  // warm pool, ABORTED while the cache GC or another eviction is running, and
+  // NOT_FOUND when no build is cached.
+  rpc DeleteIdleTemplate(DeleteIdleTemplateRequest) returns (DeleteIdleTemplateResponse);
+
   // List all templates with snapshot/pool status.
   rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
 
@@ -84,6 +93,14 @@ message DeleteTemplateRequest {
 }
 
 message DeleteTemplateResponse {}
+
+message DeleteIdleTemplateRequest {
+  string template = 1;
+  // Must be positive.
+  uint64 idle_secs = 2;
+}
+
+message DeleteIdleTemplateResponse {}
 
 message ListTemplatesRequest {}
 

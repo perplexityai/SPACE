@@ -33,8 +33,9 @@ use pplx_space_sbx_mgr_client::proto::{
     StateRequest as SbxStateRequest, StateResponse as SbxStateResponse,
 };
 use pplx_space_template_mgr_client::proto::{
-    CreatePoolRequest, DeletePoolRequest, DeleteTemplateRequest, ListTemplatesRequest,
-    PoolStatusRequest, UpdateTemplateSettingsRequest, UpdateTemplateSnapshotPolicyRequest,
+    CreatePoolRequest, DeleteIdleTemplateRequest, DeletePoolRequest, DeleteTemplateRequest,
+    ListTemplatesRequest, PoolStatusRequest, UpdateTemplateSettingsRequest,
+    UpdateTemplateSnapshotPolicyRequest,
 };
 use tonic::{Code, Request};
 

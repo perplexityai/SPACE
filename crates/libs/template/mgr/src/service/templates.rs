@@ -59,6 +59,109 @@ impl TemplateManagerService {
         Ok(Response::new(DeleteTemplateResponse {}))
     }
 
+    /// Delete a template the cluster no longer wants on this node, without
+    /// racing a sandbox create that is about to use it: builds go through the
+    /// GC's eviction with an idle bound instead of `DeleteTemplate`'s
+    /// whole-tree removal (see [`crate::eviction::evict_idle_template`]).
+    pub(super) async fn delete_idle_template(
+        &self,
+        request: Request<crate::proto::DeleteIdleTemplateRequest>,
+    ) -> Result<Response<crate::proto::DeleteIdleTemplateResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "DeleteIdleTemplate",
+            ALLOW_TEMPLATE_DESIRED_STATE_OPERATOR,
+        )?;
+        let publish_node_state = !crate::node_state_sync::should_skip_node_publish(&request);
+        let crate::proto::DeleteIdleTemplateRequest {
+            template,
+            idle_secs,
+        } = request.into_inner();
+        validate_template_name(&template)?;
+        if idle_secs == 0 {
+            return Err(Status::invalid_argument("idle_secs must be positive"));
+        }
+        let touched_before_secs = jiff::Timestamp::now()
+            .as_second()
+            .max(0)
+            .cast_unsigned()
+            .saturating_sub(idle_secs);
+
+        // Pool members keep the builds referenced, and each refill touches
+        // its build, so the pool goes first, every time: `DeletePool` also
+        // stops members a failed earlier teardown left behind. The eviction
+        // below then refuses until the pool's last touch is older than the
+        // idle period.
+        self.delete_pool(internal_request(DeletePoolRequest {
+            template: template.clone(),
+        }))
+        .await?;
+
+        let dependency_error = |error: String| {
+            Status::unavailable(format!(
+                "cannot check what protects template {template} before deleting it: {error}"
+            ))
+        };
+        let active = fetch_build_referencing_sandbox_keys()
+            .await
+            .map_err(dependency_error)?;
+        let warm_pool = fetch_warm_pool_protected_keys()
+            .await
+            .map_err(dependency_error)?;
+        // Spawned, so a caller that stops waiting cannot interrupt the
+        // eviction between a build's `deleting` swap and its final row delete.
+        let eviction = tokio::spawn({
+            let db = Arc::clone(&self.db);
+            let gate = self.eviction_gate.clone();
+            let name = template.clone();
+            let disk = crate::eviction::EvictionDisk {
+                delete: gc_delete_disk_fn(self.artifact_store.clone()),
+                probe: gc_reaper_probe_fn(self.artifact_store.clone()),
+            };
+            async move {
+                crate::eviction::evict_idle_template(
+                    db,
+                    &gate,
+                    &name,
+                    touched_before_secs,
+                    active,
+                    warm_pool,
+                    disk,
+                )
+                .await
+            }
+        });
+        let outcome = eviction
+            .await
+            .map_err(|e| blocking_join_status("evict idle template", &template, e))?
+            .map_err(|e| Status::internal(format!("evict idle template {template}: {e}")))?;
+
+        // `DeletePool` publishes its own change; this publishes evicted builds.
+        let (changed, result) = match outcome {
+            crate::eviction::IdleTemplateEviction::Evicted => (true, Ok(())),
+            crate::eviction::IdleTemplateEviction::NotFound => (
+                false,
+                Err(Status::not_found(format!("template not found: {template}"))),
+            ),
+            crate::eviction::IdleTemplateEviction::Busy => (
+                false,
+                Err(Status::aborted(format!(
+                    "template cache eviction is running; retry deleting {template} later"
+                ))),
+            ),
+            crate::eviction::IdleTemplateEviction::Kept { evicted, reason } => (
+                evicted > 0,
+                Err(Status::failed_precondition(format!(
+                    "kept template {template}: {reason}"
+                ))),
+            ),
+        };
+        if changed && publish_node_state {
+            crate::node_state_sync::mark_template_dirty(&self.db, &template);
+        }
+        result.map(|()| Response::new(crate::proto::DeleteIdleTemplateResponse {}))
+    }
+
     async fn template_local_state_exists(&self, template: &str) -> Result<bool, Status> {
         let db = Arc::clone(&self.db);
         let name = template.to_string();

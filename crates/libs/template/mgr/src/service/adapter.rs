@@ -30,6 +30,13 @@ impl TemplateManager for TemplateManagerService {
         TemplateManagerService::delete_template(self, request).await
     }
 
+    async fn delete_idle_template(
+        &self,
+        request: Request<crate::proto::DeleteIdleTemplateRequest>,
+    ) -> Result<Response<crate::proto::DeleteIdleTemplateResponse>, Status> {
+        TemplateManagerService::delete_idle_template(self, request).await
+    }
+
     async fn list_templates(
         &self,
         request: Request<ListTemplatesRequest>,
