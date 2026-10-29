@@ -16,6 +16,7 @@ use std::{collections::VecDeque, io};
 use tokio::io::AsyncRead;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+mod mutations;
 mod pty;
 mod recovery;
 use pty::PtyIo;
@@ -47,7 +48,7 @@ const SLOW_START_PHASE: Duration = Duration::from_secs(1);
 struct RecoveryLaunch {
     fence: pplx_space_spaced_guest_protocol::recovery::RecoveryFence,
     // Retained through launch and key publication, even after the caller leaves.
-    _activation: tokio::sync::OwnedRwLockReadGuard<()>,
+    _activation: crate::recovery::ActivationLease,
 }
 
 struct RecoveryStartAdmission {
@@ -316,13 +317,7 @@ impl Process for ExecutionService {
         let mut ingress = ingress;
         let recovery = if request.recovery.is_some() {
             // A queued activation update must not turn requests into payload-holding waiters.
-            let activation = self
-                .inner
-                .recovery
-                .launches
-                .clone()
-                .try_read_owned()
-                .map_err(|_| pplx_space_spaced_guest_protocol::recovery::RecoveryReason::TemporarilyUnavailable.into_status())?;
+            let activation = self.inner.recovery.lease()?;
             let permit = crate::payload::acquire(
                 &self.inner.process_payload_slots,
                 pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
@@ -657,6 +652,7 @@ impl Process for ExecutionService {
         )?;
         let request = request.into_inner();
         let address = ProcessAddress::parse(request.process_id, request.recovery)?;
+        address.require_unsequenced()?;
         let resume_after_output_gap = request.resume_after_output_gap.unwrap_or(false);
         // Validate the field for wire compatibility, but do not turn it into a
         // total stream-lifetime deadline here. ECW and native callers own
@@ -726,17 +722,44 @@ impl Process for ExecutionService {
 
     async fn send_signal(
         &self,
-        request: Request<SendSignalRequest>,
+        mut request: Request<SendSignalRequest>,
     ) -> Result<Response<SendSignalResponse>, Status> {
         let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
+        let payload = if request
+            .get_ref()
+            .recovery
+            .as_ref()
+            .is_some_and(|handle| handle.contract_version == 2)
+        {
+            Some(crate::payload::admit(
+                &mut request,
+                &self.inner.process_payload_slots,
+                1,
+                pplx_space_metrics::payload::Budget::GuestProcess,
+                pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+            )?)
+        } else {
+            None
+        };
         let request = request.into_inner();
         let address = ProcessAddress::parse(request.process_id, request.recovery)?;
         let signal =
             ProcessSignal::try_from_i32(request.signal).map_err(invalid_argument_status)?;
+        if let Some(sequence) = address.sequence() {
+            self.mutate_process(
+                address,
+                sequence,
+                mutations::Mutation::Signal(signal),
+                payload.expect("sequenced mutation has admission"),
+                _operation,
+            )
+            .await?;
+            return Ok(Response::new(SendSignalResponse {}));
+        }
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let handle = &target.record;
@@ -776,10 +799,28 @@ impl Process for ExecutionService {
             std::mem::take(&mut request.process_id),
             request.recovery.take(),
         )?;
+        if let Some(sequence) = address.sequence() {
+            self.mutate_process(
+                address,
+                sequence,
+                mutations::Mutation::Input(request),
+                _admission,
+                _operation,
+            )
+            .await?;
+            return Ok(Response::new(SendInputResponse {}));
+        }
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let record = &target.record;
-        record.write_stdin(&request.data).await?;
+        if let Some(cancellation) = target.recovery_cancellation() {
+            record
+                .input
+                .write_recovery(&request.data, cancellation)
+                .await?;
+        } else {
+            record.write_stdin(&request.data).await?;
+        }
         tracing::debug!(
             command = "bridge_guest_process_send_input",
             process_id = %process_id,
@@ -791,19 +832,50 @@ impl Process for ExecutionService {
 
     async fn close_stdin(
         &self,
-        request: Request<CloseStdinRequest>,
+        mut request: Request<CloseStdinRequest>,
     ) -> Result<Response<CloseStdinResponse>, Status> {
         let _operation = self.inner.lifecycle.admit()?;
         crate::payload::check_message(
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
+        let payload = if request
+            .get_ref()
+            .recovery
+            .as_ref()
+            .is_some_and(|handle| handle.contract_version == 2)
+        {
+            Some(crate::payload::admit(
+                &mut request,
+                &self.inner.process_payload_slots,
+                1,
+                pplx_space_metrics::payload::Budget::GuestProcess,
+                pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
+            )?)
+        } else {
+            None
+        };
         let request = request.into_inner();
         let address = ProcessAddress::parse(request.process_id, request.recovery)?;
+        if let Some(sequence) = address.sequence() {
+            self.mutate_process(
+                address,
+                sequence,
+                mutations::Mutation::Close,
+                payload.expect("sequenced mutation has admission"),
+                _operation,
+            )
+            .await?;
+            return Ok(Response::new(CloseStdinResponse {}));
+        }
         let target = self.select_process(address, TargetState::Running).await?;
         let process_id = &target.id;
         let record = &target.record;
-        record.close_stdin().await?;
+        if let Some(cancellation) = target.recovery_cancellation() {
+            record.input.close_recovery(cancellation).await?;
+        } else {
+            record.close_stdin().await?;
+        }
         tracing::debug!(
             command = "bridge_guest_process_close_stdin",
             process_id = %process_id,
@@ -823,6 +895,7 @@ impl Process for ExecutionService {
         )?;
         let request = request.into_inner();
         let address = ProcessAddress::parse(request.process_id, request.recovery)?;
+        address.require_unsequenced()?;
         let size = request
             .size
             .ok_or_else(|| Status::invalid_argument("pty size is required"))?;

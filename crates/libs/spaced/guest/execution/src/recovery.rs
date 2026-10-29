@@ -69,22 +69,52 @@ pub(super) fn binding(request: &StartRequest) -> RequestBinding {
     )
 }
 
+pub(super) struct Activation {
+    pub(super) id: Option<ProcessRecoveryToken>,
+    pub(super) cancellation: tokio_util::sync::CancellationToken,
+}
+
+pub(super) struct ActivationLease {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    pub(super) cancellation: tokio_util::sync::CancellationToken,
+}
+
 pub(super) struct RecoveryState {
     pub(super) instance: ProcessRecoveryToken,
     pub(super) launches: std::sync::Arc<tokio::sync::RwLock<()>>,
-    pub(super) activation: std::sync::Mutex<Option<ProcessRecoveryToken>>,
+    pub(super) activation: std::sync::Mutex<Activation>,
+    pub(super) configuration: tokio::sync::Mutex<()>,
     pub(super) idempotency: std::time::Duration,
 }
 
 impl RecoveryState {
+    pub(super) fn lease(&self) -> Result<ActivationLease, Status> {
+        let guard = self
+            .launches
+            .clone()
+            .try_read_owned()
+            .map_err(|_| RecoveryReason::TemporarilyUnavailable.into_status())?;
+        let cancellation = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancellation
+            .clone();
+        Ok(ActivationLease {
+            _guard: guard,
+            cancellation,
+        })
+    }
+
     pub(super) fn check(&self, fence: RecoveryFence) -> Result<(), Status> {
         if self.instance != fence.instance {
             return Err(RecoveryReason::EngineRestarted.into_status());
         }
-        match *self
+        match self
             .activation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .id
         {
             None => Err(RecoveryReason::TemporarilyUnavailable.into_status()),
             Some(current) if current != fence.activation => {

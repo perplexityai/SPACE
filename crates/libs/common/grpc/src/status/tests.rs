@@ -25,6 +25,7 @@ fn guest_capability_unsupported_status_round_trips_through_metadata() {
         GuestCapability::ProcessOutputGapResume,
         GuestCapability::ProcessRecoveryStart,
         GuestCapability::ProcessRecoveryHandles,
+        GuestCapability::ProcessMutationReceipts,
     ] {
         let status =
             guest_capability_unsupported_status(capability, format!("{capability} is unsupported"));

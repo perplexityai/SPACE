@@ -2,7 +2,7 @@
 use super::*;
 use pplx_space_spaced_guest_protocol::{
     proto::operations::RecoveryHandle,
-    recovery::{ProcessHandle, RecoveryReason, validate_handle},
+    recovery::{ControlContract, ProcessHandle, RecoveryReason, validate_handle},
 };
 
 #[derive(Clone, Copy)]
@@ -11,11 +11,43 @@ pub(super) struct RecoveryIdentity {
     pub(super) incarnation: ProcessRecoveryToken,
 }
 
+pub(super) struct RecoveryRecord {
+    identity: RecoveryIdentity,
+    pub(super) mutations: Arc<super::mutations::Ledger>,
+}
+impl RecoveryRecord {
+    pub(super) fn new(identity: RecoveryIdentity) -> Self {
+        Self {
+            identity,
+            mutations: Arc::default(),
+        }
+    }
+}
+
 pub(super) enum ProcessAddress {
     Legacy(ProcessId),
     Recovery(ProcessHandle),
 }
 impl ProcessAddress {
+    pub(super) fn sequence(&self) -> Option<std::num::NonZeroU64> {
+        match self {
+            Self::Recovery(ProcessHandle {
+                contract: ControlContract::Sequenced(sequence),
+                ..
+            }) => Some(*sequence),
+            _ => None,
+        }
+    }
+
+    pub(super) fn require_unsequenced(&self) -> Result<(), Status> {
+        if self.sequence().is_some() {
+            return Err(Status::invalid_argument(
+                "this operation does not accept mutation sequences",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn parse(legacy: String, recovery: Option<RecoveryHandle>) -> Result<Self, Status> {
         match validate_handle(&legacy, recovery.as_ref())? {
             Some(handle) => Ok(Self::Recovery(handle)),
@@ -35,7 +67,13 @@ pub(super) struct ProcessTarget {
     pub(super) id: ProcessId,
     pub(super) record: Arc<ProcessRecord>,
     // Activation changes cannot pass a control effect still using this record.
-    _activation: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _activation: Option<crate::recovery::ActivationLease>,
+}
+
+impl ProcessTarget {
+    pub(super) fn recovery_cancellation(&self) -> Option<&CancellationToken> {
+        self._activation.as_ref().map(|lease| &lease.cancellation)
+    }
 }
 
 impl ExecutionService {
@@ -47,13 +85,7 @@ impl ExecutionService {
         let (id, expected, activation) = match address {
             ProcessAddress::Legacy(id) => (id, None, None),
             ProcessAddress::Recovery(handle) => {
-                let activation = self
-                    .inner
-                    .recovery
-                    .launches
-                    .clone()
-                    .try_read_owned()
-                    .map_err(|_| RecoveryReason::TemporarilyUnavailable.into_status())?;
+                let activation = self.inner.recovery.lease()?;
                 self.inner.recovery.check(handle.fence)?;
                 (
                     handle.process_id,
@@ -72,7 +104,9 @@ impl ExecutionService {
             .ok_or_else(|| Status::not_found("process not found"))?;
         if let Some(expected) = expected {
             let actual = record
-                .recovery_identity
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.identity)
                 .ok_or_else(|| RecoveryReason::ProcessReplaced.into_status())?;
             if actual.incarnation != expected.incarnation {
                 return Err(RecoveryReason::ProcessReplaced.into_status());

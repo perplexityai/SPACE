@@ -255,6 +255,8 @@ message RecoveryHandle {
   string expected_activation_id = 3;
   string process_id = 4;
   string process_incarnation = 5;
+  // Version 2 only: one ordered sequence shared by input, close and signal.
+  optional uint64 sequence = 6;
 }
 
 message ConnectProcessRequest {

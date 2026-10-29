@@ -4,13 +4,21 @@ use pplx_space_spaced_guest_protocol::{
     recovery::RecoveryReason,
 };
 
-async fn running(service: &ExecutionService, pty: bool) -> RecoveryHandle {
+pub(super) async fn running(service: &ExecutionService, pty: bool) -> RecoveryHandle {
+    running_command(service, pty, vec!["/bin/cat".into()]).await
+}
+
+pub(super) async fn running_command(
+    service: &ExecutionService,
+    pty: bool,
+    command: Vec<String>,
+) -> RecoveryHandle {
     let mut request = recovery_request(service, "controlled").await;
     request
         .recovery
         .as_mut()
         .expect("recovery envelope")
-        .command = vec!["/bin/cat".into()];
+        .command = command;
     request.stdin = true;
     request.pty = pty.then_some(PtyConfig { size: None });
     let activation = request
@@ -37,6 +45,7 @@ async fn running(service: &ExecutionService, pty: bool) -> RecoveryHandle {
         .expect("start prefix");
     RecoveryHandle {
         contract_version: 1,
+        sequence: None,
         expected_instance_id: started.instance_id.expect("instance"),
         expected_activation_id: activation,
         process_id: event.process_id,
@@ -59,7 +68,7 @@ async fn connect(
     .await
 }
 
-async fn output(service: &ExecutionService, handle: RecoveryHandle) -> Vec<u8> {
+pub(super) async fn output(service: &ExecutionService, handle: RecoveryHandle) -> Vec<u8> {
     let mut events = connect(service, handle)
         .await
         .expect("connect")
@@ -216,7 +225,7 @@ async fn every_fenced_entrypoint_rejects_stale_or_ambiguous_handles_before_effec
                 (tonic::Code::NotFound, None)
             }
             4 => {
-                handle.contract_version = 2;
+                handle.contract_version = 3;
                 (
                     tonic::Code::FailedPrecondition,
                     Some(RecoveryReason::UnsupportedContract),
@@ -349,13 +358,15 @@ async fn quiescing_recovery_waits_for_an_admitted_control_and_cancellation_relea
     assert!(futures_util::poll!(&mut writing).is_pending());
     let mut disabling = Box::pin(service.configure_process_recovery(None));
     assert!(futures_util::poll!(&mut disabling).is_pending());
-    drop(writing);
-    tokio::time::timeout(Duration::from_secs(2), disabling)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(service.process_execution_info().activation_id.is_none());
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(writing, disabling)
+    })
+    .await;
     drop(lock);
+    let (writing, disabling) = result.expect("quiescing interrupts the admitted writer");
+    writing.unwrap_err();
+    disabling.unwrap();
+    assert!(service.process_execution_info().activation_id.is_none());
     service.cancel();
     service.drain().await.unwrap();
 }
