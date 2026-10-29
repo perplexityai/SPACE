@@ -42,9 +42,11 @@ die() { printf '[wait-node-publication] ERROR: %s\n' "$*" >&2; exit 1; }
 
 pf_pid=""
 pf_log=""
+login_body="$(mktemp)"
 cleanup() {
   [[ -z "$pf_pid" ]] || kill "$pf_pid" 2>/dev/null || true
   [[ -z "$pf_log" ]] || rm -f "$pf_log"
+  rm -f "$login_body"
 }
 trap cleanup EXIT
 
@@ -70,13 +72,17 @@ expected="$(kubectl --context "$KCTX" get nodes \
 [[ -n "$expected" ]] || die "no node labelled space.pplx.net/node-pool=sandbox or =builder in $KCTX"
 
 token=""
+# The last login's HTTP status, so a timeout spent on rejected logins says so.
+login_status=""
 deadline=$((SECONDS + TIMEOUT))
 pending="$expected"
 while true; do
   if [[ -z "$token" ]]; then
-    token="$(jq -nc --arg password "$PASSWORD" '{email: "root@local", password: $password}' \
-      | curl -fsS -m 5 -X POST "$API_URL/auth/v1/sessions" -H 'content-type: application/json' \
-          --data-binary @- 2>/dev/null | jq -r '.token // empty' || true)"
+    login_status="$(jq -nc --arg password "$PASSWORD" '{email: "root@local", password: $password}' \
+      | curl -sS -m 5 -o "$login_body" -w '%{http_code}' -X POST "$API_URL/auth/v1/sessions" \
+          -H 'content-type: application/json' --data-binary @- 2>/dev/null || true)"
+    token=""
+    [[ "$login_status" != 2* ]] || token="$(jq -r '.token // empty' "$login_body" 2>/dev/null || true)"
   fi
   if [[ -n "$token" ]] && nodes="$(curl -fsS -m 5 -H "authorization: Bearer $token" \
       "$API_URL/admin/api/v1/nodes" 2>/dev/null)"; then
@@ -93,6 +99,9 @@ while true; do
     token=""
   fi
   if (( SECONDS >= deadline )); then
+    if [[ -z "$token" && "$login_status" == 401 ]]; then
+      die "root@local login still rejected (HTTP 401) after ${TIMEOUT}s; check SPACE_CONSOLE_PASSWORD and Tilt's provision-local-console, which sets that password"
+    fi
     {
       printf 'nodes not published as ready within %ss:\n' "$TIMEOUT"
       while read -r name role; do

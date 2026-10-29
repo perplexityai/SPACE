@@ -1272,7 +1272,13 @@ the vsock-listening `spaced-svc` and boots under real Firecracker:
   image, bakes the per-host sandbox SSH public key, and authors the
   `manifest.json` next to the artifacts. Idempotent — it skips the build
   when the inputs (guest binaries, builder script, recipe, pubkey) are
-  unchanged.
+  unchanged. Tilt's `seed-artifacts` resource runs it as soon as the Rust
+  artifact image is ready. The `space-seed-publish` image build runs it
+  again, waiting on the script's lock in `SPACE_SEED_OUTPUT_DIR` while
+  another build holds it, and finds the seed up to date or rebuilds it.
+  It then builds the image from that directory while holding the lock
+  shared (`build-seed.sh --read-lock`), so no seed build rewrites it
+  meanwhile.
 - the `space-seed-publish` Job then plays the role the production builder
   plays for distribution: it uploads `metadata.json` + `manifest.json` +
   `rootfs.ext4` to the object store under `templates/seed/<content_hash>/` and
