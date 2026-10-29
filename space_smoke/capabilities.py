@@ -425,6 +425,39 @@ class EcwProtocolCompatibility(Protocol):
         """Open and immediately close the legacy streaming WatchDir route."""
         ...
 
+    @property
+    def envd_address(self) -> tuple[str, int]:
+        """TCP address behind the sandbox's envd URL."""
+        ...
+
+    def stream_command(
+        self,
+        command: str,
+        *,
+        keepalive_interval: int,
+        dial: tuple[str, int] | None = None,
+        request_timeout: float = 120,
+    ) -> EcwProcessStream:
+        """Run `command` over a raw Process.Start stream, recording every event.
+
+        `keepalive_interval` is sent as `Keepalive-Ping-Interval`. `dial`
+        redirects the TCP connection while keeping the URL's Host and TLS name.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class EcwProcessStream:
+    """Everything a client read from one ECW process response stream."""
+
+    # Event kinds in arrival order: start, data, keepalive, end.
+    events: tuple[str, ...]
+    stdout: str
+    exit_code: int | None
+    # Set when the stream ended without a clean Connect end-of-stream message.
+    error: str | None
+    longest_silence_seconds: float
+
 
 @dataclass(frozen=True)
 class RestoreCallerOutcome:

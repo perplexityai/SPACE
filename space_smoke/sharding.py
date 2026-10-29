@@ -40,6 +40,8 @@ _DURATION_SECONDS = {
         "ecw.process_reattach": 14,
         "ecw.public_port_to_all_interfaces": 5,
         "ecw.public_port_to_loopback": 5,
+        # Estimate: a 45 s quiet command plus setup. Refresh from CI runs.
+        "ecw.quiet_process_stream_keepalive": 50,
         "ecw.refresh_keepalive": 41,
         "ecw.sandbox_delete": 5,
         "ecw.sandbox_info": 4,
