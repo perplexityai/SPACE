@@ -40,22 +40,13 @@ impl SandboxManagerService {
         &self,
         sandbox: &crate::db::SandboxRow,
         authorization: Option<&SpaceApiBridgeRouteAuthorization>,
-        policy: SpacedEndpointProofPolicy,
-        timeout: Duration,
-    ) -> Result<WaitReadyResponse, Status> {
-        let started = tokio::time::Instant::now();
-        let (client, observed) = tokio::time::timeout(timeout, async {
-            let client = self
-                .connect_spaced_host_with_policy(sandbox, policy)
-                .await?;
-            let observed = client.wait_ready(timeout).await?;
-            Ok::<_, Status>((client, observed))
-        })
-        .await
-        .map_err(|_| Status::deadline_exceeded("guest readiness deadline elapsed"))??;
-        let budget = legacy_rearm_budget(timeout, started.elapsed());
+        client: SpacedHostClient,
+        observed: WaitReadyResponse,
+        remaining: Duration,
+    ) -> WaitReadyResponse {
+        let budget = legacy_rearm_budget(remaining);
         let rearm = self.rearm_observed(sandbox, authorization, client, observed.clone(), budget);
-        Ok(best_effort_recovery_ready(observed, budget, rearm).await)
+        best_effort_recovery_ready(observed, budget, rearm).await
     }
 
     pub(super) fn require_resident_recovery(
@@ -68,8 +59,7 @@ impl SandboxManagerService {
             return Ok(());
         };
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        authorization.authorize_sandbox(&sandbox)?;
-        resident_recovery_fence(&sandbox, fence)
+        authorize_resident_recovery(&sandbox, Some(authorization), fence)
     }
 
     pub(super) async fn ensure_recovery_active(
@@ -81,31 +71,44 @@ impl SandboxManagerService {
         activity: GuestActivityKind,
     ) -> Result<crate::db::SandboxRow, Status> {
         let remaining = recovery_remaining(budget)?;
-        let state_writer = self.state_writer_lease("process recovery")?;
+        let state_writer = match self.state_writer_lease("process recovery") {
+            Ok(writer) => writer,
+            Err(status) => {
+                let sandbox = self.lookup_sandbox(sandbox_id)?;
+                authorize_resident_recovery(&sandbox, Some(authorization), fence)?;
+                if sandbox.state == SandboxState::Started {
+                    return Ok(sandbox);
+                }
+                return Err(rearm_status(status));
+            }
+        };
         let service = self.clone();
         let authorization = authorization.clone();
         let sandbox_id = sandbox_id.to_owned();
-        self.task_tracker
-            .spawn(super::drain::with_state_writer(state_writer, async move {
-                tokio::time::timeout(
-                    remaining,
-                    service.ensure_active_for_guest_activity_with_start(
-                        Some(&authorization),
-                        &sandbox_id,
-                        true,
-                        Some(remaining),
-                        activity,
-                        WakeStartConfig {
-                            recovery_fence: Some(fence),
-                            ..Default::default()
-                        },
-                    ),
-                )
-                .await
-                .map_err(|_| RecoveryReason::TemporarilyUnavailable.into_status())?
-            }))
+        let wake =
+            self.task_tracker
+                .spawn(super::drain::with_state_writer(state_writer, async move {
+                    service
+                        .ensure_active_for_guest_activity_with_start(
+                            Some(&authorization),
+                            &sandbox_id,
+                            true,
+                            Some(remaining),
+                            activity,
+                            WakeStartConfig {
+                                recovery_fence: Some(fence),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                }));
+        // A resume owns its finalization after publishing Resuming. Expiring
+        // the caller detaches this tracked task; it must not drop the wake.
+        tokio::time::timeout(remaining, wake)
             .await
+            .map_err(|_| RecoveryReason::TemporarilyUnavailable.into_status())?
             .map_err(|_| Status::internal("recovery wake task failed"))?
+            .map_err(rearm_status)
     }
 
     async fn recovery_activation_scope(
@@ -118,7 +121,21 @@ impl SandboxManagerService {
             .artifact_lock(sandbox_id)
             .lock_owned()
             .await;
-        let sandbox = self.lookup_started_sandbox(sandbox_id)?;
+        let sandbox = self.lookup_sandbox(sandbox_id)?;
+        let refusal = match sandbox.state {
+            SandboxState::Started => None,
+            SandboxState::Suspended | SandboxState::Stopped => {
+                Some(RecoveryReason::ActivationChanged)
+            }
+            _ => Some(RecoveryReason::TemporarilyUnavailable),
+        };
+        if let Some(reason) = refusal {
+            let status = reason.into_status();
+            return Err(match authorization {
+                Some(authorization) => authorization.refuse_sandbox(&sandbox, status),
+                None => status,
+            });
+        }
         if let Some(authorization) = authorization {
             authorization.authorize_sandbox(&sandbox)?;
         }
@@ -173,9 +190,12 @@ impl SandboxManagerService {
         let Some(barrier) = response.process_recovery_barrier_id else {
             return Ok(response);
         };
-        let activation = self
-            .recovery_activation_scope(&sandbox.id, authorization)
-            .await?;
+        let activation = tokio::time::timeout(
+            recovery_remaining(&budget)?,
+            self.recovery_activation_scope(&sandbox.id, authorization),
+        )
+        .await
+        .map_err(|_| RecoveryReason::TemporarilyUnavailable.into_status())??;
         let current = &activation.sandbox;
         // Reuse the attested connection only while its runtime and route remain
         // current. A changed row requires a fresh observation on the next call.
@@ -233,8 +253,8 @@ fn recovery_remaining(
         .ok_or_else(|| RecoveryReason::TemporarilyUnavailable.into_status())
 }
 
-fn legacy_rearm_budget(timeout: Duration, elapsed: Duration) -> Duration {
-    timeout.saturating_sub(elapsed) / 2
+fn legacy_rearm_budget(remaining: Duration) -> Duration {
+    (remaining / 2).min(Duration::from_secs(3))
 }
 
 fn rearm_status(status: Status) -> Status {
@@ -248,10 +268,39 @@ fn rearm_status(status: Status) -> Status {
                 | tonic::Code::FailedPrecondition
         )
     {
-        RecoveryReason::TemporarilyUnavailable.into_status()
+        let temporary = RecoveryReason::TemporarilyUnavailable.into_status();
+        let mut mapped = Status::with_metadata(
+            temporary.code(),
+            temporary.message(),
+            status.metadata().clone(),
+        );
+        mapped.metadata_mut().insert(
+            pplx_space_spaced_common::recovery::RECOVERY_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(
+                RecoveryReason::TemporarilyUnavailable.as_str(),
+            ),
+        );
+        mapped
     } else {
         status
     }
+}
+
+pub(super) fn authorize_resident_recovery(
+    sandbox: &crate::db::SandboxRow,
+    authorization: Option<&SpaceApiBridgeRouteAuthorization>,
+    fence: pplx_space_spaced_common::recovery::RecoveryFence,
+) -> Result<(), Status> {
+    if let Err(status) = resident_recovery_fence(sandbox, fence) {
+        return Err(match authorization {
+            Some(authorization) => authorization.refuse_sandbox(sandbox, status),
+            None => status,
+        });
+    }
+    if let Some(authorization) = authorization {
+        authorization.authorize_sandbox(sandbox)?;
+    }
+    Ok(())
 }
 
 pub(super) fn resident_recovery_fence(

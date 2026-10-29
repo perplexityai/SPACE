@@ -254,16 +254,19 @@ receipts before flushing. Once quiescing begins, cancelling configuration leaves
 recovery disabled until a subsequent change completes the barrier.
 
 Recovery rearming is optional on ordinary readiness: first observe the guest,
-then attempt rearming within a small part of the remaining request budget. A busy
-snapshot lock or failed rearm removes recovery capabilities without failing
-readiness. Preparation waits briefly for an admitted rearm instead of immediately
-refusing because its lifecycle permit is busy.
+then attempt rearming within half the remaining request budget, capped at three
+seconds. A busy snapshot lock or failed rearm removes recovery capabilities
+without failing readiness. Preparation waits briefly for an admitted rearm
+instead of immediately refusing because its lifecycle permit is busy.
 
 Before implicitly resuming a resident paused sandbox, the manager validates its
 external activation. Recovery requests never restore a suspended sandbox using
 old fences. New public recovery command sessions require a running sandbox and
 do not enqueue a wake; callers explicitly resume or restore, then discover the
-execution for new work. Legacy command wake policy is unchanged.
+execution for new work. An admitted resident resume completes or rolls back even
+if its caller times out or disconnects. During manager drain, matching recovery
+handles may still access an already running resident; they cannot start a resume.
+Legacy command wake policy is unchanged.
 
 ### Snapshot activation handshake
 

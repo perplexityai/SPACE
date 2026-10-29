@@ -7152,7 +7152,7 @@ pub(crate) mod service_tests {
         request
     }
 
-    fn insert_platform_owned_sandbox(
+    pub(crate) fn insert_platform_owned_sandbox(
         conn: &crate::db::Connection,
         id: &str,
         state: SandboxState,

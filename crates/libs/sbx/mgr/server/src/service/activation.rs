@@ -602,10 +602,7 @@ impl SandboxManagerService {
         loop {
             let sandbox = self.lookup_sandbox(&sandbox.id)?;
             if let Some(fence) = start.recovery_fence {
-                if let Some(route_auth) = route_auth {
-                    route_auth.authorize_sandbox(&sandbox)?;
-                }
-                super::process_recovery::resident_recovery_fence(&sandbox, fence)?;
+                super::process_recovery::authorize_resident_recovery(&sandbox, route_auth, fence)?;
             }
             let wake_policy =
                 if sandbox.auto_lifecycle_authority == crate::db::PolicyAuthority::Local {

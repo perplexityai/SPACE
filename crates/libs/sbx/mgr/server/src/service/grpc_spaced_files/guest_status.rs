@@ -110,14 +110,25 @@ impl SandboxManagerService {
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCKING_READY_TIMEOUT_SECS as u64));
         let timeout =
             grpc_timeout_budget(&request).map_or(timeout, |remaining| remaining.min(timeout));
+        let started = tokio::time::Instant::now();
+        let (client, observed) = tokio::time::timeout(timeout, async {
+            let client = self
+                .connect_spaced_host_with_policy(&sandbox, endpoint_proof_policy)
+                .await?;
+            let observed = client.wait_ready(timeout).await?;
+            Ok::<_, Status>((client, observed))
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("guest readiness deadline elapsed"))??;
         let response = self
             .legacy_recovery_ready(
                 &sandbox,
                 route_auth.as_ref(),
-                endpoint_proof_policy,
-                timeout,
+                client,
+                observed,
+                timeout.saturating_sub(started.elapsed()),
             )
-            .await?;
+            .await;
         Ok(Response::new(spaced_ready_response(response)))
     }
 }

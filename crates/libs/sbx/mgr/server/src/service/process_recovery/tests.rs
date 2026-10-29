@@ -32,8 +32,8 @@ async fn recovery_activation_rechecks_state_after_snapshot_exclusion() {
     );
     drop(capture);
     assert_eq!(
-        activation.await.err().unwrap().code(),
-        tonic::Code::FailedPrecondition
+        RecoveryReason::from_status(&activation.await.err().unwrap()),
+        Some(RecoveryReason::TemporarilyUnavailable)
     );
     drop(
         lock.try_lock()
@@ -63,6 +63,12 @@ async fn recovery_activation_holds_snapshot_exclusion_through_confirmation() {
 #[tokio::test(start_paused = true)]
 async fn legacy_readiness_survives_busy_or_failed_rearming() {
     use pplx_space_spaced_host_client::proto::ProcessExecutionInfo;
+    for (remaining, expected) in [(0, 0), (2, 1), (30, 3), (60, 3)] {
+        assert_eq!(
+            legacy_rearm_budget(Duration::from_secs(remaining)),
+            Duration::from_secs(expected)
+        );
+    }
     let observed = WaitReadyResponse {
         guest_uptime: Some(prost_types::Duration {
             seconds: 10,
@@ -278,6 +284,26 @@ fn rearm_failures_are_temporary_without_masking_unsupported_or_stale_handles() {
             Some(RecoveryReason::TemporarilyUnavailable)
         );
     }
+    for code in [
+        tonic::Code::PermissionDenied,
+        tonic::Code::Unauthenticated,
+        tonic::Code::NotFound,
+        tonic::Code::Internal,
+    ] {
+        assert_eq!(
+            rearm_status(Status::new(code, "not a rearm refusal")).code(),
+            code
+        );
+    }
+    let draining =
+        rearm_status(pplx_space_sbx_mgr_client::restart_retry_on_successor_status("draining"));
+    assert!(pplx_space_sbx_mgr_client::is_restart_retry_on_successor(
+        &draining
+    ));
+    assert_eq!(
+        RecoveryReason::from_status(&draining),
+        Some(RecoveryReason::TemporarilyUnavailable)
+    );
     let unsupported = pplx_space_common_grpc::guest_capability_unsupported_status(
         pplx_space_common_grpc::GuestCapability::ProcessRecoveryStart,
         "unsupported",
@@ -358,3 +384,5 @@ async fn recovery_wake_rechecks_a_matching_fence_after_lock_admission() {
 }
 
 mod transport;
+
+mod wake;

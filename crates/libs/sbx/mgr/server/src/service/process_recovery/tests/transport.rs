@@ -127,13 +127,15 @@ async fn legacy_rearm_reuses_observation_and_allows_real_rpc_latency() {
             .await
             .unwrap();
     let observed = client.wait_ready(Duration::from_secs(3)).await.unwrap();
-    let budget = legacy_rearm_budget(Duration::from_secs(3), Duration::from_millis(50));
-    let response = best_effort_recovery_ready(
-        observed.clone(),
-        budget,
-        service.rearm_observed(&sandbox, None, client.clone(), observed, budget),
-    )
-    .await;
+    let response = service
+        .legacy_recovery_ready(
+            &sandbox,
+            None,
+            client.clone(),
+            observed,
+            Duration::from_secs(3),
+        )
+        .await;
     assert_eq!(
         response.process_execution.unwrap().activation_id.as_deref(),
         Some(host.activation.as_str())
@@ -146,14 +148,37 @@ async fn legacy_rearm_reuses_observation_and_allows_real_rpc_latency() {
     let capture = service.auto_lifecycle.artifact_lock(&id).lock_owned().await;
     host.armed.store(false, Ordering::SeqCst);
     let observed = client.wait_ready(Duration::from_secs(1)).await.unwrap();
-    let deadline =
-        pplx_space_common_grpc::GrpcRetryContext::with_timeout(Duration::from_millis(30));
     let error = tokio::time::timeout(
-        deadline.remaining().unwrap(),
-        service.rearm_observed(&sandbox, None, client, observed, Duration::from_secs(1)),
+        Duration::from_secs(1),
+        service.rearm_observed(
+            &sandbox,
+            None,
+            client.clone(),
+            observed.clone(),
+            Duration::from_millis(30),
+        ),
     )
-    .await;
-    assert!(error.is_err(), "busy artifact lock respects caller budget");
+    .await
+    .expect("rearm must enforce its own shorter lock budget")
+    .unwrap_err();
+    assert_eq!(
+        RecoveryReason::from_status(&error),
+        Some(RecoveryReason::TemporarilyUnavailable)
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        service.legacy_recovery_ready(&sandbox, None, client, observed, Duration::from_millis(60)),
+    )
+    .await
+    .expect("legacy readiness must return even while the lock is busy");
+    let info = response.process_execution.unwrap();
+    assert!(info.activation_id.is_none());
+    assert!(info.capabilities.is_empty());
+    assert_eq!(
+        host.observations.load(Ordering::SeqCst),
+        3,
+        "busy rearm does not reconnect or reobserve"
+    );
     drop(capture);
     shutdown.cancel();
     server.await.unwrap().unwrap();
