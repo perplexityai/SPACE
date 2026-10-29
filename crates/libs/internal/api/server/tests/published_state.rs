@@ -2093,6 +2093,52 @@ async fn publishing_local_suspend_handoff_records_only_kubernetes_rows() -> Test
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn publishing_local_suspend_handoff_clears_once_node_reports_running() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
+    insert_k8s_execution(&db.pool, sandbox_id, 1, "running", None).await?;
+    let mut suspended = published_sandbox_state(sandbox_id, "suspended");
+    suspended.execution_generation = Some(1);
+    suspended.pod_uid = Some("pod-uid-1".to_string());
+    suspended.current_local_artifact_id = Some(Uuid::now_v7().to_string());
+    suspended.current_local_artifact_kind =
+        Some(pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32);
+    suspended.current_local_artifact_origin =
+        Some(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend as i32);
+    let mut running = published_sandbox_state(sandbox_id, "running");
+    running.execution_generation = Some(1);
+    running.pod_uid = Some("pod-uid-1".to_string());
+
+    let mut handoffs = Vec::new();
+    for published in [suspended, running] {
+        let mut conn = db.pool.acquire().await?;
+        publish_sandbox_states(&mut conn, node_id, &[published]).await?;
+        drop(conn);
+        let handoff: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM node_facet_observed_status
+                  WHERE node_id = $1 AND facet = $2 AND element = $3
+                    AND observed_payload ? $4
+             )"
+        ))
+        .bind(node_id)
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .bind(sandbox_id.to_string())
+        .bind(SANDBOX_LOCAL_SUSPEND_KEY)
+        .fetch_one(&db.pool)
+        .await?;
+        handoffs.push(handoff);
+    }
+    assert_eq!(handoffs, [true, false]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn publishing_exact_suspend_recovers_execution_with_cleared_pod_uid() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());

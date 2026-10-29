@@ -2452,14 +2452,8 @@ pub async fn publish_sandbox_states(
     // This observation authorizes only a bounded wait; the ready-snapshot
     // finalizer below remains the sole publisher of the committed artifact.
     sqlx::query(sql!(
-        "WITH input AS (
-             SELECT * FROM jsonb_to_recordset($2::JSONB) AS input(
-                 sandbox_id UUID, status TEXT, execution_generation BIGINT,
-                 pod_uid TEXT, current_local_artifact_id UUID,
-                 current_local_artifact_kind TEXT, current_local_artifact_origin TEXT
-             )
-         ), observation AS (
-             SELECT input.sandbox_id,
+        "WITH input AS MATERIALIZED (
+             SELECT input.sandbox_id, input.execution_generation, input.pod_uid,
                     CASE WHEN LOWER(TRIM(input.status)) = 'suspended'
                                AND input.current_local_artifact_id IS NOT NULL
                                AND input.current_local_artifact_kind = 'full'
@@ -2470,29 +2464,38 @@ pub async fn publish_sandbox_states(
                              'local_artifact_id', input.current_local_artifact_id
                          ))
                          ELSE '{}'::JSONB END AS payload
-               FROM input
-               JOIN sandboxes s ON s.id = input.sandbox_id
+               FROM jsonb_to_recordset($2::JSONB) AS input(
+                   sandbox_id UUID, status TEXT, execution_generation BIGINT,
+                   pod_uid TEXT, current_local_artifact_id UUID,
+                   current_local_artifact_kind TEXT, current_local_artifact_origin TEXT
+               )
+              WHERE input.status IS NOT NULL
+         ), candidate AS MATERIALIZED (
+             -- Only rows that record or clear a handoff reach the joins.
+             SELECT input.* FROM input
+              WHERE input.payload ? $4::TEXT
+                 OR input.sandbox_id::TEXT IN (
+                     SELECT prior.element FROM node_facet_observed_status prior
+                      WHERE prior.node_id = $1 AND prior.facet = $3
+                        AND prior.observed_payload ? $4::TEXT
+                 )
+         ), observation AS (
+             SELECT candidate.sandbox_id, candidate.payload
+               FROM candidate
+               JOIN sandboxes s ON s.id = candidate.sandbox_id
                JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
               WHERE s.active_node_id = $1
                 AND s.managed_by = $5
                 AND s.lifecycle = 'started'
                 AND e.active AND e.state IN ('running', 'recovering')
-                AND e.generation = input.execution_generation
-                AND e.pod_uid = input.pod_uid
-                AND input.status IS NOT NULL
+                AND e.generation = candidate.execution_generation
+                AND e.pod_uid = candidate.pod_uid
          )
          INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_payload, observed_at, updated_at
          )
          SELECT $1, $3, observation.sandbox_id::TEXT, observation.payload, NOW(), NOW()
            FROM observation
-          WHERE observation.payload ? $4::TEXT
-             OR EXISTS (
-                 SELECT 1 FROM node_facet_observed_status prior
-                  WHERE prior.node_id = $1 AND prior.facet = $3
-                    AND prior.element = observation.sandbox_id::TEXT
-                    AND prior.observed_payload ? $4::TEXT
-             )
          ON CONFLICT (node_id, facet, element) DO UPDATE
          SET observed_payload = (COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
                                     - $4::TEXT) || EXCLUDED.observed_payload,
