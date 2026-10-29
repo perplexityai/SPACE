@@ -946,6 +946,8 @@ async fn enqueue_lifecycle_operation(
         action,
         rollback,
         wake_activity: None,
+        create_rollback_fence: None,
+        create_rollback_teardown_issued: false,
     }
     .into_json();
     let input = CreatePublicOperation {

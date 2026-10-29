@@ -539,3 +539,47 @@ fn unconfirmed_suspend_delete_never_authorizes_retirement() {
     suspend_pod_deletion_confirmation(K8sBlockingDeleteOutcome::NotFound, "sandbox-pod", 30)
         .unwrap();
 }
+
+/// A placement failure keeps its sandbox row unless the cleanup claim was
+/// confirmed. Create cleanup deletes the row on any error but `RestoreInFlight`,
+/// and that delete cascades the execution record a pod's cleanup goes through;
+/// so an unconfirmed claim — ownership moved on, or the claim's own write
+/// failed — must come back as `RestoreInFlight`. A confirmed claim keeps the
+/// original error, and so does one that already was `RestoreInFlight`.
+#[test]
+fn a_placement_failure_keeps_its_row_unless_the_cleanup_claim_is_confirmed() {
+    use super::substrate_adapter::retain_row_unless_cleanup_claimed;
+    let failed = || SubstrateError::Failed {
+        message: "placement failed".to_string(),
+    };
+    let claim_failed = || {
+        Err(SubstrateError::Failed {
+            message: "claim write failed".to_string(),
+        })
+    };
+
+    assert!(matches!(
+        retain_row_unless_cleanup_claimed(
+            failed(),
+            &Ok(CancelledCreateCleanupClaim::DeleteClaimed)
+        ),
+        SubstrateError::Failed { .. }
+    ));
+    for claim in [Ok(CancelledCreateCleanupClaim::NotOwned), claim_failed()] {
+        let mapped = retain_row_unless_cleanup_claimed(failed(), &claim);
+        let SubstrateError::RestoreInFlight { message, .. } = mapped else {
+            panic!("an unconfirmed claim must retain the row, got {mapped:?}");
+        };
+        assert!(
+            message.contains("placement failed"),
+            "the cause survives: {message}"
+        );
+    }
+    assert!(matches!(
+        retain_row_unless_cleanup_claimed(
+            SubstrateError::restore_in_flight("refused"),
+            &Ok(CancelledCreateCleanupClaim::DeleteClaimed),
+        ),
+        SubstrateError::RestoreInFlight { .. }
+    ));
+}

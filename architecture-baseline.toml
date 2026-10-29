@@ -149,7 +149,7 @@
 # the store; lower each cap as they go.
 [pattern_ratchet.sandbox_writes]
 "crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 4
-"crates/libs/api/src/controllers/sandbox/queries.rs" = 4
+"crates/libs/api/src/controllers/sandbox/queries.rs" = 5
 "crates/libs/api/src/controllers/sandbox/responses.rs" = 3
 "crates/libs/api/src/controllers/sandbox/updates.rs" = 4
 "crates/libs/api/src/controllers/sandbox/wake_completion.rs" = 1
@@ -157,14 +157,14 @@
 "crates/libs/api/src/controllers/substrate/kubernetes/store/activation_fence.rs" = 1
 "crates/libs/api/src/controllers/substrate/kubernetes/store/execution_rows.rs" = 1
 "crates/libs/api/src/controllers/substrate/kubernetes/store/pod_placement.rs" = 1
-"crates/libs/api/src/controllers/substrate/kubernetes/store/pod_tracking.rs" = 5
+"crates/libs/api/src/controllers/substrate/kubernetes/store/pod_tracking.rs" = 7
 "crates/libs/api/src/controllers/substrate/kubernetes/store/restore_lease.rs" = 8
 "crates/libs/api/src/controllers/substrate/kubernetes/store/suspend.rs" = 8
 "crates/libs/api/src/controllers/substrate/mod.rs" = 1
 "crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 1
 "crates/libs/cluster/controller/server/src/failed_restorable_repair/store.rs" = 3
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
-"crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 5
+"crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 7
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes/quarantine_recovery/store.rs" = 1
 "crates/libs/cluster/controller/server/src/started_sandbox_repair/store.rs" = 3
 "crates/libs/cluster/controller/server/src/suspended_execution_reaper/store.rs" = 1

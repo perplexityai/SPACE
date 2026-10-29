@@ -506,6 +506,8 @@ async fn native_delete_behind_an_upload(
                     action: pplx_space_public_api::SandboxLifecycleAction::Delete,
                     rollback: None,
                     wake_activity: None,
+                    create_rollback_fence: None,
+                    create_rollback_teardown_issued: false,
                 }
                 .into_json(),
             idempotency: None,

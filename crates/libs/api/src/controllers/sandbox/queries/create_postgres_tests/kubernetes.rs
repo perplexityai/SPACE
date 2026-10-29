@@ -17,6 +17,7 @@ async fn postgres_failed_pooled_create_defers_cleanup_to_the_reconciler() -> Tes
     let actor = insert_actor(&db.pool).await?;
     let sandbox_id = SandboxId::new();
     let node_id = NodeId::new();
+    insert_node(&db.pool, node_id).await?;
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let req = pooled_create_request("pooled-sandbox-cleanup", None);
     let template_network_policy = NetworkPolicyV1::deny_all();

@@ -856,6 +856,8 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
             action: SandboxLifecycleAction::Start,
             rollback: None,
             wake_activity: None,
+            create_rollback_fence: None,
+            create_rollback_teardown_issued: false,
         }
         .into_json(),
         attempts: 1,

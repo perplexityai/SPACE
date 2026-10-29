@@ -292,6 +292,46 @@ async fn a_claim_takes_no_more_than_its_non_teardown_limit_of_other_work() -> Te
     Ok(())
 }
 
+/// A create's compensation tears down a guest that is already running, so it
+/// takes the slots kept for teardowns, as a delete does: with no room left
+/// for other work it still starts, while a create doesn't.
+#[tokio::test]
+async fn a_create_compensation_takes_a_teardown_slot() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let requested = queue_all(
+        &store,
+        org_id,
+        &[
+            (OperationKind::CreateSandbox, "sbx_slot_create"),
+            (
+                OperationKind::CompensateCreateSandbox,
+                "sbx_slot_compensate",
+            ),
+        ],
+    )
+    .await?;
+    let [_, compensation] = requested[..] else {
+        unreachable!("two operations were requested");
+    };
+
+    assert_eq!(
+        claim_with(
+            &store,
+            ClaimLimits {
+                non_teardown: 0,
+                ..ClaimLimits::any(2)
+            }
+        )
+        .await?,
+        [compensation]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn teardowns_take_slots_kept_for_other_work_only_while_none_is_due() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {

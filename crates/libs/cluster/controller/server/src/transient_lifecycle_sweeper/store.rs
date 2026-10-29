@@ -670,6 +670,27 @@ pub(crate) fn list_aged_transient_query(lifecycle: SandboxLifecycle) -> String {
     )
 }
 
+/// A boolean SQL fragment, TRUE when the `creating` row aliased `sandbox_alias`
+/// can still be finished by its node's activation-completion receipt: its
+/// active execution is routable (`running` with a pod IP) and still holds an
+/// activation attempt for the receipt to match. Both sweeps that act on an
+/// abandoned create leave such a row alone while its VM is alive: the fail CAS
+/// below under [`FailGuard::NoPendingReceipt`], and the orphan cleanup's
+/// abandoned-create claim. The fail CAS still fails a row whose probe found
+/// it dead or missing ([`FailGuard::Aged`]).
+pub(crate) fn activation_receipt_pending(sandbox_alias: &str) -> String {
+    format!(
+        "({} AND EXISTS (\
+         \n                SELECT 1\
+         \n                  FROM sandbox_k8s_executions held\
+         \n                 WHERE held.sandbox_id = {sandbox_alias}.id\
+         \n                   AND held.active\
+         \n                   AND held.activation_attempt_id IS NOT NULL\
+         \n            ))",
+        routable_k8s_execution_exists(sandbox_alias)
+    )
+}
+
 /// Build the per-row fail CAS for `lifecycle`. Bind order: `$1` =
 /// `managed_by`, `$2` = lifecycle string, `$3` = age threshold seconds
 /// (`BIGINT`), `$4` = sandbox id. `RETURNING id` reports whether this call
@@ -690,14 +711,8 @@ pub(crate) fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard
     let routable_guard = match guard {
         FailGuard::Aged => String::new(),
         FailGuard::NoPendingReceipt => format!(
-            "\n            AND NOT ({} AND EXISTS (\
-             \n                SELECT 1\
-             \n                  FROM sandbox_k8s_executions held\
-             \n                 WHERE held.sandbox_id = sandboxes.id\
-             \n                   AND held.active\
-             \n                   AND held.activation_attempt_id IS NOT NULL\
-             \n            ))",
-            routable_k8s_execution_exists("sandboxes")
+            "\n            AND NOT {}",
+            activation_receipt_pending("sandboxes")
         ),
     };
     format!(

@@ -455,6 +455,96 @@ async fn delete_supersedes_backed_off_work_but_not_a_pending_create() -> TestRes
     Ok(())
 }
 
+/// A create's rollback leaves the row `deleting` and queues a compensation
+/// on the same sandbox, after the create. The create's retries can't succeed
+/// until that compensation has removed the row, so a due compensation must
+/// run first, even past a due create that was requested before it, and
+/// never beside work on its sandbox.
+#[tokio::test]
+async fn a_create_compensation_runs_ahead_of_the_create_it_rolls_back() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let create = create_op(&store, org_id, OperationKind::CreateSandbox, "sbx_comp").await?;
+    let compensation = create_op(
+        &store,
+        org_id,
+        OperationKind::CompensateCreateSandbox,
+        "sbx_comp",
+    )
+    .await?;
+
+    // Everything is due; only the compensation starts.
+    let claim = claim_all(&store).await?;
+    assert_eq!(claimed_ids(&claim), vec![compensation]);
+    // Its live claim holds the rest of the sandbox back.
+    assert!(claimed_ids(&claim_all(&store).await?).is_empty());
+
+    // Released into backoff, it no longer holds the sandbox: the create runs
+    // and finds its compensation still pending.
+    store
+        .release_claimed_operation(ReleaseClaimedPublicOperation {
+            claim_token: claim.claim_token.clone(),
+            operation_id: compensation,
+            progress_message: "teardown unconfirmed".to_string(),
+            retry_after: Duration::from_secs(300),
+            count_attempt: true,
+            undo_first_start: false,
+            cancel_if_superseded: false,
+            carried_error: None,
+        })
+        .await?;
+    let claim = claim_all(&store).await?;
+    assert_eq!(claimed_ids(&claim), vec![create]);
+    store
+        .release_claimed_operation(ReleaseClaimedPublicOperation {
+            claim_token: claim.claim_token.clone(),
+            operation_id: create,
+            progress_message: "waiting for create compensation".to_string(),
+            retry_after: Duration::from_secs(300),
+            count_attempt: false,
+            undo_first_start: false,
+            cancel_if_superseded: false,
+            carried_error: None,
+        })
+        .await?;
+
+    // Once due again the compensation goes first, even with the create also
+    // due and ahead of it in the sandbox's queue.
+    defer_until(&db.pool, create, 0).await?;
+    defer_until(&db.pool, compensation, 0).await?;
+    assert_eq!(claimed_ids(&claim_all(&store).await?), vec![compensation]);
+    assert_eq!(
+        operation_state(&db.pool, create).await?,
+        OperationState::Queued.as_str()
+    );
+
+    // A delete queued before a compensation, with no create left (a delete
+    // cancels a sandbox's queued creates), doesn't hold it back either.
+    let delete = create_op(
+        &store,
+        org_id,
+        OperationKind::DeleteSandbox,
+        "sbx_comp_delete",
+    )
+    .await?;
+    let after_delete = create_op(
+        &store,
+        org_id,
+        OperationKind::CompensateCreateSandbox,
+        "sbx_comp_delete",
+    )
+    .await?;
+    assert_eq!(claimed_ids(&claim_all(&store).await?), vec![after_delete]);
+    assert_eq!(
+        operation_state(&db.pool, delete).await?,
+        OperationState::Queued.as_str()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn stale_claim_recovery_keeps_the_sandboxs_order() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {

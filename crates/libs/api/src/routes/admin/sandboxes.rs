@@ -802,6 +802,8 @@ async fn enqueue_admin_lifecycle_operation(
         action,
         rollback: None,
         wake_activity: None,
+        create_rollback_fence: None,
+        create_rollback_teardown_issued: false,
     }
     .into_json();
     let store = PublicOperationStore::new(pool.clone());

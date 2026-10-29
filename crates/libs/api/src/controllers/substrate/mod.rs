@@ -196,6 +196,43 @@ pub struct ExecutionBinding {
     pub execution_generation: u64,
 }
 
+/// Exact substrate object created by one create attempt.
+///
+/// Create compensation persists this value before teardown and re-proves it
+/// on every retry. A stable sandbox id alone is not enough: restore and wake
+/// can replace the execution object while a delayed delete is queued.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "substrate", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CreateRollbackExecutionFence {
+    Direct {
+        node_id: NodeId,
+        route_identity: Option<SandboxRouteIdentity>,
+    },
+    Kubernetes {
+        pod_name: PodName,
+        generation: i64,
+        activation_attempt_id: Option<SandboxActivationAttemptId>,
+        route_activation_id: SandboxActivationAttemptId,
+        pod_uid: PodUid,
+    },
+}
+
+/// The claim one create-compensation attempt holds on its operation.
+///
+/// The direct teardown records on the operation, through this claim, that its
+/// node delete has run, so a later attempt that finds the record only verifies
+/// and doesn't repeat the delete by sandbox id. The write is guarded by the
+/// claim, so an attempt whose claim went stale records nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompensationClaim {
+    pub operation_id: pplx_space_public_api::OperationId,
+    pub claim_token: String,
+    pub claim_generation: i64,
+    /// An earlier attempt recorded that the node delete ran. This attempt only
+    /// verifies the teardown.
+    pub teardown_issued: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationCompletion {
     Owned,
@@ -500,6 +537,7 @@ pub struct CreateExecutionOutcome {
     pub lease_completion: Option<ActivationLeaseCompletion>,
     pub sandbox_id: SandboxId,
     pub binding: Option<ExecutionBinding>,
+    pub rollback_fence: CreateRollbackExecutionFence,
     pub initial_lifecycle: &'static str,
     pub initial_placement: &'static str,
     pub active_node_id: Option<NodeId>,
@@ -1245,6 +1283,20 @@ pub trait SubstrateAdapter: Send + Sync {
     /// This removes substrate-owned runtime state and any substrate-owned
     /// binding/cache rows. The stable sandbox row is deleted by the controller.
     async fn delete_execution(&self, sandbox_id: SandboxId) -> Result<(), SubstrateError>;
+
+    /// Delete only the execution object returned by the create attempt.
+    ///
+    /// Unlike user DELETE, compensation is delayed and must refuse a successor
+    /// that reused the stable sandbox id after the operation was enqueued.
+    /// `claim` is the attempt's claim on its compensation operation, when it
+    /// runs under one; a substrate that records teardown progress records it
+    /// there.
+    async fn delete_created_execution(
+        &self,
+        sandbox_id: SandboxId,
+        fence: &CreateRollbackExecutionFence,
+        claim: Option<&CompensationClaim>,
+    ) -> Result<(), SubstrateError>;
 
     /// Retire the active execution object for a sandbox while preserving
     /// node-local sandbox state.
@@ -2541,6 +2593,27 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.delete_execution(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.delete_execution(sandbox_id).await,
+        }
+    }
+
+    async fn delete_created_execution(
+        &self,
+        sandbox_id: SandboxId,
+        fence: &CreateRollbackExecutionFence,
+        claim: Option<&CompensationClaim>,
+    ) -> Result<(), SubstrateError> {
+        match &self.inner {
+            Inner::Direct(substrate) => {
+                substrate
+                    .delete_created_execution(sandbox_id, fence, claim)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate
+                    .delete_created_execution(sandbox_id, fence, claim)
+                    .await
+            }
         }
     }
 

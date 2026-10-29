@@ -368,8 +368,13 @@ where
             } else {
                 format!("executor returned unsupported state {}", result.state)
             };
-            let preserve_retry_budget =
-                supported_requeue && requeue_reason.preserves_retry_budget();
+            // Create compensation has no deadline (it isn't an M1 kind), so its
+            // retry budget is the only thing that ends it. Every requeue spends
+            // it, whatever the reason, so a compensation always reaches a
+            // terminal state.
+            let preserve_retry_budget = supported_requeue
+                && requeue_reason.preserves_retry_budget()
+                && kind != OperationKind::CompensateCreateSandbox;
             let last_requeue_reason = if supported_requeue {
                 requeue_reason.as_str()
             } else {
@@ -458,7 +463,10 @@ where
                 updated
             } else if deferral_exhausted_after.is_some()
                 || (!preserve_retry_budget
-                    && retry_budget_exhausted(attempts, config.max_retry_attempts))
+                    && retry_budget_exhausted(
+                        attempts,
+                        effective_max_retry_attempts(kind, config.max_retry_attempts),
+                    ))
             {
                 let terminal_error_code = result
                     .terminal_error_code
@@ -470,7 +478,11 @@ where
                         "reason": "retry_attempts_exhausted",
                         "retry_reason": retry_reason,
                         "attempts": attempts,
-                        "max_retry_attempts": config.max_retry_attempts.max(1),
+                        "max_retry_attempts": effective_max_retry_attempts(
+                            kind,
+                            config.max_retry_attempts,
+                        )
+                        .max(1),
                     }),
                     result.terminal_error_json,
                 );
@@ -708,6 +720,24 @@ fn retry_jitter_fraction(operation_id: OperationId, seed: u64) -> f64 {
     seed.hash(&mut hasher);
     // The top 53 bits fill an f64 mantissa exactly: a fraction in [0, 1).
     (hasher.finish() >> 11) as f64 / (1_u64 << 53) as f64
+}
+
+/// How much longer internal create-compensation gets than a user-facing
+/// operation before its retries are declared exhausted.
+///
+/// It is the only owner of a `managed_by = 'space'` teardown, so giving up
+/// strands a live guest; but an unbounded budget grows `public_operation_events`
+/// forever and starves the claim queue. This multiplier is the middle.
+const INTERNAL_CLEANUP_RETRY_MULTIPLIER: i32 = 16;
+
+/// The retry budget for `kind`: [`INTERNAL_CLEANUP_RETRY_MULTIPLIER`] times the
+/// configured one for create compensation, the configured one otherwise.
+fn effective_max_retry_attempts(kind: OperationKind, max_retry_attempts: i32) -> i32 {
+    if kind == OperationKind::CompensateCreateSandbox {
+        max_retry_attempts.saturating_mul(INTERNAL_CLEANUP_RETRY_MULTIPLIER)
+    } else {
+        max_retry_attempts
+    }
 }
 
 fn retry_budget_exhausted(attempts: i32, max_retry_attempts: i32) -> bool {

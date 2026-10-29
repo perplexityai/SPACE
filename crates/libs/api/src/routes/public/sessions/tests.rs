@@ -740,6 +740,8 @@ mod not_running {
                     action: SandboxLifecycleAction::Wake,
                     rollback: None,
                     wake_activity: None,
+                    create_rollback_fence: None,
+                    create_rollback_teardown_issued: false,
                 }
                 .into_json(),
                 idempotency: None,
