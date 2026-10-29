@@ -85,6 +85,28 @@ pub(super) struct AdminNodeRow {
     pub(super) substrate_node_id: Option<String>,
 }
 
+impl AdminNodeRow {
+    /// The node's published execution policy and its receipt time. `None`
+    /// when the node published none, or published one this build can't
+    /// decode: that withholds the policy evidence rather than failing the
+    /// node read.
+    pub(super) fn execution_policy(
+        &self,
+    ) -> Option<(
+        pplx_space_common_core::types::ExecutionPolicyObservation,
+        Option<OffsetDateTime>,
+    )> {
+        let value = self.execution_policy.as_ref()?;
+        match serde_json::from_value(value.0.clone()) {
+            Ok(policy) => Some((policy, self.execution_policy_received_at)),
+            Err(error) => {
+                tracing::warn!(node_id = %self.id, %error, "invalid stored execution policy; withholding policy evidence");
+                None
+            }
+        }
+    }
+}
+
 /// Placement rows attributed to the selected node, without durability accounting.
 #[derive(Debug, Serialize, FromRow)]
 pub(super) struct NodeSandboxRow {

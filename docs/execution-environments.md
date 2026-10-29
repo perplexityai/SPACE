@@ -891,6 +891,42 @@ the cluster default, the legacy permission and a generation that every store
 write raises. The store keeps the default `allowed`, replaces it but never clears it,
 and refuses a block while the cluster has no default.
 
+Operators change the policy through the admin API under
+`/admin/api/v1/runtime-environments`, or `space-admin-cli runtime env`: `PUT
+.../default` sets the default and `PUT .../{environment}/state` sets a state,
+each with a required reason recorded with the caller. Both write through the
+store, so a write it refuses, such as blocking the default, comes back as a 409
+that names the rule. The API adds one check of its own, for a write that stops
+an environment executing: blocking stops the blocked environment, and the first
+default stops every environment with no state, along with any whose state
+doesn't execute (a block only direct SQL can leave without a default). Such a
+write needs `strand: true` while sandboxes, or template releases still in use,
+are bound to an environment it stops, or while any sandbox has no environment
+binding, an unreadable one, or no binding record. Unbound legacy sandboxes count
+because they execute as the environment they match, which only a node can
+resolve, and a sandbox with no observation from its node may be bound to one
+that stops. A release is in use while a tag points to it, which creates by tag
+resolve to, or an enabled pool config pins it, which keeps creating slots. An
+in-use release counts when it's bound to an environment that stops, or when its
+environment can't be told, since new creates from it may run there. A superseded
+release doesn't count: it strands work only through the sandboxes made from it,
+which do count. Nor do sandboxes that can't run again: `cleanup_required` and
+`deleting` ones, and failed ones with no evidence the repair loop reads as live
+(an observation with a non-failed status, a pid or a node assignment, or an
+execution still active or holding a pod IP) that the repair loop, which runs
+only on Kubernetes, has nothing to revert to. Later defaults stop nothing, and
+nor does blocking an environment that already doesn't execute, so neither is
+checked, unless another policy write lands while the block waits for the lock.
+Both writes take an optional `If-Match: <generation>` (`--if-generation` in the
+CLI) and answer 412 without changing anything unless the policy is still at
+that generation, so an operator writing from a stale read can't undo another's
+change, such as re-allowing an environment that was just blocked.
+`GET .../nodes` compares each node's published policy with the cluster's, a page
+of 100 nodes at a time, and `GET .../population` counts sandboxes and template
+releases per environment binding. Node status reports the generation each node
+applied and whether it's current, but judges conformance by content, so a node
+behind on generation still conforms when nothing it would change has changed.
+
 Cluster API serves the policy in the `execution_policy` field of
 `GetNodeRuntimeDesiredState` when `SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED`
 is truthy. It's off by default, and the field is then absent, so nodes keep their

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use axum::{
     Extension, Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -50,7 +50,9 @@ use crate::{
     reconcile_trigger::enqueue_triggers_tx,
     routes::{
         AppState,
-        admin::support::{self, ContentionScope, IDEMPOTENCY_KEY_HEADER},
+        admin::support::{
+            self, ContentionScope, IDEMPOTENCY_KEY_HEADER, parse_if_match_generation,
+        },
         authz,
         public::request_context,
     },
@@ -780,7 +782,7 @@ pub async fn update_template(
     let expected_generation = if request.network_policy.is_some() {
         match parse_if_match_generation(&headers) {
             Ok(value) => value,
-            Err(response) => return response.into_response(),
+            Err(message) => return api_error(StatusCode::BAD_REQUEST, message).into_response(),
         }
     } else {
         None
@@ -950,23 +952,6 @@ pub async fn update_template(
             })
             .into_response(),
     }
-}
-
-fn parse_if_match_generation(headers: &HeaderMap) -> Result<Option<u64>, ApiErrorResponse> {
-    let Some(value) = headers.get(header::IF_MATCH) else {
-        return Ok(None);
-    };
-    let raw = value
-        .to_str()
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid If-Match header"))?
-        .trim()
-        .trim_matches('"');
-    raw.parse::<u64>().map(Some).map_err(|_| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "If-Match must be a generation number",
-        )
-    })
 }
 
 fn template_delete_idempotency_key(

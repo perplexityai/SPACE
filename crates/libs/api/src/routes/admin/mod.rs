@@ -45,6 +45,8 @@ mod node_maintenance;
 mod node_store;
 pub mod nodes;
 mod operations;
+mod runtime_environment_store;
+mod runtime_environments;
 mod sandboxes;
 // `pub(in crate::routes)` rather than private: `routes::debug` is mounted
 // inside this router (`debug::admin_v1_debug_router`, merged by `v1_router`
@@ -150,6 +152,26 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             get(operations::get_admin_operation),
         )
         .route("/audit-events", get(audit::list_audit_events))
+        .route(
+            "/runtime-environments",
+            get(runtime_environments::get_runtime_environments),
+        )
+        .route(
+            "/runtime-environments/default",
+            put(runtime_environments::set_default_runtime_environment),
+        )
+        .route(
+            "/runtime-environments/nodes",
+            get(runtime_environments::list_runtime_environment_nodes),
+        )
+        .route(
+            "/runtime-environments/population",
+            get(runtime_environments::get_runtime_environment_population),
+        )
+        .route(
+            "/runtime-environments/{environment_ref}/state",
+            put(runtime_environments::set_runtime_environment_state),
+        )
         .route(
             "/warm-pools",
             get(warm_pools::list_warm_pools).put(warm_pools::upsert_warm_pool),

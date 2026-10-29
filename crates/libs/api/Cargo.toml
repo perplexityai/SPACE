@@ -96,6 +96,7 @@ pplx-space-common-work-coalescer = { workspace = true, optional = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-portability = { workspace = true }
+pplx-space-runtime-environment-policy-store = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }

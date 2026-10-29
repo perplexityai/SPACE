@@ -21,6 +21,11 @@ space-admin-cli warm-pool create --template NAME --vcpu N --memory-mib N \
   --target-ready-slots N --refill-per-tick N --max-warming-slots N
 space-admin-cli warm-pool add ...             # alias for warm-pool create
 space-admin-cli warm-pool update --template NAME@sha256:... --vcpu N ...
+space-admin-cli runtime env list [--json]
+space-admin-cli runtime env default <environment> --reason TEXT [--strand] [--if-generation N] [--json]
+space-admin-cli runtime env state <environment> <allowed|deprecated|blocked> --reason TEXT [--strand] [--if-generation N] [--json]
+space-admin-cli runtime env nodes [--after NODE_ID | --all] [--json]
+space-admin-cli runtime env population [--json]
 ```
 
 `<node>` accepts a full UUID or a unique short prefix (≥4 chars). Prefix
@@ -29,6 +34,21 @@ when the prefix is ambiguous.
 
 For setting up warm pools and checking that creates use them, see
 [Warm pools](../../../../docs/warm-pools.md).
+
+`runtime env` reads and sets the cluster's execution environment policy, and
+`<environment>` is a full environment reference (`sha256:` or `blake3:`). Every write needs `--reason`,
+which is recorded with you on the policy. A write that stops an environment, a
+block or the cluster's first default, is refused with the counts while work that
+can still run is bound to an environment it stops (sandboxes, and template
+releases a tag points to or an enabled pool config pins), or while any such
+sandbox's or in-use release's environment can't be told (no binding, an
+unreadable one, or no record), until you pass `--strand`. Blocking an environment that already doesn't
+execute normally needs no `--strand`, unless another policy write lands first. The first default stops every environment with no
+state, so mark the ones to keep `allowed` before setting it. `--if-generation`
+takes the generation `runtime env list` showed and refuses the write if the
+policy has changed since, so a write from a stale read can't undo someone
+else's, such as re-allowing an environment another operator just blocked. See "Cluster desired policy" in
+[Execution environments](../../../../docs/execution-environments.md).
 
 ## Install
 

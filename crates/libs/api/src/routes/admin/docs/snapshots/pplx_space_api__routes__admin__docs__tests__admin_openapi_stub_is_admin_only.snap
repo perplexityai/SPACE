@@ -90,6 +90,21 @@ expression: paths_by_method
     "get",
     "post"
   ],
+  "/runtime-environments": [
+    "get"
+  ],
+  "/runtime-environments/default": [
+    "put"
+  ],
+  "/runtime-environments/nodes": [
+    "get"
+  ],
+  "/runtime-environments/population": [
+    "get"
+  ],
+  "/runtime-environments/{environment_ref}/state": [
+    "put"
+  ],
   "/sandboxes": [
     "get",
     "post"
