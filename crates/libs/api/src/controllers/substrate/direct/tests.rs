@@ -39,11 +39,30 @@ fn direct_create_boot_mode_never_delegates_pool_adoption_to_sbxmgr() {
 
 #[test]
 fn one_shot_create_only_applies_to_ready_cold_or_base_snapshot_requests() {
-    assert!(use_one_shot_create(true, CreateBootMode::BaseSnapshot));
-    assert!(use_one_shot_create(true, CreateBootMode::Cold));
-    assert!(!use_one_shot_create(true, CreateBootMode::Fallthrough));
-    assert!(!use_one_shot_create(true, CreateBootMode::Pool));
-    assert!(!use_one_shot_create(false, CreateBootMode::BaseSnapshot));
+    for disk_mib in [None, Some(4096)] {
+        let resources = SandboxResources {
+            vcpu: None,
+            memory_mib: None,
+            disk_mib,
+        };
+        assert!(use_one_shot_create(
+            true,
+            CreateBootMode::BaseSnapshot,
+            &resources
+        ));
+        assert!(use_one_shot_create(true, CreateBootMode::Cold, &resources));
+        assert!(!use_one_shot_create(
+            true,
+            CreateBootMode::Fallthrough,
+            &resources
+        ));
+        assert!(!use_one_shot_create(true, CreateBootMode::Pool, &resources));
+        assert!(!use_one_shot_create(
+            false,
+            CreateBootMode::BaseSnapshot,
+            &resources
+        ));
+    }
 }
 
 #[test]
@@ -2945,33 +2964,6 @@ impl DirectCreateFixture {
             )
             .await
     }
-
-    async fn assert_refused_without_a_node_call(
-        &self,
-        request: &crate::models::CreateSandboxRequest,
-    ) -> TestResult {
-        let error = match self.create(request).await {
-            Ok(response) => panic!(
-                "one-shot create with a custom shape created {}",
-                response.id
-            ),
-            Err(error) => error,
-        };
-        assert_eq!(error.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
-        assert!(
-            error.to_string().contains("one-shot create"),
-            "unexpected refusal: {error}"
-        );
-        let sandbox_rows = sqlx::query_scalar::<_, i64>(sql!("SELECT COUNT(*) FROM sandboxes"))
-            .fetch_one(&self.postgres.pool)
-            .await?;
-        assert_eq!(sandbox_rows, 0, "the failed create must not leave its row");
-        assert!(
-            self.worker.list().await.is_empty(),
-            "the refusal must precede the worker create"
-        );
-        Ok(())
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2991,47 +2983,40 @@ async fn one_shot_direct_create_boots_a_default_shape_on_the_worker() -> TestRes
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn one_shot_direct_create_refuses_a_custom_vcpu() -> TestResult {
+async fn ready_direct_create_boots_custom_shapes_on_the_worker() -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
     let Some(fixture) = direct_create_fixture().await? else {
         return Ok(());
     };
-    let mut request = one_shot_create_request()?;
-    request.vcpu = Some(4);
+    for boot_mode in [None, Some("cold")] {
+        for (vcpu, memory_mib) in [(Some(4), None), (None, Some(2048)), (Some(4), Some(2048))] {
+            let mut request = one_shot_create_request()?;
+            request.boot_mode = boot_mode.map(str::to_owned);
+            request.vcpu = vcpu;
+            request.memory_mib = memory_mib;
 
-    fixture.assert_refused_without_a_node_call(&request).await
-}
+            let response = fixture.create(&request).await?;
 
-#[tokio::test(flavor = "current_thread")]
-async fn one_shot_direct_create_refuses_a_custom_memory() -> TestResult {
-    if !crate::test_support::enter_sim_worker_process() {
-        return Ok(());
+            assert_eq!(response.lifecycle.as_deref(), Some("started"));
+            assert_eq!(
+                fixture.worker.get(&response.id.to_string()).await?.status,
+                "running"
+            );
+            let stored = sqlx::query_as::<_, (Option<i32>, Option<i32>)>(sql!(
+                "SELECT vcpu, memory_mib FROM sandboxes WHERE id = $1"
+            ))
+            .bind(response.id.as_uuid())
+            .fetch_one(&fixture.postgres.pool)
+            .await?;
+            assert_eq!(
+                stored,
+                (vcpu.map(|v| v as i32), memory_mib.map(|v| v as i32))
+            );
+        }
     }
-    let Some(fixture) = direct_create_fixture().await? else {
-        return Ok(());
-    };
-    let mut request = one_shot_create_request()?;
-    request.memory_mib = Some(2048);
-
-    fixture.assert_refused_without_a_node_call(&request).await
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn one_shot_direct_create_refuses_a_custom_vcpu_with_an_inferred_cold_boot() -> TestResult {
-    if !crate::test_support::enter_sim_worker_process() {
-        return Ok(());
-    }
-    let Some(fixture) = direct_create_fixture().await? else {
-        return Ok(());
-    };
-    // A custom shape without a boot mode boots cold (`CreateBootMode::from_api`).
-    let mut request = one_shot_create_request()?;
-    request.boot_mode = None;
-    request.vcpu = Some(4);
-
-    fixture.assert_refused_without_a_node_call(&request).await
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]

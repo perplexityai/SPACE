@@ -11,18 +11,11 @@
 //!   an execution.
 //! - Warm-pool claims adopt node-side; custom vcpu/memory or encrypted claims
 //!   go cold. Admission-time pool slot claims always miss.
-//! - [`SubstrateError::Unsupported`]: node-pool placement, forks, cluster
-//!   pool configs, and a vCPU or memory override on one-shot create
-//!   (`use_one_shot_create`), whose sbx-mgr `CreateRequest` cannot carry
-//!   them. `create_execution` refuses before any node call, and the shared
-//!   create path's failure handling deletes the row it inserted, best
-//!   effort, as for any substrate create failure. Only a `wait_until_ready`
-//!   cold create can be refused: `CreateBootMode::from_api` already answers
-//!   400 for a snapshot or pool boot with a custom shape. It guards future
-//!   callers: today native and admin creates never wait
-//!   (`controller_create_request`), ECW creates carry no vCPU or memory, and
-//!   fork restores stop at the fork refusal. Disk size is forwarded, and the
-//!   two-call create and start carries the full shape.
+//! - [`SubstrateError::Unsupported`]: node-pool placement, forks, and cluster
+//!   pool configs. Custom vCPU or memory uses separate create and start calls:
+//!   only `StartRequest` carries those fields. A readiness wait still blocks
+//!   on start. Default shapes and disk-only overrides can use one-shot create,
+//!   whose `CreateRequest` forwards disk size as `rootfs_size_mb`.
 //! - No-ops returning `None` or nothing: `sandbox_ip`, `access_sandbox_ip`,
 //!   `list_inventory_nodes` (Postgres is the inventory),
 //!   `retire_fence_mismatch` and `observe_pod_identities`.
@@ -233,8 +226,15 @@ fn direct_create_boot_mode(boot_mode: CreateBootMode) -> Result<i32, SubstrateEr
     }
 }
 
-fn use_one_shot_create(wait_until_ready: bool, boot_mode: CreateBootMode) -> bool {
-    wait_until_ready
+fn use_one_shot_create(
+    wait_until_ready: bool,
+    boot_mode: CreateBootMode,
+    resources: &SandboxResources,
+) -> bool {
+    // CreateRequest cannot carry CPU or memory; StartRequest can.
+    resources.vcpu.is_none()
+        && resources.memory_mib.is_none()
+        && wait_until_ready
         && matches!(
             boot_mode,
             CreateBootMode::BaseSnapshot | CreateBootMode::Cold
@@ -3603,9 +3603,11 @@ impl SubstrateAdapter for DirectSubstrate {
             });
         }
         ensure_direct_create_supported(request.restore_from.is_some())?;
-        let one_shot_create =
-            use_one_shot_create(request.wait_until_ready, request.template_ref.boot_mode);
-        ensure_direct_create_shape_supported(one_shot_create, request.resources)?;
+        let one_shot_create = use_one_shot_create(
+            request.wait_until_ready,
+            request.template_ref.boot_mode,
+            request.resources,
+        );
         let sandbox_id = request.sandbox_id;
         let cached_candidates = self
             .cached_worker_create_candidates(
@@ -4369,25 +4371,6 @@ impl SubstrateAdapter for DirectSubstrate {
         // its SQL query.
         Ok(None)
     }
-}
-
-/// One-shot create sends a single sbx-mgr `CreateRequest`, which has no vCPU
-/// or memory fields, and sbx-mgr's autostart boots node-side defaults, so the
-/// VM would not match the shape `public.sandboxes` records. Disk size is
-/// forwarded (`rootfs_size_mb`), and the two-call path's `StartRequest`
-/// carries vCPU and memory.
-fn ensure_direct_create_shape_supported(
-    one_shot_create: bool,
-    resources: &SandboxResources,
-) -> Result<(), SubstrateError> {
-    if one_shot_create && (resources.vcpu.is_some() || resources.memory_mib.is_some()) {
-        return Err(SubstrateError::Unsupported {
-            message: "custom vCPU/memory is not supported for one-shot create on the Direct \
-                      substrate"
-                .to_string(),
-        });
-    }
-    Ok(())
 }
 
 fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), SubstrateError> {
