@@ -378,6 +378,7 @@ pub(super) async fn process_start(
         &route,
         stdout_stream,
         stall_after,
+        ecw_connect::keepalive_interval(&headers),
         EcwProcessStreamLease {
             permit: stream_permit,
             shutdown_token: state.stream_shutdown_token.child_token(),
@@ -455,6 +456,7 @@ pub(super) async fn process_connect(
         &route,
         stdout_stream,
         stall_after,
+        ecw_connect::keepalive_interval(&headers),
         EcwProcessStreamLease {
             permit: stream_permit,
             shutdown_token: state.stream_shutdown_token.child_token(),

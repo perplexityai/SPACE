@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration as StdDuration,
 };
 
 const MULTIPART_BOUNDARY: &str = "space-test-boundary";
