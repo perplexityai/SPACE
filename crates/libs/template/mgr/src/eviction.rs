@@ -291,11 +291,16 @@ enum PrecheckOutcome {
 ///      not-resolvable — closing the GC-vs-sandbox-create race
 ///      where a sandbox could be issued against a build that was
 ///      already mid-eviction.
+///
+/// With `touched_before_secs`, the swap also requires that the build was
+/// neither created nor used after that bound, so a `GetTemplate` that handed
+/// the build to a sandbox create after the caller's own check keeps it.
 fn execute_precheck(
     conn: &Connection,
     active: &HashSet<(String, String)>,
     warm_pool: &HashSet<(String, String)>,
     candidate: &EvictionCandidate,
+    touched_before_secs: Option<u64>,
 ) -> rusqlite::Result<PrecheckOutcome> {
     let key = (candidate.name.clone(), candidate.content_hash.clone());
     if active.contains(&key) {
@@ -324,8 +329,14 @@ fn execute_precheck(
     // eviction) already grabbed it.
     let updated = tx.execute(
         "UPDATE template_builds SET state = 'deleting'
-         WHERE name = ?1 AND content_hash = ?2 AND state = 'ready'",
-        params![candidate.name, candidate.content_hash],
+         WHERE name = ?1 AND content_hash = ?2 AND state = 'ready'
+           AND (?3 IS NULL
+                OR MAX(CAST(created_at AS INTEGER), CAST(last_used_at AS INTEGER)) <= ?3)",
+        params![
+            candidate.name,
+            candidate.content_hash,
+            touched_before_secs.map(|secs| i64::try_from(secs).unwrap_or(i64::MAX)),
+        ],
     )?;
     if updated == 0 {
         return Ok(PrecheckOutcome::SkipRowMissing);
@@ -369,7 +380,7 @@ pub(crate) fn execute_one(
     candidate: &EvictionCandidate,
     delete_disk: impl FnOnce(&str, &str) -> rusqlite::Result<()>,
 ) -> rusqlite::Result<EvictionOutcome> {
-    match execute_precheck(conn, active, warm_pool, candidate)? {
+    match execute_precheck(conn, active, warm_pool, candidate, None)? {
         PrecheckOutcome::SkipPinned => return Ok(EvictionOutcome::SkippedPinnedAtExecute),
         PrecheckOutcome::SkipActive => return Ok(EvictionOutcome::SkippedActiveAtExecute),
         PrecheckOutcome::SkipWarmPool => return Ok(EvictionOutcome::SkippedWarmPoolAtExecute),
@@ -401,6 +412,18 @@ pub(crate) async fn execute_one_async(
     candidate: EvictionCandidate,
     delete_disk: DeleteDiskFn,
 ) -> rusqlite::Result<EvictionOutcome> {
+    execute_one_async_touched_before(db, active, warm_pool, candidate, delete_disk, None).await
+}
+
+/// [`execute_one_async`], with the pre-check's optional touch bound.
+async fn execute_one_async_touched_before(
+    db: Arc<Mutex<Connection>>,
+    active: HashSet<(String, String)>,
+    warm_pool: HashSet<(String, String)>,
+    candidate: EvictionCandidate,
+    delete_disk: DeleteDiskFn,
+    touched_before_secs: Option<u64>,
+) -> rusqlite::Result<EvictionOutcome> {
     // Phase 1: pre-check in a short locked region.
     let cand_for_precheck = candidate.clone();
     let active_for_precheck = active.clone();
@@ -415,6 +438,7 @@ pub(crate) async fn execute_one_async(
             &active_for_precheck,
             &warm_pool_for_precheck,
             &cand_for_precheck,
+            touched_before_secs,
         )
     })
     .await
@@ -455,6 +479,201 @@ pub(crate) async fn execute_one_async(
     })??;
 
     Ok(EvictionOutcome::Deleted)
+}
+
+/// Serializes evictions that run outside the GC loop with the passes that
+/// repair rows an interrupted eviction left in `deleting`. Those passes (the
+/// GC tick's [`reap_stuck_deleting`] and startup recovery) put a `deleting`
+/// row whose artifacts are intact back to `ready`, which is right only when
+/// no eviction is still deleting it. The GC loop holds the gate from before
+/// it fetches its protected sets to the end of each tick, so its own
+/// evictions never overlap its repair pass, and a wait for the gate cannot
+/// age those sets.
+#[derive(Clone, Debug, Default)]
+pub struct EvictionGate(Arc<tokio::sync::Mutex<()>>);
+
+impl EvictionGate {
+    pub(crate) async fn hold(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.lock().await
+    }
+
+    fn try_hold(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.0.try_lock().ok()
+    }
+}
+
+/// The disk side of an eviction outside the GC loop: how to delete a build's
+/// files, and how a repair pass tells whether they are still there.
+#[derive(Clone)]
+pub(crate) struct EvictionDisk {
+    pub(crate) delete: DeleteDiskFn,
+    pub(crate) probe: ReaperDiskProbeFn,
+}
+
+/// What [`evict_idle_template`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleTemplateEviction {
+    /// Every ready build was evicted, then the template's remaining rows.
+    /// A build recorded meanwhile, by a pull, makes this `Kept` instead.
+    Evicted,
+    /// The template has no ready build.
+    NotFound,
+    /// Another eviction or repair pass holds the gate; nothing was read.
+    Busy,
+    /// A build stayed. Builds evicted before it stay evicted.
+    Kept {
+        evicted: usize,
+        reason: IdleTemplateKept,
+    },
+}
+
+/// Why [`evict_idle_template`] kept a build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleTemplateKept {
+    /// It was created or used after the bound.
+    Recent,
+    Pinned,
+    /// A local sandbox references it.
+    Active,
+    /// A warm pool targets it.
+    WarmPool,
+    /// Its row was used, removed or claimed by another delete after the
+    /// check, or a pull recorded a new build of the template meanwhile.
+    Changed,
+}
+
+impl std::fmt::Display for IdleTemplateKept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Recent => "a build was created or used within the idle period",
+            Self::Pinned => "a build is pinned",
+            Self::Active => "a local sandbox uses a build",
+            Self::WarmPool => "a warm pool targets a build",
+            Self::Changed => "a build changed during the delete",
+        })
+    }
+}
+
+/// Evict every ready build of `name` the way the GC evicts one, but only
+/// while none was created or used after `touched_before_secs`. Each build's
+/// compare-and-swap checks the bound again, which closes the window between a
+/// `GetTemplate` handing the build to a sandbox create and sandbox-manager
+/// recording that sandbox: the touch keeps the build. Once no build is left,
+/// the template's pool, settings and snapshot rows go too, as
+/// `DeleteTemplate` removes them.
+///
+/// Returns [`IdleTemplateEviction::Busy`] instead of waiting while the GC loop
+/// or another eviction holds `gate`. A build whose disk delete or final row
+/// delete fails is repaired before returning, as the GC's next tick would:
+/// back to `ready` when its artifacts are intact, dropped otherwise.
+pub(crate) async fn evict_idle_template(
+    db: Arc<Mutex<Connection>>,
+    gate: &EvictionGate,
+    name: &str,
+    touched_before_secs: u64,
+    active: HashSet<(String, String)>,
+    warm_pool: HashSet<(String, String)>,
+    disk: EvictionDisk,
+) -> rusqlite::Result<IdleTemplateEviction> {
+    // Held until the last build is finalized, so no repair pass sees this
+    // eviction's `deleting` rows as abandoned.
+    let Some(_evicting) = gate.try_hold() else {
+        return Ok(IdleTemplateEviction::Busy);
+    };
+    let builds = {
+        let db = Arc::clone(&db);
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| crate::db::mutex_poison_error("idle template eviction"))?;
+            Ok::<_, rusqlite::Error>(
+                crate::db::list_eviction_candidates(&conn)?
+                    .into_iter()
+                    .filter(|build| build.name == name)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                "idle template eviction spawn_blocking: {e}"
+            ))))
+        })??
+    };
+    if builds.is_empty() {
+        return Ok(IdleTemplateEviction::NotFound);
+    }
+    if builds
+        .iter()
+        .any(|build| build.created_at_secs.max(build.last_used_at_secs) > touched_before_secs)
+    {
+        return Ok(IdleTemplateEviction::Kept {
+            evicted: 0,
+            reason: IdleTemplateKept::Recent,
+        });
+    }
+
+    let mut evicted = 0;
+    for build in builds {
+        let candidate = EvictionCandidate {
+            name: build.name,
+            content_hash: build.content_hash,
+            size_bytes: build.artifact_size_bytes,
+        };
+        let outcome = execute_one_async_touched_before(
+            Arc::clone(&db),
+            active.clone(),
+            warm_pool.clone(),
+            candidate,
+            Arc::clone(&disk.delete),
+            Some(touched_before_secs),
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Still holding the gate, so every `deleting` row is ours
+                // or abandoned. Don't leave this one for a GC loop that may
+                // be disabled.
+                reap_stuck_deleting(Arc::clone(&db), &disk.probe).await;
+                return Err(error);
+            }
+        };
+        let reason = match outcome {
+            EvictionOutcome::Deleted => {
+                evicted += 1;
+                continue;
+            }
+            EvictionOutcome::SkippedPinnedAtExecute => IdleTemplateKept::Pinned,
+            EvictionOutcome::SkippedActiveAtExecute => IdleTemplateKept::Active,
+            EvictionOutcome::SkippedWarmPoolAtExecute => IdleTemplateKept::WarmPool,
+            EvictionOutcome::SkippedRowMissing => IdleTemplateKept::Changed,
+        };
+        return Ok(IdleTemplateEviction::Kept { evicted, reason });
+    }
+
+    let name = name.to_string();
+    let removed = tokio::task::spawn_blocking(move || {
+        let conn = db
+            .lock()
+            .map_err(|_| crate::db::mutex_poison_error("idle template eviction"))?;
+        crate::db::delete_template_local_state_without_builds(&conn, &name)
+    })
+    .await
+    .map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+            "idle template eviction spawn_blocking: {e}"
+        ))))
+    })??;
+    Ok(if removed {
+        IdleTemplateEviction::Evicted
+    } else {
+        IdleTemplateEviction::Kept {
+            evicted,
+            reason: IdleTemplateKept::Changed,
+        }
+    })
 }
 
 /// Charge a build's full disk footprint (digest dir + snapshots).
@@ -556,12 +775,13 @@ pub(crate) type ReaperDiskProbeFn = Arc<
 ///   `digest_dir_existed` adoption path.
 ///
 /// **Race safety:** called at the start of `gc_tick`, before any
-/// candidate enters `execute_precheck`. Within a single
-/// template-manager process, `execute_precheck`'s Phase 1 CAS is the
-/// sole writer of `state='deleting'`, so any row in that state at
-/// start-of-tick is necessarily from a prior tick or from a crash —
-/// not from an in-flight eviction within this same tick. Tests model
-/// this directly by planting `'deleting'` before invoking `gc_tick`.
+/// candidate enters `execute_precheck`. `execute_precheck`'s Phase 1 CAS
+/// is the only writer of `state='deleting'`, and its callers outside the
+/// tick (`evict_idle_template`) hold the [`EvictionGate`] that
+/// `run_loop` holds around each tick, so any row in that state at
+/// start-of-tick is from a prior tick, an interrupted eviction or a
+/// crash, not from an eviction still in flight. Tests model this
+/// directly by planting `'deleting'` before invoking `gc_tick`.
 pub(crate) async fn reap_stuck_deleting(
     db: Arc<Mutex<Connection>>,
     reaper_probe: &ReaperDiskProbeFn,
@@ -1016,6 +1236,7 @@ pub async fn run_loop(
     cfg: GcConfig,
     shutdown: CancellationToken,
     hooks: GcHooks,
+    gate: EvictionGate,
 ) {
     let GcHooks {
         fetch_active,
@@ -1042,6 +1263,15 @@ pub async fn run_loop(
 
     loop {
         let tick_started = std::time::Instant::now();
+        // Held from before the protected sets are fetched until the tick
+        // ends, so a wait for an idle eviction cannot leave the tick acting
+        // on sets older than its own grace clock. Released before every
+        // interval wait.
+        let evicting = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            guard = gate.hold() => guard,
+        };
         // Fetch the active sandbox set first. A failed sbx-mgr call
         // is treated as "do not evict this tick" — without an active
         // set we cannot safely drop a build that some sandbox might
@@ -1073,6 +1303,7 @@ pub async fn run_loop(
                         0,
                         0,
                     );
+                    drop(evicting);
                     if wait_or_shutdown(cfg.interval, &shutdown).await {
                         return;
                     }
@@ -1104,6 +1335,7 @@ pub async fn run_loop(
                         0,
                         0,
                     );
+                    drop(evicting);
                     if wait_or_shutdown(cfg.interval, &shutdown).await {
                         return;
                     }
@@ -1131,6 +1363,7 @@ pub async fn run_loop(
                 Arc::clone(&reaper_probe),
             ) => result,
         };
+        drop(evicting);
         match tick_result {
             Ok(report) => {
                 info!(

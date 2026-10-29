@@ -434,6 +434,30 @@ pub fn delete_build(conn: &Connection, name: &str, content_hash: &str) -> Result
 
 pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> {
     let tx = immediate_transaction(conn)?;
+    delete_template_rows(&tx, name)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// [`delete_template_local_state`] once the template has no build row left,
+/// so a build a concurrent pull just recorded keeps its settings. Returns
+/// whether it deleted.
+pub fn delete_template_local_state_without_builds(conn: &Connection, name: &str) -> Result<bool> {
+    let tx = immediate_transaction(conn)?;
+    let has_builds = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM template_builds WHERE name = ?1)",
+        params![name],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if has_builds {
+        return Ok(false);
+    }
+    delete_template_rows(&tx, name)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn delete_template_rows(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<()> {
     tx.execute(
         "DELETE FROM template_snapshots WHERE name = ?1",
         params![name],
@@ -448,7 +472,6 @@ pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> 
         "DELETE FROM template_settings WHERE template = ?1",
         params![name],
     )?;
-    tx.commit()?;
     Ok(())
 }
 

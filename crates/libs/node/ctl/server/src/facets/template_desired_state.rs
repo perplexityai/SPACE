@@ -2,6 +2,205 @@
 
 use super::*;
 
+/// How long the cluster must have left a local template out of its
+/// desired-state answers before a worker deletes its copy.
+///
+/// The cluster answers for a template only while this node has a reason to
+/// hold it: the template is generic and present, a sandbox of it is placed
+/// here, a Kubernetes warm-pool config for it is enabled, or it is retired
+/// and still in this node's published inventory. An org-specific template
+/// whose sandboxes have all left, like a template the cluster does not know,
+/// is omitted from every answer while its build stays cached, and the
+/// template-manager LRU reclaims it only once the cache is over budget.
+/// Without this, a worker keeps such templates and asks about them every sync
+/// indefinitely. The wait keeps the copy for a sandbox of the same template
+/// placed here again soon after.
+pub(super) const UNANSWERED_TEMPLATE_EVICT_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Test-only override of [`UNANSWERED_TEMPLATE_EVICT_AFTER`], in seconds, so a
+/// Kind run can watch a delete and the next placement without waiting an hour.
+const UNANSWERED_TEMPLATE_EVICT_AFTER_SECS_ENV: &str =
+    "SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS";
+
+fn unanswered_template_evict_after() -> Duration {
+    static AFTER: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+        pplx_space_common_core::env::test_hook_var(UNANSWERED_TEMPLATE_EVICT_AFTER_SECS_ENV)
+            .and_then(|secs| secs.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map_or(UNANSWERED_TEMPLATE_EVICT_AFTER, Duration::from_secs)
+    });
+    *AFTER
+}
+
+/// Cap on unanswered-template deletes per sync. Each delete can spend a
+/// template-manager subvolume-delete budget, and the facet shares one
+/// watchdog; the rest wait for the next sync.
+pub(super) const UNANSWERED_TEMPLATE_EVICTS_PER_SYNC: usize = 4;
+
+/// When each local template was first left out of a desired-state answer,
+/// cleared as soon as an answer includes it. Process lifetime, in memory: a
+/// node-ctl restart only restarts the wait.
+#[derive(Debug, Default)]
+pub(super) struct UnansweredTemplates {
+    since: BTreeMap<String, std::time::Instant>,
+}
+
+impl UnansweredTemplates {
+    /// Record one answer to a request for `requested`. `full_scope` means the
+    /// request named every local template, so entries for templates no longer
+    /// local are dropped.
+    pub(super) fn observe(
+        &mut self,
+        requested: &[String],
+        answered: &BTreeSet<String>,
+        full_scope: bool,
+        now: std::time::Instant,
+    ) {
+        if full_scope {
+            let requested = requested.iter().collect::<BTreeSet<_>>();
+            self.since
+                .retain(|template, _| requested.contains(template));
+        }
+        for template in requested {
+            if answered.contains(template) {
+                self.since.remove(template);
+            } else {
+                self.since.entry(template.clone()).or_insert(now);
+            }
+        }
+    }
+
+    /// Templates left out of every answer for at least `after`, longest first.
+    pub(super) fn due(
+        &self,
+        now: std::time::Instant,
+        after: Duration,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut due = self
+            .since
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= after)
+            .map(|(template, since)| (*since, template.clone()))
+            .collect::<Vec<_>>();
+        due.sort();
+        due.into_iter()
+            .take(limit)
+            .map(|(_, template)| template)
+            .collect()
+    }
+
+    /// Record one desired-state answer and pick the templates to delete now,
+    /// with a template the answer named for each recheck to ask about too.
+    ///
+    /// An answer that names none of the requested templates is no evidence
+    /// about any of them, since a broken read returns exactly that: it records
+    /// nothing and deletes nothing. A node whose every template is omitted
+    /// keeps them until the cluster answers for one of its templates again.
+    /// Only a full sync deletes, so the cap holds per sync and a run scoped
+    /// to other templates acts on nothing it did not ask about.
+    pub(super) fn plan(
+        &mut self,
+        requested: &[String],
+        answered: &BTreeSet<String>,
+        full_scope: bool,
+        now: std::time::Instant,
+        after: Duration,
+        limit: usize,
+    ) -> (Vec<String>, Option<String>) {
+        let Some(witness) = answered.first() else {
+            return (Vec::new(), None);
+        };
+        self.observe(requested, answered, full_scope, now);
+        let due = if full_scope {
+            self.due(now, after, limit)
+        } else {
+            Vec::new()
+        };
+        (due, Some(witness.clone()))
+    }
+
+    /// Record a delete attempt. A template that is gone is forgotten; one
+    /// still here waits the full period again before the next attempt.
+    pub(super) fn settle(
+        &mut self,
+        template: &str,
+        outcome: UnansweredDelete,
+        now: std::time::Instant,
+    ) {
+        match outcome {
+            UnansweredDelete::Deleted | UnansweredDelete::Gone => {
+                self.since.remove(template);
+            }
+            UnansweredDelete::InUse | UnansweredDelete::Unsupported | UnansweredDelete::Failed => {
+                self.since.insert(template.to_string(), now);
+            }
+        }
+    }
+}
+
+/// What deleting an unanswered template came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UnansweredDelete {
+    Deleted,
+    /// It was no longer local.
+    Gone,
+    /// template-manager kept it: a build was used within the wait, a local
+    /// sandbox, a pin or a warm pool still protects one, or another eviction
+    /// was running.
+    InUse,
+    /// template-manager predates `DeleteIdleTemplate`.
+    Unsupported,
+    Failed,
+}
+
+impl UnansweredDelete {
+    pub(super) fn from_result<T>(result: &Result<T, tonic::Status>) -> Self {
+        match result {
+            Ok(_) => Self::Deleted,
+            Err(error) if error.code() == Code::NotFound => Self::Gone,
+            Err(error) if matches!(error.code(), Code::FailedPrecondition | Code::Aborted) => {
+                Self::InUse
+            }
+            Err(error) if error.code() == Code::Unimplemented => Self::Unsupported,
+            Err(_) => Self::Failed,
+        }
+    }
+}
+
+/// What the recheck just before a delete says about the template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Recheck {
+    /// The cluster answers for it again: keep it and clear its record.
+    Answered,
+    /// Still left out while the witness is answered: delete it.
+    Omitted,
+    /// The answer named neither it nor the witness, which is no evidence:
+    /// keep it.
+    Silent,
+}
+
+impl Recheck {
+    pub(super) fn of(answered: &BTreeSet<String>, template: &str, witness: &str) -> Self {
+        if answered.contains(template) {
+            Self::Answered
+        } else if answered.contains(witness) {
+            Self::Omitted
+        } else {
+            Self::Silent
+        }
+    }
+}
+
+static UNANSWERED_TEMPLATES: std::sync::LazyLock<std::sync::Mutex<UnansweredTemplates>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn unanswered_templates() -> std::sync::MutexGuard<'static, UnansweredTemplates> {
+    UNANSWERED_TEMPLATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(super) async fn refresh_template_base_snapshot_policy(
     node_id: &str,
     node_role: Option<NodeRole>,
@@ -71,12 +270,22 @@ pub(super) async fn refresh_template_desired_state(
     node_role: Option<NodeRole>,
     scope: FacetScope,
 ) -> Result<ReconcileStats, String> {
+    let full_scope = matches!(scope, FacetScope::Full);
     let templates = resolve_template_scope(scope).await?;
     let mut stats = ReconcileStats {
         templates_seen: templates.len() as u64,
         ..ReconcileStats::default()
     };
     if templates.is_empty() {
+        if full_scope {
+            // No local templates left: drop every record, as a full answer would.
+            unanswered_templates().observe(
+                &templates,
+                &BTreeSet::new(),
+                true,
+                std::time::Instant::now(),
+            );
+        }
         return Ok(stats);
     }
 
@@ -86,12 +295,31 @@ pub(super) async fn refresh_template_desired_state(
     let response = cluster
         .get_node_template_desired_state(GetNodeTemplateDesiredStateRequest {
             node_id: node_id.to_string(),
-            templates,
+            templates: templates.clone(),
             role: proto_node_role(node_role),
         })
         .await
         .map_err(|error| format!("cluster template desired-state refresh failed: {error}"))?
         .into_inner();
+    // Templates due for deletion, and one template the same answer named,
+    // which each recheck below asks about too.
+    let (evict_unanswered, witness) = if node_role == Some(NodeRole::Worker) {
+        let answered = response
+            .templates
+            .iter()
+            .map(|template| template.template.clone())
+            .collect::<BTreeSet<_>>();
+        unanswered_templates().plan(
+            &templates,
+            &answered,
+            full_scope,
+            std::time::Instant::now(),
+            unanswered_template_evict_after(),
+            UNANSWERED_TEMPLATE_EVICTS_PER_SYNC,
+        )
+    } else {
+        (Vec::new(), None)
+    };
 
     let mut tmpl = pplx_space_template_mgr_client::connect()
         .await
@@ -292,6 +520,112 @@ pub(super) async fn refresh_template_desired_state(
         if applied {
             stats.templates_applied = stats.templates_applied.saturating_add(1);
         }
+    }
+
+    for template in evict_unanswered {
+        let Some(witness) = witness.as_ref() else {
+            break;
+        };
+        if !local_templates.contains_key(&template) {
+            unanswered_templates().settle(
+                &template,
+                UnansweredDelete::Gone,
+                std::time::Instant::now(),
+            );
+            continue;
+        }
+        // Ask again just before deleting it. The answer that made it due can
+        // be up to a sync old, and a sandbox placed here since then makes the
+        // cluster answer for the template. The witness, which that answer
+        // named, tells an omission from a recheck that answered nothing.
+        let recheck = cluster
+            .get_node_template_desired_state(GetNodeTemplateDesiredStateRequest {
+                node_id: node_id.to_string(),
+                templates: vec![template.clone(), witness.clone()],
+                role: proto_node_role(node_role),
+            })
+            .await;
+        match recheck {
+            Ok(response) => {
+                let answered = response
+                    .into_inner()
+                    .templates
+                    .into_iter()
+                    .map(|state| state.template)
+                    .collect::<BTreeSet<_>>();
+                match Recheck::of(&answered, &template, witness) {
+                    Recheck::Answered => {
+                        unanswered_templates().observe(
+                            std::slice::from_ref(&template),
+                            &answered,
+                            false,
+                            std::time::Instant::now(),
+                        );
+                        continue;
+                    }
+                    Recheck::Silent => {
+                        tracing::debug!(
+                            template,
+                            witness,
+                            "kept unanswered local template: the cluster recheck answered nothing"
+                        );
+                        continue;
+                    }
+                    Recheck::Omitted => {}
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    template,
+                    %error,
+                    "kept unanswered local template: cluster recheck failed"
+                );
+                continue;
+            }
+        }
+        // Count the delete as failed until it returns, so one the facet
+        // watchdog cancels still waits the full period before the next try.
+        unanswered_templates().settle(
+            &template,
+            UnansweredDelete::Failed,
+            std::time::Instant::now(),
+        );
+        // Not `DeleteTemplate`: the template can still be placed here, and
+        // only template-manager can tell, atomically with the delete, that no
+        // sandbox create was just handed one of its builds.
+        let result = tmpl
+            .delete_idle_template(local_manager_request(
+                DeleteIdleTemplateRequest {
+                    template: template.clone(),
+                    idle_secs: unanswered_template_evict_after().as_secs(),
+                },
+                true,
+            ))
+            .await;
+        let outcome = UnansweredDelete::from_result(&result);
+        match &result {
+            Ok(_) => {
+                tracing::info!(
+                    template,
+                    "deleted local template the cluster no longer answers for"
+                );
+                stats.templates_applied = stats.templates_applied.saturating_add(1);
+            }
+            Err(error) => match outcome {
+                UnansweredDelete::InUse | UnansweredDelete::Unsupported => tracing::debug!(
+                    template,
+                    %error,
+                    "kept unanswered local template"
+                ),
+                UnansweredDelete::Failed => tracing::warn!(
+                    template,
+                    %error,
+                    "failed to delete local template the cluster no longer answers for"
+                ),
+                UnansweredDelete::Deleted | UnansweredDelete::Gone => {}
+            },
+        }
+        unanswered_templates().settle(&template, outcome, std::time::Instant::now());
     }
 
     if failures > 0 {

@@ -389,6 +389,7 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
             delete_disk_for: delete_disk,
             reaper_probe: noop_reaper_probe(),
         },
+        EvictionGate::default(),
     ));
 
     // Give the loop a brief moment to complete its first tick so
@@ -727,6 +728,7 @@ async fn run_loop_exits_when_active_fetch_is_stuck() {
             delete_disk_for: delete_disk,
             reaper_probe: noop_reaper_probe(),
         },
+        EvictionGate::default(),
     ));
 
     // Give the loop a moment to enter the await on the stuck
@@ -778,6 +780,7 @@ async fn run_loop_returns_immediately_when_disabled() {
                 delete_disk_for: delete_disk,
                 reaper_probe: noop_reaper_probe(),
             },
+            EvictionGate::default(),
         ),
     )
     .await;
@@ -1344,5 +1347,401 @@ async fn gc_tick_releases_stuck_deleting_row_when_pin_lands() {
     assert_eq!(
         state, "ready",
         "the reaper must restore a pinned stuck-deleting row to 'ready' so the pin is honored",
+    );
+}
+
+/// Seed `name@hash` created and last used at `secs`, so a test controls which
+/// side of an idle bound it falls on.
+fn seed_build_touched_at(conn: &Connection, name: &str, hash: &str, secs: u64) {
+    seed_build(conn, name, hash, 100);
+    conn.execute(
+        "UPDATE template_builds SET created_at = ?3, last_used_at = ?3
+         WHERE name = ?1 AND content_hash = ?2",
+        params![name, hash, secs.to_string()],
+    )
+    .unwrap();
+}
+
+/// One row of `idle_template_eviction_takes_every_build_only_when_none_is_protected`.
+struct IdleCase {
+    case: &'static str,
+    /// Each build of `doomed` and its last touch.
+    builds: &'static [(&'static str, u64)],
+    pinned: &'static [&'static str],
+    active: &'static [&'static str],
+    warm_pool: &'static [&'static str],
+    expected: IdleTemplateEviction,
+}
+
+impl IdleCase {
+    const fn new(
+        case: &'static str,
+        builds: &'static [(&'static str, u64)],
+        pinned: &'static [&'static str],
+        active: &'static [&'static str],
+        warm_pool: &'static [&'static str],
+        expected: IdleTemplateEviction,
+    ) -> Self {
+        Self {
+            case,
+            builds,
+            pinned,
+            active,
+            warm_pool,
+            expected,
+        }
+    }
+}
+
+#[tokio::test]
+async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() {
+    use IdleTemplateKept::{Active, Pinned, Recent, WarmPool};
+    let bound = 1_000;
+    let kept = |reason| IdleTemplateEviction::Kept { evicted: 0, reason };
+    let row = IdleCase::new;
+    let cases = [
+        row(
+            "idle",
+            &[("h1", 500), ("h2", 1_000)],
+            &[],
+            &[],
+            &[],
+            IdleTemplateEviction::Evicted,
+        ),
+        row(
+            "one recent",
+            &[("h1", 500), ("h2", 1_001)],
+            &[],
+            &[],
+            &[],
+            kept(Recent),
+        ),
+        row("pinned", &[("h1", 500)], &["h1"], &[], &[], kept(Pinned)),
+        row("in use", &[("h1", 500)], &[], &["h1"], &[], kept(Active)),
+        row(
+            "warm pool",
+            &[("h1", 500)],
+            &[],
+            &[],
+            &["h1"],
+            kept(WarmPool),
+        ),
+        row(
+            "not cached",
+            &[],
+            &[],
+            &[],
+            &[],
+            IdleTemplateEviction::NotFound,
+        ),
+    ];
+    for IdleCase {
+        case,
+        builds,
+        pinned,
+        active,
+        warm_pool,
+        expected,
+    } in cases
+    {
+        let conn = crate::db::test_conn();
+        seed_build_touched_at(&conn, "other", "h1", 1);
+        for (hash, touched) in builds {
+            seed_build_touched_at(&conn, "doomed", hash, *touched);
+        }
+        for hash in pinned {
+            plant_pin(&conn, "doomed", hash);
+        }
+        crate::db::upsert_template_settings(
+            &conn,
+            "doomed",
+            &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let delete_disk: DeleteDiskFn = {
+            let deleted = Arc::clone(&deleted);
+            Arc::new(move |name, hash| {
+                deleted.lock().unwrap().push(format!("{name}@{hash}"));
+                Box::pin(async { Ok(()) })
+            })
+        };
+        let pairs = |hashes: &[&str]| {
+            hashes
+                .iter()
+                .map(|hash| ("doomed".to_string(), (*hash).to_string()))
+                .collect::<HashSet<_>>()
+        };
+
+        let outcome = evict_idle_template(
+            Arc::clone(&db),
+            &EvictionGate::default(),
+            "doomed",
+            bound,
+            pairs(active),
+            pairs(warm_pool),
+            EvictionDisk {
+                delete: delete_disk,
+                probe: noop_reaper_probe(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, expected, "{case}");
+        let conn = db.lock().unwrap();
+        let left = crate::db::list_builds_by_name(&conn, "doomed").unwrap();
+        let settings = crate::db::get_template_settings(&conn, "doomed").unwrap();
+        if expected == IdleTemplateEviction::Evicted {
+            assert!(left.is_empty(), "{case}: every build is gone");
+            assert!(settings.is_none(), "{case}: so are the template's settings");
+            let mut deleted = deleted.lock().unwrap().clone();
+            deleted.sort();
+            assert_eq!(deleted, ["doomed@h1", "doomed@h2"], "{case}");
+        } else {
+            assert_eq!(left.len(), builds.len(), "{case}: no build is evicted");
+            assert!(settings.is_some(), "{case}: settings stay");
+            assert!(deleted.lock().unwrap().is_empty(), "{case}");
+        }
+        assert_eq!(
+            crate::db::list_builds_by_name(&conn, "other")
+                .unwrap()
+                .len(),
+            1,
+            "{case}: other templates are untouched"
+        );
+    }
+}
+
+/// What happens while a build's files are being deleted, with the DB lock
+/// released: another build is handed to a sandbox create (`GetTemplate`
+/// touches it), a pull records a new build, or the disk delete fails.
+#[tokio::test]
+async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
+    #[derive(Clone, Copy, Debug)]
+    enum During {
+        OtherBuildUsed,
+        NewBuildPulled,
+        DiskDeleteFails,
+    }
+    for during in [
+        During::OtherBuildUsed,
+        During::NewBuildPulled,
+        During::DiskDeleteFails,
+    ] {
+        let conn = crate::db::test_conn();
+        seed_build_touched_at(&conn, "doomed", "h1", 500);
+        seed_build_touched_at(&conn, "doomed", "h2", 500);
+        crate::db::upsert_template_settings(
+            &conn,
+            "doomed",
+            &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let delete_disk: DeleteDiskFn = {
+            let db = Arc::clone(&db);
+            Arc::new(move |name, hash| {
+                let first = first.swap(false, std::sync::atomic::Ordering::SeqCst);
+                let fail = first && matches!(during, During::DiskDeleteFails);
+                if first {
+                    let conn = db.lock().unwrap();
+                    match during {
+                        During::OtherBuildUsed => {
+                            let other = if hash == "h1" { "h2" } else { "h1" };
+                            crate::db::touch_build(&conn, name, other).unwrap();
+                        }
+                        During::NewBuildPulled => seed_build(&conn, name, "h3", 100),
+                        During::DiskDeleteFails => {}
+                    }
+                }
+                Box::pin(async move {
+                    if fail {
+                        Err(rusqlite::Error::InvalidQuery)
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+        };
+        let intact: ReaperDiskProbeFn =
+            Arc::new(|_, _| Box::pin(async { ReaperDiskState::Intact }));
+
+        let outcome = evict_idle_template(
+            Arc::clone(&db),
+            &EvictionGate::default(),
+            "doomed",
+            1_000,
+            keys(&[]),
+            keys(&[]),
+            EvictionDisk {
+                delete: delete_disk,
+                probe: intact,
+            },
+        )
+        .await;
+
+        let conn = db.lock().unwrap();
+        let ready = crate::db::list_eviction_candidates(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|build| build.content_hash)
+            .collect::<Vec<_>>();
+        let settings_kept = crate::db::get_template_settings(&conn, "doomed")
+            .unwrap()
+            .is_some();
+        match during {
+            During::OtherBuildUsed => {
+                assert_eq!(
+                    outcome.unwrap(),
+                    IdleTemplateEviction::Kept {
+                        evicted: 1,
+                        reason: IdleTemplateKept::Changed,
+                    }
+                );
+                assert_eq!(ready.len(), 1, "the build used meanwhile stays ready");
+            }
+            During::NewBuildPulled => {
+                assert_eq!(
+                    outcome.unwrap(),
+                    IdleTemplateEviction::Kept {
+                        evicted: 2,
+                        reason: IdleTemplateKept::Changed,
+                    },
+                    "the template is still cached, so it is reported kept"
+                );
+                assert_eq!(ready, ["h3"], "the pulled build keeps its row");
+            }
+            During::DiskDeleteFails => {
+                outcome.expect_err("the failed disk delete is reported");
+                assert_eq!(ready.len(), 2, "the failed build is back to ready");
+                assert!(
+                    !crate::db::is_build_marked_deleting(&conn, "doomed", "h1").unwrap()
+                        && !crate::db::is_build_marked_deleting(&conn, "doomed", "h2").unwrap(),
+                    "nothing is left in deleting"
+                );
+            }
+        }
+        assert!(
+            settings_kept,
+            "{during:?}: a build is left, so settings stay"
+        );
+    }
+}
+
+/// A GC tick's repair pass puts a `deleting` row with intact artifacts back to
+/// `ready`. It must not do that to a build an idle eviction is still deleting,
+/// or `GetTemplate` could hand that build to a sandbox create just before its
+/// files go.
+#[tokio::test]
+async fn gc_repair_waits_for_a_live_idle_eviction() {
+    let conn = crate::db::test_conn();
+    seed_build_touched_at(&conn, "doomed", "h1", 500);
+    let db = Arc::new(Mutex::new(conn));
+    let gate = EvictionGate::default();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let delete_disk: DeleteDiskFn = {
+        let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+        Arc::new(move |_, _| {
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        })
+    };
+    let eviction = tokio::spawn({
+        let (db, gate) = (Arc::clone(&db), gate.clone());
+        async move {
+            evict_idle_template(
+                db,
+                &gate,
+                "doomed",
+                1_000,
+                keys(&[]),
+                keys(&[]),
+                EvictionDisk {
+                    delete: delete_disk,
+                    probe: noop_reaper_probe(),
+                },
+            )
+            .await
+        }
+    });
+    entered.notified().await;
+    assert_eq!(
+        evict_idle_template(
+            Arc::clone(&db),
+            &gate,
+            "doomed",
+            1_000,
+            keys(&[]),
+            keys(&[]),
+            EvictionDisk {
+                delete: Arc::new(|_, _| panic!("a second eviction must not start")),
+                probe: noop_reaper_probe(),
+            },
+        )
+        .await
+        .unwrap(),
+        IdleTemplateEviction::Busy,
+        "a second eviction does not wait for the gate"
+    );
+
+    let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reaper_probe: ReaperDiskProbeFn = {
+        let reaped = Arc::clone(&reaped);
+        Arc::new(move |_, _| {
+            reaped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { ReaperDiskState::Intact })
+        })
+    };
+    let shutdown = CancellationToken::new();
+    let gc = tokio::spawn(run_loop(
+        Arc::clone(&db),
+        GcConfig {
+            enabled: true,
+            budget_bytes: u64::MAX,
+            headroom_fraction: 0.9,
+            interval: Duration::from_millis(10),
+            grace: Duration::from_secs(0),
+        },
+        shutdown.clone(),
+        GcHooks {
+            fetch_active: Arc::new(|| Box::pin(async { Ok(HashSet::new()) })),
+            fetch_warm_pool: empty_warm_pool_fetch(),
+            disk_size_for: Arc::new(|_, _, fallback, _| fallback),
+            delete_disk_for: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            reaper_probe,
+        },
+        gate,
+    ));
+    // Long enough for several ticks had the loop not waited for the gate.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        reaped.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no repair pass ran during the eviction"
+    );
+    assert!(
+        crate::db::is_build_marked_deleting(&db.lock().unwrap(), "doomed", "h1").unwrap(),
+        "the build stays out of reach of GetTemplate"
+    );
+
+    release.notify_one();
+    assert_eq!(
+        eviction.await.unwrap().unwrap(),
+        IdleTemplateEviction::Evicted
+    );
+    shutdown.cancel();
+    gc.await.unwrap();
+    assert!(
+        crate::db::list_builds_by_name(&db.lock().unwrap(), "doomed")
+            .unwrap()
+            .is_empty()
     );
 }

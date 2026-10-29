@@ -86,11 +86,13 @@ impl TemplateManagerService {
     /// Returns NOT_FOUND if unresolvable.
     ///
     /// Every successful resolution advances `last_used_at` on the
-    /// matched build so the on-node LRU eviction loop sees real
-    /// usage. Touch failures are logged but do **not** fail the
-    /// resolution — the LRU clock is best-effort, and a missing
-    /// touch only risks an earlier eviction (re-protected by the
-    /// grace period and the next access).
+    /// matched build, under the same DB lock, so the on-node LRU
+    /// eviction loop sees real usage. The touch is also what keeps a
+    /// build just handed to a sandbox create from being evicted before
+    /// sandbox-manager records that sandbox: the GC's grace period and
+    /// `DeleteIdleTemplate`'s idle bound both read it. Touch failures are
+    /// logged but do **not** fail the resolution, so a failed touch can
+    /// leave the build open to either eviction.
     ///
     /// Builds in `state='deleting'` (mid-eviction; see
     /// `eviction::execute_precheck`) are treated as not-resolvable
@@ -944,9 +946,9 @@ impl TemplateManagerService {
 }
 
 /// Advance the LRU clock on a resolved build. Logged on failure but
-/// never surfaced to the caller — the resolution succeeded and the
-/// LRU column is a best-effort hint for eviction, not a correctness
-/// boundary.
+/// never surfaced to the caller: the resolution succeeded. Eviction's
+/// recency guards read this column (see `resolve_template`), so a failed
+/// touch can let them evict the build.
 fn touch_lru(conn: &rusqlite::Connection, name: &str, content_hash: &str) {
     if let Err(err) = crate::db::touch_build(conn, name, content_hash) {
         tracing::warn!(

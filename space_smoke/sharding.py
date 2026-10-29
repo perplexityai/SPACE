@@ -108,6 +108,9 @@ _DURATION_SECONDS = {
         # budget and 60 s grace.
         "local.template_cache_lru_eviction_reclaims": 92,
         "local.template_startup_recovery_decision_table": 45,
+        # Kind bench runs: 428 s, of which 180 s is the hold with the sandbox
+        # running and 180 s the 90 s wait plus up to two 60 s syncs.
+        "local.unanswered_template_deleted_after_wait": 430,
         "network_policy.v1_cidr_allow": 11,
         "network_policy.v1_cidr_deny": 13,
         "network_policy.v1_deny_precedes_allow": 11,
