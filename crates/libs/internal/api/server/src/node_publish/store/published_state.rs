@@ -22,6 +22,7 @@ use pplx_space_events::{
 
 use crate::node_publish::plan::sandboxes::SandboxPlan;
 use crate::node_publish::plan::suspended::SuspendedClaim;
+use crate::node_publish::plan::templates::TemplatePlan;
 use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes,
     inventory_reconcile::{self, enqueue as queue_policy_reconcile_refs_for_new_inventory},
@@ -40,6 +41,7 @@ use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
 use crate::node_publish::validate::sandbox_inventory::{
     DegradedSandboxClaim, ValidatedSandboxInventory,
 };
+#[cfg(test)]
 use crate::node_publish::validate::templates::ValidatedTemplateInventory;
 use crate::proto::PublishedSandboxState;
 #[cfg(test)]
@@ -157,7 +159,7 @@ async fn publish_template_states(
     states: &[PublishedTemplateState],
 ) -> Result<u64, Status> {
     let inventory = ValidatedTemplateInventory::try_from_proto(publisher_role, states)?;
-    publish_validated_template_states(conn, node_id, &inventory)
+    publish_validated_template_states(conn, node_id, &inventory.into())
         .await
         .map_err(Status::from)
 }
@@ -169,7 +171,9 @@ pub(crate) enum ApplyTemplateClaimsError {
     #[error(transparent)]
     Inventory(#[from] template_inventory::UpsertTemplateInventoryError),
     #[error(transparent)]
-    Components(#[from] template_components::ReplaceTemplateComponentsError),
+    ComponentPruning(#[from] template_components::PruneTemplateComponentsError),
+    #[error(transparent)]
+    Components(#[from] template_components::UpsertTemplateComponentsError),
     #[error(transparent)]
     InventoryReconcile(#[from] inventory_reconcile::EnqueueInventoryReconcileError),
     #[error(transparent)]
@@ -182,9 +186,9 @@ pub(crate) enum ApplyTemplateClaimsError {
 pub(crate) async fn publish_validated_template_states(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    inventory: &ValidatedTemplateInventory,
+    plan: &TemplatePlan,
 ) -> Result<u64, ApplyTemplateClaimsError> {
-    let (absent_templates, rows) = inventory.legacy_rows();
+    let (absent_templates, rows) = plan.inventory.legacy_rows();
     let mut accepted = template_pruning::remove_absent(conn, node_id, &absent_templates).await?;
 
     if rows.is_empty() {
@@ -194,7 +198,8 @@ pub(crate) async fn publish_validated_template_states(
     let rows_json = Json(serde_json::Value::Array(rows));
     let accepted_rows = template_inventory::upsert(conn, node_id, &rows_json).await?;
 
-    template_components::replace(conn, node_id, &rows_json).await?;
+    template_components::prune(conn, node_id, &plan.component_scopes, &plan.component_keys).await?;
+    template_components::upsert(conn, node_id, &plan.components).await?;
 
     // Node publication deliberately never writes `template_releases`. Release
     // rows are fleet-shared, and any per-node write to them (even a guarded

@@ -3,25 +3,32 @@ use pplx_space_net_common::NetworkPolicyV1;
 use tonic::Status;
 
 use crate::node_publish::validate::fields::{
-    ExecutionProjection, execution_projection, non_zero_u64_to_i64, optional_u32_to_i32_when,
-    optional_u64_to_i64_when, u32_to_i32, u64_to_i64,
+    ArtifactComponentProjection, ExecutionProjection, execution_projection, non_zero_u64_to_i64,
+    optional_u32_to_i32_when, optional_u64_to_i64_when, u32_to_i32, u64_to_i64,
 };
 use crate::node_publish::validate::sandbox_metadata::PublishedRuntimeLabel;
 use crate::proto::PublishedTemplateState;
 use crate::{optional_trimmed, proto_network_policy_to_common, trimmed_required};
 
 /// A publication name follows the open inventory grammar, not path-name rules.
-#[derive(Debug)]
-pub(super) struct PublishedTemplateName(String);
+#[derive(Clone, Debug)]
+pub(crate) struct PublishedTemplateName(String);
 
 impl PublishedTemplateName {
     pub(super) fn parse(raw: &str) -> Result<Self, Status> {
         trimmed_required(raw, "template").map(Self)
     }
 
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+#[derive(Debug)]
+pub(in crate::node_publish) struct TemplateComponentSet {
+    pub(in crate::node_publish) name: PublishedTemplateName,
+    pub(in crate::node_publish) content_hash: String,
+    pub(in crate::node_publish) components: Vec<ArtifactComponentProjection>,
 }
 
 /// Optional descriptive metadata retains its legacy spelling. Runtime and
@@ -81,6 +88,18 @@ pub(super) struct TemplateClaim {
 }
 
 impl TemplateClaim {
+    pub(super) fn take_components(&mut self) -> TemplateComponentSet {
+        TemplateComponentSet {
+            name: self.name.clone(),
+            content_hash: self.content_hash.clone(),
+            components: self
+                .execution
+                .as_mut()
+                .map(|execution| std::mem::take(&mut execution.components))
+                .unwrap_or_default(),
+        }
+    }
+
     pub(super) fn try_from_proto(
         state: &PublishedTemplateState,
         include_template_metadata: bool,

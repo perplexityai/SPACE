@@ -1,4 +1,6 @@
-use pplx_space_common_core::types::{ArtifactOrigin, ExecutionMetadata, RuntimeKind};
+use pplx_space_common_core::types::{
+    ArtifactComponentKind, ArtifactOrigin, ExecutionMetadata, RuntimeKind,
+};
 use time::format_description::well_known::Rfc3339;
 use tonic::Status;
 
@@ -23,7 +25,7 @@ impl ExecutionProjection {
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct ArtifactComponentProjection {
-    pub(crate) kind: String,
+    pub(crate) kind: ArtifactComponentKind,
     pub(crate) role_key: String,
     pub(crate) version: Option<String>,
     pub(crate) digest: Option<String>,
@@ -41,7 +43,7 @@ fn projection_from_execution(execution: ExecutionMetadata) -> Result<ExecutionPr
         .components()
         .iter()
         .map(|component| ArtifactComponentProjection {
-            kind: component.kind.as_str().to_string(),
+            kind: component.kind,
             role_key: component
                 .role
                 .as_ref()

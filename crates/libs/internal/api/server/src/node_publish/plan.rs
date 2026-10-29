@@ -12,9 +12,9 @@ use super::validate::{
     execution_observation::ValidatedReport,
     node_status::ValidatedNodeStatus,
     pending_backup::PendingBackupReport,
-    templates::ValidatedTemplateInventory,
 };
 use sandboxes::SandboxPlan;
+use templates::TemplatePlan;
 
 pub(crate) mod activation;
 pub(crate) mod activity;
@@ -26,6 +26,7 @@ pub(crate) mod recovery_observation;
 pub(crate) mod sandboxes;
 pub(crate) mod suspend_handoff;
 pub(crate) mod suspended;
+pub(crate) mod templates;
 
 /// Ownership of checked claims moves into the plan without cloning opaque payloads.
 /// Lifecycle guards, row locks and generated identifiers belong to the store.
@@ -37,7 +38,7 @@ pub(crate) struct PublishPlan {
     pub(crate) sandbox_census: SandboxCensus,
     pub(crate) census_diagnostics: Vec<InvalidCensusIdentity>,
     pub(crate) template_census: Option<TemplateCensus>,
-    pub(crate) templates: ValidatedTemplateInventory,
+    pub(crate) templates: TemplatePlan,
     pub(crate) sandboxes: SandboxPlan,
     pub(crate) execution_observation: Option<ValidatedReport>,
     pub(crate) pending_local_backups: PendingBackupReport,
@@ -54,7 +55,7 @@ impl From<ValidatedPublish> for PublishPlan {
             sandbox_census: publish.sandbox_census,
             census_diagnostics: publish.census_diagnostics,
             template_census: publish.template_census,
-            templates: publish.templates,
+            templates: publish.templates.into(),
             sandboxes: publish.sandboxes.into(),
             execution_observation: publish.execution_observation,
             pending_local_backups: publish.pending_local_backups,

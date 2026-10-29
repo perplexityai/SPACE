@@ -235,7 +235,13 @@ async fn repeated_template_publish_does_not_rewrite_node_template_inventory() ->
     .await?;
 
     let mut conn = db.pool.acquire().await?;
-    let accepted = publish_template_states(&mut conn, node_id, NodeRole::Builder, &[state]).await?;
+    let accepted = publish_template_states(
+        &mut conn,
+        node_id,
+        NodeRole::Builder,
+        std::slice::from_ref(&state),
+    )
+    .await?;
     assert_eq!(accepted, 1);
     drop(conn);
 
@@ -267,6 +273,115 @@ async fn repeated_template_publish_does_not_rewrite_node_template_inventory() ->
         current_component_ctid, component_ctid,
         "unchanged publish should not rewrite component rows"
     );
+
+    // A component census is scoped by both release and node, including the
+    // empty content-hash release. Nullable neighbors must keep column alignment.
+    use pplx_space_common_core::types::{
+        Arch, ArtifactComponentKind, ArtifactComponentMetadata, ExecutionMetadata,
+    };
+    let other_node = NodeId::new();
+    insert_ready_worker_node(&db.pool, other_node).await?;
+    let mut neighbor = state.clone();
+    neighbor.content_hash = Some("sha256:neighbor".to_owned());
+    let mut unreported = state.clone();
+    unreported.content_hash = None;
+    let mut conn = db.pool.acquire().await?;
+    publish_template_states(
+        &mut conn,
+        node_id,
+        NodeRole::Builder,
+        &[neighbor.clone(), unreported],
+    )
+    .await?;
+    publish_template_states(
+        &mut conn,
+        other_node,
+        NodeRole::Builder,
+        std::slice::from_ref(&state),
+    )
+    .await?;
+    let execution = ExecutionMetadata::initial_firecracker(
+        Arch::X86_64,
+        vec![
+            ArtifactComponentMetadata {
+                kind: ArtifactComponentKind::Initrd,
+                role: None,
+                version: None,
+                digest: None,
+                format: None,
+            },
+            test_execution().components()[0].clone(),
+        ],
+    );
+    neighbor.execution = Some((&execution).into());
+    state.execution = None;
+    publish_template_states(
+        &mut conn,
+        node_id,
+        NodeRole::Builder,
+        &[state, neighbor.clone()],
+    )
+    .await?;
+    drop(conn);
+
+    #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+    struct ComponentRecord {
+        content_hash: String,
+        kind: String,
+        role_key: String,
+        version: Option<String>,
+        digest: Option<String>,
+        format: Option<String>,
+    }
+    let components: Vec<ComponentRecord> = sqlx::query_as(sql!(
+        "SELECT content_hash, kind, role_key, version, digest, format
+             FROM node_template_components WHERE node_id = $1
+             ORDER BY content_hash, kind, role_key"
+    ))
+    .bind(node_id)
+    .fetch_all(&db.pool)
+    .await?;
+    let kernel_execution = test_execution();
+    let kernel = &kernel_execution.components()[0];
+    let kernel_record = |content_hash: &str| ComponentRecord {
+        content_hash: content_hash.to_owned(),
+        kind: "kernel".to_owned(),
+        role_key: String::new(),
+        version: kernel.version.as_ref().map(ToString::to_string),
+        digest: kernel.digest.as_ref().map(ToString::to_string),
+        format: kernel.format.as_ref().map(ToString::to_string),
+    };
+    assert_eq!(
+        components,
+        vec![
+            kernel_record(""),
+            ComponentRecord {
+                content_hash: "sha256:neighbor".to_owned(),
+                kind: "initrd".to_owned(),
+                role_key: String::new(),
+                version: None,
+                digest: None,
+                format: None,
+            },
+            kernel_record("sha256:neighbor"),
+        ]
+    );
+    neighbor.execution = None;
+    let mut conn = db.pool.acquire().await?;
+    publish_template_states(&mut conn, node_id, NodeRole::Builder, &[neighbor]).await?;
+    drop(conn);
+    let retained: Vec<(NodeId, String)> = sqlx::query_as(sql!(
+        "SELECT node_id, content_hash FROM node_template_components
+         ORDER BY node_id, content_hash"
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    let mut expected = vec![
+        (node_id, String::new()),
+        (other_node, "sha256:abc".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(retained, expected);
     Ok(())
 }
 

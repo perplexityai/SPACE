@@ -1,54 +1,56 @@
 use pplx_space_common_core::{sql, types::NodeId};
-use sqlx::{PgConnection, types::Json};
+use sqlx::PgConnection;
+
+use crate::node_publish::plan::templates::{
+    TemplateComponentClaim, TemplateComponentKeyClaim, TemplateReleaseClaim,
+};
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ReplaceTemplateComponentsError {
+pub(crate) enum PruneTemplateComponentsError {
     #[error("replace node template components: {0}")]
-    Prune(#[source] sqlx::Error),
-    #[error("insert node template components: {0}")]
-    Upsert(#[source] sqlx::Error),
+    Storage(#[source] sqlx::Error),
 }
 
-/// Replace components in the reported template/release scope, accepting new
-/// components only for inventory already on this node. Delete precedes upsert
-/// on the caller's connection, with ordinary component-row write locks and no
-/// explicit template locks. Zero changed rows is normal; an empty component
-/// list clears that reported release rather than skipping its deletion.
-pub(crate) async fn replace(
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum UpsertTemplateComponentsError {
+    #[error("insert node template components: {0}")]
+    Storage(#[source] sqlx::Error),
+}
+
+/// Prune components in the reported release scope, recognizing component keys
+/// only for this node's existing inventory. Ordinary component-row write locks
+/// precede upsert on the caller's connection, with no explicit template locks.
+/// Empty scopes do nothing; empty keys clear those scopes. Zero rows is normal.
+pub(crate) async fn prune(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
-) -> Result<(), ReplaceTemplateComponentsError> {
+    scopes: &[TemplateReleaseClaim],
+    keys: &[TemplateComponentKeyClaim],
+) -> Result<(), PruneTemplateComponentsError> {
+    if scopes.is_empty() {
+        return Ok(());
+    }
     sqlx::query(sql!(
         "WITH scope AS (
              SELECT DISTINCT input.template_name, COALESCE(input.content_hash, '') AS content_hash
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT
+             FROM UNNEST($2::TEXT[], $3::TEXT[]) AS input(
+                 template_name, content_hash
              )
          ),
          input AS (
-             SELECT template_name, content_hash, execution_components
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT,
-                 execution_components JSONB
+             SELECT template_name, content_hash, kind, role_key
+             FROM UNNEST($4::TEXT[], $5::TEXT[], $6::TEXT[], $7::TEXT[]) AS input(
+                 template_name, content_hash, kind, role_key
              )
          ),
          incoming AS (
              SELECT input.template_name, COALESCE(input.content_hash, '') AS content_hash,
-                    component.kind, component.role_key, component.version,
-                    component.digest, component.format
+                    input.kind, input.role_key
              FROM input
              JOIN node_template_inventory inventory
                ON inventory.node_id = $1
               AND inventory.template_name = input.template_name
               AND inventory.content_hash = COALESCE(input.content_hash, '')
-             CROSS JOIN LATERAL jsonb_to_recordset(
-                 COALESCE(input.execution_components, '[]'::jsonb)
-             ) AS component(
-                 kind TEXT, role_key TEXT, version TEXT, digest TEXT, format TEXT
-             )
          )
          DELETE FROM node_template_components component
          USING scope
@@ -65,33 +67,75 @@ pub(crate) async fn replace(
            )"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(
+        scopes
+            .iter()
+            .map(|scope| scope.template.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        scopes
+            .iter()
+            .map(|scope| scope.content_hash.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        keys.iter()
+            .map(|key| key.release.template.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        keys.iter()
+            .map(|key| key.release.content_hash.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(keys.iter().map(|key| key.kind.as_str()).collect::<Vec<_>>())
+    .bind(
+        keys.iter()
+            .map(|key| key.role_key.as_str())
+            .collect::<Vec<_>>(),
+    )
     .execute(&mut *conn)
     .await
-    .map_err(ReplaceTemplateComponentsError::Prune)?;
+    .map_err(PruneTemplateComponentsError::Storage)?;
+    Ok(())
+}
+
+/// Upsert component values only for inventory already on this node. Conflict
+/// checks lock component rows, but unchanged values are not rewritten. Empty
+/// claims issue no SQL; claims outside node inventory are a normal zero outcome.
+pub(crate) async fn upsert(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+    claims: &[TemplateComponentClaim],
+) -> Result<(), UpsertTemplateComponentsError> {
+    if claims.is_empty() {
+        return Ok(());
+    }
+    // Preserve claim order and NULL positions in every bound column.
+    macro_rules! column {
+        ($value:expr) => {
+            claims.iter().map($value).collect::<Vec<_>>()
+        };
+    }
     sqlx::query(
         sql!("WITH input AS (
-             SELECT template_name, content_hash, execution_components
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT,
-                 execution_components JSONB
+             SELECT template_name, content_hash, kind, role_key, version, digest, format
+             FROM UNNEST(
+                 $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[],
+                 $6::TEXT[], $7::TEXT[], $8::TEXT[]
+             ) AS input(
+                 template_name, content_hash, kind, role_key, version, digest, format
              )
          ),
          incoming AS (
              SELECT $1 AS node_id, input.template_name, COALESCE(input.content_hash, '') AS content_hash,
-                    component.kind, component.role_key, component.version,
-                    component.digest, component.format
+                    input.kind, input.role_key, input.version, input.digest, input.format
              FROM input
              JOIN node_template_inventory inventory
                ON inventory.node_id = $1
               AND inventory.template_name = input.template_name
               AND inventory.content_hash = COALESCE(input.content_hash, '')
-             CROSS JOIN LATERAL jsonb_to_recordset(
-                 COALESCE(input.execution_components, '[]'::jsonb)
-             ) AS component(
-                 kind TEXT, role_key TEXT, version TEXT, digest TEXT, format TEXT
-             )
          )
          INSERT INTO node_template_components (
              node_id, template_name, content_hash, kind, role_key, version, digest, format
@@ -113,9 +157,15 @@ pub(crate) async fn replace(
          )"),
     )
     .bind(node_id)
-    .bind(rows_json)
+    .bind(column!(|claim| claim.key.release.template.as_str()))
+    .bind(column!(|claim| claim.key.release.content_hash.as_str()))
+    .bind(column!(|claim| claim.key.kind.as_str()))
+    .bind(column!(|claim| claim.key.role_key.as_str()))
+    .bind(column!(|claim| claim.version.as_deref()))
+    .bind(column!(|claim| claim.digest.as_deref()))
+    .bind(column!(|claim| claim.format.as_deref()))
     .execute(&mut *conn)
     .await
-    .map_err(ReplaceTemplateComponentsError::Upsert)?;
+    .map_err(UpsertTemplateComponentsError::Storage)?;
     Ok(())
 }
