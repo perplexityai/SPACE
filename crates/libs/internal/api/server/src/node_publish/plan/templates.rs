@@ -1,8 +1,10 @@
 use pplx_space_common_core::types::ArtifactComponentKind;
 
-pub(crate) use crate::node_publish::validate::templates::TemplatePolicyClaim;
 use crate::node_publish::validate::templates::{
     PublishedTemplateName, TemplateComponentSet, ValidatedTemplateInventory,
+};
+pub(crate) use crate::node_publish::validate::templates::{
+    TemplateInventoryClaim, TemplatePolicyClaim,
 };
 
 /// A reported release remains in scope even when it reports no components.
@@ -36,7 +38,8 @@ pub(crate) struct TemplatePolicyAppliedClaim {
 /// opaque execution metadata remains available to the inventory observation.
 #[derive(Debug)]
 pub(crate) struct TemplatePlan {
-    pub(crate) inventory: ValidatedTemplateInventory,
+    pub(crate) inventory: Vec<TemplateInventoryClaim>,
+    pub(crate) absent: Vec<PublishedTemplateName>,
     pub(crate) component_scopes: Vec<TemplateReleaseClaim>,
     pub(crate) component_keys: Vec<TemplateComponentKeyClaim>,
     pub(crate) components: Vec<TemplateComponentClaim>,
@@ -82,8 +85,10 @@ impl From<ValidatedTemplateInventory> for TemplatePlan {
                 template: claim.template.clone(),
             })
             .collect();
+        let (absent, inventory) = inventory.into_inventory();
         Self {
             inventory,
+            absent,
             component_scopes,
             component_keys,
             components,

@@ -1,6 +1,8 @@
 use pplx_space_common_core::{sql, types::NodeId};
 use sqlx::{PgConnection, types::Json};
 
+use crate::node_publish::plan::templates::TemplateInventoryClaim;
+
 pub(crate) type AcceptedTemplateInventoryRow = (String, String, bool, bool, String);
 
 #[derive(Debug, thiserror::Error)]
@@ -13,44 +15,28 @@ const UPSERT_TEMPLATE_INVENTORY: &str = sql!(
     "WITH input AS (
              SELECT template_name, content_hash, runtime, arch, runtime_version,
                     guest_os, state_format_name, state_format_version,
-                    execution_metadata, execution_components, built_at,
+                    execution_metadata, built_at,
                     artifact_size_bytes, cache_size_bytes, has_base_snapshot,
                     base_snapshot_size_bytes, pool_target, pool_current,
                     pool_pending, pool_sandbox_ids, snapshots,
                     default_auto_lifecycle_json, default_auto_lifecycle_authority,
                     network_policy_authority, ensure_base_snapshot, snapshot_vcpu,
                     snapshot_memory_mib, vcpu, memory_mib, disk_size_mb
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT,
-                 runtime TEXT,
-                 arch TEXT,
-                 runtime_version TEXT,
-                 guest_os TEXT,
-                 state_format_name TEXT,
-                 state_format_version TEXT,
-                 execution_metadata JSONB,
-                 execution_components JSONB,
-                 built_at TEXT,
-                 artifact_size_bytes BIGINT,
-                 cache_size_bytes BIGINT,
-                 has_base_snapshot BOOLEAN,
-                 base_snapshot_size_bytes BIGINT,
-                 pool_target INTEGER,
-                 pool_current INTEGER,
-                 pool_pending INTEGER,
-                 pool_sandbox_ids JSONB,
-                 snapshots JSONB,
-                 default_auto_lifecycle_json JSONB,
-                 default_auto_lifecycle_authority TEXT,
-                 network_policy_authority TEXT,
-                 ensure_base_snapshot BOOLEAN,
-                 snapshot_vcpu INTEGER,
-                 snapshot_memory_mib INTEGER,
-                 vcpu INTEGER,
-                 memory_mib INTEGER,
-                 disk_size_mb INTEGER
-             )
+             FROM UNNEST(
+                 $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[],
+                 $7::TEXT[], $8::TEXT[], $9::TEXT[], $10::JSONB[], $11::TEXT[],
+                 $12::BIGINT[], $13::BIGINT[], $14::BOOLEAN[], $15::BIGINT[],
+                 $16::INTEGER[], $17::INTEGER[], $18::INTEGER[], $19::JSONB[], $20::JSONB[],
+                 $21::JSONB[], $22::TEXT[], $23::TEXT[], $24::BOOLEAN[], $25::INTEGER[],
+                 $26::INTEGER[], $27::INTEGER[], $28::INTEGER[], $29::INTEGER[]
+             ) AS input(
+                 template_name, content_hash, runtime, arch, runtime_version, guest_os,
+                 state_format_name, state_format_version, execution_metadata, built_at,
+                 artifact_size_bytes, cache_size_bytes, has_base_snapshot, base_snapshot_size_bytes,
+                 pool_target, pool_current, pool_pending, pool_sandbox_ids, snapshots,
+                 default_auto_lifecycle_json, default_auto_lifecycle_authority,
+                 network_policy_authority, ensure_base_snapshot, snapshot_vcpu,
+                 snapshot_memory_mib, vcpu, memory_mib, disk_size_mb)
          ),
          known_templates AS (
              SELECT name, desired_state
@@ -232,12 +218,86 @@ const UPSERT_TEMPLATE_INVENTORY: &str = sql!(
 pub(crate) async fn upsert(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
+    claims: &[TemplateInventoryClaim],
 ) -> Result<Vec<AcceptedTemplateInventoryRow>, UpsertTemplateInventoryError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     sqlx::query_as::<_, AcceptedTemplateInventoryRow>(UPSERT_TEMPLATE_INVENTORY)
         .bind(node_id)
-        .bind(rows_json)
+        .bind(column_values(claims, |claim| claim.name.as_str()))
+        .bind(column_values(claims, |claim| claim.content_hash.as_str()))
+        .bind(column_values(claims, TemplateInventoryClaim::runtime))
+        .bind(column_values(claims, TemplateInventoryClaim::arch))
+        .bind(column_values(claims, |claim| {
+            claim
+                .execution
+                .as_ref()
+                .map(|execution| execution.runtime_version.as_str())
+        }))
+        .bind(column_values(claims, |claim| {
+            claim
+                .execution
+                .as_ref()
+                .map(|execution| execution.guest_os.as_str())
+        }))
+        .bind(column_values(claims, |claim| {
+            claim
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.state_format_name.as_deref())
+        }))
+        .bind(column_values(claims, |claim| {
+            claim
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.state_format_version.as_deref())
+        }))
+        .bind(column_values(claims, |claim| {
+            claim
+                .execution
+                .as_ref()
+                .map(|execution| Json(&execution.metadata))
+        }))
+        .bind(column_values(claims, TemplateInventoryClaim::built_at))
+        .bind(column_values(claims, |claim| claim.artifact_size_bytes))
+        .bind(column_values(claims, |claim| claim.cache_size_bytes))
+        .bind(column_values(claims, |claim| claim.has_base_snapshot))
+        .bind(column_values(claims, |claim| {
+            claim.base_snapshot_size_bytes
+        }))
+        .bind(column_values(claims, |claim| claim.pool_target))
+        .bind(column_values(claims, |claim| claim.pool_current))
+        .bind(column_values(claims, |claim| claim.pool_pending))
+        .bind(column_values(claims, |claim| Json(&claim.pool_sandbox_ids)))
+        .bind(column_values(claims, |claim| Json(&claim.snapshots)))
+        .bind(column_values(claims, |claim| {
+            claim.default_auto_lifecycle.as_ref().map(Json)
+        }))
+        .bind(column_values(claims, |claim| {
+            claim
+                .default_auto_lifecycle_authority
+                .map(|authority| authority.as_str())
+        }))
+        .bind(column_values(claims, |claim| {
+            claim
+                .network_policy_authority
+                .map(|authority| authority.as_str())
+        }))
+        .bind(column_values(claims, |claim| claim.ensure_base_snapshot))
+        .bind(column_values(claims, |claim| claim.snapshot_vcpu))
+        .bind(column_values(claims, |claim| claim.snapshot_memory_mib))
+        .bind(column_values(claims, |claim| claim.vcpu))
+        .bind(column_values(claims, |claim| claim.memory_mib))
+        .bind(column_values(claims, |claim| claim.disk_size_mb))
         .fetch_all(&mut *conn)
         .await
         .map_err(UpsertTemplateInventoryError::Upsert)
+}
+
+fn column_values<'a, T>(
+    claims: &'a [TemplateInventoryClaim],
+    field: impl FnMut(&'a TemplateInventoryClaim) -> T,
+) -> Vec<T> {
+    claims.iter().map(field).collect()
 }

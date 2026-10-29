@@ -2,6 +2,8 @@ use pplx_space_common_core::{sql, types::NodeId};
 use pplx_space_common_svc::types::FACET_NETWORK_POLICY;
 use sqlx::PgConnection;
 
+use crate::node_publish::validate::templates::PublishedTemplateName;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RemoveAbsentTemplatesError {
     #[error("delete absent published template: {0}")]
@@ -23,7 +25,7 @@ pub(crate) enum PruneTemplateCensusError {
 pub(crate) async fn remove_absent(
     conn: &mut PgConnection,
     node_id: NodeId,
-    absent_templates: &[&str],
+    absent_templates: &[PublishedTemplateName],
 ) -> Result<u64, RemoveAbsentTemplatesError> {
     if absent_templates.is_empty() {
         return Ok(0);
@@ -34,13 +36,18 @@ pub(crate) async fn remove_absent(
              WHERE node_id = $1 AND template_name = ANY($2)"
     ))
     .bind(node_id)
-    .bind(absent_templates)
+    .bind(
+        absent_templates
+            .iter()
+            .map(PublishedTemplateName::as_str)
+            .collect::<Vec<_>>(),
+    )
     .execute(&mut *conn)
     .await
     .map_err(RemoveAbsentTemplatesError::Inventory)?;
     let elements = absent_templates
         .iter()
-        .map(|template| format!("template:{template}"))
+        .map(|template| format!("template:{}", template.as_str()))
         .collect::<Vec<_>>();
     sqlx::query(sql!(
         "DELETE FROM node_facet_observed_status

@@ -206,12 +206,62 @@ async fn repeated_template_publish_does_not_rewrite_node_template_inventory() ->
     insert_ready_worker_node(&db.pool, node_id).await?;
 
     let mut state = template_state();
+    state.arch = Some("amd64".to_string());
     state.execution = Some((&test_execution()).into());
     let mut conn = db.pool.acquire().await?;
     let accepted =
         publish_template_states(&mut conn, node_id, NodeRole::Builder, &[state.clone()]).await?;
     assert_eq!(accepted, 1);
     drop(conn);
+
+    let metadata: serde_json::Value = sqlx::query_scalar(sql!(
+        "SELECT jsonb_build_object(
+             'runtime', runtime, 'arch', arch,
+             'built_at', built_at, 'artifact_size_bytes', artifact_size_bytes,
+             'cache_size_bytes', cache_size_bytes, 'has_base_snapshot', has_base_snapshot,
+             'base_snapshot_size_bytes', base_snapshot_size_bytes, 'pool_target', pool_target,
+             'pool_current', pool_current, 'pool_pending', pool_pending,
+             'pool_sandbox_ids', pool_sandbox_ids, 'snapshots', snapshots,
+             'default_auto_lifecycle_json', default_auto_lifecycle_json,
+             'default_auto_lifecycle_authority', default_auto_lifecycle_authority,
+             'network_policy_authority', network_policy_authority,
+             'ensure_base_snapshot', ensure_base_snapshot, 'snapshot_vcpu', snapshot_vcpu,
+             'snapshot_memory_mib', snapshot_memory_mib, 'vcpu', vcpu,
+             'memory_mib', memory_mib, 'disk_size_mb', disk_size_mb)
+         FROM node_template_inventory
+         WHERE node_id = $1 AND template_name = $2 AND content_hash = $3"
+    ))
+    .bind(node_id)
+    .bind("code-runtime")
+    .bind("sha256:abc")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        metadata,
+        serde_json::json!({
+            "runtime": "fc",
+            "arch": "amd64",
+            "built_at": "2026-05-07T00:00:00Z",
+            "artifact_size_bytes": 1234,
+            "cache_size_bytes": 2345,
+            "has_base_snapshot": true,
+            "base_snapshot_size_bytes": 5678,
+            "pool_target": 3,
+            "pool_current": 2,
+            "pool_pending": 1,
+            "pool_sandbox_ids": [],
+            "snapshots": [],
+            "default_auto_lifecycle_json": null,
+            "default_auto_lifecycle_authority": null,
+            "network_policy_authority": null,
+            "ensure_base_snapshot": true,
+            "snapshot_vcpu": 2,
+            "snapshot_memory_mib": 1024,
+            "vcpu": 4,
+            "memory_mib": 4096,
+            "disk_size_mb": 20480,
+        }),
+    );
 
     let component_ctid: String = sqlx::query_scalar(
         "SELECT ctid::TEXT

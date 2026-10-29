@@ -10,6 +10,10 @@ use crate::node_publish::validate::sandbox_metadata::PublishedRuntimeLabel;
 use crate::proto::PublishedTemplateState;
 use crate::{optional_trimmed, proto_network_policy_to_common, trimmed_required};
 
+pub(crate) use inventory::TemplateInventoryClaim;
+
+mod inventory;
+
 /// A publication name follows the open inventory grammar, not path-name rules.
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedTemplateName(String);
@@ -60,7 +64,7 @@ impl PublishedArchitectureLabel {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct TemplateSnapshotClaim {
+pub(crate) struct TemplateSnapshotClaim {
     vcpu: u32,
     memory_mib: u32,
     snapshot_hash: String,
@@ -228,6 +232,7 @@ impl TemplateClaim {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn legacy_row(&self) -> serde_json::Value {
         let execution = self.execution.as_ref();
         // Explicit builder descriptions win; workers fall back to execution evidence.

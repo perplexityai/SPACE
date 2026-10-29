@@ -188,15 +188,13 @@ pub(crate) async fn publish_validated_template_states(
     node_id: NodeId,
     plan: &TemplatePlan,
 ) -> Result<u64, ApplyTemplateClaimsError> {
-    let (absent_templates, rows) = plan.inventory.legacy_rows();
-    let mut accepted = template_pruning::remove_absent(conn, node_id, &absent_templates).await?;
+    let mut accepted = template_pruning::remove_absent(conn, node_id, &plan.absent).await?;
 
-    if rows.is_empty() {
+    if plan.inventory.is_empty() {
         return Ok(accepted);
     }
 
-    let rows_json = Json(serde_json::Value::Array(rows));
-    let accepted_rows = template_inventory::upsert(conn, node_id, &rows_json).await?;
+    let accepted_rows = template_inventory::upsert(conn, node_id, &plan.inventory).await?;
 
     template_components::prune(conn, node_id, &plan.component_scopes, &plan.component_keys).await?;
     template_components::upsert(conn, node_id, &plan.components).await?;

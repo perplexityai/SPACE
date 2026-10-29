@@ -4,7 +4,7 @@ use tonic::Status;
 use crate::proto::PublishedTemplateState;
 use claim::TemplateClaim;
 pub(in crate::node_publish) use claim::TemplateComponentSet;
-pub(crate) use claim::{PublishedTemplateName, TemplatePolicyClaim};
+pub(crate) use claim::{PublishedTemplateName, TemplateInventoryClaim, TemplatePolicyClaim};
 
 mod claim;
 
@@ -17,6 +17,15 @@ pub(crate) struct ValidatedTemplateInventory {
 }
 
 impl ValidatedTemplateInventory {
+    pub(in crate::node_publish) fn into_inventory(
+        self,
+    ) -> (Vec<PublishedTemplateName>, Vec<TemplateInventoryClaim>) {
+        (
+            self.absent_templates,
+            self.claims.into_iter().map(Into::into).collect(),
+        )
+    }
+
     pub(in crate::node_publish) fn take_policies(
         &mut self,
     ) -> impl Iterator<Item = TemplatePolicyClaim> + '_ {
@@ -57,6 +66,7 @@ impl ValidatedTemplateInventory {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn legacy_rows(&self) -> (Vec<&str>, Vec<serde_json::Value>) {
         (
             self.absent_templates

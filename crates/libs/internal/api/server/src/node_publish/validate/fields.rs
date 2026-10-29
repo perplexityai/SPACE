@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::{
-    ArtifactComponentKind, ArtifactOrigin, ExecutionMetadata, RuntimeKind,
+    ArtifactComponentKind, ArtifactOrigin, ExecutionMetadata, GuestPlatform, RuntimeKind,
 };
 use time::format_description::well_known::Rfc3339;
 use tonic::Status;
@@ -7,6 +7,7 @@ use tonic::Status;
 #[derive(Debug)]
 pub(crate) struct ExecutionProjection {
     runtime_kind: RuntimeKind,
+    guest: GuestPlatform,
     pub(crate) runtime: String,
     pub(crate) runtime_version: String,
     pub(crate) guest_os: String,
@@ -20,6 +21,10 @@ pub(crate) struct ExecutionProjection {
 impl ExecutionProjection {
     pub(crate) fn runtime_kind(&self) -> RuntimeKind {
         self.runtime_kind
+    }
+
+    pub(crate) fn guest(&self) -> GuestPlatform {
+        self.guest
     }
 }
 
@@ -55,6 +60,7 @@ fn projection_from_execution(execution: ExecutionMetadata) -> Result<ExecutionPr
         .collect();
     Ok(ExecutionProjection {
         runtime_kind: execution.runtime().kind,
+        guest: execution.guest(),
         runtime: execution.runtime().kind.alias().to_string(),
         runtime_version: execution.runtime().version.to_string(),
         guest_os: execution.guest().os.to_string(),
