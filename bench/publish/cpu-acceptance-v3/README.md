@@ -55,6 +55,9 @@ are not established by these results.
 
 | Application head | Same-lane reference | PostgreSQL CPU median, ms/publish | Reduction |
 | --- | --- | ---: | ---: |
+| [23c27a10](head-23c27a10/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 3.398 | -1.7975% |
+| [80a369e3](head-80a369e3/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 3.371 | -1.2921% |
+| [b91ad676](head-b91ad676/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.361 | -2.0650% |
 | [3be0baa7](head-3be0baa7/README.md) | [Lane D](baseline-lane-d/README.md) | 3.319 → 3.334 | -0.4519% |
 | [d5d873c4](head-d5d873c4/README.md) | [Lane E](baseline-lane-e/README.md) | 3.338 → 3.380 | -1.2582% |
 | [487d04e6](head-487d04e6/README.md) | [Lane F](baseline-lane-f/README.md) | 3.336 → 3.335 | 0.0300% |
