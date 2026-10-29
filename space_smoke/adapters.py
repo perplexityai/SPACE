@@ -44,6 +44,7 @@ from space_smoke.capabilities import (
     CensusPublication,
     FencePolicy,
     NodeSnapshot,
+    NodeCtlFacetRun,
     NodeCtlIdentity,
     NodeTemplatePresence,
     PendingBackupRow,
@@ -531,7 +532,7 @@ NODE_API = "node-api"
 # (`unanswered_template_evict_after` in node-ctl's template desired-state facet).
 WORKER_NODE_CTL_DAEMONSET = f"space-{NODE_CTL}"
 UNANSWERED_TEMPLATE_EVICT_AFTER_ENV = "SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS"
-UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS = (60, 600)
+UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS = (10, 600)
 NODE_TEMPLATE_PRESENCE_PREFIX = "space.pplx.net/template-build-"
 # The node services that read the object store, by DaemonSet and the
 # container that does: each holds the store's static keys in
@@ -5431,6 +5432,30 @@ ON CONFLICT (key_hash) DO NOTHING;
             annotations={
                 str(k): str(v) for k, v in annotations.items() if str(k).startswith(NODE_TEMPLATE_PRESENCE_PREFIX)
             },
+        )
+
+    def reconcile_node_ctl_facet(self, node_name: str, facet: str) -> None:
+        _require_ok(
+            self._node_shell_exec(node_name, f"space-nodectl reconcile --facet {shlex.quote(facet)}", timeout=30),
+            f"reconcile node-ctl facet {facet} on {node_name}",
+        )
+
+    def node_ctl_facet_run(self, node_name: str, facet: str) -> NodeCtlFacetRun:
+        result = self._node_shell_exec(
+            node_name, f"space-nodectl facet status {shlex.quote(facet)} --json", timeout=30
+        )
+        state = json.loads(_require_ok(result, f"read node-ctl facet {facet} status on {node_name}") or "{}")
+        inbound = next(
+            (entry.get("inbound") for entry in state.get("facets") or [] if entry.get("facet") == facet), None
+        )
+        if not inbound:
+            raise RuntimeError(f"node-ctl on {node_name} reports no inbound status for facet {facet}")
+        return NodeCtlFacetRun(
+            last_started_at=int(inbound["last_started_at_unix_secs"]),
+            last_completed_at=int(inbound["last_completed_at_unix_secs"]),
+            last_success_at=int(inbound["last_success_at_unix_secs"]),
+            running=bool(inbound["running"]),
+            last_error=str(inbound.get("last_error") or ""),
         )
 
     def node_ctl_log(self, node_name: str, *, since_time: str) -> str:

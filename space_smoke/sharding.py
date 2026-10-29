@@ -108,9 +108,9 @@ _DURATION_SECONDS = {
         # budget and 60 s grace.
         "local.template_cache_lru_eviction_reclaims": 92,
         "local.template_startup_recovery_decision_table": 45,
-        # Two Kind bench runs: 299 s, of which 130 s is the hold with the
-        # sandbox running and 101 s the 60 s wait plus the syncs around it.
-        "local.unanswered_template_deleted_after_wait": 300,
+        # A Kind bench run with the 20 s wait took 116 s, 29 s of it the two
+        # node-ctl rollouts (95-96 s with a 10 s wait).
+        "local.unanswered_template_deleted_after_wait": 116,
         "network_policy.v1_cidr_allow": 11,
         "network_policy.v1_cidr_deny": 13,
         "network_policy.v1_deny_precedes_allow": 11,

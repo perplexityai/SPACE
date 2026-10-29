@@ -803,6 +803,23 @@ class NodeTemplatePresence:
     annotations: Mapping[str, str]
 
 
+@dataclass(frozen=True)
+class NodeCtlFacetRun:
+    """One node-ctl inbound facet's latest run, from `space-nodectl facet status --json`.
+
+    Times are unix seconds, 0 before the first run. node-ctl runs one work
+    item at a time, so `running` false with `last_completed_at` no earlier
+    than `last_started_at` means the latest started run has finished, and
+    `last_success_at` equal to `last_completed_at` that it succeeded.
+    """
+
+    last_started_at: int
+    last_completed_at: int
+    last_success_at: int
+    running: bool
+    last_error: str
+
+
 class UnansweredTemplateEvictionControl(Protocol):
     """Kind-only operations for node-ctl's unanswered-template cleanup scenario.
 
@@ -814,7 +831,9 @@ class UnansweredTemplateEvictionControl(Protocol):
     captured literal back. The observables are what an operator reads on the
     worker: `space-tmplmgr list`, the template's digest directories, and the
     Node's template-build labels and annotations. node-ctl's log is failure
-    evidence only.
+    evidence only. Instead of waiting for node-ctl's poll, the scenario runs
+    the template desired-state facet on demand and reads the facet's status
+    to know the run finished.
     """
 
     def acquire_node_ctl_mutation(self) -> Callable[[], None]:
@@ -826,7 +845,7 @@ class UnansweredTemplateEvictionControl(Protocol):
         ...
 
     def set_unanswered_template_evict_after(self, seconds: int) -> None:
-        """Set the wait and await the rollout; refuses a value outside 60..600 s."""
+        """Set the wait and await the rollout; refuses a value outside 10..600 s."""
         ...
 
     def restore_unanswered_template_evict_env(self, standing: str | None) -> None:
@@ -850,6 +869,20 @@ class UnansweredTemplateEvictionControl(Protocol):
         ...
 
     def node_template_presence(self, node_name: str) -> NodeTemplatePresence: ...
+
+    def reconcile_node_ctl_facet(self, node_name: str, facet: str) -> None:
+        """Have that node's node-ctl run inbound `facet` at full scope now (`space-nodectl reconcile`).
+
+        node-ctl's `RefreshFacetState` with no element: the run a poll makes
+        for that facet, followed by an outbound sync. It only enqueues the
+        run; read `node_ctl_facet_run` to see it finish. Raises if node-ctl
+        did not take the request.
+        """
+        ...
+
+    def node_ctl_facet_run(self, node_name: str, facet: str) -> NodeCtlFacetRun:
+        """That node's node-ctl status for inbound `facet`'s latest run."""
+        ...
 
     def node_ctl_log(self, node_name: str, *, since_time: str) -> str:
         """That worker's node-ctl log since `since_time`. Failure evidence only."""

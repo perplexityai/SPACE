@@ -15,6 +15,13 @@ node-ctl mutation Lease. It is not a chart value: on every scenario's bench
 it would also delete templates other scenarios plant on a worker and the
 cluster does not know.
 
+The scenario does not wait for node-ctl's poll. It runs the facet on
+demand with `space-nodectl reconcile --facet template-desired-state`, which
+runs it at full scope, the only scope that deletes, and reads the facet's
+status to know when a run that started after the request has finished (see
+`full_sync`). Every timing claim is then made against such a run's monotonic
+bounds rather than against the poll period.
+
 The observables are what an operator reads on the worker:
 `space-tmplmgr list`, the template's digest directories, and the Node's
 template-build label and annotation. node-ctl's log is attached to a
@@ -38,11 +45,12 @@ if TYPE_CHECKING:
 
 # node-ctl runs a full sync on every poll tick, the first at start; Kind
 # renders the binary's default poll (`DEFAULT_NODE_CTL_POLL_INTERVAL`). A
-# delete lands on the first full sync at least the wait after the first
-# omitted answer, which can be one sync after the sandbox left, and a sync
-# whose clock reads just under the wait defers it one more.
+# run asked for on demand waits behind a poll already running, and node-ctl
+# publishes its inventory (the Node's template-build metadata) on the
+# outbound sync after either, so a poll period bounds both.
 FULL_SYNC_SECONDS = 60
 POLL_SECONDS = 5
+TEMPLATE_DESIRED_STATE_FACET = "template-desired-state"
 
 
 @dataclass(frozen=True)
@@ -102,12 +110,8 @@ class UnansweredTemplateEvictionAssertions:
             raise
         self.restore_standing()
 
-    def shorten_wait(self, *, seconds: int, workers: tuple[str, ...]) -> float:
-        """Set the wait on the worker node-ctl DaemonSet; returns when its pods restarted with it.
-
-        The return value is a monotonic time no earlier than every rolled
-        node-ctl's first full sync.
-        """
+    def shorten_wait(self, *, seconds: int, workers: tuple[str, ...]) -> None:
+        """Set the wait on the worker node-ctl DaemonSet; returns when its pods restarted with it."""
 
         release = self._control.acquire_node_ctl_mutation()
         self._release_lease = self._scope.defer(
@@ -131,7 +135,6 @@ class UnansweredTemplateEvictionAssertions:
             critical=True,
         )
         self._control.set_unanswered_template_evict_after(seconds)
-        rolled_at = time.monotonic()
         running = {node: self._control.running_unanswered_template_evict_env(node) for node in workers}
         self._fixture.verify(
             all(value == str(seconds) for value in running.values()),
@@ -140,7 +143,6 @@ class UnansweredTemplateEvictionAssertions:
             running=running,
         )
         self._wait_seconds = seconds
-        return rolled_at
 
     def restore_standing(self) -> None:
         """Put the captured literal back now and check it took; then release the Lease.
@@ -221,64 +223,177 @@ class UnansweredTemplateEvictionAssertions:
 
         polls = 0
         while True:
-            held = self.expect_held(copy.node_name, copy.template)
+            self._expect_unchanged(copy, "the worker's copy of the template changed while its sandbox ran")
             polls += 1
-            self._fixture.verify(
-                held == copy,
-                "the worker's copy of the template changed while its sandbox ran",
-                before=asdict(copy),
-                after=asdict(held),
-                failure_evidence=lambda: self._evidence(copy.node_name),
-            )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._fixture.record("held_polls", polls)
                 return
             self._fixture.wait(min(15, remaining))
 
-    def expect_deleted_after_wait(self, copy: LocalTemplate, *, since: float) -> float:
-        """The worker drops the copy no sooner than the wait after `since`, and within two more syncs.
+    def _expect_unchanged(self, copy: LocalTemplate, message: str) -> None:
+        held = self.expect_held(copy.node_name, copy.template)
+        self._fixture.verify(
+            held == copy,
+            message,
+            before=asdict(copy),
+            after=asdict(held),
+            failure_evidence=lambda: self._evidence(copy.node_name),
+        )
 
-        Returns the seconds from `since` to the first poll that found it gone.
+    # --- on-demand full syncs -----------------------------------------------------
+
+    def full_sync(self, node_name: str) -> float:
+        """Run the worker's template desired-state facet at full scope now; return once a run
+        that started after this call has finished and succeeded, with a monotonic time no
+        earlier than its end.
+
+        The facet's status has one-second resolution and also moves for
+        node-ctl's own poll. The status read first names the latest run's
+        start second; the request goes out a second after that read, so the
+        run it starts has a later start second; and the call returns only on
+        a finished, successful run with a later start second than the read's,
+        which therefore started after the read. That run is the requested one
+        or a poll that began in between, which is also a full-scope run.
+        Element-scoped runs of this facet come from cluster triggers for a
+        template's admin writes or its first appearance in the node's
+        inventory, neither of which overlaps the scenario's syncs. A failed
+        run fails the call: it may have stopped before the deletes, and a
+        check after it would show nothing.
+        """
+
+        before = self._control.node_ctl_facet_run(node_name, TEMPLATE_DESIRED_STATE_FACET)
+        self._fixture.wait(1)
+        self._control.reconcile_node_ctl_facet(node_name, TEMPLATE_DESIRED_STATE_FACET)
+        deadline = time.monotonic() + FULL_SYNC_SECONDS
+        while True:
+            run = self._control.node_ctl_facet_run(node_name, TEMPLATE_DESIRED_STATE_FACET)
+            if (
+                run.last_started_at > before.last_started_at
+                and not run.running
+                and run.last_completed_at >= run.last_started_at
+            ):
+                completed_at = time.monotonic()
+                self._fixture.verify(
+                    run.last_success_at == run.last_completed_at,
+                    "worker node-ctl's on-demand template desired-state run failed",
+                    node=node_name,
+                    run=asdict(run),
+                    failure_evidence=lambda: self._evidence(node_name),
+                )
+                return completed_at
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "worker node-ctl did not finish an on-demand template desired-state run "
+                f"within {FULL_SYNC_SECONDS} s",
+                node=node_name,
+                before=asdict(before),
+                latest=asdict(run),
+                failure_evidence=lambda: self._evidence(node_name),
+            )
+            self._fixture.wait(0.5)
+
+    def expect_held_past_wait(self, copy: LocalTemplate) -> None:
+        """While a sandbox of the template runs: a full sync, the wait, another, and the copy unchanged.
+
+        The second run starts at least the wait after the first finished, so a
+        template the first run, or any before it, recorded as left out is due
+        in the second, which would delete it.
+        """
+
+        first = self.full_sync(copy.node_name)
+        self.expect_held_until(copy, first + self.wait_seconds)
+        self.full_sync(copy.node_name)
+        self._expect_unchanged(copy, "the worker's copy of the template changed while its sandbox ran")
+
+    def expect_held_before_wait(self, copy: LocalTemplate, *, since: float) -> float:
+        """After the sandbox left: a full sync, another, and the copy unchanged, all before the wait has passed.
+
+        `since` is a monotonic time no later than the first answer that left
+        the template out, which is taken before the sandbox delete. A run
+        before `since` plus the wait cannot find the template due, so a copy
+        gone by then went early. Returns the first run's end, by which
+        node-ctl has recorded the omission.
         """
 
         wait = self.wait_seconds
-        earliest = wait - POLL_SECONDS - 10
-        deadline = since + wait + 2 * FULL_SYNC_SECONDS + 30
+        recorded = self.full_sync(copy.node_name)
+        early = self.full_sync(copy.node_name)
+        held, current, seen = self._holding(copy.node_name, copy.template)
+        checked_after = time.monotonic() - since
+        # Past the wait a poll may delete the copy, rightly; the check would no
+        # longer tell an early delete from that.
+        self._fixture.verify(
+            checked_after < wait,
+            "the syncs after the sandbox left and the check of the copy took longer than the wait, "
+            "so they cannot show the worker keeps the template until then; lengthen the scenario's wait",
+            wait_seconds=wait,
+            checked_after_seconds=round(checked_after, 1),
+        )
+        self._fixture.verify(
+            held and current == copy,
+            "the worker deleted or changed its copy of the template before the wait had passed",
+            wait_seconds=wait,
+            before=asdict(copy),
+            seen=seen,
+            failure_evidence=lambda: self._evidence(copy.node_name),
+        )
+        self._fixture.record("early_sync_completed_after_seconds", round(early - since, 1))
+        return recorded
+
+    def expect_deleted_after_wait(self, copy: LocalTemplate, *, recorded: float, since: float) -> None:
+        """A full sync once the wait has passed since `recorded` deletes the local copy; the Node's
+        template-build metadata clears within a poll period after it.
+
+        By `recorded` node-ctl had recorded the omission, so a run starting
+        the wait later finds the template due. The builds were last used
+        before it too: the sandbox's `GetTemplate` at create, and any touch
+        by a node-ctl run, which needs an answer still naming the template,
+        so a run that read the cluster before the sandbox was gone; node-ctl
+        runs one work item at a time, and the run that ended at `recorded`
+        was asked for after that. template-manager's idle bound is the wait,
+        so it finds every build idle. `since` dates the delete in the
+        evidence.
+        """
+
+        wait = self.wait_seconds
+        remaining = recorded + wait - time.monotonic()
+        if remaining > 0:
+            self._fixture.wait(remaining)
+        deleting = self.full_sync(copy.node_name)
+        names = self._control.local_template_names(copy.node_name)
+        digests = self._control.template_digest_dirs(copy.node_name, copy.template)
+        self._fixture.verify(
+            copy.template not in names and not digests,
+            "the worker still holds the template the cluster stopped answering for "
+            "after a full sync past the wait",
+            wait_seconds=wait,
+            listed=copy.template in names,
+            digests=list(digests),
+            failure_evidence=lambda: self._evidence(copy.node_name),
+        )
+        self._fixture.record("deleted_after_seconds", round(deleting - since, 1))
+        # node-ctl publishes the Node's metadata on the outbound sync after the
+        # run, or a poll's if that publication failed.
+        deadline = time.monotonic() + FULL_SYNC_SECONDS + POLL_SECONDS
         while True:
-            names = self._control.local_template_names(copy.node_name)
-            digests = self._control.template_digest_dirs(copy.node_name, copy.template)
             presence = self._control.node_template_presence(copy.node_name)
             left = {
-                "listed": copy.template in names,
-                "digests": sorted(set(digests)),
                 "labels": sorted(set(copy.presence_keys) & presence.labels),
                 "annotations": sorted(set(copy.presence_keys) & set(presence.annotations)),
             }
-            elapsed = time.monotonic() - since
-            # The local copy is judged on its own: Node metadata can trail it,
-            # and an early delete must not hide behind that lag.
-            if not left["listed"] and not left["digests"]:
-                self._fixture.verify(
-                    elapsed >= earliest,
-                    "the worker deleted its copy of the template before the wait had passed",
-                    wait_seconds=wait,
-                    deleted_after_seconds=round(elapsed, 1),
-                    failure_evidence=lambda: self._evidence(copy.node_name),
-                )
             if not any(left.values()):
-                self._fixture.record("deleted_after_seconds", round(elapsed, 1))
-                return elapsed
+                self._fixture.record(
+                    "node_metadata_cleared_after_seconds", round(time.monotonic() - deleting, 1)
+                )
+                return
             self._fixture.verify(
                 time.monotonic() < deadline,
-                "the worker still holds the template the cluster stopped answering for "
-                "after the wait and two full syncs",
-                wait_seconds=wait,
-                waited_seconds=round(elapsed, 1),
+                "the worker's Node still advertises the template's builds a poll period after it deleted them",
                 still_present=left,
                 failure_evidence=lambda: self._evidence(copy.node_name),
             )
-            self._fixture.wait(POLL_SECONDS)
+            self._fixture.wait(1)
 
     def _evidence(self, node_name: str) -> dict[str, object]:
         return {"node_ctl_log": self._control.node_ctl_log(node_name, since_time=self._since_time)[-20_000:]}
