@@ -15,8 +15,8 @@ MARKER = "space-smoke-unanswered-template-ok"
 
 # The template is a minimal run-owned build no worker prefetches, so only
 # this scenario's sandboxes give a worker a reason to hold it, and the
-# cluster stops answering for it once they are gone. The wait is node-ctl's
-# one-hour default shortened by a test hook on the worker node-ctl
+# cluster releases it once they are gone. The wait is node-ctl's one-hour
+# default shortened through an env override on the worker node-ctl
 # DaemonSet, scoped to the body and put back in its own phase, and each
 # check follows a full sync run on demand rather than node-ctl's poll (see
 # `space_smoke.unanswered_template_eviction`). The other worker is cordoned
@@ -26,7 +26,6 @@ MARKER = "space-smoke-unanswered-template-ok"
     # The template build, two worker node-ctl rollouts and the hold past the
     # wait with the sandbox running.
     sandbox=smoke.SandboxConfig(timeout=900, kind_dedicated_template=True),
-    test_hooks="SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS; release waits an hour",
 )
 def unanswered_template_deleted_after_wait(test: smoke.KindEcw) -> None:
     """With node-ctl's unanswered-template wait shortened, a worker keeps an

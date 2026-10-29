@@ -29,8 +29,6 @@ kubernetes = [
     "pplx-space-common-core/kubernetes",
     "pplx-space-common-svc/k8s",
 ]
-# Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-common-core/test-hooks"]
 
 [dependencies]
 dashmap = { workspace = true }

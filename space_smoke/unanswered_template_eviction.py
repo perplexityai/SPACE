@@ -2,18 +2,19 @@
 
 ClusterApi answers a worker's template desired-state request only for the
 templates the worker has a reason to hold. An org template whose last
-sandbox left the worker is omitted from every answer, and node-ctl records
-when it first was. After the wait, on a full sync, it asks about that
-template again, together with one the same answer named, and, still omitted,
-has template-manager delete it with `DeleteIdleTemplate`
-(crates/libs/node/ctl/server/src/facets/template_desired_state.rs).
+sandbox left the worker, which the worker still reports holding, comes back
+in the answer's `released_templates` instead, and node-ctl records when it
+first did. After the wait, on a full sync, node-ctl asks about that template
+again and, still released, has template-manager delete it with
+`DeleteIdleTemplate` (crates/libs/node/ctl/server/src/facets/
+unanswered_templates.rs).
 
 The wait is an hour and is read once at start, so the scenario scopes a
-short one to itself: the worker node-ctl DaemonSet's literal for the test
-hook is captured, overridden, and put back in a scenario phase, under the
-node-ctl mutation Lease. It is not a chart value: on every scenario's bench
-it would also delete templates other scenarios plant on a worker and the
-cluster does not know.
+short one to itself: the worker node-ctl DaemonSet's literal for
+`SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS` is captured, overridden,
+and put back in a scenario phase, under the node-ctl mutation Lease. It is
+not a chart value: on every scenario's bench it would also delete the
+dedicated templates other scenarios leave on a worker between sandboxes.
 
 The scenario does not wait for node-ctl's poll. It runs the facet on
 demand with `space-nodectl reconcile --facet template-desired-state`, which

@@ -824,11 +824,11 @@ class UnansweredTemplateEvictionControl(Protocol):
     """Kind-only operations for node-ctl's unanswered-template cleanup scenario.
 
     A worker's node-ctl waits an hour before deleting a local template the
-    cluster stopped answering for, and reads that wait once at start, so the
-    scenario overrides one env key on the worker node-ctl DaemonSet
-    (`SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS`, a test hook, to a
-    bounded number of seconds) under its own mutation Lease and puts the
-    captured literal back. The observables are what an operator reads on the
+    cluster released, and reads that wait once at start, so the scenario
+    overrides one env key on the worker node-ctl DaemonSet
+    (`SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS`, to a bounded number
+    of seconds) under its own mutation Lease and puts the captured literal
+    back. The observables are what an operator reads on the
     worker: `space-tmplmgr list`, the template's digest directories, and the
     Node's template-build labels and annotations. node-ctl's log is failure
     evidence only. Instead of waiting for node-ctl's poll, the scenario runs

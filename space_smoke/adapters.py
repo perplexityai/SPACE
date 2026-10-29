@@ -528,8 +528,8 @@ NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
 NODE_API = "node-api"
 # The worker node-ctl DaemonSet (release `space`) and the one env key the
-# unanswered-template scenario may set on it, a test hook read once at start
-# (`unanswered_template_evict_after` in node-ctl's template desired-state facet).
+# unanswered-template scenario may set on it, read once at start
+# (`unanswered_template_evict_after` in node-ctl's facets/unanswered_templates.rs).
 WORKER_NODE_CTL_DAEMONSET = f"space-{NODE_CTL}"
 UNANSWERED_TEMPLATE_EVICT_AFTER_ENV = "SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS"
 UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS = (10, 600)

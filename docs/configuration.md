@@ -184,6 +184,7 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_TEMPLATE_PREFETCH_TAGS` | `seed:latest`, `code-runtime:latest` | |
 | `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | retired | Ignored; prefetch requires confirmed generic visibility. |
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
+| `SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS` | 3600 | node-ctl on workers: how long the cluster must keep releasing a local template (present, held by the node, but with no sandbox, generic visibility or warm pool to justify it) before the worker deletes its copy. 0 or an invalid value turns these deletes off. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
 | `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. A tenant-list account must likewise present the grant the API issued before dispatching that organization's build of that template, from the builder node the grant is bound to; it authorizes one release. |
