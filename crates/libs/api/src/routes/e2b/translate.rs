@@ -779,6 +779,28 @@ pub(super) fn build_detail_sandbox(
     let metadata = sandbox_metadata(sandbox, native);
 
     Ok(SandboxDetailE2b {
+        ownership: match sandbox.owner_source {
+            pplx_space_common_core::types::SandboxOwnerSource::Local => {
+                crate::e2b::schema::SandboxOwnershipE2b::Local
+            }
+            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => {
+                let invalid = || E2bApiError::internal("Invalid sandbox ownership");
+                crate::e2b::schema::SandboxOwnershipE2b::FederatedIdentity {
+                    issuer: sandbox
+                        .upstream_issuer
+                        .as_deref()
+                        .ok_or_else(invalid)?
+                        .parse()
+                        .map_err(|_| invalid())?,
+                    org_id: sandbox
+                        .upstream_org_id
+                        .as_deref()
+                        .ok_or_else(invalid)?
+                        .parse()
+                        .map_err(|_| invalid())?,
+                }
+            }
+        },
         template_id: sandbox_template_id(sandbox, native, &runtime_spec),
         alias: None,
         sandbox_id: sandbox.id.to_string(),

@@ -312,8 +312,21 @@ pub mod schema {
         Error { error: SandboxForkErrorE2b },
     }
 
+    /// Stored ownership, independent of caller-editable sandbox metadata.
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(tag = "source", rename_all = "snake_case")]
+    pub enum SandboxOwnershipE2b {
+        Local,
+        FederatedIdentity {
+            issuer: pplx_space_common_core::types::UpstreamIssuer,
+            #[serde(rename = "orgID")]
+            org_id: pplx_space_common_core::types::UpstreamOrgId,
+        },
+    }
+
     #[derive(Debug, Clone, Serialize)]
     pub struct SandboxDetailE2b {
+        pub ownership: SandboxOwnershipE2b,
         #[serde(rename = "templateID")]
         pub template_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
