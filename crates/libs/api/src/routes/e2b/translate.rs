@@ -46,7 +46,10 @@ pub(super) fn translate_create_request(
         .transpose()
         .map_err(|error| E2bApiError::bad_request(format!("invalid space.resources: {error}")))?
         .unwrap_or_default();
-    for (field, value) in [("vcpu", resources.vcpu), ("memory_mib", resources.memory_mib)] {
+    for (field, value) in [
+        ("vcpu", resources.vcpu),
+        ("memory_mib", resources.memory_mib),
+    ] {
         // Resource columns are signed 32-bit integers; reject before admission.
         if let Some(value) = value
             && (value == 0 || value > i32::MAX as u32)

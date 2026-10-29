@@ -1788,7 +1788,9 @@ fn create_translation_applies_resource_overrides() {
         ("{}", None, None),
     ] {
         let mut request = base_create_request();
-        request.metadata.insert("space.resources".into(), raw.into());
+        request
+            .metadata
+            .insert("space.resources".into(), raw.into());
         request.metadata.insert("purpose".into(), "example".into());
         let translated = translate_create_request(request).unwrap();
         assert_eq!(translated.native.vcpu, cpu);
@@ -1816,7 +1818,9 @@ fn create_translation_rejects_invalid_resource_overrides() {
         r#"{"memory_mb":8192}"#,
     ] {
         let mut request = base_create_request();
-        request.metadata.insert("space.resources".into(), raw.into());
+        request
+            .metadata
+            .insert("space.resources".into(), raw.into());
         assert_eq!(
             translate_create_request(request).unwrap_err().status,
             StatusCode::BAD_REQUEST,
