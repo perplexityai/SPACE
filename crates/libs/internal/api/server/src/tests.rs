@@ -7717,11 +7717,11 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
 
     // Inventory is what the node reports about itself, so holding a template
     // is not a placement. A held template the cluster keeps present but the
-    // node has no reason to hold is released; one the cluster does not know
-    // never is.
+    // node has no reason to hold is released. A template the cluster does not
+    // know, also requested, never is: inventory only lists known templates.
     sqlx::query(sql!(
         "INSERT INTO node_template_inventory (node_id, template_name)
-         VALUES ($1, 'private-base'), ($1, 'hand-registered')"
+         VALUES ($1, 'private-base')"
     ))
     .bind(host)
     .execute(pool)

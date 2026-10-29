@@ -61,7 +61,8 @@ pub(super) const UNANSWERED_TEMPLATE_RPC_TIMEOUT: Duration = Duration::from_secs
 
 /// Wall-clock budget for the deletes inside one sync, well inside the facet's
 /// stall watchdog so the desired-state applies that share the sync can never
-/// fail because of them. What is left waits for the next sync.
+/// fail because of them. No recheck or delete call runs past it; what is left
+/// waits for the next sync.
 pub(super) const UNANSWERED_TEMPLATE_SYNC_BUDGET: Duration = Duration::from_secs(20);
 
 /// What [`UnansweredTemplates::plan`] compares against.
@@ -242,11 +243,12 @@ pub(super) async fn delete_unanswered_templates(
             lock().forget(&template);
             continue;
         }
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             break;
         }
-        match tokio::time::timeout(
-            UNANSWERED_TEMPLATE_RPC_TIMEOUT,
+        match tokio::time::timeout_at(
+            deadline.min(now + UNANSWERED_TEMPLATE_RPC_TIMEOUT),
             calls.still_released(&template),
         )
         .await
@@ -280,8 +282,8 @@ pub(super) async fn delete_unanswered_templates(
             records.restart(&template, std::time::Instant::now());
             previous
         };
-        let result = tokio::time::timeout(
-            UNANSWERED_TEMPLATE_RPC_TIMEOUT,
+        let result = tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + UNANSWERED_TEMPLATE_RPC_TIMEOUT),
             calls.delete_idle(&template, after),
         )
         .await
