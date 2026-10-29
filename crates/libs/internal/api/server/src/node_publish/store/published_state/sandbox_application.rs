@@ -1,8 +1,8 @@
 use super::{
-    ApplySandboxClaimsError, BTreeSet, ClaimedQuarantineProjection, EncodeQuarantineInputError,
-    Json, NodeId, PostCommitSandboxEvent, QuarantineClaim, QuarantineProjectionSqlInput,
-    SandboxEventType, SandboxLifecycle, SandboxQuarantineReasonCode, SandboxTransitionTargetState,
-    emit_lifecycle_convergence_events, emit_node_published_state_events, lifecycle_transitions,
+    ApplySandboxClaimsError, BTreeSet, ClaimedQuarantineProjection, NodeId, PostCommitSandboxEvent,
+    QuarantineClaim, QuarantineSelectionClaim, SandboxEventType, SandboxLifecycle,
+    SandboxQuarantineReasonCode, SandboxTransitionTargetState, emit_lifecycle_convergence_events,
+    emit_node_published_state_events, lifecycle_transitions,
     project_node_published_suspended_sandboxes, quarantine_claims, quarantine_persistence,
 };
 use crate::node_publish::plan::lifecycle::PauseFailedRecoveryClaim;
@@ -125,38 +125,31 @@ pub(super) async fn project_quarantine(
     if !quarantine_inputs.is_empty() {
         let quarantine_sql_inputs = quarantine_inputs
             .iter()
-            .map(QuarantineProjectionSqlInput::materialize)
+            .map(QuarantineSelectionClaim::materialize)
             .collect::<Vec<_>>();
-        let quarantine_rows_json = Json(
-            serde_json::to_value(&quarantine_sql_inputs)
-                .map_err(EncodeQuarantineInputError::Input)?,
-        );
-        let claimed = quarantine_claims::select(conn, node_id, quarantine_rows_json).await?;
+        let claimed = quarantine_claims::select(conn, node_id, &quarantine_sql_inputs).await?;
         if !claimed.is_empty() {
             let claimed_sql = claimed
                 .iter()
-                .map(ClaimedQuarantineProjection::sql_projection)
+                .map(ClaimedQuarantineProjection::lifecycle_guard)
                 .collect::<Vec<_>>();
-            let claimed_json = Json(
-                serde_json::to_value(&claimed_sql).map_err(EncodeQuarantineInputError::Claimed)?,
-            );
-            let updated_ids = quarantine_claims::apply(conn, node_id, claimed_json).await?;
+            let updated_ids = quarantine_claims::apply(conn, node_id, &claimed_sql).await?;
             let updated_ids = updated_ids.into_iter().collect::<BTreeSet<_>>();
             let updated = claimed
                 .into_iter()
                 .filter(|row| updated_ids.contains(&row.sandbox_id))
                 .collect::<Vec<_>>();
             if !updated.is_empty() {
-                let updated_sql = updated
+                let state_records = updated
                     .iter()
-                    .map(ClaimedQuarantineProjection::sql_projection)
+                    .map(ClaimedQuarantineProjection::state_record)
                     .collect::<Vec<_>>();
-                let updated_json = Json(
-                    serde_json::to_value(&updated_sql)
-                        .map_err(EncodeQuarantineInputError::Updated)?,
-                );
-                quarantine_persistence::record_state(conn, node_id, &updated_json).await?;
-                quarantine_persistence::record_history(conn, node_id, &updated_json).await?;
+                quarantine_persistence::record_state(conn, node_id, &state_records).await?;
+                let history_records = updated
+                    .iter()
+                    .map(ClaimedQuarantineProjection::history_record)
+                    .collect::<Vec<_>>();
+                quarantine_persistence::record_history(conn, node_id, &history_records).await?;
                 quarantined_sandboxes = updated
                     .iter()
                     .map(|row| (row.sandbox_id, row.from_lifecycle.clone()))

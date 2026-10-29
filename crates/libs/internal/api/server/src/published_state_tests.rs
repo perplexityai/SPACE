@@ -12,7 +12,8 @@ use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db, try_pg_t
 use pplx_space_placement::StoredSandboxLifecycle;
 use pplx_space_sbx_mgr_client::proto::QuarantineRecoveryObservedOwner;
 use pplx_space_test_env::TestResult;
-use sqlx::PgPool;
+use sqlx::{PgPool, types::Json};
+use uuid::Uuid;
 
 #[path = "../tests/support/published_state.rs"]
 mod support;

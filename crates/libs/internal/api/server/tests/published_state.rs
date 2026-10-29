@@ -2875,7 +2875,7 @@ async fn publishing_owned_quarantined_sandbox_marks_central_lifecycle_and_record
 
     assert_eq!(accepted.accepted, 1);
     let (
-        sandbox_lifecycle,
+        central_lifecycle,
         observed_status,
         current_reason,
         current_source,
@@ -2915,7 +2915,7 @@ async fn publishing_owned_quarantined_sandbox_marks_central_lifecycle_and_record
     .await?;
 
     assert_eq!(observed_status, "quarantined");
-    assert_eq!(sandbox_lifecycle, "quarantined");
+    assert_eq!(central_lifecycle, "quarantined");
     assert_eq!(
         current_reason.as_deref(),
         Some("sync path found conflicting local artifacts")
@@ -2937,6 +2937,71 @@ async fn publishing_owned_quarantined_sandbox_marks_central_lifecycle_and_record
         history_reason.as_deref(),
         Some("sync path found conflicting local artifacts")
     );
+
+    // Neighboring nullable evidence must retain alignment, and existing,
+    // foreign-owned and deleted rows must not acquire another history entry.
+    let nullable_id = SandboxId::new();
+    let foreign_id = SandboxId::new();
+    let deleted_id = SandboxId::new();
+    let other_node = NodeId::new();
+    insert_ready_worker_node(&db.pool, other_node).await?;
+    insert_active_sandbox(&db.pool, nullable_id, node_id, "started").await?;
+    insert_active_sandbox(&db.pool, foreign_id, other_node, "started").await?;
+    insert_active_sandbox(&db.pool, deleted_id, node_id, "deleted").await?;
+    sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $1 WHERE id = $2"))
+        .bind(" Started ")
+        .bind(nullable_id)
+        .execute(&db.pool)
+        .await?;
+    let mut nullable = quarantined_sandbox_state(nullable_id);
+    nullable.failure_reason = None;
+    nullable.quarantine_reason_code = None;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[
+            quarantined_sandbox_state(sandbox_id),
+            nullable,
+            quarantined_sandbox_state(foreign_id),
+            quarantined_sandbox_state(deleted_id),
+        ],
+    )
+    .await?;
+    let nullable_evidence =
+        sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, bool)>(sql!(
+            "SELECT qs.entered_from_lifecycle, qs.reason_message, qh.message,
+                     qs.source, qs.reason_code, qs.quarantine_id = qh.quarantine_id
+              FROM sandbox_quarantine_state qs
+              JOIN sandbox_quarantine_history qh ON qh.sandbox_id = qs.sandbox_id
+              WHERE qs.sandbox_id = $1"
+        ))
+        .bind(nullable_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        nullable_evidence,
+        (
+            " Started ".to_owned(),
+            None,
+            None,
+            SandboxQuarantineSource::NodeStatePublish
+                .as_str()
+                .to_owned(),
+            SandboxQuarantineReasonCode::NodePublishedQuarantined
+                .as_str()
+                .to_owned(),
+            true,
+        ),
+    );
+    assert_eq!(sandbox_lifecycle(&db.pool, foreign_id).await?, "started");
+    assert_eq!(sandbox_lifecycle(&db.pool, deleted_id).await?, "deleted");
+    let history_count: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM sandbox_quarantine_history WHERE sandbox_id = ANY($1)"
+    ))
+    .bind([sandbox_id, nullable_id, foreign_id, deleted_id].as_slice())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(history_count, 2);
     Ok(())
 }
 

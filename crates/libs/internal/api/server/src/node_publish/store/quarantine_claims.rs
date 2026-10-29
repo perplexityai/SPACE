@@ -5,8 +5,35 @@ use pplx_space_common_core::{
         SandboxQuarantineVocabularyParseError,
     },
 };
-use sqlx::{PgConnection, types::Json};
+use sqlx::PgConnection;
 use uuid::Uuid;
+
+use super::quarantine_persistence::{QuarantineHistoryRecord, QuarantineStateRecord};
+use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
+
+/// Episode identifiers are storage-owned, not claims made by the node.
+#[derive(Debug)]
+pub(crate) struct QuarantineSelectionClaim<'a> {
+    sandbox_id: SandboxId,
+    failure_reason: Option<&'a str>,
+    source: SandboxQuarantineSource,
+    reason_code: SandboxQuarantineReasonCode,
+    quarantine_id: Uuid,
+    history_id: Uuid,
+}
+
+impl<'a> QuarantineSelectionClaim<'a> {
+    pub(crate) fn materialize(claim: &'a QuarantineClaim) -> Self {
+        Self {
+            sandbox_id: claim.sandbox_id(),
+            failure_reason: claim.failure_reason(),
+            source: claim.source(),
+            reason_code: claim.reason_code(),
+            quarantine_id: Uuid::now_v7(),
+            history_id: Uuid::now_v7(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClaimedQuarantineProjection {
@@ -19,25 +46,38 @@ pub(crate) struct ClaimedQuarantineProjection {
     history_id: Uuid,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct ClaimedQuarantineSqlProjection<'a> {
+/// The stored lifecycle text must match literally, without normalization.
+#[derive(Debug)]
+pub(crate) struct QuarantineLifecycleGuard<'a> {
     sandbox_id: SandboxId,
     from_lifecycle: &'a str,
-    failure_reason: &'a Option<String>,
-    source: &'a str,
-    reason_code: &'a str,
-    quarantine_id: Uuid,
-    history_id: Uuid,
 }
 
 impl ClaimedQuarantineProjection {
-    pub(crate) fn sql_projection(&self) -> ClaimedQuarantineSqlProjection<'_> {
-        ClaimedQuarantineSqlProjection {
+    pub(crate) fn lifecycle_guard(&self) -> QuarantineLifecycleGuard<'_> {
+        QuarantineLifecycleGuard {
             sandbox_id: self.sandbox_id,
             from_lifecycle: &self.from_lifecycle,
-            failure_reason: &self.failure_reason,
-            source: self.source.as_str(),
-            reason_code: self.reason_code.as_str(),
+        }
+    }
+
+    pub(crate) fn state_record(&self) -> QuarantineStateRecord<'_> {
+        QuarantineStateRecord {
+            sandbox_id: self.sandbox_id,
+            from_lifecycle: &self.from_lifecycle,
+            failure_reason: self.failure_reason.as_deref(),
+            source: self.source,
+            reason_code: self.reason_code,
+            quarantine_id: self.quarantine_id,
+        }
+    }
+
+    pub(crate) fn history_record(&self) -> QuarantineHistoryRecord<'_> {
+        QuarantineHistoryRecord {
+            sandbox_id: self.sandbox_id,
+            failure_reason: self.failure_reason.as_deref(),
+            source: self.source,
+            reason_code: self.reason_code,
             quarantine_id: self.quarantine_id,
             history_id: self.history_id,
         }
@@ -67,8 +107,11 @@ pub(crate) enum ApplyQuarantineClaimsError {
 pub(crate) async fn select(
     conn: &mut PgConnection,
     node_id: NodeId,
-    quarantine_rows_json: Json<serde_json::Value>,
+    claims: &[QuarantineSelectionClaim<'_>],
 ) -> Result<Vec<ClaimedQuarantineProjection>, SelectQuarantineClaimsError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     // Unlike failed projection, quarantine is a node-authored hold that
     // preserves local evidence and hot-node affiliation across substrates.
     // Quarantine is a stronger hold than cleanup/delete intent: it stops
@@ -86,19 +129,51 @@ pub(crate) async fn select(
                      input.quarantine_id,
                      input.history_id
                  FROM sandboxes s
-                 JOIN jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     failure_reason TEXT,
-                     source TEXT,
-                     reason_code TEXT,
-                     quarantine_id UUID,
-                     history_id UUID
+                 JOIN UNNEST(
+                     $2::UUID[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::UUID[], $7::UUID[]
+                 ) AS input(
+                     sandbox_id, failure_reason, source, reason_code, quarantine_id, history_id
                  ) ON input.sandbox_id = s.id
                  WHERE s.active_node_id = $1
                    AND LOWER(TRIM(s.lifecycle)) NOT IN ('quarantined', 'deleted')"
         ))
         .bind(node_id)
-        .bind(quarantine_rows_json)
+        .bind(
+            claims
+                .iter()
+                .map(|claim| claim.sandbox_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            claims
+                .iter()
+                .map(|claim| claim.failure_reason)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            claims
+                .iter()
+                .map(|claim| claim.source.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            claims
+                .iter()
+                .map(|claim| claim.reason_code.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            claims
+                .iter()
+                .map(|claim| claim.quarantine_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            claims
+                .iter()
+                .map(|claim| claim.history_id)
+                .collect::<Vec<_>>(),
+        )
         .fetch_all(&mut *conn)
         .await
         .map_err(SelectQuarantineClaimsError::Select)?;
@@ -138,22 +213,33 @@ pub(crate) async fn select(
 pub(crate) async fn apply(
     conn: &mut PgConnection,
     node_id: NodeId,
-    claimed_json: Json<serde_json::Value>,
+    claims: &[QuarantineLifecycleGuard<'_>],
 ) -> Result<Vec<SandboxId>, ApplyQuarantineClaimsError> {
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
     sqlx::query_scalar::<_, SandboxId>(sql!(
         "UPDATE sandboxes s
                  SET lifecycle = 'quarantined'
-                 FROM jsonb_to_recordset($1::jsonb) AS input(
-                     sandbox_id UUID,
-                     from_lifecycle TEXT
-                 )
+                 FROM UNNEST($1::UUID[], $3::TEXT[]) AS input(sandbox_id, from_lifecycle)
                  WHERE s.id = input.sandbox_id
                    AND s.active_node_id = $2
                    AND s.lifecycle = input.from_lifecycle
                  RETURNING s.id"
     ))
-    .bind(claimed_json)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
     .bind(node_id)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.from_lifecycle)
+            .collect::<Vec<_>>(),
+    )
     .fetch_all(&mut *conn)
     .await
     .map_err(ApplyQuarantineClaimsError::Update)

@@ -2,9 +2,7 @@ use pplx_space_common_core::types::{NodeId, SnapshotId};
 
 use std::collections::BTreeSet;
 
-use sqlx::types::Json;
 use tonic::Status;
-use uuid::Uuid;
 
 #[cfg(test)]
 use pplx_space_common_core::types::NodeRole;
@@ -27,7 +25,7 @@ use crate::node_publish::store::{
     absent_sandboxes, activity, degraded_observations, failure_episodes,
     inventory_reconcile::{self, enqueue as queue_policy_reconcile_refs_for_new_inventory},
     lifecycle_transitions, network_policy, observed_state,
-    quarantine_claims::{self, ClaimedQuarantineProjection},
+    quarantine_claims::{self, ClaimedQuarantineProjection, QuarantineSelectionClaim},
     quarantine_persistence, ready_suspend, sandbox_facet_observations, snapshot_inventory,
     suspend_finalization::{self, SuspendedFinalizationCandidate},
     template_components, template_inventory, template_network_policy, template_pruning,
@@ -51,29 +49,6 @@ use crate::sandbox_quarantine_store;
 
 #[path = "published_state/sandbox_application.rs"]
 mod sandbox_application;
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct QuarantineProjectionSqlInput<'a> {
-    sandbox_id: SandboxId,
-    failure_reason: Option<&'a str>,
-    source: &'static str,
-    reason_code: &'static str,
-    quarantine_id: Uuid,
-    history_id: Uuid,
-}
-
-impl<'a> QuarantineProjectionSqlInput<'a> {
-    fn materialize(claim: &'a QuarantineClaim) -> Self {
-        Self {
-            sandbox_id: claim.sandbox_id(),
-            failure_reason: claim.failure_reason(),
-            source: claim.source().as_str(),
-            reason_code: claim.reason_code().as_str(),
-            quarantine_id: Uuid::now_v7(),
-            history_id: Uuid::now_v7(),
-        }
-    }
-}
 
 /// Longest prefix of an invalid capture host CPU that reaches the log. The
 /// value is node-supplied and the begin request isn't authorized yet when it's
@@ -360,16 +335,6 @@ pub async fn publish_sandbox_states(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EncodeQuarantineInputError {
-    #[error("serialize quarantine input: {0}")]
-    Input(#[source] serde_json::Error),
-    #[error("serialize claimed quarantine input: {0}")]
-    Claimed(#[source] serde_json::Error),
-    #[error("serialize updated quarantine input: {0}")]
-    Updated(#[source] serde_json::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
 pub(crate) enum ApplySandboxClaimsError {
     #[error(transparent)]
     InventoryReconcile(#[from] inventory_reconcile::EnqueueInventoryReconcileError),
@@ -425,8 +390,6 @@ pub(crate) enum ApplySandboxClaimsError {
     SuspendedProjection(#[from] crate::sandbox_quarantine_store::SelectSuspendedProjectionsError),
     #[error(transparent)]
     RecoveryHistory(#[from] crate::sandbox_quarantine_store::RecordQuarantineRecoveryError),
-    #[error(transparent)]
-    QuarantineEncoding(#[from] EncodeQuarantineInputError),
 }
 
 /// Apply parsed node claims on the caller's connection. Lifecycle guards and

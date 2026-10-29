@@ -1,8 +1,32 @@
 use pplx_space_common_core::{
     sql,
-    types::{NodeId, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction},
+    types::{
+        NodeId, SandboxId, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+        SandboxQuarantineReasonCode, SandboxQuarantineSource,
+    },
 };
-use sqlx::{PgConnection, types::Json};
+use sqlx::PgConnection;
+use uuid::Uuid;
+
+#[derive(Debug)]
+pub(crate) struct QuarantineStateRecord<'a> {
+    pub(super) sandbox_id: SandboxId,
+    pub(super) from_lifecycle: &'a str,
+    pub(super) failure_reason: Option<&'a str>,
+    pub(super) source: SandboxQuarantineSource,
+    pub(super) reason_code: SandboxQuarantineReasonCode,
+    pub(super) quarantine_id: Uuid,
+}
+
+#[derive(Debug)]
+pub(crate) struct QuarantineHistoryRecord<'a> {
+    pub(super) sandbox_id: SandboxId,
+    pub(super) failure_reason: Option<&'a str>,
+    pub(super) source: SandboxQuarantineSource,
+    pub(super) reason_code: SandboxQuarantineReasonCode,
+    pub(super) quarantine_id: Uuid,
+    pub(super) history_id: Uuid,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RecordStateError {
@@ -22,8 +46,11 @@ pub(crate) enum RecordHistoryError {
 pub(crate) async fn record_state(
     conn: &mut PgConnection,
     node_id: NodeId,
-    updated_json: &Json<serde_json::Value>,
+    records: &[QuarantineStateRecord<'_>],
 ) -> Result<bool, RecordStateError> {
+    if records.is_empty() {
+        return Ok(false);
+    }
     let result = sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_state (
                          sandbox_id, quarantine_id, entered_at, updated_at,
@@ -42,13 +69,11 @@ pub(crate) async fn record_state(
                          jsonb_build_object('node_id', $3::TEXT),
                          $2,
                          $1
-                     FROM jsonb_to_recordset($4::jsonb) AS input(
-                         sandbox_id UUID,
-                         from_lifecycle TEXT,
-                         failure_reason TEXT,
-                         source TEXT,
-                         reason_code TEXT,
-                         quarantine_id UUID
+                     FROM UNNEST(
+                         $4::UUID[], $5::TEXT[], $6::TEXT[], $7::TEXT[], $8::TEXT[], $9::UUID[]
+                     ) AS input(
+                         sandbox_id, from_lifecycle, failure_reason, source, reason_code,
+                         quarantine_id
                      )
                      ON CONFLICT (sandbox_id) DO UPDATE SET
                          quarantine_id = EXCLUDED.quarantine_id,
@@ -71,7 +96,42 @@ pub(crate) async fn record_state(
     .bind(node_id)
     .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
     .bind(node_id.to_string())
-    .bind(updated_json)
+    .bind(
+        records
+            .iter()
+            .map(|record| record.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.from_lifecycle)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.failure_reason)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.source.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.reason_code.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.quarantine_id)
+            .collect::<Vec<_>>(),
+    )
     .execute(&mut *conn)
     .await
     .map_err(RecordStateError::Upsert)?;
@@ -84,8 +144,11 @@ pub(crate) async fn record_state(
 pub(crate) async fn record_history(
     conn: &mut PgConnection,
     node_id: NodeId,
-    updated_json: &Json<serde_json::Value>,
+    records: &[QuarantineHistoryRecord<'_>],
 ) -> Result<bool, RecordHistoryError> {
+    if records.is_empty() {
+        return Ok(false);
+    }
     let result = sqlx::query(sql!(
         "INSERT INTO sandbox_quarantine_history (
                          id, quarantine_id, sandbox_id, occurred_at, source,
@@ -102,19 +165,51 @@ pub(crate) async fn record_history(
                          NULLIF(BTRIM(input.failure_reason), ''),
                          $3,
                          jsonb_build_object('node_id', $1::TEXT)
-                     FROM jsonb_to_recordset($4::jsonb) AS input(
-                         sandbox_id UUID,
-                         failure_reason TEXT,
-                         source TEXT,
-                         reason_code TEXT,
-                         quarantine_id UUID,
-                         history_id UUID
+                     FROM UNNEST(
+                         $4::UUID[], $5::TEXT[], $6::TEXT[], $7::TEXT[], $8::UUID[], $9::UUID[]
+                     ) AS input(
+                         sandbox_id, failure_reason, source, reason_code, quarantine_id, history_id
                      )",
     ))
     .bind(node_id.to_string())
     .bind(SandboxQuarantineHistoryAction::EnteredQuarantine.as_str())
     .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-    .bind(updated_json)
+    .bind(
+        records
+            .iter()
+            .map(|record| record.sandbox_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.failure_reason)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.source.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.reason_code.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.quarantine_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        records
+            .iter()
+            .map(|record| record.history_id)
+            .collect::<Vec<_>>(),
+    )
     .execute(&mut *conn)
     .await
     .map_err(RecordHistoryError::Insert)?;
