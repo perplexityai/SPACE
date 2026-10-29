@@ -10,7 +10,9 @@ Each `head-*` directory identifies the exact service, frozen Rust driver,
 runner revision, binary digests, CPU affinity, and same-lane reference.
 Its README provides the before/after table and workload command.
 `warmup.json` is discarded; `run-1.json` through `run-3.json` are the three
-measured runs. No run replacement or exclusion is used in these records.
+measured runs. No individual run is replaced. Complete attempts that fail
+the CPU-spread gate remain in `unqualified-*` directories; any later
+qualified retry links the earlier attempt rather than overwriting it.
 
 The JSON report values are unchanged from the captures, including every
 `pg_stat_statements` record. Only whitespace follows the existing checked-in
@@ -63,6 +65,8 @@ are not established by these results.
 | [487d04e6](head-487d04e6/README.md) | [Lane F](baseline-lane-f/README.md) | 3.336 → 3.335 | 0.0300% |
 | [c0f8acab](head-c0f8acab/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.337 | -0.3609% |
 | [88aefee5](head-88aefee5/README.md) | [Lane H](baseline-lane-h/README.md) | 3.352 → 3.357 | -0.1492% |
+| [74dba9b9](head-74dba9b9/README.md) | [Lane E](baseline-lane-e/README.md) | 3.338 → 3.346 | -0.2397% |
+| [71323bd8](head-71323bd8/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.349 | -0.7218% |
 | [c55485c0](head-c55485c0/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 3.328 | 0.0000% |
 | [ce6bf8df](head-ce6bf8df/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.288 | 0.1518% |
 | [938e0cf4](head-938e0cf4/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 1.522 | 54.4038% |
@@ -76,3 +80,20 @@ The final `938e0cf4` head's local PG17 and PG16 matrices each pass 429 tests
 with zero skips, including lifecycle and counter lock-wait race coverage.
 This does not assert that all GitHub CI passes or that the stack is ready
 to merge onto an updated base.
+
+## Retained unqualified attempts
+
+These complete first attempts exceeded the five-percent headline CPU-spread
+gate. They are not included as qualified head records above, and no cause of
+the variance has been established.
+
+| Application head | PostgreSQL CPU runs, ms/publish | Spread | Retained record |
+| --- | --- | ---: | --- |
+| `f373db56` | 3.431, 3.333, 3.222 | 6.2706% | [First attempt](unqualified-f373db56-attempt-1/README.md) |
+| `ed788ea1` | 3.439, 3.378, 3.266 | 5.1214% | [First attempt](unqualified-ed788ea1-attempt-1/README.md) |
+| `3b67f748` | 3.462, 3.351, 3.262 | 5.9684% | [First attempt](unqualified-3b67f748-attempt-1/README.md) |
+
+The workload and publish counts matched. All four row comparisons per
+attempt passed after the CPU gate stopped its queue, but those diagnostic
+checks do not qualify the CPU evidence. Retries repeat the full discarded
+warmup and three measured runs against the unchanged same-lane baseline.
