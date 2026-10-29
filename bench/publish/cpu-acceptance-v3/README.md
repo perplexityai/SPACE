@@ -55,9 +55,21 @@ are not established by these results.
 
 | Application head | Same-lane reference | PostgreSQL CPU median, ms/publish | Reduction |
 | --- | --- | ---: | ---: |
+| [3be0baa7](head-3be0baa7/README.md) | [Lane D](baseline-lane-d/README.md) | 3.319 → 3.334 | -0.4519% |
+| [d5d873c4](head-d5d873c4/README.md) | [Lane E](baseline-lane-e/README.md) | 3.338 → 3.380 | -1.2582% |
+| [487d04e6](head-487d04e6/README.md) | [Lane F](baseline-lane-f/README.md) | 3.336 → 3.335 | 0.0300% |
+| [c0f8acab](head-c0f8acab/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.337 | -0.3609% |
+| [88aefee5](head-88aefee5/README.md) | [Lane H](baseline-lane-h/README.md) | 3.352 → 3.357 | -0.1492% |
+| [c55485c0](head-c55485c0/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 3.328 | 0.0000% |
+| [ce6bf8df](head-ce6bf8df/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.288 | 0.1518% |
 | [938e0cf4](head-938e0cf4/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 1.522 | 54.4038% |
 
-The application head's local PG17 and PG16 matrices each pass 429 tests
+Reductions compare each head with its own lane's fixed reference; negative
+values mean CPU increased. Small deltas in the behavior-preserving refactor
+heads are not optimization claims. The final result is cumulative across
+the stack, not the isolated contribution of its final slice.
+
+The final `938e0cf4` head's local PG17 and PG16 matrices each pass 429 tests
 with zero skips, including lifecycle and counter lock-wait race coverage.
 This does not assert that all GitHub CI passes or that the stack is ready
 to merge onto an updated base.
