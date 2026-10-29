@@ -224,6 +224,10 @@ fn accepts_paths_strictly_inside_the_cache_root() {
     let id = uuid::Uuid::now_v7();
     for suffix in [
         format!("{id}/snapshot"),
+        // GC staging, in the fixed-length form and the earlier long form.
+        format!("{id}/.gc-pending-{id}"),
+        format!("{id}/snapshots/.gc-pending-{id}"),
+        format!("{id}/snapshot.gc-pending-{id}"),
         format!("{id}/snapshots/name.gc-pending-x"),
         // Sandbox-manager retires superseded snapshots here for the sweep.
         format!("{id}/snapshots/.suspend-gc-pending-{id}"),
@@ -233,6 +237,8 @@ fn accepts_paths_strictly_inside_the_cache_root() {
     }
     for path in [
         format!("{root}/{id}"),
+        format!("{root}/{id}/instance"),
+        format!("{root}/{id}/gc-pending-{id}"),
         format!("{root}/.fork-copies"),
         format!("{}/firecracker/templates/name/hash", cache_root()),
     ] {

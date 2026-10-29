@@ -49,7 +49,7 @@
 //! commit; a state-writer lease keeps this work owned through shutdown.
 //!
 //! The rmdir of the staged directory runs after commit and lock release. If it fails, the staging
-//! directory persists under `<local_path>.gc-pending-*` with no row
+//! directory persists as `.gc-pending-<id>` beside `local_path` with no row
 //! referencing it — invisible to the planner. The orphan sweep
 //! covers that gap: it runs once at startup (even when the reaper
 //! is disabled — the bytes are logically deleted either way) and
@@ -58,7 +58,7 @@
 
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -72,7 +72,9 @@ use crate::auto_lifecycle::now_secs;
 use crate::db::snapshot_gc::ArtifactScan;
 
 mod orphans;
-use crate::local_artifacts::{CheckoutError, GcDeleteCheckout, GcEligibility, LocalArtifacts};
+use crate::local_artifacts::{
+    CheckoutError, GcDeleteCheckout, GcEligibility, GcStagingError, LocalArtifacts,
+};
 
 pub(crate) struct GcOwnership {
     pub coordinator: crate::auto_lifecycle::AutoLifecycleCoordinator,
@@ -268,12 +270,13 @@ pub(crate) fn dir_size_bytes(path: &Path) -> u64 {
 ///      Ready → Deleting under the db lock. The check_out also
 ///      validates backup, pin, idle/grace, and shared-path evidence. On
 ///      success the row is reserved.
-///   2. atomic `rename(local_path → .gc-pending-<id>)` outside the
-///      lock. If it fails for a non-ENOENT reason the lease drops
-///      and the row rolls back to Ready.
-///   3. `lease.commit()` — DELETEs the row under the lock again. If
-///      it fails the row stays Deleting, and startup recovery
-///      finishes the delete.
+///   2. atomic `rename(local_path → <parent>/.gc-pending-<id>)` outside
+///      the lock. If it fails for a non-ENOENT reason the row is rolled
+///      back to Ready explicitly, and dropping the lease retries a
+///      rollback that failed.
+///   3. the row DELETE under the lock again. If it fails the row stays
+///      Deleting, and startup recovery finishes the delete. Steps 2 and 3
+///      are `DeleteLease::commit_through_gc_staging`.
 ///      The on-disk cleanup of the staging dir runs **after** this
 ///      function returns, via node-mgr's `DeleteCacheArtifact` RPC
 ///      (which can `btrfs subvolume delete` a subvolume root that
@@ -292,7 +295,7 @@ fn execute_one(
     let candidate_id: LocalArtifactId = candidate_id_str
         .parse()
         .map_err(|e| format!("invalid local_artifact_id: {e}"))?;
-    let mut lease = match artifacts.check_out_for_gc(candidate_id, sandbox_id, eligibility) {
+    let lease = match artifacts.check_out_for_gc(candidate_id, sandbox_id, eligibility) {
         Ok(GcDeleteCheckout::Leased(lease)) => lease,
         Ok(GcDeleteCheckout::Pinned) | Err(CheckoutError::Pinned(_)) => {
             return Ok((EvictionOutcome::SkippedPinnedCurrentAtExecute, None));
@@ -329,32 +332,30 @@ fn execute_one(
         }
     };
 
-    // Atomic rename into a `.gc-pending-<id>` sibling. Linux's
-    // open-file semantics keep any in-flight reader's fd valid; new
-    // opens of the original path fail with ENOENT. The lease holds
-    // the row in 'deleting' across the rename, and from here a failed
-    // commit leaves it 'deleting' for startup recovery rather than
-    // 'ready' advertising a missing path.
-    let staging_to_clean = match lease.vacate_to_gc_staging() {
+    // Atomic rename into a `.gc-pending-<id>` sibling, then DELETE the row.
+    // Linux's open-file semantics keep any in-flight reader's fd valid; new
+    // opens of the original path fail with ENOENT. The lease holds the row in
+    // 'deleting' across the rename, and from there a failed commit leaves it
+    // 'deleting' for startup recovery rather than 'ready' advertising a
+    // missing path. The DELETE is gated by `state = 'deleting'` so a
+    // concurrent rollback (impossible while we hold the lease, but defensive)
+    // cannot turn this into a spurious deletion. Named-snapshot deletes share
+    // this protocol (`LocalArtifacts::delete_named_snapshot`).
+    let local_path = lease.local_path().to_owned();
+    let staging_to_clean = match lease.commit_through_gc_staging() {
         Ok(staging) => staging,
-        Err(err) => {
+        Err(GcStagingError::Rename(err)) => {
             warn!(
                 local_artifact_id = %candidate_id,
-                local_path = %lease.local_path(),
+                local_path = %local_path,
                 error = %err,
-                "snapshot reaper: rename to staging path failed; lease will roll state back",
+                "snapshot reaper: rename to staging path failed; row rolled back to 'ready'",
             );
-            // Drop the lease without commit → DeleteLease::drop
-            // rolls back to 'ready'. Next tick retries.
+            // Next tick retries.
             return Err(format!("rename failed: {err}"));
         }
+        Err(GcStagingError::Commit(e)) => return Err(format!("delete commit: {e}")),
     };
-
-    // Finalize: DELETE the row. The DELETE is gated by `state =
-    // 'deleting'` so a concurrent rollback (impossible while we
-    // hold the lease, but defensive) cannot turn this into a
-    // spurious deletion.
-    lease.commit().map_err(|e| format!("delete commit: {e}"))?;
 
     // The staging directory cleanup runs after this function
     // returns, via node-mgr's `DeleteCacheArtifact` RPC. Returning
@@ -524,9 +525,9 @@ async fn gc_tick(
                 // named snapshots and d-stop-* stopped artifacts —
                 // sbx-mgr's UID can't `rmdir` the subvol root) and
                 // plain directories (suspend snapshots written file-
-                // by-file). On RPC failure the staging dir leaks
-                // until the next sbx-mgr startup sweep, which now
-                // also goes through this RPC.
+                // by-file). On RPC failure the staging dir waits
+                // for the orphan sweep, which also goes through
+                // this RPC.
                 if let Some(staging) = staging_to_clean {
                     delete_cache_artifact_via_node_mgr(
                         &staging,
@@ -598,8 +599,10 @@ async fn gc_tick(
 const CACHE_ROOT_FOR_SWEEP: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
 
 /// Maximum directory-walk depth below [`CACHE_ROOT_FOR_SWEEP`]. Staging
-/// directories sit at `<sandbox_id>/snapshot.gc-pending-<id>` and
-/// `<sandbox_id>/{snapshots,template-snapshot-staging}/<name>.gc-pending-<id>`,
+/// directories sit at `<sandbox_id>/.gc-pending-<id>` and
+/// `<sandbox_id>/{snapshots,template-snapshot-staging}/.gc-pending-<id>`, or,
+/// left by an earlier version, at `<sandbox_id>/snapshot.gc-pending-<id>` and
+/// `<sandbox_id>/{snapshots,template-snapshot-staging}/<name>.gc-pending-<id>`:
 /// the shapes node-mgr accepts. The walk reads no deeper, and inside a
 /// sandbox's directory it enters only those snapshot directories
 /// (`OrphanKind::descends_into`): the rest are artifact contents and the jail
@@ -608,7 +611,7 @@ const SWEEP_MAX_DEPTH: usize = 3;
 const FORK_COPY_ORPHAN_MIN_AGE_SECS: u64 = 60 * 60;
 
 /// Issue a `DeleteCacheArtifact` RPC against node-mgr. Best-effort;
-/// callers (per-candidate reap finalize, startup sweep) only log on
+/// callers (per-candidate reap finalize, orphan sweep) only log on
 /// failure rather than abort, because the parent operation has
 /// already committed (the row is gone, or this was orphan cleanup
 /// to begin with).
@@ -624,32 +627,53 @@ async fn delete_cache_artifact_via_node_mgr(
                 candidate = %candidate_label,
                 staging_path,
                 error = %err,
-                "snapshot reaper: node-mgr connect for DeleteCacheArtifact failed; staging directory will be retried at next sbx-mgr start",
+                "snapshot reaper: node-mgr connect for DeleteCacheArtifact failed; the orphan sweep retries the staging directory",
             );
             return;
         }
     };
+    if delete_gc_staging(
+        &mut client,
+        staging_path,
+        "snapshot reaper",
+        candidate_label,
+    )
+    .await
+    .is_ok()
+    {
+        info!(
+            candidate = %candidate_label,
+            staging_path,
+            "snapshot reaper: deleted cache artifact via node-mgr",
+        );
+    }
+}
+
+/// Delete GC staging through node-mgr's `DeleteCacheArtifact`, which removes a
+/// btrfs subvolume root that sbx-mgr's UID cannot `rmdir` as well as a plain
+/// directory. Its row is already gone, so a failure is only logged here: the
+/// orphan sweep finds unowned staging on every pass and retries it. Named
+/// snapshot deletes and retention call this too, after releasing their locks,
+/// so the log names the deleter in `deleter`.
+pub(crate) async fn delete_gc_staging(
+    client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
+    staging_path: &str,
+    deleter: &str,
+    candidate_label: &str,
+) -> Result<(), tonic::Status> {
     let req = pplx_space_node_mgr_client::proto::DeleteCacheArtifactRequest {
         local_path: staging_path.to_string(),
     };
-    match client.delete_cache_artifact(req).await {
-        Ok(_) => {
-            info!(
-                candidate = %candidate_label,
-                staging_path,
-                "snapshot reaper: deleted cache artifact via node-mgr",
-            );
-        }
-        Err(status) => {
-            warn!(
-                candidate = %candidate_label,
-                staging_path,
-                code = %status.code(),
-                message = %status.message(),
-                "snapshot reaper: DeleteCacheArtifact RPC failed; staging directory will be retried at next sbx-mgr start",
-            );
-        }
-    }
+    client.delete_cache_artifact(req).await.map(drop).inspect_err(|status| {
+        warn!(
+            deleter,
+            candidate = %candidate_label,
+            staging_path,
+            code = %status.code(),
+            message = %status.message(),
+            "GC staging: DeleteCacheArtifact RPC failed; the orphan sweep retries the staging directory",
+        );
+    })
 }
 
 /// Visit one bounded namespace page. Failed deletions stay on disk and are
@@ -657,6 +681,7 @@ async fn delete_cache_artifact_via_node_mgr(
 async fn sweep_orphans(
     scan: &mut OrphanScan,
     kind: OrphanKind,
+    cache_root: &Path,
     artifacts: &LocalArtifacts,
     active_copy_operations: Arc<crate::service::fork_artifact::CopyOperationReservations>,
     ownership: &GcOwnership,
@@ -665,10 +690,8 @@ async fn sweep_orphans(
         return;
     }
     let root = match kind {
-        OrphanKind::GcPending => PathBuf::from(CACHE_ROOT_FOR_SWEEP),
-        OrphanKind::ForkCopy => crate::service::fork_artifact::copy_staging_root_under(Path::new(
-            pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR,
-        )),
+        OrphanKind::GcPending => cache_root.to_path_buf(),
+        OrphanKind::ForkCopy => crate::service::fork_artifact::copy_staging_root_under(cache_root),
     };
     let mut next_scan = std::mem::take(scan);
     let discovery_active_operations = Arc::clone(&active_copy_operations);
@@ -744,7 +767,7 @@ fn gc_pending_is_unowned(artifacts: &LocalArtifacts, path: &Path) -> bool {
     let Some(id) = path
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| name.rsplit_once(".gc-pending-"))
+        .and_then(|name| name.rsplit_once(crate::local_artifacts::GC_PENDING_MARKER))
         .and_then(|(_, id)| id.parse::<LocalArtifactId>().ok())
     else {
         warn!(path = %path.display(), "retaining GC staging with invalid artifact identity");
@@ -812,6 +835,7 @@ pub(crate) async fn run_loop(
         sweep_orphans(
             &mut gc_orphans,
             OrphanKind::GcPending,
+            Path::new(CACHE_ROOT_FOR_SWEEP),
             &artifacts,
             Arc::clone(&active_fork_copy_operations),
             &ownership,
@@ -820,6 +844,7 @@ pub(crate) async fn run_loop(
         sweep_orphans(
             &mut fork_orphans,
             OrphanKind::ForkCopy,
+            Path::new(CACHE_ROOT_FOR_SWEEP),
             &artifacts,
             Arc::clone(&active_fork_copy_operations),
             &ownership,
