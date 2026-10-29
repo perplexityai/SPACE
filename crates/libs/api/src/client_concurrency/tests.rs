@@ -2,13 +2,13 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use pplx_space_feature_flags::FeatureFlagClient;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::redis::Redis;
 use uuid::Uuid;
 
 use super::redis_limiter::RedisConcurrencyStore;
 use super::*;
+use crate::test_support::try_redis_url;
 
 use pplx_space_test_env::TestResult;
 
@@ -464,32 +464,6 @@ async fn unreachable_store_fails_open() {
 // ---------------------------------------------------------------------------
 // Redis-backed behavior (testcontainers, or SPACE_TEST_REDIS_URL).
 // ---------------------------------------------------------------------------
-
-/// Prefers `SPACE_TEST_REDIS_URL` so the Lua can be exercised without Docker;
-/// otherwise starts a throwaway container. `None` skips the test, which only a
-/// run that opted out of required test dependencies allows.
-async fn try_redis_url() -> TestResult<Option<(Option<ContainerAsync<Redis>>, String)>> {
-    if let Ok(url) = std::env::var("SPACE_TEST_REDIS_URL")
-        && !url.trim().is_empty()
-    {
-        return Ok(Some((None, url.trim().to_string())));
-    }
-    let (image_name, image_tag) = pplx_space_db_test_fixtures::redis_image_ref()?;
-    let node = match Redis::default()
-        .with_name(image_name)
-        .with_tag(image_tag)
-        .start()
-        .await
-    {
-        Ok(node) => node,
-        Err(error) => {
-            pplx_space_db_test_fixtures::report_unavailable_dependency("redis", &error)?;
-            return Ok(None);
-        }
-    };
-    let port = node.get_host_port_ipv4(6379).await?;
-    Ok(Some((Some(node), format!("redis://127.0.0.1:{port}"))))
-}
 
 async fn try_store() -> TestResult<Option<(Option<ContainerAsync<Redis>>, RedisConcurrencyStore)>> {
     match try_redis_url().await? {

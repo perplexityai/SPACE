@@ -745,6 +745,22 @@ fn cluster_admission_controller_error(
     }
 }
 
+/// Charge one activation for `client` against `admission`. No admission
+/// configured admits.
+pub(super) async fn charge_cluster_activation(
+    admission: Option<&crate::cluster_admission::ClusterSandboxAdmission>,
+    class: crate::cluster_admission::ClusterActivationClass,
+    client: &ClientKey,
+) -> Result<(), ControllerError> {
+    let Some(admission) = admission else {
+        return Ok(());
+    };
+    admission
+        .admit_activation(class, client)
+        .await
+        .map_err(cluster_admission_controller_error)
+}
+
 /// Classify the cluster-activation cost of *implicitly* waking a sandbox from
 /// its currently-observed lifecycle. Covers the data-plane access path
 /// (`access_runtime_client` / `access_sandbox_ip`) and the control-plane
@@ -878,13 +894,12 @@ impl SandboxController {
         class: crate::cluster_admission::ClusterActivationClass,
         client: Option<&ClientKey>,
     ) -> Result<(), ControllerError> {
-        let Some(admission) = self.cluster_admission.as_ref() else {
-            return Ok(());
-        };
-        admission
-            .admit_activation(class, client.unwrap_or(ClientKey::unknown_ref()))
-            .await
-            .map_err(cluster_admission_controller_error)
+        charge_cluster_activation(
+            self.cluster_admission.as_deref(),
+            class,
+            client.unwrap_or(ClientKey::unknown_ref()),
+        )
+        .await
     }
 
     async fn admit_action_cluster_activation(

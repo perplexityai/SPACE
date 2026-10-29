@@ -73,6 +73,7 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
             refill_rps: 6.0,
             burst: 60.0,
             redis_url: None,
+            client_rate: None,
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );

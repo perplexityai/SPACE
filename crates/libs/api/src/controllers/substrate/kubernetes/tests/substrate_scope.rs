@@ -53,6 +53,7 @@ async fn control_runtime_client_wakes_only_kubernetes_rows_after_an_unreachable_
                 refill_rps: 6.0,
                 burst: 60.0,
                 redis_url: None,
+                client_rate: None,
             },
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         );

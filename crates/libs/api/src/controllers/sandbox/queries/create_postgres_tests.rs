@@ -12,6 +12,7 @@ use pplx_space_common_core::types::PodUid;
 
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
+mod pool_step;
 
 type InsertedPooledSandboxRow = (
     Option<String>,

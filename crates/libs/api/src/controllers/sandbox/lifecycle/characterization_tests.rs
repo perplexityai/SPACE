@@ -141,6 +141,7 @@ fn controller_with_empty_cluster_admission(pool: &PgPool) -> SandboxController {
             refill_rps: 6.0,
             burst: 60.0,
             redis_url: None,
+            client_rate: None,
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );

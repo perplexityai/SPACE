@@ -4,9 +4,13 @@
 //! restore work that spends a node slot (and optionally a Kubernetes pod) —
 //! before API and cluster-controller execution paths fan out to substrate
 //! placement. The bucket lives in Redis: a single atomic `EVALSHA` per
-//! admission does refill + consume + TTL against one key, so every replica
+//! admission does refill + consume + TTL against its key, so every replica
 //! shares one rate with no `SELECT … FOR UPDATE` contention and no OLTP
 //! coupling.
+//!
+//! An activation can also draw from its client's own bucket. The same
+//! `EVALSHA` then covers both keys, so it takes a token from both or neither;
+//! see [`client_rate`].
 //!
 //! The limiter is a guardrail, not a correctness gate, so it **fails open**:
 //! any Redis error (unreachable, timeout, malformed reply) admits the
@@ -20,7 +24,7 @@ use pplx_space_common_core::env::{env_flag_var, parse_positive_f64_env, valid_po
 use pplx_space_common_core::types::ClientKey;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_CLUSTER_RATE_LIMITER_FLAG};
 use pplx_space_metrics::sandbox::admission::{
-    AdmissionDecision, AdmissionOperationClass, AdmissionRejectReason,
+    AdmissionDecision, AdmissionOperationClass, AdmissionRejectReason, ClusterAdmissionBucket,
 };
 use rand::RngExt as _;
 use tokio_util::sync::CancellationToken;
@@ -30,14 +34,19 @@ use crate::controllers::substrate::{
     ActivationAdmissionRejection, GATEWAY_RETRY_AFTER, Substrate,
 };
 
+mod client_rate;
 mod redis_bucket;
 #[cfg(test)]
 mod tests;
 
-use redis_bucket::{ConsumeOutcome, RedisTokenBucket};
+pub use client_rate::ClientActivationRate;
+use client_rate::{ClientRateOverrides, client_bucket_key};
+use redis_bucket::{BucketSpec, ConsumeOutcome, RedisTokenBucket};
 
 /// Redis key for the shared cluster activation bucket. Namespaced so it never
-/// collides with other SPACE keys in a shared Redis.
+/// collides with other SPACE keys in a shared Redis. Also the hash tag of every
+/// client bucket's key (see [`client_bucket_key`]), so renaming it moves them
+/// too.
 const SANDBOX_ACTIVATION_BUCKET: &str = "space:cluster_admission:sandbox_activation";
 const DEFAULT_REFILL_RPS: f64 = 60.0;
 const DEFAULT_BURST: f64 = 60.0;
@@ -171,6 +180,10 @@ pub struct ClusterSandboxAdmissionConfig {
     /// `with_config` is a complete, testable interface; the process-env read
     /// lives only in [`Self::from_env`].
     pub redis_url: Option<String>,
+    /// The rate of every client's own bucket, `unknown` included, unless the
+    /// quotas flag's `rate` field names the client. `None` means no
+    /// per-client rate for clients the flag doesn't name.
+    pub client_rate: Option<ClientActivationRate>,
 }
 
 impl Default for ClusterSandboxAdmissionConfig {
@@ -180,6 +193,7 @@ impl Default for ClusterSandboxAdmissionConfig {
             refill_rps: DEFAULT_REFILL_RPS,
             burst: DEFAULT_BURST,
             redis_url: None,
+            client_rate: None,
         }
     }
 }
@@ -198,6 +212,7 @@ impl ClusterSandboxAdmissionConfig {
                 .ok()
                 .map(|url| url.trim().to_string())
                 .filter(|url| !url.is_empty()),
+            client_rate: ClientActivationRate::from_env(),
         }
     }
 }
@@ -231,7 +246,10 @@ impl ClusterActivationClass {
 /// re-queuing forever.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterAdmissionError {
-    /// The shared token bucket is empty — wait behind the limiter (backpressure).
+    /// A token bucket the activation draws from is empty — wait behind the
+    /// limiter (backpressure). The message says which one: the shared cluster
+    /// bucket, or the client's own when that one is empty, whatever the
+    /// cluster bucket held.
     #[error("{message}")]
     RateLimited {
         message: String,
@@ -323,17 +341,21 @@ impl ClusterSandboxAdmission {
         )
     }
 
-    /// Consume one activation token from the shared cluster bucket.
+    /// Consume one activation token from the shared cluster bucket, and one
+    /// from `client`'s own bucket when that client has a per-client rate.
     ///
     /// Rejects with [`ClusterAdmissionError::EmptyCluster`] when the cluster has
-    /// no start-capable nodes, or [`ClusterAdmissionError::RateLimited`] when the
-    /// shared bucket is empty. On any Redis error the limiter fails open: the
-    /// activation is admitted and a `store_unavailable` decision metric is
-    /// emitted rather than returning an error.
+    /// no start-capable nodes, or [`ClusterAdmissionError::RateLimited`] when a
+    /// bucket the activation draws from is empty. On any Redis error the
+    /// limiter fails open: the activation is admitted and a `store_unavailable`
+    /// decision metric is emitted rather than returning an error.
     ///
-    /// `client` is the bounded key of the client that is activating. The
-    /// shared bucket doesn't read it yet; it's carried so per-client admission
-    /// can sit on this path without another signature change.
+    /// `client` is the bounded key of the client that is activating: each
+    /// distinct value is a Redis key, which is why it's never a raw header. The
+    /// two buckets are consumed in one script, so a rejection by either takes
+    /// nothing from the other. When both are empty the rejection names the
+    /// client's bucket, since that one stays empty however the rest of the
+    /// cluster behaves.
     pub async fn admit_activation(
         &self,
         class: ClusterActivationClass,
@@ -367,40 +389,83 @@ impl ClusterSandboxAdmission {
             return Ok(());
         };
 
-        match bucket
-            .consume(
-                SANDBOX_ACTIVATION_BUCKET,
-                self.config.refill_rps,
-                self.config.burst,
-                1.0,
-            )
-            .await
-        {
-            Ok(ConsumeOutcome::Admitted { remaining }) => {
+        // Resolved only once the bucket is in play, so the disabled and
+        // fail-open paths above never read the quotas flag.
+        let client_rate = ClientRateOverrides::rate_for(
+            ClientRateOverrides::from_flags(self.config.enabled, &self.feature_flags).as_ref(),
+            client.as_str(),
+            self.config.client_rate,
+        );
+        let client_key = client_rate.map(|_| client_bucket_key(client.as_str()));
+        let mut buckets = vec![BucketSpec {
+            key: SANDBOX_ACTIVATION_BUCKET,
+            refill_rps: self.config.refill_rps,
+            burst: self.config.burst,
+        }];
+        if let (Some(key), Some(rate)) = (&client_key, client_rate) {
+            buckets.push(BucketSpec {
+                key,
+                refill_rps: rate.refill_rps,
+                burst: rate.burst,
+            });
+        }
+
+        // `consume` returns one count per bucket, in `buckets` order: the
+        // cluster's first, then the client's when it has a bucket.
+        match bucket.consume(&buckets, 1.0).await {
+            Ok(ConsumeOutcome {
+                admitted: true,
+                remaining,
+            }) => {
                 emit_decision(
                     class,
                     AdmissionDecision::Accepted,
                     AdmissionRejectReason::None,
-                    Some(remaining),
+                    remaining.first().copied(),
                 );
                 Ok(())
             }
-            Ok(ConsumeOutcome::RateLimited { remaining }) => {
-                emit_decision(
+            Ok(ConsumeOutcome {
+                admitted: false,
+                remaining,
+            }) => {
+                // Every bucket short of the one token is what the caller waits
+                // on, so the hint is paced by whichever refills last.
+                let short: Vec<(f64, f64)> = buckets
+                    .iter()
+                    .zip(&remaining)
+                    .filter(|(_, remaining)| **remaining < 1.0)
+                    .map(|(bucket, remaining)| (*remaining, bucket.refill_rps))
+                    .collect();
+                let client_short = remaining.get(1).is_some_and(|remaining| *remaining < 1.0);
+                let (bucket, message) = if client_short {
+                    (
+                        ClusterAdmissionBucket::ClientActivation,
+                        client_rate_limited_message(client),
+                    )
+                } else {
+                    (
+                        ClusterAdmissionBucket::SandboxActivation,
+                        // Server-wide throttle, worded so a client can tell it
+                        // apart from the per-client limits: this one is not
+                        // caused by (nor fixable by) the client's own request
+                        // rate.
+                        "Server rate limit: the sandbox platform is shedding \
+                         create/restore load to protect shared cluster capacity. \
+                         Not specific to your client — retry with backoff."
+                            .to_string(),
+                    )
+                };
+                emit_bucket_decision(
+                    bucket,
                     class,
                     AdmissionDecision::Rejected,
                     AdmissionRejectReason::RateLimited,
-                    Some(remaining),
+                    remaining.first().copied(),
                 );
                 Err(ClusterAdmissionError::RateLimited {
-                    // Server-wide throttle, worded so a client can tell it apart
-                    // from the per-client concurrency limit: this one is not
-                    // caused by (nor fixable by) the client's own request rate.
-                    message: "Server rate limit: the sandbox platform is shedding \
-                              create/restore load to protect shared cluster capacity. \
-                              Not specific to your client — retry with backoff."
-                        .to_string(),
-                    retry_after: rate_limited_retry_after(remaining, self.config.refill_rps),
+                    message,
+                    retry_after: rate_limited_retry_after(&short),
                 })
             }
             Err(error) => {
@@ -421,6 +486,40 @@ impl ClusterSandboxAdmission {
         }
     }
 }
+
+#[cfg(test)]
+impl ClusterSandboxAdmission {
+    /// What the cluster bucket and `client`'s bucket hold, as last written:
+    /// `None` for a bucket no consume has touched. For tests outside this
+    /// module that check which buckets an activation drew from.
+    pub(crate) async fn stored_tokens(
+        &self,
+        client: &ClientKey,
+    ) -> TestResult<(Option<f64>, Option<f64>)> {
+        let bucket = self.bucket.as_ref().expect("a Redis-backed admission");
+        Ok((
+            bucket.stored_tokens(SANDBOX_ACTIVATION_BUCKET).await?,
+            bucket
+                .stored_tokens(&client_bucket_key(client.as_str()))
+                .await?,
+        ))
+    }
+
+    /// Delete the buckets whose keys are fixed, the cluster's and `unknown`'s,
+    /// so a test starts from full ones. Other client buckets need no reset:
+    /// tests use fresh client keys.
+    pub(crate) async fn clear_shared_buckets(&self) -> TestResult {
+        let bucket = self.bucket.as_ref().expect("a Redis-backed admission");
+        bucket.clear(SANDBOX_ACTIVATION_BUCKET).await?;
+        bucket
+            .clear(&client_bucket_key(ClientKey::unknown_ref().as_str()))
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+use pplx_space_test_env::TestResult;
 
 impl ActivationAdmission for ClusterSandboxAdmission {
     fn admit<'a>(
@@ -571,16 +670,44 @@ async fn prepare_activation_admission(
 /// The `Retry-After` hint for a bucket rejection, paced by the configured refill
 /// rate and then jittered above it.
 ///
+/// `short` holds each bucket that lacked the token, as `(remaining,
+/// refill_rps)`. The activation needs a token from every one of them, so the
+/// base is the latest of their earliest refills.
+///
 /// One function rather than two composed at the call site, so the floor cannot
 /// be dropped by changing an argument: `remaining` sizes only *how long until
 /// the missing token exists*, and it cannot size the wait itself — on a
 /// rejection it is always in `[0, 1)` however many callers are queued behind it.
 /// Everything above the floor is therefore policy, and the policy is to spread
 /// the shed population rather than pick one number for all of it.
-fn rate_limited_retry_after(remaining: f64, refill_rps: f64) -> Duration {
+fn rate_limited_retry_after(short: &[(f64, f64)]) -> Duration {
     // Every activation requests exactly one token, so the deficit is whatever
     // fraction of that token the bucket is short.
-    jittered_retry_after(earliest_refill(1.0 - remaining, refill_rps))
+    let earliest = short
+        .iter()
+        .map(|(remaining, refill_rps)| earliest_refill(1.0 - remaining, *refill_rps))
+        .max()
+        .unwrap_or(RETRY_AFTER_FLOOR);
+    jittered_retry_after(earliest)
+}
+
+/// The rejection message for a client over its own activation rate. Unlike
+/// the server message, this one is the client's to fix by slowing down, and
+/// it names the key so a caller sharing `unknown` can tell why. The `unknown`
+/// wording names everything that shares that bucket, because a caller can land
+/// there with a recognized `X-Client-ID` too: an implicit wake or a recovery
+/// carries no client, whoever triggered it.
+fn client_rate_limited_message(client: &ClientKey) -> String {
+    let shared = if client.is_unknown() {
+        " Activations without an allowlisted X-Client-ID share this rate, including \
+         implicit wakes and recoveries."
+    } else {
+        ""
+    };
+    format!(
+        "Client rate limit: sandbox creates and restores for client `{client}` exceed its \
+         per-client activation rate.{shared} Slow down and retry with backoff."
+    )
 }
 
 /// Sample the `Retry-After` hint for one shed activation: `earliest` — the first
@@ -697,7 +824,27 @@ fn emit_decision(
     reason: AdmissionRejectReason,
     tokens: Option<f64>,
 ) {
+    emit_bucket_decision(
+        ClusterAdmissionBucket::SandboxActivation,
+        class,
+        decision,
+        reason,
+        tokens,
+    );
+}
+
+/// [`emit_decision`] naming the deciding bucket. `tokens` is always the
+/// cluster bucket's count: a client bucket's count without its client tag
+/// would mix every client into one gauge.
+fn emit_bucket_decision(
+    bucket: ClusterAdmissionBucket,
+    class: ClusterActivationClass,
+    decision: AdmissionDecision,
+    reason: AdmissionRejectReason,
+    tokens: Option<f64>,
+) {
     pplx_space_metrics::sandbox::admission::cluster_decision(
+        bucket,
         class.metric_class(),
         decision,
         reason,
@@ -726,5 +873,10 @@ fn sanitize_config(config: ClusterSandboxAdmissionConfig) -> ClusterSandboxAdmis
             .map(|burst| burst.max(1.0))
             .unwrap_or(defaults.burst),
         redis_url: config.redis_url,
+        // The fields are public, so a hand-built rate goes through the same
+        // checks as a parsed one; an unusable refill means no per-client rate.
+        client_rate: config
+            .client_rate
+            .and_then(|rate| ClientActivationRate::new(rate.refill_rps, Some(rate.burst))),
     }
 }

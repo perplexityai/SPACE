@@ -36,6 +36,11 @@
 //! → `ZREM`), whereas a consumed rate-limiter token is not. Making the
 //! refundable gate the outer one keeps both budgets independent.
 //!
+//! The per-client activation *rate* can't be ordered that way, because both of
+//! its budgets are tokens. So it isn't a third gate here: the cluster limiter
+//! consumes the client's bucket and the cluster bucket in one script, both or
+//! neither.
+//!
 //! # Buckets and the allowlist
 //!
 //! Only **recognized** client ids get their own per-client bucket. The
@@ -283,11 +288,11 @@ struct QuotaOverrides {
     /// Per-`X-Client-ID` caps for explicitly configured clients.
     /// Presence of a key here **also allowlists** that id at runtime, so ops can
     /// add a recognized client without a redeploy.
-    #[serde(deserialize_with = "deserialize_overrides")]
+    #[serde(deserialize_with = "deserialize_flagd_map")]
     overrides: std::collections::HashMap<String, usize>,
 }
 
-/// Accept the override map either as an object or as its JSON text.
+/// Accept one of the flag's maps either as an object or as its JSON text.
 ///
 /// flagd 0.2.2's in-process resolvers stringify any nested object inside a
 /// flag's variant, so a deployment serving this flag through flagd delivers
@@ -295,10 +300,12 @@ struct QuotaOverrides {
 /// assignment fails to parse and every cap silently falls back to its
 /// env-configured value — the flag would look configured and do nothing.
 ///
-/// Confined to this field on purpose: this is the one place that knows
-/// `overrides` must be a map of caps, so decoding a string found here is a
-/// typed decision rather than a guess. A string that does not decode to that
-/// map is still an error, exactly as a malformed object would be.
+/// Applied per field on purpose, never to the whole document: only a field
+/// declared as a map knows that a string found there must be that map's text,
+/// so decoding it is a typed decision rather than a guess. That's `overrides`
+/// here and `rate`, the per-client activation rates `crate::cluster_admission`
+/// reads from the same flag. A string that does not decode to the field's map
+/// is still an error, exactly as a malformed object would be.
 ///
 /// The shape is dispatched on explicitly rather than through an untagged
 /// enum. An untagged enum tries each variant and, when none fits, reports
@@ -310,11 +317,10 @@ struct QuotaOverrides {
 ///
 /// Pinned upstream by `pplx-space-feature-flags`'s `tests/flagd_end_to_end.rs`;
 /// when flagd stops stringifying, that test fails and this can go.
-fn deserialize_overrides<'de, D>(
-    deserializer: D,
-) -> Result<std::collections::HashMap<String, usize>, D::Error>
+pub(crate) fn deserialize_flagd_map<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
 {
     let decoded = match <serde_json::Value as serde::Deserialize>::deserialize(deserializer)? {
         // Only ever flagd's stringified map; its own parse error names what
@@ -325,6 +331,39 @@ where
         value => serde_json::from_value(value),
     };
     decoded.map_err(serde::de::Error::custom)
+}
+
+/// Read the quotas flag as `T`, under `env_enabled` as its env master.
+///
+/// Two consumers read the one document, each through its own struct that
+/// ignores the other's fields: this limiter's caps and the cluster activation
+/// limiter's per-client `rate` map. Both go through here, so they evaluate the
+/// same subject and fall back the same way: `None` when the master is off,
+/// nothing resolved, or the assignment doesn't parse as `T`, which the caller
+/// treats as "use the env value". `what` names the consumer in the warning.
+pub(crate) fn read_quotas_flag<T: serde::de::DeserializeOwned>(
+    env_enabled: bool,
+    feature_flags: &FeatureFlagClient,
+    what: &str,
+) -> Option<T> {
+    let value = feature_flags
+        .json_override(
+            env_enabled,
+            SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
+            FLAG_SUBJECT,
+        )
+        .resolved()?;
+    match serde_json::from_value::<T>(value) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                flag = SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG.key(),
+                "invalid {what} JSON; falling back to the env values"
+            );
+            None
+        }
+    }
 }
 
 /// Parse env var `name` as a `usize`, falling back to `default` when it is
@@ -494,26 +533,11 @@ impl ClientConcurrencyLimiter {
         // sound here because both answers land on the env-configured caps: the
         // overrides only ever retune a limiter that `limiter_active` already
         // gated on the same master.
-        let value = self
-            .inner
-            .feature_flags
-            .json_override(
-                self.inner.config.mode != Mode::Off,
-                SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
-                FLAG_SUBJECT,
-            )
-            .resolved()?;
-        match serde_json::from_value::<QuotaOverrides>(value) {
-            Ok(overrides) => Some(overrides),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    flag = SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG.key(),
-                    "invalid client-concurrency quota override JSON; falling back to env caps"
-                );
-                None
-            }
-        }
+        read_quotas_flag(
+            self.inner.config.mode != Mode::Off,
+            &self.inner.feature_flags,
+            "client-concurrency quota overrides",
+        )
     }
 
     /// This limiter's liveness-heartbeat loop, for the caller to spawn.

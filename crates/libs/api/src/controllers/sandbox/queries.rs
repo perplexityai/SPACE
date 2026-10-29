@@ -1365,73 +1365,58 @@ impl SandboxController {
             volume_encryption,
             client_key,
         };
-        // Set when this create was admitted against a warm-pool slot and is
-        // building cold instead: the slot's pod used this ID's generation 1.
-        let mut skip_pool_reserved_generation = false;
-        if let Some(admitted) = admitted_pool_claim {
-            let adoption_eligible = restore_from.is_none()
-                && self.admitted_pool_adoption_eligible(req, &auto_lifecycle, boot_mode, &backend);
-            let PoolCreateResult {
-                response,
-                observation,
-            } = Self::try_create_from_admitted_pool_claim_with_substrate(
-                &self.substrate,
-                pooled_input,
-                admitted,
-                adoption_eligible,
-                Arc::clone(&create_path_claim_duration_nanos),
-            )
-            .await?;
-            create_path.set_observation(observation);
-            if let Some(response) = response {
-                create_path.mark_request_succeeded();
-                pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
-                return Ok(response);
-            }
-            skip_pool_reserved_generation = true;
-        } else if let Some(observation) =
-            pool_bypass_observation(placement_requested, restore_from.is_some())
-        {
-            create_path.set_observation(observation);
-        } else {
-            let PoolCreateResult {
-                response,
-                observation,
-            } = self
-                .try_create_from_pool(pooled_input, Arc::clone(&create_path_claim_duration_nanos))
-                .await?;
-            create_path.set_observation(observation);
-            if let Some(response) = response {
-                create_path.mark_request_succeeded();
-                pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
-                return Ok(response);
-            }
-        }
-        if boot_mode == CreateBootMode::Pool {
-            return Err(ControllerError::service_unavailable(
-                "boot_mode=pool requested but no warm-pool sandbox is available",
-            ));
-        }
-        let (resources, disk_io_limits, shape_source) = resolve_cold_create_resources(
-            pool,
-            ColdCreateShapeInput {
-                capabilities: self.substrate.capabilities(),
-                runtime,
-                boot_mode,
-                template: &template_name,
-                content_hash: &resolved_content_hash,
-                template_release_id: resolved_template_release_id,
-                requested: requested_resources,
-                restoring: restore_from.is_some(),
+        let path = match admitted_pool_claim {
+            Some(claim) => pool_step::PoolPath::Admitted {
+                claim,
+                adoption_eligible: restore_from.is_none()
+                    && self.admitted_pool_adoption_eligible(
+                        req,
+                        &auto_lifecycle,
+                        boot_mode,
+                        &backend,
+                    ),
             },
+            None => match pool_bypass_observation(placement_requested, restore_from.is_some()) {
+                Some(observation) => pool_step::PoolPath::Bypass(observation),
+                None => pool_step::PoolPath::Claim,
+            },
+        };
+        let step = pool_step::warm_pool_step_then_charge(
+            &self.substrate,
+            self.cluster_admission.as_deref(),
+            pool_step::PoolStepInput {
+                pool,
+                pooled: pooled_input,
+                path,
+                cold_shape: ColdCreateShapeInput {
+                    capabilities: self.substrate.capabilities(),
+                    runtime,
+                    boot_mode,
+                    template: &template_name,
+                    content_hash: &resolved_content_hash,
+                    template_release_id: resolved_template_release_id,
+                    requested: requested_resources,
+                    restoring: restore_from.is_some(),
+                },
+                client_key,
+            },
+            &mut create_path,
+            Arc::clone(&create_path_claim_duration_nanos),
         )
         .await?;
-
-        self.admit_cluster_activation(
-            crate::cluster_admission::ClusterActivationClass::Cold,
-            Some(client_key),
-        )
-        .await?;
+        let pool_step::ColdPlan {
+            resources,
+            disk_io_limits,
+            shape_source,
+            skip_pool_reserved_generation,
+        } = match step {
+            pool_step::PoolStep::Served(response) => {
+                create_path.mark_request_succeeded();
+                pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
+                return Ok(*response);
+            }
+            pool_step::PoolStep::Cold(cold) => cold,
+        };
 
         // Store the resolved hash as the sandbox's immutable build pin; wake and restore
         // keep using it even if a tag moves later.
@@ -1872,15 +1857,6 @@ impl SandboxController {
         create_path.mark_request_succeeded();
         pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
         Ok(sandbox_to_response(&sandbox, None))
-    }
-
-    async fn try_create_from_pool(
-        &self,
-        input: PooledCreateInput<'_>,
-        claim_duration_nanos: Arc<AtomicU64>,
-    ) -> Result<PoolCreateResult, ControllerError> {
-        Self::try_create_from_pool_with_substrate(&self.substrate, input, claim_duration_nanos)
-            .await
     }
 
     async fn try_create_from_pool_with_substrate<A: SubstrateAdapter + ?Sized>(
@@ -3048,6 +3024,8 @@ async fn enqueue_pooled_network_policy_reconcile_if_needed(
 
     Ok(())
 }
+
+mod pool_step;
 
 #[cfg(test)]
 mod create_env_tests;
