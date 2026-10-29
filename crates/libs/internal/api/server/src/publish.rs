@@ -3,6 +3,8 @@ use super::status::*;
 use super::*;
 use crate::auto_lifecycle_delete_completions::consume_auto_lifecycle_delete_completions;
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
+use crate::node_publish::validate::node_role::PublicationRoleIntent;
+use crate::node_publish::validate::node_status::ValidatedNodeStatus;
 use pplx_space_metrics::internal_api::{LocalBackupQueueOutcome, local_backup_queue_reconcile};
 use pplx_space_node_api_client::node_status_freshness::reported_freshness;
 use pplx_space_placement::StoredSandboxLifecycle;
@@ -16,37 +18,15 @@ impl ClusterApiService {
         let template_inventory_complete = request.get_ref().template_inventory_complete;
         let auto_lifecycle_delete_completions_received =
             request.get_ref().auto_lifecycle_delete_completions.len();
-        let requested_role = optional_db_role_from_proto(request.get_ref().role)?;
-        let publishes_delete_completions = auto_lifecycle_delete_completions_received > 0;
-        let publishes_sandboxes = sandbox_inventory_complete
-            || !request.get_ref().sandboxes.is_empty()
-            || publishes_delete_completions;
-        if publishes_sandboxes
-            && let Some(role) = requested_role
-            && role != SpaceNodeRole::Worker
-            && role != SpaceNodeRole::Builder
-        {
-            return Err(Status::invalid_argument(
-                "sandbox inventory state can only be published by worker or builder nodes",
-            ));
-        }
-        let role_hint = if publishes_sandboxes {
-            requested_role.or(Some(SpaceNodeRole::Worker))
-        } else {
-            requested_role
-        };
+        let role_intent = PublicationRoleIntent::try_from_proto(request.get_ref())?;
         let origin = self
-            .authenticated_origin_node_id(&request, &request.get_ref().node_id, role_hint)
+            .authenticated_origin_node_id(
+                &request,
+                &request.get_ref().node_id,
+                role_intent.role_hint(),
+            )
             .await?;
-        // Sandbox inventory is worker-or-builder, but only workers run the
-        // cluster-owned auto-lifecycle deletes these receipts prove. Gate on the
-        // authenticated role rather than the self-declared one, which is
-        // optional on the wire.
-        if publishes_delete_completions && origin.role != SpaceNodeRole::Worker {
-            return Err(Status::invalid_argument(
-                "auto-lifecycle delete completions can only be published by worker nodes",
-            ));
-        }
+        role_intent.validate_authenticated_role(origin.role)?;
         let request = request.into_inner();
         let reported_window = reported_freshness(
             request
@@ -56,7 +36,7 @@ impl ClusterApiService {
         );
         let node_status = request
             .node_status
-            .map(published_node_status_db)
+            .map(ValidatedNodeStatus::try_from_proto)
             .transpose()?;
         // Per-row validation and telemetry live in `publish_sandbox_states`.
         // Pruning reuses only identities that can name a central row.
@@ -131,9 +111,14 @@ impl ClusterApiService {
         // declined: the two outcomes this publication can have, held in one
         // value so the gate stamp below and the metric after the commit cannot
         // come to disagree about which one happened.
+        let pending_local_backups =
+            crate::node_publish::validate::pending_backup::PendingBackupReport::from_proto(
+                request.pending_local_backups.as_ref(),
+            );
+        let reported_count = pending_local_backups.reported_count();
         let backup_queue = match node_local_backup_pending::decide(
             &mut tx,
-            request.pending_local_backups.as_ref(),
+            pending_local_backups,
             inventory_prune,
             &sandbox_publication.state_only_sandbox_ids,
             origin.id,
@@ -261,10 +246,7 @@ impl ClusterApiService {
             // the outcome rather than a bool, so a node whose report is
             // declined every tick — and whose gate therefore never advances —
             // says *why* without a second lookup.
-            pending_local_backups_reported = request
-                .pending_local_backups
-                .as_ref()
-                .map(|report| report.pending.len()),
+            pending_local_backups_reported = reported_count,
             local_backup_queue_outcome = %backup_queue_outcome,
             local_backup_queue_depth = mirrored.map(|queue| queue.depth),
             local_backup_queue_unknown_sandboxes = mirrored.map(|queue| queue.unknown_sandboxes),

@@ -41,6 +41,119 @@ use uuid::Uuid;
 mod support;
 use support::*;
 
+#[tokio::test(flavor = "current_thread")]
+async fn publication_validation_preserves_database_error_precedence() -> TestResult {
+    use pplx_space_execution_common::proto::{NodeExecutionInventory, RuntimeInstallation};
+    use pplx_space_internal_api_server::proto::PublishedTemplateState;
+
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query(sql!("SET lock_timeout = '20ms'"))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&db.database_url)
+        .await?;
+    let service = ClusterApiService::new(pool.clone());
+    let publish = async |templates, inventory| {
+        let mut request = Request::new(PublishNodeStateRequest {
+            node_id: node_id.to_string(),
+            role: Some(ProtoNodeRole::Worker as i32),
+            templates,
+            execution_inventory: Some(inventory),
+            ..Default::default()
+        });
+        request
+            .extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
+            });
+        service.publish_node_state(request).await
+    };
+
+    // Authentication can read the registration, but publication must acquire
+    // its node lock before reaching template validation.
+    let mut blocker = db.pool.begin().await?;
+    sqlx::query(sql!("SELECT id FROM nodes WHERE id = $1 FOR NO KEY UPDATE"))
+        .bind(node_id)
+        .execute(&mut *blocker)
+        .await?;
+    let error = publish(
+        vec![PublishedTemplateState::default()],
+        NodeExecutionInventory::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(
+        error
+            .message()
+            .starts_with("lock node execution publication:")
+    );
+    blocker.rollback().await?;
+    let error = publish(
+        vec![PublishedTemplateState::default()],
+        NodeExecutionInventory::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert_eq!(error.message(), "template must not be empty");
+
+    // A template write also precedes execution-inventory content validation.
+    // This statement trigger fails even when the absence claim matches no row.
+    sqlx::query(sql!(
+        "CREATE FUNCTION fail_template_publish() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'synthetic template failure'; END $$"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER fail_template_publish BEFORE DELETE ON node_template_inventory
+         FOR EACH STATEMENT EXECUTE FUNCTION fail_template_publish()"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let malformed_inventory = || NodeExecutionInventory {
+        runtimes: vec![RuntimeInstallation::default()],
+        ..Default::default()
+    };
+    let absent_template = || PublishedTemplateState {
+        template: "synthetic-template".to_owned(),
+        present: false,
+        ..Default::default()
+    };
+    let error = publish(vec![absent_template()], malformed_inventory())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(
+        error
+            .message()
+            .starts_with("delete absent published template:")
+    );
+    sqlx::query(sql!(
+        "DROP TRIGGER fail_template_publish ON node_template_inventory"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let error = publish(vec![absent_template()], malformed_inventory())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert_eq!(error.message(), "runtime installation is missing identity");
+    pool.close().await;
+    Ok(())
+}
+
 /// Typed reader for the placement columns a suspend finalization clears,
 /// alongside the execution's own active/state columns.
 #[derive(Debug, sqlx::FromRow, serde::Serialize)]

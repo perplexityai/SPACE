@@ -1,17 +1,16 @@
 //! Decode publication evidence without treating omission or collection failure
 //! as an empty inventory. Existing placement projections remain unchanged.
 
-use pplx_space_common_core::{
-    sql,
-    types::{
-        ArtifactComponentMetadata, GuestPlatform, NodeId, RuntimeIdentity, StateFormatIdentity,
-    },
-};
+use pplx_space_common_core::{sql, types::NodeId};
 use pplx_space_execution_common::proto::NodeExecutionInventory;
 use sqlx::types::Json;
 use tonic::Status;
 
-use crate::proto::{ExecutionInventoryObservation, execution_inventory_observation::Outcome};
+use crate::node_publish::validate::execution_inventory::ValidatedExecutionInventory;
+use crate::node_publish::validate::execution_observation::{
+    ExecutionInventoryEvidence, Report, ValidatedReport, decode,
+};
+use crate::proto::ExecutionInventoryObservation;
 
 /// The outcome recorded only when the surrounding publication commits.
 #[derive(Clone, Copy, Debug)]
@@ -31,47 +30,6 @@ impl InventoryStatus {
     }
 }
 
-#[derive(Debug)]
-enum Report<'a> {
-    Complete(&'a NodeExecutionInventory),
-    Legacy(&'a NodeExecutionInventory),
-    Unavailable,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ObservationError {
-    #[error("execution observation is missing a supported outcome")]
-    MissingOutcome,
-    #[error("complete execution observation disagrees with legacy inventory")]
-    ConflictingInventory,
-    #[error("unavailable execution observation cannot include legacy inventory")]
-    UnavailableWithInventory,
-}
-
-fn decode<'a>(
-    observation: Option<&'a ExecutionInventoryObservation>,
-    legacy: Option<&'a NodeExecutionInventory>,
-) -> Result<Option<Report<'a>>, ObservationError> {
-    let Some(observation) = observation else {
-        return Ok(legacy.map(Report::Legacy));
-    };
-    match observation.outcome.as_ref() {
-        Some(Outcome::Complete(inventory)) => {
-            if legacy.is_some_and(|legacy| legacy != inventory) {
-                return Err(ObservationError::ConflictingInventory);
-            }
-            Ok(Some(Report::Complete(inventory)))
-        }
-        Some(Outcome::Unavailable(_)) => {
-            if legacy.is_some() {
-                return Err(ObservationError::UnavailableWithInventory);
-            }
-            Ok(Some(Report::Unavailable))
-        }
-        None => Err(ObservationError::MissingOutcome),
-    }
-}
-
 /// Holds decoded evidence after acquiring this publication's node lock.
 /// Construct before census writes; consume before the status upsert.
 pub(super) struct PreparedObservation<'a> {
@@ -85,9 +43,7 @@ pub(super) async fn prepare<'a>(
     observation: Option<&'a ExecutionInventoryObservation>,
     legacy: Option<&'a NodeExecutionInventory>,
 ) -> Result<Option<PreparedObservation<'a>>, Status> {
-    let Some(report) =
-        decode(observation, legacy).map_err(|error| Status::invalid_argument(error.to_string()))?
-    else {
+    let Some(report) = decode(observation, legacy)? else {
         return Ok(None);
     };
     // Acquire before census writes to preserve node-before-sandbox lock order.
@@ -116,25 +72,23 @@ pub(super) async fn publish(
     let Some(PreparedObservation { node_id, report }) = prepared else {
         return Ok(None);
     };
-    let (status, inventory) = match report {
-        Report::Complete(inventory) => (InventoryStatus::Complete, Some(inventory)),
-        Report::Legacy(inventory) => (InventoryStatus::Legacy, Some(inventory)),
-        Report::Unavailable => (InventoryStatus::Unavailable, None),
+    let (status, evidence) = match ValidatedReport::try_from_report(report)? {
+        ValidatedReport::Complete(evidence) => (InventoryStatus::Complete, Some(evidence)),
+        ValidatedReport::Legacy(evidence) => (InventoryStatus::Legacy, Some(evidence)),
+        ValidatedReport::Unavailable => (InventoryStatus::Unavailable, None),
     };
-    if let Some(inventory) = inventory {
+    let policy = if let Some(ExecutionInventoryEvidence { inventory, policy }) = evidence {
         publish_inventory(tx, node_id, inventory).await?;
-    }
-    let policy = inventory
-        .and_then(|inventory| inventory.policy.as_ref())
-        .and_then(|policy| {
-            match pplx_space_common_core::types::ExecutionPolicyObservation::try_from(policy) {
-                Ok(policy) => Some(policy),
-                Err(error) => {
-                    tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");
-                    None
-                }
+        match policy {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");
+                None
             }
-        });
+        }
+    } else {
+        None
+    };
     Ok(Some(PublishedExecutionObservation { status, policy }))
 }
 
@@ -145,81 +99,9 @@ pub(super) async fn publish(
 async fn publish_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    inventory: &pplx_space_execution_common::proto::NodeExecutionInventory,
+    inventory: ValidatedExecutionInventory,
 ) -> Result<(), Status> {
-    let mut runtime_rows = Vec::with_capacity(inventory.runtimes.len());
-    for installation in &inventory.runtimes {
-        let runtime = installation
-            .runtime
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("runtime installation is missing identity"))
-            .and_then(|runtime| {
-                RuntimeIdentity::try_from(runtime)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))
-            })?;
-        let guests = installation
-            .supported_guests
-            .iter()
-            .map(|guest| {
-                GuestPlatform::try_from(guest)
-                    .map(|guest| {
-                        serde_json::json!({
-                            "guest_os": guest.os.as_str(),
-                            "guest_arch": guest.architecture.as_str(),
-                        })
-                    })
-                    .map_err(|error| Status::invalid_argument(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let state_formats = installation
-            .state_formats
-            .iter()
-            .map(|capability| {
-                let identity = capability.identity.as_ref().ok_or_else(|| {
-                    Status::invalid_argument("state format capability is missing identity")
-                })?;
-                let identity = StateFormatIdentity::try_from(identity)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                Ok(serde_json::json!({
-                    "state_format_name": identity.format.as_str(),
-                    "state_format_version": identity.version.as_str(),
-                    "can_create": capability.can_create,
-                    "can_load": capability.can_load,
-                }))
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        runtime_rows.push(serde_json::json!({
-            "runtime": runtime.kind.alias(),
-            "runtime_version": runtime.version.as_str(),
-            "guests": guests,
-            "state_formats": state_formats,
-        }));
-    }
-
-    let component_rows = inventory
-        .components
-        .iter()
-        .map(|installation| {
-            let component = installation.component.as_ref().ok_or_else(|| {
-                Status::invalid_argument("artifact component installation is missing component")
-            })?;
-            let component = ArtifactComponentMetadata::try_from(component)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            Ok(serde_json::json!({
-                "kind": component.kind.as_str(),
-                "role_key": component.role.as_ref().map_or("", |role| role.as_str()),
-                "version_key": component.version.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "digest_key": component.digest.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "format_key": component.format.as_ref().map(ToString::to_string).unwrap_or_default(),
-                "version": component.version.as_ref().map(ToString::to_string),
-                "digest": component.digest.as_ref().map(ToString::to_string),
-                "format": component.format.as_ref().map(ToString::to_string),
-                "default_for_new": installation.default_for_new,
-                "legacy_default": installation.legacy_default,
-            }))
-        })
-        .collect::<Result<Vec<_>, Status>>()?;
-
+    let (runtime_rows, component_rows) = inventory.into_legacy_rows();
     let runtime_rows = Json(serde_json::Value::Array(runtime_rows));
     let component_rows = Json(serde_json::Value::Array(component_rows));
     sqlx::query(sql!(

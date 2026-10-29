@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Cluster control-plane gRPC API (`ClusterApi`) backed by the Postgres
 //! cluster-state SSOT. Extracted from `pplx-space-node-api-server` (the former
 //! `--role cluster` surface of `space-node-api-svc`).
@@ -21,6 +23,7 @@ pub use node_info::ClusterNodeInfoService;
 mod data_plane_sessions;
 pub mod ingress_activation;
 mod node_inventory;
+mod node_publish;
 mod route_identity;
 mod run;
 mod runtime_desired_state;
@@ -89,20 +92,19 @@ use crate::proto::{
     GetSuspendSnapshotLocationResponse, ListLatestTemplateReleasesEntry,
     ListLatestTemplateReleasesRequest, ListLatestTemplateReleasesResponse, ListNodesRequest,
     ListNodesResponse, ListWarmPoolTemplateReleasesRequest, ListWarmPoolTemplateReleasesResponse,
-    NetworkPolicyTargetRef, NodeCtlStatus, NodeRecord, NodeRole as ProtoNodeRole,
-    NodeSchedulingStatus, PublishNodeStateRequest, PublishNodeStateResponse,
-    PublishSandboxPortExposureStatesRequest, PublishSandboxPortExposureStatesResponse,
-    PublishedNodeStatus, QuarantineRecoverySuspendSnapshot, QuarantineRecoveryTargetState,
-    ReconcileFacet as ProtoReconcileFacet, RecordDataPlaneSessionReconnectRequest,
-    RecordDataPlaneSessionReconnectResponse, RegisterTemplateReleaseRequest,
-    RegisterTemplateReleaseResponse, RegisterTemplateRequest, RegisterTemplateResponse,
-    ResolveDataPlaneSessionRouteRequest, ResolveDataPlaneSessionRouteResponse, SandboxDesiredState,
-    SandboxNetworkPolicyState, SandboxPortApplyStateKind, SandboxPortDesiredStateKind,
-    SandboxPortExposureApplyStateError, SandboxPortExposureDesiredState, SandboxPortProtocol,
-    SuspendSnapshotTerminalState, Template, TemplateBaseSnapshotPolicyState, TemplateDesiredState,
-    TemplateNetworkPolicyState, TemplatePoolPolicyState, TemplateRelease,
-    TemplateReleaseStorageLocation, TemplateReleaseTag, TemplateVisibility,
-    TouchArtifactBackupRequest, TouchArtifactBackupResponse,
+    NetworkPolicyTargetRef, NodeRecord, NodeRole as ProtoNodeRole, PublishNodeStateRequest,
+    PublishNodeStateResponse, PublishSandboxPortExposureStatesRequest,
+    PublishSandboxPortExposureStatesResponse, QuarantineRecoverySuspendSnapshot,
+    QuarantineRecoveryTargetState, ReconcileFacet as ProtoReconcileFacet,
+    RecordDataPlaneSessionReconnectRequest, RecordDataPlaneSessionReconnectResponse,
+    RegisterTemplateReleaseRequest, RegisterTemplateReleaseResponse, RegisterTemplateRequest,
+    RegisterTemplateResponse, ResolveDataPlaneSessionRouteRequest,
+    ResolveDataPlaneSessionRouteResponse, SandboxDesiredState, SandboxNetworkPolicyState,
+    SandboxPortApplyStateKind, SandboxPortDesiredStateKind, SandboxPortExposureApplyStateError,
+    SandboxPortExposureDesiredState, SandboxPortProtocol, SuspendSnapshotTerminalState, Template,
+    TemplateBaseSnapshotPolicyState, TemplateDesiredState, TemplateNetworkPolicyState,
+    TemplatePoolPolicyState, TemplateRelease, TemplateReleaseStorageLocation, TemplateReleaseTag,
+    TemplateVisibility, TouchArtifactBackupRequest, TouchArtifactBackupResponse,
     UnstableResetSandboxServiceRouteRequest, UnstableResetSandboxServiceRouteResponse,
     UnstableResolveSandboxServiceRouteRequest, UnstableResolveSandboxServiceRouteResponse,
     WarmPoolTemplateRelease, facet_ref, network_policy_target_ref,
@@ -189,91 +191,6 @@ fn emit_ready_suspend_projection_event(
             .with_to_state("suspended")
             .source_node_id(source_node_id.to_string()),
     );
-}
-
-fn u32_to_i32(value: u32, field: &str) -> Result<i32, Status> {
-    i32::try_from(value)
-        .map_err(|error| Status::invalid_argument(format!("{field} exceeds i32::MAX: {error}")))
-}
-
-fn scheduling_status_label(status: i32) -> &'static str {
-    match NodeSchedulingStatus::try_from(status).unwrap_or_default() {
-        NodeSchedulingStatus::Ready => "ready",
-        NodeSchedulingStatus::Warming => "warming",
-        NodeSchedulingStatus::Draining => "draining",
-        NodeSchedulingStatus::Degraded => "degraded",
-        NodeSchedulingStatus::Empty => "empty",
-        NodeSchedulingStatus::Unavailable => "unavailable",
-        NodeSchedulingStatus::Full => "full",
-        NodeSchedulingStatus::Unspecified => "unknown",
-    }
-}
-
-fn node_ctl_status_json(status: NodeCtlStatus) -> serde_json::Value {
-    serde_json::json!({
-        "reachable": status.reachable,
-        "error": status.error,
-        "reconciliations": status
-            .reconciliations
-            .into_iter()
-            .map(|status| {
-                serde_json::json!({
-                    "name": status.name,
-                    "poll_interval_secs": status.poll_interval_secs,
-                    "last_started_at_unix_secs": status.last_started_at_unix_secs,
-                    "last_completed_at_unix_secs": status.last_completed_at_unix_secs,
-                    "last_success_at_unix_secs": status.last_success_at_unix_secs,
-                    "next_due_at_unix_secs": status.next_due_at_unix_secs,
-                    "running": status.running,
-                    "templates_seen": status.templates_seen,
-                    "sandboxes_seen": status.sandboxes_seen,
-                    "templates_applied": status.templates_applied,
-                    "sandboxes_applied": status.sandboxes_applied,
-                    "last_error": status.last_error,
-                })
-            })
-            .collect::<Vec<_>>(),
-    })
-}
-
-struct PublishedNodeStatusDb {
-    scheduling_status: String,
-    scheduling_reason: String,
-    network_slots_ready: i32,
-    network_pool_min_ready: i32,
-    network_slots_degraded: i32,
-    network_slots_quarantined: i32,
-    network_slots_total: i32,
-    network_slots_leased: i32,
-    network_pool_max_slots: i32,
-    node_ctl: Option<serde_json::Value>,
-}
-
-fn published_node_status_db(status: PublishedNodeStatus) -> Result<PublishedNodeStatusDb, Status> {
-    Ok(PublishedNodeStatusDb {
-        scheduling_status: scheduling_status_label(status.scheduling_status).to_string(),
-        scheduling_reason: status.scheduling_reason,
-        network_slots_ready: u32_to_i32(status.network_slots_ready, "network_slots_ready")?,
-        network_pool_min_ready: u32_to_i32(
-            status.network_pool_min_ready,
-            "network_pool_min_ready",
-        )?,
-        network_slots_degraded: u32_to_i32(
-            status.network_slots_degraded,
-            "network_slots_degraded",
-        )?,
-        network_slots_quarantined: u32_to_i32(
-            status.network_slots_quarantined,
-            "network_slots_quarantined",
-        )?,
-        network_slots_total: u32_to_i32(status.network_slots_total, "network_slots_total")?,
-        network_slots_leased: u32_to_i32(status.network_slots_leased, "network_slots_leased")?,
-        network_pool_max_slots: u32_to_i32(
-            status.network_pool_max_slots,
-            "network_pool_max_slots",
-        )?,
-        node_ctl: status.node_ctl.map(node_ctl_status_json),
-    })
 }
 
 #[derive(Clone)]

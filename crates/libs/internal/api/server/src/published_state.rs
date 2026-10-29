@@ -1,23 +1,18 @@
 use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use sqlx::types::Json;
-use time::format_description::well_known::Rfc3339;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::metadata::artifact_kind_from_proto;
 use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
 use pplx_space_common_core::types::{
-    Arch, ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration,
-    ExecutionMetadata, LocalArtifactId, NodeRole, PodUid, PolicyAuthority, RuntimeKind,
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
+    ArtifactKind, NodeRole, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SemVer,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
 use pplx_space_common_svc::{
     sql::sandbox_quarantine::{
@@ -35,22 +30,26 @@ use pplx_space_common_svc::{
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_sandbox_portability::{
     SuspendedTargetNodeAssignment, node_published_execution_identity_matches,
     publish_clear_or_preserve_current_local_artifact_marker_assignments,
     started_suspend_revert_eligibility, stopped_artifact_durable, suspended_k8s_finalization_sql,
     suspended_projection_lifecycle_eligible,
 };
-use pplx_space_sbx_mgr_client::proto::{
-    QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
-};
-use pplx_space_template_mgr_client::proto::SnapshotInfo;
 
+use crate::node_publish::validate::failure_episode::FailureEpisodeClaim;
+pub(crate) use crate::node_publish::validate::fields::snapshot_execution_metadata;
+#[cfg(test)]
+use crate::node_publish::validate::quarantine::{
+    QuarantineRecoveryProjectionState, quarantine_recovery_projection,
+};
+use crate::node_publish::validate::quarantine_claim::QuarantineClaim;
+use crate::node_publish::validate::sandbox_inventory::{
+    LegacySandboxInput, ValidatedSandboxInventory,
+};
+use crate::node_publish::validate::templates::ValidatedTemplateInventory;
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
 use crate::sandbox_quarantine_store;
-
-use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
 
 const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
 ON CONFLICT (node_id, facet, element) DO UPDATE
@@ -75,178 +74,6 @@ struct AcceptedSandboxPublishRow {
     published_status: Option<String>,
     state_changed_at: Option<time::OffsetDateTime>,
     status_changed: bool,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("invalid {field}: {message}")]
-struct PublishedTransitionReceiptError {
-    field: pplx_space_metrics::sandbox::publication::StatePublicationField,
-    message: String,
-}
-
-fn parse_published_transition_receipt(
-    state: &PublishedSandboxState,
-) -> Result<
-    Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
-    PublishedTransitionReceiptError,
-> {
-    use pplx_space_metrics::sandbox::publication::StatePublicationField as Field;
-
-    let Some(receipt) = state.transition_receipt.as_ref() else {
-        return Ok(None);
-    };
-    let required = |value: Option<&str>, field| {
-        optional_trimmed(value).ok_or_else(|| PublishedTransitionReceiptError {
-            field,
-            message: "required receipt field is missing or blank".to_string(),
-        })
-    };
-    let id = required(Some(&receipt.id), Field::TransitionReceiptId)?
-        .parse()
-        .map_err(|error: uuid::Error| PublishedTransitionReceiptError {
-            field: Field::TransitionReceiptId,
-            message: error.to_string(),
-        })?;
-    let kind = required(Some(&receipt.kind), Field::TransitionReceiptKind)?
-        .parse()
-        .map_err(
-            |error: pplx_space_common_core::types::SandboxTransitionReceiptKindParseError| {
-                PublishedTransitionReceiptError {
-                    field: Field::TransitionReceiptKind,
-                    message: error.to_string(),
-                }
-            },
-        )?;
-    let target_state: SandboxTransitionTargetState = required(
-        Some(&receipt.target_state),
-        Field::TransitionReceiptTargetState,
-    )?
-    .parse()
-    .map_err(
-        |error: pplx_space_common_core::types::SandboxTransitionTargetStateParseError| {
-            PublishedTransitionReceiptError {
-                field: Field::TransitionReceiptTargetState,
-                message: error.to_string(),
-            }
-        },
-    )?;
-    let execution_generation =
-        ExecutionGeneration::new(receipt.execution_generation).map_err(|error| {
-            PublishedTransitionReceiptError {
-                field: Field::TransitionReceiptExecutionGeneration,
-                message: error.to_string(),
-            }
-        })?;
-    let reason_code: Option<SandboxQuarantineReasonCode> = if kind
-        == SandboxTransitionReceiptKind::ActivationCompleted
-    {
-        None
-    } else {
-        optional_trimmed(Some(&receipt.reason_code))
-                .map(|reason_value| match reason_value.parse() {
-                    Ok(reason_code) => Ok(reason_code),
-                    Err(error) if kind == SandboxTransitionReceiptKind::ActivationRollback => {
-                        let fallback = match target_state {
-                            SandboxTransitionTargetState::Created => {
-                                SandboxQuarantineReasonCode::CreateInterrupted
-                            }
-                            SandboxTransitionTargetState::Stopped => {
-                                SandboxQuarantineReasonCode::ColdActivationInterrupted
-                            }
-                            SandboxTransitionTargetState::Suspended => {
-                                SandboxQuarantineReasonCode::RestoreActivationInterrupted
-                            }
-                            SandboxTransitionTargetState::Started
-                            | SandboxTransitionTargetState::Paused => {
-                                return Err(PublishedTransitionReceiptError {
-                                    field: Field::TransitionReceiptTargetState,
-                                    message: format!(
-                                        "activation rollback cannot target {target_state}"
-                                    ),
-                                });
-                            }
-                        };
-                        let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::FallbackTransitionReason;
-                        pplx_space_metrics::sandbox::publication::degraded(
-                            pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                            Field::TransitionReceiptReasonCode,
-                            disposition,
-                        );
-                        tracing::warn!(
-                            sandbox_id = %state.sandbox_id,
-                            reason_code = reason_value,
-                            %error,
-                            %disposition,
-                            fallback_reason_code = %fallback,
-                            "using target-specific fallback for a forward-compatible activation rollback reason"
-                        );
-                        Ok(fallback)
-                    }
-                    Err(error) => Err(PublishedTransitionReceiptError {
-                        field: Field::TransitionReceiptReasonCode,
-                        message: error.to_string(),
-                    }),
-                })
-                .transpose()?
-    };
-    let status = optional_trimmed(state.status.as_deref()).unwrap_or_default();
-    if !status.eq_ignore_ascii_case(target_state.as_str()) {
-        return Err(PublishedTransitionReceiptError {
-            field: Field::TransitionReceiptTargetState,
-            message: format!("receipt target {target_state} disagrees with status {status:?}"),
-        });
-    }
-    if kind == SandboxTransitionReceiptKind::QuarantineRecovery
-        && reason_code
-            .as_ref()
-            .is_some_and(|reason| reason.automatic_recovery_policy().is_none())
-    {
-        return Err(PublishedTransitionReceiptError {
-            field: Field::TransitionReceiptKind,
-            message: "quarantine recovery requires a reviewed pre-resume reason".to_string(),
-        });
-    }
-    let activation_attempt_id = receipt
-        .activation_attempt_id
-        .as_deref()
-        .map(|value| {
-            value
-                .trim()
-                .parse()
-                .map_err(|error: uuid::Error| PublishedTransitionReceiptError {
-                    field: Field::TransitionReceiptActivationAttemptId,
-                    message: error.to_string(),
-                })
-        })
-        .transpose()?;
-    let receipt = SandboxTransitionReceipt::try_new(
-        id,
-        kind,
-        target_state,
-        execution_generation,
-        reason_code,
-        activation_attempt_id,
-    )
-    .map_err(|error| PublishedTransitionReceiptError {
-        field: match error {
-            SandboxTransitionReceiptInvariantError::MissingActivationAttempt => {
-                Field::TransitionReceiptActivationAttemptId
-            }
-            SandboxTransitionReceiptInvariantError::MissingReasonCode
-            | SandboxTransitionReceiptInvariantError::UnexpectedReasonCode => {
-                Field::TransitionReceiptReasonCode
-            }
-            SandboxTransitionReceiptInvariantError::InvalidActivationCompletionTarget {
-                ..
-            }
-            | SandboxTransitionReceiptInvariantError::InvalidActivationRollbackTarget { .. }
-            | SandboxTransitionReceiptInvariantError::InvalidQuarantineRecoveryTarget { .. } => {
-                Field::TransitionReceiptTargetState
-            }
-        },
-        message: error.to_string(),
-    })?;
-    Ok(Some(receipt))
 }
 
 struct ObservedStateComparableColumn {
@@ -345,55 +172,25 @@ fn render_observed_state_expression(template: &str, source: &str, column: &str) 
         .replace("{column}", column)
 }
 
-pub(crate) struct ExecutionProjection {
-    pub(crate) runtime: String,
-    pub(crate) runtime_version: String,
-    pub(crate) guest_os: String,
-    pub(crate) guest_arch: String,
-    pub(crate) state_format_name: Option<String>,
-    pub(crate) state_format_version: Option<String>,
-    pub(crate) metadata: serde_json::Value,
-    pub(crate) components: Vec<ArtifactComponentProjection>,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct ArtifactComponentProjection {
-    pub(crate) kind: String,
-    pub(crate) role_key: String,
-    pub(crate) version: Option<String>,
-    pub(crate) digest: Option<String>,
-    pub(crate) format: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct QuarantineProjectionInput {
-    sandbox_id: SandboxId,
-    failure_reason: Option<String>,
-    source: SandboxQuarantineSource,
-    reason_code: SandboxQuarantineReasonCode,
-    quarantine_id: Uuid,
-    history_id: Uuid,
-}
-
 #[derive(Clone, Debug, serde::Serialize)]
 struct QuarantineProjectionSqlInput<'a> {
     sandbox_id: SandboxId,
-    failure_reason: &'a Option<String>,
+    failure_reason: Option<&'a str>,
     source: &'static str,
     reason_code: &'static str,
     quarantine_id: Uuid,
     history_id: Uuid,
 }
 
-impl QuarantineProjectionInput {
-    fn sql_input(&self) -> QuarantineProjectionSqlInput<'_> {
-        QuarantineProjectionSqlInput {
-            sandbox_id: self.sandbox_id,
-            failure_reason: &self.failure_reason,
-            source: self.source.as_str(),
-            reason_code: self.reason_code.as_str(),
-            quarantine_id: self.quarantine_id,
-            history_id: self.history_id,
+impl<'a> QuarantineProjectionSqlInput<'a> {
+    fn materialize(claim: &'a QuarantineClaim) -> Self {
+        Self {
+            sandbox_id: claim.sandbox_id(),
+            failure_reason: claim.failure_reason(),
+            source: claim.source().as_str(),
+            reason_code: claim.reason_code().as_str(),
+            quarantine_id: Uuid::now_v7(),
+            history_id: Uuid::now_v7(),
         }
     }
 }
@@ -432,164 +229,6 @@ impl ClaimedQuarantineProjection {
             history_id: self.history_id,
         }
     }
-}
-
-fn projection_from_execution(execution: ExecutionMetadata) -> Result<ExecutionProjection, Status> {
-    let state_format_name = execution
-        .state_format()
-        .map(|state_format| state_format.format.to_string());
-    let state_format_version = execution
-        .state_format()
-        .map(|state_format| state_format.version.to_string());
-    let components = execution
-        .components()
-        .iter()
-        .map(|component| ArtifactComponentProjection {
-            kind: component.kind.as_str().to_string(),
-            role_key: component
-                .role
-                .as_ref()
-                .map_or_else(String::new, ToString::to_string),
-            version: component.version.as_ref().map(ToString::to_string),
-            digest: component.digest.as_ref().map(ToString::to_string),
-            format: component.format.as_ref().map(ToString::to_string),
-        })
-        .collect();
-    Ok(ExecutionProjection {
-        runtime: execution.runtime().kind.alias().to_string(),
-        runtime_version: execution.runtime().version.to_string(),
-        guest_os: execution.guest().os.to_string(),
-        guest_arch: execution.guest().architecture.to_string(),
-        state_format_name,
-        state_format_version,
-        metadata: serde_json::to_value(&execution)
-            .map_err(|error| Status::internal(format!("serialize execution metadata: {error}")))?,
-        components,
-    })
-}
-
-fn execution_projection(
-    execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
-) -> Result<Option<ExecutionProjection>, Status> {
-    let Some(execution) = execution else {
-        return Ok(None);
-    };
-    let execution = ExecutionMetadata::try_from(execution)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    projection_from_execution(execution).map(Some)
-}
-
-fn proto_timestamp_to_rfc3339(
-    timestamp: &prost_types::Timestamp,
-    field: &str,
-) -> Result<String, Status> {
-    proto_timestamp(timestamp, field)?
-        .format(&Rfc3339)
-        .map_err(|error| Status::internal(format!("format {field}: {error}")))
-}
-
-fn proto_timestamp(
-    timestamp: &prost_types::Timestamp,
-    field: &str,
-) -> Result<time::OffsetDateTime, Status> {
-    let nanos = u32::try_from(timestamp.nanos)
-        .ok()
-        .filter(|nanos| *nanos < 1_000_000_000)
-        .ok_or_else(|| Status::invalid_argument(format!("{field} has invalid nanos")))?;
-    time::OffsetDateTime::from_unix_timestamp(timestamp.seconds)
-        .map_err(|error| Status::invalid_argument(format!("{field} is out of range: {error}")))?
-        .replace_nanosecond(nanos)
-        .map_err(|error| Status::invalid_argument(format!("{field} is invalid: {error}")))
-}
-
-#[derive(Clone, Debug)]
-struct QuarantineRecoveryProjection {
-    schema_version: u32,
-    local_quarantine_id: Uuid,
-    observed_owner: QuarantineRecoveryObservedOwner,
-    attempt_count: i64,
-    next_attempt_at: Option<String>,
-}
-
-enum QuarantineRecoveryProjectionState {
-    Absent,
-    Degraded,
-    Observed(QuarantineRecoveryProjection),
-}
-
-impl QuarantineRecoveryProjection {
-    fn observed_owner_name(&self) -> &'static str {
-        match self.observed_owner {
-            QuarantineRecoveryObservedOwner::Unspecified => "unspecified",
-            QuarantineRecoveryObservedOwner::LegacyRecovery => "legacy_recovery",
-        }
-    }
-}
-
-fn quarantine_recovery_projection(
-    state: &PublishedSandboxState,
-) -> Result<QuarantineRecoveryProjectionState, Status> {
-    let Some(observation) = state.quarantine_recovery.as_ref() else {
-        return Ok(QuarantineRecoveryProjectionState::Absent);
-    };
-    if observation.degraded {
-        return Ok(QuarantineRecoveryProjectionState::Degraded);
-    };
-    if observation.schema_version == 0 {
-        return Err(Status::invalid_argument(format!(
-            "unsupported quarantine recovery observation schema version {}",
-            observation.schema_version
-        )));
-    }
-    let local_quarantine_id = optional_trimmed(Some(&observation.local_quarantine_id))
-        .ok_or_else(|| Status::invalid_argument("local_quarantine_id is required"))?
-        .parse::<Uuid>()
-        .map_err(|error| {
-            Status::invalid_argument(format!("invalid local_quarantine_id: {error}"))
-        })?;
-    // Owner is descriptive evidence, not authority. Preserve the episode and
-    // scheduling facts when a newer publisher sends an owner this release does
-    // not know; rollout safety is better served by an explicit unspecified
-    // owner than by freezing the entire prior observation as degraded.
-    let observed_owner = QuarantineRecoveryObservedOwner::try_from(observation.observed_owner)
-        .unwrap_or(QuarantineRecoveryObservedOwner::Unspecified);
-    let next_attempt_at = observation
-        .next_attempt_at
-        .as_ref()
-        .map(|timestamp| {
-            if timestamp.seconds < 0 {
-                return Err(Status::invalid_argument(
-                    "quarantine_next_attempt_at is negative",
-                ));
-            }
-            proto_timestamp_to_rfc3339(timestamp, "quarantine_next_attempt_at")
-        })
-        .transpose()?;
-    Ok(QuarantineRecoveryProjectionState::Observed(
-        QuarantineRecoveryProjection {
-            schema_version: observation.schema_version,
-            local_quarantine_id,
-            observed_owner,
-            attempt_count: i64::from(observation.attempt_count),
-            next_attempt_at,
-        },
-    ))
-}
-
-/// Execution metadata is required: the node-side senders (spaced and the
-/// sbx-mgr durable upload worker) have always populated it, and the former
-/// mixed-version backfill forced an expensive template/inventory arch
-/// resolution onto every suspend/backup begin. A caller that omits it gets
-/// a loud `INVALID_ARGUMENT` instead of a silently backfilled identity.
-pub(crate) fn snapshot_execution_metadata(
-    execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, Status> {
-    let execution =
-        execution.ok_or_else(|| Status::invalid_argument("execution metadata is required"))?;
-    let execution = ExecutionMetadata::try_from(execution)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    pplx_space_common_core::types::SnapshotExecutionMetadata::new(execution)
-        .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 /// Longest prefix of an invalid capture host CPU that reaches the log. The
@@ -631,179 +270,8 @@ pub(crate) fn capture_host_cpu(
         .ok()
 }
 
-fn u64_to_i64(value: u64, field: &str) -> Result<i64, Status> {
-    i64::try_from(value)
-        .map_err(|error| Status::invalid_argument(format!("{field} exceeds i64::MAX: {error}")))
-}
-
-fn u32_to_i32(value: u32, field: &str) -> Result<i32, Status> {
-    i32::try_from(value)
-        .map_err(|error| Status::invalid_argument(format!("{field} exceeds i32::MAX: {error}")))
-}
-
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn non_zero_u64_to_i64(value: u64, field: &str) -> Result<Option<i64>, Status> {
-    if value == 0 {
-        Ok(None)
-    } else {
-        u64_to_i64(value, field).map(Some)
-    }
-}
-
-fn optional_u64_to_i64_when(
-    include: bool,
-    value: Option<u64>,
-    field: &str,
-) -> Result<Option<i64>, Status> {
-    if include {
-        value.map(|value| u64_to_i64(value, field)).transpose()
-    } else {
-        Ok(None)
-    }
-}
-
-fn optional_u32_to_i32_when(
-    include: bool,
-    value: Option<u32>,
-    field: &str,
-) -> Result<Option<i32>, Status> {
-    if include {
-        value.map(|value| u32_to_i32(value, field)).transpose()
-    } else {
-        Ok(None)
-    }
-}
-
-fn network_policy_source_str(source: i32) -> Option<&'static str> {
-    match NetworkPolicySource::try_from(source).unwrap_or(NetworkPolicySource::Unspecified) {
-        NetworkPolicySource::Template => Some("template"),
-        NetworkPolicySource::Override => Some("override"),
-        NetworkPolicySource::Unspecified => None,
-    }
-}
-
-fn template_state_row(
-    state: &PublishedTemplateState,
-    include_template_metadata: bool,
-) -> Result<serde_json::Value, Status> {
-    let execution = execution_projection(state.execution.as_ref())?;
-    if let Some(execution) = execution.as_ref() {
-        if let Some(runtime) = optional_trimmed(state.runtime.as_deref()) {
-            let runtime = RuntimeKind::parse(&runtime)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let execution_runtime = RuntimeKind::parse(&execution.runtime)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            if runtime != execution_runtime {
-                return Err(Status::invalid_argument(
-                    "published template runtime disagrees with execution metadata",
-                ));
-            }
-        }
-        if let Some(arch) = optional_trimmed(state.arch.as_deref()) {
-            let arch = arch
-                .parse::<Arch>()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let execution_arch = execution
-                .guest_arch
-                .parse::<Arch>()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            if arch != execution_arch {
-                return Err(Status::invalid_argument(
-                    "published template architecture disagrees with execution metadata",
-                ));
-            }
-        }
-    }
-    let policy = state
-        .network_policy
-        .as_ref()
-        .map(proto_network_policy_to_common)
-        .transpose()?;
-    let default_auto_lifecycle = if include_template_metadata {
-        state
-            .default_auto_lifecycle
-            .as_ref()
-            .and_then(|policy| AutoLifecyclePolicy::try_from(policy).ok())
-    } else {
-        None
-    };
-    Ok(serde_json::json!({
-        "template_name": trimmed_required(&state.template, "template")?,
-        "content_hash": optional_trimmed(state.content_hash.as_deref()).unwrap_or_default(),
-        "runtime": include_template_metadata
-            .then(|| optional_trimmed(state.runtime.as_deref()))
-            .flatten()
-            .or_else(|| execution.as_ref().map(|execution| execution.runtime.clone())),
-        "arch": include_template_metadata
-            .then(|| optional_trimmed(state.arch.as_deref()))
-            .flatten()
-            .or_else(|| execution.as_ref().map(|execution| execution.guest_arch.clone())),
-        "runtime_version": execution.as_ref().map(|execution| execution.runtime_version.clone()),
-        "guest_os": execution.as_ref().map(|execution| execution.guest_os.clone()),
-        "state_format_name": execution.as_ref().and_then(|execution| execution.state_format_name.clone()),
-        "state_format_version": execution.as_ref().and_then(|execution| execution.state_format_version.clone()),
-        "execution_metadata": execution.as_ref().map(|execution| execution.metadata.clone()),
-        "execution_components": execution.as_ref().map(|execution| execution.components.clone()).unwrap_or_default(),
-        "built_at": include_template_metadata
-            .then(|| optional_trimmed(state.built_at.as_deref()))
-            .flatten(),
-        "artifact_size_bytes": optional_u64_to_i64_when(
-            include_template_metadata,
-            state.artifact_size_bytes,
-            "artifact_size_bytes",
-        )?,
-        "cache_size_bytes": state.cache_size_bytes
-            .map(|value| u64_to_i64(value, "cache_size_bytes"))
-            .transpose()?,
-        "has_base_snapshot": state.has_base_snapshot,
-        "base_snapshot_size_bytes": state.base_snapshot_size_bytes
-            .map(|value| u64_to_i64(value, "base_snapshot_size_bytes"))
-            .transpose()?,
-        "pool_target": state.pool_target
-            .map(|value| u32_to_i32(value, "pool_target"))
-            .transpose()?,
-        "pool_current": u32_to_i32(state.pool_current, "pool_current")?,
-        "pool_pending": u32_to_i32(state.pool_pending, "pool_pending")?,
-        "pool_sandbox_ids": &state.pool_sandbox_ids,
-        "snapshots": template_snapshots_json(&state.snapshots),
-        "default_auto_lifecycle_json": default_auto_lifecycle,
-        "default_auto_lifecycle_authority": PolicyAuthority::from_optional_proto(state.auto_lifecycle_authority)
-            .map(|authority| authority.map(|authority| authority.as_str()))
-            .map_err(|error| Status::invalid_argument(error.to_string()))?,
-        "network_policy_json": policy,
-        "network_policy_generation": non_zero_u64_to_i64(
-            state.network_policy_generation,
-            "network_policy_generation",
-        )?,
-        "network_policy_authority": PolicyAuthority::from_optional_proto(state.network_policy_authority)
-            .map(|authority| authority.map(|authority| authority.as_str()))
-            .map_err(|error| Status::invalid_argument(error.to_string()))?,
-        "ensure_base_snapshot": include_template_metadata.then_some(state.ensure_base_snapshot).flatten(),
-        "snapshot_vcpu": optional_u32_to_i32_when(
-            include_template_metadata,
-            state.snapshot_vcpu,
-            "snapshot_vcpu",
-        )?,
-        "snapshot_memory_mib": optional_u32_to_i32_when(
-            include_template_metadata,
-            state.snapshot_memory_mib,
-            "snapshot_memory_mib",
-        )?,
-        "vcpu": optional_u32_to_i32_when(include_template_metadata, state.vcpu, "vcpu")?,
-        "memory_mib": optional_u32_to_i32_when(
-            include_template_metadata,
-            state.memory_mib,
-            "memory_mib",
-        )?,
-        "disk_size_mb": optional_u32_to_i32_when(
-            include_template_metadata,
-            state.disk_size_mb,
-            "disk_size_mb",
-        )?,
-    }))
 }
 
 fn sandbox_policy_reconcile_refs_for_new_sandboxes(
@@ -890,19 +358,19 @@ pub async fn publish_template_states(
     publisher_role: NodeRole,
     states: &[PublishedTemplateState],
 ) -> Result<u64, Status> {
-    let include_template_metadata = publisher_role == NodeRole::Builder;
-    let mut absent_templates = Vec::new();
-    let mut rows = Vec::new();
+    let inventory = ValidatedTemplateInventory::try_from_proto(publisher_role, states)?;
+    publish_validated_template_states(conn, node_id, inventory).await
+}
 
-    for state in states {
-        let template = trimmed_required(&state.template, "template")?;
-        if !state.present {
-            absent_templates.push(template);
-            continue;
-        }
-        rows.push(template_state_row(state, include_template_metadata)?);
-    }
-
+/// Apply checked template evidence on the caller's connection. This phase uses
+/// ordinary write locks in statement order, with no separate transaction or
+/// explicit row-lock query. Zero matching inventory rows is a normal outcome.
+pub(crate) async fn publish_validated_template_states(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    inventory: ValidatedTemplateInventory,
+) -> Result<u64, Status> {
+    let (absent_templates, rows) = inventory.into_legacy_rows();
     let mut accepted = 0_u64;
     if !absent_templates.is_empty() {
         let result = sqlx::query(sql!(
@@ -1485,65 +953,6 @@ impl PostCommitSandboxEvent {
     }
 }
 
-fn published_spaced_version(
-    node_id: NodeId,
-    sandbox_id: SandboxId,
-    raw: Option<&str>,
-) -> Option<SemVer> {
-    let raw = optional_trimmed(raw)?;
-    match SemVer::parse(&raw) {
-        Ok(version) => Some(version),
-        Err(error) => {
-            tracing::warn!(
-                %node_id,
-                %sandbox_id,
-                spaced_version = %raw,
-                error = %error,
-                "dropping invalid sandbox spaced version from node publish"
-            );
-            None
-        }
-    }
-}
-
-fn published_artifact_origin(raw: i32) -> Result<ArtifactOrigin, Status> {
-    match pplx_space_sbx_mgr_client::proto::ArtifactOrigin::try_from(raw) {
-        Ok(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop) => Ok(ArtifactOrigin::Stop),
-        Ok(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend) => {
-            Ok(ArtifactOrigin::Suspend)
-        }
-        Ok(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Snapshot) => {
-            Ok(ArtifactOrigin::Snapshot)
-        }
-        Ok(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork) => Ok(ArtifactOrigin::Fork),
-        _ => Err(Status::invalid_argument(
-            "current_local_artifact_origin must be STOP, SUSPEND, SNAPSHOT, or FORK",
-        )),
-    }
-}
-
-fn failure_episode_input(
-    sandbox_id: SandboxId,
-    state: &PublishedSandboxState,
-    state_degraded: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "sandbox_id": sandbox_id,
-        "status": optional_trimmed(state.status.as_deref()),
-        "state_degraded": state_degraded,
-        "execution_generation": state
-            .execution_generation
-            .and_then(|generation| ExecutionGeneration::new(generation).ok())
-            .map(ExecutionGeneration::get),
-        "pod_uid": optional_trimmed(state.pod_uid.as_deref())
-            .and_then(|pod_uid| PodUid::parse(pod_uid).ok())
-            .map(|pod_uid| pod_uid.to_string()),
-        "activation_attempt_id": optional_trimmed(state.activation_attempt_id.as_deref())
-            .and_then(|attempt| attempt.parse::<SandboxActivationAttemptId>().ok())
-            .map(|attempt| attempt.to_string()),
-    })
-}
-
 /// Deletes the stopped Direct sandboxes a node reported absent, and detaches
 /// their snapshots' storage locations.
 ///
@@ -1605,412 +1014,21 @@ pub async fn publish_sandbox_states(
     node_id: NodeId,
     states: &[PublishedSandboxState],
 ) -> Result<SandboxPublicationOutcome, Status> {
-    let mut states_by_id = BTreeMap::new();
-    for state in states {
-        let sandbox_id = match parse_sandbox_id(&state.sandbox_id) {
-            Ok(sandbox_id) => sandbox_id,
-            Err(error) => {
-                let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitSandbox;
-                pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                    pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
-                    disposition,
-                );
-                tracing::warn!(
-                    %node_id,
-                    sandbox_id = %state.sandbox_id,
-                    %error,
-                    %disposition,
-                    "omitting malformed sandbox identity from node publication"
-                );
-                continue;
-            }
-        };
-        states_by_id.insert(sandbox_id, state);
+    let inventory = ValidatedSandboxInventory::from_proto(states);
+    for diagnostic in inventory.diagnostics() {
+        diagnostic.emit(node_id);
     }
-
-    let mut absent_ids = Vec::new();
-    let mut rows = Vec::new();
-    // Keyed rather than two parallel collections: the ids are reported to
-    // callers and the payloads are written to `sandbox_observed_states`, and a
-    // third state-only disposition that appended to only one of them would
-    // fail silently in whichever half it forgot.
-    //
-    // The payload array this produces is therefore ordered by sandbox id
-    // rather than by publication order, which `jsonb_to_recordset` does not
-    // care about.
-    //
-    // Keying by sandbox id also collapses a request that names one sandbox
-    // twice, where a vector would have emitted both and hit the `ON
-    // CONFLICT`. Nothing dedupes `request.sandboxes`, so that is a real
-    // behaviour change and not merely a consequence of the two dispositions
-    // being mutually exclusive. It is the wanted direction: the value here
-    // is a diagnostic `(sandbox_id, status)` pair, so collapsing duplicates
-    // loses at most one status string, whereas the pending-backup report
-    // rejects a duplicated sandbox outright because there collapsing would
-    // silently drop one of two *artifacts*.
-    let mut state_only: BTreeMap<SandboxId, serde_json::Value> = BTreeMap::new();
-    let mut failure_episode_rows = Vec::new();
-    let mut snapshot_rows = Vec::new();
-    let mut quarantine_inputs = Vec::new();
+    let LegacySandboxInput {
+        absent_ids,
+        rows,
+        state_only,
+        failure_episode_rows,
+        snapshot_rows,
+        quarantine_inputs,
+        publishes_network_policy,
+    } = inventory.into_legacy_input();
     let mut post_commit_events = Vec::new();
     let mut post_commit_state_convergence = Vec::new();
-    let mut publishes_network_policy = false;
-
-    for (sandbox_id, state) in states_by_id {
-        let sandbox_uuid = sandbox_id;
-        if !state.present {
-            absent_ids.push(sandbox_uuid);
-            continue;
-        }
-        if state.state_degraded {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, true));
-            state_only.insert(
-                sandbox_uuid,
-                serde_json::json!({
-                    "sandbox_id": sandbox_uuid,
-                    "status": optional_trimmed(state.status.as_deref()),
-                }),
-            );
-            continue;
-        }
-        let transition_receipt = match parse_published_transition_receipt(state) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitTransitionReceipt;
-                pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                    error.field,
-                    disposition,
-                );
-                tracing::warn!(
-                    %node_id,
-                    %sandbox_id,
-                    field = %error.field,
-                    %disposition,
-                    %error,
-                    "ignoring malformed or forward-incompatible transition receipt without rejecting sandbox state"
-                );
-                None
-            }
-        };
-        let (quarantine_recovery, quarantine_recovery_degraded) =
-            match quarantine_recovery_projection(state) {
-                Ok(QuarantineRecoveryProjectionState::Absent) => (None, false),
-                Ok(QuarantineRecoveryProjectionState::Degraded) => (None, true),
-                Ok(QuarantineRecoveryProjectionState::Observed(observation)) => {
-                    (Some(observation), false)
-                }
-                Err(error) => {
-                    let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitQuarantineRecoveryObservation;
-                    pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                    pplx_space_metrics::sandbox::publication::StatePublicationField::QuarantineRecoveryObservation,
-                    disposition,
-                );
-                    tracing::warn!(
-                        %node_id,
-                        %sandbox_id,
-                        %error,
-                        %disposition,
-                        "ignoring malformed quarantine recovery observation without rejecting sandbox state"
-                    );
-                    (None, true)
-                }
-            };
-        let row_count = rows.len();
-        let snapshot_count = snapshot_rows.len();
-        let quarantine_count = quarantine_inputs.len();
-        let mut row_publishes_network_policy = false;
-        let parse_result = (|| -> Result<(), Status> {
-            if optional_trimmed(state.status.as_deref())
-                .is_some_and(|status| status.eq_ignore_ascii_case("quarantined"))
-            {
-                let (source, reason_code) = match optional_trimmed(
-                    state.quarantine_reason_code.as_deref(),
-                ) {
-                    Some(value) => match value.parse::<SandboxQuarantineReasonCode>() {
-                        Ok(reason_code) => (SandboxQuarantineSource::SbxManager, reason_code),
-                        Err(error) => {
-                            tracing::warn!(
-                                %node_id,
-                                %sandbox_id,
-                                quarantine_reason_code = %value,
-                                %error,
-                                "downgrading unknown node quarantine reason without rejecting state publication"
-                            );
-                            (
-                                SandboxQuarantineSource::NodeStatePublish,
-                                SandboxQuarantineReasonCode::NodePublishedQuarantined,
-                            )
-                        }
-                    },
-                    None => (
-                        SandboxQuarantineSource::NodeStatePublish,
-                        SandboxQuarantineReasonCode::NodePublishedQuarantined,
-                    ),
-                };
-                quarantine_inputs.push(QuarantineProjectionInput {
-                    sandbox_id,
-                    failure_reason: optional_trimmed(state.failure_reason.as_deref()),
-                    source,
-                    reason_code,
-                    quarantine_id: Uuid::now_v7(),
-                    history_id: Uuid::now_v7(),
-                });
-            }
-
-            let observed_network_policy = state
-                .observed_network_policy
-                .as_ref()
-                .map(proto_network_policy_to_common)
-                .transpose()?;
-            let observed_network_policy_generation = non_zero_u64_to_i64(
-                state.observed_network_policy_generation,
-                "observed_network_policy_generation",
-            )?;
-            row_publishes_network_policy = observed_network_policy_generation.is_some();
-            let execution = execution_projection(state.execution.as_ref())?;
-            let spaced_version =
-                published_spaced_version(node_id, sandbox_uuid, state.spaced_version.as_deref());
-            if let Some(execution) = execution.as_ref()
-                && let Some(runtime) = optional_trimmed(state.runtime.as_deref())
-            {
-                let runtime = RuntimeKind::parse(&runtime)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                let execution_runtime = RuntimeKind::parse(&execution.runtime)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                if runtime != execution_runtime {
-                    return Err(Status::invalid_argument(
-                        "published sandbox runtime disagrees with execution metadata",
-                    ));
-                }
-            }
-            let current_local_artifact = match (
-                optional_trimmed(state.current_local_artifact_id.as_deref()),
-                state.current_local_artifact_kind,
-                state.current_local_artifact_origin,
-            ) {
-                (None, None, None) => None,
-                (Some(raw_id), Some(raw_kind), Some(raw_origin)) => {
-                    let artifact_id = raw_id.parse::<LocalArtifactId>().map_err(|error| {
-                        Status::invalid_argument(format!(
-                            "invalid current_local_artifact_id: {error}"
-                        ))
-                    })?;
-                    let kind = artifact_kind_from_proto(raw_kind).ok_or_else(|| {
-                        Status::invalid_argument("current_local_artifact_kind must be DISK or FULL")
-                    })?;
-                    let origin = published_artifact_origin(raw_origin)?;
-                    if transition_receipt.is_some_and(|receipt| {
-                        receipt.kind() == SandboxTransitionReceiptKind::QuarantineRecovery
-                    }) && (kind != ArtifactKind::Full || origin != ArtifactOrigin::Suspend)
-                    {
-                        return Err(Status::invalid_argument(
-                            "suspended recovery artifact must be a full suspend artifact",
-                        ));
-                    }
-                    Some((artifact_id.as_uuid(), kind, origin))
-                }
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "current local artifact identity must be fully present or absent",
-                    ));
-                }
-            };
-            let state_changed_at = state
-                .state_changed_at
-                .as_ref()
-                .map(|timestamp| proto_timestamp(timestamp, "state_changed_at"))
-                .transpose()?;
-            if optional_trimmed(state.status.as_deref()).is_none() && state_changed_at.is_some() {
-                return Err(Status::invalid_argument("state_changed_at requires status"));
-            }
-            let execution_generation = state
-                .execution_generation
-                .map(ExecutionGeneration::new)
-                .transpose()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let pod_uid = state
-                .pod_uid
-                .as_deref()
-                .map(PodUid::parse)
-                .transpose()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let mut row = serde_json::json!({
-                "sandbox_id": sandbox_uuid,
-                "status": optional_trimmed(state.status.as_deref()),
-                "template": optional_trimmed(state.template.as_deref()),
-                "runtime": optional_trimmed(state.runtime.as_deref())
-                    .or_else(|| execution.as_ref().map(|execution| execution.runtime.clone())),
-                "spaced_version": spaced_version.as_ref().map(ToString::to_string),
-                "runtime_version": execution.as_ref().map(|execution| execution.runtime_version.clone()),
-                "guest_os": execution.as_ref().map(|execution| execution.guest_os.clone()),
-                "guest_arch": execution.as_ref().map(|execution| execution.guest_arch.clone()),
-                "state_format_name": execution.as_ref().and_then(|execution| execution.state_format_name.clone()),
-                "state_format_version": execution.as_ref().and_then(|execution| execution.state_format_version.clone()),
-                "execution_metadata": execution.as_ref().map(|execution| execution.metadata.clone()),
-                "execution_components": execution.as_ref().map(|execution| execution.components.clone()).unwrap_or_default(),
-                "pid": state.pid.map(|value| u32_to_i32(value, "pid")).transpose()?,
-                "namespace": optional_trimmed(state.namespace.as_deref()),
-                "uptime": optional_trimmed(state.uptime.as_deref()),
-                "sandbox_owner": optional_trimmed(state.owner.as_deref()),
-                "sandbox_user": optional_trimmed(state.owner.as_deref()),
-                "image_hash": optional_trimmed(state.content_hash.as_deref()),
-                "snapshots_enabled": state.snapshots_enabled,
-                "pool_template": optional_trimmed(state.pool_template.as_deref()),
-                "failure_reason": optional_trimmed(state.failure_reason.as_deref()),
-                "observed_created_at": optional_trimmed(state.created_at.as_deref()),
-                "last_used_at": state.last_used_at.as_ref()
-                    .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_used_at"))
-                    .transpose()?,
-                "last_access_at": state.last_access_at.as_ref()
-                    .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_access_at"))
-                    .transpose()?,
-                "last_command_at": state.last_command_at.as_ref()
-                    .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_command_at"))
-                    .transpose()?,
-                "network_tx_bytes": state.network_tx_bytes
-                    .map(|value| u64_to_i64(value, "network_tx_bytes"))
-                    .transpose()?,
-                "network_rx_bytes": state.network_rx_bytes
-                    .map(|value| u64_to_i64(value, "network_rx_bytes"))
-                    .transpose()?,
-                "disk_usage_bytes": state.disk_usage_bytes
-                    .map(|value| u64_to_i64(value, "disk_usage_bytes"))
-                    .transpose()?,
-                "observed_network_policy_json": observed_network_policy,
-                "observed_network_policy_generation": observed_network_policy_generation,
-                "observed_network_policy_source": network_policy_source_str(
-                    state.observed_network_policy_source,
-                ),
-                "observed_network_policy_authority": PolicyAuthority::from_optional_proto(
-                    state.observed_network_policy_authority,
-                )
-                .map(|authority| authority.map(|authority| authority.as_str()))
-                .map_err(|error| Status::invalid_argument(error.to_string()))?,
-                "auto_lifecycle_authority": PolicyAuthority::from_optional_proto(
-                    state.auto_lifecycle_authority,
-                )
-                .map(|authority| authority.map(|authority| authority.as_str()))
-                .map_err(|error| Status::invalid_argument(error.to_string()))?,
-                "quarantine_reason_code": optional_trimmed(state.quarantine_reason_code.as_deref()),
-                "transition_receipt_id": transition_receipt.map(|receipt| receipt.id().as_uuid()),
-                "transition_receipt_kind": transition_receipt.map(|receipt| receipt.kind().as_str()),
-                "transition_receipt_target_state": transition_receipt.map(|receipt| receipt.target_state().as_str()),
-                "transition_receipt_execution_generation": transition_receipt
-                    .map(|receipt| receipt.execution_generation().get()),
-                "transition_receipt_reason_code": transition_receipt
-                    .and_then(|receipt| receipt.reason_code().map(|reason| reason.as_str())),
-                "transition_receipt_activation_attempt_id": transition_receipt
-                    .and_then(|receipt| receipt.activation_attempt_id().map(|id| id.as_uuid())),
-            });
-            let row_fields = row.as_object_mut().ok_or_else(|| {
-                Status::internal("published sandbox state did not serialize as an object")
-            })?;
-            let quarantine_recovery_payload = quarantine_recovery.as_ref().map(|observation| {
-                serde_json::json!({
-                    "schema_version": observation.schema_version,
-                    "local_quarantine_id": observation.local_quarantine_id,
-                    "observed_owner": observation.observed_owner_name(),
-                    "attempt_count": observation.attempt_count,
-                    "next_attempt_at": observation.next_attempt_at.as_deref(),
-                })
-            });
-            row_fields.insert(
-                "quarantine_recovery_payload".to_string(),
-                quarantine_recovery_payload.unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "quarantine_recovery_observation_degraded".to_string(),
-                serde_json::Value::Bool(quarantine_recovery_degraded),
-            );
-            row_fields.insert(
-                "transition_receipt_recovery_policy".to_string(),
-                transition_receipt
-                    .and_then(|receipt| receipt.reason_code().copied())
-                    .and_then(|reason| reason.automatic_recovery_policy())
-                    .map(|policy| serde_json::Value::String(policy.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_id".to_string(),
-                current_local_artifact
-                    .map(|(id, _, _)| serde_json::Value::String(id.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_kind".to_string(),
-                current_local_artifact
-                    .map(|(_, kind, _)| serde_json::Value::String(kind.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_origin".to_string(),
-                current_local_artifact
-                    .map(|(_, _, origin)| serde_json::Value::String(origin.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "state_changed_at".to_string(),
-                match state_changed_at {
-                    Some(changed_at) => {
-                        serde_json::Value::String(changed_at.format(&Rfc3339).map_err(|error| {
-                            Status::internal(format!("format state_changed_at: {error}"))
-                        })?)
-                    }
-                    None => serde_json::Value::Null,
-                },
-            );
-            row_fields.insert(
-                "execution_generation".to_string(),
-                execution_generation
-                    .map(|generation| serde_json::Value::from(generation.get()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "pod_uid".to_string(),
-                pod_uid
-                    .map(|pod_uid| serde_json::Value::String(pod_uid.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            rows.push(row);
-            for snapshot in &state.snapshots {
-                snapshot_rows.push(snapshot_json(sandbox_uuid, snapshot)?);
-            }
-            Ok(())
-        })();
-        if let Err(error) = parse_result {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, true));
-            rows.truncate(row_count);
-            snapshot_rows.truncate(snapshot_count);
-            quarantine_inputs.truncate(quarantine_count);
-            let disposition =
-                pplx_space_metrics::sandbox::publication::StatePublicationDisposition::StateOnly;
-            pplx_space_metrics::sandbox::publication::degraded(
-                pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
-                disposition,
-            );
-            tracing::warn!(
-                %node_id,
-                %sandbox_id,
-                %error,
-                %disposition,
-                "publishing sandbox lifecycle without malformed optional fields"
-            );
-            state_only.insert(
-                sandbox_uuid,
-                serde_json::json!({
-                    "sandbox_id": sandbox_uuid,
-                    "status": optional_trimmed(state.status.as_deref()),
-                }),
-            );
-        } else {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, false));
-            publishes_network_policy |= row_publishes_network_policy;
-        }
-    }
 
     let mut accepted = 0_u64;
     if !absent_ids.is_empty() {
@@ -2154,7 +1172,12 @@ pub async fn publish_sandbox_states(
         accepted = accepted.saturating_add(usize_to_u64(result.len()));
     }
 
-    let failure_episode_rows_json = Json(serde_json::Value::Array(failure_episode_rows));
+    let failure_episode_rows_json = Json(serde_json::Value::Array(
+        failure_episode_rows
+            .iter()
+            .map(FailureEpisodeClaim::legacy_row)
+            .collect(),
+    ));
     sqlx::query(sql!(
         "INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_payload, observed_at, updated_at
@@ -2871,7 +1894,7 @@ pub async fn publish_sandbox_states(
     if !quarantine_inputs.is_empty() {
         let quarantine_sql_inputs = quarantine_inputs
             .iter()
-            .map(QuarantineProjectionInput::sql_input)
+            .map(QuarantineProjectionSqlInput::materialize)
             .collect::<Vec<_>>();
         let quarantine_rows_json = Json(
             serde_json::to_value(&quarantine_sql_inputs)
@@ -3646,45 +2669,6 @@ pub async fn prune_absent_node_templates(
     Ok(())
 }
 
-fn template_snapshots_json(snapshots: &[SnapshotInfo]) -> serde_json::Value {
-    serde_json::Value::Array(
-        snapshots
-            .iter()
-            .map(|snapshot| {
-                serde_json::json!({
-                    "vcpu": snapshot.vcpu,
-                    "memory_mib": snapshot.memory_mib,
-                    "snapshot_hash": snapshot.snapshot_hash,
-                })
-            })
-            .collect(),
-    )
-}
-
-fn snapshot_json(
-    sandbox_id: SandboxId,
-    snapshot: &SnapshotDetail,
-) -> Result<serde_json::Value, Status> {
-    Ok(serde_json::json!({
-        "sandbox_id": sandbox_id,
-        "snapshot_id": &snapshot.id,
-        "type": snapshot_type_name(snapshot.r#type),
-        "state": &snapshot.state,
-        "timestamp": snapshot.timestamp.as_deref(),
-        "source_node_id": snapshot.source_node_id.as_deref(),
-        "label": snapshot.label.as_deref(),
-        "retention_tier": snapshot.retention_tier.as_deref(),
-        "vcpu": u32_to_i32(snapshot.vcpu, "snapshot.vcpu")?,
-        "memory_mib": u32_to_i32(snapshot.memory_mib, "snapshot.memory_mib")?,
-        "size_bytes": snapshot.size_bytes
-            .map(|value| u64_to_i64(value, "snapshot.size_bytes"))
-            .transpose()?,
-        "template_id": snapshot.template_id.as_deref(),
-        "content_hash": snapshot.content_hash.as_deref(),
-        "locations": snapshot_locations_json(snapshot),
-    }))
-}
-
 async fn publish_sandbox_snapshots_batch(
     conn: &mut sqlx::PgConnection,
     sandbox_ids: &[SandboxId],
@@ -3830,33 +2814,6 @@ async fn publish_sandbox_snapshots_batch(
     .await
     .map_err(|err| Status::internal(format!("upsert published sandbox snapshot: {err}")))?;
     Ok(())
-}
-
-fn snapshot_type_name(value: i32) -> &'static str {
-    match SnapshotType::try_from(value) {
-        Ok(SnapshotType::Disk) => "disk",
-        Ok(SnapshotType::Full) => "full",
-        _ => "unknown",
-    }
-}
-
-fn snapshot_locations_json(snapshot: &SnapshotDetail) -> serde_json::Value {
-    serde_json::Value::Array(
-        snapshot
-            .locations
-            .iter()
-            .map(|location| {
-                serde_json::json!({
-                    "location_type": location.location_type,
-                    "node_id": location.node_id,
-                    "node_address": location.node_address,
-                    "volume_id": location.volume_id,
-                    "state": location.state,
-                    "size_bytes": location.size_bytes,
-                })
-            })
-            .collect(),
-    )
 }
 
 #[cfg(test)]
