@@ -100,6 +100,45 @@ async fn template_delete_waits_for_inventory_without_spending_failure_budget() -
     assert_eq!(pending.state, OperationState::Queued);
     assert!(pending.requeue_reason.preserves_retry_budget());
 
+    // Keep a blocked cleanup observable without polling at a fixed five seconds.
+    sqlx::query(sql!(
+        "UPDATE public_operations SET started_at = NOW() - INTERVAL '8 minutes'
+         WHERE operation_id = $1"
+    ))
+    .bind(id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    let pending = executor.execute(&operation).await;
+    assert_eq!(pending.state, OperationState::Queued);
+    assert!(pending.requeue_reason.preserves_retry_budget());
+    assert!(
+        pending
+            .retry_after
+            .is_some_and(|delay| delay >= Duration::from_secs(35))
+    );
+
+    // A node that never relinquishes its copy must eventually produce a terminal
+    // error identifying the blocker, while preserving the template's delete intent.
+    sqlx::query(sql!(
+        "UPDATE public_operations SET started_at = NOW() - INTERVAL '30 minutes'
+         WHERE operation_id = $1"
+    ))
+    .bind(id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    let expired = executor.execute(&operation).await;
+    assert_eq!(expired.state, OperationState::Failed);
+    assert_eq!(expired.terminal_error_code, Some(PublicErrorCode::Conflict));
+    let error = expired
+        .terminal_error_json
+        .expect("cleanup timeout has details");
+    assert_eq!(error["reason"], "template_delete_cleanup_timeout");
+    assert_eq!(error["blocking_nodes"], serde_json::json!([node]));
+    assert_eq!(
+        fetch_template_desired_state(&db.pool, &template).await?,
+        Some(TemplateDesiredState::Deleting)
+    );
+
     sqlx::query(sql!(
         "DELETE FROM node_template_inventory WHERE template_name = $1"
     ))

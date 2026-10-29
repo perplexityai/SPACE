@@ -12,7 +12,10 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
-    public_operations::{ClaimedPublicOperation, PublicOperationRequeueReason},
+    public_operations::{
+        ClaimedPublicOperation, PublicOperationRequeueReason, PublicOperationStore,
+        PublicOperationStoreError,
+    },
     public_sandbox_operations::PublicOperationExecutionResult,
     reconcile_queue::{
         NetworkPolicyTarget, ReconcileElementRef, ReconcileRef,
@@ -22,6 +25,9 @@ use crate::{
 };
 
 const TEMPLATE_DELETE_RETRY_AFTER: Duration = Duration::from_secs(5);
+// Admin deletes have no driver age deadline. Bound cleanup independently of
+// failed attempts so a retained node copy cannot keep the operation active forever.
+const TEMPLATE_DELETE_WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,7 +70,7 @@ impl DeleteTemplateOperationExecutor {
     async fn execute_inner(
         &self,
         operation: &ClaimedPublicOperation,
-    ) -> Result<PublicOperationExecutionResult, sqlx::Error> {
+    ) -> Result<PublicOperationExecutionResult, PublicOperationStoreError> {
         let payload = match serde_json::from_value::<DeleteTemplateOperationPayload>(
             operation.payload.clone(),
         ) {
@@ -118,17 +124,33 @@ impl DeleteTemplateOperationExecutor {
 
         let nodes = nodes_with_template_inventory(&self.pool, &template).await?;
         if !nodes.is_empty() {
+            let waited = PublicOperationStore::new(self.pool.clone())
+                .time_since_first_claim(operation.id)
+                .await?
+                .unwrap_or_default();
+            if waited >= TEMPLATE_DELETE_WAIT_LIMIT {
+                return Ok(terminal_failure(
+                    operation,
+                    PublicErrorCode::Conflict,
+                    "template deletion timed out waiting for node cleanup",
+                    serde_json::json!({
+                        "operation_id": operation.id.to_string(),
+                        "template": template.to_string(),
+                        "reason": "template_delete_cleanup_timeout",
+                        "blocking_nodes": nodes,
+                        "waited_secs": waited.as_secs(),
+                    }),
+                ));
+            }
             enqueue_template_delete_reconcile(&self.pool, &template, &nodes).await?;
-            return Ok(PublicOperationExecutionResult {
-                state: OperationState::Queued,
-                progress_message: format!("waiting for {} node(s) to delete template", nodes.len()),
-                result_json: None,
-                terminal_error_code: None,
-                terminal_error_json: None,
-                retry_after: Some(TEMPLATE_DELETE_RETRY_AFTER),
-                // Node cleanup is asynchronous progress, not a failed attempt.
-                requeue_reason: PublicOperationRequeueReason::WorkflowProgress,
-            });
+            return Ok(PublicOperationExecutionResult::workflow_progress(
+                format!("waiting for {} node(s) to delete template", nodes.len()),
+                crate::public_operation_driver::deferred_retry_delay(
+                    operation.id,
+                    waited,
+                    TEMPLATE_DELETE_RETRY_AFTER,
+                ),
+            ));
         }
 
         mark_template_deleted(&self.pool, &template, operation.id.as_uuid()).await?;
@@ -321,7 +343,7 @@ fn terminal_failure(
 
 fn internal_failure(
     operation: &ClaimedPublicOperation,
-    error: sqlx::Error,
+    error: PublicOperationStoreError,
 ) -> PublicOperationExecutionResult {
     tracing::warn!(
         operation_id = %operation.id,
