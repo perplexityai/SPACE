@@ -28,6 +28,7 @@ nix = { workspace = true, features = ["feature"] }
 pplx-space-common-core = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-execution-common = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }

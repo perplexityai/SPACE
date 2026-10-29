@@ -6886,6 +6886,7 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
+ "pplx-space-execution-common",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-rustls-provider",

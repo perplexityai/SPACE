@@ -4,19 +4,24 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use pplx_space_common_core::types::PolicyAuthority;
+use pplx_space_common_core::types::{
+    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ExecutionMetadata, PolicyAuthority,
+};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
 use pplx_space_net_common::proto::{
     EgressDefaultAction, NetworkPolicySource, NetworkPolicyV1, NetworkPolicyVersion,
 };
 use pplx_space_node_api_client::proto::{
-    NodeRole, NodeSchedulingStatus, PublishNodeStateRequest, PublishedNodeStatus,
-    PublishedTemplateState,
+    ExecutionInventoryObservation, ExecutionInventoryUnavailable, NodeRole, NodeSchedulingStatus,
+    PublishNodeStateRequest, PublishedNodeStatus, PublishedTemplateState,
+    execution_inventory_observation::Outcome,
 };
 use pplx_space_publish_load::{Args, Node, service::LocalService, store};
 use pplx_space_sbx_mgr_client::proto::{SnapshotDetail, SnapshotLocation, SnapshotType};
 use pplx_space_state_reconciliation::NetworkPolicyTarget;
 use serde::Serialize;
+
+mod statement_inventory;
 
 #[derive(Debug, Serialize)]
 struct Scenario {
@@ -30,8 +35,13 @@ struct Scenario {
 enum ScenarioKind {
     Empty,
     NodeStatus,
+    ExecutionInventory,
+    UnavailableExecutionInventory,
+    EmptyExecutionInventory,
     Templates,
     RepeatedTemplates,
+    TemplateComponents,
+    ClearedTemplateComponents,
     TemplatePolicy,
     OmittedTemplatePolicy,
     AbsentTemplates,
@@ -160,6 +170,42 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
             ..Default::default()
         });
         scenarios.push(capture(db, &service, ScenarioKind::NodeStatus, status).await?);
+        for (kind, outcome, expected_rows) in [
+            (
+                ScenarioKind::ExecutionInventory,
+                Outcome::Complete(statement_inventory::installed()),
+                1,
+            ),
+            (
+                ScenarioKind::UnavailableExecutionInventory,
+                Outcome::Unavailable(ExecutionInventoryUnavailable {}),
+                1,
+            ),
+            (
+                ScenarioKind::EmptyExecutionInventory,
+                Outcome::Complete(Default::default()),
+                0,
+            ),
+        ] {
+            let mut publication = request(node);
+            publication.execution_observation = Some(ExecutionInventoryObservation {
+                outcome: Some(outcome),
+            });
+            let scenario = capture(db, &service, kind, publication).await?;
+            for table in [
+                "node_runtime_installations",
+                "node_runtime_guests",
+                "node_runtime_state_formats",
+                "node_artifact_components",
+            ] {
+                let rows = scenario
+                    .rows
+                    .get(table)
+                    .with_context(|| format!("missing {table}"))?;
+                ensure!(rows.len() == expected_rows, "unexpected {table} row count");
+            }
+            scenarios.push(scenario);
+        }
         let mut templates = request(node);
         templates.template_inventory_complete = true;
         templates.templates.push(PublishedTemplateState {
@@ -188,6 +234,41 @@ async fn run(args: &Args, db: &TestDb) -> Result<()> {
             store::template_inventory_hashes(&db.pool, node.id.parse()?).await? == template_hashes,
             "repeated template inventory changed release identity"
         );
+        let execution = ExecutionMetadata::initial_firecracker(
+            Arch::X86_64,
+            vec![ArtifactComponentMetadata {
+                kind: ArtifactComponentKind::Kernel,
+                role: None,
+                version: Some("6.1.155".parse()?),
+                digest: Some(format!("sha256:{}", "42".repeat(32)).parse()?),
+                format: Some("vmlinux".parse()?),
+            }],
+        );
+        let mut component_report = templates.clone();
+        component_report
+            .templates
+            .first_mut()
+            .context("template missing")?
+            .execution = Some((&execution).into());
+        for (kind, publication, expected_rows) in [
+            (ScenarioKind::TemplateComponents, component_report, 1),
+            (
+                ScenarioKind::ClearedTemplateComponents,
+                templates.clone(),
+                0,
+            ),
+        ] {
+            let scenario = capture(db, &service, kind, publication).await?;
+            let rows = scenario
+                .rows
+                .get("node_template_components")
+                .context("missing components")?;
+            ensure!(
+                rows.len() == expected_rows,
+                "unexpected template component row count",
+            );
+            scenarios.push(scenario);
+        }
         let mut template_policy = templates.clone();
         let policy_state = template_policy
             .templates

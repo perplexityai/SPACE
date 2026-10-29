@@ -6,6 +6,8 @@ use sqlx::PgPool;
 
 use crate::TestDbResult;
 
+mod publish_details;
+
 /// Give every freshly seeded run planner statistics before measuring it.
 /// ANALYZE takes its usual maintenance locks; it changes no fixture rows.
 pub async fn analyze(pool: &PgPool) -> TestDbResult<()> {
@@ -95,5 +97,6 @@ pub async fn dump(pool: &PgPool) -> TestDbResult<Vec<(&'static str, Vec<serde_js
     for (table, query) in tables {
         result.push((table, sqlx::query_scalar(query).fetch_all(pool).await?));
     }
+    result.extend(publish_details::dump(pool).await?);
     Ok(result)
 }

@@ -20,6 +20,10 @@ TABLES = (
     "sandbox_quarantine_state", "sandbox_quarantine_history",
     "node_status_snapshots", "sandbox_k8s_executions",
     "sandbox_direct_route_identities",
+    "node_template_inventory", "node_template_components",
+    "node_runtime_installations", "node_runtime_guests", "node_runtime_state_formats",
+    "node_artifact_components", "sandbox_snapshot_inventory", "node_facet_conditions",
+    "node_reconcile_queue", "node_reconcile_triggers", "node_local_backup_pending",
 )
 ACTIVITY = {"last_access_at", "last_command_at", "last_used_at"}
 # Normalize only named database columns. Opaque text and JSON can themselves
@@ -47,6 +51,22 @@ SERVER_TIMESTAMPS = {
         "activation_attempt_expires_at",
     },
     "sandbox_direct_route_identities": {"updated_at"},
+    "node_template_inventory": {"observed_at", "updated_at"},
+    "node_template_components": set(),
+    "node_runtime_installations": {"observed_at"},
+    "node_runtime_guests": set(),
+    "node_runtime_state_formats": set(),
+    "node_artifact_components": {"observed_at"},
+    # Snapshot timestamp and source_node_id are opaque node-supplied strings.
+    "sandbox_snapshot_inventory": {"observed_at", "updated_at"},
+    "node_facet_conditions": {"last_transition_at", "updated_at"},
+    "node_reconcile_queue": {
+        "claimed_at", "next_attempt_at", "requested_at", "updated_at", "dead_at",
+    },
+    "node_reconcile_triggers": {
+        "claimed_at", "next_attempt_at", "requested_at", "updated_at", "dead_at",
+    },
+    "node_local_backup_pending": {"created_at"},
 }
 TIMESTAMP = re.compile(
     r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)$"
