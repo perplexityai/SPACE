@@ -1,5 +1,6 @@
 use pplx_space_common_core::types::ArtifactComponentKind;
 
+pub(crate) use crate::node_publish::validate::templates::TemplatePolicyClaim;
 use crate::node_publish::validate::templates::{
     PublishedTemplateName, TemplateComponentSet, ValidatedTemplateInventory,
 };
@@ -26,6 +27,11 @@ pub(crate) struct TemplateComponentClaim {
     pub(crate) format: Option<String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct TemplatePolicyAppliedClaim {
+    pub(crate) template: PublishedTemplateName,
+}
+
 /// Component values move out of the validated execution projection, while its
 /// opaque execution metadata remains available to the inventory observation.
 #[derive(Debug)]
@@ -34,6 +40,8 @@ pub(crate) struct TemplatePlan {
     pub(crate) component_scopes: Vec<TemplateReleaseClaim>,
     pub(crate) component_keys: Vec<TemplateComponentKeyClaim>,
     pub(crate) components: Vec<TemplateComponentClaim>,
+    pub(crate) policies: Vec<TemplatePolicyClaim>,
+    pub(crate) applied_policies: Vec<TemplatePolicyAppliedClaim>,
 }
 
 impl From<ValidatedTemplateInventory> for TemplatePlan {
@@ -67,11 +75,20 @@ impl From<ValidatedTemplateInventory> for TemplatePlan {
             }
             component_scopes.push(release);
         }
+        let policies: Vec<_> = inventory.take_policies().collect();
+        let applied_policies = policies
+            .iter()
+            .map(|claim| TemplatePolicyAppliedClaim {
+                template: claim.template.clone(),
+            })
+            .collect();
         Self {
             inventory,
             component_scopes,
             component_keys,
             components,
+            policies,
+            applied_policies,
         }
     }
 }

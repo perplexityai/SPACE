@@ -386,6 +386,135 @@ async fn repeated_template_publish_does_not_rewrite_node_template_inventory() ->
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn template_policy_claims_preserve_generation_and_inventory_guards() -> TestResult {
+    use pplx_space_common_core::types::PolicyAuthority;
+    use pplx_space_net_common::NetworkPolicyV1;
+
+    #[derive(Debug, PartialEq, sqlx::FromRow)]
+    struct PolicyRecord {
+        node_id: NodeId,
+        element: String,
+        generation: Option<i64>,
+        payload: Option<serde_json::Value>,
+        authority: Option<String>,
+        failure: bool,
+    }
+
+    const READ_POLICIES: &str = sql!(
+        "SELECT observation.node_id, observation.element,
+                observation.observed_generation AS generation,
+                observation.observed_payload AS payload,
+                observation.applied_authority AS authority,
+                EXISTS (
+                    SELECT 1 FROM node_facet_conditions condition
+                    WHERE condition.node_id = observation.node_id
+                      AND condition.facet = observation.facet
+                      AND condition.element = observation.element
+                      AND condition.condition_type = $2
+                ) AS failure
+         FROM node_facet_observed_status observation
+         WHERE observation.facet = $1
+         ORDER BY observation.node_id, observation.element"
+    );
+    let db = pg_test_db().await?;
+    register_inventory_template(&db.pool).await?;
+    let node_id = NodeId::new();
+    let other_node = NodeId::new();
+    let targets = ["template:code-runtime", "template:unregistered-policy"];
+    let mut conn = db.pool.acquire().await?;
+    for owner in [node_id, other_node] {
+        insert_ready_worker_node(&db.pool, owner).await?;
+        for target in targets {
+            sqlx::query(sql!(
+                "INSERT INTO node_facet_observed_status
+                     (node_id, facet, element, observed_generation, observed_payload, observed_at)
+                 VALUES ($1, $2, $3, $4, $5, NOW())"
+            ))
+            .bind(owner)
+            .bind(FACET_NETWORK_POLICY)
+            .bind(target)
+            .bind(7_i64)
+            .bind(Json(serde_json::json!({"prior": true})))
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+
+    for (generation, policy, authority) in [
+        (
+            0,
+            Some(NetworkPolicyV1::allow_all()),
+            Some(PolicyAuthority::Cluster),
+        ),
+        (
+            11,
+            Some(NetworkPolicyV1::allow_all()),
+            Some(PolicyAuthority::Cluster),
+        ),
+        (0, None, None),
+        (12, None, None),
+    ] {
+        for owner in [node_id, other_node] {
+            for target in targets {
+                sqlx::query(sql!(
+                    "INSERT INTO node_facet_conditions
+                         (node_id, facet, element, condition_type, condition_status,
+                          last_transition_at)
+                     VALUES ($1, $2, $3, $4, $5, NOW())
+                     ON CONFLICT (node_id, facet, element, condition_type) DO NOTHING"
+                ))
+                .bind(owner)
+                .bind(FACET_NETWORK_POLICY)
+                .bind(target)
+                .bind("ApplyFailed")
+                .bind("True")
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+        let mut expected: Vec<PolicyRecord> = sqlx::query_as(READ_POLICIES)
+            .bind(FACET_NETWORK_POLICY)
+            .bind("ApplyFailed")
+            .fetch_all(&mut *conn)
+            .await?;
+        if generation != 0 {
+            let observed = expected
+                .iter_mut()
+                .find(|row| row.node_id == node_id && row.element == targets[0])
+                .unwrap();
+            observed.generation = Some(generation as i64);
+            observed.payload = policy.as_ref().map(serde_json::to_value).transpose()?;
+            observed.authority = authority.map(|value| value.as_str().to_owned());
+            observed.failure = false;
+        }
+        let state = PublishedTemplateState {
+            network_policy_generation: generation,
+            network_policy: policy.as_ref().map(Into::into),
+            network_policy_authority: authority
+                .map(|value| value.as_proto_i32())
+                .unwrap_or_default(),
+            ..template_state()
+        };
+        let unknown = PublishedTemplateState {
+            template: "unregistered-policy".to_owned(),
+            ..state.clone()
+        };
+        assert_eq!(
+            publish_template_states(&mut conn, node_id, NodeRole::Worker, &[state, unknown])
+                .await?,
+            1,
+        );
+        let actual: Vec<PolicyRecord> = sqlx::query_as(READ_POLICIES)
+            .bind(FACET_NETWORK_POLICY)
+            .bind("ApplyFailed")
+            .fetch_all(&mut *conn)
+            .await?;
+        assert_eq!(actual, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn template_publish_does_not_reactivate_deleted_template() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());

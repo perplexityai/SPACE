@@ -31,6 +31,15 @@ pub(in crate::node_publish) struct TemplateComponentSet {
     pub(in crate::node_publish) components: Vec<ArtifactComponentProjection>,
 }
 
+/// A node's policy observation is actionable only with a reported generation.
+#[derive(Debug)]
+pub(crate) struct TemplatePolicyClaim {
+    pub(crate) template: PublishedTemplateName,
+    pub(crate) generation: i64,
+    pub(crate) policy: Option<NetworkPolicyV1>,
+    pub(crate) authority: Option<PolicyAuthority>,
+}
+
 /// Optional descriptive metadata retains its legacy spelling. Runtime and
 /// architecture are checked against execution evidence before constructing it.
 #[derive(Debug)]
@@ -88,6 +97,16 @@ pub(super) struct TemplateClaim {
 }
 
 impl TemplateClaim {
+    pub(super) fn take_policy(&mut self) -> Option<TemplatePolicyClaim> {
+        let generation = self.network_policy_generation?;
+        Some(TemplatePolicyClaim {
+            template: self.name.clone(),
+            generation,
+            policy: self.network_policy.take(),
+            authority: self.network_policy_authority,
+        })
+    }
+
     pub(super) fn take_components(&mut self) -> TemplateComponentSet {
         TemplateComponentSet {
             name: self.name.clone(),

@@ -2,6 +2,8 @@ use pplx_space_common_core::{sql, types::NodeId};
 use pplx_space_common_svc::types::FACET_NETWORK_POLICY;
 use sqlx::{PgConnection, types::Json};
 
+use crate::node_publish::plan::templates::{TemplatePolicyAppliedClaim, TemplatePolicyClaim};
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ObserveTemplatePolicyError {
     #[error("upsert template network policy facet status: {0}")]
@@ -10,25 +12,24 @@ pub(crate) enum ObserveTemplatePolicyError {
     ClearCondition(#[source] sqlx::Error),
 }
 
-/// Observe policies only for this node's existing inventory and reports with
-/// a generation, then clear their apply failures. Ordinary facet-row write
-/// locks follow that order; conflict checks also lock unchanged observations.
-/// No matching inventory or no reported generation is a normal zero-row result.
+/// Observe generated policy claims only for this node's existing inventory.
+/// Conflict checks lock facet rows even for unchanged observations. False means
+/// there were no claims, no matching inventory, or no changed observations.
 pub(crate) async fn observe(
     conn: &mut PgConnection,
     node_id: NodeId,
-    rows_json: &Json<serde_json::Value>,
-) -> Result<(), ObserveTemplatePolicyError> {
-    sqlx::query(sql!(
+    claims: &[TemplatePolicyClaim],
+) -> Result<bool, ObserveTemplatePolicyError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
+    let result = sqlx::query(sql!(
         "WITH input AS (
              SELECT template_name, network_policy_json,
                     network_policy_generation, network_policy_authority
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 network_policy_json JSONB,
-                 network_policy_generation BIGINT,
-                 network_policy_authority TEXT
-             )
+             FROM UNNEST($2::TEXT[], $4::JSONB[], $5::BIGINT[], $6::TEXT[])
+                 AS input(template_name, network_policy_json,
+                          network_policy_generation, network_policy_authority)
          )
          INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_generation, observed_payload,
@@ -45,8 +46,7 @@ pub(crate) async fn observe(
              NOW(),
              NOW()
          FROM input
-         WHERE network_policy_generation IS NOT NULL
-           AND EXISTS (
+         WHERE EXISTS (
                SELECT 1 FROM node_template_inventory inventory
                WHERE inventory.node_id = $1 AND inventory.template_name = input.template_name
            )
@@ -70,26 +70,58 @@ pub(crate) async fn observe(
          )"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.template.as_str())
+            .collect::<Vec<_>>(),
+    )
     .bind(FACET_NETWORK_POLICY)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.policy.as_ref().map(Json))
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.generation)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.authority.map(|authority| authority.as_str()))
+            .collect::<Vec<_>>(),
+    )
     .execute(&mut *conn)
     .await
     .map_err(ObserveTemplatePolicyError::Upsert)?;
+    Ok(result.rows_affected() > 0)
+}
 
-    sqlx::query(sql!(
+/// Clear apply failures after observing a generated policy claim, guarded by
+/// this node's inventory. Deletes lock matching condition rows. False means
+/// no claims, no matching inventory, or no failure condition to clear.
+pub(crate) async fn clear_apply_failures(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+    claims: &[TemplatePolicyAppliedClaim],
+) -> Result<bool, ObserveTemplatePolicyError> {
+    if claims.is_empty() {
+        return Ok(false);
+    }
+    let result = sqlx::query(sql!(
         "WITH input AS (
-             SELECT template_name, network_policy_generation
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 network_policy_generation BIGINT
-             )
+             SELECT template_name
+             FROM UNNEST($2::TEXT[]) AS input(template_name)
          )
          DELETE FROM node_facet_conditions nfc
          USING input
          WHERE nfc.node_id = $1
            AND nfc.facet = $3
            AND nfc.element = 'template:' || input.template_name
-           AND input.network_policy_generation IS NOT NULL
            AND nfc.condition_type = 'ApplyFailed'
            AND EXISTS (
                SELECT 1 FROM node_template_inventory inventory
@@ -97,10 +129,15 @@ pub(crate) async fn observe(
            )"
     ))
     .bind(node_id)
-    .bind(rows_json)
+    .bind(
+        claims
+            .iter()
+            .map(|claim| claim.template.as_str())
+            .collect::<Vec<_>>(),
+    )
     .bind(FACET_NETWORK_POLICY)
     .execute(&mut *conn)
     .await
     .map_err(ObserveTemplatePolicyError::ClearCondition)?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }

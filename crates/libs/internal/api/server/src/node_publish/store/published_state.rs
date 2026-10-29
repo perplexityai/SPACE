@@ -234,7 +234,8 @@ pub(crate) async fn publish_validated_template_states(
     )
     .await?;
 
-    template_network_policy::observe(conn, node_id, &rows_json).await?;
+    template_network_policy::observe(conn, node_id, &plan.policies).await?;
+    template_network_policy::clear_apply_failures(conn, node_id, &plan.applied_policies).await?;
 
     accepted = accepted.saturating_add(usize_to_u64(accepted_rows.len()));
     Ok(accepted)

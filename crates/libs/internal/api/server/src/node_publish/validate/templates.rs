@@ -2,9 +2,9 @@ use pplx_space_common_core::types::NodeRole;
 use tonic::Status;
 
 use crate::proto::PublishedTemplateState;
-pub(crate) use claim::PublishedTemplateName;
 use claim::TemplateClaim;
 pub(in crate::node_publish) use claim::TemplateComponentSet;
+pub(crate) use claim::{PublishedTemplateName, TemplatePolicyClaim};
 
 mod claim;
 
@@ -17,6 +17,14 @@ pub(crate) struct ValidatedTemplateInventory {
 }
 
 impl ValidatedTemplateInventory {
+    pub(in crate::node_publish) fn take_policies(
+        &mut self,
+    ) -> impl Iterator<Item = TemplatePolicyClaim> + '_ {
+        self.claims
+            .iter_mut()
+            .filter_map(TemplateClaim::take_policy)
+    }
+
     pub(in crate::node_publish) fn take_components(
         &mut self,
     ) -> impl Iterator<Item = TemplateComponentSet> + '_ {
