@@ -58,6 +58,7 @@ are not established by these results.
 | Application head | Same-lane reference | PostgreSQL CPU median, ms/publish | Reduction |
 | --- | --- | ---: | ---: |
 | [753d3b1f](head-753d3b1f/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.369 | -2.3079% |
+| [b44c0ce4](head-b44c0ce4/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.358 | -1.9739% |
 | [23c27a10](head-23c27a10/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 3.398 | -1.7975% |
 | [80a369e3](head-80a369e3/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 3.371 | -1.2921% |
 | [b91ad676](head-b91ad676/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.361 | -2.0650% |
@@ -76,7 +77,9 @@ are not established by these results.
 | [3b67f748](head-3b67f748/README.md) | [Lane H](baseline-lane-h/README.md) | 3.352 → 3.316 | 1.0740% |
 | [c55485c0](head-c55485c0/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 3.328 | 0.0000% |
 | [ce6bf8df](head-ce6bf8df/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.288 | 0.1518% |
+| [a310e90f](head-a310e90f/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 2.802 | 16.0575% |
 | [0a70b4d5](head-0a70b4d5/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 2.080 | 37.5000% |
+| [9b9c5e2c](head-9b9c5e2c/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 1.816 | 45.4327% |
 | [938e0cf4](head-938e0cf4/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 1.522 | 54.4038% |
 
 Reductions compare each head with its own lane's fixed reference; negative

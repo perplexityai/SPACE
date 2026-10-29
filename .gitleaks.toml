@@ -151,6 +151,27 @@ paths = ['''^bench/publish/cpu-acceptance-v3/unqualified-3b67f748-attempt-1/summ
 regexes = ['''^39eae8522d781e465784dc1777538460cf990a8f94d0ceb17bb4abd53baabbd4$''']
 
 [[allowlists]]
+description = "Verified SHA-256 of the measured publication executable at a310e90f"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^bench/publish/cpu-acceptance-v3/head-a310e90f/summary\.json$''']
+regexes = ['''^159c26b4fe9b11a459fcaae1f6ba772462c8921d303966d26e32fa5b4eaadc9d$''']
+
+[[allowlists]]
+description = "Verified SHA-256 of the measured publication executable at 9b9c5e2c"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^bench/publish/cpu-acceptance-v3/head-9b9c5e2c/summary\.json$''']
+regexes = ['''^f9d3e356500bb1cf2ef014a7658f9085f4159fc882efbb0c81e17444ba16ae45$''']
+
+[[allowlists]]
+description = "Verified SHA-256 of the measured publication executable at b44c0ce4"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^bench/publish/cpu-acceptance-v3/head-b44c0ce4/summary\.json$''']
+regexes = ['''^4a74ee833e2b8168f2539c3bb0301587314301996ddff7105a881fc6a2826f96$''']
+
+[[allowlists]]
 description = "Verified SHA-256 of the measured publication executable at 8b345478"
 targetRules = ["generic-api-key"]
 condition = "AND"
