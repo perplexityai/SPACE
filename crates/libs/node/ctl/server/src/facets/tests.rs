@@ -1509,3 +1509,53 @@ fn the_budget_outlasts_several_connect_retry_attempts() {
          before a fourth dial attempt"
     );
 }
+
+/// Which failed publishes node-ctl retries ahead of the next tick: the
+/// statuses the shared gRPC policy treats as transport-class (`Unavailable`,
+/// `Unknown`, and `Internal`/`Cancelled` carrying a transport error), whoever
+/// produced them, never one marked refused-before-start.
+#[test]
+fn publish_statuses_retry_only_when_the_cluster_was_unreachable() {
+    let refused = pplx_space_common_grpc::refused_before_start(
+        tonic::Status::unavailable("admission limit"),
+        std::time::Duration::from_secs(1),
+    );
+    let cases = [
+        (tonic::Status::unavailable("tcp connect error"), true),
+        (tonic::Status::unavailable("dns error"), true),
+        (
+            tonic::Status::unknown("transport closed before trailers"),
+            true,
+        ),
+        (
+            tonic::Status::internal("h2 protocol error: connection reset"),
+            true,
+        ),
+        (tonic::Status::cancelled("connection reset by peer"), true),
+        (
+            tonic::Status::permission_denied("node token rejected"),
+            false,
+        ),
+        (tonic::Status::not_found("node is not registered"), false),
+        (
+            tonic::Status::invalid_argument("role does not match the node"),
+            false,
+        ),
+        (
+            tonic::Status::resource_exhausted("too many publishes"),
+            false,
+        ),
+        (tonic::Status::deadline_exceeded("Deadline expired"), false),
+        (tonic::Status::cancelled("Timeout expired"), false),
+        (tonic::Status::internal("publish failed"), false),
+        (refused, false),
+    ];
+    for (status, retried) in cases {
+        let error = OutboundError::from_publish_status(&status);
+        assert_eq!(
+            error.retry_soon(),
+            retried,
+            "{status:?} classified as {error:?}"
+        );
+    }
+}

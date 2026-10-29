@@ -102,6 +102,52 @@ enum SandboxInventoryEnrichmentError {
     MissingNetworkPolicy(SandboxId),
 }
 
+/// Why an outbound facet failed to publish, as far as retrying it goes.
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum OutboundError {
+    /// A transport-class status the shared gRPC retry policy replays
+    /// (`is_temporary_tcp_failure`), whoever produced it: a refused or failed
+    /// connect, a lost transport, or an `Unavailable` answer. A publish soon
+    /// can succeed.
+    #[error("{0}")]
+    ClusterUnavailable(String),
+    /// Anything a publish soon would only repeat: a ClusterApi rejection,
+    /// deadline or `ResourceExhausted` answer, a status marked
+    /// refused-before-start, a node-local collection failure, a missing
+    /// endpoint, a timeout or a shutdown.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl OutboundError {
+    /// Classify a failed `PublishNodeState` call. Retried soon: the statuses
+    /// the shared gRPC policy replays, short of a server's ResourceExhausted
+    /// push-back, since a node retrying on top of its ticks would only add
+    /// to the load being shed. A client-side DeadlineExceeded is not retried
+    /// either: the server is slow, not gone, and the next tick tries again. A
+    /// bearer token that fails to attach locally surfaces as Unavailable too
+    /// and is retried; that costs a local census, not ClusterApi load.
+    pub(crate) fn from_publish_status(status: &tonic::Status) -> Self {
+        let error = format!("cluster node state publish failed: {status}");
+        if pplx_space_common_grpc::is_temporary_tcp_failure(status) {
+            Self::ClusterUnavailable(error)
+        } else {
+            Self::Other(error)
+        }
+    }
+
+    /// Whether node-ctl retries the publish ahead of the next tick.
+    pub(crate) fn retry_soon(&self) -> bool {
+        matches!(self, Self::ClusterUnavailable(_))
+    }
+}
+
+impl From<String> for OutboundError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FacetPlugin {
     kind: FacetKind,
@@ -347,13 +393,13 @@ impl FacetKind {
         }
     }
 
-    pub async fn run_outbound(
+    pub(crate) async fn run_outbound(
         self,
         node_id: &str,
         node_role: Option<NodeRole>,
         scope: FacetScope,
         node_status: Option<PublishedNodeStatus>,
-    ) -> Result<ReconcileStats, String> {
+    ) -> Result<ReconcileStats, OutboundError> {
         match self {
             Self::NetworkPolicy => {
                 publish_network_policy(node_id, node_role, scope, node_status).await
@@ -423,7 +469,7 @@ async fn publish_node_state(
     node_id: &str,
     node_role: Option<NodeRole>,
     state: NodeStatePublish,
-) -> Result<ReconcileStats, String> {
+) -> Result<ReconcileStats, OutboundError> {
     if state.sandboxes.is_empty()
         && state.templates.is_empty()
         && !state.sandbox_inventory_complete
@@ -466,7 +512,7 @@ async fn publish_node_state(
             pending_local_backups: state.pending_local_backups,
         })
         .await
-        .map_err(|error| format!("cluster node state publish failed: {error}"))?
+        .map_err(|status| OutboundError::from_publish_status(&status))?
         .into_inner();
 
     acknowledge_auto_lifecycle_delete_completions(
